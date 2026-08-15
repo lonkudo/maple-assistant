@@ -2,7 +2,7 @@
 
 Independent workers analyze the game without relying on slow interactive computer control:
 
-1. `capture_worker.py` captures the MapleStory client every three seconds.
+1. `capture_worker.py` captures the small minimap and status regions every four seconds.
 2. `movement_worker.py` locates the yellow minimap diamond and recommends or performs movement.
 3. `status_worker.py` monitors HP/MP and handles potions.
 4. `attack_worker.py` sends Ctrl on its own timer, independently of movement.
@@ -14,6 +14,29 @@ the old normalized rectangle is used only as a low-confidence fallback. The UI
 shows the detected minimap size, boxes, confidence, minimap preview, and cropped
 map-name area. Map-name OCR is a replaceable adapter because OpenCV locates text
 regions but does not itself recognize Chinese text.
+
+The UI also owns manual multi-layer patrol controls. Move the character by hand
+and wait until the displayed yellow-diamond position updates, then record
+`Left-most`, `Rope`, and `Right-most`. Recorded buttons lock automatically and
+turn grey; click the same embedded button once to unlock it, then click it again
+to record the new position. Each point is saved to six decimal places in the
+shared `recording-configuration.json`. After all three are present, `Add Layer Above`
+creates/selects the next layer and pauses patrol while it is calibrated. A new
+layer must have a smaller minimap Y than the layer below and becomes active only
+after all three of its points are recorded. `Start Patrol` then runs each layer's
+left/right route, uses that layer's own rope to climb, and changes to `Stop
+Patrol` while active. These controls never send keys from the UI thread—the
+movement worker remains the only movement executor.
+
+UI-recorded points use adaptive minimap coordinates. OpenCV detects the inner
+map canvas, and the marker detector measures the full anti-aliased yellow
+diamond. Positions are stored as diamond-sized offsets from the canvas center,
+then projected into the current canvas at runtime. Small animation-related
+diamond-size changes are median-smoothed; a large size jump is treated as a
+real zoom change immediately. Horizontal tolerance, near-rope range, final
+movement zone, and layer-Y tolerance scale with the current diamond size.
+Layers shown as `legacy layout` should be re-recorded once in the UI to gain
+adaptive width/zoom mapping; `adaptive` layers already include this metadata.
 
 The assistant starts in **live mode** and presses keys using Python `SendInput`.
 
@@ -34,7 +57,10 @@ python assistant.py --dry-run --debug-dir work/debug
 ```
 
 The live assistant intentionally refuses to send keys unless the configured
-game window is currently in the foreground. Potion readings also require a
+game window is currently in the foreground. Losing focus pauses movement,
+attacks, potion analysis, and releases held keys without closing the debug UI;
+manually selecting the game again resumes automation. The assistant never
+steals focus to resume itself. Potion readings also require a
 confidence of at least 0.55 and two consecutive low frames, preventing an
 uncertain color match from consuming an item.
 
@@ -64,10 +90,10 @@ so the two-second hold can be verified directly.
 Climbing uses a narrow 0.008 minimap-X tolerance and requires three consecutive
 aligned screenshots before Alt + Up.
 
-`rope_calibration.json` stores reusable movement/climb timing. Map-specific
-structure is isolated under `map_profiles/`. The active
-`map_profiles/shooter_training_ground_1.json` profile stores 射手训练场 I's
-rope, layer endpoints, and explicit route order. Add layer 2 under its
+`rope_calibration.json` stores reusable movement/climb timing. The shared
+`recording-configuration.json` stores the recorded layers, endpoints, ropes,
+and explicit route order instead of creating one configuration file per map.
+Add layer 2 under its
 `layers` object and append `layer2` to `route_order` after calibration.
 while the character was aligned with the rope. On every startup the movement
 worker detects the current yellow diamond, moves Left/Right toward that saved

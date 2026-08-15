@@ -19,6 +19,7 @@ from PIL import Image
 
 
 WindowRect = Tuple[int, int, int, int]
+NormalizedBox = Tuple[float, float, float, float]
 CaptureFunction = Callable[[str], tuple[Image.Image, WindowRect]]
 
 
@@ -40,6 +41,7 @@ class CapturedFrame:
     captured_monotonic: float
     image: Image.Image
     window_rect: WindowRect
+    status_image: Optional[Image.Image] = None
 
 
 class FrameBus:
@@ -98,7 +100,28 @@ class FrameBus:
             return self._latest if ready else None
 
 
-def capture_window(window_title: str) -> tuple[Image.Image, WindowRect]:
+def remap_normalized_box(box: NormalizedBox, crop: NormalizedBox) -> NormalizedBox:
+    """Map a full-client normalized box into normalized cropped-frame units."""
+
+    crop_left, crop_top, crop_right, crop_bottom = crop
+    crop_width = crop_right - crop_left
+    crop_height = crop_bottom - crop_top
+    if crop_width <= 0 or crop_height <= 0:
+        raise ValueError("capture crop must have positive width and height")
+    left, top, right, bottom = box
+    return (
+        (left - crop_left) / crop_width,
+        (top - crop_top) / crop_height,
+        (right - crop_left) / crop_width,
+        (bottom - crop_top) / crop_height,
+    )
+
+
+def capture_window(
+    window_title: str,
+    crop_region: NormalizedBox = (0.0, 0.0, 1.0, 1.0),
+    crop_pixel_size: Optional[tuple[int, int]] = None,
+) -> tuple[Image.Image, WindowRect]:
     """Capture the visible client area of a Windows window as an RGB image."""
 
     if not window_title.strip():
@@ -124,10 +147,30 @@ def capture_window(window_title: str) -> tuple[Image.Image, WindowRect]:
     screen_right, screen_bottom = win32gui.ClientToScreen(
         hwnd, (client_right, client_bottom)
     )
-    width = screen_right - screen_left
-    height = screen_bottom - screen_top
-    if width <= 0 or height <= 0:
+    client_width = screen_right - screen_left
+    client_height = screen_bottom - screen_top
+    if client_width <= 0 or client_height <= 0:
         raise WindowCaptureError(f"window has an empty client area: {window_title!r}")
+
+    if crop_pixel_size is not None:
+        pixel_width, pixel_height = map(int, crop_pixel_size)
+        if pixel_width <= 0 or pixel_height <= 0:
+            raise ValueError("pixel capture crop must have positive dimensions")
+        source_x = 0
+        source_y = 0
+        source_right = min(client_width, pixel_width)
+        source_bottom = min(client_height, pixel_height)
+    else:
+        crop_left, crop_top, crop_right, crop_bottom = crop_region
+        if not (0.0 <= crop_left < crop_right <= 1.0
+                and 0.0 <= crop_top < crop_bottom <= 1.0):
+            raise ValueError(f"invalid normalized capture crop: {crop_region!r}")
+        source_x = round(crop_left * client_width)
+        source_y = round(crop_top * client_height)
+        source_right = round(crop_right * client_width)
+        source_bottom = round(crop_bottom * client_height)
+    width = max(1, source_right - source_x)
+    height = max(1, source_bottom - source_y)
 
     # GetDC(hwnd) has its origin at the client area's upper-left. GetWindowDC
     # would include borders/title bar and offset the pixels from window_rect.
@@ -142,7 +185,7 @@ def capture_window(window_title: str) -> tuple[Image.Image, WindowRect]:
             (0, 0),
             (width, height),
             source_dc,
-            (0, 0),
+            (source_x, source_y),
             win32con.SRCCOPY,
         )
         raw_bgra = bitmap.GetBitmapBits(True)
@@ -157,7 +200,12 @@ def capture_window(window_title: str) -> tuple[Image.Image, WindowRect]:
         source_dc.DeleteDC()
         win32gui.ReleaseDC(hwnd, window_dc)
 
-    return image, (screen_left, screen_top, screen_right, screen_bottom)
+    return image, (
+        screen_left + source_x,
+        screen_top + source_y,
+        screen_left + source_right,
+        screen_top + source_bottom,
+    )
 
 
 class CaptureWorker(threading.Thread):
@@ -171,6 +219,10 @@ class CaptureWorker(threading.Thread):
         stop_event: threading.Event,
         debug_dir: Optional[Path] = None,
         capture_fn: Optional[CaptureFunction] = None,
+        capture_region: NormalizedBox = (0.0, 0.0, 1.0, 1.0),
+        capture_pixel_size: Optional[tuple[int, int]] = None,
+        status_capture_region: Optional[NormalizedBox] = None,
+        capture_enabled_event: Optional[threading.Event] = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
@@ -181,8 +233,36 @@ class CaptureWorker(threading.Thread):
         self.stop_event = stop_event
         self.debug_dir = Path(debug_dir) if debug_dir is not None else None
         self.capture_fn = capture_fn or capture_window
+        self.capture_region = capture_region
+        self.capture_pixel_size = capture_pixel_size
+        self.status_capture_region = status_capture_region
+        self.capture_enabled_event = capture_enabled_event
+        self._uses_default_capture = capture_fn is None
         self.log = logging.getLogger(__name__)
         self._last_debug_path: Optional[Path] = None
+        self._capture_requested = threading.Event()
+
+    def capture_now(self, timeout: float = 2.0) -> CapturedFrame:
+        """Request a capture begun after this call and wait for its frame."""
+
+        requested_at = time.monotonic()
+        latest = self.bus.latest
+        after_sequence = latest.sequence if latest is not None else -1
+        deadline = requested_at + max(0.1, float(timeout))
+        self._capture_requested.set()
+        while not self.stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            frame = self.bus.wait_for_new(after_sequence, remaining)
+            if frame is None:
+                break
+            if frame.captured_monotonic >= requested_at:
+                return frame
+            # A scheduled capture already in progress when the button was
+            # clicked is stale for recording. Wait for the requested one.
+            after_sequence = frame.sequence
+        raise TimeoutError("immediate game capture timed out")
 
     def run(self) -> None:
         if self.debug_dir is not None:
@@ -192,19 +272,58 @@ class CaptureWorker(threading.Thread):
         sequence = 0
         next_capture = time.monotonic()
         while not self.stop_event.is_set():
+            forced = self._capture_requested.is_set()
+            enabled = (
+                self.capture_enabled_event is None
+                or self.capture_enabled_event.is_set()
+            )
+            if not enabled and not forced:
+                next_capture = time.monotonic()
+                self._capture_requested.wait(0.05)
+                if self.stop_event.is_set():
+                    break
+                continue
             delay = max(0.0, next_capture - time.monotonic())
-            if self.stop_event.wait(delay):
-                break
+            if delay > 0.0 and not forced:
+                self._capture_requested.wait(min(delay, 0.05))
+                if self.stop_event.is_set():
+                    break
+                continue
+            forced = self._capture_requested.is_set()
+            enabled = (
+                self.capture_enabled_event is None
+                or self.capture_enabled_event.is_set()
+            )
+            if not enabled and not forced:
+                continue
+            if forced:
+                # Clear before starting so a second request arriving during
+                # capture remains set and receives another newer frame.
+                self._capture_requested.clear()
 
             captured_monotonic = time.monotonic()
             try:
-                image, window_rect = self.capture_fn(self.window_title)
+                if self._uses_default_capture:
+                    image, window_rect = capture_window(
+                        self.window_title,
+                        self.capture_region,
+                        self.capture_pixel_size,
+                    )
+                    status_image = None
+                    if self.status_capture_region is not None:
+                        status_image, _status_rect = capture_window(
+                            self.window_title, self.status_capture_region
+                        )
+                else:
+                    image, window_rect = self.capture_fn(self.window_title)
+                    status_image = None
                 frame = CapturedFrame(
                     sequence=sequence,
                     captured_at=datetime.now(timezone.utc),
                     captured_monotonic=captured_monotonic,
                     image=image,
                     window_rect=window_rect,
+                    status_image=status_image,
                 )
                 self.bus.publish(frame)
                 if self.debug_dir is not None:

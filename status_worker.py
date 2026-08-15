@@ -39,7 +39,13 @@ class WindowKeySender:
         "delete": (0x53, True), "end": (0x4F, True),
     }
 
-    def __init__(self, window_title: str, dry_run: bool = True) -> None:
+    def __init__(
+        self,
+        window_title: str,
+        dry_run: bool = True,
+        *,
+        input_enabled: bool = True,
+    ) -> None:
         self.window_title = window_title
         self.dry_run = dry_run
         self.targets_configured_window = True
@@ -48,7 +54,39 @@ class WindowKeySender:
         self._selection_lock = threading.Lock()
         self._key_state_lock = threading.Lock()
         self._key_owners: dict[str, int] = {}
+        self._input_enabled = threading.Event()
+        if input_enabled:
+            self._input_enabled.set()
         self.hwnd: Optional[int] = None
+
+    def enable_input(self) -> None:
+        """Allow workers to emit keyboard events after explicit UI activation."""
+
+        self._input_enabled.set()
+        LOG.info("live keyboard input enabled")
+
+    def disable_input(self) -> None:
+        """Block new keyboard events and release every currently held key."""
+
+        self._input_enabled.clear()
+        self.release_all_keys()
+        LOG.info("live keyboard input disabled")
+
+    def release_all_keys(self) -> None:
+        """Release owned keys without changing the UI-controlled input state."""
+
+        with self._key_state_lock:
+            held_keys = tuple(self._key_owners)
+            self._key_owners.clear()
+        if not self.dry_run:
+            for key in held_keys:
+                scan_code, extended = self._SCAN[key]
+                self._send_scan_code(scan_code, key_up=True, extended=extended)
+        if held_keys:
+            LOG.info("released held keys: %s", ", ".join(held_keys))
+
+    def input_is_enabled(self) -> bool:
+        return self._input_enabled.is_set()
 
     def _find_target_window(self) -> int:
         """Find exactly one visible top-level window containing the title."""
@@ -83,24 +121,42 @@ class WindowKeySender:
         import win32gui
         import win32process
 
+        LOG.info("WINDOW SELECT: waiting for selection lock")
         with self._selection_lock:
+            LOG.info("WINDOW SELECT: selection lock acquired")
             # A game can recreate its top-level window while keeping the same
             # title. Never rely on an HWND cached by a previous selection.
             hwnd = self._find_target_window()
+            LOG.info("WINDOW SELECT: found hwnd=%s", hwnd)
             try:
                 if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                else:
-                    win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                    # ShowWindow sends a synchronous message to the game and
+                    # can freeze Tk indefinitely while the game thread is busy.
+                    # An already-visible window needs no ShowWindow call at all.
+                    win32gui.ShowWindowAsync(hwnd, win32con.SW_RESTORE)
+                    time.sleep(0.05)
+                    LOG.info("WINDOW SELECT: minimized game restored asynchronously")
 
                 # This succeeds directly on many systems and avoids needless
                 # AttachThreadInput calls (which can return ERROR_INVALID_PARAMETER).
                 if win32gui.GetForegroundWindow() != hwnd:
                     try:
-                        win32gui.BringWindowToTop(hwnd)
+                        # BringWindowToTop synchronously sends a window-manager
+                        # message to the target. Some games stop pumping that
+                        # message while rendering and can consequently freeze
+                        # the Tk callback forever. SetForegroundWindow is enough
+                        # here because the click gave this process foreground
+                        # activation rights.
                         win32gui.SetForegroundWindow(hwnd)
                     except Exception:
                         LOG.debug("direct foreground selection was refused", exc_info=True)
+
+                # Start Patrol is clicked from our foreground Tk window, so the
+                # direct activation normally succeeds. Return immediately and
+                # avoid unnecessary Alt/AttachThreadInput fallbacks.
+                if win32gui.GetForegroundWindow() == hwnd:
+                    LOG.info("WINDOW SELECT: direct activation verified")
+                    return True
 
                 # A brief Alt transition lets Windows accept a foreground request
                 # after its foreground-lock timeout in most interactive sessions.
@@ -108,7 +164,6 @@ class WindowKeySender:
                     self._send_scan_code(0x38, key_up=False, extended=False)
                     self._send_scan_code(0x38, key_up=True, extended=False)
                     try:
-                        win32gui.BringWindowToTop(hwnd)
                         win32gui.SetForegroundWindow(hwnd)
                     except Exception:
                         LOG.debug("Alt-assisted foreground selection was refused",
@@ -136,7 +191,6 @@ class WindowKeySender:
                                     LOG.debug("could not attach input thread %s",
                                               thread_id, exc_info=True)
                         try:
-                            win32gui.BringWindowToTop(hwnd)
                             win32gui.SetForegroundWindow(hwnd)
                         except Exception:
                             LOG.debug("attached foreground selection was refused",
@@ -154,6 +208,7 @@ class WindowKeySender:
                     raise OSError(
                         "Windows refused to foreground the dynamically selected game window"
                     )
+                LOG.info("WINDOW SELECT: fallback activation verified")
                 return True
             except Exception as exc:
                 raise OSError(
@@ -179,13 +234,16 @@ class WindowKeySender:
     def is_target_focused(self) -> bool:
         """Public focus predicate used by movement-worker safety checks."""
 
+        if not self.input_is_enabled():
+            return False
+        return self.is_game_foreground()
+
+    def is_game_foreground(self) -> bool:
+        """Check focus without enabling input or selecting any window."""
+
         if self.dry_run:
             return True
-        try:
-            return self._foreground_matches() or self.select_window()
-        except OSError as exc:
-            LOG.error("automatic game-window selection failed: %s", exc)
-            return False
+        return self._foreground_matches()
 
     def press(self, key: str, duration: float = 0.025) -> bool:
         """Press a key using native SendInput scan-code keyboard events only."""
@@ -221,14 +279,14 @@ class WindowKeySender:
         key = key.casefold()
         if key not in self._SCAN:
             raise ValueError(f"unsupported key: {key}")
+        if not self.input_is_enabled():
+            LOG.debug("blocked key-down=%s: live input is not enabled", key)
+            return False
         if self.dry_run:
             LOG.info("DRY-RUN key-down=%s target=%r", key, self.window_title)
         elif not self._foreground_matches():
-            try:
-                self.select_window()
-            except OSError as exc:
-                LOG.error("blocked key-down=%s: %s", key, exc)
-                return False
+            LOG.debug("blocked key-down=%s: game window is not foreground", key)
+            return False
         with self._key_state_lock:
             owners = self._key_owners.get(key, 0)
             if owners == 0 and not self.dry_run:
@@ -267,6 +325,8 @@ class WindowKeySender:
         key = key.casefold()
         if key not in ("left", "right"):
             raise ValueError("repeat_key_down is only for movement directions")
+        if not self.input_is_enabled():
+            return False
         with self._key_state_lock:
             owned = self._key_owners.get(key, 0) > 0
         if not owned:
@@ -430,11 +490,19 @@ class BarStatusDetector:
         return ratio, confidence
 
     def detect(self, image: Image.Image) -> StatusReading:
-        rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
-        height, width = rgb.shape[:2]
+        width, height = image.size
         left, top, right, bottom = self.config.status_roi
-        crop = rgb[int(top * height):int(bottom * height),
-                   int(left * width):int(right * width)]
+        pixel_box = (
+            max(0, min(width, int(left * width))),
+            max(0, min(height, int(top * height))),
+            max(0, min(width, int(right * width))),
+            max(0, min(height, int(bottom * height))),
+        )
+        if pixel_box[2] <= pixel_box[0] or pixel_box[3] <= pixel_box[1]:
+            return StatusReading(None, None, None, None, 0.0)
+        # Convert only the tiny status area instead of allocating an int16
+        # NumPy copy of the entire captured client image.
+        crop = np.asarray(image.crop(pixel_box).convert("RGB"), dtype=np.int16)
         if crop.size == 0:
             return StatusReading(None, None, None, None, 0.0)
 
@@ -460,6 +528,7 @@ class StatusWorker(threading.Thread):
         stop_event: threading.Event,
         *,
         detector: Optional[BarStatusDetector] = None,
+        automation_active_event: Optional[threading.Event] = None,
         potion_cooldown: float = 5.0,
         low_frames_required: int = 2,
     ) -> None:
@@ -468,6 +537,7 @@ class StatusWorker(threading.Thread):
         self.key_sender = key_sender
         self.stop_event = stop_event
         self.detector = detector or BarStatusDetector()
+        self.automation_active_event = automation_active_event
         self.potion_cooldown = max(0.0, potion_cooldown)
         self.low_frames_required = max(1, low_frames_required)
         self._low_count = {"hp": 0, "mp": 0}
@@ -488,7 +558,10 @@ class StatusWorker(threading.Thread):
                             threshold, key)
 
     def _process_frame(self, frame: object) -> None:
-        image = getattr(frame, "image", frame)
+        status_image = getattr(frame, "status_image", None)
+        image = status_image if isinstance(status_image, Image.Image) else getattr(
+            frame, "image", frame
+        )
         if not isinstance(image, Image.Image):
             LOG.warning("ignored frame without PIL image")
             return
@@ -513,6 +586,9 @@ class StatusWorker(threading.Thread):
             except queue.Empty:
                 continue
             try:
+                if (self.automation_active_event is not None
+                        and not self.automation_active_event.is_set()):
+                    continue
                 self._process_frame(frame)
             except Exception:
                 LOG.exception("status frame analysis failed")

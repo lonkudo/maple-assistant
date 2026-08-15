@@ -39,6 +39,7 @@ class MinimapDetection:
 
     window_box: Box
     analysis_box: Box
+    canvas_box: Box
     map_name_box: Box
     confidence: float
     source: str
@@ -66,15 +67,21 @@ class MinimapDetector:
         self,
         fallback_region: NormalizedBox = (0.0, 0.075, 0.12, 0.24),
         map_name_reader: Optional[MapNameReader] = None,
+        dedicated_crop: bool = False,
     ) -> None:
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
+        self.dedicated_crop = bool(dedicated_crop)
 
     def detect(self, image: Image.Image) -> MinimapDetection:
         rgb = np.asarray(image.convert("RGB"))
         height, width = rgb.shape[:2]
-        search_width = max(1, int(round(width * 0.40)))
-        search_height = max(1, int(round(height * 0.48)))
+        search_width = (
+            width if self.dedicated_crop else max(1, int(round(width * 0.40)))
+        )
+        search_height = (
+            height if self.dedicated_crop else max(1, int(round(height * 0.48)))
+        )
         gray = cv2.cvtColor(rgb[:search_height, :search_width], cv2.COLOR_RGB2GRAY)
         edges = cv2.Canny(gray, 45, 140)
         contours, _hierarchy = cv2.findContours(
@@ -82,29 +89,65 @@ class MinimapDetector:
         )
 
         candidates: list[tuple[float, Box, float]] = []
+        rectangles: list[tuple[Box, float]] = []
         for contour in contours:
             x, y, candidate_width, candidate_height = cv2.boundingRect(contour)
             if candidate_width < max(90, int(width * 0.055)):
                 continue
             if candidate_height < max(90, int(height * 0.075)):
                 continue
-            if candidate_width > width * 0.40 or candidate_height > height * 0.45:
-                continue
-            if x > width * 0.06 or y > height * 0.08:
+            max_width_ratio = 0.98 if self.dedicated_crop else 0.40
+            max_height_ratio = 0.98 if self.dedicated_crop else 0.45
+            if (candidate_width > width * max_width_ratio
+                    or candidate_height > height * max_height_ratio):
                 continue
             rectangle_area = float(candidate_width * candidate_height)
             rectangularity = abs(float(cv2.contourArea(contour))) / rectangle_area
             if rectangularity < 0.72:
                 continue
             aspect = candidate_width / candidate_height
-            if not 0.55 <= aspect <= 1.65:
+            # Expanded minimaps can become much wider without changing height.
+            if not 0.45 <= aspect <= 4.50:
+                continue
+            candidate_box = (x, y, x + candidate_width, y + candidate_height)
+            rectangles.append((candidate_box, rectangularity))
+            if (self.dedicated_crop
+                    and x <= width * 0.10
+                    and height * 0.18 <= y <= height * 0.42
+                    and candidate_width >= width * 0.35
+                    and candidate_height >= height * 0.30):
+                # In the tight top-left capture, the outer minimap border can
+                # merge with the crop edge and no longer form a closed contour.
+                # Its large rectangular map canvas remains reliable; reconstruct
+                # the outer frame from that canvas and the known top anchoring.
+                inferred_box = _clamp_box(
+                    (
+                        x - 4,
+                        0,
+                        x + candidate_width + 4,
+                        y + candidate_height + 16,
+                    ),
+                    width,
+                    height,
+                )
+                inferred_area = (
+                    (inferred_box[2] - inferred_box[0])
+                    * (inferred_box[3] - inferred_box[1])
+                )
+                inferred_score = 0.60 + min(
+                    inferred_area / float(width * height), 0.30
+                )
+                candidates.append((inferred_score, inferred_box, rectangularity))
+                continue
+            max_left_ratio = 0.20 if self.dedicated_crop else 0.06
+            max_top_ratio = 0.20 if self.dedicated_crop else 0.08
+            if x > width * max_left_ratio or y > height * max_top_ratio:
                 continue
             # Prefer the outer, highly rectangular minimap frame over its map
             # canvas and title-panel child rectangles.
             area_ratio = rectangle_area / float(width * height)
             score = rectangularity * 0.65 + min(area_ratio / 0.03, 1.0) * 0.35
-            candidates.append((score, (x, y, x + candidate_width, y + candidate_height),
-                               rectangularity))
+            candidates.append((score, candidate_box, rectangularity))
 
         if not candidates:
             return self._fallback_detection(image)
@@ -125,6 +168,23 @@ class MinimapDetector:
             width,
             height,
         )
+        inner_candidates: list[Box] = []
+        for candidate_box, _candidate_rectangularity in rectangles:
+            inner_left, inner_top, inner_right, inner_bottom = candidate_box
+            inner_width = inner_right - inner_left
+            inner_height = inner_bottom - inner_top
+            if candidate_box == window_box:
+                continue
+            if (inner_left >= left and inner_right <= right + 2
+                    and inner_top >= top + minimap_height * 0.25
+                    and inner_bottom <= bottom + 2
+                    and inner_width >= minimap_width * 0.60
+                    and inner_height >= minimap_height * 0.35):
+                inner_candidates.append(candidate_box)
+        canvas_box = (
+            max(inner_candidates, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]))
+            if inner_candidates else analysis_box
+        )
         map_name_box = _clamp_box(
             (
                 left + round(minimap_width * 0.14),
@@ -140,6 +200,7 @@ class MinimapDetector:
         return MinimapDetection(
             window_box=window_box,
             analysis_box=analysis_box,
+            canvas_box=canvas_box,
             map_name_box=map_name_box,
             confidence=confidence,
             source="opencv",
@@ -166,6 +227,7 @@ class MinimapDetector:
         return MinimapDetection(
             window_box=analysis_box,
             analysis_box=analysis_box,
+            canvas_box=analysis_box,
             map_name_box=analysis_box,
             confidence=0.0,
             source="fallback",

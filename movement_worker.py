@@ -19,6 +19,9 @@ from typing import Any, Iterable, Optional, Protocol
 import numpy as np
 from PIL import Image
 
+from marker_detector import DiamondSizeTracker, detect_yellow_diamond
+from patrol_control import CoordinateLayout
+
 
 LOG = logging.getLogger(__name__)
 
@@ -47,6 +50,8 @@ class MinimapObservation:
     minimap_box: tuple[int, int, int, int]
     platform_y: Optional[float] = None
     action: str = "unknown"
+    marker_pixel_size: Optional[tuple[int, int]] = None
+    analysis_size: Optional[tuple[int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -506,62 +511,12 @@ def _crop(image: Image.Image, region: tuple[float, float, float, float]) -> tupl
     return np.asarray(image.crop(box), dtype=np.uint8), box
 
 
-def _components(mask: np.ndarray, min_pixels: int = 2) -> list[np.ndarray]:
-    """Return 8-connected components without requiring OpenCV/scipy."""
-
-    height, width = mask.shape
-    seen = np.zeros_like(mask, dtype=bool)
-    result: list[np.ndarray] = []
-    for start_y, start_x in np.argwhere(mask):
-        if seen[start_y, start_x]:
-            continue
-        stack = [(int(start_y), int(start_x))]
-        seen[start_y, start_x] = True
-        points: list[tuple[int, int]] = []
-        while stack:
-            y, x = stack.pop()
-            points.append((y, x))
-            for ny in range(max(0, y - 1), min(height, y + 2)):
-                for nx in range(max(0, x - 1), min(width, x + 2)):
-                    if mask[ny, nx] and not seen[ny, nx]:
-                        seen[ny, nx] = True
-                        stack.append((ny, nx))
-        if len(points) >= min_pixels:
-            result.append(np.asarray(points, dtype=np.int32))
-    return result
-
-
 def detect_marker(minimap_rgb: np.ndarray) -> tuple[Optional[Point], float]:
     """Locate a saturated yellow diamond/arrow in a minimap RGB image."""
-
-    rgb = minimap_rgb.astype(np.int16)
-    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
-    # Tolerates compression/glow while rejecting beige UI decoration.
-    # User-calibrated player-marker color: #ffff88 (255, 255, 136). Include
-    # nearby anti-aliased pixels but reject ordinary orange/yellow map details.
-    yellow = ((np.abs(red - 255) <= 22)
-              & (np.abs(green - 255) <= 22)
-              & (np.abs(blue - 136) <= 30))
-    candidates = []
-    height, width = yellow.shape
-    for component in _components(yellow, min_pixels=3):
-        ys, xs = component[:, 0], component[:, 1]
-        span_x, span_y = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
-        count = len(component)
-        if count > 180 or span_x > 18 or span_y > 18:
-            continue
-        aspect = span_x / max(1, span_y)
-        compact = count / max(1, span_x * span_y)
-        if 0.45 <= aspect <= 2.2 and compact >= 0.20 and 2 <= span_x <= 15 and 2 <= span_y <= 15:
-            # Prefer a small compact component away from the crop's title bar.
-            shape_score = max(0.0, 1.0 - abs(aspect - 1.0) / 2.0)
-            size_score = max(0.0, 1.0 - abs(count - 12) / 30.0)
-            score = 0.50 * compact + 0.35 * shape_score + 0.15 * size_score
-            candidates.append((score, float(xs.mean()) / width, float(ys.mean()) / height))
-    if not candidates:
+    detection = detect_yellow_diamond(minimap_rgb)
+    if detection is None:
         return None, 0.0
-    score, x, y = max(candidates)
-    return Point(x, y), min(1.0, float(score))
+    return Point(detection.x, detection.y), detection.confidence
 
 
 def _find_upper_connector(minimap_rgb: np.ndarray, player: Point) -> Optional[Point]:
@@ -640,7 +595,9 @@ def analyze_minimap(
 ) -> MinimapObservation:
     image = _image_from_frame(frame)
     minimap, box = _crop(image, region)
-    player, confidence = detect_marker(minimap)
+    marker = detect_yellow_diamond(minimap)
+    player = Point(marker.x, marker.y) if marker is not None else None
+    confidence = marker.confidence if marker is not None else 0.0
     target = _find_upper_connector(minimap, player) if player is not None else None
     platform_y = _find_current_platform(minimap, player) if player is not None else None
     action = "climb" if target is not None else "unknown"
@@ -651,6 +608,8 @@ def analyze_minimap(
         minimap_box=box,
         platform_y=platform_y,
         action=action,
+        marker_pixel_size=marker.pixel_size if marker is not None else None,
+        analysis_size=(minimap.shape[1], minimap.shape[0]),
     )
 
 
@@ -796,12 +755,14 @@ class MovementWorker(threading.Thread):
         movement_cooldown: float = 0.25,
         fixed_target_x: Optional[float] = None,
         horizontal_tolerance: float = 0.010,
+        horizontal_tolerance_diamonds: Optional[float] = None,
         climb_up_hold_seconds: float = 0.45,
         movement_hold_seconds: float = 2.0,
         minimum_final_hold_seconds: float = 0.08,
         minimum_movement_hold_seconds: float = 0.30,
         estimated_minimap_speed: float = 0.11,
         final_calculation_distance: float = 0.04,
+        final_calculation_diamonds: Optional[float] = None,
         estimated_final_speed: float = 0.205,
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 2,
@@ -810,17 +771,22 @@ class MovementWorker(threading.Thread):
         climb_failed_shift_right_seconds: float = 0.01,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
+        near_rope_diamonds: Optional[float] = None,
         climb_attack_lock: Optional[threading.Lock] = None,
         climbing_active_event: Optional[threading.Event] = None,
         near_rope_event: Optional[threading.Event] = None,
         important_positions: Optional[dict[str, Any]] = None,
         route_order: Optional[list[str]] = None,
         patrol_enabled: bool = True,
+        climbing_enabled: bool = True,
         final_layer_action: str = "wait",
         first_layer: Optional[str] = None,
         drop_chord_hold_seconds: float = 0.10,
         drop_retry_seconds: float = 1.0,
         minimap_detector: Any = None,
+        patrol_controller: Any = None,
+        diamond_size_tracker: Optional[DiamondSizeTracker] = None,
+        automation_active_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -831,12 +797,22 @@ class MovementWorker(threading.Thread):
         self.movement_cooldown = movement_cooldown
         self.fixed_target_x = fixed_target_x
         self.horizontal_tolerance = horizontal_tolerance
+        self.horizontal_tolerance_diamonds = (
+            float(horizontal_tolerance_diamonds)
+            if horizontal_tolerance_diamonds is not None else None
+        )
+        self._current_horizontal_tolerance = horizontal_tolerance
         self.climb_up_hold_seconds = climb_up_hold_seconds
         self.movement_hold_seconds = movement_hold_seconds
         self.minimum_final_hold_seconds = minimum_final_hold_seconds
         self.minimum_movement_hold_seconds = minimum_movement_hold_seconds
         self.estimated_minimap_speed = estimated_minimap_speed
         self.final_calculation_distance = final_calculation_distance
+        self.final_calculation_diamonds = (
+            float(final_calculation_diamonds)
+            if final_calculation_diamonds is not None else None
+        )
+        self._current_final_calculation_distance = final_calculation_distance
         self.estimated_final_speed = estimated_final_speed
         self.final_move_safety_gain = final_move_safety_gain
         self.aligned_frames_required = max(2, aligned_frames_required)
@@ -845,6 +821,9 @@ class MovementWorker(threading.Thread):
         self.climb_failed_shift_right_seconds = climb_failed_shift_right_seconds
         self.near_rope_seconds = near_rope_seconds
         self.near_rope_range = near_rope_range
+        self.near_rope_diamonds = (
+            float(near_rope_diamonds) if near_rope_diamonds is not None else None
+        )
         self.climb_attack_lock = climb_attack_lock
         self.climbing_active_event = climbing_active_event
         self.near_rope_event = near_rope_event
@@ -864,11 +843,15 @@ class MovementWorker(threading.Thread):
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
         self.patrol_enabled = patrol_enabled
+        self.climbing_enabled = climbing_enabled
         self.final_layer_action = final_layer_action
         self.first_layer = first_layer or (self._route_layers[0] if self._route_layers else None)
         self.drop_chord_hold_seconds = drop_chord_hold_seconds
         self.drop_retry_seconds = drop_retry_seconds
         self.minimap_detector = minimap_detector
+        self.patrol_controller = patrol_controller
+        self.diamond_size_tracker = diamond_size_tracker
+        self.automation_active_event = automation_active_event
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_drop_attempt = float("-inf")
         self.last_observation: Optional[MinimapObservation] = None
@@ -897,6 +880,14 @@ class MovementWorker(threading.Thread):
         gap = abs(layer_y - player.y)
         tolerance = float(candidate.get("y_tolerance", 0.020000))
         if gap > tolerance:
+            if len(self._route_layers) == 1:
+                self._route_layer_index = 0
+                LOG.warning(
+                    "single-layer Y fallback: selected %s at marker_y=%.6f "
+                    "layer_y=%.6f gap=%.6f tolerance=%.6f",
+                    self._route_layers[0], player.y, layer_y, gap, tolerance,
+                )
+                return
             LOG.warning(
                 "layer unknown: marker_y=%.6f nearest=%s layer_y=%.6f gap=%.6f tolerance=%.6f",
                 player.y, self._route_layers[candidate_index],
@@ -963,11 +954,11 @@ class MovementWorker(threading.Thread):
     def _route_target(self, observation: MinimapObservation) -> tuple[Optional[float], bool, str]:
         """Return target X, whether near-target means climb, and route label."""
 
+        if not self.patrol_enabled:
+            return None, False, "patrol-paused"
         if observation.player is None or not self._route_layers:
             return self.fixed_target_x, True, "rope"
         self._select_route_layer(observation.player)
-        if not self.patrol_enabled:
-            return self.fixed_target_x, True, "rope"
         if self._route_layer_index is None or self._route_layer_index >= len(self._route_layers):
             return None, False, "route-complete"
         name = self._route_layers[self._route_layer_index]
@@ -977,9 +968,57 @@ class MovementWorker(threading.Thread):
         if self._route_phase == "right":
             return float(layer["right_most_pos"]["x"]), False, f"{name}.right-most"
         is_final = self._route_layer_index == len(self._route_layers) - 1
+        if is_final and (
+            self.final_layer_action == "repeat_patrol"
+            or (self.final_layer_action == "drop_to_first_layer"
+                and len(self._route_layers) == 1)
+        ):
+            # Recover safely if a previous run/profile left this state at rope.
+            self._route_phase = "left"
+            return float(layer["left_most_pos"]["x"]), False, f"{name}.left-most"
         if is_final and self.final_layer_action == "drop_to_first_layer":
             return None, False, f"{name}.drop-to-first"
-        return self.fixed_target_x, True, f"{name}.rope"
+        if not self.climbing_enabled:
+            return None, False, "route-complete"
+        rope = layer.get("rope_pos", {})
+        rope_x = float(rope["x"]) if isinstance(rope, dict) and "x" in rope else self.fixed_target_x
+        return rope_x, True, f"{name}.rope"
+
+    def _sync_patrol_controller(
+        self, coordinate_layout: Optional[CoordinateLayout] = None
+    ) -> None:
+        if self.patrol_controller is None:
+            return
+        snapshot = self.patrol_controller.snapshot(coordinate_layout)
+        previous_name = None
+        if (self._route_layer_index is not None
+                and 0 <= self._route_layer_index < len(self._route_layers)):
+            previous_name = self._route_layers[self._route_layer_index]
+        final_name = snapshot.route_order[-1] if snapshot.route_order else None
+        new_route = []
+        for name in snapshot.route_order:
+            layer = snapshot.layers.get(name)
+            if not isinstance(layer, dict):
+                continue
+            required = ("left_most_pos", "right_most_pos")
+            if name != final_name:
+                required += ("rope_pos",)
+            if all(point in layer for point in required):
+                new_route.append(name)
+        route_changed = new_route != self._route_layers
+        self.patrol_enabled = snapshot.enabled
+        self.climbing_enabled = snapshot.climbing_enabled
+        self.final_layer_action = snapshot.final_layer_action
+        self.important_positions = snapshot.layers
+        if route_changed:
+            self._route_layers = new_route
+            if previous_name in new_route:
+                self._route_layer_index = new_route.index(previous_name)
+            else:
+                self._route_layer_index = None
+                self._route_phase = "left"
+            LOG.info("patrol route updated from UI: %s",
+                     " -> ".join(new_route) if new_route else "none")
 
     def _advance_route_endpoint(self, observation: MinimapObservation, target_x: Optional[float]) -> bool:
         if observation.player is None or target_x is None:
@@ -987,16 +1026,33 @@ class MovementWorker(threading.Thread):
         if self._route_phase == "left":
             # Passing the line counts. We intentionally do not turn this into
             # an exact-position problem at the minimap's coarse resolution.
-            if observation.player.x > target_x + self.horizontal_tolerance:
+            if observation.player.x > target_x + self._current_horizontal_tolerance:
                 return False
             self._route_phase = "right"
             LOG.info("route endpoint reached/crossed: left-most; next right-most")
             return True
         if self._route_phase == "right":
-            if observation.player.x < target_x - self.horizontal_tolerance:
+            if observation.player.x < target_x - self._current_horizontal_tolerance:
                 return False
-            self._route_phase = "rope"
-            LOG.info("route endpoint reached/crossed: right-most; next rope")
+            is_final = (
+                self._route_layer_index is not None
+                and self._route_layer_index == len(self._route_layers) - 1
+            )
+            if is_final and (
+                self.final_layer_action == "repeat_patrol"
+                or (self.final_layer_action == "drop_to_first_layer"
+                    and len(self._route_layers) == 1)
+            ):
+                self._route_phase = "left"
+                LOG.info(
+                    "route endpoint reached/crossed: right-most; "
+                    "single-layer patrol repeats at left-most"
+                )
+            elif self.climbing_enabled:
+                self._route_phase = "rope"
+                LOG.info("route endpoint reached/crossed: right-most; next rope")
+            else:
+                LOG.info("route endpoint reached/crossed: right-most; climbing disabled")
             return True
         return False
 
@@ -1052,7 +1108,14 @@ class MovementWorker(threading.Thread):
             except queue.Empty:
                 continue
             try:
+                if (self.automation_active_event is not None
+                        and not self.automation_active_event.is_set()):
+                    self._release_climb_up()
+                    if self.climbing_active_event is not None:
+                        self.climbing_active_event.clear()
+                    continue
                 minimap_region = self.minimap_region
+                minimap_detection = None
                 if self.minimap_detector is not None:
                     minimap_detection = self.minimap_detector.detect(frame.image)
                     minimap_region = minimap_detection.normalized_analysis_box(
@@ -1070,6 +1133,47 @@ class MovementWorker(threading.Thread):
                         )
                         self._last_minimap_box = minimap_detection.window_box
                 observation = analyze_minimap(frame, minimap_region)
+                coordinate_layout = None
+                if (minimap_detection is not None
+                        and observation.marker_pixel_size is not None
+                        and observation.analysis_size is not None):
+                    analysis_left, analysis_top, _, _ = minimap_detection.analysis_box
+                    canvas_left, canvas_top, canvas_right, canvas_bottom = (
+                        minimap_detection.canvas_box
+                    )
+                    marker_width, marker_height = observation.marker_pixel_size
+                    if self.diamond_size_tracker is not None:
+                        marker_width, marker_height = self.diamond_size_tracker.stabilize(
+                            (marker_width, marker_height)
+                        )
+                    coordinate_layout = CoordinateLayout(
+                        analysis_width=observation.analysis_size[0],
+                        analysis_height=observation.analysis_size[1],
+                        canvas_left=canvas_left - analysis_left,
+                        canvas_top=canvas_top - analysis_top,
+                        canvas_width=canvas_right - canvas_left,
+                        canvas_height=canvas_bottom - canvas_top,
+                        diamond_width=marker_width,
+                        diamond_height=marker_height,
+                    )
+                self._current_horizontal_tolerance = self.horizontal_tolerance
+                self._current_final_calculation_distance = (
+                    self.final_calculation_distance
+                )
+                if coordinate_layout is not None:
+                    if self.horizontal_tolerance_diamonds is not None:
+                        self._current_horizontal_tolerance = (
+                            self.horizontal_tolerance_diamonds
+                            * coordinate_layout.diamond_width
+                            / coordinate_layout.analysis_width
+                        )
+                    if self.final_calculation_diamonds is not None:
+                        self._current_final_calculation_distance = (
+                            self.final_calculation_diamonds
+                            * coordinate_layout.diamond_width
+                            / coordinate_layout.analysis_width
+                        )
+                self._sync_patrol_controller(coordinate_layout)
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.
@@ -1080,11 +1184,18 @@ class MovementWorker(threading.Thread):
                 if route_label.endswith(".drop-to-first") and self._on_first_layer(observation):
                     self._reset_route_loop()
                     route_target_x, route_is_rope, route_label = self._route_target(observation)
-                rope_jump_distance = (
-                    self.near_rope_range
-                    if self.near_rope_range is not None
-                    else self.estimated_final_speed * self.near_rope_seconds
-                )
+                if coordinate_layout is not None and self.near_rope_diamonds is not None:
+                    rope_jump_distance = (
+                        self.near_rope_diamonds
+                        * coordinate_layout.diamond_width
+                        / coordinate_layout.analysis_width
+                    )
+                else:
+                    rope_jump_distance = (
+                        self.near_rope_range
+                        if self.near_rope_range is not None
+                        else self.estimated_final_speed * self.near_rope_seconds
+                    )
                 inside_rope_zone = bool(
                     observation.player is not None
                     and route_is_rope
@@ -1095,7 +1206,10 @@ class MovementWorker(threading.Thread):
                     # A new approach may use one correction again. Staying in
                     # the zone cannot accumulate repeated Right holds.
                     self._climb_state = ClimbState()
-                if route_label == "route-complete":
+                if route_label == "patrol-paused":
+                    decision = MovementDecision(None, "patrol paused from UI")
+                    active_target_x = None
+                elif route_label == "route-complete":
                     decision = MovementDecision(None, "waiting for next layer calibration")
                 elif route_label.endswith(".drop-to-first"):
                     decision = MovementDecision(
@@ -1116,13 +1230,13 @@ class MovementWorker(threading.Thread):
                         route_target_x,
                         rope_jump_distance,
                         aligned_direction=self._rope_approach_direction,
-                        horizontal_tolerance=self.horizontal_tolerance,
+                        horizontal_tolerance=self._current_horizontal_tolerance,
                         minimum_confidence=self.minimum_confidence,
                         movement_hold_seconds=self.movement_hold_seconds,
                         minimum_final_hold_seconds=self.minimum_final_hold_seconds,
                         minimum_movement_hold_seconds=self.minimum_movement_hold_seconds,
                         estimated_minimap_speed=self.estimated_minimap_speed,
-                        final_calculation_distance=self.final_calculation_distance,
+                        final_calculation_distance=self._current_final_calculation_distance,
                         estimated_final_speed=self.estimated_final_speed,
                         final_move_safety_gain=self.final_move_safety_gain,
                     )
@@ -1136,7 +1250,7 @@ class MovementWorker(threading.Thread):
                         position_plan = move_to_left_most(
                             observation,
                             position_target,
-                            horizontal_tolerance=self.horizontal_tolerance,
+                            horizontal_tolerance=self._current_horizontal_tolerance,
                             movement_hold_seconds=self.movement_hold_seconds,
                             minimum_confidence=self.minimum_confidence,
                         )
@@ -1144,13 +1258,13 @@ class MovementWorker(threading.Thread):
                         position_plan = move_to_right_most(
                             observation,
                             position_target,
-                            horizontal_tolerance=self.horizontal_tolerance,
+                            horizontal_tolerance=self._current_horizontal_tolerance,
                             movement_hold_seconds=self.movement_hold_seconds,
                             minimum_confidence=self.minimum_confidence,
                         )
                     decision = position_plan.decision
                     active_target_x = route_target_x
-                if route_label == "route-complete":
+                if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None
                 climb_decision_active = decision.key in (
                     "climb", "jump_climb_left", "jump_climb_right", "drop"

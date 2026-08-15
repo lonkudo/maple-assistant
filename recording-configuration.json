@@ -1,0 +1,91 @@
+{
+  "configuration_id": "patrol_recording",
+  "map_name": "射手训练场 I",
+  "patrol_enabled": false,
+  "climbing_enabled": true,
+  "route_order": [
+    "layer1"
+  ],
+  "final_layer_action": "drop_to_first_layer",
+  "first_layer": "layer1",
+  "minimap_region": [
+    0.0,
+    0.075,
+    0.12,
+    0.24
+  ],
+  "rope": {
+    "x": 0.5,
+    "near_range": 0.0225
+  },
+  "layers": {
+    "layer1": {
+      "y_tolerance": 0.02,
+      "calibration_status": "complete",
+      "right_most_pos": {
+        "x": 0.482659,
+        "y": 0.467647,
+        "source": "manual-ui",
+        "coordinate_v2": {
+          "x_diamond": 0.25,
+          "y_diamond": -0.416667,
+          "recorded_layout": {
+            "analysis_width": 173.0,
+            "analysis_height": 170.0,
+            "canvas_left": 6.0,
+            "canvas_top": 11.0,
+            "canvas_width": 152.0,
+            "canvas_height": 142.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      },
+      "y_tolerance_diamonds": 0.566667,
+      "layer_y": 0.467647,
+      "layer_y_source": "manual-ui",
+      "left_most_pos": {
+        "x": 0.135838,
+        "y": 0.467647,
+        "source": "manual-ui",
+        "coordinate_v2": {
+          "x_diamond": -9.75,
+          "y_diamond": -0.416667,
+          "recorded_layout": {
+            "analysis_width": 173.0,
+            "analysis_height": 170.0,
+            "canvas_left": 6.0,
+            "canvas_top": 11.0,
+            "canvas_width": 152.0,
+            "canvas_height": 142.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      },
+      "rope_pos": {
+        "x": 0.176301,
+        "y": 0.467647,
+        "source": "manual-ui",
+        "coordinate_v2": {
+          "x_diamond": -8.583333,
+          "y_diamond": -0.333333,
+          "recorded_layout": {
+            "analysis_width": 173.0,
+            "analysis_height": 170.0,
+            "canvas_left": 6.0,
+            "canvas_top": 11.0,
+            "canvas_width": 152.0,
+            "canvas_height": 141.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      }
+    },
+    "layer2": {
+      "y_tolerance": 0.02,
+      "calibration_status": "awaiting_left_rope_right"
+    }
+  }
+}

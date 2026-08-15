@@ -361,6 +361,105 @@ class MovementTests(unittest.TestCase):
         self.assertTrue(worker._advance_route_endpoint(at_right, target))
         self.assertEqual(worker._route_target(at_right), (.5, True, "layer1.rope"))
 
+    def test_single_layer_patrol_repeats_without_climbing(self):
+        positions = {
+            "layer1": {
+                "layer_y": .7,
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            fixed_target_x=.5,
+            important_positions=positions,
+            route_order=["layer1"],
+            climbing_enabled=False,
+            final_layer_action="repeat_patrol",
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        at_right = MinimapObservation(Point(.8, .7), None, .9, (0, 0, 1, 1))
+
+        self.assertTrue(worker._advance_route_endpoint(at_right, .8))
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(
+            worker._route_target(at_right),
+            (.2, False, "layer1.left-most"),
+        )
+
+    def test_single_active_layer_never_drops_even_with_multilayer_final_action(self):
+        positions = {
+            "layer1": {
+                "layer_y": .7,
+                "left_most_pos": {"x": .2, "y": .7},
+                "rope_pos": {"x": .5, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1"],
+            climbing_enabled=True, final_layer_action="drop_to_first_layer",
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        at_right = MinimapObservation(Point(.8, .7), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(at_right, .8))
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(worker._route_target(at_right)[2], "layer1.left-most")
+
+    def test_paused_patrol_does_not_fall_back_to_rope(self):
+        positions = {
+            "layer1": {
+                "layer_y": .7,
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1"],
+            patrol_enabled=False, climbing_enabled=False,
+            final_layer_action="repeat_patrol",
+        )
+        observation = MinimapObservation(Point(.4, .7), None, .9, (0, 0, 1, 1))
+        self.assertEqual(
+            worker._route_target(observation),
+            (None, False, "patrol-paused"),
+        )
+
+    def test_each_layer_uses_its_own_recorded_rope(self):
+        positions = {
+            "layer1": {
+                "layer_y": .7,
+                "left_most_pos": {"x": .2, "y": .7},
+                "rope_pos": {"x": .45, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            },
+            "layer2": {
+                "layer_y": .5,
+                "left_most_pos": {"x": .3, "y": .5},
+                "rope_pos": {"x": .62, "y": .5},
+                "right_most_pos": {"x": .7, "y": .5},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+            climbing_enabled=True, final_layer_action="repeat_patrol",
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        layer1 = MinimapObservation(Point(.4, .7), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._route_target(layer1), (.45, True, "layer1.rope"))
+
+        worker._route_layer_index = 1
+        worker._route_phase = "rope"
+        layer2 = MinimapObservation(Point(.6, .5), None, .9, (0, 0, 1, 1))
+        # The current top layer repeats patrol rather than attempting a climb.
+        self.assertEqual(worker._route_target(layer2), (.3, False, "layer2.left-most"))
+
     def test_map_profile_route_order_is_explicit(self):
         positions = {
             "layer1": {"left_most_pos": {"x": .1, "y": .7},
@@ -400,6 +499,21 @@ class MovementTests(unittest.TestCase):
         )
         unknown._select_route_layer(Point(.5, .600000))
         self.assertIsNone(unknown._route_layer_index)
+
+    def test_single_layer_start_uses_its_only_y_route_when_tolerance_misses(self):
+        positions = {
+            "layer1": {
+                "layer_y": .467647, "y_tolerance": .019318,
+                "left_most_pos": {"x": .413295, "y": .467647},
+                "right_most_pos": {"x": .644509, "y": .467647},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1"],
+        )
+        worker._select_route_layer(Point(.542424, .497159))
+        self.assertEqual(worker._route_layer_index, 0)
 
     def test_route_stops_after_last_calibrated_layer(self):
         positions = {"layer1": {

@@ -25,6 +25,7 @@ class AttackWorker(threading.Thread):
         attack_interval: float = 3.0,
         *,
         climbing_active_event: Optional[threading.Event] = None,
+        automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
@@ -32,6 +33,7 @@ class AttackWorker(threading.Thread):
         self.stop_event = stop_event
         self.attack_interval = max(0.25, attack_interval)
         self.climbing_active_event = climbing_active_event
+        self.automation_active_event = automation_active_event
         self.initial_offset = (
             self.attack_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
@@ -56,7 +58,10 @@ class AttackWorker(threading.Thread):
         while not self.stop_event.is_set():
             if self.stop_event.wait(max(0.0, next_attack - time.monotonic())):
                 break
-            if (self.climbing_active_event is not None
+            if (self.automation_active_event is not None
+                    and not self.automation_active_event.is_set()):
+                pass
+            elif (self.climbing_active_event is not None
                     and self.climbing_active_event.is_set()):
                 LOG.info("attack skipped: jump-climb input is active")
             else:

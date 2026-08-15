@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+from dataclasses import replace
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import queue
 import signal
 import threading
@@ -12,10 +15,84 @@ import time
 from pathlib import Path
 
 
+MINIMAP_CAPTURE_SIZE = (320, 320)
+MINIMAP_FALLBACK_REGION = (0.0, 0.20, 0.75, 1.0)
+STATUS_CAPTURE_REGION = (0.34, 0.96, 0.56, 1.0)
+SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
+
+
+def _acquire_single_instance_mutex(
+    mutex_name: str = SINGLE_INSTANCE_MUTEX_NAME,
+) -> int | None:
+    """Own the per-session assistant mutex, or return None for a duplicate."""
+
+    if not hasattr(ctypes, "WinDLL"):
+        return 1
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR
+    )
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    error_code = ctypes.get_last_error()
+    if not handle:
+        # A normal process cannot open a mutex created by an elevated copy.
+        # Treat access denied as proof that the singleton already exists.
+        if error_code == 5:
+            return None
+        raise OSError(error_code, "could not create Maple Assistant singleton mutex")
+    if error_code == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def _release_single_instance_mutex(handle: int | None) -> None:
+    if not handle or handle == 1 or not hasattr(ctypes, "WinDLL"):
+        return
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _start_live_input(
+    key_sender: object,
+    automation_active_event: threading.Event,
+) -> None:
+    """Select the game first, then arm all keyboard-producing workers."""
+
+    logging.info("START PATROL: selecting game window")
+    if key_sender.select_window() is False:
+        raise OSError("game window selection returned failure")
+    if not key_sender.is_game_foreground():
+        raise OSError("game window did not become foreground")
+    logging.info("START PATROL: game window verified foreground")
+    key_sender.enable_input()
+    automation_active_event.set()
+    logging.info("START PATROL: automation input armed")
+
+
+def _stop_live_input(
+    key_sender: object,
+    automation_active_event: threading.Event,
+) -> None:
+    automation_active_event.clear()
+    key_sender.disable_input()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Modular MapleStory screen assistant")
     parser.add_argument("--window-title", default="冒险岛怀旧服")
-    parser.add_argument("--interval", type=float, default=3.0)
+    parser.add_argument("--interval", type=float, default=4.0,
+                        help="seconds between cropped screenshots (default: 4)")
     parser.add_argument("--attack-interval", type=float, default=2.0,
                         help="seconds between Ctrl attacks (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
@@ -28,33 +105,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rope-calibration", type=Path,
                         default=Path(__file__).with_name("rope_calibration.json"))
     parser.add_argument(
-        "--map-profile", type=Path,
-        default=Path(__file__).with_name("map_profiles") / "shooter_training_ground_1.json",
-        help="map-specific layers, endpoints, rope, and route order",
+        "--recording-configuration", type=Path,
+        default=Path(__file__).with_name("recording-configuration.json"),
+        help="shared recorded layers, endpoints, ropes, and route order",
     )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
 
 def main() -> int:
+    singleton_handle = _acquire_single_instance_mutex()
+    if singleton_handle is None:
+        return 0
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(threadName)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    log_path = Path(__file__).with_name("work") / "assistant.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_log_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=1_000_000,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    file_log_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(threadName)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logging.getLogger().addHandler(file_log_handler)
 
     # Imports are delayed so `--help` works even before dependencies are installed.
     from capture_worker import CaptureWorker, FrameBus
     from movement_worker import MovementWorker
-    from status_worker import StatusWorker, WindowKeySender
+    from status_worker import (
+        BarStatusDetector,
+        StatusConfig,
+        StatusWorker,
+        WindowKeySender,
+    )
     from attack_worker import AttackWorker
+    from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
-    from ui_worker import UiWorker
+    from marker_detector import DiamondSizeTracker
+    from patrol_control import PatrolController
+    from ui_worker import UiLogHandler, UiWorker
 
     stop_event = threading.Event()
     climb_attack_lock = threading.Lock()
     climbing_active = threading.Event()
+    automation_active = threading.Event()
+    game_focused = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -62,32 +165,76 @@ def main() -> int:
     if not args.no_ui:
         subscribers.append(ui_frames)
     bus = FrameBus(subscribers)
-    key_sender = WindowKeySender(args.window_title, dry_run=args.dry_run)
-    if not args.dry_run:
-        try:
-            key_sender.select_window()
-        except OSError as exc:
-            logging.error("cannot start live input: %s", exc)
-            return 2
-    calibration = json.loads(args.rope_calibration.read_text(encoding="utf-8"))
-    map_profile = json.loads(args.map_profile.read_text(encoding="utf-8"))
-    rope_profile = map_profile["rope"]
-    minimap_detector = MinimapDetector(
-        fallback_region=tuple(map_profile["minimap_region"])
+    ui_log_handler = None
+    if not args.no_ui:
+        ui_log_handler = UiLogHandler(capacity=300)
+        ui_log_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(threadName)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logging.getLogger().addHandler(ui_log_handler)
+    # The dashboard and frame analysis start without stealing focus. Keyboard
+    # input is armed only after the user explicitly clicks Start Patrol.
+    key_sender = WindowKeySender(
+        args.window_title,
+        dry_run=args.dry_run,
+        input_enabled=False,
     )
+    calibration = json.loads(args.rope_calibration.read_text(encoding="utf-8"))
+    map_profile = json.loads(
+        args.recording_configuration.read_text(encoding="utf-8")
+    )
+    patrol_controller = PatrolController(args.recording_configuration, map_profile)
+
+    def stop_patrol_after_focus_loss() -> None:
+        patrol_controller.set_enabled(False)
+
+    rope_profile = map_profile["rope"]
+    minimap_region = MINIMAP_FALLBACK_REGION
+    status_defaults = StatusConfig()
+    status_capture_width = STATUS_CAPTURE_REGION[2] - STATUS_CAPTURE_REGION[0]
+    status_detector = BarStatusDetector(replace(
+        status_defaults,
+        status_roi=(0.0, 0.0, 1.0, 1.0),
+        full_bar_width_fraction=(
+            status_defaults.full_bar_width_fraction / status_capture_width
+        ),
+        min_bar_width_fraction=(
+            status_defaults.min_bar_width_fraction / status_capture_width
+        ),
+    ))
+    minimap_detector = MinimapDetector(
+        fallback_region=minimap_region,
+        dedicated_crop=True,
+    )
+    movement_diamond_tracker = DiamondSizeTracker()
+    ui_diamond_tracker = DiamondSizeTracker()
     logging.info("map=%s patrol=%s route=%s", map_profile["map_name"],
                  map_profile.get("patrol_enabled", False),
                  " -> ".join(map_profile.get("route_order", [])))
 
+    capture_worker = CaptureWorker(
+        args.window_title,
+        args.interval,
+        bus,
+        stop_event,
+        args.debug_dir,
+        capture_pixel_size=MINIMAP_CAPTURE_SIZE,
+        status_capture_region=STATUS_CAPTURE_REGION,
+        capture_enabled_event=game_focused,
+    )
     core_workers = [
-        CaptureWorker(args.window_title, args.interval, bus, stop_event, args.debug_dir),
+        capture_worker,
         MovementWorker(
             movement_frames,
             key_sender,
             stop_event,
-            minimap_region=tuple(map_profile["minimap_region"]),
+            minimap_region=minimap_region,
             fixed_target_x=float(rope_profile["x"]),
             horizontal_tolerance=float(calibration["horizontal_tolerance"]),
+            horizontal_tolerance_diamonds=calibration.get(
+                "horizontal_tolerance_diamonds"
+            ),
             climb_up_hold_seconds=float(calibration["climb_up_hold_seconds"]),
             movement_hold_seconds=float(calibration.get("movement_hold_seconds", 2.0)),
             minimum_final_hold_seconds=float(calibration.get("minimum_final_hold_seconds", 0.08)),
@@ -96,6 +243,7 @@ def main() -> int:
             ),
             estimated_minimap_speed=float(calibration.get("estimated_minimap_speed", 0.11)),
             final_calculation_distance=float(calibration.get("final_calculation_distance", 0.04)),
+            final_calculation_diamonds=calibration.get("final_calculation_diamonds"),
             estimated_final_speed=float(calibration.get("estimated_final_speed", 0.205)),
             final_move_safety_gain=float(calibration.get("final_move_safety_gain", 0.95)),
             aligned_frames_required=int(calibration.get("aligned_frames_required", 2)),
@@ -106,11 +254,13 @@ def main() -> int:
             ),
             near_rope_seconds=float(calibration.get("near_rope_seconds", 0.5)),
             near_rope_range=float(rope_profile["near_range"]),
+            near_rope_diamonds=calibration.get("near_rope_diamonds"),
             climb_attack_lock=climb_attack_lock,
             climbing_active_event=climbing_active,
             important_positions=map_profile.get("layers", {}),
             route_order=map_profile.get("route_order", []),
             patrol_enabled=map_profile.get("patrol_enabled", False),
+            climbing_enabled=map_profile.get("climbing_enabled", True),
             final_layer_action=map_profile.get("final_layer_action", "wait"),
             first_layer=map_profile.get("first_layer"),
             drop_chord_hold_seconds=float(
@@ -118,41 +268,97 @@ def main() -> int:
             ),
             drop_retry_seconds=float(calibration.get("drop_retry_seconds", 1.0)),
             minimap_detector=minimap_detector,
+            patrol_controller=patrol_controller,
+            diamond_size_tracker=movement_diamond_tracker,
+            automation_active_event=automation_active,
         ),
-        StatusWorker(status_frames, key_sender, stop_event),
+        StatusWorker(
+            status_frames,
+            key_sender,
+            stop_event,
+            detector=status_detector,
+            automation_active_event=automation_active,
+        ),
         AttackWorker(key_sender, stop_event, args.attack_interval,
-                     climbing_active_event=climbing_active),
+                     climbing_active_event=climbing_active,
+                     automation_active_event=automation_active),
+        FocusWorker(
+            key_sender,
+            stop_event,
+            automation_active,
+            game_focused,
+            on_focus_lost=stop_patrol_after_focus_loss,
+        ),
     ]
-    optional_workers = [] if args.no_ui else [
+    ui_worker = None if args.no_ui else (
         UiWorker(
             ui_frames,
             stop_event,
             minimap_detector,
             configured_map_name=str(map_profile.get("map_name", "")),
             refresh_ms=args.ui_refresh_ms,
+            patrol_controller=patrol_controller,
+            diamond_size_tracker=ui_diamond_tracker,
+            on_patrol_start=lambda: _start_live_input(
+                key_sender, automation_active
+            ),
+            on_patrol_stop=lambda: _stop_live_input(
+                key_sender, automation_active
+            ),
+            on_capture_now=capture_worker.capture_now,
+            log_queue=ui_log_handler.messages if ui_log_handler is not None else None,
+            automation_active_event=automation_active,
         )
-    ]
-    workers = core_workers + optional_workers
+    )
 
     def request_stop(*_unused: object) -> None:
         stop_event.set()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    for worker in workers:
+    for worker in core_workers:
         worker.start()
 
-    logging.info("assistant running (%s); Ctrl+C stops",
-                 "DRY-RUN" if args.dry_run else "LIVE")
-    try:
+    def monitor_core_workers() -> None:
         while not stop_event.wait(0.5):
             if any(not worker.is_alive() for worker in core_workers):
                 logging.error("a core worker stopped unexpectedly")
                 stop_event.set()
+                return
+
+    supervisor = threading.Thread(
+        target=monitor_core_workers,
+        name="supervisor-worker",
+        daemon=True,
+    )
+    supervisor.start()
+
+    logging.info(
+        "assistant running (%s); click Start Patrol to enable input; Ctrl+C stops",
+        "DRY-RUN" if args.dry_run else "LIVE INPUT DISARMED",
+    )
+    try:
+        if ui_worker is not None:
+            logging.info("opening Maple Assistant Debug UI")
+            # Tk must run on Python's main thread on Windows. All automation
+            # work remains in its own independent workers.
+            ui_worker.run()
+            if not stop_event.is_set():
+                logging.info("debug UI closed; stopping assistant safely")
+                stop_event.set()
+        else:
+            stop_event.wait()
     finally:
+        _stop_live_input(key_sender, automation_active)
         stop_event.set()
-        for worker in workers:
+        for worker in core_workers:
             worker.join(timeout=5)
+        supervisor.join(timeout=1)
+        if ui_log_handler is not None:
+            logging.getLogger().removeHandler(ui_log_handler)
+        logging.getLogger().removeHandler(file_log_handler)
+        file_log_handler.close()
+        _release_single_instance_mutex(singleton_handle)
     return 0
 
 

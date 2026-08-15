@@ -2,10 +2,12 @@ import queue
 import threading
 import time
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+from capture_worker import remap_normalized_box
 from status_worker import BarStatusDetector, StatusConfig, StatusWorker, WindowKeySender
 
 
@@ -35,6 +37,36 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.hp, 328, delta=5)
         self.assertAlmostEqual(reading.mp, 74, delta=5)
 
+    def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
+        full = status_image(0.5, 0.2)
+        cropped = full.crop((0, 0, 600, 1000))
+        defaults = StatusConfig()
+        config = replace(
+            defaults,
+            status_roi=remap_normalized_box(
+                defaults.status_roi, (0.0, 0.0, 0.60, 1.0)
+            ),
+            full_bar_width_fraction=defaults.full_bar_width_fraction / 0.60,
+            min_bar_width_fraction=defaults.min_bar_width_fraction / 0.60,
+        )
+        reading = BarStatusDetector(config).detect(cropped)
+        self.assertAlmostEqual(reading.hp, 328, delta=5)
+        self.assertAlmostEqual(reading.mp, 74, delta=5)
+
+    def test_bar_calibration_uses_status_only_capture(self) -> None:
+        full = status_image(0.5, 0.2)
+        cropped = full.crop((340, 960, 560, 1000))
+        defaults = StatusConfig()
+        config = replace(
+            defaults,
+            status_roi=(0.0, 0.0, 1.0, 1.0),
+            full_bar_width_fraction=defaults.full_bar_width_fraction / 0.22,
+            min_bar_width_fraction=defaults.min_bar_width_fraction / 0.22,
+        )
+        reading = BarStatusDetector(config).detect(cropped)
+        self.assertAlmostEqual(reading.hp, 328, delta=5)
+        self.assertAlmostEqual(reading.mp, 74, delta=5)
+
     def test_two_low_frames_trigger_once_and_cooldown_debounces(self) -> None:
         sender = FakeSender()
         worker = StatusWorker(queue.Queue(), sender, threading.Event(),
@@ -52,6 +84,35 @@ class StatusTests(unittest.TestCase):
         sender = WindowKeySender("game")
         self.assertTrue(sender.dry_run)
         self.assertTrue(sender.tap("ctrl"))
+
+    def test_disabled_input_does_not_select_window_or_send_keys(self) -> None:
+        sender = WindowKeySender("game", dry_run=False, input_enabled=False)
+        selections = []
+        events = []
+        sender.select_window = lambda: selections.append(True)
+        sender._send_scan_code = lambda code, key_up, extended: events.append(key_up)
+
+        self.assertFalse(sender.tap("ctrl"))
+        self.assertEqual(selections, [])
+        self.assertEqual(events, [])
+
+        sender.enable_input()
+        sender._foreground_matches = lambda: True
+        self.assertTrue(sender.tap("ctrl"))
+        self.assertEqual(events, [False, True])
+
+    def test_focus_loss_blocks_keys_without_reselecting_window(self) -> None:
+        sender = WindowKeySender("game", dry_run=False)
+        selections = []
+        sender._foreground_matches = lambda: False
+        sender.select_window = lambda: selections.append(True)
+        sender._send_scan_code = lambda *args, **kwargs: self.fail(
+            "no input should be injected while unfocused"
+        )
+
+        self.assertFalse(sender.is_target_focused())
+        self.assertFalse(sender.tap("ctrl"))
+        self.assertEqual(selections, [])
 
     def test_two_second_hold_is_not_clamped(self) -> None:
         sender = WindowKeySender("game", dry_run=False)

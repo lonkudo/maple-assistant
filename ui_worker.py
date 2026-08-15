@@ -7,14 +7,167 @@ from datetime import datetime
 import logging
 import queue
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+import numpy as np
 from PIL import Image, ImageTk
 
+from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from minimap_detector import Box, MinimapDetection, MinimapDetector
+from patrol_control import CoordinateLayout, PatrolController
 
 
 LOG = logging.getLogger(__name__)
+
+
+def tooltip_cursor_top_right_position(
+    pointer_x: int,
+    pointer_y: int,
+    tooltip_width: int,
+    tooltip_height: int,
+    monitor_work_area: tuple[int, int, int, int],
+) -> tuple[int, int]:
+    """Place a tooltip at cursor upper-right on the cursor's own monitor."""
+
+    left, top, right, bottom = monitor_work_area
+    x = pointer_x + 14
+    x = max(left + 4, min(x, max(left + 4, right - tooltip_width - 4)))
+    y = pointer_y - tooltip_height - 10
+    y = max(top + 4, min(y, max(top + 4, bottom - tooltip_height - 4)))
+    return x, y
+
+
+def monitor_work_area_for_pointer(
+    pointer_x: int,
+    pointer_y: int,
+) -> tuple[int, int, int, int]:
+    """Return the Windows work area for the monitor containing the pointer."""
+
+    try:
+        import win32api
+        import win32con
+
+        monitor = win32api.MonitorFromPoint(
+            (pointer_x, pointer_y), win32con.MONITOR_DEFAULTTONEAREST
+        )
+        return tuple(int(value) for value in win32api.GetMonitorInfo(monitor)["Work"])
+    except Exception:
+        # Last-resort virtual desktop bounds; Tk reports these in the same
+        # coordinate space as winfo_pointerx/y.
+        import tkinter as tk
+
+        root = tk._default_root
+        if root is not None:
+            left = int(root.winfo_vrootx())
+            top = int(root.winfo_vrooty())
+            return (
+                left,
+                top,
+                left + int(root.winfo_vrootwidth()),
+                top + int(root.winfo_vrootheight()),
+            )
+        return (0, 0, 1920, 1080)
+
+
+class HoverTooltip:
+    """Small cursor-adjacent tooltip that also works on disabled ttk buttons."""
+
+    def __init__(self, widget: Any, text: str, delay_ms: int = 250) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = max(0, int(delay_ms))
+        self.enabled = False
+        self._after_id: Any = None
+        self._window: Any = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        if not self.enabled:
+            self._hide()
+
+    def _schedule(self, _event: Any = None) -> None:
+        self._cancel()
+        if self.enabled:
+            self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _show(self) -> None:
+        self._after_id = None
+        if not self.enabled or self._window is not None:
+            return
+        import tkinter as tk
+
+        window = tk.Toplevel(self.widget)
+        window.wm_overrideredirect(True)
+        label = tk.Label(
+            window,
+            text=self.text,
+            justify="left",
+            background="#fffbd6",
+            foreground="#202020",
+            relief="solid",
+            borderwidth=1,
+            padx=7,
+            pady=4,
+        )
+        label.pack()
+        window.update_idletasks()
+        pointer_x = self.widget.winfo_pointerx()
+        pointer_y = self.widget.winfo_pointery()
+        x, y = tooltip_cursor_top_right_position(
+            pointer_x,
+            pointer_y,
+            window.winfo_reqwidth(),
+            window.winfo_reqheight(),
+            monitor_work_area_for_pointer(pointer_x, pointer_y),
+        )
+        window.wm_geometry(f"+{x}+{y}")
+        self._window = window
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _hide(self, _event: Any = None) -> None:
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except Exception:
+                pass
+            self._window = None
+
+    def destroy(self) -> None:
+        self._hide()
+
+
+class UiLogHandler(logging.Handler):
+    """Feed formatted logs to Tk without allowing an unbounded backlog."""
+
+    def __init__(self, capacity: int = 300) -> None:
+        super().__init__()
+        self.messages: "queue.Queue[str]" = queue.Queue(maxsize=max(20, capacity))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            while True:
+                try:
+                    self.messages.put_nowait(message)
+                    return
+                except queue.Full:
+                    try:
+                        self.messages.get_nowait()
+                    except queue.Empty:
+                        return
+        except Exception:
+            self.handleError(record)
 
 
 @dataclass(frozen=True)
@@ -26,16 +179,43 @@ class DebugSnapshot:
     minimap_preview: Image.Image
     map_name_preview: Image.Image
     configured_map_name: str
+    player_x: Optional[float]
+    player_y: Optional[float]
+    marker_confidence: float
+    marker_pixel_size: Optional[tuple[int, int]]
+    coordinate_layout: Optional[CoordinateLayout]
 
 
 def build_debug_snapshot(
     frame: Any,
     detector: MinimapDetector,
     configured_map_name: str = "",
+    diamond_size_tracker: Optional[DiamondSizeTracker] = None,
 ) -> DebugSnapshot:
     """Pure frame-to-view-model conversion, independently testable from Tk."""
 
     detection = detector.detect(frame.image)
+    analysis_image = frame.image.crop(detection.analysis_box)
+    marker = detect_yellow_diamond(np.asarray(analysis_image.convert("RGB")))
+    analysis_left, analysis_top, analysis_right, analysis_bottom = detection.analysis_box
+    canvas_left, canvas_top, canvas_right, canvas_bottom = detection.canvas_box
+    coordinate_layout = None
+    if marker is not None:
+        marker_width, marker_height = marker.pixel_size
+        if diamond_size_tracker is not None:
+            marker_width, marker_height = diamond_size_tracker.stabilize(
+                (marker_width, marker_height)
+            )
+        coordinate_layout = CoordinateLayout(
+            analysis_width=analysis_right - analysis_left,
+            analysis_height=analysis_bottom - analysis_top,
+            canvas_left=canvas_left - analysis_left,
+            canvas_top=canvas_top - analysis_top,
+            canvas_width=canvas_right - canvas_left,
+            canvas_height=canvas_bottom - canvas_top,
+            diamond_width=marker_width,
+            diamond_height=marker_height,
+        )
     return DebugSnapshot(
         sequence=frame.sequence,
         captured_at=frame.captured_at,
@@ -44,6 +224,11 @@ def build_debug_snapshot(
         minimap_preview=frame.image.crop(detection.window_box),
         map_name_preview=frame.image.crop(detection.map_name_box),
         configured_map_name=configured_map_name,
+        player_x=marker.x if marker is not None else None,
+        player_y=marker.y if marker is not None else None,
+        marker_confidence=marker.confidence if marker is not None else 0.0,
+        marker_pixel_size=(marker_width, marker_height) if marker is not None else None,
+        coordinate_layout=coordinate_layout,
     )
 
 
@@ -52,8 +237,33 @@ def _box_text(box: Box) -> str:
     return f"x={left}, y={top}, w={right-left}, h={bottom-top}"
 
 
+def patrol_button_states(running: bool, can_start: bool) -> tuple[str, str]:
+    """Return Tk states for the separate Start and Stop patrol buttons."""
+
+    return (
+        "normal" if can_start and not running else "disabled",
+        "normal" if running else "disabled",
+    )
+
+
+def layer_display_order(layer_names: list[str]) -> tuple[str, ...]:
+    """Display the highest/newest layer above the lower layers."""
+
+    return tuple(reversed(layer_names))
+
+
+def rope_unavailable_hint() -> str:
+    return "Add a layer to enable Rope recording."
+
+
+def record_button_is_locked(saved_endpoint: Any, explicitly_unlocked: bool) -> bool:
+    """Saved endpoints lock automatically unless the user explicitly unlocks."""
+
+    return saved_endpoint is not None and not explicitly_unlocked
+
+
 class UiWorker(threading.Thread):
-    """Own a Tk window on its own thread; never sends gameplay input."""
+    """Own the independent UI loop; Tk requires ``run`` on Python's main thread."""
 
     def __init__(
         self,
@@ -63,6 +273,13 @@ class UiWorker(threading.Thread):
         *,
         configured_map_name: str = "",
         refresh_ms: int = 100,
+        patrol_controller: Optional[PatrolController] = None,
+        diamond_size_tracker: Optional[DiamondSizeTracker] = None,
+        on_patrol_start: Optional[Callable[[], None]] = None,
+        on_patrol_stop: Optional[Callable[[], None]] = None,
+        on_capture_now: Optional[Callable[[], Any]] = None,
+        log_queue: Optional["queue.Queue[str]"] = None,
+        automation_active_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -70,31 +287,88 @@ class UiWorker(threading.Thread):
         self.detector = detector
         self.configured_map_name = configured_map_name
         self.refresh_ms = max(30, int(refresh_ms))
+        self.patrol_controller = patrol_controller
+        self.diamond_size_tracker = diamond_size_tracker
+        self.on_patrol_start = on_patrol_start
+        self.on_patrol_stop = on_patrol_stop
+        self.on_capture_now = on_capture_now
+        self.log_queue = log_queue
+        self.automation_active_event = automation_active_event
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
         self._photo_minimap: Any = None
         self._photo_map_name: Any = None
+        self._record_buttons: dict[tuple[str, str], Any] = {}
+        self._rope_tooltips: dict[str, HoverTooltip] = {}
+        self._layer_labels: dict[str, Any] = {}
+        self._layer_row_names: tuple[str, ...] = ()
+        # Only explicit unlocks need UI state. Locking itself is derived from
+        # the controller's saved endpoint, so dynamically created rows behave
+        # identically to rows present at startup.
+        self._unlocked_points: set[tuple[str, str]] = set()
 
     def run(self) -> None:
         try:
             import tkinter as tk
             from tkinter import ttk
+            self._ttk = ttk
 
             root = tk.Tk()
             self._root = root
             root.title("Maple Assistant Debug UI")
-            root.geometry("620x620")
+            screen_width = root.winfo_screenwidth()
+            screen_height = root.winfo_screenheight()
+            window_height = min(900, max(650, screen_height - 70))
+            root.geometry(
+                f"700x{window_height}+{max(0, screen_width - 720)}+20"
+            )
             root.minsize(520, 500)
             root.protocol("WM_DELETE_WINDOW", root.destroy)
+            root.attributes("-topmost", True)
+            root.after(1500, lambda: root.attributes("-topmost", False))
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
             title = ttk.Label(container, text="Maple Assistant", font=("Segoe UI", 16, "bold"))
             title.pack(anchor="w")
-            ttk.Label(container, text="OpenCV minimap detection · read-only UI").pack(anchor="w")
+            ttk.Label(container, text="OpenCV minimap detection · patrol controls").pack(anchor="w")
+
+            controls = ttk.LabelFrame(container, text="Layer calibration and patrol", padding=10)
+            controls.pack(fill="x", pady=(12, 8))
+            style = ttk.Style(root)
+            style.configure("Locked.TButton", foreground="#777777")
+            style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
+            action_row = ttk.Frame(controls)
+            action_row.pack(fill="x", pady=(0, 8))
+            self._start_patrol_button = ttk.Button(
+                action_row, text="Start Patrol", command=self._start_patrol
+            )
+            self._start_patrol_button.pack(side="left", padx=(0, 8))
+            self._stop_patrol_button = ttk.Button(
+                action_row, text="Stop Patrol", command=self._stop_patrol
+            )
+            self._stop_patrol_button.pack(side="left", padx=(0, 8))
+            self._add_layer_button = ttk.Button(
+                action_row, text="Add Layer", command=self._add_layer_above
+            )
+            self._add_layer_button.pack(side="left", padx=(0, 8))
+            self._reset_recording_button = ttk.Button(
+                action_row, text="Reset Recording", command=self._reset_recording
+            )
+            self._reset_recording_button.pack(side="left")
+            self._layer_rows_frame = ttk.Frame(controls)
+            self._layer_rows_frame.pack(fill="x")
+            self._control_status = ttk.Label(
+                controls,
+                text="Record Left, Rope, and Right; then add the layer above.",
+            )
+            self._control_status.pack(anchor="w", pady=(8, 0))
+            self._automation_status_label = ttk.Label(controls)
+            self._automation_status_label.pack(anchor="w", pady=(5, 0))
+            self._refresh_patrol_controls()
 
             info = ttk.LabelFrame(container, text="Detection", padding=10)
-            info.pack(fill="x", pady=(12, 8))
+            info.pack(fill="x", pady=(0, 8))
             self._info_label = ttk.Label(info, text="Waiting for first frame…", justify="left")
             self._info_label.pack(anchor="w")
 
@@ -104,6 +378,22 @@ class UiWorker(threading.Thread):
             ttk.Label(container, text="Map-name region").pack(anchor="w")
             self._map_name_label = ttk.Label(container)
             self._map_name_label.pack(anchor="w", pady=(4, 0))
+
+            debug_frame = ttk.LabelFrame(container, text="Debug log", padding=6)
+            debug_frame.pack(fill="both", expand=True, pady=(10, 0))
+            self._log_text = tk.Text(
+                debug_frame,
+                height=10,
+                wrap="none",
+                state="disabled",
+                font=("Consolas", 9),
+            )
+            log_scroll = ttk.Scrollbar(
+                debug_frame, orient="vertical", command=self._log_text.yview
+            )
+            self._log_text.configure(yscrollcommand=log_scroll.set)
+            self._log_text.pack(side="left", fill="both", expand=True)
+            log_scroll.pack(side="right", fill="y")
 
             root.after(0, self._poll)
             root.mainloop()
@@ -134,24 +424,79 @@ class UiWorker(threading.Thread):
         if latest is not None:
             try:
                 self.last_snapshot = build_debug_snapshot(
-                    latest, self.detector, self.configured_map_name
+                    latest,
+                    self.detector,
+                    self.configured_map_name,
+                    self.diamond_size_tracker,
                 )
                 self._render(self.last_snapshot)
             except Exception:
                 LOG.exception("could not update debug UI")
+        self._drain_logs()
+        self._refresh_automation_status()
         root.after(self.refresh_ms, self._poll)
+
+    def _refresh_automation_status(self) -> None:
+        if not hasattr(self, "_automation_status_label"):
+            return
+        patrol_running = bool(
+            self.patrol_controller is not None
+            and self.patrol_controller.is_enabled()
+        )
+        active = bool(
+            self.automation_active_event is not None
+            and self.automation_active_event.is_set()
+        )
+        if active:
+            text = "Automation: ACTIVE — game window selected"
+        elif patrol_running:
+            text = "Automation: PAUSED — select the game window to resume"
+        else:
+            text = "Automation: stopped"
+        self._automation_status_label.configure(text=text)
+
+    def _drain_logs(self) -> None:
+        if self.log_queue is None or not hasattr(self, "_log_text"):
+            return
+        messages: list[str] = []
+        while True:
+            try:
+                messages.append(self.log_queue.get_nowait())
+            except queue.Empty:
+                break
+        if not messages:
+            return
+        self._log_text.configure(state="normal")
+        self._log_text.insert("end", "\n".join(messages) + "\n")
+        line_count = int(self._log_text.index("end-1c").split(".")[0])
+        if line_count > 250:
+            self._log_text.delete("1.0", f"{line_count - 250}.0")
+        self._log_text.see("end")
+        self._log_text.configure(state="disabled")
 
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
         recognized_name = detection.map_name or "OCR adapter not configured"
+        player_text = (
+            f"({snapshot.player_x:.6f}, {snapshot.player_y:.6f})"
+            if snapshot.player_x is not None and snapshot.player_y is not None
+            else "not detected"
+        )
+        diamond_text = (
+            f"{snapshot.marker_pixel_size[0]} × {snapshot.marker_pixel_size[1]} px"
+            if snapshot.marker_pixel_size is not None else "not detected"
+        )
         self._info_label.configure(text=(
             f"Frame: {snapshot.sequence}\n"
             f"Captured: {snapshot.captured_at.astimezone().strftime('%H:%M:%S.%f')[:-3]}\n"
-            f"Client: {snapshot.client_size[0]} × {snapshot.client_size[1]} px\n"
+            f"Cropped capture: {snapshot.client_size[0]} × {snapshot.client_size[1]} px\n"
             f"Detector: {detection.source}  confidence={detection.confidence:.3f}\n"
             f"Minimap: {_box_text(detection.window_box)}\n"
             f"Analysis: {_box_text(detection.analysis_box)}\n"
+            f"Map canvas: {_box_text(detection.canvas_box)}\n"
             f"Map-name crop: {_box_text(detection.map_name_box)}\n"
+            f"Player: {player_text}  confidence={snapshot.marker_confidence:.3f}\n"
+            f"Diamond: {diamond_text}\n"
             f"Configured map: {snapshot.configured_map_name or 'unknown'}\n"
             f"Recognized map: {recognized_name}"
         ))
@@ -164,5 +509,262 @@ class UiWorker(threading.Thread):
         self._minimap_label.configure(image=self._photo_minimap)
         self._map_name_label.configure(image=self._photo_map_name)
 
+    def _record_endpoint(self, boundary: str) -> None:
+        if self.patrol_controller is None:
+            self._control_status.configure(text="Patrol controller is unavailable.")
+            return
+        snapshot = self.last_snapshot
+        if self.on_capture_now is not None:
+            self._control_status.configure(text="Capturing current position…")
+            if self._root is not None:
+                self._root.update_idletasks()
+            try:
+                fresh_frame = self.on_capture_now()
+                snapshot = build_debug_snapshot(
+                    fresh_frame,
+                    self.detector,
+                    self.configured_map_name,
+                    self.diamond_size_tracker,
+                )
+                self.last_snapshot = snapshot
+                self._render(snapshot)
+            except Exception as exc:
+                LOG.exception("immediate recording capture failed")
+                self._control_status.configure(
+                    text=f"Cannot record: immediate capture failed: {exc}"
+                )
+                return
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(
+                text="Cannot record: yellow diamond is not detected in the latest frame."
+            )
+            return
+        try:
+            recorded = self.patrol_controller.record_endpoint(
+                boundary,
+                snapshot.player_x,
+                snapshot.player_y,
+                layout=snapshot.coordinate_layout,
+            )
+        except (OSError, ValueError) as exc:
+            LOG.warning("record rejected: layer=%s point=%s error=%s",
+                        self.patrol_controller.selected_layer(), boundary, exc)
+            self._control_status.configure(text=f"Cannot record: {exc}")
+            return
+        labels = {
+            "left_most_pos": "Left-most",
+            "rope_pos": "Rope",
+            "right_most_pos": "Right-most",
+        }
+        label = labels[boundary]
+        self._unlocked_points.discard((recorded.layer, boundary))
+        LOG.info("record locked: layer=%s point=%s x=%.6f y=%.6f frame=%s",
+                 recorded.layer, boundary, recorded.x, recorded.y, snapshot.sequence)
+        self._control_status.configure(
+            text=(f"Recorded {recorded.layer} {label}: "
+                  f"x={recorded.x:.6f}, y={recorded.y:.6f}")
+        )
+        self._refresh_patrol_controls()
 
-__all__ = ["DebugSnapshot", "UiWorker", "build_debug_snapshot"]
+    def _record_or_unlock(self, layer_name: str, boundary: str) -> None:
+        """Use one embedded button to unlock, then record and relock."""
+
+        if self.patrol_controller is None:
+            return
+        try:
+            self.patrol_controller.select_layer(layer_name)
+        except ValueError as exc:
+            self._control_status.configure(text=str(exc))
+            return
+        key = (layer_name, boundary)
+        saved_endpoint = self.patrol_controller.endpoint(layer_name, boundary)
+        if record_button_is_locked(saved_endpoint, key in self._unlocked_points):
+            self._unlocked_points.add(key)
+            self._control_status.configure(
+                text=(f"Unlocked {layer_name} {boundary}. Click the same Record "
+                      "button again to save the current position.")
+            )
+            self._refresh_patrol_controls()
+            return
+        self._unlocked_points.discard(key)
+        self._record_endpoint(boundary)
+
+    def _start_patrol(self) -> None:
+        if self.patrol_controller is None:
+            self._control_status.configure(text="Patrol controller is unavailable.")
+            return
+        if self.patrol_controller.is_enabled():
+            return
+        if not self.patrol_controller.can_start():
+            self._control_status.configure(
+                text=("Cannot start: record adaptive Left/Right on every layer "
+                      "and Rope on every layer except the final layer.")
+            )
+            return
+        self._control_status.configure(text="Selecting game window…")
+        if self._root is not None:
+            self._root.update_idletasks()
+        if self.on_patrol_start is not None:
+            try:
+                self.on_patrol_start()
+            except OSError as exc:
+                self._control_status.configure(
+                    text=f"Cannot start: game window selection failed: {exc}"
+                )
+                return
+        self.patrol_controller.set_enabled(True)
+        self._refresh_patrol_controls()
+        self._control_status.configure(text="Patrol started.")
+
+    def _stop_patrol(self) -> None:
+        if self.patrol_controller is None:
+            return
+        self.patrol_controller.set_enabled(False)
+        if self.on_patrol_stop is not None:
+            self.on_patrol_stop()
+        self._refresh_patrol_controls()
+        self._control_status.configure(text="Patrol stopped.")
+
+    def _add_layer_above(self) -> None:
+        if self.patrol_controller is None:
+            self._control_status.configure(text="Patrol controller is unavailable.")
+            return
+        try:
+            layer_name = self.patrol_controller.add_layer_above()
+        except (OSError, ValueError) as exc:
+            self._control_status.configure(text=f"Cannot add layer: {exc}")
+            return
+        self._control_status.configure(
+            text=(f"Selected {layer_name}. Move there manually and record "
+                  "Left, Rope, and Right. Patrol is paused.")
+        )
+        self._refresh_patrol_controls()
+
+    def _reset_recording(self) -> None:
+        if self.patrol_controller is None:
+            return
+        # Reset is deliberately immediate: no confirmation dialog or hint.
+        # Stop and release live input before mutating the recording.
+        self.patrol_controller.set_enabled(False)
+        if self.on_patrol_stop is not None:
+            self.on_patrol_stop()
+        try:
+            self.patrol_controller.reset_recording()
+        except OSError as exc:
+            self._control_status.configure(text=f"Cannot reset recording: {exc}")
+            return
+        self._unlocked_points.clear()
+        self._layer_row_names = ()
+        self._refresh_patrol_controls()
+        self._control_status.configure(
+            text="Recording reset. Layer 1 is empty; patrol is stopped."
+        )
+
+    def _refresh_patrol_controls(self) -> None:
+        if self.patrol_controller is None:
+            self._start_patrol_button.configure(state="disabled")
+            self._stop_patrol_button.configure(state="disabled")
+            self._add_layer_button.configure(state="disabled")
+            self._reset_recording_button.configure(state="disabled")
+            return
+        running = self.patrol_controller.is_enabled()
+        can_start = self.patrol_controller.can_start()
+        selected = self.patrol_controller.selected_layer()
+        snapshot = self.patrol_controller.snapshot()
+        route = snapshot.route_order
+        layer_names = list(route)
+        layer_names.extend(name for name in snapshot.layers if name not in layer_names)
+        layer_names = list(layer_display_order(layer_names))
+        self._ensure_layer_rows(tuple(layer_names))
+        button_labels = {
+            "left_most_pos": "Left-most",
+            "rope_pos": "Rope",
+            "right_most_pos": "Right-most",
+        }
+        final_name = self.patrol_controller.final_layer_name()
+        for layer_name in layer_names:
+            suffix = "  ← selected" if layer_name == selected else ""
+            if layer_name == final_name:
+                suffix += "  (final)"
+            self._layer_labels[layer_name].configure(text=f"{layer_name}{suffix}")
+            for point, button_label in button_labels.items():
+                final_rope = point == "rope_pos" and layer_name == final_name
+                recorded = self.patrol_controller.endpoint(layer_name, point)
+                key = (layer_name, point)
+                locked = not final_rope and record_button_is_locked(
+                    recorded, key in self._unlocked_points
+                )
+                if locked and recorded is not None:
+                    text = (
+                        f"🔒 {button_label}\n"
+                        f"x={recorded.x:.6f} y={recorded.y:.6f}"
+                    )
+                else:
+                    text = (
+                        "Rope unavailable (final)"
+                        if final_rope else f"Record {button_label}"
+                    )
+                self._record_buttons[(layer_name, point)].configure(
+                    text=text,
+                    state="disabled" if final_rope else "normal",
+                    style="Locked.TButton" if locked else "TButton",
+                )
+                if point == "rope_pos":
+                    self._rope_tooltips[layer_name].set_enabled(final_rope)
+        start_state, stop_state = patrol_button_states(running, can_start)
+        self._start_patrol_button.configure(state=start_state)
+        self._stop_patrol_button.configure(state=stop_state)
+        self._add_layer_button.configure(state="normal")
+        self._reset_recording_button.configure(state="normal")
+
+    def _ensure_layer_rows(self, layer_names: tuple[str, ...]) -> None:
+        if layer_names == self._layer_row_names:
+            return
+        for tooltip in self._rope_tooltips.values():
+            tooltip.destroy()
+        for child in self._layer_rows_frame.winfo_children():
+            child.destroy()
+        self._record_buttons.clear()
+        self._rope_tooltips.clear()
+        self._layer_labels.clear()
+        self._layer_row_names = layer_names
+        ttk = self._ttk
+        point_labels = (
+            ("left_most_pos", "Left-most"),
+            ("rope_pos", "Rope"),
+            ("right_most_pos", "Right-most"),
+        )
+        for layer_name in layer_names:
+            row = ttk.Frame(self._layer_rows_frame)
+            row.pack(fill="x", pady=3)
+            label = ttk.Label(row, width=18)
+            label.pack(side="left", padx=(0, 6))
+            self._layer_labels[layer_name] = label
+            for point_name, point_label in point_labels:
+                button = ttk.Button(
+                    row,
+                    text=f"Record {point_label}",
+                    command=lambda layer=layer_name, point=point_name: (
+                        self._record_or_unlock(layer, point)
+                    ),
+                )
+                button.pack(side="left", fill="x", expand=True, padx=(0, 5))
+                self._record_buttons[(layer_name, point_name)] = button
+                if point_name == "rope_pos":
+                    self._rope_tooltips[layer_name] = HoverTooltip(
+                        button, rope_unavailable_hint()
+                    )
+
+
+__all__ = [
+    "DebugSnapshot",
+    "UiLogHandler",
+    "UiWorker",
+    "build_debug_snapshot",
+    "layer_display_order",
+    "monitor_work_area_for_pointer",
+    "patrol_button_states",
+    "rope_unavailable_hint",
+    "record_button_is_locked",
+    "tooltip_cursor_top_right_position",
+]
