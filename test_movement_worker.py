@@ -22,6 +22,7 @@ from movement_worker import (
     move_to_left_most,
     move_to_right_most,
     climb,
+    preserve_persistent_climb,
     _send_tap,
     _drop_through_platform,
 )
@@ -35,6 +36,15 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_horizontal_correction_cannot_cancel_attached_climb(self):
+        state = ClimbState(phase="climbing-up", up_held=True)
+        proposed = MovementDecision("right", "tiny rope-edge correction", .30)
+
+        protected = preserve_persistent_climb(state, proposed)
+
+        self.assertIsNone(protected.key)
+        self.assertIn("Up remains held", protected.reason)
+
     def test_drop_is_simultaneous_alt_down_chord(self):
         class Sender:
             dry_run = True

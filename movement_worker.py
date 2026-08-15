@@ -274,6 +274,20 @@ class ClimbState:
     stalled_frames: int = 0
 
 
+def preserve_persistent_climb(
+    state: ClimbState,
+    proposed: MovementDecision,
+) -> MovementDecision:
+    """Never let a horizontal recalculation cancel an attached rope climb."""
+
+    if state.phase == "climbing-up" and state.up_held:
+        return MovementDecision(
+            None,
+            "Up remains held until the next recorded layer is confirmed",
+        )
+    return proposed
+
+
 def _pressed(sender: Any, decision: MovementDecision) -> bool:
     return _send_tap(sender, decision)
 
@@ -1449,6 +1463,7 @@ class MovementWorker(threading.Thread):
                         )
                     decision = position_plan.decision
                     active_target_x = route_target_x
+                decision = preserve_persistent_climb(self._climb_state, decision)
                 if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None
                 climb_decision_active = decision.key in (
@@ -1595,4 +1610,5 @@ __all__ = [
     "move_to_left_most",
     "move_to_right_most",
     "plan_movement",
+    "preserve_persistent_climb",
 ]
