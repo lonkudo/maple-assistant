@@ -323,7 +323,7 @@ class MovementTests(unittest.TestCase):
         )
         scrolling = MinimapObservation(
             Point(.48, .467647), None, .9, (0, 0, 1, 1),
-            world_y_diamonds=-.70, structure_confidence=.9,
+            world_y_diamonds=-1.00, structure_confidence=.9,
         )
         with patch("movement_worker.time.sleep"):
             self.assertEqual(climb(sender, start, state,
@@ -334,6 +334,32 @@ class MovementTests(unittest.TestCase):
                              "climbing-up")
         self.assertEqual(state.phase, "climbing-up")
         self.assertIn("up", sender.owned)
+
+    def test_stalled_world_y_releases_up_and_restarts_recovery(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        state = ClimbState(
+            phase="climbing-up",
+            baseline_world_y=0.0,
+            up_held=True,
+            last_world_y=-1.0,
+        )
+        stalled = MinimapObservation(
+            Point(.48, .467647), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-1.02, structure_confidence=.9,
+        )
+        self.assertEqual(climb(sender, stalled, state, persistent_up=True),
+                         "climbing-up")
+        self.assertEqual(climb(sender, stalled, state, persistent_up=True),
+                         "climb-stalled-retry")
+        self.assertEqual(state.phase, "idle")
+        self.assertNotIn("up", sender.owned)
 
     def test_persistent_climb_waits_for_capture_lag_before_releasing_up(self):
         class Sender:

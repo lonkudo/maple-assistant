@@ -270,6 +270,8 @@ class ClimbState:
     up_held: bool = False
     progress_check_frames: int = 0
     target_layer_frames: int = 0
+    last_world_y: Optional[float] = None
+    stalled_frames: int = 0
 
 
 def _pressed(sender: Any, decision: MovementDecision) -> bool:
@@ -360,6 +362,9 @@ def climb(
     climb_duration: float = 0.45,
     nudge_duration: float = 0.10,
     y_change_required: float = 0.015,
+    world_y_change_required: float = 0.75,
+    world_y_stall_change_required: float = 0.15,
+    world_y_stall_frames: int = 2,
     action_lock: Optional[threading.Lock] = None,
     preferred_direction: Optional[str] = None,
     failed_cycle_right_seconds: float = 0.01,
@@ -407,6 +412,8 @@ def climb(
             state.phase = next_phase
             state.up_held = persistent_up
             state.progress_check_frames = 0
+            state.last_world_y = state.baseline_world_y
+            state.stalled_frames = 0
             return result
         return "input-blocked"
 
@@ -432,6 +439,33 @@ def climb(
             return "right-retry"
         return "input-blocked"
 
+    if persistent_up and state.up_held and state.phase == "climbing-up":
+        if (observation.world_y_diamonds is not None
+                and observation.structure_confidence >= 0.12):
+            if state.last_world_y is not None:
+                frame_progress = state.last_world_y - observation.world_y_diamonds
+                if frame_progress >= world_y_stall_change_required:
+                    state.stalled_frames = 0
+                else:
+                    state.stalled_frames += 1
+            state.last_world_y = observation.world_y_diamonds
+            if state.stalled_frames >= max(1, int(world_y_stall_frames)):
+                key_up = getattr(sender, "key_up", None)
+                if key_up is not None:
+                    key_up("up")
+                state.phase = "idle"
+                state.baseline_y = None
+                state.baseline_world_y = None
+                state.up_held = False
+                state.progress_check_frames = 0
+                state.last_world_y = None
+                state.stalled_frames = 0
+                LOG.warning(
+                    "CLIMB stalled: world Y stopped advancing; restarting rope recovery"
+                )
+                return "climb-stalled-retry"
+        return "climbing-up"
+
     if persistent_up and state.up_held:
         state.progress_check_frames += 1
         if (state.baseline_world_y is not None
@@ -440,7 +474,7 @@ def climb(
             upward_progress = (
                 state.baseline_world_y - observation.world_y_diamonds
             )
-            attached = upward_progress >= 0.25
+            attached = upward_progress >= world_y_change_required
             progress_detail = f"world Y +{upward_progress:.3f} diamonds"
         else:
             upward_progress = baseline - player.y if baseline is not None else 0.0
@@ -448,6 +482,8 @@ def climb(
             progress_detail = f"screen Y +{upward_progress:.6f}"
         if attached:
             state.phase = "climbing-up"
+            state.last_world_y = observation.world_y_diamonds
+            state.stalled_frames = 0
             LOG.info("CLIMB attached: keeping Up held (%s)", progress_detail)
             return "climbing-up"
         # Phase-correlation and the game animation can lag the jump chord by
@@ -495,6 +531,8 @@ def climb(
             state.phase = "check-opposite"
             state.up_held = persistent_up
             state.progress_check_frames = 0
+            state.last_world_y = state.baseline_world_y
+            state.stalled_frames = 0
             return f"{retry_direction}-retry-toward-rope"
         return "input-blocked"
 
@@ -503,6 +541,10 @@ def climb(
     if state.failed_shift_used:
         state.phase = "idle"
         state.baseline_y = None
+        state.baseline_world_y = None
+        state.progress_check_frames = 0
+        state.last_world_y = None
+        state.stalled_frames = 0
         LOG.warning("CLIMB failed again; right correction already used for this approach")
         return "failed-cycle-no-more-shift"
     shifted = perform([
@@ -517,6 +559,8 @@ def climb(
     state.baseline_world_y = None
     state.up_held = False
     state.progress_check_frames = 0
+    state.last_world_y = None
+    state.stalled_frames = 0
     if shifted:
         state.failed_shift_used = True
         LOG.warning(
@@ -822,6 +866,9 @@ class MovementWorker(threading.Thread):
         climb_layer_confirm_frames: int = 3,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
+        climb_world_y_change_required: float = 0.75,
+        climb_world_y_stall_change_required: float = 0.15,
+        climb_world_y_stall_frames: int = 2,
         climb_failed_shift_right_seconds: float = 0.01,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
@@ -874,6 +921,9 @@ class MovementWorker(threading.Thread):
         self.climb_layer_confirm_frames = max(2, int(climb_layer_confirm_frames))
         self.climb_nudge_seconds = climb_nudge_seconds
         self.climb_y_change_required = climb_y_change_required
+        self.climb_world_y_change_required = climb_world_y_change_required
+        self.climb_world_y_stall_change_required = climb_world_y_stall_change_required
+        self.climb_world_y_stall_frames = max(1, int(climb_world_y_stall_frames))
         self.climb_failed_shift_right_seconds = climb_failed_shift_right_seconds
         self.near_rope_seconds = near_rope_seconds
         self.near_rope_range = near_rope_range
@@ -1497,6 +1547,11 @@ class MovementWorker(threading.Thread):
                             climb_duration=self.climb_up_hold_seconds,
                             nudge_duration=self.climb_nudge_seconds,
                             y_change_required=self.climb_y_change_required,
+                            world_y_change_required=self.climb_world_y_change_required,
+                            world_y_stall_change_required=(
+                                self.climb_world_y_stall_change_required
+                            ),
+                            world_y_stall_frames=self.climb_world_y_stall_frames,
                             action_lock=self.climb_attack_lock,
                             preferred_direction=preferred_direction,
                             failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,

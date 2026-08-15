@@ -97,6 +97,8 @@ def parse_args() -> argparse.Namespace:
                         help="seconds between HP/MP captures (default: 1.0)")
     parser.add_argument("--attack-interval", type=float, default=2.0,
                         help="seconds between Ctrl attacks (default: 2)")
+    parser.add_argument("--enable-attack", action="store_true",
+                        help="enable the independent Ctrl attack worker (off by default)")
     parser.add_argument("--dry-run", action="store_true",
                         help="analyze/log only; default sends keyboard events")
     parser.add_argument("--debug-dir", type=Path)
@@ -233,6 +235,17 @@ def main() -> int:
         status_capture_interval=args.status_interval,
         capture_enabled_event=game_focused,
     )
+    attack_workers = []
+    if args.enable_attack:
+        attack_workers.append(AttackWorker(
+            key_sender,
+            stop_event,
+            args.attack_interval,
+            climbing_active_event=climbing_active,
+            automation_active_event=automation_active,
+        ))
+    else:
+        logging.info("attack worker temporarily disabled")
     core_workers = [
         capture_worker,
         MovementWorker(
@@ -262,6 +275,15 @@ def main() -> int:
             ),
             climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.10)),
             climb_y_change_required=float(calibration.get("climb_y_change_required", 0.015)),
+            climb_world_y_change_required=float(
+                calibration.get("climb_world_y_change_required", 0.75)
+            ),
+            climb_world_y_stall_change_required=float(
+                calibration.get("climb_world_y_stall_change_required", 0.15)
+            ),
+            climb_world_y_stall_frames=int(
+                calibration.get("climb_world_y_stall_frames", 2)
+            ),
             climb_failed_shift_right_seconds=float(
                 calibration.get("climb_failed_shift_right_seconds", 0.01)
             ),
@@ -293,9 +315,7 @@ def main() -> int:
             detector=status_detector,
             automation_active_event=automation_active,
         ),
-        AttackWorker(key_sender, stop_event, args.attack_interval,
-                     climbing_active_event=climbing_active,
-                     automation_active_event=automation_active),
+        *attack_workers,
         FocusWorker(
             key_sender,
             stop_event,

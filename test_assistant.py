@@ -1,7 +1,8 @@
 import threading
 import unittest
+from unittest.mock import patch
 
-from assistant import _start_live_input
+from assistant import _start_live_input, parse_args
 
 
 class FakeSender:
@@ -22,6 +23,10 @@ class FakeSender:
 
 
 class StartLiveInputTests(unittest.TestCase):
+    def test_attack_worker_is_disabled_by_default(self) -> None:
+        with patch("sys.argv", ["assistant.py"]):
+            self.assertFalse(parse_args().enable_attack)
+
     def test_start_selects_and_verifies_game_before_enabling_input(self) -> None:
         sender = FakeSender()
         active = threading.Event()
