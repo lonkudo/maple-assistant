@@ -27,6 +27,8 @@
   "drop_retry_seconds": 1.0,
   "near_rope_seconds": 0.5,
   "near_rope_range": 0.022500,
+  "near_rope_inner_range": 0.021500,
+  "near_rope_outer_range": 0.022900,
   "near_rope_diamonds": 0.660000,
   "patrol_enabled": false,
   "captured_client_size": [1707, 1067],

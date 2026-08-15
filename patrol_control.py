@@ -169,9 +169,13 @@ class PatrolController:
             }
             rope = self._profile.setdefault("rope", {})
             near_range = float(rope.get("near_range", 0.022500))
+            inner_range = float(rope.get("inner_range", near_range))
+            outer_range = float(rope.get("outer_range", near_range))
             self._profile["rope"] = {
                 "x": 0.500000,
                 "near_range": near_range,
+                "inner_range": inner_range,
+                "outer_range": outer_range,
             }
             self._persist_locked()
 

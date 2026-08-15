@@ -259,6 +259,20 @@ def move_towards_rope(
     )
 
 
+def update_honey_zone(
+    active: bool,
+    absolute_gap: float,
+    inner_gap: float,
+    outer_gap: float,
+) -> bool:
+    """Enter at the inner edge and leave only beyond the outer edge."""
+
+    inner = max(0.0, float(inner_gap))
+    outer = max(inner, float(outer_gap))
+    gap = abs(float(absolute_gap))
+    return gap <= outer if active else gap <= inner
+
+
 @dataclass
 class ClimbState:
     """State kept between fresh screenshots while finding the rope grab point."""
@@ -888,6 +902,8 @@ class MovementWorker(threading.Thread):
         climb_failed_shift_right_seconds: float = 0.01,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
+        near_rope_inner_range: Optional[float] = None,
+        near_rope_outer_range: Optional[float] = None,
         near_rope_diamonds: Optional[float] = None,
         climb_attack_lock: Optional[threading.Lock] = None,
         climbing_active_event: Optional[threading.Event] = None,
@@ -947,6 +963,14 @@ class MovementWorker(threading.Thread):
         self.climb_failed_shift_right_seconds = climb_failed_shift_right_seconds
         self.near_rope_seconds = near_rope_seconds
         self.near_rope_range = near_rope_range
+        self.near_rope_inner_range = (
+            float(near_rope_inner_range)
+            if near_rope_inner_range is not None else None
+        )
+        self.near_rope_outer_range = (
+            float(near_rope_outer_range)
+            if near_rope_outer_range is not None else None
+        )
         self.near_rope_diamonds = (
             float(near_rope_diamonds) if near_rope_diamonds is not None else None
         )
@@ -990,6 +1014,7 @@ class MovementWorker(threading.Thread):
         self._last_climb_attempt = float("-inf")
         self._climb_state = ClimbState()
         self._rope_approach_direction: Optional[str] = None
+        self._rope_honey_zone_active = False
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
@@ -1465,23 +1490,40 @@ class MovementWorker(threading.Thread):
                 if route_label.endswith(".drop-to-first") and self._on_first_layer(observation):
                     self._reset_route_loop()
                     route_target_x, route_is_rope, route_label = self._route_target(observation)
-                if coordinate_layout is not None and self.near_rope_diamonds is not None:
-                    rope_jump_distance = (
+                if self.near_rope_inner_range is not None:
+                    rope_inner_distance = self.near_rope_inner_range
+                elif coordinate_layout is not None and self.near_rope_diamonds is not None:
+                    rope_inner_distance = (
                         self.near_rope_diamonds
                         * coordinate_layout.diamond_width
                         / coordinate_layout.analysis_width
                     )
                 else:
-                    rope_jump_distance = (
+                    rope_inner_distance = (
                         self.near_rope_range
                         if self.near_rope_range is not None
                         else self.estimated_final_speed * self.near_rope_seconds
                     )
-                inside_rope_zone = bool(
-                    observation.player is not None
-                    and route_is_rope
-                    and route_target_x is not None
-                    and abs(route_target_x - observation.player.x) <= rope_jump_distance
+                rope_outer_distance = (
+                    self.near_rope_outer_range
+                    if self.near_rope_outer_range is not None
+                    else rope_inner_distance
+                )
+                if (observation.player is not None
+                        and route_is_rope
+                        and route_target_x is not None):
+                    self._rope_honey_zone_active = update_honey_zone(
+                        self._rope_honey_zone_active,
+                        route_target_x - observation.player.x,
+                        rope_inner_distance,
+                        rope_outer_distance,
+                    )
+                else:
+                    self._rope_honey_zone_active = False
+                inside_rope_zone = self._rope_honey_zone_active
+                rope_jump_distance = (
+                    rope_outer_distance if inside_rope_zone
+                    else rope_inner_distance
                 )
                 if not inside_rope_zone and self._climb_state.failed_shift_used:
                     # A new approach may use one correction again. Staying in

@@ -18,6 +18,7 @@ from movement_worker import (
     detect_layer_by_y,
     detect_layer_by_world_y,
     plan_movement,
+    update_honey_zone,
     move_towards_rope,
     move_to_left_most,
     move_to_right_most,
@@ -36,6 +37,12 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_rope_honey_zone_enters_inner_and_leaves_outer(self):
+        self.assertFalse(update_honey_zone(False, .0220, .0215, .0229))
+        self.assertTrue(update_honey_zone(False, .0215, .0215, .0229))
+        self.assertTrue(update_honey_zone(True, .0228, .0215, .0229))
+        self.assertFalse(update_honey_zone(True, .0230, .0215, .0229))
+
     def test_horizontal_correction_cannot_cancel_attached_climb(self):
         state = ClimbState(phase="climbing-up", up_held=True)
         proposed = MovementDecision("right", "tiny rope-edge correction", .30)

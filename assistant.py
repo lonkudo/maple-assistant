@@ -350,6 +350,12 @@ def main() -> int:
             ),
             near_rope_seconds=float(calibration.get("near_rope_seconds", 0.5)),
             near_rope_range=float(rope_profile["near_range"]),
+            near_rope_inner_range=float(
+                rope_profile.get("inner_range", rope_profile["near_range"])
+            ),
+            near_rope_outer_range=float(
+                rope_profile.get("outer_range", rope_profile["near_range"])
+            ),
             near_rope_diamonds=calibration.get("near_rope_diamonds"),
             climb_attack_lock=climb_attack_lock,
             climbing_active_event=climbing_active,
