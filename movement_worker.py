@@ -182,9 +182,10 @@ def move_towards_rope(
     rope_x: float,
     near_range: float,
     aligned_direction: Optional[str] = None,
+    inner_range: float = 0.0,
     **movement_options: Any,
 ) -> RopeMovementPlan:
-    """Stop at the nearest near-zone edge, then jump inward toward the rope."""
+    """Move into the rope band, then jump inward only from within it."""
 
     player = observation.player
     if player is None:
@@ -192,9 +193,14 @@ def move_towards_rope(
             "detect", None, rope_x, None,
             MovementDecision(None, "yellow marker missing or uncertain"),
         )
-    left_edge = rope_x - near_range
-    right_edge = rope_x + near_range
+    outer_range = max(0.0, float(near_range))
+    inner_range = min(outer_range, max(0.0, float(inner_range)))
+    left_outer = rope_x - outer_range
+    right_outer = rope_x + outer_range
+    left_inner = rope_x - inner_range
+    right_inner = rope_x + inner_range
     rope_gap = rope_x - player.x
+    absolute_gap = abs(rope_gap)
     minimum_confidence = float(movement_options.get("minimum_confidence", 0.55))
     if observation.confidence < minimum_confidence:
         return RopeMovementPlan(
@@ -202,23 +208,33 @@ def move_towards_rope(
             MovementDecision(None, "yellow marker missing or uncertain"),
         )
 
-    if player.x < left_edge - 1e-9:
-        edge, direction = left_edge, "right"
-    elif player.x > right_edge + 1e-9:
-        edge, direction = right_edge, "left"
-    else:
+    if inner_range - 1e-9 <= absolute_gap <= outer_range + 1e-9:
         direction = "right" if rope_gap > 1e-9 else "left" if rope_gap < -1e-9 else aligned_direction
         if direction not in ("left", "right"):
             direction = "right"
-        edge = left_edge if direction == "right" else right_edge
+        edge = left_outer if direction == "right" else right_outer
         return RopeMovementPlan(
             "climb", player, edge, edge - player.x,
             MovementDecision(
                 f"jump_climb_{direction}",
-                f"inside near zone; jump {direction} inward from edge",
+                f"inside rope band; jump {direction} inward",
                 float(movement_options.get("minimum_final_hold_seconds", 0.08)),
             ),
         )
+    if player.x < left_outer - 1e-9:
+        edge, direction = left_outer, "right"
+    elif player.x > right_outer + 1e-9:
+        edge, direction = right_outer, "left"
+    elif player.x < rope_x:
+        # Too close on the left side: back away into the band.
+        edge, direction = left_inner, "left"
+    elif player.x > rope_x:
+        # Too close on the right side: back away into the band.
+        edge, direction = right_inner, "right"
+    elif aligned_direction == "right":
+        edge, direction = left_inner, "left"
+    else:
+        edge, direction = right_inner, "right"
 
     # Outside the near-rope zone, keep using the full fixed movement hold.
     # Shorten the hold only in the final edge-calculation zone immediately
@@ -253,24 +269,10 @@ def move_towards_rope(
         "move-to-rope-edge", player, edge, edge_gap,
         MovementDecision(
             direction,
-            f"move to {direction}-side near-zone edge {edge:.6f}; {hold_detail}",
+            f"move into rope band at {edge:.6f}; {hold_detail}",
             duration,
         ),
     )
-
-
-def update_honey_zone(
-    active: bool,
-    absolute_gap: float,
-    inner_gap: float,
-    outer_gap: float,
-) -> bool:
-    """Enter at the inner edge and leave only beyond the outer edge."""
-
-    inner = max(0.0, float(inner_gap))
-    outer = max(inner, float(outer_gap))
-    gap = abs(float(absolute_gap))
-    return gap <= outer if active else gap <= inner
 
 
 @dataclass
@@ -295,7 +297,7 @@ def preserve_persistent_climb(
 ) -> MovementDecision:
     """Never let a horizontal recalculation cancel an attached rope climb."""
 
-    if state.phase == "climbing-up" and state.up_held:
+    if state.phase in ("climbing-up", "arrival-compensation") and state.up_held:
         return MovementDecision(
             None,
             "Up remains held until the next recorded layer is confirmed",
@@ -467,6 +469,9 @@ def climb(
             state.phase = "check-right"
             return "right-retry"
         return "input-blocked"
+
+    if persistent_up and state.up_held and state.phase == "arrival-compensation":
+        return "arrival-compensation"
 
     if persistent_up and state.up_held and state.phase == "climbing-up":
         if (observation.world_y_diamonds is not None
@@ -1014,7 +1019,6 @@ class MovementWorker(threading.Thread):
         self._last_climb_attempt = float("-inf")
         self._climb_state = ClimbState()
         self._rope_approach_direction: Optional[str] = None
-        self._rope_honey_zone_active = False
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
@@ -1083,7 +1087,36 @@ class MovementWorker(threading.Thread):
 
         if observation.player is None or not self._route_layers:
             return None
-        detected_name = self._detected_layer(observation)
+        climb_input_active = (
+            self._climb_state.up_held
+            or self._climb_state.phase in ("climbing-up", "arrival-compensation")
+        )
+        expected_next_index = (
+            self._route_layer_index + 1
+            if self._route_layer_index is not None else -1
+        )
+        compensating = (
+            climb_input_active
+            and self._climb_state.phase == "arrival-compensation"
+            and self._climb_state.target_layer_since is not None
+            and 0 <= expected_next_index < len(self._route_layers)
+        )
+        if compensating:
+            elapsed = time.monotonic() - self._climb_state.target_layer_since
+            expected_name = self._route_layers[expected_next_index]
+            if elapsed < self.climb_layer_confirm_seconds:
+                LOG.info(
+                    "CLIMB arrival compensation: %s %.2f/%.2fs; keeping Up held",
+                    expected_name,
+                    elapsed,
+                    self.climb_layer_confirm_seconds,
+                )
+                return self._route_layers[self._route_layer_index]
+            # The next layer was already confirmed. Finish the fixed Up hold
+            # even if the centered marker/scroll estimate flickers afterward.
+            detected_name = expected_name
+        else:
+            detected_name = self._detected_layer(observation)
         if detected_name is None:
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
@@ -1102,25 +1135,23 @@ class MovementWorker(threading.Thread):
                 self._climb_state.target_layer_since = None
             return detected_name
 
-        climb_input_active = (
-            self._climb_state.up_held
-            or self._climb_state.phase == "climbing-up"
-        )
         expected_next_index = self._route_layer_index + 1
         if climb_input_active and detected_index == expected_next_index:
-            now = time.monotonic()
-            if self._climb_state.target_layer_since is None:
-                self._climb_state.target_layer_since = now
             self._climb_state.target_layer_frames += 1
-            arrival_seconds = now - self._climb_state.target_layer_since
-            if (self._climb_state.target_layer_frames < self.climb_layer_confirm_frames
-                    or arrival_seconds < self.climb_layer_confirm_seconds):
+            if self._climb_state.target_layer_frames < self.climb_layer_confirm_frames:
                 LOG.info(
-                    "CLIMB arrival confirmation: %s %d/%d %.2f/%.2fs; keeping Up held",
+                    "CLIMB arrival confirmation: %s %d/%d; keeping Up held",
                     detected_name,
                     self._climb_state.target_layer_frames,
                     self.climb_layer_confirm_frames,
-                    arrival_seconds,
+                )
+                return self._route_layers[self._route_layer_index]
+            if not compensating and self.climb_layer_confirm_seconds > 0:
+                self._climb_state.target_layer_since = time.monotonic()
+                self._climb_state.phase = "arrival-compensation"
+                LOG.info(
+                    "CLIMB layer %s seems reached; starting %.2fs Up compensation",
+                    detected_name,
                     self.climb_layer_confirm_seconds,
                 )
                 return self._route_layers[self._route_layer_index]
@@ -1509,21 +1540,13 @@ class MovementWorker(threading.Thread):
                     if self.near_rope_outer_range is not None
                     else rope_inner_distance
                 )
-                if (observation.player is not None
-                        and route_is_rope
-                        and route_target_x is not None):
-                    self._rope_honey_zone_active = update_honey_zone(
-                        self._rope_honey_zone_active,
-                        route_target_x - observation.player.x,
-                        rope_inner_distance,
-                        rope_outer_distance,
-                    )
-                else:
-                    self._rope_honey_zone_active = False
-                inside_rope_zone = self._rope_honey_zone_active
-                rope_jump_distance = (
-                    rope_outer_distance if inside_rope_zone
-                    else rope_inner_distance
+                inside_rope_zone = bool(
+                    observation.player is not None
+                    and route_is_rope
+                    and route_target_x is not None
+                    and rope_inner_distance - 1e-9
+                    <= abs(route_target_x - observation.player.x)
+                    <= rope_outer_distance + 1e-9
                 )
                 if not inside_rope_zone and self._climb_state.failed_shift_used:
                     # A new approach may use one correction again. Staying in
@@ -1553,8 +1576,9 @@ class MovementWorker(threading.Thread):
                     rope_plan = move_towards_rope(
                         observation,
                         route_target_x,
-                        rope_jump_distance,
+                        rope_outer_distance,
                         aligned_direction=self._rope_approach_direction,
+                        inner_range=rope_inner_distance,
                         horizontal_tolerance=self._current_horizontal_tolerance,
                         minimum_confidence=self.minimum_confidence,
                         movement_hold_seconds=self.movement_hold_seconds,
@@ -1633,8 +1657,7 @@ class MovementWorker(threading.Thread):
                 if observation.player is not None:
                     gap = ((active_target_x - observation.player.x)
                            if active_target_x is not None else None)
-                    stage = ("CLIMB" if route_is_rope and gap is not None
-                             and abs(gap) <= rope_jump_distance else
+                    stage = ("CLIMB" if route_is_rope and inside_rope_zone else
                              "MOVE TO ROPE" if route_is_rope else "PATROL")
                     target_text = (f"{active_target_x:.6f}"
                                    if active_target_x is not None else "----")

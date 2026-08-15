@@ -18,7 +18,6 @@ from movement_worker import (
     detect_layer_by_y,
     detect_layer_by_world_y,
     plan_movement,
-    update_honey_zone,
     move_towards_rope,
     move_to_left_most,
     move_to_right_most,
@@ -37,11 +36,31 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
-    def test_rope_honey_zone_enters_inner_and_leaves_outer(self):
-        self.assertFalse(update_honey_zone(False, .0220, .0215, .0229))
-        self.assertTrue(update_honey_zone(False, .0215, .0215, .0229))
-        self.assertTrue(update_honey_zone(True, .0228, .0215, .0229))
-        self.assertFalse(update_honey_zone(True, .0230, .0215, .0229))
+    def test_rope_honey_zone_jumps_only_between_inner_and_outer_edges(self):
+        rope_x = .5
+        in_band = MinimapObservation(
+            Point(rope_x - .0220, .5), None, .9, (0, 0, 1, 1)
+        )
+        too_close = MinimapObservation(
+            Point(rope_x - .0210, .5), None, .9, (0, 0, 1, 1)
+        )
+        too_far = MinimapObservation(
+            Point(rope_x - .0230, .5), None, .9, (0, 0, 1, 1)
+        )
+
+        band_plan = move_towards_rope(
+            in_band, rope_x, .0229, inner_range=.0215
+        )
+        close_plan = move_towards_rope(
+            too_close, rope_x, .0229, inner_range=.0215
+        )
+        far_plan = move_towards_rope(
+            too_far, rope_x, .0229, inner_range=.0215
+        )
+
+        self.assertEqual(band_plan.decision.key, "jump_climb_right")
+        self.assertEqual(close_plan.decision.key, "left")
+        self.assertEqual(far_plan.decision.key, "right")
 
     def test_horizontal_correction_cannot_cancel_attached_climb(self):
         state = ClimbState(phase="climbing-up", up_held=True)
@@ -541,12 +560,17 @@ class MovementTests(unittest.TestCase):
             Point(.5, .5), None, .9, (0, 0, 1, 1),
             world_y_diamonds=-7.1, structure_confidence=.9,
         )
+        y_flicker = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-3.0, structure_confidence=.9,
+        )
 
-        with patch("movement_worker.time.monotonic", side_effect=[0, .1, .2, 1.05]):
+        with patch("movement_worker.time.monotonic", side_effect=[0, 1.05]):
             for _ in range(3):
                 self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(sender.released, [])
-            self.assertEqual(worker._resync_route_layer(upper), "layer2")
+            self.assertEqual(worker._climb_state.phase, "arrival-compensation")
+            self.assertEqual(worker._resync_route_layer(y_flicker), "layer2")
         self.assertEqual(sender.released, ["up"])
 
     def test_next_layer_y_controls_climb_completion(self):
