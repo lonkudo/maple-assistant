@@ -257,6 +257,9 @@ def main() -> int:
             estimated_final_speed=float(calibration.get("estimated_final_speed", 0.205)),
             final_move_safety_gain=float(calibration.get("final_move_safety_gain", 0.95)),
             aligned_frames_required=int(calibration.get("aligned_frames_required", 2)),
+            climb_layer_confirm_frames=int(
+                calibration.get("climb_layer_confirm_frames", 3)
+            ),
             climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.10)),
             climb_y_change_required=float(calibration.get("climb_y_change_required", 0.015)),
             climb_failed_shift_right_seconds=float(

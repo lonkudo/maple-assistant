@@ -308,6 +308,96 @@ class MovementTests(unittest.TestCase):
             self.assertIn("up", sender.owned)
         self.assertNotIn(("up", "up"), sender.events)
 
+    def test_persistent_climb_uses_world_y_when_marker_stays_centered(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = set()
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender, state = Sender(), ClimbState()
+        start = MinimapObservation(
+            Point(.48, .467647), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-.14, structure_confidence=.9,
+        )
+        scrolling = MinimapObservation(
+            Point(.48, .467647), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-.70, structure_confidence=.9,
+        )
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, start, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "right-toward-rope")
+            self.assertEqual(climb(sender, scrolling, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "climbing-up")
+        self.assertEqual(state.phase, "climbing-up")
+        self.assertIn("up", sender.owned)
+
+    def test_persistent_climb_waits_for_capture_lag_before_releasing_up(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = set()
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender, state = Sender(), ClimbState()
+        centered = MinimapObservation(
+            Point(.48, .467647), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-.14, structure_confidence=.9,
+        )
+        with patch("movement_worker.time.sleep"):
+            climb(sender, centered, state,
+                  preferred_direction="right", persistent_up=True)
+            for _ in range(3):
+                self.assertEqual(
+                    climb(sender, centered, state,
+                          preferred_direction="right", persistent_up=True),
+                    "holding-up-awaiting-progress",
+                )
+                self.assertIn("up", sender.owned)
+
+    def test_climb_releases_up_only_after_stable_next_layer_confirmation(self):
+        class Sender:
+            def __init__(self): self.released = []
+            def key_up(self, key): self.released.append(key); return True
+
+        positions = {
+            "layer1": {
+                "layer_world_y": 0.0, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+            "layer2": {
+                "layer_world_y": -7.0, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+        }
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions=positions, route_order=["layer1", "layer2"],
+            climb_layer_confirm_frames=3,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        upper = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-7.1, structure_confidence=.9,
+        )
+
+        self.assertEqual(worker._resync_route_layer(upper), "layer1")
+        self.assertEqual(worker._resync_route_layer(upper), "layer1")
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(sender.released, [])
+        self.assertEqual(worker._resync_route_layer(upper), "layer2")
+        self.assertEqual(worker._route_layer_index, 1)
+        self.assertEqual(sender.released, ["up"])
+
     def test_next_layer_y_controls_climb_completion(self):
         positions = {
             "layer1": {"layer_y": .698864, "y_tolerance": .02,

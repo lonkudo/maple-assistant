@@ -265,8 +265,11 @@ class ClimbState:
 
     phase: str = "idle"
     baseline_y: Optional[float] = None
+    baseline_world_y: Optional[float] = None
     failed_shift_used: bool = False
     up_held: bool = False
+    progress_check_frames: int = 0
+    target_layer_frames: int = 0
 
 
 def _pressed(sender: Any, decision: MovementDecision) -> bool:
@@ -397,8 +400,13 @@ def climb(
         result = f"{direction}-toward-rope"
         if ok:
             state.baseline_y = player.y
+            state.baseline_world_y = (
+                observation.world_y_diamonds
+                if observation.structure_confidence >= 0.12 else None
+            )
             state.phase = next_phase
             state.up_held = persistent_up
+            state.progress_check_frames = 0
             return result
         return "input-blocked"
 
@@ -425,11 +433,29 @@ def climb(
         return "input-blocked"
 
     if persistent_up and state.up_held:
-        if baseline is not None and baseline - player.y >= y_change_required:
+        state.progress_check_frames += 1
+        if (state.baseline_world_y is not None
+                and observation.world_y_diamonds is not None
+                and observation.structure_confidence >= 0.12):
+            upward_progress = (
+                state.baseline_world_y - observation.world_y_diamonds
+            )
+            attached = upward_progress >= 0.25
+            progress_detail = f"world Y +{upward_progress:.3f} diamonds"
+        else:
+            upward_progress = baseline - player.y if baseline is not None else 0.0
+            attached = upward_progress >= y_change_required
+            progress_detail = f"screen Y +{upward_progress:.6f}"
+        if attached:
             state.phase = "climbing-up"
-            LOG.info("CLIMB attached: keeping Up held, y %.6f -> %.6f",
-                     baseline, player.y)
+            LOG.info("CLIMB attached: keeping Up held (%s)", progress_detail)
             return "climbing-up"
+        # Phase-correlation and the game animation can lag the jump chord by
+        # several minimap frames. Keep Up owned during that grace period;
+        # releasing it on the first centered-diamond frame makes the character
+        # jump away from the rope before the map starts scrolling.
+        if state.progress_check_frames < 4:
+            return "holding-up-awaiting-progress"
         # No upward progress on the fresh screenshot: release this Up claim
         # before another directional jump attempt.
         key_up = getattr(sender, "key_up", None)
@@ -462,8 +488,13 @@ def climb(
                 ok = jump_toward_current_rope_side()
         if ok:
             state.baseline_y = player.y
+            state.baseline_world_y = (
+                observation.world_y_diamonds
+                if observation.structure_confidence >= 0.12 else None
+            )
             state.phase = "check-opposite"
             state.up_held = persistent_up
+            state.progress_check_frames = 0
             return f"{retry_direction}-retry-toward-rope"
         return "input-blocked"
 
@@ -483,7 +514,9 @@ def climb(
     ])
     state.phase = "idle"
     state.baseline_y = None
+    state.baseline_world_y = None
     state.up_held = False
+    state.progress_check_frames = 0
     if shifted:
         state.failed_shift_used = True
         LOG.warning(
@@ -786,6 +819,7 @@ class MovementWorker(threading.Thread):
         estimated_final_speed: float = 0.205,
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 2,
+        climb_layer_confirm_frames: int = 3,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_failed_shift_right_seconds: float = 0.01,
@@ -837,6 +871,7 @@ class MovementWorker(threading.Thread):
         self.estimated_final_speed = estimated_final_speed
         self.final_move_safety_gain = final_move_safety_gain
         self.aligned_frames_required = max(2, aligned_frames_required)
+        self.climb_layer_confirm_frames = max(2, int(climb_layer_confirm_frames))
         self.climb_nudge_seconds = climb_nudge_seconds
         self.climb_y_change_required = climb_y_change_required
         self.climb_failed_shift_right_seconds = climb_failed_shift_right_seconds
@@ -954,6 +989,8 @@ class MovementWorker(threading.Thread):
             return None
         detected_name = self._detected_layer(observation)
         if detected_name is None:
+            if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
+                self._climb_state.target_layer_frames = 0
             return None
         detected_index = self._route_layers.index(detected_name)
         if self._route_layer_index is None:
@@ -963,14 +1000,34 @@ class MovementWorker(threading.Thread):
                      detected_name)
             return detected_name
         if detected_index == self._route_layer_index:
+            if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
+                self._climb_state.target_layer_frames = 0
             return detected_name
+
+        climb_input_active = (
+            self._climb_state.up_held
+            or self._climb_state.phase == "climbing-up"
+        )
+        expected_next_index = self._route_layer_index + 1
+        if climb_input_active and detected_index == expected_next_index:
+            self._climb_state.target_layer_frames += 1
+            if self._climb_state.target_layer_frames < self.climb_layer_confirm_frames:
+                LOG.info(
+                    "CLIMB arrival confirmation: %s %d/%d; keeping Up held",
+                    detected_name,
+                    self._climb_state.target_layer_frames,
+                    self.climb_layer_confirm_frames,
+                )
+                return self._route_layers[self._route_layer_index]
+        elif climb_input_active:
+            self._climb_state.target_layer_frames = 0
 
         previous_name = (
             self._route_layers[self._route_layer_index]
             if 0 <= self._route_layer_index < len(self._route_layers)
             else "route-complete"
         )
-        was_climbing = self._climb_state.phase == "climbing-up"
+        was_climbing = climb_input_active
         self._release_climb_up()
         self._route_layer_index = detected_index
         self._route_phase = "left"
