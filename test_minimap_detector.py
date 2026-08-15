@@ -124,6 +124,29 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(detection.window_box[2], 140)
         self.assertGreater(detection.window_box[3], 220)
 
+    def test_transient_contour_miss_keeps_last_good_minimap_geometry(self) -> None:
+        detector = MinimapDetector(
+            dedicated_crop=True,
+            opencv_size=(170, 170),
+            transient_hold_seconds=1.0,
+        )
+        good = Image.new("RGB", (320, 320), "black")
+        draw = ImageDraw.Draw(good)
+        draw.rectangle(
+            (6, 90, 155, 240), fill=(35, 45, 55),
+            outline=(190, 190, 190), width=3,
+        )
+        blank = Image.new("RGB", good.size, "black")
+
+        detected = detector.detect(good)
+        held = detector.detect(blank)
+
+        self.assertEqual(detected.source, "opencv")
+        self.assertEqual(held.source, "opencv-held")
+        self.assertEqual(held.window_box, detected.window_box)
+        self.assertEqual(held.analysis_box, detected.analysis_box)
+        self.assertEqual(held.canvas_box, detected.canvas_box)
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

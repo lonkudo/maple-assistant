@@ -6,7 +6,9 @@ debug UI can reuse the same detector without becoming coupled to one another.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import threading
+import time
 from typing import Optional, Protocol
 
 import cv2
@@ -93,6 +95,7 @@ class MinimapDetector:
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
+        transient_hold_seconds: float = 1.0,
     ) -> None:
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
@@ -101,6 +104,33 @@ class MinimapDetector:
             (max(96, int(opencv_size[0])), max(96, int(opencv_size[1])))
             if opencv_size is not None else None
         )
+        self.transient_hold_seconds = max(0.0, float(transient_hold_seconds))
+        self._last_good: Optional[MinimapDetection] = None
+        self._last_good_image_size: Optional[tuple[int, int]] = None
+        self._last_good_at = float("-inf")
+        self._state_lock = threading.Lock()
+
+    def _held_or_fallback(self, image: Image.Image) -> MinimapDetection:
+        now = time.monotonic()
+        with self._state_lock:
+            if (self._last_good is not None
+                    and self._last_good_image_size == image.size
+                    and now - self._last_good_at <= self.transient_hold_seconds):
+                return replace(
+                    self._last_good,
+                    confidence=max(0.0, self._last_good.confidence * 0.85),
+                    source="opencv-held",
+                )
+        return self._fallback_detection(image)
+
+    def _remember_good(
+        self, detection: MinimapDetection, image_size: tuple[int, int]
+    ) -> MinimapDetection:
+        with self._state_lock:
+            self._last_good = detection
+            self._last_good_image_size = image_size
+            self._last_good_at = time.monotonic()
+        return detection
 
     def detect(self, image: Image.Image) -> MinimapDetection:
         original_size = image.size
@@ -184,7 +214,7 @@ class MinimapDetector:
             candidates.append((score, candidate_box, rectangularity))
 
         if not candidates:
-            return self._fallback_detection(image)
+            return self._held_or_fallback(image)
 
         _score, window_box, rectangularity = max(candidates, key=lambda item: item[0])
         left, top, right, bottom = window_box
@@ -236,7 +266,7 @@ class MinimapDetector:
         map_name_box = _scale_box(map_name_box, working_size, original_size)
         map_name = self._read_map_name(image, map_name_box)
         confidence = float(np.clip(0.55 + rectangularity * 0.45, 0.0, 1.0))
-        return MinimapDetection(
+        return self._remember_good(MinimapDetection(
             window_box=window_box,
             analysis_box=analysis_box,
             canvas_box=canvas_box,
@@ -244,7 +274,7 @@ class MinimapDetector:
             confidence=confidence,
             source="opencv",
             map_name=map_name,
-        )
+        ), original_size)
 
     def _read_map_name(self, image: Image.Image, box: Box) -> Optional[str]:
         if self.map_name_reader is None:
