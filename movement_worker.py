@@ -270,6 +270,7 @@ class ClimbState:
     up_held: bool = False
     progress_check_frames: int = 0
     target_layer_frames: int = 0
+    target_layer_since: Optional[float] = None
     last_world_y: Optional[float] = None
     stalled_frames: int = 0
 
@@ -878,6 +879,7 @@ class MovementWorker(threading.Thread):
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 2,
         climb_layer_confirm_frames: int = 3,
+        climb_layer_confirm_seconds: float = 0.75,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
@@ -933,6 +935,9 @@ class MovementWorker(threading.Thread):
         self.final_move_safety_gain = final_move_safety_gain
         self.aligned_frames_required = max(2, aligned_frames_required)
         self.climb_layer_confirm_frames = max(2, int(climb_layer_confirm_frames))
+        self.climb_layer_confirm_seconds = max(
+            0.0, float(climb_layer_confirm_seconds)
+        )
         self.climb_nudge_seconds = climb_nudge_seconds
         self.climb_y_change_required = climb_y_change_required
         self.climb_world_y_change_required = climb_world_y_change_required
@@ -1055,6 +1060,7 @@ class MovementWorker(threading.Thread):
         if detected_name is None:
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
+                self._climb_state.target_layer_since = None
             return None
         detected_index = self._route_layers.index(detected_name)
         if self._route_layer_index is None:
@@ -1066,6 +1072,7 @@ class MovementWorker(threading.Thread):
         if detected_index == self._route_layer_index:
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
+                self._climb_state.target_layer_since = None
             return detected_name
 
         climb_input_active = (
@@ -1074,17 +1081,25 @@ class MovementWorker(threading.Thread):
         )
         expected_next_index = self._route_layer_index + 1
         if climb_input_active and detected_index == expected_next_index:
+            now = time.monotonic()
+            if self._climb_state.target_layer_since is None:
+                self._climb_state.target_layer_since = now
             self._climb_state.target_layer_frames += 1
-            if self._climb_state.target_layer_frames < self.climb_layer_confirm_frames:
+            arrival_seconds = now - self._climb_state.target_layer_since
+            if (self._climb_state.target_layer_frames < self.climb_layer_confirm_frames
+                    or arrival_seconds < self.climb_layer_confirm_seconds):
                 LOG.info(
-                    "CLIMB arrival confirmation: %s %d/%d; keeping Up held",
+                    "CLIMB arrival confirmation: %s %d/%d %.2f/%.2fs; keeping Up held",
                     detected_name,
                     self._climb_state.target_layer_frames,
                     self.climb_layer_confirm_frames,
+                    arrival_seconds,
+                    self.climb_layer_confirm_seconds,
                 )
                 return self._route_layers[self._route_layer_index]
         elif climb_input_active:
             self._climb_state.target_layer_frames = 0
+            self._climb_state.target_layer_since = None
 
         previous_name = (
             self._route_layers[self._route_layer_index]
