@@ -166,6 +166,7 @@ def main() -> int:
     stop_event = threading.Event()
     climb_attack_lock = threading.Lock()
     climbing_active = threading.Event()
+    dropping_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -242,7 +243,7 @@ def main() -> int:
         status_capture_region=STATUS_CAPTURE_REGION,
         status_capture_interval=args.status_interval,
         capture_enabled_event=game_focused,
-        fast_capture_event=climbing_active,
+        fast_capture_event=dropping_active,
         fast_interval=0.10,
     )
 
@@ -348,6 +349,7 @@ def main() -> int:
             near_rope_diamonds=calibration.get("near_rope_diamonds"),
             climb_attack_lock=climb_attack_lock,
             climbing_active_event=climbing_active,
+            dropping_active_event=dropping_active,
             important_positions=map_profile.get("layers", {}),
             route_order=map_profile.get("route_order", []),
             patrol_enabled=map_profile.get("patrol_enabled", False),

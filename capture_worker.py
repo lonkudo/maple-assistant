@@ -290,8 +290,8 @@ class CaptureWorker(threading.Thread):
             capture_interval = self.active_interval()
             now = time.monotonic()
             if next_capture - now > capture_interval:
-                # A climb/drop just began. Do not wait out the previous normal
-                # patrol deadline before switching to the faster cadence.
+                # A fast-capture action just began. Do not wait out the prior
+                # normal patrol deadline before switching cadence.
                 next_capture = now
             forced = self._capture_requested.is_set()
             enabled = (

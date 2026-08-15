@@ -891,6 +891,7 @@ class MovementWorker(threading.Thread):
         near_rope_diamonds: Optional[float] = None,
         climb_attack_lock: Optional[threading.Lock] = None,
         climbing_active_event: Optional[threading.Event] = None,
+        dropping_active_event: Optional[threading.Event] = None,
         near_rope_event: Optional[threading.Event] = None,
         important_positions: Optional[dict[str, Any]] = None,
         route_order: Optional[list[str]] = None,
@@ -951,6 +952,7 @@ class MovementWorker(threading.Thread):
         )
         self.climb_attack_lock = climb_attack_lock
         self.climbing_active_event = climbing_active_event
+        self.dropping_active_event = dropping_active_event
         self.near_rope_event = near_rope_event
         self.important_positions = important_positions or {}
         complete_layers = {
@@ -1116,6 +1118,8 @@ class MovementWorker(threading.Thread):
         self._last_drop_attempt = float("-inf")
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
         if self.near_rope_event is not None:
             self.near_rope_event.clear()
         returned_to_first = (
@@ -1362,6 +1366,8 @@ class MovementWorker(threading.Thread):
                     self._release_climb_up()
                     if self.climbing_active_event is not None:
                         self.climbing_active_event.clear()
+                    if self.dropping_active_event is not None:
+                        self.dropping_active_event.clear()
                     continue
                 minimap_region = self.minimap_region
                 minimap_detection = None
@@ -1482,6 +1488,8 @@ class MovementWorker(threading.Thread):
                     # the zone cannot accumulate repeated Right holds.
                     self._climb_state = ClimbState()
                 if route_label == "patrol-paused":
+                    if self.dropping_active_event is not None:
+                        self.dropping_active_event.clear()
                     decision = MovementDecision(None, "patrol paused from UI")
                     active_target_x = None
                 elif route_label == "route-complete":
@@ -1608,6 +1616,8 @@ class MovementWorker(threading.Thread):
                         self._last_drop_attempt = now
                         if self.climbing_active_event is not None:
                             self.climbing_active_event.set()
+                        if self.dropping_active_event is not None:
+                            self.dropping_active_event.set()
                         if self.climb_attack_lock is None:
                             _drop_through_platform(
                                 self.key_sender, self.drop_chord_hold_seconds
@@ -1667,6 +1677,8 @@ class MovementWorker(threading.Thread):
         self._release_climb_up()
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
         LOG.info("movement worker stopped")
 
 

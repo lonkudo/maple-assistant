@@ -145,7 +145,7 @@ class CaptureWorkerTests(unittest.TestCase):
         )
         self.assertEqual(worker.status_capture_interval, .2)
 
-    def test_vertical_action_selects_fast_capture_interval(self) -> None:
+    def test_drop_action_selects_fast_capture_interval(self) -> None:
         stop = threading.Event()
         fast = threading.Event()
         worker = CaptureWorker(
