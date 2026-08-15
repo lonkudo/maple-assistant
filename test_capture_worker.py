@@ -67,6 +67,7 @@ class CaptureWorkerTests(unittest.TestCase):
         bus = FrameBus()
         worker = CaptureWorker(
             "game", 0.01, bus, stop,
+            debug_draw_regions=True,
             capture_fn=fake_capture,
             capture_enabled_event=focused,
         )

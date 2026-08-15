@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-MINIMAP_CAPTURE_SIZE = (320, 320)
-OPENCV_ANALYSIS_SIZE = (180, 180)
-MINIMAP_FALLBACK_REGION = (0.0, 0.20, 0.75, 1.0)
-STATUS_CAPTURE_REGION = (0.34, 0.96, 0.56, 1.0)
+MINIMAP_CAPTURE_SIZE = (1707, 1067)
+OPENCV_ANALYSIS_SIZE = (200, 200)
+MINIMAP_FALLBACK_REGION = (0, 0, 0.2, 0.24)
+STATUS_CAPTURE_REGION = (0.36, 0.96, 0.53, 1)
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
 
 
@@ -119,6 +119,9 @@ def parse_args() -> argparse.Namespace:
         help="shared recorded layers, endpoints, ropes, and route order",
     )
     parser.add_argument("--log-level", default="INFO")
+    # ==== ADDED ==== debug flag for drawing capture region rectangles
+    parser.add_argument("--debug-capture-regions", action="store_true",
+                        help="draw rectangles on captured frame showing all ROI capture regions for debugging")
     return parser.parse_args()
 
 
@@ -249,6 +252,9 @@ def main() -> int:
         capture_enabled_event=game_focused,
         fast_capture_event=dropping_active,
         fast_interval=0.10,
+        # ==== ADDED pass debug flag into capture worker ====
+        debug_draw_regions=args.debug_capture_regions,
+        debug_minimap_fallback=MINIMAP_FALLBACK_REGION, # <------ ADD THIS LINE
     )
 
     def prepare_map_session() -> None:
@@ -439,7 +445,7 @@ def main() -> int:
 
     logging.info(
         "assistant running (%s); click Start Patrol to enable input; Ctrl+C stops",
-        "DRY-RUN" if args.dry_run else "LIVE INPUT DISARMED",
+        "DRY‑RUN" if args.dry_run else "LIVE INPUT DISARMED",
     )
     try:
         if ui_worker is not None:

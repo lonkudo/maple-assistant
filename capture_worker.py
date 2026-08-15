@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 WindowRect = Tuple[int, int, int, int]
@@ -31,8 +31,8 @@ class WindowCaptureError(RuntimeError):
 class CapturedFrame:
     """One immutable publication describing a captured game frame.
 
-    The PIL image itself should be treated as read-only by subscribers.
-    ``captured_monotonic`` is suitable for elapsed-time calculations while
+    The PIL image itself should be treated as read‑only by subscribers.
+    ``captured_monotonic`` is suitable for elapsed‑time calculations while
     ``captured_at`` is an absolute UTC timestamp suitable for logs/files.
     """
 
@@ -101,7 +101,7 @@ class FrameBus:
 
 
 def remap_normalized_box(box: NormalizedBox, crop: NormalizedBox) -> NormalizedBox:
-    """Map a full-client normalized box into normalized cropped-frame units."""
+    """Map a full‑client normalized box into normalized cropped‑frame units."""
 
     crop_left, crop_top, crop_right, crop_bottom = crop
     crop_width = crop_right - crop_left
@@ -172,7 +172,7 @@ def capture_window(
     width = max(1, source_right - source_x)
     height = max(1, source_bottom - source_y)
 
-    # GetDC(hwnd) has its origin at the client area's upper-left. GetWindowDC
+    # GetDC(hwnd) has its origin at the client area's upper‑left. GetWindowDC
     # would include borders/title bar and offset the pixels from window_rect.
     window_dc = win32gui.GetDC(hwnd)
     source_dc = win32ui.CreateDCFromHandle(window_dc)
@@ -226,10 +226,13 @@ class CaptureWorker(threading.Thread):
         capture_enabled_event: Optional[threading.Event] = None,
         fast_capture_event: Optional[threading.Event] = None,
         fast_interval: float = 0.10,
+        # === ADDED DEBUG FLAG ===
+        debug_draw_regions: bool = False,
+        debug_minimap_fallback: Optional[NormalizedBox] = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
-        super().__init__(name="screen-capture", daemon=False)
+        super().__init__(name="screen‑capture", daemon=False)
         self.window_title = window_title
         self.interval = float(interval)
         self.bus = bus
@@ -250,6 +253,9 @@ class CaptureWorker(threading.Thread):
         self.log = logging.getLogger(__name__)
         self._last_debug_path: Optional[Path] = None
         self._capture_requested = threading.Event()
+        # === store debug flag ===
+        self.debug_draw_regions = debug_draw_regions
+        self.debug_minimap_fallback = debug_minimap_fallback
 
     def active_interval(self) -> float:
         if self.fast_capture_event is not None and self.fast_capture_event.is_set():
@@ -290,7 +296,7 @@ class CaptureWorker(threading.Thread):
             capture_interval = self.active_interval()
             now = time.monotonic()
             if next_capture - now > capture_interval:
-                # A fast-capture action just began. Do not wait out the prior
+                # A fast‑capture action just began. Do not wait out the prior
                 # normal patrol deadline before switching cadence.
                 next_capture = now
             forced = self._capture_requested.is_set()
@@ -344,6 +350,38 @@ class CaptureWorker(threading.Thread):
                 else:
                     image, window_rect = self.capture_fn(self.window_title)
                     status_image = None
+
+                # ========== ADDED: draw debug rectangles ONLY on copied debug image ==========
+                drawn_debug_image: Optional[Image.Image] = None
+                if self.debug_draw_regions:
+                    # critical: make copy, NEVER draw on original image used for processing
+                    drawn_debug_image = image.copy()
+                    draw = ImageDraw.Draw(drawn_debug_image)
+                    w, h = drawn_debug_image.size
+
+                    # Red: main capture_region
+                    cr_x1, cr_y1, cr_x2, cr_y2 = self.capture_region
+                    draw.rectangle(
+                        (int(cr_x1 * w), int(cr_y1 * h), int(cr_x2 * w), int(cr_y2 * h)),
+                        outline=(255, 0, 0), width=2
+                    )
+                    # Blue: status capture region
+                    if self.status_capture_region is not None:
+                        sr_x1, sr_y1, sr_x2, sr_y2 = self.status_capture_region
+                        draw.rectangle(
+                            (int(sr_x1 * w), int(sr_y1 * h), int(sr_x2 * w), int(sr_y2 * h)),
+                            outline=(0, 120, 255), width=2
+                        )
+                    # Green: static fallback search ROI
+                    if self.debug_minimap_fallback is not None:
+                        x1, y1, x2, y2 = self.debug_minimap_fallback
+                        draw.rectangle(
+                            (int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)),
+                            outline=(0, 255, 0),
+                            width=2
+                        )
+                # Do NOT draw anything on variable `image` here, original image stays clean for opencv
+
                 frame = CapturedFrame(
                     sequence=sequence,
                     captured_at=datetime.now(timezone.utc),
@@ -353,8 +391,23 @@ class CaptureWorker(threading.Thread):
                     status_image=status_image,
                 )
                 self.bus.publish(frame)
+
+                # save debug frame: if overlay is enabled, swap image for saving only
                 if self.debug_dir is not None:
-                    self._save_debug_frame(frame)
+                    if drawn_debug_image is not None:
+                        # create temporary frame copy for saving, replace image with drawn overlay
+                        debug_save_frame = CapturedFrame(
+                            sequence=frame.sequence,
+                            captured_at=frame.captured_at,
+                            captured_monotonic=frame.captured_monotonic,
+                            image=drawn_debug_image,
+                            window_rect=frame.window_rect,
+                            status_image=frame.status_image,
+                        )
+                        self._save_debug_frame(debug_save_frame)
+                    else:
+                        self._save_debug_frame(frame)
+
                 sequence += 1
             except Exception:
                 # A temporarily obscured/minimized/restarting game should not
@@ -375,7 +428,7 @@ class CaptureWorker(threading.Thread):
     def _save_debug_frame(self, frame: CapturedFrame) -> None:
         assert self.debug_dir is not None
         stamp = frame.captured_at.strftime("%Y%m%dT%H%M%S.%fZ")
-        path = self.debug_dir / f"frame-{frame.sequence:06d}-{stamp}.png"
+        path = self.debug_dir / f"frame‑{frame.sequence:06d}‑{stamp}.png"
         previous = self._last_debug_path
         self._last_debug_path = None
         if previous is not None and previous != path:
@@ -405,7 +458,7 @@ class CaptureWorker(threading.Thread):
         """Remove only screenshots created by an earlier interrupted run."""
 
         assert self.debug_dir is not None
-        for path in self.debug_dir.glob("frame-*.png"):
+        for path in self.debug_dir.glob("frame‑*.png"):
             try:
                 if path.is_file() and not path.is_symlink():
                     path.unlink()
