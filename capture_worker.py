@@ -222,6 +222,7 @@ class CaptureWorker(threading.Thread):
         capture_region: NormalizedBox = (0.0, 0.0, 1.0, 1.0),
         capture_pixel_size: Optional[tuple[int, int]] = None,
         status_capture_region: Optional[NormalizedBox] = None,
+        status_capture_interval: Optional[float] = None,
         capture_enabled_event: Optional[threading.Event] = None,
     ) -> None:
         if interval <= 0:
@@ -236,6 +237,10 @@ class CaptureWorker(threading.Thread):
         self.capture_region = capture_region
         self.capture_pixel_size = capture_pixel_size
         self.status_capture_region = status_capture_region
+        self.status_capture_interval = (
+            max(0.05, float(status_capture_interval))
+            if status_capture_interval is not None else None
+        )
         self.capture_enabled_event = capture_enabled_event
         self._uses_default_capture = capture_fn is None
         self.log = logging.getLogger(__name__)
@@ -271,6 +276,7 @@ class CaptureWorker(threading.Thread):
 
         sequence = 0
         next_capture = time.monotonic()
+        next_status_capture = 0.0
         while not self.stop_event.is_set():
             forced = self._capture_requested.is_set()
             enabled = (
@@ -310,10 +316,16 @@ class CaptureWorker(threading.Thread):
                         self.capture_pixel_size,
                     )
                     status_image = None
-                    if self.status_capture_region is not None:
+                    if (self.status_capture_region is not None
+                            and (self.status_capture_interval is None
+                                 or captured_monotonic >= next_status_capture)):
                         status_image, _status_rect = capture_window(
                             self.window_title, self.status_capture_region
                         )
+                        if self.status_capture_interval is not None:
+                            next_status_capture = (
+                                captured_monotonic + self.status_capture_interval
+                            )
                 else:
                     image, window_rect = self.capture_fn(self.window_title)
                     status_image = None

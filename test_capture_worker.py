@@ -135,6 +135,16 @@ class CaptureWorkerTests(unittest.TestCase):
             stop.set()
             worker.join(0.5)
 
+    def test_status_capture_can_run_slower_than_minimap_capture(self) -> None:
+        stop = threading.Event()
+        bus = FrameBus()
+        worker = CaptureWorker(
+            "game", .02, bus, stop,
+            capture_fn=lambda _title: (Image.new("RGB", (2, 2)), (0, 0, 2, 2)),
+            status_capture_interval=.2,
+        )
+        self.assertEqual(worker.status_capture_interval, .2)
+
     def test_transient_capture_failure_does_not_kill_worker(self) -> None:
         attempts = 0
 

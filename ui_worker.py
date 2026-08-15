@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
+from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
 
@@ -184,6 +185,10 @@ class DebugSnapshot:
     marker_confidence: float
     marker_pixel_size: Optional[tuple[int, int]]
     coordinate_layout: Optional[CoordinateLayout]
+    scroll_y_diamonds: float = 0.0
+    world_y_diamonds: Optional[float] = None
+    structure_confidence: float = 0.0
+    structure_mode: str = "disabled"
 
 
 def build_debug_snapshot(
@@ -191,6 +196,7 @@ def build_debug_snapshot(
     detector: MinimapDetector,
     configured_map_name: str = "",
     diamond_size_tracker: Optional[DiamondSizeTracker] = None,
+    structure_tracker: Optional[MapStructureTracker] = None,
 ) -> DebugSnapshot:
     """Pure frame-to-view-model conversion, independently testable from Tk."""
 
@@ -216,6 +222,10 @@ def build_debug_snapshot(
             diamond_width=marker_width,
             diamond_height=marker_height,
         )
+    tracking = (
+        structure_tracker.analyze(frame, detection, marker)
+        if structure_tracker is not None else None
+    )
     return DebugSnapshot(
         sequence=frame.sequence,
         captured_at=frame.captured_at,
@@ -229,6 +239,10 @@ def build_debug_snapshot(
         marker_confidence=marker.confidence if marker is not None else 0.0,
         marker_pixel_size=(marker_width, marker_height) if marker is not None else None,
         coordinate_layout=coordinate_layout,
+        scroll_y_diamonds=(tracking.scroll_y_diamonds if tracking else 0.0),
+        world_y_diamonds=(tracking.world_y_diamonds if tracking else None),
+        structure_confidence=(tracking.confidence if tracking else 0.0),
+        structure_mode=(tracking.mode if tracking else "disabled"),
     )
 
 
@@ -275,6 +289,7 @@ class UiWorker(threading.Thread):
         refresh_ms: int = 100,
         patrol_controller: Optional[PatrolController] = None,
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
+        structure_tracker: Optional[MapStructureTracker] = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -289,6 +304,7 @@ class UiWorker(threading.Thread):
         self.refresh_ms = max(30, int(refresh_ms))
         self.patrol_controller = patrol_controller
         self.diamond_size_tracker = diamond_size_tracker
+        self.structure_tracker = structure_tracker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -428,6 +444,7 @@ class UiWorker(threading.Thread):
                     self.detector,
                     self.configured_map_name,
                     self.diamond_size_tracker,
+                    self.structure_tracker,
                 )
                 self._render(self.last_snapshot)
             except Exception:
@@ -497,6 +514,11 @@ class UiWorker(threading.Thread):
             f"Map-name crop: {_box_text(detection.map_name_box)}\n"
             f"Player: {player_text}  confidence={snapshot.marker_confidence:.3f}\n"
             f"Diamond: {diamond_text}\n"
+            f"Map scroll Y: {snapshot.scroll_y_diamonds:+.3f} diamonds\n"
+            f"World Y: "
+            f"{snapshot.world_y_diamonds if snapshot.world_y_diamonds is not None else 'unknown'}"
+            f"  structure={snapshot.structure_confidence:.3f} "
+            f"({snapshot.structure_mode})\n"
             f"Configured map: {snapshot.configured_map_name or 'unknown'}\n"
             f"Recognized map: {recognized_name}"
         ))
@@ -525,6 +547,7 @@ class UiWorker(threading.Thread):
                     self.detector,
                     self.configured_map_name,
                     self.diamond_size_tracker,
+                    self.structure_tracker,
                 )
                 self.last_snapshot = snapshot
                 self._render(snapshot)
@@ -540,11 +563,15 @@ class UiWorker(threading.Thread):
             )
             return
         try:
+            if self.structure_tracker is not None:
+                self.structure_tracker.save_reference()
             recorded = self.patrol_controller.record_endpoint(
                 boundary,
                 snapshot.player_x,
                 snapshot.player_y,
                 layout=snapshot.coordinate_layout,
+                world_y=snapshot.world_y_diamonds,
+                tracking_confidence=snapshot.structure_confidence,
             )
         except (OSError, ValueError) as exc:
             LOG.warning("record rejected: layer=%s point=%s error=%s",
@@ -650,6 +677,8 @@ class UiWorker(threading.Thread):
             self.on_patrol_stop()
         try:
             self.patrol_controller.reset_recording()
+            if getattr(self, "structure_tracker", None) is not None:
+                self.structure_tracker.reset(delete_reference=True)
         except OSError as exc:
             self._control_status.configure(text=f"Cannot reset recording: {exc}")
             return

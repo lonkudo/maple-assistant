@@ -9,7 +9,7 @@ the sender remains responsible for checking/focusing the configured window.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import queue
 import threading
@@ -52,6 +52,9 @@ class MinimapObservation:
     action: str = "unknown"
     marker_pixel_size: Optional[tuple[int, int]] = None
     analysis_size: Optional[tuple[int, int]] = None
+    world_y_diamonds: Optional[float] = None
+    structure_confidence: float = 0.0
+    scroll_y_diamonds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,23 @@ def detect_layer_by_y(
             continue
         gap = abs(float(layer["layer_y"]) - player_y)
         tolerance = float(layer.get("y_tolerance", 0.020000))
+        if gap <= tolerance:
+            candidates.append((gap, name))
+    return min(candidates)[1] if candidates else None
+
+
+def detect_layer_by_world_y(
+    world_y: float,
+    layers: dict[str, Any],
+) -> Optional[str]:
+    """Return nearest layer using scroll-compensated map-structure Y."""
+
+    candidates = []
+    for name, layer in layers.items():
+        if not isinstance(layer, dict) or "layer_world_y" not in layer:
+            continue
+        gap = abs(float(layer["layer_world_y"]) - float(world_y))
+        tolerance = float(layer.get("world_y_tolerance", 0.75))
         if gap <= tolerance:
             candidates.append((gap, name))
     return min(candidates)[1] if candidates else None
@@ -786,6 +806,7 @@ class MovementWorker(threading.Thread):
         minimap_detector: Any = None,
         patrol_controller: Any = None,
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
+        structure_tracker: Any = None,
         automation_active_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
@@ -851,8 +872,10 @@ class MovementWorker(threading.Thread):
         self.minimap_detector = minimap_detector
         self.patrol_controller = patrol_controller
         self.diamond_size_tracker = diamond_size_tracker
+        self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
+        self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
@@ -862,39 +885,60 @@ class MovementWorker(threading.Thread):
         self._climb_state = ClimbState()
         self._rope_approach_direction: Optional[str] = None
 
-    def _select_route_layer(self, player: Point) -> None:
+    def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
+        layers = {name: self.important_positions[name] for name in self._route_layers}
+        has_world_calibration = any(
+            isinstance(layer, dict) and "layer_world_y" in layer
+            for layer in layers.values()
+        )
+        if (has_world_calibration
+                and observation.world_y_diamonds is not None
+                and observation.structure_confidence >= 0.12):
+            detected = detect_layer_by_world_y(observation.world_y_diamonds, layers)
+            if detected is not None:
+                return detected
+            # During migration, layers not yet re-recorded have only raw Y.
+            # Restrict fallback to those legacy layers so a centered marker
+            # cannot override a valid world-Y match.
+            legacy_layers = {
+                name: layer for name, layer in layers.items()
+                if isinstance(layer, dict) and "layer_world_y" not in layer
+            }
+            if observation.player is not None and legacy_layers:
+                return detect_layer_by_y(observation.player.y, legacy_layers)
+            return None
+        if observation.player is None:
+            return None
+        return detect_layer_by_y(observation.player.y, layers)
+
+    def _select_route_layer(self, observation: MinimapObservation | Point) -> None:
+        if isinstance(observation, Point):
+            observation = MinimapObservation(
+                observation, None, 1.0, (0, 0, 1, 1)
+            )
         if self._route_layer_index is not None or not self._route_layers:
             return
-        candidate_index = min(
-            range(len(self._route_layers)),
-            key=lambda index: abs(
-                float(self.important_positions[self._route_layers[index]].get(
-                    "layer_y",
-                    self.important_positions[self._route_layers[index]]["left_most_pos"]["y"],
-                ))
-                - player.y
-            ),
-        )
-        candidate = self.important_positions[self._route_layers[candidate_index]]
-        layer_y = float(candidate.get("layer_y", candidate["left_most_pos"]["y"]))
-        gap = abs(layer_y - player.y)
-        tolerance = float(candidate.get("y_tolerance", 0.020000))
-        if gap > tolerance:
+        detected_name = self._detected_layer(observation)
+        if detected_name is None:
             if len(self._route_layers) == 1:
                 self._route_layer_index = 0
                 LOG.warning(
-                    "single-layer Y fallback: selected %s at marker_y=%.6f "
-                    "layer_y=%.6f gap=%.6f tolerance=%.6f",
-                    self._route_layers[0], player.y, layer_y, gap, tolerance,
+                    "single-layer fallback: selected %s marker_y=%s world_y=%s",
+                    self._route_layers[0],
+                    f"{observation.player.y:.6f}" if observation.player else "unknown",
+                    (f"{observation.world_y_diamonds:.3f}"
+                     if observation.world_y_diamonds is not None else "unknown"),
                 )
                 return
             LOG.warning(
-                "layer unknown: marker_y=%.6f nearest=%s layer_y=%.6f gap=%.6f tolerance=%.6f",
-                player.y, self._route_layers[candidate_index],
-                layer_y, gap, tolerance,
+                "layer unknown: marker_y=%s world_y=%s structure=%.3f",
+                f"{observation.player.y:.6f}" if observation.player else "unknown",
+                (f"{observation.world_y_diamonds:.3f}"
+                 if observation.world_y_diamonds is not None else "unknown"),
+                observation.structure_confidence,
             )
             return
-        self._route_layer_index = candidate_index
+        self._route_layer_index = self._route_layers.index(detected_name)
         LOG.info("route starting on %s: left-most -> right-most -> rope",
                  self._route_layers[self._route_layer_index])
 
@@ -908,10 +952,7 @@ class MovementWorker(threading.Thread):
 
         if observation.player is None or not self._route_layers:
             return None
-        detected_name = detect_layer_by_y(
-            observation.player.y,
-            {name: self.important_positions[name] for name in self._route_layers},
-        )
+        detected_name = self._detected_layer(observation)
         if detected_name is None:
             return None
         detected_index = self._route_layers.index(detected_name)
@@ -958,7 +999,7 @@ class MovementWorker(threading.Thread):
             return None, False, "patrol-paused"
         if observation.player is None or not self._route_layers:
             return self.fixed_target_x, True, "rope"
-        self._select_route_layer(observation.player)
+        self._select_route_layer(observation)
         if self._route_layer_index is None or self._route_layer_index >= len(self._route_layers):
             return None, False, "route-complete"
         name = self._route_layers[self._route_layer_index]
@@ -1062,6 +1103,12 @@ class MovementWorker(threading.Thread):
         layer = self.important_positions.get(self.first_layer)
         if not isinstance(layer, dict) or "layer_y" not in layer:
             return False
+        if (observation.world_y_diamonds is not None
+                and "layer_world_y" in layer
+                and observation.structure_confidence >= 0.12):
+            return abs(
+                observation.world_y_diamonds - float(layer["layer_world_y"])
+            ) <= float(layer.get("world_y_tolerance", 0.75))
         return abs(observation.player.y - float(layer["layer_y"])) <= float(
             layer.get("y_tolerance", 0.020000)
         )
@@ -1089,6 +1136,12 @@ class MovementWorker(threading.Thread):
             return False
         next_name = self._route_layers[self._route_layer_index + 1]
         layer = self.important_positions[next_name]
+        if (observation.world_y_diamonds is not None
+                and "layer_world_y" in layer
+                and observation.structure_confidence >= 0.12):
+            return abs(
+                observation.world_y_diamonds - float(layer["layer_world_y"])
+            ) <= float(layer.get("world_y_tolerance", 0.75))
         layer_y = float(layer.get("layer_y", layer["left_most_pos"]["y"]))
         tolerance = float(layer.get("y_tolerance", 0.020000))
         return abs(observation.player.y - layer_y) <= tolerance
@@ -1133,6 +1186,31 @@ class MovementWorker(threading.Thread):
                         )
                         self._last_minimap_box = minimap_detection.window_box
                 observation = analyze_minimap(frame, minimap_region)
+                if self.structure_tracker is not None and minimap_detection is not None:
+                    analysis_rgb = np.asarray(
+                        frame.image.crop(minimap_detection.analysis_box).convert("RGB")
+                    )
+                    structure_marker = detect_yellow_diamond(analysis_rgb)
+                    tracking = self.structure_tracker.analyze(
+                        frame, minimap_detection, structure_marker
+                    )
+                    observation = replace(
+                        observation,
+                        world_y_diamonds=tracking.world_y_diamonds,
+                        structure_confidence=tracking.confidence,
+                        scroll_y_diamonds=tracking.scroll_y_diamonds,
+                    )
+                    if tracking.mode != self._last_structure_mode:
+                        LOG.info(
+                            "MAP TRACKING mode=%s confidence=%.3f "
+                            "scroll_y=%+.3f world_y=%s",
+                            tracking.mode,
+                            tracking.confidence,
+                            tracking.scroll_y_diamonds,
+                            (f"{tracking.world_y_diamonds:.3f}"
+                             if tracking.world_y_diamonds is not None else "unknown"),
+                        )
+                        self._last_structure_mode = tracking.mode
                 coordinate_layout = None
                 if (minimap_detection is not None
                         and observation.marker_pixel_size is not None
@@ -1400,6 +1478,7 @@ __all__ = [
     "climb",
     "detect_marker",
     "detect_layer_by_y",
+    "detect_layer_by_world_y",
     "move_towards_rope",
     "move_to_left_most",
     "move_to_right_most",

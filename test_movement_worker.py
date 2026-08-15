@@ -16,6 +16,7 @@ from movement_worker import (
     analyze_minimap,
     detect_marker,
     detect_layer_by_y,
+    detect_layer_by_world_y,
     plan_movement,
     move_towards_rope,
     move_to_left_most,
@@ -499,6 +500,40 @@ class MovementTests(unittest.TestCase):
         )
         unknown._select_route_layer(Point(.5, .600000))
         self.assertIsNone(unknown._route_layer_index)
+
+    def test_centered_marker_uses_structure_world_y_for_layer_and_fall(self):
+        positions = {
+            "layer1": {
+                "layer_y": .5, "layer_world_y": 0.0,
+                "world_y_tolerance": .75,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+            "layer2": {
+                "layer_y": .5, "layer_world_y": -3.0,
+                "world_y_tolerance": .75,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+        )
+        upper = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-3.1, structure_confidence=.9,
+        )
+        worker._select_route_layer(upper)
+        self.assertEqual(worker._route_layer_index, 1)
+
+        fallen = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=.1, structure_confidence=.9,
+        )
+        self.assertEqual(worker._resync_route_layer(fallen), "layer1")
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(detect_layer_by_world_y(-3.1, positions), "layer2")
 
     def test_single_layer_start_uses_its_only_y_route_when_tolerance_misses(self):
         positions = {

@@ -91,8 +91,10 @@ def _stop_live_input(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Modular MapleStory screen assistant")
     parser.add_argument("--window-title", default="冒险岛怀旧服")
-    parser.add_argument("--interval", type=float, default=4.0,
-                        help="seconds between cropped screenshots (default: 4)")
+    parser.add_argument("--interval", type=float, default=0.25,
+                        help="seconds between minimap captures (default: 0.25)")
+    parser.add_argument("--status-interval", type=float, default=1.0,
+                        help="seconds between HP/MP captures (default: 1.0)")
     parser.add_argument("--attack-interval", type=float, default=2.0,
                         help="seconds between Ctrl attacks (default: 2)")
     parser.add_argument("--dry-run", action="store_true",
@@ -150,6 +152,7 @@ def main() -> int:
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
     from marker_detector import DiamondSizeTracker
+    from map_structure_tracker import MapStructureTracker
     from patrol_control import PatrolController
     from ui_worker import UiLogHandler, UiWorker
 
@@ -185,6 +188,12 @@ def main() -> int:
         args.recording_configuration.read_text(encoding="utf-8")
     )
     patrol_controller = PatrolController(args.recording_configuration, map_profile)
+    structure_reference = (
+        args.recording_configuration.parent
+        / "recording-assets"
+        / "map-structure-reference.png"
+    )
+    structure_tracker = MapStructureTracker(structure_reference)
 
     def stop_patrol_after_focus_loss() -> None:
         patrol_controller.set_enabled(False)
@@ -221,6 +230,7 @@ def main() -> int:
         args.debug_dir,
         capture_pixel_size=MINIMAP_CAPTURE_SIZE,
         status_capture_region=STATUS_CAPTURE_REGION,
+        status_capture_interval=args.status_interval,
         capture_enabled_event=game_focused,
     )
     core_workers = [
@@ -270,6 +280,7 @@ def main() -> int:
             minimap_detector=minimap_detector,
             patrol_controller=patrol_controller,
             diamond_size_tracker=movement_diamond_tracker,
+            structure_tracker=structure_tracker,
             automation_active_event=automation_active,
         ),
         StatusWorker(
@@ -299,6 +310,7 @@ def main() -> int:
             refresh_ms=args.ui_refresh_ms,
             patrol_controller=patrol_controller,
             diamond_size_tracker=ui_diamond_tracker,
+            structure_tracker=structure_tracker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active
             ),

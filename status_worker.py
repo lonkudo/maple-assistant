@@ -559,9 +559,12 @@ class StatusWorker(threading.Thread):
 
     def _process_frame(self, frame: object) -> None:
         status_image = getattr(frame, "status_image", None)
-        image = status_image if isinstance(status_image, Image.Image) else getattr(
-            frame, "image", frame
-        )
+        if hasattr(frame, "status_image"):
+            if status_image is None:
+                return
+            image = status_image
+        else:
+            image = getattr(frame, "image", frame)
         if not isinstance(image, Image.Image):
             LOG.warning("ignored frame without PIL image")
             return

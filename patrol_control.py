@@ -226,6 +226,22 @@ class PatrolController:
                     candidates.append((gap, name))
             return min(candidates)[1] if candidates else None
 
+    def layer_for_world_y(self, world_y: float) -> Optional[str]:
+        """Resolve a layer from scroll-compensated minimap structure Y."""
+
+        with self._lock:
+            layers = self._profile.get("layers", {})
+            candidates: list[tuple[float, str]] = []
+            for name in self._profile.get("route_order", list(layers)):
+                layer = layers.get(name)
+                if not isinstance(layer, dict) or "layer_world_y" not in layer:
+                    continue
+                gap = abs(float(layer["layer_world_y"]) - float(world_y))
+                tolerance = float(layer.get("world_y_tolerance", 0.75))
+                if gap <= tolerance:
+                    candidates.append((gap, name))
+            return min(candidates)[1] if candidates else None
+
     def layer_is_complete(self, layer_name: Optional[str] = None) -> bool:
         with self._lock:
             name = layer_name or self._selected_layer
@@ -266,6 +282,8 @@ class PatrolController:
         player_x: float,
         player_y: float,
         layout: Optional[CoordinateLayout] = None,
+        world_y: Optional[float] = None,
+        tracking_confidence: Optional[float] = None,
     ) -> RecordedEndpoint:
         """Record Left/Rope/Right for the selected calibration layer."""
 
@@ -282,18 +300,30 @@ class PatrolController:
                 match.group(1)
             ) > 1 else None
             lower_layer = layers.get(lower_name, {}) if lower_name else {}
-            if isinstance(lower_layer, dict) and "layer_y" in lower_layer:
-                lower_y = float(lower_layer["layer_y"])
-                separation = max(
-                    float(lower_layer.get("y_tolerance", 0.020000)),
-                    float(layer.get("y_tolerance", 0.020000)),
-                )
-                if float(player_y) >= lower_y - separation:
-                    raise ValueError(
-                        f"{layer_name} must be above {lower_name}: "
-                        f"Y must be below {lower_y - separation:.6f}"
+            if isinstance(lower_layer, dict):
+                if world_y is not None and "layer_world_y" in lower_layer:
+                    lower_world_y = float(lower_layer["layer_world_y"])
+                    separation = max(
+                        float(lower_layer.get("world_y_tolerance", 0.75)),
+                        float(layer.get("world_y_tolerance", 0.75)),
                     )
-            if "layer_y" in layer and layout is None:
+                    if float(world_y) >= lower_world_y - separation:
+                        raise ValueError(
+                            f"{layer_name} must be above {lower_name}: "
+                            f"world Y must be below {lower_world_y - separation:.6f}"
+                        )
+                elif world_y is None and "layer_y" in lower_layer:
+                    lower_y = float(lower_layer["layer_y"])
+                    separation = max(
+                        float(lower_layer.get("y_tolerance", 0.020000)),
+                        float(layer.get("y_tolerance", 0.020000)),
+                    )
+                    if float(player_y) >= lower_y - separation:
+                        raise ValueError(
+                            f"{layer_name} must be above {lower_name}: "
+                            f"Y must be below {lower_y - separation:.6f}"
+                        )
+            if "layer_y" in layer and layout is None and world_y is None:
                 gap = abs(float(layer["layer_y"]) - float(player_y))
                 tolerance = float(layer.get("y_tolerance", 0.020000))
                 if gap > tolerance:
@@ -305,6 +335,11 @@ class PatrolController:
             point["x"] = round(float(player_x), 6)
             point["y"] = round(float(player_y), 6)
             point["source"] = "manual-ui"
+            if world_y is not None:
+                point["world_y"] = round(float(world_y), 6)
+                point["tracking_confidence"] = round(
+                    float(tracking_confidence or 0.0), 6
+                )
             if layout is not None:
                 stable_x, stable_y = layout.stable_point(player_x, player_y)
                 point["coordinate_v2"] = {
@@ -329,6 +364,20 @@ class PatrolController:
                     len(manual_y_values) // 2
                 ]), 6)
                 layer["layer_y_source"] = "manual-ui"
+            manual_world_values = [
+                float(layer[name]["world_y"])
+                for name in REQUIRED_LAYER_POINTS
+                if isinstance(layer.get(name), dict)
+                and layer[name].get("source") == "manual-ui"
+                and "world_y" in layer[name]
+            ]
+            if manual_world_values:
+                layer["layer_world_y"] = round(float(sorted(manual_world_values)[
+                    len(manual_world_values) // 2
+                ]), 6)
+                layer["world_y_tolerance"] = round(float(
+                    layer.get("world_y_tolerance", 0.75)
+                ), 6)
             patrol_edges_ready = self._layer_has_points_locked(
                 layer_name, PATROL_EDGE_POINTS
             )

@@ -93,6 +93,24 @@ class PatrolControllerTests(unittest.TestCase):
             # Inactive layer calibration remains untouched.
             self.assertEqual(saved["layers"]["layer2"]["left_most_pos"]["x"], .3)
 
+    def test_scroll_compensated_world_y_allows_centered_marker_on_upper_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.json"
+            data = profile()
+            data["layers"]["layer1"]["layer_world_y"] = 0.0
+            controller = PatrolController(path, data)
+            controller.select_layer("layer2")
+
+            recorded = controller.record_endpoint(
+                "left_most_pos", .3, .70, world_y=-2.0,
+                tracking_confidence=.9,
+            )
+
+            self.assertEqual(recorded.layer, "layer2")
+            layer = controller.snapshot().layers["layer2"]
+            self.assertEqual(layer["layer_world_y"], -2.0)
+            self.assertEqual(layer["left_most_pos"]["tracking_confidence"], .9)
+
     def test_record_rejects_unknown_layer_y(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = PatrolController(Path(directory) / "map.json", profile())

@@ -6,6 +6,7 @@ __pycache__/
 
 work/
 outputs/
+recording-assets/
 
 *.log
 *.pid
