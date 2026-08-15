@@ -224,6 +224,8 @@ class CaptureWorker(threading.Thread):
         status_capture_region: Optional[NormalizedBox] = None,
         status_capture_interval: Optional[float] = None,
         capture_enabled_event: Optional[threading.Event] = None,
+        fast_capture_event: Optional[threading.Event] = None,
+        fast_interval: float = 0.10,
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
@@ -242,10 +244,17 @@ class CaptureWorker(threading.Thread):
             if status_capture_interval is not None else None
         )
         self.capture_enabled_event = capture_enabled_event
+        self.fast_capture_event = fast_capture_event
+        self.fast_interval = max(0.02, min(float(fast_interval), self.interval))
         self._uses_default_capture = capture_fn is None
         self.log = logging.getLogger(__name__)
         self._last_debug_path: Optional[Path] = None
         self._capture_requested = threading.Event()
+
+    def active_interval(self) -> float:
+        if self.fast_capture_event is not None and self.fast_capture_event.is_set():
+            return self.fast_interval
+        return self.interval
 
     def capture_now(self, timeout: float = 2.0) -> CapturedFrame:
         """Request a capture begun after this call and wait for its frame."""
@@ -278,6 +287,12 @@ class CaptureWorker(threading.Thread):
         next_capture = time.monotonic()
         next_status_capture = 0.0
         while not self.stop_event.is_set():
+            capture_interval = self.active_interval()
+            now = time.monotonic()
+            if next_capture - now > capture_interval:
+                # A climb/drop just began. Do not wait out the previous normal
+                # patrol deadline before switching to the faster cadence.
+                next_capture = now
             forced = self._capture_requested.is_set()
             enabled = (
                 self.capture_enabled_event is None
@@ -347,12 +362,12 @@ class CaptureWorker(threading.Thread):
                 # stop this thread immediately through stop_event.
                 self.log.exception("could not capture game window")
 
-            next_capture += self.interval
+            next_capture += capture_interval
             now = time.monotonic()
             if next_capture <= now:
                 # Skip missed ticks instead of emitting a burst of stale frames.
-                missed = int((now - next_capture) // self.interval) + 1
-                next_capture += missed * self.interval
+                missed = int((now - next_capture) // capture_interval) + 1
+                next_capture += missed * capture_interval
 
         # The current screenshot is useful only while the assistant is running.
         self._remove_last_debug_frame()

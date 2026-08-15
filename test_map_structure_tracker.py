@@ -103,6 +103,23 @@ class MapStructureTrackerTests(unittest.TestCase):
         self.assertGreater(result.confidence, .9)
         self.assertLess(abs(result.scroll_y_diamonds), 1.0)
 
+    def test_world_reanchor_preserves_tracking_state(self):
+        rng = np.random.default_rng(30)
+        canvas = rng.integers(0, 140, (160, 160, 3), dtype=np.uint8)
+        tracker = MapStructureTracker(tracking_size=128, minimum_response=.05)
+        first = tracker.analyze(
+            self.frame(0, canvas), self.detection(), self.marker()
+        )
+
+        tracker.reanchor_world_y(-7.5)
+        anchored = tracker.analyze(
+            self.frame(0, canvas), self.detection(), self.marker()
+        )
+
+        self.assertNotAlmostEqual(first.world_y_diamonds, -7.5)
+        self.assertAlmostEqual(anchored.world_y_diamonds, -7.5, places=6)
+        self.assertIn("world-reanchor", anchored.mode)
+
 
 if __name__ == "__main__":
     unittest.main()

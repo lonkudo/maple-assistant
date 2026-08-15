@@ -1114,8 +1114,16 @@ class MovementWorker(threading.Thread):
                 first_layer.get("layer_world_y")
                 if isinstance(first_layer, dict) else None
             )
+            reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
             start_session = getattr(self.structure_tracker, "start_session", None)
-            if anchor_world_y is not None and callable(start_session):
+            if anchor_world_y is not None and callable(reanchor):
+                reanchor(float(anchor_world_y))
+                LOG.info(
+                    "MAP LOOP reset world Y at %s=%.6f",
+                    self.first_layer,
+                    float(anchor_world_y),
+                )
+            elif anchor_world_y is not None and callable(start_session):
                 start_session(float(anchor_world_y))
                 LOG.info(
                     "MAP LOOP reset world Y at %s=%.6f",
@@ -1293,6 +1301,39 @@ class MovementWorker(threading.Thread):
                 key_up("up")
             self._climb_state.up_held = False
 
+    def _current_layer_world_y(self) -> Optional[float]:
+        if (self._route_layer_index is None
+                or not 0 <= self._route_layer_index < len(self._route_layers)):
+            return None
+        layer = self.important_positions.get(
+            self._route_layers[self._route_layer_index], {}
+        )
+        if not isinstance(layer, dict) or "layer_world_y" not in layer:
+            return None
+        return float(layer["layer_world_y"])
+
+    def _pin_stationary_layer_world_y(
+        self, observation: MinimapObservation
+    ) -> MinimapObservation:
+        """Ignore OpenCV vertical aliases while no vertical action is active."""
+
+        if self._climb_state.up_held or self._climb_state.phase != "idle":
+            return observation
+        canonical = self._current_layer_world_y()
+        if canonical is None:
+            return observation
+        return replace(
+            observation,
+            world_y_diamonds=canonical,
+            structure_confidence=max(observation.structure_confidence, 1.0),
+        )
+
+    def _reanchor_tracker_to_current_layer(self) -> None:
+        canonical = self._current_layer_world_y()
+        reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
+        if canonical is not None and callable(reanchor):
+            reanchor(canonical)
+
     def run(self) -> None:
         LOG.info("movement worker started (%s)", "DRY-RUN" if getattr(self.key_sender, "dry_run", True) else "LIVE")
         while not self.stop_event.is_set():
@@ -1396,6 +1437,7 @@ class MovementWorker(threading.Thread):
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.
                 self._resync_route_layer(observation)
+                observation = self._pin_stationary_layer_world_y(observation)
                 route_target_x, route_is_rope, route_label = self._route_target(observation)
                 if self._advance_route_endpoint(observation, route_target_x):
                     route_target_x, route_is_rope, route_label = self._route_target(observation)
@@ -1564,6 +1606,8 @@ class MovementWorker(threading.Thread):
                         if now - self._last_climb_attempt < 2.0:
                             continue
                         self._last_climb_attempt = now
+                        if self._climb_state.phase == "idle":
+                            self._reanchor_tracker_to_current_layer()
                         # Direction comes from character X versus Rope X. At
                         # an exactly quantized X, retain the last observed side
                         # of approach instead of using a fixed right-first rule.

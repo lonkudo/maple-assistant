@@ -145,6 +145,19 @@ class CaptureWorkerTests(unittest.TestCase):
         )
         self.assertEqual(worker.status_capture_interval, .2)
 
+    def test_vertical_action_selects_fast_capture_interval(self) -> None:
+        stop = threading.Event()
+        fast = threading.Event()
+        worker = CaptureWorker(
+            "game", .25, FrameBus(), stop,
+            capture_fn=lambda _title: (Image.new("RGB", (2, 2)), (0, 0, 2, 2)),
+            fast_capture_event=fast,
+            fast_interval=.10,
+        )
+        self.assertEqual(worker.active_interval(), .25)
+        fast.set()
+        self.assertEqual(worker.active_interval(), .10)
+
     def test_transient_capture_failure_does_not_kill_worker(self) -> None:
         attempts = 0
 
@@ -164,7 +177,10 @@ class CaptureWorkerTests(unittest.TestCase):
         worker.join(timeout=0.5)
 
         self.assertIsNotNone(frame)
-        self.assertEqual(frame.sequence, 0)
+        # The bus intentionally exposes the newest frame, so a fast worker may
+        # publish more valid frames before this thread resumes.
+        self.assertGreaterEqual(frame.sequence, 0)
+        self.assertGreaterEqual(attempts, 2)
         self.assertFalse(worker.is_alive())
 
     def test_debug_dir_keeps_only_current_frame_and_cleans_on_stop(self) -> None:

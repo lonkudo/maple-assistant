@@ -242,6 +242,8 @@ def main() -> int:
         status_capture_region=STATUS_CAPTURE_REGION,
         status_capture_interval=args.status_interval,
         capture_enabled_event=game_focused,
+        fast_capture_event=climbing_active,
+        fast_interval=0.10,
     )
 
     def prepare_map_session() -> None:

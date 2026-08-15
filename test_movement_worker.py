@@ -164,6 +164,37 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(tracker.anchors, [-.4])
         self.assertEqual(worker._route_layer_index, 0)
 
+    def test_stationary_patrol_pins_world_y_and_climb_reanchors_tracker(self):
+        class Tracker:
+            def __init__(self): self.anchors = []
+            def reanchor_world_y(self, world_y): self.anchors.append(world_y)
+
+        positions = {
+            "layer1": {
+                "layer_world_y": -.4,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+        }
+        tracker = Tracker()
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer1"],
+            structure_tracker=tracker,
+        )
+        worker._route_layer_index = 0
+        aliased = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=2.4, structure_confidence=.95,
+        )
+
+        pinned = worker._pin_stationary_layer_world_y(aliased)
+        worker._reanchor_tracker_to_current_layer()
+
+        self.assertEqual(pinned.world_y_diamonds, -.4)
+        self.assertEqual(tracker.anchors, [-.4])
+
     def test_same_layer_does_not_restart_patrol_phase(self):
         positions = {
             "layer1": {"layer_y": .70, "y_tolerance": .02,

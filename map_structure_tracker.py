@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from pathlib import Path
 import threading
@@ -216,6 +216,32 @@ class MapStructureTracker:
             self._pending_anchor_world_y = float(anchor_world_y)
             self._last_sequence = -1
             self._last_result = None
+
+    def reanchor_world_y(self, anchor_world_y: float) -> None:
+        """Adjust only the world origin while preserving frame continuity."""
+
+        with self._lock:
+            anchor = float(anchor_world_y)
+            if (self._last_result is None
+                    or self._last_result.world_y_diamonds is None):
+                self._pending_anchor_world_y = anchor
+                return
+            correction = anchor - self._last_result.world_y_diamonds
+            self._world_bias += correction
+            self._pending_anchor_world_y = None
+            self._last_result = replace(
+                self._last_result,
+                scroll_y_diamonds=(
+                    self._last_result.scroll_y_diamonds + correction
+                ),
+                world_y_diamonds=anchor,
+                mode=f"world-reanchor/{self._last_result.mode}",
+            )
+            LOG.info(
+                "MAP TRACKING world Y re-anchored at %.6f correction=%+.3f",
+                anchor,
+                correction,
+            )
 
     def _marker_height_normalized(
         self,
