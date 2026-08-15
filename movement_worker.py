@@ -1103,6 +1103,25 @@ class MovementWorker(threading.Thread):
             self.climbing_active_event.clear()
         if self.near_rope_event is not None:
             self.near_rope_event.clear()
+        returned_to_first = (
+            self.first_layer is not None
+            and detected_name == self.first_layer
+            and previous_name != self.first_layer
+        )
+        if returned_to_first and self.structure_tracker is not None:
+            first_layer = self.important_positions.get(self.first_layer, {})
+            anchor_world_y = (
+                first_layer.get("layer_world_y")
+                if isinstance(first_layer, dict) else None
+            )
+            start_session = getattr(self.structure_tracker, "start_session", None)
+            if anchor_world_y is not None and callable(start_session):
+                start_session(float(anchor_world_y))
+                LOG.info(
+                    "MAP LOOP reset world Y at %s=%.6f",
+                    self.first_layer,
+                    float(anchor_world_y),
+                )
         if was_climbing:
             LOG.info("CLIMB complete: detected %s at y=%.6f",
                      detected_name, observation.player.y)

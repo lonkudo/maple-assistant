@@ -126,6 +126,44 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._climb_state.phase, "idle")
         self.assertEqual(sender.released, ["up"])
 
+    def test_return_to_first_layer_resets_world_y_for_next_loop(self):
+        class Sender:
+            def key_up(self, key): return True
+
+        class Tracker:
+            def __init__(self): self.anchors = []
+            def start_session(self, world_y): self.anchors.append(world_y)
+
+        positions = {
+            "layer1": {
+                "layer_world_y": -.4, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+            "layer2": {
+                "layer_world_y": -7.4, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+        }
+        tracker = Tracker()
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer1", "layer2"],
+            first_layer="layer1",
+            structure_tracker=tracker,
+        )
+        worker._route_layer_index = 1
+        returned = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-.35, structure_confidence=.9,
+        )
+
+        self.assertEqual(worker._resync_route_layer(returned), "layer1")
+        self.assertEqual(tracker.anchors, [-.4])
+        self.assertEqual(worker._route_layer_index, 0)
+
     def test_same_layer_does_not_restart_patrol_phase(self):
         positions = {
             "layer1": {"layer_y": .70, "y_tolerance": .02,
