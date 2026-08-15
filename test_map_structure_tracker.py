@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -80,6 +81,27 @@ class MapStructureTrackerTests(unittest.TestCase):
 
         self.assertAlmostEqual(anchored.world_y_diamonds, -3.25, places=6)
         self.assertIn("session-anchor", anchored.mode)
+
+    def test_high_confidence_incremental_wins_over_repeating_reference_alias(self):
+        rng = np.random.default_rng(21)
+        canvas = rng.integers(0, 140, (160, 160, 3), dtype=np.uint8)
+        tracker = MapStructureTracker(tracking_size=128, minimum_response=.05)
+        tracker.analyze(self.frame(0, canvas), self.detection(), self.marker())
+
+        # Absolute matching locks onto a repeated platform 30 px away with a
+        # weak response. Frame-to-frame tracking sees the real smooth 3 px
+        # movement with high confidence and must preserve continuity.
+        with patch(
+            "map_structure_tracker.cv2.phaseCorrelate",
+            side_effect=[((0.0, 30.0), .15), ((0.0, 3.0), .95)],
+        ):
+            result = tracker.analyze(
+                self.frame(1, canvas), self.detection(), self.marker()
+            )
+
+        self.assertEqual(result.mode, "incremental")
+        self.assertGreater(result.confidence, .9)
+        self.assertLess(abs(result.scroll_y_diamonds), 1.0)
 
 
 if __name__ == "__main__":

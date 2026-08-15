@@ -112,43 +112,63 @@ class MapStructureTracker:
                 shift_y = 0.0
                 offset = 0.0
             else:
-                (shift_x, shift_y), response = cv2.phaseCorrelate(
+                (reference_x, reference_y), reference_response = cv2.phaseCorrelate(
                     self._reference, structure, self._window
                 )
-                accepted = (
-                    np.isfinite(shift_x) and np.isfinite(shift_y)
-                    and abs(shift_x) <= self.tracking_size * self.maximum_shift_fraction
-                    and abs(shift_y) <= self.tracking_size * self.maximum_shift_fraction
-                    and response >= self.minimum_response
+                reference_valid = (
+                    np.isfinite(reference_x) and np.isfinite(reference_y)
+                    and abs(reference_x) <= self.tracking_size * self.maximum_shift_fraction
+                    and abs(reference_y) <= self.tracking_size * self.maximum_shift_fraction
+                    and reference_response >= self.minimum_response
                 )
-                mode = "reference"
-                if not accepted and self._previous is not None:
+                incremental_valid = False
+                incremental_x = incremental_y = 0.0
+                incremental_response = 0.0
+                if self._previous is not None:
                     (incremental_x, incremental_y), incremental_response = cv2.phaseCorrelate(
                         self._previous, structure, self._window
                     )
-                    accepted = (
+                    incremental_valid = (
                         np.isfinite(incremental_x) and np.isfinite(incremental_y)
                         and abs(incremental_x) <= self.tracking_size * self.maximum_shift_fraction
                         and abs(incremental_y) <= self.tracking_size * self.maximum_shift_fraction
                         and incremental_response >= self.minimum_response
                     )
-                    if accepted:
-                        shift_y = incremental_y
-                        response = incremental_response
-                        mode = "incremental"
-                if not accepted:
+                marker_height_normalized = self._marker_height_normalized(
+                    marker, detection
+                )
+                reference_offset = -float(reference_y) / marker_height_normalized
+                incremental_offset = (
+                    self._previous_offset
+                    - float(incremental_y) / marker_height_normalized
+                )
+                prefer_incremental = (
+                    incremental_valid
+                    and (
+                        not reference_valid
+                        or incremental_response >= reference_response + 0.05
+                        or (
+                            abs(reference_offset - self._previous_offset) > 1.50
+                            and abs(incremental_offset - self._previous_offset) < 0.75
+                        )
+                    )
+                )
+                if prefer_incremental:
+                    shift_y = incremental_y
+                    response = incremental_response
+                    offset = incremental_offset
+                    mode = "incremental"
+                elif reference_valid:
+                    shift_y = reference_y
+                    response = reference_response
+                    offset = reference_offset
+                    mode = "reference"
+                else:
                     shift_y = 0.0
                     offset = self._previous_offset
                     mode = "uncertain"
-                    response = max(0.0, float(response))
-                else:
-                    marker_height_normalized = self._marker_height_normalized(
-                        marker, detection
-                    )
-                    delta_diamonds = -float(shift_y) / marker_height_normalized
-                    offset = (
-                        self._previous_offset + delta_diamonds
-                        if mode == "incremental" else delta_diamonds
+                    response = max(
+                        0.0, float(reference_response), float(incremental_response)
                     )
 
             local_y = self._local_marker_y_diamonds(marker, detection)
