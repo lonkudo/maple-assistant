@@ -111,6 +111,32 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertEqual(layer["layer_world_y"], -2.0)
             self.assertEqual(layer["left_most_pos"]["tracking_confidence"], .9)
 
+    def test_later_endpoint_inherits_established_layer_world_y(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.json"
+            data = profile()
+            data["layers"]["layer1"]["layer_world_y"] = 0.0
+            controller = PatrolController(path, data)
+            controller.select_layer("layer2")
+
+            controller.record_endpoint(
+                "left_most_pos", .3, .56, world_y=-7.25,
+                tracking_confidence=.95,
+            )
+            # Repeating platform graphics can alias to the lower layer while
+            # walking horizontally. The explicit selected layer remains the
+            # authority after its first point establishes canonical world Y.
+            controller.record_endpoint(
+                "right_most_pos", .7, .56, world_y=-.10,
+                tracking_confidence=.90,
+            )
+
+            layer = controller.snapshot().layers["layer2"]
+            right = layer["right_most_pos"]
+            self.assertEqual(layer["layer_world_y"], -7.25)
+            self.assertEqual(right["world_y"], -7.25)
+            self.assertEqual(right["observed_world_y"], -.10)
+
     def test_record_rejects_unknown_layer_y(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = PatrolController(Path(directory) / "map.json", profile())

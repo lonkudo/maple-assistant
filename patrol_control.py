@@ -300,14 +300,25 @@ class PatrolController:
                 match.group(1)
             ) > 1 else None
             lower_layer = layers.get(lower_name, {}) if lower_name else {}
+            # The first recorded point establishes a layer-level world Y.
+            # Horizontal movement across a repeating minimap can make phase
+            # correlation briefly lock onto another identical platform. Once
+            # established, explicit recordings on this selected layer inherit
+            # its canonical Y instead of treating that visual alias as a new
+            # layer. Keep the measured value separately for diagnostics.
+            observed_world_y = float(world_y) if world_y is not None else None
+            canonical_world_y = (
+                float(layer["layer_world_y"])
+                if "layer_world_y" in layer else observed_world_y
+            )
             if isinstance(lower_layer, dict):
-                if world_y is not None and "layer_world_y" in lower_layer:
+                if canonical_world_y is not None and "layer_world_y" in lower_layer:
                     lower_world_y = float(lower_layer["layer_world_y"])
                     separation = max(
                         float(lower_layer.get("world_y_tolerance", 0.75)),
                         float(layer.get("world_y_tolerance", 0.75)),
                     )
-                    if float(world_y) >= lower_world_y - separation:
+                    if canonical_world_y >= lower_world_y - separation:
                         raise ValueError(
                             f"{layer_name} must be above {lower_name}: "
                             f"world Y must be below {lower_world_y - separation:.6f}"
@@ -335,8 +346,10 @@ class PatrolController:
             point["x"] = round(float(player_x), 6)
             point["y"] = round(float(player_y), 6)
             point["source"] = "manual-ui"
-            if world_y is not None:
-                point["world_y"] = round(float(world_y), 6)
+            if canonical_world_y is not None:
+                point["world_y"] = round(canonical_world_y, 6)
+                if observed_world_y is not None:
+                    point["observed_world_y"] = round(observed_world_y, 6)
                 point["tracking_confidence"] = round(
                     float(tracking_confidence or 0.0), 6
                 )
