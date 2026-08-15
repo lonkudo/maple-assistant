@@ -1,0 +1,46 @@
+{
+  "map": "金银岛/射手训练场 I",
+  "minimap_region": [0.0, 0.075, 0.12, 0.24],
+  "rope_x": 0.492600,
+  "calibrated_player_y": 0.656250,
+  "horizontal_tolerance": 0.010000,
+  "aligned_frames_required": 2,
+  "movement_hold_seconds": 2.0,
+  "minimum_final_hold_seconds": 0.08,
+  "minimum_movement_hold_seconds": 0.30,
+  "estimated_minimap_speed": 0.110000,
+  "final_calculation_distance": 0.035000,
+  "estimated_final_speed": 0.205000,
+  "final_move_safety_gain": 0.950000,
+  "climb_up_hold_seconds": 0.45,
+  "climb_nudge_seconds": 0.10,
+  "climb_y_change_required": 0.015000,
+  "climb_failed_shift_right_seconds": 0.1,
+  "drop_chord_hold_seconds": 0.10,
+  "drop_retry_seconds": 1.0,
+  "near_rope_seconds": 0.5,
+  "near_rope_range": 0.022500,
+  "patrol_enabled": false,
+  "captured_client_size": [1707, 1067],
+  "source_capture": "work/rope-six-decimal-20260812-172000.png",
+  "source_marker_pixel_x": 100.5,
+  "important_positions": {
+    "layer1": {
+      "left_most_pos": {
+        "x": 0.186275,
+        "y": 0.698864,
+        "marker_pixel_x": 38.000000,
+        "marker_pixel_y": 123.000000,
+        "source_capture": "work/layer1-left-most-20260812-163728.png"
+      },
+      "right_most_pos": {
+        "x": 0.806373,
+        "y": 0.698864,
+        "marker_pixel_x": 164.500000,
+        "marker_pixel_y": 123.000000,
+        "source_capture": "work/layer1-right-most-20260812-163835.png"
+      }
+    }
+  },
+  "note": "Fresh rope capture at 17:20:00: #ffff88 marker center measured pixel (100.500000, 115.500000), normalized (0.492647, 0.656250). All movement coordinates are stored to six decimal places."
+}

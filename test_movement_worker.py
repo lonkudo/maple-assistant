@@ -1,0 +1,696 @@
+import queue
+import threading
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+from PIL import Image
+
+from capture_worker import CapturedFrame
+from movement_worker import (
+    MinimapObservation,
+    MovementDecision,
+    ClimbState,
+    MovementWorker,
+    Point,
+    analyze_minimap,
+    detect_marker,
+    detect_layer_by_y,
+    plan_movement,
+    move_towards_rope,
+    move_to_left_most,
+    move_to_right_most,
+    climb,
+    _send_tap,
+    _drop_through_platform,
+)
+
+
+def diamond(image, cx, cy, radius=4):
+    for y in range(-radius, radius + 1):
+        for x in range(-radius, radius + 1):
+            if abs(x) + abs(y) <= radius:
+                image[cy + y, cx + x] = (255, 255, 136)
+
+
+class MovementTests(unittest.TestCase):
+    def test_drop_is_simultaneous_alt_down_chord(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key):
+                self.events.append(("down", key)); return True
+            def key_up(self, key):
+                self.events.append(("up", key)); return True
+        sender = Sender()
+        with patch("movement_worker.time.sleep") as sleep:
+            self.assertTrue(_drop_through_platform(sender, .10))
+        sleep.assert_called_once_with(.10)
+        self.assertEqual(sender.events, [
+            ("down", "down"), ("down", "alt"),
+            ("up", "alt"), ("up", "down"),
+        ])
+
+    def test_final_layer_drops_instead_of_targeting_rope_then_resets(self):
+        positions = {
+            "layer1": {"layer_y": .70, "y_tolerance": .02,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+            "layer2": {"layer_y": .56, "y_tolerance": .02,
+                       "left_most_pos": {"x": .3, "y": .56},
+                       "right_most_pos": {"x": .6, "y": .56}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+            final_layer_action="drop_to_first_layer", first_layer="layer1",
+        )
+        worker._route_layer_index = 1
+        worker._route_phase = "rope"
+        on_final = MinimapObservation(Point(.6, .56), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._route_target(on_final),
+                         (None, False, "layer2.drop-to-first"))
+        self.assertFalse(worker._on_first_layer(on_final))
+        on_first = MinimapObservation(Point(.6, .70), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._on_first_layer(on_first))
+        worker._reset_route_loop()
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(worker._route_phase, "left")
+
+    def test_y_only_incomplete_layer_can_be_detected(self):
+        layers = {
+            "layer1": {"layer_y": .698864, "y_tolerance": .02},
+            "layer2": {"layer_y": .565341, "y_tolerance": .02,
+                       "calibration_status": "awaiting_left_and_right_positions"},
+        }
+        self.assertEqual(detect_layer_by_y(.565000, layers), "layer2")
+        self.assertIsNone(detect_layer_by_y(.620000, layers))
+
+    def test_fall_resyncs_to_detected_layer_patrol(self):
+        class Sender:
+            def __init__(self): self.released = []
+            def key_up(self, key): self.released.append(key); return True
+
+        positions = {
+            "layer1": {"layer_y": .70, "y_tolerance": .02,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+            "layer2": {"layer_y": .56, "y_tolerance": .02,
+                       "left_most_pos": {"x": .3, "y": .56},
+                       "right_most_pos": {"x": .6, "y": .56}},
+        }
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+        )
+        worker._route_layer_index = 1
+        worker._route_phase = "rope"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        fallen = MinimapObservation(Point(.5, .70), None, .9, (0, 0, 1, 1))
+
+        self.assertEqual(worker._resync_route_layer(fallen), "layer1")
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(worker._climb_state.phase, "idle")
+        self.assertEqual(sender.released, ["up"])
+
+    def test_same_layer_does_not_restart_patrol_phase(self):
+        positions = {
+            "layer1": {"layer_y": .70, "y_tolerance": .02,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1"],
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        same = MinimapObservation(Point(.5, .699), None, .9, (0, 0, 1, 1))
+
+        self.assertEqual(worker._resync_route_layer(same), "layer1")
+        self.assertEqual(worker._route_phase, "right")
+
+    def test_layer_resync_ignores_player_x(self):
+        positions = {
+            "layer1": {"layer_y": .70, "y_tolerance": .02,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+            "layer2": {"layer_y": .56, "y_tolerance": .02,
+                       "left_most_pos": {"x": .3, "y": .56},
+                       "right_most_pos": {"x": .6, "y": .56}},
+        }
+        for player_x in (.0, .25, .50, .75, 1.0):
+            worker = MovementWorker(
+                queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+                important_positions=positions,
+                route_order=["layer1", "layer2"],
+            )
+            observation = MinimapObservation(
+                Point(player_x, .560), None, .9, (0, 0, 1, 1)
+            )
+            self.assertEqual(worker._resync_route_layer(observation), "layer2")
+            self.assertEqual(worker._route_layer_index, 1)
+
+    def test_left_and_right_boundary_movement_are_independent(self):
+        observation = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        left = move_to_left_most(observation, Point(.2, .7))
+        right = move_to_right_most(observation, Point(.8, .7))
+        self.assertEqual((left.stage, left.decision.key, left.decision.duration),
+                         ("move-to-left-most", "left", 2.0))
+        self.assertEqual((right.stage, right.decision.key, right.decision.duration),
+                         ("move-to-right-most", "right", 2.0))
+
+    def test_boundary_functions_accept_crossing_without_correction(self):
+        crossed_left = MinimapObservation(Point(.15, .7), None, .9, (0, 0, 1, 1))
+        crossed_right = MinimapObservation(Point(.85, .7), None, .9, (0, 0, 1, 1))
+        left = move_to_left_most(crossed_left, Point(.2, .7))
+        right = move_to_right_most(crossed_right, Point(.8, .7))
+        self.assertTrue(left.reached_or_crossed)
+        self.assertTrue(right.reached_or_crossed)
+        self.assertIsNone(left.decision.key)
+        self.assertIsNone(right.decision.key)
+
+    def test_move_towards_rope_has_distinct_travel_and_climb_stages(self):
+        far = MinimapObservation(Point(.20, .70), None, .9, (0, 0, 1, 1))
+        near = MinimapObservation(Point(.47, .70), None, .9, (0, 0, 1, 1))
+        far_plan = move_towards_rope(far, .4926470588, .0325)
+        near_plan = move_towards_rope(near, .4926470588, .0325)
+        self.assertEqual(far_plan.stage, "move-to-rope-edge")
+        self.assertEqual(far_plan.decision.key, "right")
+        self.assertAlmostEqual(far_plan.target_x, .4601470588)
+        self.assertAlmostEqual(far_plan.gap, .2601470588)
+        self.assertEqual(near_plan.stage, "climb")
+        self.assertEqual(near_plan.decision.key, "jump_climb_right")
+
+    def test_rope_approach_targets_nearest_zone_edge(self):
+        rope_x, near_range = .492600, .022500
+        left = MinimapObservation(Point(.300000, .7), None, .9, (0, 0, 1, 1))
+        right = MinimapObservation(Point(.700000, .7), None, .9, (0, 0, 1, 1))
+        left_plan = move_towards_rope(left, rope_x, near_range)
+        right_plan = move_towards_rope(right, rope_x, near_range)
+        self.assertAlmostEqual(left_plan.target_x, .470100, places=6)
+        self.assertEqual(left_plan.decision.key, "right")
+        self.assertAlmostEqual(right_plan.target_x, .515100, places=6)
+        self.assertEqual(right_plan.decision.key, "left")
+
+    def test_final_edge_approach_is_calculated_not_full_two_seconds(self):
+        observation = MinimapObservation(Point(.450000, .7), None, .9,
+                                         (0, 0, 1, 1))
+        plan = move_towards_rope(
+            observation, .492600, .022500,
+            estimated_final_speed=.205, final_move_safety_gain=.95,
+            movement_hold_seconds=2.0, minimum_final_hold_seconds=.08,
+        )
+        self.assertEqual(plan.decision.key, "right")
+        self.assertLess(plan.decision.duration, .2)
+
+    def test_rope_hold_stays_fixed_until_final_edge_zone(self):
+        observation = MinimapObservation(Point(.300000, .7), None, .9,
+                                         (0, 0, 1, 1))
+        plan = move_towards_rope(
+            observation, .492600, .022500,
+            final_calculation_distance=.04,
+            estimated_final_speed=.205,
+            movement_hold_seconds=2.0,
+        )
+        self.assertEqual(plan.decision.key, "right")
+        self.assertEqual(plan.decision.duration, 2.0)
+        self.assertIn("outside edge zone", plan.decision.reason)
+
+    def test_rope_hold_reduces_only_inside_final_edge_zone(self):
+        observation = MinimapObservation(Point(.450000, .7), None, .9,
+                                         (0, 0, 1, 1))
+        plan = move_towards_rope(
+            observation, .492600, .022500,
+            final_calculation_distance=.04,
+            estimated_final_speed=.205,
+            final_move_safety_gain=.95,
+            movement_hold_seconds=2.0,
+            minimum_final_hold_seconds=.08,
+        )
+        self.assertLess(plan.decision.duration, 2.0)
+        self.assertIn("inside edge zone", plan.decision.reason)
+
+    def test_rope_edge_movement_enforces_configured_minimum_hold(self):
+        observation = MinimapObservation(Point(.465000, .7), None, .9,
+                                         (0, 0, 1, 1))
+        plan = move_towards_rope(
+            observation, .492600, .022500,
+            estimated_final_speed=.205,
+            movement_hold_seconds=2.0,
+            minimum_movement_hold_seconds=.50,
+        )
+        self.assertEqual(plan.decision.key, "right")
+        self.assertEqual(plan.decision.duration, .50)
+
+    def test_climb_direction_comes_from_character_side_of_rope(self):
+        rope_x = .492647
+        left_side = MinimapObservation(Point(.480000, .70), None, .9, (0, 0, 1, 1))
+        right_side = MinimapObservation(Point(.505000, .70), None, .9, (0, 0, 1, 1))
+        self.assertEqual(
+            move_towards_rope(left_side, rope_x, .032500).decision.key,
+            "jump_climb_right",
+        )
+        self.assertEqual(
+            move_towards_rope(right_side, rope_x, .032500).decision.key,
+            "jump_climb_left",
+        )
+
+    def test_directional_jump_holds_up_immediately_without_gap(self):
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.events = []
+            def key_down(self, key):
+                self.events.append(("down", key))
+                return True
+            def key_up(self, key):
+                self.events.append(("up", key))
+                return True
+            def press(self, key, duration=0):
+                self.events.append(("press", key, duration))
+                return True
+
+        sender = Sender()
+        with patch("movement_worker.time.sleep") as sleep:
+            from movement_worker import _directional_jump_climb
+            self.assertTrue(_directional_jump_climb(sender, "right", .10, .45))
+        # The only sleep is the Alt+Right chord hold. There is no post-jump
+        # delay before press("up") begins.
+        sleep.assert_called_once_with(.10)
+        self.assertEqual(sender.events[-1], ("press", "up", .45))
+
+    def test_persistent_climb_keeps_up_owned_until_next_layer(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []; self.owned = set()
+            def key_down(self, key):
+                self.events.append(("down", key)); self.owned.add(key); return True
+            def key_up(self, key):
+                self.events.append(("up", key)); self.owned.discard(key); return True
+            def press(self, key, duration=0):
+                self.events.append(("press", key, duration)); return True
+
+        sender, state = Sender(), ClimbState()
+        start = MinimapObservation(Point(.48, .70), None, .9, (0, 0, 1, 1))
+        moving = MinimapObservation(Point(.49, .66), None, .9, (0, 0, 1, 1))
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, start, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "right-toward-rope")
+            self.assertIn("up", sender.owned)
+            self.assertEqual(climb(sender, moving, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "climbing-up")
+            self.assertIn("up", sender.owned)
+        self.assertNotIn(("up", "up"), sender.events)
+
+    def test_next_layer_y_controls_climb_completion(self):
+        positions = {
+            "layer1": {"layer_y": .698864, "y_tolerance": .02,
+                       "left_most_pos": {"x": .2, "y": .698864},
+                       "right_most_pos": {"x": .8, "y": .698864}},
+            "layer2": {"layer_y": .565341, "y_tolerance": .02,
+                       "left_most_pos": {"x": .28, "y": .565341},
+                       "right_most_pos": {"x": .63, "y": .565341}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.4926,
+            important_positions=positions, route_order=["layer1", "layer2"],
+        )
+        worker._route_layer_index = 0
+        self.assertFalse(worker._next_layer_reached(
+            MinimapObservation(Point(.49, .62), None, .9, (0, 0, 1, 1))))
+        self.assertTrue(worker._next_layer_reached(
+            MinimapObservation(Point(.49, .565341), None, .9, (0, 0, 1, 1))))
+
+    def test_aligned_marker_keeps_last_approach_direction(self):
+        rope_x = .492647
+        aligned = MinimapObservation(Point(rope_x, .70), None, .9, (0, 0, 1, 1))
+        self.assertEqual(
+            move_towards_rope(aligned, rope_x, .032500,
+                              aligned_direction="right").decision.key,
+            "jump_climb_right",
+        )
+        self.assertEqual(
+            move_towards_rope(aligned, rope_x, .032500,
+                              aligned_direction="left").decision.key,
+            "jump_climb_left",
+        )
+
+    def test_layer_route_is_left_then_right_then_rope(self):
+        positions = {
+            "layer1": {
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            fixed_target_x=.5, important_positions=positions,
+        )
+        at_left = MinimapObservation(Point(.2, .7), None, .9, (0, 0, 1, 1))
+        target, is_rope, label = worker._route_target(at_left)
+        self.assertEqual((target, is_rope, label), (.2, False, "layer1.left-most"))
+        self.assertTrue(worker._advance_route_endpoint(at_left, target))
+        target, is_rope, label = worker._route_target(at_left)
+        self.assertEqual((target, is_rope, label), (.8, False, "layer1.right-most"))
+        at_right = MinimapObservation(Point(.8, .7), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(at_right, target))
+        self.assertEqual(worker._route_target(at_right), (.5, True, "layer1.rope"))
+
+    def test_map_profile_route_order_is_explicit(self):
+        positions = {
+            "layer1": {"left_most_pos": {"x": .1, "y": .7},
+                       "right_most_pos": {"x": .9, "y": .7}},
+            "layer2": {"left_most_pos": {"x": .2, "y": .5},
+                       "right_most_pos": {"x": .8, "y": .5}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer2", "layer1"],
+        )
+        self.assertEqual(worker._route_layers, ["layer2", "layer1"])
+
+    def test_layer_is_selected_by_explicit_y_with_tolerance(self):
+        positions = {
+            "layer1": {
+                "layer_y": .698864, "y_tolerance": .020000,
+                "left_most_pos": {"x": .2, "y": .1},
+                "right_most_pos": {"x": .8, "y": .1},
+            },
+            "layer2": {
+                "layer_y": .500000, "y_tolerance": .020000,
+                "left_most_pos": {"x": .2, "y": .9},
+                "right_most_pos": {"x": .8, "y": .9},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+        )
+        worker._select_route_layer(Point(.5, .698000))
+        self.assertEqual(worker._route_layer_index, 0)
+
+        unknown = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+        )
+        unknown._select_route_layer(Point(.5, .600000))
+        self.assertIsNone(unknown._route_layer_index)
+
+    def test_route_stops_after_last_calibrated_layer(self):
+        positions = {"layer1": {
+            "left_most_pos": {"x": .2, "y": .7},
+            "right_most_pos": {"x": .8, "y": .7},
+        }}
+        worker = MovementWorker(queue.Queue(), object(), threading.Event(),
+                                fixed_target_x=.5, important_positions=positions)
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        worker._advance_after_climb()
+        observation = MinimapObservation(Point(.5, .5), Point(.9, .2), .9, (0, 0, 1, 1))
+        self.assertEqual(worker._route_target(observation), (None, False, "route-complete"))
+
+    def test_detects_yellow_diamond(self):
+        minimap = np.zeros((120, 200, 3), dtype=np.uint8)
+        diamond(minimap, 140, 80)
+        point, confidence = detect_marker(minimap)
+        self.assertIsNotNone(point)
+        self.assertAlmostEqual(point.x, 0.70, places=2)
+        self.assertAlmostEqual(point.y, 2 / 3, places=2)
+        self.assertGreater(confidence, 0.55)
+
+    def test_unknown_map_waits(self):
+        observation = MinimapObservation(Point(.5, .5), None, .9, (0, 0, 1, 1))
+        self.assertIsNone(plan_movement(observation).key)
+
+    def test_approaches_then_climbs(self):
+        left = MinimapObservation(Point(.7, .7), Point(.5, .7), .9, (0, 0, 1, 1))
+        aligned = MinimapObservation(Point(.5, .7), Point(.509, .7), .9, (0, 0, 1, 1))
+        self.assertEqual(plan_movement(left).key, "left")
+        self.assertEqual(plan_movement(left).duration, 2.0)
+        self.assertEqual(plan_movement(aligned).key, "jump_climb_right")
+
+    def test_direction_uses_configured_hold_duration(self):
+        observation = MinimapObservation(Point(.2, .7), None, .9, (0, 0, 1, 1))
+        decision = plan_movement(observation, fixed_target_x=.8,
+                                 movement_hold_seconds=1.25)
+        self.assertEqual(decision.key, "right")
+        self.assertEqual(decision.duration, 1.25)
+
+    def test_fixed_steps_then_jump_toward_rope(self):
+        def decision(distance):
+            player_x = .5 - distance
+            observation = MinimapObservation(Point(player_x, .7), None, .9,
+                                             (0, 0, 1, 1))
+            return plan_movement(observation, fixed_target_x=.5)
+
+        for distance in (.40, .30, .20, .10):
+            self.assertEqual(decision(distance).duration, 2.0)
+        self.assertEqual(decision(.04).key, "jump_climb_right")
+
+    def test_near_rope_does_not_use_tiny_walk(self):
+        observation = MinimapObservation(Point(.3, .7), None, .9,
+                                         (0, 0, 1, 1))
+        decision = plan_movement(observation, fixed_target_x=.5,
+                                 estimated_minimap_speed=.2,
+                                 estimated_final_speed=.2,
+                                 final_calculation_distance=.25,
+                                 final_move_safety_gain=1.0,
+                                 horizontal_tolerance=.01)
+        self.assertEqual(decision.key, "jump_climb_right")
+
+    def test_important_endpoint_keeps_fixed_hold_when_near(self):
+        observation = MinimapObservation(Point(.19, .7), None, .9,
+                                         (0, 0, 1, 1))
+        decision = plan_movement(
+            observation,
+            fixed_target_x=.20,
+            horizontal_tolerance=.001,
+            final_calculation_distance=.04,
+            movement_hold_seconds=2.0,
+            jump_when_near=False,
+        )
+        self.assertEqual(decision.key, "right")
+        self.assertEqual(decision.duration, 2.0)
+
+    def test_passing_important_endpoint_advances_route(self):
+        positions = {"layer1": {
+            "left_most_pos": {"x": .2, "y": .7},
+            "right_most_pos": {"x": .8, "y": .7},
+        }}
+        worker = MovementWorker(queue.Queue(), object(), threading.Event(),
+                                fixed_target_x=.5, important_positions=positions)
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        crossed_left = MinimapObservation(Point(.17, .7), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(crossed_left, .2))
+        self.assertEqual(worker._route_phase, "right")
+        crossed_right = MinimapObservation(Point(.83, .7), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(crossed_right, .8))
+        self.assertEqual(worker._route_phase, "rope")
+
+    def test_saved_rope_position_overrides_connector_detection(self):
+        observation = MinimapObservation(Point(.70, .70), None, .90, (0, 0, 1, 1))
+        self.assertEqual(plan_movement(observation, fixed_target_x=.25).key, "left")
+        aligned = MinimapObservation(Point(.251, .70), None, .90, (0, 0, 1, 1))
+        self.assertEqual(plan_movement(aligned, fixed_target_x=.25).key, "jump_climb_left")
+
+    def test_capture_frame_contract(self):
+        # This intentionally uses the integration's immutable frame wrapper.
+        image = np.zeros((400, 600, 3), dtype=np.uint8)
+        # Marker lies inside the real normalized minimap-interior crop.
+        diamond(image, 60, 60)
+        frame = object.__new__(CapturedFrame)
+        object.__setattr__(frame, "sequence", 1)
+        object.__setattr__(frame, "captured_at", None)
+        object.__setattr__(frame, "captured_monotonic", 1.0)
+        object.__setattr__(frame, "image", Image.fromarray(image))
+        object.__setattr__(frame, "window_rect", (0, 0, 600, 400))
+        self.assertIsNotNone(analyze_minimap(frame).player)
+
+    def test_climb_sends_jump_then_up(self):
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.keys = []
+            def press(self, key, duration=0):
+                self.keys.append((key, duration))
+                return True
+            def key_down(self, key):
+                self.keys.append((f"{key}-down", 0))
+                return True
+            def key_up(self, key):
+                self.keys.append((f"{key}-up", 0))
+                return True
+            def key_down(self, key):
+                self.keys.append((f"{key}-down", 0))
+                return True
+            def key_up(self, key):
+                self.keys.append((f"{key}-up", 0))
+                return True
+
+        sender = Sender()
+        with patch("movement_worker.time.sleep"):
+            success = _send_tap(sender, MovementDecision("climb", "test", .45))
+        self.assertTrue(success)
+        self.assertEqual(sender.keys, [("alt", .025), ("up", .45)])
+
+    def test_failed_climb_reports_failure_for_retry(self):
+        class Sender:
+            dry_run = True
+            def press(self, key, duration=0):
+                return key != "alt"
+
+        with patch("movement_worker.time.sleep"):
+            self.assertFalse(_send_tap(Sender(), MovementDecision("climb", "test", .45)))
+
+    def test_climb_starts_directional_then_tries_opposite_and_checks_y(self):
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.keys = []
+            def press(self, key, duration=0):
+                self.keys.append((key, duration))
+                return True
+            def key_down(self, key):
+                self.keys.append((f"{key}-down", 0))
+                return True
+            def key_up(self, key):
+                self.keys.append((f"{key}-up", 0))
+                return True
+
+        def observation(y):
+            return MinimapObservation(Point(.5, y), None, .9, (0, 0, 1, 1))
+
+        sender, state = Sender(), ClimbState()
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, observation(.70), state,
+                                   preferred_direction="right"), "right-toward-rope")
+            self.assertEqual(climb(sender, observation(.70), state),
+                             "left-retry-toward-rope")
+            self.assertEqual(climb(sender, observation(.66), state), "succeeded")
+        self.assertEqual([key for key, _ in sender.keys], [
+            "right-down", "alt-down", "alt-up", "right-up", "up",
+            "left-down", "alt-down", "alt-up", "left-up", "up",
+        ])
+
+    def test_climb_does_not_treat_falling_as_success(self):
+        class Sender:
+            dry_run = True
+            def press(self, key, duration=0):
+                return True
+            def key_down(self, key):
+                return True
+            def key_up(self, key):
+                return True
+        state = ClimbState()
+        with patch("movement_worker.time.sleep"):
+            climb(Sender(), MinimapObservation(Point(.5, .5), None, .9, (0, 0, 1, 1)),
+                  state, preferred_direction="left")
+            result = climb(Sender(), MinimapObservation(Point(.5, .6), None, .9, (0, 0, 1, 1)), state)
+        self.assertEqual(result, "right-retry-toward-rope")
+
+    def test_retry_does_not_reverse_when_character_stays_left_of_rope(self):
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.events = []
+            def press(self, key, duration=0):
+                self.events.append(("press", key))
+                return True
+            def key_down(self, key):
+                self.events.append(("down", key))
+                return True
+            def key_up(self, key):
+                self.events.append(("up", key))
+                return True
+
+        # Both fresh observations say character X is still left of Rope X.
+        observation = MinimapObservation(Point(.480000, .70), None, .9,
+                                         (0, 0, 1, 1))
+        sender, state = Sender(), ClimbState()
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, observation, state,
+                                   preferred_direction="right"),
+                             "right-toward-rope")
+            self.assertEqual(climb(sender, observation, state,
+                                   preferred_direction="right"),
+                             "right-retry-toward-rope")
+        direction_downs = [key for event, key in sender.events
+                           if event == "down" and key in ("left", "right")]
+        self.assertEqual(direction_downs, ["right", "right"])
+
+    def test_failed_directional_round_shifts_right_point_zero_one_seconds(self):
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.events = []
+            def press(self, key, duration=0):
+                self.events.append((key, duration))
+                return True
+            def key_down(self, key):
+                self.events.append((f"{key}-down", 0))
+                return True
+            def key_up(self, key):
+                self.events.append((f"{key}-up", 0))
+                return True
+
+        observation = MinimapObservation(Point(.48, .70), None, .9, (0, 0, 1, 1))
+        sender, state = Sender(), ClimbState()
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, observation, state,
+                                   preferred_direction="right"), "right-toward-rope")
+            self.assertEqual(climb(sender, observation, state),
+                             "left-retry-toward-rope")
+            result = climb(sender, observation, state,
+                           failed_cycle_right_seconds=.01)
+        self.assertEqual(result, "failed-cycle-shifted-right")
+        self.assertEqual(sender.events[-1], ("right", .01))
+        self.assertEqual(state.phase, "idle")
+        self.assertTrue(state.failed_shift_used)
+
+        # Another complete failed round during the same near-rope approach
+        # must not accumulate another right correction.
+        right_count = sender.events.count(("right", .01))
+        with patch("movement_worker.time.sleep"):
+            climb(sender, observation, state, preferred_direction="right")
+            climb(sender, observation, state)
+            second_result = climb(sender, observation, state,
+                                  failed_cycle_right_seconds=.01)
+        self.assertEqual(second_result, "failed-cycle-no-more-shift")
+        self.assertEqual(sender.events.count(("right", .01)), right_count)
+
+    def test_half_second_rope_distance_boundary(self):
+        speed = .20
+        half_second_distance = speed * .5
+        outside = MinimapObservation(Point(.5 - half_second_distance - .001, .7),
+                                     None, .9, (0, 0, 1, 1))
+        inside = MinimapObservation(Point(.5 - half_second_distance, .7),
+                                    None, .9, (0, 0, 1, 1))
+        self.assertEqual(plan_movement(
+            outside, fixed_target_x=.5, estimated_final_speed=speed,
+            final_calculation_distance=half_second_distance).key, "right")
+        self.assertEqual(plan_movement(
+            inside, fixed_target_x=.5, estimated_final_speed=speed,
+            final_calculation_distance=half_second_distance).key, "jump_climb_right")
+
+    def test_explicit_tight_rope_range_overrides_old_tolerance(self):
+        target = .4926470588
+        outside = MinimapObservation(Point(target - .003, .7), None, .9,
+                                     (0, 0, 1, 1))
+        inside = MinimapObservation(Point(target - .0025, .7), None, .9,
+                                    (0, 0, 1, 1))
+        self.assertEqual(plan_movement(
+            outside, fixed_target_x=target, horizontal_tolerance=.0025,
+            final_calculation_distance=.0025).key, "right")
+        self.assertEqual(plan_movement(
+            inside, fixed_target_x=target, horizontal_tolerance=.0025,
+            final_calculation_distance=.0025).key, "jump_climb_right")
+
+
+if __name__ == "__main__":
+    unittest.main()
