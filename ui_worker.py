@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
+from map_identity import MapIdentityStore
 from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
@@ -290,6 +291,7 @@ class UiWorker(threading.Thread):
         patrol_controller: Optional[PatrolController] = None,
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Optional[MapStructureTracker] = None,
+        map_identity_store: Optional[MapIdentityStore] = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -305,6 +307,7 @@ class UiWorker(threading.Thread):
         self.patrol_controller = patrol_controller
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
+        self.map_identity_store = map_identity_store
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -563,6 +566,10 @@ class UiWorker(threading.Thread):
             )
             return
         try:
+            if self.map_identity_store is not None and self.configured_map_name:
+                self.map_identity_store.record(
+                    self.configured_map_name, snapshot.map_name_preview
+                )
             if self.structure_tracker is not None:
                 self.structure_tracker.save_reference()
             recorded = self.patrol_controller.record_endpoint(
@@ -679,6 +686,8 @@ class UiWorker(threading.Thread):
             self.patrol_controller.reset_recording()
             if getattr(self, "structure_tracker", None) is not None:
                 self.structure_tracker.reset(delete_reference=True)
+            if getattr(self, "map_identity_store", None) is not None:
+                self.map_identity_store.remove(self.configured_map_name)
         except OSError as exc:
             self._control_status.configure(text=f"Cannot reset recording: {exc}")
             return

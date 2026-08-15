@@ -66,6 +66,21 @@ class MapStructureTrackerTests(unittest.TestCase):
             self.assertEqual(result.mode, "reference")
             self.assertAlmostEqual(result.scroll_y_diamonds, 0.0, places=2)
 
+    def test_new_session_reanchors_without_rerecording_positions(self):
+        rng = np.random.default_rng(14)
+        canvas = rng.integers(0, 140, (160, 160, 3), dtype=np.uint8)
+        frame = self.frame(0, canvas)
+        detection = self.detection()
+        marker = self.marker()
+        tracker = MapStructureTracker(tracking_size=128, minimum_response=.05)
+        tracker.analyze(frame, detection, marker)
+
+        tracker.start_session(anchor_world_y=-3.25)
+        anchored = tracker.analyze(frame, detection, marker)
+
+        self.assertAlmostEqual(anchored.world_y_diamonds, -3.25, places=6)
+        self.assertIn("session-anchor", anchored.mode)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,31 @@ class StartLiveInputTests(unittest.TestCase):
         self.assertEqual(sender.calls, ["select", "verify", "enable"])
         self.assertTrue(active.is_set())
 
+    def test_map_session_is_prepared_before_input_is_enabled(self) -> None:
+        sender = FakeSender()
+        active = threading.Event()
+
+        def prepare() -> None:
+            sender.calls.append("prepare-map")
+
+        _start_live_input(sender, active, prepare)
+        self.assertEqual(
+            sender.calls, ["select", "verify", "prepare-map", "enable"]
+        )
+        self.assertTrue(active.is_set())
+
+    def test_failed_map_match_does_not_enable_input(self) -> None:
+        sender = FakeSender()
+        active = threading.Event()
+
+        def reject() -> None:
+            raise OSError("wrong map")
+
+        with self.assertRaisesRegex(OSError, "wrong map"):
+            _start_live_input(sender, active, reject)
+        self.assertEqual(sender.calls, ["select", "verify"])
+        self.assertFalse(active.is_set())
+
     def test_failed_foreground_verification_does_not_enable_input(self) -> None:
         sender = FakeSender(foreground=False)
         active = threading.Event()

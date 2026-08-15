@@ -13,6 +13,7 @@ import signal
 import threading
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 
 MINIMAP_CAPTURE_SIZE = (320, 320)
@@ -66,6 +67,7 @@ def _release_single_instance_mutex(handle: int | None) -> None:
 def _start_live_input(
     key_sender: object,
     automation_active_event: threading.Event,
+    before_enable: Optional[Callable[[], None]] = None,
 ) -> None:
     """Select the game first, then arm all keyboard-producing workers."""
 
@@ -75,6 +77,8 @@ def _start_live_input(
     if not key_sender.is_game_foreground():
         raise OSError("game window did not become foreground")
     logging.info("START PATROL: game window verified foreground")
+    if before_enable is not None:
+        before_enable()
     key_sender.enable_input()
     automation_active_event.set()
     logging.info("START PATROL: automation input armed")
@@ -154,6 +158,7 @@ def main() -> int:
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
     from marker_detector import DiamondSizeTracker
+    from map_identity import MapIdentityStore
     from map_structure_tracker import MapStructureTracker
     from patrol_control import PatrolController
     from ui_worker import UiLogHandler, UiWorker
@@ -196,6 +201,9 @@ def main() -> int:
         / "map-structure-reference.png"
     )
     structure_tracker = MapStructureTracker(structure_reference)
+    map_identity_store = MapIdentityStore(
+        args.recording_configuration.parent / "recording-assets" / "map-names"
+    )
 
     def stop_patrol_after_focus_loss() -> None:
         patrol_controller.set_enabled(False)
@@ -235,6 +243,49 @@ def main() -> int:
         status_capture_interval=args.status_interval,
         capture_enabled_event=game_focused,
     )
+
+    def prepare_map_session() -> None:
+        """Verify the recorded map name and re-anchor transient world Y."""
+
+        configured_name = str(map_profile.get("map_name", "")).strip()
+        fresh_frame = capture_worker.capture_now()
+        detection = minimap_detector.detect(fresh_frame.image)
+        title_image = fresh_frame.image.crop(detection.map_name_box)
+        if configured_name and map_identity_store.has_reference(configured_name):
+            matched, score = map_identity_store.matches(configured_name, title_image)
+            if not matched:
+                raise OSError(
+                    f"current minimap name does not match recorded map "
+                    f"{configured_name!r} (visual match {score:.2f})"
+                )
+            logging.info(
+                "MAP NAME matched recorded profile %s confidence=%.3f",
+                configured_name,
+                score,
+            )
+        elif configured_name:
+            logging.info(
+                "MAP NAME profile %s will be recorded with the next position",
+                configured_name,
+            )
+
+        snapshot = patrol_controller.snapshot()
+        anchor_name = str(map_profile.get("first_layer") or (
+            snapshot.route_order[0] if snapshot.route_order else ""
+        ))
+        anchor_layer = snapshot.layers.get(anchor_name, {})
+        anchor_world_y = anchor_layer.get("layer_world_y")
+        if anchor_world_y is None:
+            raise OSError(
+                f"{anchor_name or 'first layer'} has no recorded world Y; "
+                "record this map once"
+            )
+        structure_tracker.start_session(float(anchor_world_y))
+        logging.info(
+            "MAP SESSION re-anchoring %s at world_y=%.6f",
+            anchor_name,
+            float(anchor_world_y),
+        )
     attack_workers = []
     if args.enable_attack:
         attack_workers.append(AttackWorker(
@@ -334,8 +385,9 @@ def main() -> int:
             patrol_controller=patrol_controller,
             diamond_size_tracker=ui_diamond_tracker,
             structure_tracker=structure_tracker,
+            map_identity_store=map_identity_store,
             on_patrol_start=lambda: _start_live_input(
-                key_sender, automation_active
+                key_sender, automation_active, prepare_map_session
             ),
             on_patrol_stop=lambda: _stop_live_input(
                 key_sender, automation_active

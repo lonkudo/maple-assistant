@@ -50,6 +50,8 @@ class MapStructureTracker:
         self._reference: Optional[np.ndarray] = None
         self._previous: Optional[np.ndarray] = None
         self._previous_offset = 0.0
+        self._world_bias = 0.0
+        self._pending_anchor_world_y: Optional[float] = None
         self._last_sequence = -1
         self._last_result: Optional[MapTrackingResult] = None
         self._window = cv2.createHanningWindow(
@@ -150,12 +152,23 @@ class MapStructureTracker:
                     )
 
             local_y = self._local_marker_y_diamonds(marker, detection)
-            world_y = local_y + offset if local_y is not None else None
+            if local_y is not None and self._pending_anchor_world_y is not None:
+                self._world_bias = (
+                    self._pending_anchor_world_y - (local_y + float(offset))
+                )
+                self._pending_anchor_world_y = None
+                mode = f"session-anchor/{mode}"
+                LOG.info(
+                    "MAP SESSION anchored world Y at %.6f",
+                    local_y + float(offset) + self._world_bias,
+                )
+            scroll_y = float(offset) + self._world_bias
+            world_y = local_y + scroll_y if local_y is not None else None
             result = MapTrackingResult(
                 sequence=sequence,
                 screen_y=marker.y if marker is not None else None,
                 local_y_diamonds=local_y,
-                scroll_y_diamonds=float(offset),
+                scroll_y_diamonds=scroll_y,
                 world_y_diamonds=world_y,
                 vertical_shift_pixels=float(shift_y),
                 confidence=max(0.0, min(1.0, float(response))),
@@ -166,6 +179,23 @@ class MapStructureTracker:
             self._last_sequence = sequence
             self._last_result = result
             return result
+
+    def start_session(self, anchor_world_y: float) -> None:
+        """Start fresh translation tracking anchored to a recorded map layer.
+
+        A new game/map session can render the same repeating platforms at a
+        different minimap scroll origin.  The saved patrol coordinates remain
+        valid; only the transient world-Y origin must be re-established.
+        """
+
+        with self._lock:
+            self._reference = None
+            self._previous = None
+            self._previous_offset = 0.0
+            self._world_bias = 0.0
+            self._pending_anchor_world_y = float(anchor_world_y)
+            self._last_sequence = -1
+            self._last_result = None
 
     def _marker_height_normalized(
         self,
@@ -205,6 +235,8 @@ class MapStructureTracker:
             self._reference = None
             self._previous = None
             self._previous_offset = 0.0
+            self._world_bias = 0.0
+            self._pending_anchor_world_y = None
             self._last_sequence = -1
             self._last_result = None
             if delete_reference and self.reference_path is not None:
