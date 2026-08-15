@@ -7,6 +7,7 @@
   "horizontal_tolerance_diamonds": 0.293000,
   "aligned_frames_required": 2,
   "climb_layer_confirm_frames": 3,
+  "climb_layer_confirm_seconds": 1.0,
   "climb_world_y_change_required": 0.75,
   "climb_world_y_stall_change_required": 0.15,
   "climb_world_y_stall_frames": 2,

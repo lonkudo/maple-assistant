@@ -879,7 +879,7 @@ class MovementWorker(threading.Thread):
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 2,
         climb_layer_confirm_frames: int = 3,
-        climb_layer_confirm_seconds: float = 0.75,
+        climb_layer_confirm_seconds: float = 1.0,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,

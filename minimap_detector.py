@@ -33,6 +33,30 @@ def box_to_normalized(box: Box, image_size: tuple[int, int]) -> NormalizedBox:
     return left / width, top / height, right / width, bottom / height
 
 
+def _scale_box(
+    box: Box,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> Box:
+    """Map an OpenCV working box back into source-image pixels."""
+
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    scale_x = target_width / source_width
+    scale_y = target_height / source_height
+    left, top, right, bottom = box
+    return _clamp_box(
+        (
+            round(left * scale_x),
+            round(top * scale_y),
+            round(right * scale_x),
+            round(bottom * scale_y),
+        ),
+        target_width,
+        target_height,
+    )
+
+
 @dataclass(frozen=True)
 class MinimapDetection:
     """All boxes use full client-image pixel coordinates."""
@@ -68,13 +92,22 @@ class MinimapDetector:
         fallback_region: NormalizedBox = (0.0, 0.075, 0.12, 0.24),
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
+        opencv_size: Optional[tuple[int, int]] = None,
     ) -> None:
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
         self.dedicated_crop = bool(dedicated_crop)
+        self.opencv_size = (
+            (max(96, int(opencv_size[0])), max(96, int(opencv_size[1])))
+            if opencv_size is not None else None
+        )
 
     def detect(self, image: Image.Image) -> MinimapDetection:
-        rgb = np.asarray(image.convert("RGB"))
+        original_size = image.size
+        cv_image = image
+        if self.opencv_size is not None and image.size != self.opencv_size:
+            cv_image = image.resize(self.opencv_size, Image.Resampling.BILINEAR)
+        rgb = np.asarray(cv_image.convert("RGB"))
         height, width = rgb.shape[:2]
         search_width = (
             width if self.dedicated_crop else max(1, int(round(width * 0.40)))
@@ -92,9 +125,10 @@ class MinimapDetector:
         rectangles: list[tuple[Box, float]] = []
         for contour in contours:
             x, y, candidate_width, candidate_height = cv2.boundingRect(contour)
-            if candidate_width < max(90, int(width * 0.055)):
+            minimum_side = 40 if self.dedicated_crop else 90
+            if candidate_width < max(minimum_side, int(width * 0.055)):
                 continue
-            if candidate_height < max(90, int(height * 0.075)):
+            if candidate_height < max(minimum_side, int(height * 0.075)):
                 continue
             max_width_ratio = 0.98 if self.dedicated_crop else 0.40
             max_height_ratio = 0.98 if self.dedicated_crop else 0.45
@@ -195,6 +229,11 @@ class MinimapDetector:
             width,
             height,
         )
+        working_size = (width, height)
+        window_box = _scale_box(window_box, working_size, original_size)
+        analysis_box = _scale_box(analysis_box, working_size, original_size)
+        canvas_box = _scale_box(canvas_box, working_size, original_size)
+        map_name_box = _scale_box(map_name_box, working_size, original_size)
         map_name = self._read_map_name(image, map_name_box)
         confidence = float(np.clip(0.55 + rectangularity * 0.45, 0.0, 1.0))
         return MinimapDetection(

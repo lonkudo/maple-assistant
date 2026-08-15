@@ -526,7 +526,7 @@ class MovementTests(unittest.TestCase):
             queue.Queue(), sender, threading.Event(),
             important_positions=positions, route_order=["layer1", "layer2"],
             climb_layer_confirm_frames=3,
-            climb_layer_confirm_seconds=.75,
+            climb_layer_confirm_seconds=1.0,
         )
         worker._route_layer_index = 0
         worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
@@ -535,7 +535,7 @@ class MovementTests(unittest.TestCase):
             world_y_diamonds=-7.1, structure_confidence=.9,
         )
 
-        with patch("movement_worker.time.monotonic", side_effect=[0, .1, .2, .8]):
+        with patch("movement_worker.time.monotonic", side_effect=[0, .1, .2, 1.05]):
             for _ in range(3):
                 self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(sender.released, [])

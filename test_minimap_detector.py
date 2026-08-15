@@ -106,6 +106,24 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertAlmostEqual(detection.window_box[2], 160, delta=5)
         self.assertAlmostEqual(detection.window_box[3], 257, delta=5)
 
+    def test_opencv_working_image_is_150_square_and_boxes_scale_back(self) -> None:
+        image = Image.new("RGB", (320, 320), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(
+            (6, 90, 155, 240), fill=(35, 45, 55),
+            outline=(190, 190, 190), width=3,
+        )
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(150, 150)
+        )
+
+        detection = detector.detect(image)
+
+        self.assertEqual(detector.opencv_size, (150, 150))
+        self.assertEqual(detection.source, "opencv")
+        self.assertGreater(detection.window_box[2], 140)
+        self.assertGreater(detection.window_box[3], 220)
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

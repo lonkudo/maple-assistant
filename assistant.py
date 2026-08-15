@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 
 MINIMAP_CAPTURE_SIZE = (320, 320)
+OPENCV_ANALYSIS_SIZE = (150, 150)
 MINIMAP_FALLBACK_REGION = (0.0, 0.20, 0.75, 1.0)
 STATUS_CAPTURE_REGION = (0.34, 0.96, 0.56, 1.0)
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
@@ -201,7 +202,9 @@ def main() -> int:
         / "recording-assets"
         / "map-structure-reference.png"
     )
-    structure_tracker = MapStructureTracker(structure_reference)
+    structure_tracker = MapStructureTracker(
+        structure_reference, tracking_size=OPENCV_ANALYSIS_SIZE[0]
+    )
     map_identity_store = MapIdentityStore(
         args.recording_configuration.parent / "recording-assets" / "map-names"
     )
@@ -226,6 +229,7 @@ def main() -> int:
     minimap_detector = MinimapDetector(
         fallback_region=minimap_region,
         dedicated_crop=True,
+        opencv_size=OPENCV_ANALYSIS_SIZE,
     )
     movement_diamond_tracker = DiamondSizeTracker()
     ui_diamond_tracker = DiamondSizeTracker()
@@ -328,7 +332,7 @@ def main() -> int:
                 calibration.get("climb_layer_confirm_frames", 3)
             ),
             climb_layer_confirm_seconds=float(
-                calibration.get("climb_layer_confirm_seconds", 0.75)
+                calibration.get("climb_layer_confirm_seconds", 1.0)
             ),
             climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.10)),
             climb_y_change_required=float(calibration.get("climb_y_change_required", 0.015)),
