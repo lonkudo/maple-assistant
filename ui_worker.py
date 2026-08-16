@@ -521,6 +521,9 @@ class UiWorker(threading.Thread):
                 yolo_row, textvariable=self._yolo_threshold_var, width=8
             )
             yolo_threshold.pack(side="left", padx=(0, 10))
+            yolo_threshold.bind(
+                "<KeyRelease>", self._yolo_on_threshold_change
+            )
             self._yolo_run_button = ttk.Button(
                 yolo_row, text="Run", command=self._yolo_start
             )
@@ -1012,6 +1015,12 @@ class UiWorker(threading.Thread):
         except OSError:
             LOG.warning("could not save yolo settings to %s", path, exc_info=True)
 
+    def _yolo_on_threshold_change(self, _event: Any = None) -> None:
+        """Persist the threshold as soon as it is typed."""
+
+        if hasattr(self, "_yolo_threshold_var"):
+            self._yolo_save_settings()
+
     def _yolo_on_range_change(self, _value: str = "") -> None:
         """Update the attack-range label as the slider moves."""
 
@@ -1019,6 +1028,7 @@ class UiWorker(threading.Thread):
             return
         value = int(self._yolo_attack_range_var.get())
         self._yolo_attack_range_label.configure(text=f"{value} px")
+        self._yolo_save_settings()
 
     def _yolo_on_zone_change(self, _value: str = "") -> None:
         """Update the zone size labels as the sliders move."""
@@ -1034,6 +1044,7 @@ class UiWorker(threading.Thread):
             self._yolo_zone_shift_y_label.configure(
                 text=f"{shift:+d}%" if shift else "0%"
             )
+        self._yolo_save_settings()
 
     def _yolo_start(self) -> None:
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
@@ -1122,6 +1133,7 @@ class UiWorker(threading.Thread):
             self._yolo_show_button.configure(style="TCheckbutton")
         else:
             self._yolo_show_button.configure(style="Off.TCheckbutton")
+        self._yolo_save_settings()
         running = (self._yolo_process is not None
                    and self._yolo_process.poll() is None)
         if running:
