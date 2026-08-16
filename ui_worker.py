@@ -992,26 +992,47 @@ class UiWorker(threading.Thread):
         config.yaml's ``detection_behavior.confidence_threshold`` is the
         source of truth the model reads on startup; keep it in sync with the
         slider so the saved threshold survives even without --threshold.
+
+        The update runs in the yolo venv (venv313) because that environment
+        has the yaml dependency; the assistant's own Python 3.10 env does
+        not (and must not import auto.py, which needs mss).
         """
 
         try:
-            import sys
+            import subprocess
 
             yolo_root = Path(__file__).resolve().parent / "yolo-detection"
-            sys.path.insert(0, str(yolo_root))
-            from auto import ConfigManager
-
-            manager = ConfigManager(str(yolo_root / "config.yaml"))
-            manager.set(
-                "detection_behavior.confidence_threshold",
-                float(self._yolo_threshold_var.get()),
+            python = yolo_root / "venv313" / "Scripts" / "python.exe"
+            if not python.is_file():
+                LOG.warning("venv313 not found; config.yaml threshold not updated")
+                return
+            threshold = round(float(self._yolo_threshold_var.get()), 2)
+            code = (
+                "import sys; "
+                "sys.path.insert(0, r'%s'); "
+                "from auto import ConfigManager; "
+                "m = ConfigManager(r'%s'); "
+                "m.set('detection_behavior.confidence_threshold', %r); "
+                "sys.exit(0 if m.save() else 1)"
+            ) % (
+                str(yolo_root),
+                str(yolo_root / "config.yaml"),
+                threshold,
             )
-            if manager.save():
+            result = subprocess.run(
+                [str(python), "-c", code],
+                capture_output=True, text=True, timeout=30,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW
+                    if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+                ),
+            )
+            if result.returncode == 0:
                 LOG.info("threshold %.3f written to %s",
-                         float(self._yolo_threshold_var.get()),
-                         yolo_root / "config.yaml")
+                         threshold, yolo_root / "config.yaml")
             else:
-                LOG.warning("could not save threshold to config.yaml")
+                LOG.warning("config.yaml threshold update failed: %s",
+                            result.stderr.strip())
         except Exception:
             LOG.warning("could not update config.yaml threshold", exc_info=True)
 
