@@ -79,5 +79,47 @@ class AttackDecisionTests(unittest.TestCase):
         self.assertIs(target, near)
 
 
+class CharacterStabilizationTests(unittest.TestCase):
+    def setUp(self):
+        _require_auto()
+
+    def test_continuity_prefers_candidate_near_previous_position(self):
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        # The true player moved slightly from (400,400); a high-confidence
+        # false positive sits far away.  Continuity must win.
+        true_player = make_detection("character", 420, 410, conf=0.6)
+        false_positive = make_detection("character", 1500, 900, conf=0.95)
+        best = bot._score_character_candidates(
+            [false_positive, true_player], (400, 400), 2561, 1601
+        )
+        self.assertIs(best, true_player)
+
+    def test_no_previous_position_falls_back_to_confidence(self):
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        low = make_detection("character", 400, 400, conf=0.5)
+        high = make_detection("character", 1500, 900, conf=0.9)
+        best = bot._score_character_candidates([low, high], None, 2561, 1601)
+        self.assertIs(best, high)
+
+    def test_median_smoothing_kills_jitter(self):
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        bot._char_history = __import__("collections").deque(maxlen=8)
+        bot._char_smoothed = None
+        bot._char_miss_frames = 0
+        # Feed a noisy series around x=1000: one outlier must not move the
+        # median center by much.
+        centers = [(1000, 500)] * 3 + [(1800, 500)] + [(1000, 500)] * 3
+        for cx, cy in centers:
+            bot._char_history.append((cx, cy))
+        xs = sorted(p[0] for p in bot._char_history)
+        self.assertEqual(xs[len(xs) // 2], 1000)
+
+
 if __name__ == "__main__":
     unittest.main()

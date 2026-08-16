@@ -19,7 +19,7 @@ bot.model.conf = 0.3
 region = bot.monitor
 
 with mss.MSS() as sct:
-    for i in range(5):
+    for i in range(8):
         shot = sct.grab(region)
         img = np.ascontiguousarray(np.array(shot)[:, :, :3])
         mobs = bot.detect_objects(img)

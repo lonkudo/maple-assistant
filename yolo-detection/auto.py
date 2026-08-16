@@ -19,6 +19,7 @@ import yaml
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from ultralytics import YOLO
@@ -167,6 +168,11 @@ class OptimizedMapleBot:
         self.original_position = None
         self.search_direction = 1  # 1 for right, -1 for left
         self.search_moves = 0
+
+        # 角色位置穩定追蹤 (temporal smoothing)
+        self._char_history: deque = deque(maxlen=8)
+        self._char_smoothed: Optional[Detection] = None
+        self._char_miss_frames = 0
         
         # 設定 PyAutoGUI
         if self.config.get('safety.enable_failsafe', True):
@@ -300,13 +306,48 @@ class OptimizedMapleBot:
             logger.error(f"物件偵測失敗: {e}")
             return []
 
-    def detect_character(self, img: np.ndarray) -> Optional[Detection]:
-        """Return the most likely player character position.
+    @staticmethod
+    def _score_character_candidates(
+        candidates: List[Detection],
+        previous: Optional[Tuple[int, int]],
+        monitor_width: int,
+        monitor_height: int,
+    ) -> Detection:
+        """Score character candidates; returns the best one.
 
-        Runs the model without the mob-only filter and picks the best
-        ``character`` box: highest confidence among those nearest the screen
-        center (the player is typically centered in MapleStory).  Returns
-        ``None`` when no character is detected.
+        Continuity with the previously accepted position is the strongest
+        signal (the real player moves smoothly); confidence and screen-center
+        proximity break ties.
+        """
+
+        def score(candidate: Detection) -> float:
+            s = candidate.confidence
+            if previous is not None:
+                dx = candidate.center[0] - previous[0]
+                dy = candidate.center[1] - previous[1]
+                dist = float(np.hypot(dx, dy))
+                continuity = 0.5 * max(
+                    0.0, 1.0 - dist / max(1, monitor_width * 0.15)
+                )
+                s += continuity
+            s += 0.05 * max(
+                0.0,
+                1.0 - candidate.distance_from_center / max(1, monitor_height * 0.5),
+            )
+            return s
+
+        return max(candidates, key=score)
+
+    def detect_character(self, img: np.ndarray) -> Optional[Detection]:
+        """Return a temporally stabilized player character position.
+
+        Runs the model without the mob-only filter and collects all
+        ``character`` boxes.  The true player is tracked across frames:
+        candidates near the previously accepted position are preferred over
+        high-confidence false positives (NPCs/decorations), and the accepted
+        center is a median over recent frames so the reported position does
+        not jump.  When the character is briefly missed the last known
+        position is kept for a few frames.
         """
 
         if self.model is None:
@@ -338,14 +379,40 @@ class OptimizedMapleBot:
                         class_name='character', center=detection_center,
                         distance_from_center=float(distance),
                     ))
+
             if not candidates:
+                # Brief miss: keep the last known position for a few frames.
+                self._char_miss_frames += 1
+                if (self._char_smoothed is not None
+                        and self._char_miss_frames <= 5):
+                    return self._char_smoothed
+                self._char_smoothed = None
                 return None
-            # Prefer the highest confidence; break ties toward screen center.
-            candidates.sort(
-                key=lambda d: (d.confidence, -d.distance_from_center),
-                reverse=True,
+            self._char_miss_frames = 0
+
+            # Score candidates: continuity with the last accepted position is
+            # the strongest signal; confidence and screen-center proximity
+            # break ties.
+            previous = (self._char_smoothed.center
+                        if self._char_smoothed is not None else None)
+            best = self._score_character_candidates(
+                candidates, previous,
+                self.monitor['width'], self.monitor['height'],
             )
-            return candidates[0]
+
+            # Median-smooth the center over recent frames to kill jitter.
+            self._char_history.append(best.center)
+            xs = [p[0] for p in self._char_history]
+            ys = [p[1] for p in self._char_history]
+            smoothed_x = int(sorted(xs)[len(xs) // 2])
+            smoothed_y = int(sorted(ys)[len(ys) // 2])
+            best = Detection(
+                bbox=best.bbox, confidence=best.confidence, class_id=best.class_id,
+                class_name=best.class_name, center=(smoothed_x, smoothed_y),
+                distance_from_center=best.distance_from_center,
+            )
+            self._char_smoothed = best
+            return best
         except Exception as e:
             logger.error(f"角色偵測失敗: {e}")
             return None
