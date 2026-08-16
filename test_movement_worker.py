@@ -74,6 +74,20 @@ class MovementTests(unittest.TestCase):
         self.assertIsNone(protected.key)
         self.assertIn("Up remains held", protected.reason)
 
+    def test_yolo_jump_decision_hands_climb_to_patrol(self):
+        # Once the character is on the rope (climbing-up, Up held), even a
+        # fresh YOLO jump decision must be converted to the patrol's held-Up
+        # climb - YOLO only jumps, patrol climbs.
+        state = ClimbState(phase="climbing-up", up_held=True)
+        yolo_jump = MovementDecision(
+            "jump_climb_right", "YOLO rope gap +60px; jump right", .08
+        )
+
+        protected = preserve_persistent_climb(state, yolo_jump)
+
+        self.assertIsNone(protected.key)
+        self.assertIn("Up remains held", protected.reason)
+
     def test_drop_is_simultaneous_alt_down_chord(self):
         class Sender:
             dry_run = True
@@ -194,18 +208,16 @@ class MovementTests(unittest.TestCase):
             important_positions={}, rope_state_path=str(tmp),
             rope_jump_px=140.0,
         )
-        # No state yet: fall back to the minimap plan.
+        # No state yet: fall back to the patrol (minimap) plan.
         self.assertEqual(worker._yolo_rope_decision(), (None, None))
-        # Small real gap -> jump in the real direction.
+        # Small real gap -> jump in the real direction (YOLO's only job).
         state.write(True, rope_x=1340.0, char_x=1280.0)
         decision, _ = worker._yolo_rope_decision()
         self.assertEqual(decision.key, "jump_climb_right")
-        # Large real gap -> short bounded nudge, never a long fixed hold.
+        # Large real gap -> NO YOLO decision: patrol walks to the zone.
         state.write(True, rope_x=2000.0, char_x=1280.0)
-        decision, _ = worker._yolo_rope_decision()
-        self.assertEqual(decision.key, "right")
-        self.assertLessEqual(decision.duration, 0.35)
-        # Rope not visible -> fall back to the minimap plan.
+        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        # Rope not visible -> fall back to the patrol plan.
         state.write(False)
         self.assertEqual(worker._yolo_rope_decision(), (None, None))
 

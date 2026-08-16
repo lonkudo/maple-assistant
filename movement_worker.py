@@ -1052,18 +1052,16 @@ class MovementWorker(threading.Thread):
             self.moving_active_event.clear()
 
     def _yolo_rope_decision(self) -> tuple[Optional[MovementDecision], Optional[float]]:
-        """Gate the inner-gap jump on the YOLO rope screen gap.
+        """YOLO's ONLY rope job: decide the jump onto the rope.
 
         Called only when the minimap plan has already decided to jump (we
-        are inside the rope jump zone).  Returns ``(decision, target_x)``;
-        ``(None, None)`` when YOLO rope state is unavailable/stale, so the
-        caller falls back to the minimap jump plan.  When fresh:
-
-        - small real gap  -> jump inward toward the nearest rope, using the
-          real direction (the rope whose X is nearest the character)
-        - large real gap  -> a short nudge toward the rope, then re-evaluate
-          next frame (never a long fixed hold; the minimap band estimate
-          may be off, and a long walk would overshoot)
+        are inside the rope jump zone) and no climb is in progress.  Returns
+        ``(decision, target_x)``; ``(None, None)`` when YOLO rope state is
+        unavailable/stale or the real gap is too large - in both cases the
+        caller falls back to the patrol (minimap) plan, which owns walking
+        and climbing.  When fresh and the character is close enough to the
+        rope, YOLO supplies the jump direction from the real screen gap,
+        targeting the rope nearest the character's X.
         """
 
         if self._rope_state is None or not self._rope_state.is_fresh():
@@ -1071,28 +1069,18 @@ class MovementWorker(threading.Thread):
         gap = self._rope_state.screen_gap()
         if gap is None:
             return None, None
+        if abs(gap) > self.rope_jump_px:
+            # Too far to jump: hand the approach back to patrol (minimap
+            # walk).  YOLO never issues walking nudges - that is patrol's job.
+            LOG.debug("YOLO rope: gap=%+.0fpx too large; patrol walks", gap)
+            return None, None
         direction = "right" if gap > 0 else "left"
-        if abs(gap) <= self.rope_jump_px:
-            decision = MovementDecision(
-                f"jump_climb_{direction}",
-                f"YOLO rope gap {gap:+.0f}px; jump {direction} inward",
-                self.minimum_final_hold_seconds,
-            )
-            LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s", gap, direction)
-            return decision, None
-        # Inside the zone but the real gap is still large: take a short,
-        # bounded nudge so the next frame re-checks instead of overshooting.
-        nudge = float(np.clip(
-            abs(gap) / 1000.0, self.minimum_final_hold_seconds, 0.35
-        ))
         decision = MovementDecision(
-            direction,
-            f"YOLO rope gap {gap:+.0f}px too large; nudge {direction} "
-            f"{nudge:.3f}s",
-            nudge,
+            f"jump_climb_{direction}",
+            f"YOLO rope gap {gap:+.0f}px; jump {direction} onto rope",
+            self.minimum_final_hold_seconds,
         )
-        LOG.info("YOLO rope nudge: gap=%+.0fpx dir=%s hold=%.3fs",
-                 gap, direction, nudge)
+        LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s", gap, direction)
         return decision, None
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
@@ -1691,12 +1679,13 @@ class MovementWorker(threading.Thread):
                     )
                     decision = rope_plan.decision
                     active_target_x = rope_plan.target_x
-                    # YOLO rope gate: ONLY inside the rope jump zone (the
-                    # minimap plan decided to jump).  Walking to the zone is
-                    # pure patrol logic - YOLO must not override the
-                    # calculated approach holds.  When the YOLO subprocess
-                    # sees the actual rope on screen, jump only when the real
-                    # screen gap is small, in the real direction.
+                    # YOLO rope gate - YOLO's ONLY job is the jump itself:
+                    # inside the rope jump zone (patrol decided to jump), YOLO
+                    # supplies the real jump direction when the character is
+                    # close enough to the rope.  Walking to the zone is pure
+                    # patrol logic; once the character is on the rope,
+                    # preserve_persistent_climb below hands the climb (held
+                    # Up) back to patrol.
                     if decision.key in ("jump_climb_left", "jump_climb_right"):
                         yolo_decision, yolo_target_x = self._yolo_rope_decision()
                         if yolo_decision is not None:
