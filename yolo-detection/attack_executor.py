@@ -130,10 +130,11 @@ class AttackExecutor:
         window_title: str,
         *,
         attack_key: str = "ctrl",
-        face_hold: float = 0.05,
-        attack_hold: float = 0.08,
+        face_hold: float = 0.08,
+        attack_hold: float = 0.1,
         cooldown: float = 0.6,
         refocus_interval: float = 3.0,
+        turn_settle: float = 0.15,
         log_path: Optional[str] = None,
         dry_run: bool = False,
     ) -> None:
@@ -145,6 +146,7 @@ class AttackExecutor:
         self.attack_hold = max(0.01, float(attack_hold))
         self.cooldown = max(0.0, float(cooldown))
         self.refocus_interval = max(1.0, float(refocus_interval))
+        self.turn_settle = max(0.0, float(turn_settle))
         self.dry_run = dry_run
         self._facing: Optional[str] = None  # last direction we turned toward
         self._last_attack = 0.0
@@ -328,14 +330,21 @@ class AttackExecutor:
             if facing is not None and facing != self._facing:
                 self._tap(facing, self.face_hold)
                 self._facing = facing
+                # Let the game register the turn before the attack lands so
+                # the character actually faces the monster.
+                time.sleep(self.turn_settle)
             self._tap(self.attack_key, self.attack_hold)
         except OSError as exc:
             LOG.error("attack FAILED: %s", exc)
             return False
         self._last_attack = now
-        LOG.info("attack: key=%s facing=%s target=%.0f,%.0f",
+        LOG.info("attack: key=%s facing=%s player=(%.0f,%.0f) "
+                 "target=(%.0f,%.0f) dx=%.0f dy=%.0f",
                  self.attack_key, self._facing,
-                 target.center[0], target.center[1])
+                 character.center[0], character.center[1],
+                 target.center[0], target.center[1],
+                 target.center[0] - character.center[0],
+                 target.center[1] - character.center[1])
         return True
 
     def reset_facing(self) -> None:

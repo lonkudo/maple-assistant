@@ -437,21 +437,28 @@ class OptimizedMapleBot:
     ) -> Optional[Detection]:
         """Return the best mob to attack, or None.
 
-        A mob is attackable only when its center is within ``attack_range``
-        pixels of the character position.  Among attackable mobs the one
-        nearest the character wins.  Without a character position no mob is
-        attackable.
+        ``attack_range`` is the width of the attack range line drawn on the
+        preview, so a mob is attackable only when its center is within
+        ``attack_range/2`` pixels horizontally of the character (the line
+        spans half the range on each side) and within ``attack_range/2``
+        vertically.  This keeps the decision identical to the visible line:
+        a mob outside the line is never attacked.  Among attackable mobs the
+        one nearest the character wins.  Without a character position no mob
+        is attackable.
         """
 
         if character is None or not mobs:
             return None
         cx, cy = character.center
+        half = max(10.0, float(attack_range) / 2.0)
         attackable = []
         for mob in mobs:
             mx, my = mob.center
-            distance = np.sqrt((mx - cx) ** 2 + (my - cy) ** 2)
-            if distance <= attack_range:
-                attackable.append((float(distance), mob))
+            dx = mx - cx
+            dy = my - cy
+            if abs(dx) <= half and abs(dy) <= half:
+                distance = float(np.hypot(dx, dy))
+                attackable.append((distance, mob))
         if not attackable:
             return None
         attackable.sort(key=lambda item: item[0])

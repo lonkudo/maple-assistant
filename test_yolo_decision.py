@@ -78,6 +78,39 @@ class AttackDecisionTests(unittest.TestCase):
         target = bot.attack_decision([mid, near], character, 800)
         self.assertIs(target, near)
 
+    def test_mob_beyond_drawn_line_is_not_attackable(self):
+        # attack_range is the line WIDTH: it spans attack_range/2 on each
+        # side of the character.  A mob beyond that half-width (e.g. 600px
+        # with range 800 -> line edge at 400) must never be targeted, even
+        # though 600 < 800 (the old euclidean-radius bug attacked these).
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        character = make_detection("character", 1280, 880)
+        far_right = make_detection("mob", 2001, 900)   # dx=+721 > 400
+        far_left = make_detection("mob", 437, 897)     # dx=-843 < -400
+        self.assertIsNone(bot.attack_decision(
+            [far_right, far_left], character, 800))
+
+    def test_mob_inside_line_is_attackable(self):
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        character = make_detection("character", 1280, 880)
+        inside = make_detection("mob", 1500, 890)      # dx=+220 <= 400
+        target = bot.attack_decision([inside], character, 800)
+        self.assertIs(target, inside)
+
+    def test_vertical_distance_is_also_gated(self):
+        # A mob directly above/below but beyond the vertical half-range
+        # must not be targeted (the character cannot attack straight up).
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        character = make_detection("character", 1280, 880)
+        above = make_detection("mob", 1290, 100)       # dy=-780 > 400
+        self.assertIsNone(bot.attack_decision([above], character, 800))
+
 
 class CharacterStabilizationTests(unittest.TestCase):
     def setUp(self):
@@ -161,21 +194,21 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertIsNone(ex.facing_for(char, above))
 
     def test_attack_turns_toward_target_then_presses_ctrl(self):
-        ex = self._executor(cooldown=0.0)
+        ex = self._executor(cooldown=0.0, turn_settle=0.0)
         char = make_detection("character", 400, 400)
         right = make_detection("mob", 600, 400)
         self.assertTrue(ex.attack(char, right))
-        self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
+        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
 
     def test_attack_skips_turn_when_already_facing(self):
-        ex = self._executor(cooldown=0.0)
+        ex = self._executor(cooldown=0.0, turn_settle=0.0)
         char = make_detection("character", 400, 400)
         left = make_detection("mob", 200, 400)
         ex.attack(char, left)  # turns left
         ex._taps.clear()
         # Still on the left: only ctrl, no extra turn tap.
         self.assertTrue(ex.attack(char, left))
-        self.assertEqual(ex._taps, [("ctrl", 0.08)])
+        self.assertEqual(ex._taps, [("ctrl", 0.1)])
 
     def test_attack_respects_cooldown(self):
         ex = self._executor(cooldown=10.0)
@@ -197,7 +230,7 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertEqual(ex._taps, [])
 
     def test_attack_refocuses_then_attacks(self):
-        ex = self._executor(cooldown=0.0)
+        ex = self._executor(cooldown=0.0, turn_settle=0.0)
         # Not focused first, but refocus succeeds: attack must still fire.
         state = {"fg": False}
         ex.is_game_foreground = lambda: state["fg"]
@@ -205,10 +238,10 @@ class AttackExecutorTests(unittest.TestCase):
         char = make_detection("character", 400, 400)
         mob = make_detection("mob", 600, 400)
         self.assertTrue(ex.attack(char, mob))
-        self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
+        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
 
     def test_reset_facing_forgets_direction(self):
-        ex = self._executor(cooldown=0.0)
+        ex = self._executor(cooldown=0.0, turn_settle=0.0)
         char = make_detection("character", 400, 400)
         right = make_detection("mob", 600, 400)
         ex.attack(char, right)
@@ -216,7 +249,7 @@ class AttackExecutorTests(unittest.TestCase):
         ex._taps.clear()
         # Facing forgotten: turns right again before attacking.
         self.assertTrue(ex.attack(char, right))
-        self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
+        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
 
     def test_failed_injection_returns_false_and_logs(self):
         ex = self._executor(cooldown=0.0)
