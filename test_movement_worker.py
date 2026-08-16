@@ -387,6 +387,21 @@ class MovementTests(unittest.TestCase):
         state.write(False)
         self.assertFalse(worker._attack_state.is_active())
 
+    def test_attack_defers_to_active_climb(self):
+        # Mid-climb (Up held): an active attack must NOT pause/release the
+        # climb - releasing Up stopped the character on the rope.
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={},
+        )
+        worker._climb_state.phase = "climbing-up"
+        worker._climb_state.up_held = True
+        self.assertTrue(worker._attack_should_defer_to_climb())
+        # Idle: no deferral.
+        worker._climb_state.phase = "idle"
+        worker._climb_state.up_held = False
+        self.assertFalse(worker._attack_should_defer_to_climb())
+
     def test_y_only_incomplete_layer_can_be_detected(self):
         layers = {
             "layer1": {"layer_y": .698864, "y_tolerance": .02},

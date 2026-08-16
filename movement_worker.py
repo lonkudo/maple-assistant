@@ -1075,6 +1075,21 @@ class MovementWorker(threading.Thread):
                 LOG.debug("not moving: pickup Z paused")
             self.moving_active_event.clear()
 
+    def _attack_should_defer_to_climb(self) -> bool:
+        """True when an active attack must wait for a climb/drop to finish.
+
+        The attack executor is already blocked by patrol_state busy while
+        climbing/dropping, so the patrol must keep holding Up and finish the
+        climb instead of releasing it (which stopped the character mid-rope).
+        """
+
+        return bool(
+            self._climb_state.up_held
+            or self._climb_state.phase != "idle"
+            or (self.dropping_active_event is not None
+                and self.dropping_active_event.is_set())
+        )
+
     def _yolo_rope_action(self) -> Optional[MovementDecision]:
         """Decide the rope action from YOLO SCREEN positions only.
 
@@ -1561,17 +1576,25 @@ class MovementWorker(threading.Thread):
                 # character stands still and fights.
                 if self._attack_state is not None:
                     if self._attack_state.is_active():
-                        if not self._attack_paused_last:
-                            LOG.info("attack active: patrol movement paused")
-                            self._attack_paused_last = True
-                        if self.climbing_active_event is not None:
-                            self.climbing_active_event.clear()
-                        if self.dropping_active_event is not None:
-                            self.dropping_active_event.clear()
-                        if self.moving_active_event is not None:
-                            self.moving_active_event.clear()
-                        self._release_climb_up()
-                        continue
+                        # Mid-climb/drop: finish the climb.  The attack
+                        # executor is already blocked by patrol_state busy,
+                        # so releasing Up here would stop the character on
+                        # the rope for nothing.
+                        if self._attack_should_defer_to_climb():
+                            LOG.debug("attack active but climbing/dropping: "
+                                      "finishing climb")
+                        else:
+                            if not self._attack_paused_last:
+                                LOG.info("attack active: patrol movement paused")
+                                self._attack_paused_last = True
+                            if self.climbing_active_event is not None:
+                                self.climbing_active_event.clear()
+                            if self.dropping_active_event is not None:
+                                self.dropping_active_event.clear()
+                            if self.moving_active_event is not None:
+                                self.moving_active_event.clear()
+                            self._release_climb_up()
+                            continue
                     if self._attack_paused_last:
                         LOG.info("attack clear: patrol movement resumed")
                         self._attack_paused_last = False
