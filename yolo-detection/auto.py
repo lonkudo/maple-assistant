@@ -298,9 +298,10 @@ class OptimizedMapleBot:
                                     ('character', 'environment', 'mob')):
                                 continue
                             detection_center = (int((xyxy[0] + xyxy[2]) / 2), int((xyxy[1] + xyxy[3]) / 2))
-                            # 只保留中央區域內的偵測 (full-class preview
-                            # ignores the zone so every class is visible)
-                            if zone_enabled and not include_all:
+                            # 只保留中央區域內的偵測 (applies to both the
+                            # mob-only attack path and the preview: no
+                            # environment/mob boxes outside the zone)
+                            if zone_enabled:
                                 if not (zone_left <= detection_center[0] <= zone_right
                                         and zone_top <= detection_center[1] <= zone_bottom):
                                     continue

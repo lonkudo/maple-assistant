@@ -331,7 +331,24 @@ class FullClassDetectionTests(unittest.TestCase):
         )
         bot.confidence_threshold = 0.2
         bot.monitor = {"width": 1280, "height": 720}
-        bot.config = {"detection_behavior": {"center_zone": {"enabled": True}}}
+        # Dotted-path config lookup like the real ConfigManager so the
+        # center-zone filter actually engages in these tests.
+        class DotConfig(dict):
+            def get(self, key, default=None):
+                if "." in key:
+                    node = dict(self)
+                    for part in key.split("."):
+                        if not isinstance(node, dict) or part not in node:
+                            return default
+                        node = node[part]
+                    return node
+                return dict.get(self, key, default)
+
+        bot.config = DotConfig({
+            "detection_behavior": {
+                "center_zone": {"enabled": True},
+            },
+        })
         bot.stats = {"detections": 0}
         bot.performance_monitor = type(
             "PM", (), {"record_detection_time": lambda self, t: None}
@@ -353,10 +370,10 @@ class FullClassDetectionTests(unittest.TestCase):
                 return self._v
 
         specs = [
-            (np.array([10, 10, 60, 60]), 0.9, 2),   # item
-            (np.array([200, 200, 260, 260]), 0.8, 1),  # environment
-            (np.array([400, 400, 460, 460]), 0.7, 0),  # character
-            (np.array([600, 600, 660, 660]), 0.8, 3),  # mob
+            (np.array([300, 200, 340, 240]), 0.9, 2),   # item (inside zone)
+            (np.array([400, 200, 460, 260]), 0.8, 1),   # environment
+            (np.array([500, 300, 560, 360]), 0.7, 0),   # character
+            (np.array([600, 350, 660, 410]), 0.8, 3),   # mob
         ]
 
         class FakeBox:
@@ -399,6 +416,59 @@ class FullClassDetectionTests(unittest.TestCase):
         dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8))
         # mob is the only class returned (no temporal confirmation anymore).
         self.assertEqual([d.class_name for d in dets], ["mob"])
+
+    def test_out_of_zone_environment_and_mobs_excluded(self):
+        import numpy as np
+
+        bot = self._make_bot()
+        # Boxes outside the default zone (x 256-1024, y 144-576):
+        # environment at top-left, mob at bottom-right.
+        class FakeBox:
+            def __init__(self, xyxy, conf, cls):
+                self.xyxy = [self._t(xyxy)]
+                self.conf = [self._t(np.float64(conf))]
+                self.cls = [self._t(np.float64(cls))]
+
+            @staticmethod
+            def _t(v):
+                class Tensor:
+                    def __init__(self, val):
+                        self._v = val
+
+                    def cpu(self):
+                        return self
+
+                    def numpy(self):
+                        return self._v
+
+                return Tensor(v)
+
+        class FakeBoxes:
+            def __iter__(self):
+                # out-of-zone environment (x=10 < 256)
+                yield FakeBox(np.array([10, 200, 60, 260]), 0.9, 1)
+                # out-of-zone mob (y=700 > 576)
+                yield FakeBox(np.array([600, 700, 660, 760]), 0.9, 3)
+                # in-zone character (kept)
+                yield FakeBox(np.array([500, 300, 560, 360]), 0.7, 0)
+
+        class FakeResult:
+            boxes = FakeBoxes()
+
+        class FakeResults:
+            def __iter__(self):
+                yield FakeResult()
+
+        bot.model = type("M", (), {
+            "names": bot.model.names,
+            "__call__": lambda self, img, conf, verbose: FakeResults(),
+        })()
+        bot.detect_character = lambda img: None
+        dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8),
+                                  include_all=True)
+        # Only the in-zone character survives; environment and mob outside
+        # the zone are dropped even in the preview path.
+        self.assertEqual([d.class_name for d in dets], ["character"])
 
     def test_detect_rope_finds_tall_environment_box(self):
         import numpy as np
