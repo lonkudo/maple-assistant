@@ -282,6 +282,11 @@ def record_button_is_locked(saved_endpoint: Any, explicitly_unlocked: bool) -> b
 class UiWorker(threading.Thread):
     """Own the independent UI loop; Tk requires ``run`` on Python's main thread."""
 
+    # Set True to show the detected-minimap and map-name preview images in
+    # the UI again (they are hidden by default; the code is kept for future
+    # debugging of minimap detection).
+    _SHOW_MINIMAP_PREVIEW = False
+
     def __init__(
         self,
         frame_queue: "queue.Queue[Any]",
@@ -557,12 +562,15 @@ class UiWorker(threading.Thread):
             # Restore previously saved YOLO panel settings (threshold, ranges).
             self._yolo_load_settings()
 
-            ttk.Label(container, text="Detected minimap").pack(anchor="w")
-            self._minimap_label = ttk.Label(container)
-            self._minimap_label.pack(anchor="w", pady=(4, 10))
-            ttk.Label(container, text="Map-name region").pack(anchor="w")
-            self._map_name_label = ttk.Label(container)
-            self._map_name_label.pack(anchor="w", pady=(4, 0))
+            # Minimap / map-name preview widgets: built but hidden by default
+            # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
+            if self._SHOW_MINIMAP_PREVIEW:
+                ttk.Label(container, text="Detected minimap").pack(anchor="w")
+                self._minimap_label = ttk.Label(container)
+                self._minimap_label.pack(anchor="w", pady=(4, 10))
+                ttk.Label(container, text="Map-name region").pack(anchor="w")
+                self._map_name_label = ttk.Label(container)
+                self._map_name_label.pack(anchor="w", pady=(4, 0))
 
             debug_frame = ttk.LabelFrame(container, text="Debug log", padding=6)
             debug_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -696,10 +704,11 @@ class UiWorker(threading.Thread):
         minimap.thumbnail((360, 260), Image.Resampling.NEAREST)
         name = snapshot.map_name_preview.copy()
         name.thumbnail((360, 90), Image.Resampling.NEAREST)
-        self._photo_minimap = ImageTk.PhotoImage(minimap)
-        self._photo_map_name = ImageTk.PhotoImage(name)
-        self._minimap_label.configure(image=self._photo_minimap)
-        self._map_name_label.configure(image=self._photo_map_name)
+        if self._SHOW_MINIMAP_PREVIEW and hasattr(self, "_minimap_label"):
+            self._photo_minimap = ImageTk.PhotoImage(minimap)
+            self._photo_map_name = ImageTk.PhotoImage(name)
+            self._minimap_label.configure(image=self._photo_minimap)
+            self._map_name_label.configure(image=self._photo_map_name)
 
     def _record_endpoint(self, boundary: str) -> None:
         if self.patrol_controller is None:
