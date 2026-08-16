@@ -225,10 +225,10 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertTrue(ex.attack(char, right))
         self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
 
-    def test_facing_synced_from_patrol_before_attack(self):
-        # Desync bug: executor cached facing=right, but patrol walked the
-        # character left.  A monster on the RIGHT would then be attacked
-        # without a turn.  The patrol-facing sync must trigger the turn.
+    def test_attack_turns_when_patrol_moved_character(self):
+        # Patrol walked the character left (publishing facing=left), then a
+        # monster appears on the right.  The turn must still fire - the
+        # executor never relies on a cached facing belief.
         import tempfile
         from pathlib import Path
         from combat_coordination import PatrolStateFile
@@ -245,21 +245,21 @@ class AttackExecutorTests(unittest.TestCase):
         ex._taps.clear()
         # Patrol walked the character left: publish facing=left.
         state.write(False, "left", "left")
-        # Monster still on the right: facing must be re-synced and the turn
-        # tap must fire.
+        # Monster still on the right: the turn tap must fire every attack.
         self.assertTrue(ex.attack(char, right))
         self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
         self.assertEqual(ex._facing, "right")
 
-    def test_attack_skips_turn_when_already_facing(self):
+    def test_attack_always_turns_toward_target(self):
         ex = self._executor(cooldown=0.0, turn_settle=0.0)
         char = make_detection("character", 400, 400)
         left = make_detection("mob", 200, 400)
         ex.attack(char, left)  # turns left
         ex._taps.clear()
-        # Still on the left: only ctrl, no extra turn tap.
+        # Every attack turns toward the target first - never trust a cached
+        # facing to skip the turn (the game is the source of truth).
         self.assertTrue(ex.attack(char, left))
-        self.assertEqual(ex._taps, [("ctrl", 0.1)])
+        self.assertEqual(ex._taps, [("left", 0.08), ("ctrl", 0.1)])
 
     def test_attack_respects_cooldown(self):
         ex = self._executor(cooldown=10.0)
