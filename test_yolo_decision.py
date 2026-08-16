@@ -351,5 +351,103 @@ class MobTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.update([mob]), [])
 
 
+class FullClassDetectionTests(unittest.TestCase):
+    """include_all=True returns every class without zone/tracker filters."""
+
+    def setUp(self):
+        _require_auto()
+
+    def _make_bot(self):
+        from auto import OptimizedMapleBot
+
+        class FakeModel:
+            names = {
+                0: "character", 1: "environment", 2: "item",
+                3: "mob", 4: "npc", 5: "ui",
+            }
+
+            def __init__(self, call_fn):
+                self._call_fn = call_fn
+
+            def __call__(self, img, conf=None, verbose=False):
+                return self._call_fn(img, conf, verbose)
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        bot.model = FakeModel(
+            lambda img, conf, verbose: self._fake_call(img, conf, verbose)
+        )
+        bot.confidence_threshold = 0.2
+        bot.monitor = {"width": 1280, "height": 720}
+        bot.config = {"detection_behavior": {"center_zone": {"enabled": True}}}
+        bot.stats = {"detections": 0}
+        bot.performance_monitor = type(
+            "PM", (), {"record_detection_time": lambda self, t: None}
+        )()
+        bot._mob_tracker = __import__("mob_tracker").MobTracker()
+        return bot
+
+    @staticmethod
+    def _fake_call(img, conf, verbose):
+        import numpy as np
+
+        class Tensor:
+            def __init__(self, value):
+                self._v = value
+
+            def cpu(self):
+                return self
+
+            def numpy(self):
+                return self._v
+
+        specs = [
+            (np.array([10, 10, 60, 60]), 0.9, 2),   # item
+            (np.array([200, 200, 260, 260]), 0.8, 1),  # environment
+            (np.array([400, 400, 460, 460]), 0.7, 0),  # character
+            (np.array([600, 600, 660, 660]), 0.8, 3),  # mob
+        ]
+
+        class FakeBox:
+            def __init__(self, xyxy, conf, cls):
+                self.xyxy = [Tensor(xyxy)]
+                self.conf = [Tensor(np.float64(conf))]  # 0-d: float()/int() work
+                self.cls = [Tensor(np.float64(cls))]
+
+        class FakeBoxes:
+            def __init__(self):
+                self._boxes = [FakeBox(*s) for s in specs]
+
+            def __iter__(self):
+                return iter(self._boxes)
+
+        class FakeResult:
+            boxes = FakeBoxes()
+
+        class FakeResults:
+            def __iter__(self):
+                yield FakeResult()
+
+        return FakeResults()
+
+    def test_include_all_returns_item_and_environment(self):
+        import numpy as np
+
+        bot = self._make_bot()
+        dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8),
+                                  include_all=True)
+        classes = sorted(d.class_name for d in dets)
+        self.assertEqual(classes,
+                         ["character", "environment", "item", "mob"])
+
+    def test_default_still_mobs_only(self):
+        import numpy as np
+
+        bot = self._make_bot()
+        bot.config["detection_behavior"]["detect_only_mobs"] = True
+        dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8))
+        # mob is the only class, but the tracker needs 3 frames to confirm.
+        self.assertEqual(dets, [])
+
+
 if __name__ == "__main__":
     unittest.main()

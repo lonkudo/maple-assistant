@@ -84,6 +84,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mob-match-px", type=float, default=None,
                         help="max center distance to treat detections as the "
                              "same mob across frames (default 100)")
+    parser.add_argument("--full-classes", action="store_true",
+                        help="draw every detected class (character/environment/"
+                             "item/mob/npc/ui) each with its own color, no zone "
+                             "filter or tracker (attack still uses mobs only)")
     return parser.parse_args()
 
 
@@ -208,7 +212,16 @@ def main() -> int:
             target = bot.attack_decision(
                 dets, character, attack_range=args.attack_range
             )
-            preview = bot._draw_detections(img.copy(), dets)
+            if args.full_classes:
+                # Full-class preview: every class, no zone filter, no tracker
+                # - each class is drawn with its own color by
+                # _draw_detections.  The attack decision above still uses the
+                # mob-only tracked detections.
+                preview = bot._draw_detections(
+                    img.copy(), bot.detect_objects(img, include_all=True)
+                )
+            else:
+                preview = bot._draw_detections(img.copy(), dets)
             if character is not None:
                 # Draw the player box in bright green with a label.
                 x1, y1, x2, y2 = character.bbox

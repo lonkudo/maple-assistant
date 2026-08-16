@@ -456,6 +456,17 @@ class UiWorker(threading.Thread):
             )
             self._yolo_attack_button.pack(side="left")
             self._yolo_attack_button.configure(style="Off.TCheckbutton")
+            # Full-class preview: draw every detected class with its own
+            # color (no zone filter / tracker) in the detection window.
+            self._yolo_full_classes_var = tk.BooleanVar(value=False)
+            self._yolo_full_classes_button = ttk.Checkbutton(
+                attack_row,
+                text="Full Classes",
+                variable=self._yolo_full_classes_var,
+                command=self._yolo_sync_show_button,
+            )
+            self._yolo_full_classes_button.pack(side="left", padx=(8, 0))
+            self._yolo_full_classes_button.configure(style="Off.TCheckbutton")
             ttk.Label(attack_row, text="Attack Key:").pack(
                 side="left", padx=(10, 4)
             )
@@ -777,6 +788,9 @@ class UiWorker(threading.Thread):
             if "auto_attack" in data:
                 if hasattr(self, "_yolo_attack_var"):
                     self._yolo_attack_var.set(bool(data["auto_attack"]))
+            if "full_classes" in data:
+                if hasattr(self, "_yolo_full_classes_var"):
+                    self._yolo_full_classes_var.set(bool(data["full_classes"]))
             if "attack_key" in data:
                 if hasattr(self, "_yolo_attack_key_var"):
                     self._yolo_attack_key_var.set(str(data["attack_key"]))
@@ -802,6 +816,10 @@ class UiWorker(threading.Thread):
             "auto_attack": bool(
                 self._yolo_attack_var.get()
                 if hasattr(self, "_yolo_attack_var") else False
+            ),
+            "full_classes": bool(
+                self._yolo_full_classes_var.get()
+                if hasattr(self, "_yolo_full_classes_var") else False
             ),
             "attack_key": (
                 self._yolo_attack_key_var.get().strip()
@@ -876,6 +894,8 @@ class UiWorker(threading.Thread):
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
         if not self._yolo_show_var.get():
             cmd.append("--no-show")
+        if hasattr(self, "_yolo_full_classes_var") and self._yolo_full_classes_var.get():
+            cmd.append("--full-classes")
         if hasattr(self, "_yolo_attack_var") and self._yolo_attack_var.get():
             cmd.append("--attack")
             attack_key = "ctrl"
@@ -964,6 +984,11 @@ class UiWorker(threading.Thread):
                 self._yolo_attack_button.configure(style="TCheckbutton")
             else:
                 self._yolo_attack_button.configure(style="Off.TCheckbutton")
+        if hasattr(self, "_yolo_full_classes_button"):
+            if self._yolo_full_classes_var.get():
+                self._yolo_full_classes_button.configure(style="TCheckbutton")
+            else:
+                self._yolo_full_classes_button.configure(style="Off.TCheckbutton")
         running = (self._yolo_process is not None
                    and self._yolo_process.poll() is None)
         if running:

@@ -1,10 +1,11 @@
-{
-  "threshold": 0.33,
-  "attack_range": 1006,
-  "zone_width": 60,
-  "zone_height": 29,
-  "zone_shift_y": 0,
-  "show_detection": true,
-  "auto_attack": true,
-  "attack_key": "ctrl"
+﻿{
+    "threshold":  0.33,
+    "attack_range":  1006,
+    "zone_width":  60,
+    "zone_height":  29,
+    "zone_shift_y":  0,
+    "show_detection":  true,
+    "auto_attack":  true,
+    "attack_key":  "ctrl",
+    "full_classes":  false
 }

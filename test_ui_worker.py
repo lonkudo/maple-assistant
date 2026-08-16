@@ -149,6 +149,7 @@ class UiLogHandlerTests(unittest.TestCase):
             "Var", (), {"get": lambda self: "0.33", "set": lambda self, v: None}
         )()
         worker._yolo_show_var = type("Var", (), {"get": lambda self: False})()
+        worker._yolo_full_classes_var = type("Var", (), {"get": lambda self: True})()
         worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 800})()
         worker._yolo_zone_w_var = type("Var", (), {"get": lambda self: 60})()
         worker._yolo_zone_h_var = type("Var", (), {"get": lambda self: 60})()
@@ -165,6 +166,7 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("--threshold", args)
             self.assertIn("0.33", args)
             self.assertIn("--no-show", args)  # show toggle off by default
+            self.assertIn("--full-classes", args)  # full-class preview on
             self.assertIn("--attack-range", args)
             self.assertIn("800", args)
             self.assertIn("--zone-width", args)

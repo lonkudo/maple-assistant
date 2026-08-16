@@ -241,8 +241,17 @@ class OptimizedMapleBot:
             logger.error(f"螢幕擷取失敗: {e}")
             return None
     
-    def detect_objects(self, img: np.ndarray) -> List[Detection]:
-        """優化的物件偵測"""
+    def detect_objects(
+        self, img: np.ndarray, include_all: bool = False
+    ) -> List[Detection]:
+        """Detect objects in the frame.
+
+        Default: mobs only, restricted to the center zone, passed through
+        the temporal-confirmation tracker (used by the attack decision).
+        With ``include_all=True`` every class is returned without the
+        zone filter or tracker, so the preview can mark each class with
+        its own color.
+        """
         if self.model is None:
             return []
 
@@ -288,12 +297,13 @@ class OptimizedMapleBot:
 
                         if conf > self.confidence_threshold:
                             class_name = self.model.names[int(cls)]
-                            # 只保留 mob
-                            if detect_only_mobs and class_name != 'mob':
+                            # 只保留 mob (full-class preview keeps everything)
+                            if detect_only_mobs and not include_all and class_name != 'mob':
                                 continue
                             detection_center = (int((xyxy[0] + xyxy[2]) / 2), int((xyxy[1] + xyxy[3]) / 2))
-                            # 只保留中央區域內的偵測
-                            if zone_enabled:
+                            # 只保留中央區域內的偵測 (full-class preview
+                            # ignores the zone so every class is visible)
+                            if zone_enabled and not include_all:
                                 if not (zone_left <= detection_center[0] <= zone_right
                                         and zone_top <= detection_center[1] <= zone_bottom):
                                     continue
@@ -316,8 +326,10 @@ class OptimizedMapleBot:
 
             # Temporal confirmation: only mobs seen on several consecutive
             # frames are returned, so a single-frame flash detection never
-            # reaches the attack decision or the preview overlay.
-            detections = self._mob_tracker.update(detections)
+            # reaches the attack decision or the preview overlay.  Full-class
+            # preview (include_all) skips the tracker so every frame is shown.
+            if not include_all:
+                detections = self._mob_tracker.update(detections)
 
             # 記錄統計
             self.stats['detections'] += len(detections)
