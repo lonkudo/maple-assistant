@@ -160,12 +160,8 @@ def main() -> int:
     executor = None
     attack_state = None
     rope_state = None
-    _input_mutex = None
     if args.attack:
         from attack_executor import AttackExecutor
-        from input_mutex import InputControlMutex
-
-        _input_mutex = InputControlMutex()
 
         log_path = args.attack_log
         if log_path is None:
@@ -175,7 +171,6 @@ def main() -> int:
             attack_key=args.attack_key,
             cooldown=args.attack_cooldown,
             patrol_state_path=args.patrol_state,
-            input_mutex=_input_mutex,
             log_path=log_path,
         )
         if args.attack_state:

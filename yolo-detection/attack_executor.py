@@ -23,7 +23,7 @@ from ctypes import wintypes
 import logging
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 LOG = logging.getLogger("attack_executor")
 
@@ -136,7 +136,6 @@ class AttackExecutor:
         refocus_interval: float = 3.0,
         turn_settle: float = 0.15,
         patrol_state_path: Optional[str] = None,
-        input_mutex: Optional[Any] = None,
         log_path: Optional[str] = None,
         dry_run: bool = False,
     ) -> None:
@@ -165,9 +164,6 @@ class AttackExecutor:
             except Exception:
                 LOG.warning("patrol state unavailable; attacks not gated",
                             exc_info=True)
-        # Cross-process input-control mutex: attacks only fire while this
-        # worker owns the keyboard (never during patrol climb/drop).
-        self._input_mutex = input_mutex
         if log_path:
             self._enable_file_log(log_path)
 
@@ -348,12 +344,6 @@ class AttackExecutor:
                 return False
 
         facing = self.facing_for(character, target)
-        # Take the input mutex: patrol (climbing/dropping) owns the keyboard;
-        # if it is held, skip this attack entirely.
-        if self._input_mutex is not None:
-            if not self._input_mutex.try_acquire(0):
-                LOG.debug("attack blocked: patrol owns input")
-                return False
         try:
             if facing is not None and facing != self._facing:
                 self._tap(facing, self.face_hold)
@@ -365,9 +355,6 @@ class AttackExecutor:
         except OSError as exc:
             LOG.error("attack FAILED: %s", exc)
             return False
-        finally:
-            if self._input_mutex is not None:
-                self._input_mutex.release()
         self._last_attack = now
         LOG.info("attack: key=%s facing=%s player=(%.0f,%.0f) "
                  "target=(%.0f,%.0f) dx=%.0f dy=%.0f",
