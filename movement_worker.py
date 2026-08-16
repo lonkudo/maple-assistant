@@ -22,6 +22,8 @@ from PIL import Image
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from patrol_control import CoordinateLayout
 
+from combat_coordination import AttackStateFile
+
 
 LOG = logging.getLogger(__name__)
 
@@ -920,6 +922,7 @@ class MovementWorker(threading.Thread):
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Any = None,
         automation_active_event: Optional[threading.Event] = None,
+        attack_state_path: Optional[str] = None,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -998,6 +1001,13 @@ class MovementWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
+        # Cross-process attack coordination: when the YOLO attack worker
+        # reports an active target, patrol movement pauses (attack priority).
+        self._attack_state = (
+            AttackStateFile(attack_state_path)
+            if attack_state_path else None
+        )
+        self._attack_paused_last = False
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
@@ -1414,6 +1424,23 @@ class MovementWorker(threading.Thread):
                     if self.dropping_active_event is not None:
                         self.dropping_active_event.clear()
                     continue
+                # Attack priority: while the YOLO attack worker reports an
+                # active target, hold patrol movement entirely so the
+                # character stands still and fights.
+                if self._attack_state is not None:
+                    if self._attack_state.is_active():
+                        if not self._attack_paused_last:
+                            LOG.info("attack active: patrol movement paused")
+                            self._attack_paused_last = True
+                        if self.climbing_active_event is not None:
+                            self.climbing_active_event.clear()
+                        if self.dropping_active_event is not None:
+                            self.dropping_active_event.clear()
+                        self._release_climb_up()
+                        continue
+                    if self._attack_paused_last:
+                        LOG.info("attack clear: patrol movement resumed")
+                        self._attack_paused_last = False
                 minimap_region = self.minimap_region
                 minimap_detection = None
                 if self.minimap_detector is not None:

@@ -877,6 +877,11 @@ class UiWorker(threading.Thread):
             cmd.extend(["--attack-key", attack_key])
             cmd.extend(["--attack-log",
                         str(yolo_root / "attack.log")])
+            # Share the attack state file with the patrol worker so patrol
+            # movement pauses while a target is active (attack priority).
+            cmd.extend(["--attack-state", str(
+                Path(__file__).resolve().parent / "work" / "attack_state.json"
+            )])
         attack_range = int(self._yolo_attack_range_var.get())
         cmd.extend(["--attack-range", f"{attack_range}"])
         zone_w = max(0.1, min(1.0, int(self._yolo_zone_w_var.get()) / 100.0))

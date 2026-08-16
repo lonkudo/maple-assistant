@@ -22,6 +22,9 @@ try:
 except Exception:
     pass
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The assistant root (parent of yolo-detection) holds shared coordination
+# modules like combat_coordination.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
 import numpy as np
@@ -54,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-log", default=None,
                         help="path to append attack diagnostics (default: "
                              "attack.log next to this script)")
+    parser.add_argument("--attack-state", default=None,
+                        help="path to write attack state JSON for the patrol "
+                             "worker (attack priority signal)")
     parser.add_argument("--window-title", default="\u5192\u9669\u5c9b\u6000\u65e7\u670d",
                         help="game window title used for the foreground check "
                              "(default: \u5192\u9669\u5c9b\u6000\u65e7\u670d)")
@@ -143,6 +149,7 @@ def main() -> int:
     region = bot.monitor
 
     executor = None
+    attack_state = None
     if args.attack:
         from attack_executor import AttackExecutor
 
@@ -155,6 +162,10 @@ def main() -> int:
             cooldown=args.attack_cooldown,
             log_path=log_path,
         )
+        if args.attack_state:
+            from combat_coordination import AttackStateFile
+
+            attack_state = AttackStateFile(args.attack_state)
         if executor.select_window():
             print(f"auto-attack enabled: game window focused "
                   f"(title={args.window_title!r})")
@@ -201,6 +212,13 @@ def main() -> int:
                     if executor.attack(character, target):
                         print(f"ATTACK pressed ctrl, facing="
                               f"{executor._facing}")
+            # Publish the attack state for the patrol worker: active only
+            # while a target is selected (attack priority over patrol).
+            if attack_state is not None:
+                if target is not None and character is not None:
+                    attack_state.write(True, target.center)
+                else:
+                    attack_state.write(False)
             preview = draw_attack_range(
                 preview, args.attack_range, args.attack_line_height,
                 character=character,

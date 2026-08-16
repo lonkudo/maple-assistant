@@ -117,6 +117,27 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_layer_index, 0)
         self.assertEqual(worker._route_phase, "left")
 
+    def test_attack_state_pause_gate(self):
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import AttackStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "attack_state.json"
+        state = AttackStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, attack_state_path=str(tmp),
+        )
+        # No state file yet: patrol must NOT be paused.
+        self.assertFalse(worker._attack_state.is_active())
+        self.assertFalse(worker._attack_paused_last)
+        # Attack worker reports a target: the gate trips.
+        state.write(True, (100.0, 200.0))
+        self.assertTrue(worker._attack_state.is_active())
+        # Attack clears: the gate releases.
+        state.write(False)
+        self.assertFalse(worker._attack_state.is_active())
+
     def test_y_only_incomplete_layer_can_be_detected(self):
         layers = {
             "layer1": {"layer_y": .698864, "y_tolerance": .02},

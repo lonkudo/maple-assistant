@@ -380,6 +380,9 @@ def main() -> int:
             diamond_size_tracker=movement_diamond_tracker,
             structure_tracker=structure_tracker,
             automation_active_event=automation_active,
+            attack_state_path=str(
+                Path(__file__).with_name("work") / "attack_state.json"
+            ),
         ),
         StatusWorker(
             status_frames,
