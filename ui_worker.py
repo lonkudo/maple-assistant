@@ -287,6 +287,10 @@ class UiWorker(threading.Thread):
     # debugging of minimap detection).
     _SHOW_MINIMAP_PREVIEW = False
 
+    # Set True to show the "Detection" info panel (frame stats) again; it is
+    # hidden by default, the rendering code is kept for future use.
+    _SHOW_DETECTION_INFO = False
+
     def __init__(
         self,
         frame_queue: "queue.Queue[Any]",
@@ -346,7 +350,7 @@ class UiWorker(threading.Thread):
             screen_width = root.winfo_screenwidth()
             # Default tall layout on the left/secondary monitor; the position
             # is negative so the window opens on the monitor left of primary.
-            window_height = 1600
+            window_height = 1000
             root.geometry(f"700x{window_height}-1000-500")
             root.minsize(520, 560)
             root.protocol("WM_DELETE_WINDOW", root.destroy)
@@ -399,10 +403,14 @@ class UiWorker(threading.Thread):
             self._automation_status_label.pack(anchor="w", pady=(5, 0))
             self._refresh_patrol_controls()
 
-            info = ttk.LabelFrame(container, text="Detection", padding=10)
-            info.pack(fill="x", pady=(0, 8))
-            self._info_label = ttk.Label(info, text="Waiting for first frame…", justify="left")
-            self._info_label.pack(anchor="w")
+            # Detection info panel: hidden by default (kept for future use).
+            if self._SHOW_DETECTION_INFO:
+                info = ttk.LabelFrame(container, text="Detection", padding=10)
+                info.pack(fill="x", pady=(0, 8))
+                self._info_label = ttk.Label(
+                    info, text="Waiting for first frame…", justify="left"
+                )
+                self._info_label.pack(anchor="w")
 
             yolo_panel = ttk.LabelFrame(container, text="YOLO detection (maplestory-worlds-automation)", padding=10)
             yolo_panel.pack(fill="x", pady=(0, 8))
@@ -681,13 +689,14 @@ class UiWorker(threading.Thread):
             f"{snapshot.marker_pixel_size[0]} × {snapshot.marker_pixel_size[1]} px"
             if snapshot.marker_pixel_size is not None else "not detected"
         )
-        self._info_label.configure(text=(
-            f"Frame: {snapshot.sequence}\n"
-            f"Captured: {snapshot.captured_at.astimezone().strftime('%H:%M:%S.%f')[:-3]}\n"
-            f"Cropped capture: {snapshot.client_size[0]} × {snapshot.client_size[1]} px\n"
-            f"Detector: {detection.source}  confidence={detection.confidence:.3f}\n"
-            f"Minimap: {_box_text(detection.window_box)}\n"
-            f"Analysis: {_box_text(detection.analysis_box)}\n"
+        if hasattr(self, "_info_label"):
+            self._info_label.configure(text=(
+                f"Frame: {snapshot.sequence}\n"
+                f"Captured: {snapshot.captured_at.astimezone().strftime('%H:%M:%S.%f')[:-3]}\n"
+                f"Cropped capture: {snapshot.client_size[0]} × {snapshot.client_size[1]} px\n"
+                f"Detector: {detection.source}  confidence={detection.confidence:.3f}\n"
+                f"Minimap: {_box_text(detection.window_box)}\n"
+                f"Analysis: {_box_text(detection.analysis_box)}\n"
             f"Map canvas: {_box_text(detection.canvas_box)}\n"
             f"Map-name crop: {_box_text(detection.map_name_box)}\n"
             f"Player: {player_text}  confidence={snapshot.marker_confidence:.3f}\n"
