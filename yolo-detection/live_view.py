@@ -64,14 +64,12 @@ def draw_attack_range(
     line_height: float,
     character: Optional[Detection] = None,
 ) -> np.ndarray:
-    """Draw the attack range anchored to the character position.
+    """Draw the attack range line anchored to the character position.
 
     When ``character`` is provided the range line is centered on the
-    character's center (so it follows the player as the camera moves) and a
-    cyan circle with radius ``attack_range`` is drawn around it, matching the
-    euclidean distance used by ``attack_decision``.  Without a character the
-    line falls back to the screen center at ``line_height`` (fraction of
-    frame height).
+    character's center (so it follows the player as the camera moves).
+    Without a character the line falls back to the screen center at
+    ``line_height`` (fraction of frame height).
     """
 
     height, width = img.shape[:2]
@@ -79,8 +77,6 @@ def draw_attack_range(
     if character is not None:
         center_x = int(character.center[0])
         y = int(character.center[1])
-        # Full attack circle (euclidean range used by attack_decision).
-        cv2.circle(img, (center_x, y), max(10, attack_range), color, 2)
     else:
         center_x = width // 2
         y = int(height * max(0.05, min(0.95, line_height)))
