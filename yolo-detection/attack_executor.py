@@ -146,12 +146,16 @@ class AttackExecutor:
         """Restore and refocus the game window (best effort).
 
         Finds the game window by title; unminimizes it and brings it to the
-        foreground.  Returns True when the game now has focus.
+        foreground.  Plain SetForegroundWindow is often refused by the
+        Windows foreground lock, so it falls back to an Alt transition and
+        thread-input attachment (same chain as the assistant's
+        WindowKeySender).  Returns True when the game now has focus.
         """
 
         if self.dry_run:
             return True
         try:
+            import win32api
             import win32con
             import win32gui
             import win32process
@@ -173,12 +177,65 @@ class AttackExecutor:
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                 time.sleep(0.05)
-            if win32gui.GetForegroundWindow() != hwnd:
+
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+            # 1) Direct attempt (usually succeeds when our process was the
+            #    last to receive input).
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                LOG.debug("direct foreground selection refused", exc_info=True)
+            time.sleep(0.05)
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+
+            # 2) Alt transition: briefly press/release Alt, which lets
+            #    Windows accept a foreground request after its lock timeout.
+            _send_scan_code(0x38, key_up=False, extended=False)
+            _send_scan_code(0x38, key_up=True, extended=False)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                LOG.debug("Alt-assisted foreground selection refused",
+                          exc_info=True)
+            time.sleep(0.05)
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+
+            # 3) Thread-input attachment: final best-effort fallback.
+            foreground = win32gui.GetForegroundWindow()
+            if foreground:
+                current_tid = win32api.GetCurrentThreadId()
+                foreground_tid = win32process.GetWindowThreadProcessId(
+                    foreground)[0]
+                target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+                attached: list[int] = []
                 try:
-                    win32gui.SetForegroundWindow(hwnd)
-                except Exception:
-                    LOG.debug("SetForegroundWindow refused", exc_info=True)
-                time.sleep(0.05)
+                    for thread_id in {foreground_tid, target_tid}:
+                        if thread_id and thread_id != current_tid:
+                            try:
+                                win32process.AttachThreadInput(
+                                    current_tid, thread_id, True
+                                )
+                                attached.append(thread_id)
+                            except Exception:
+                                LOG.debug("could not attach input thread %s",
+                                          thread_id, exc_info=True)
+                    try:
+                        win32gui.SetForegroundWindow(hwnd)
+                    except Exception:
+                        LOG.debug("attached foreground selection refused",
+                                  exc_info=True)
+                    time.sleep(0.05)
+                finally:
+                    for thread_id in reversed(attached):
+                        try:
+                            win32process.AttachThreadInput(
+                                current_tid, thread_id, False
+                            )
+                        except Exception:
+                            pass
             return win32gui.GetForegroundWindow() == hwnd
         except Exception as exc:
             LOG.warning("refocus failed: %s", exc)
