@@ -173,6 +173,19 @@ class OptimizedMapleBot:
         self._char_history: deque = deque(maxlen=8)
         self._char_smoothed: Optional[Detection] = None
         self._char_miss_frames = 0
+
+        # Mob temporal confirmation: reject single-frame flash false
+        # positives (requires ``confirm_frames`` consecutive sightings).
+        from mob_tracker import MobTracker
+
+        self._mob_tracker = MobTracker(
+            confirm_frames=int(self.config.get(
+                'detection_behavior.mob_confirm_frames', 3)),
+            miss_hold=int(self.config.get(
+                'detection_behavior.mob_miss_hold', 3)),
+            match_px=float(self.config.get(
+                'detection_behavior.mob_match_px', 100)),
+        )
         
         # 設定 PyAutoGUI
         if self.config.get('safety.enable_failsafe', True):
@@ -296,6 +309,11 @@ class OptimizedMapleBot:
 
             # 按優先級和距離排序
             detections = self._prioritize_detections(detections)
+
+            # Temporal confirmation: only mobs seen on several consecutive
+            # frames are returned, so a single-frame flash detection never
+            # reaches the attack decision or the preview overlay.
+            detections = self._mob_tracker.update(detections)
 
             # 記錄統計
             self.stats['detections'] += len(detections)
