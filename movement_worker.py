@@ -926,6 +926,7 @@ class MovementWorker(threading.Thread):
         attack_state_path: Optional[str] = None,
         rope_state_path: Optional[str] = None,
         rope_jump_px: float = 140.0,
+        on_rope_px: float = 50.0,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1021,6 +1022,12 @@ class MovementWorker(threading.Thread):
             if rope_state_path else None
         )
         self.rope_jump_px = max(20.0, float(rope_jump_px))
+        # When the character's screen X is within this many pixels of the
+        # rope, it is considered ON the rope: YOLO stops jumping and patrol's
+        # climb state machine holds Up.  This dead zone prevents YOLO from
+        # flipping the jump direction as the character passes the rope X and
+        # yanking it off the rope mid-climb.
+        self.on_rope_px = max(10.0, min(float(on_rope_px), self.rope_jump_px))
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
@@ -1068,6 +1075,11 @@ class MovementWorker(threading.Thread):
             return None, None
         gap = self._rope_state.screen_gap()
         if gap is None:
+            return None, None
+        # ON the rope: no jump.  The character overlays the rope, so YOLO
+        # hands off - patrol's climb state machine holds Up and climbs.
+        if abs(gap) <= self.on_rope_px:
+            LOG.info("YOLO rope: on rope (gap=%+.0fpx); patrol climbs", gap)
             return None, None
         if abs(gap) > self.rope_jump_px:
             # Too far to jump: hand the approach back to patrol (minimap
@@ -1691,6 +1703,17 @@ class MovementWorker(threading.Thread):
                         if yolo_decision is not None:
                             decision = yolo_decision
                             active_target_x = yolo_target_x
+                        elif self._rope_state is not None and self._rope_state.is_fresh():
+                            # Fresh YOLO state but no jump decision: either
+                            # the character is ON the rope (hand the climb to
+                            # patrol - no jump) or too far (patrol walks).
+                            gap = self._rope_state.screen_gap()
+                            if gap is not None and abs(gap) <= self.on_rope_px:
+                                decision = MovementDecision(
+                                    None,
+                                    "YOLO: on rope; patrol holds Up to climb",
+                                )
+                                active_target_x = None
                 else:
                     assert route_target_x is not None
                     target_y = observation.player.y if observation.player is not None else 0.0

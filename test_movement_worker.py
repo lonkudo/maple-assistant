@@ -221,6 +221,26 @@ class MovementTests(unittest.TestCase):
         state.write(False)
         self.assertEqual(worker._yolo_rope_decision(), (None, None))
 
+    def test_yolo_on_rope_dead_zone_hands_climb_to_patrol(self):
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import RopeStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "rope_state.json"
+        state = RopeStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, rope_state_path=str(tmp),
+            rope_jump_px=140.0, on_rope_px=50.0,
+        )
+        # Character overlays the rope (gap 30px <= on_rope 50): NO jump.
+        state.write(True, rope_x=1310.0, char_x=1280.0)
+        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        # Just outside the dead zone (gap 60px): jump fires again.
+        state.write(True, rope_x=1340.0, char_x=1280.0)
+        decision, _ = worker._yolo_rope_decision()
+        self.assertEqual(decision.key, "jump_climb_right")
+
     def test_attack_state_pause_gate(self):
         import tempfile
         from pathlib import Path
