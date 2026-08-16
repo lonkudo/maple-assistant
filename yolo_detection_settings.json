@@ -6,6 +6,5 @@
     "zone_shift_y":  0,
     "show_detection":  true,
     "auto_attack":  true,
-    "attack_key":  "ctrl",
-    "full_classes":  false
+    "attack_key":  "ctrl"
 }

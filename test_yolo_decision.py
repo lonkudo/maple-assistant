@@ -454,15 +454,15 @@ class FullClassDetectionTests(unittest.TestCase):
 
         return FakeResults()
 
-    def test_include_all_returns_item_and_environment(self):
+    def test_include_all_returns_kept_classes_only(self):
         import numpy as np
 
         bot = self._make_bot()
         dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8),
                                   include_all=True)
         classes = sorted(d.class_name for d in dets)
-        self.assertEqual(classes,
-                         ["character", "environment", "item", "mob"])
+        # item/npc/ui are excluded; only character/environment/mob remain.
+        self.assertEqual(classes, ["character", "environment", "mob"])
 
     def test_default_still_mobs_only(self):
         import numpy as np

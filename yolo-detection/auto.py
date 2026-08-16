@@ -248,9 +248,10 @@ class OptimizedMapleBot:
 
         Default: mobs only, restricted to the center zone, passed through
         the temporal-confirmation tracker (used by the attack decision).
-        With ``include_all=True`` every class is returned without the
-        zone filter or tracker, so the preview can mark each class with
-        its own color.
+        With ``include_all=True`` character/environment/mob detections are
+        returned without the zone filter or tracker, so the preview can
+        mark those classes with their own colors (item/npc/ui are
+        excluded).
         """
         if self.model is None:
             return []
@@ -297,8 +298,13 @@ class OptimizedMapleBot:
 
                         if conf > self.confidence_threshold:
                             class_name = self.model.names[int(cls)]
-                            # 只保留 mob (full-class preview keeps everything)
+                            # 只保留 mob (preview mode keeps character/
+                            # environment/mob only)
                             if detect_only_mobs and not include_all and class_name != 'mob':
+                                continue
+                            if (include_all
+                                    and class_name not in
+                                    ('character', 'environment', 'mob')):
                                 continue
                             detection_center = (int((xyxy[0] + xyxy[2]) / 2), int((xyxy[1] + xyxy[3]) / 2))
                             # 只保留中央區域內的偵測 (full-class preview
