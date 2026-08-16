@@ -14,6 +14,7 @@ import time
 import ctypes
 import argparse
 from pathlib import Path
+from typing import Optional
 
 try:
     if sys.stdout is not None and hasattr(sys.stdout, "buffer"):
@@ -26,7 +27,7 @@ import cv2
 import numpy as np
 import mss
 
-from auto import OptimizedMapleBot
+from auto import OptimizedMapleBot, Detection
 
 INTERVAL = 0.1  # 10 fps
 
@@ -58,22 +59,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def draw_attack_range(
-    img: np.ndarray, attack_range: int, line_height: float
+    img: np.ndarray,
+    attack_range: int,
+    line_height: float,
+    character: Optional[Detection] = None,
 ) -> np.ndarray:
-    """Draw the attack range line centered on the screen.
+    """Draw the attack range anchored to the character position.
 
-    A horizontal cyan line spans ``attack_range`` pixels centered on the
-    frame, with end ticks and a label.  Used to suggest how far the bot can
-    attack in the width direction.
+    When ``character`` is provided the range line is centered on the
+    character's center (so it follows the player as the camera moves) and a
+    cyan circle with radius ``attack_range`` is drawn around it, matching the
+    euclidean distance used by ``attack_decision``.  Without a character the
+    line falls back to the screen center at ``line_height`` (fraction of
+    frame height).
     """
 
     height, width = img.shape[:2]
-    center_x = width // 2
-    y = int(height * max(0.05, min(0.95, line_height)))
+    color = (255, 255, 0)  # cyan
+    if character is not None:
+        center_x = int(character.center[0])
+        y = int(character.center[1])
+        # Full attack circle (euclidean range used by attack_decision).
+        cv2.circle(img, (center_x, y), max(10, attack_range), color, 2)
+    else:
+        center_x = width // 2
+        y = int(height * max(0.05, min(0.95, line_height)))
     half = max(10, int(attack_range // 2))
     left = max(0, center_x - half)
     right = min(width - 1, center_x + half)
-    color = (255, 255, 0)  # cyan
     # Main range line.
     cv2.line(img, (left, y), (right, y), color, 3)
     # End ticks.
@@ -147,7 +160,8 @@ def main() -> int:
                 cv2.rectangle(preview, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6),
                               (0, 0, 255), 2)
             preview = draw_attack_range(
-                preview, args.attack_range, args.attack_line_height
+                preview, args.attack_range, args.attack_line_height,
+                character=character,
             )
             cv2.putText(
                 preview,
