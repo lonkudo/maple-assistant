@@ -245,6 +245,32 @@ class MovementTests(unittest.TestCase):
         decision = worker._yolo_rope_action()
         self.assertEqual(decision.key, "jump_climb_right")
 
+    def test_patrol_busy_hysteresis_holds_after_idle_reset(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from combat_coordination import PatrolStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "patrol_state.json"
+        state = PatrolStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={},
+            patrol_state_path=str(tmp),
+            patrol_busy_hold=3.0,
+        )
+        # Emulate a stall reset to idle right after a climb: the hold window
+        # (patrol_busy_until in the future) must keep the published state
+        # busy so the YOLO attack stays blocked during the re-grab.
+        worker._climb_state.phase = "idle"
+        worker._patrol_busy_until = time.monotonic() + 3.0
+        worker._patrol_state.write(True, "climb")
+        self.assertTrue(state.is_busy())
+        # After the hold window expires, a fresh idle frame publishes idle.
+        worker._patrol_busy_until = 0.0
+        worker._patrol_state.write(False, None)
+        self.assertFalse(state.is_busy())
+
     def test_attack_state_pause_gate(self):
         import tempfile
         from pathlib import Path

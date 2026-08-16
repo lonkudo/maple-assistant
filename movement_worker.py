@@ -926,6 +926,7 @@ class MovementWorker(threading.Thread):
         attack_state_path: Optional[str] = None,
         rope_state_path: Optional[str] = None,
         patrol_state_path: Optional[str] = None,
+        patrol_busy_hold: float = 3.0,
         rope_jump_px: float = 140.0,
         on_rope_px: float = 50.0,
     ) -> None:
@@ -1028,6 +1029,11 @@ class MovementWorker(threading.Thread):
             PatrolStateFile(patrol_state_path)
             if patrol_state_path else None
         )
+        # Busy hysteresis: keep patrol_state busy for this many seconds after
+        # the last climb/drop frame, so brief idle resets between climb
+        # attempts cannot unblock the attack mid-rope.
+        self._patrol_busy_hold = max(0.5, float(patrol_busy_hold))
+        self._patrol_busy_until = 0.0
         self.rope_jump_px = max(20.0, float(rope_jump_px))
         # When the character's screen X is within this many pixels of the
         # rope, it is considered ON the rope: YOLO stops jumping and patrol's
@@ -1749,11 +1755,23 @@ class MovementWorker(threading.Thread):
                 # Publish the patrol state so the YOLO attack worker blocks
                 # attacks while the character is climbing or dropping.
                 if self._patrol_state is not None:
-                    patrol_busy = bool(
+                    busy_now = bool(
                         climb_decision_active
                         or self._climb_state.phase != "idle"
                         or (self.dropping_active_event is not None
                             and self.dropping_active_event.is_set())
+                    )
+                    # Hysteresis: once busy (climbing/dropping), stay busy for
+                    # a grace window even through brief idle resets between
+                    # climb attempts.  Without this, a stall reset wrote
+                    # busy=false for one frame and the YOLO attack fired Ctrl
+                    # exactly as the climb re-grabbed the rope, interrupting
+                    # the climb.
+                    now_mono = time.monotonic()
+                    if busy_now:
+                        self._patrol_busy_until = now_mono + self._patrol_busy_hold
+                    patrol_busy = bool(
+                        busy_now or now_mono < self._patrol_busy_until
                     )
                     self._patrol_state.write(patrol_busy, decision.key)
                 # Walking state for the pickup worker: Z is only tapped while
