@@ -229,6 +229,8 @@ class CaptureWorker(threading.Thread):
         # === ADDED DEBUG FLAG ===
         debug_draw_regions: bool = False,
         debug_minimap_fallback: Optional[NormalizedBox] = None,
+        # Pink monster search zone overlay (drawn when debug_draw_regions is on).
+        debug_monster_zone: Optional[NormalizedBox] = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
@@ -256,6 +258,7 @@ class CaptureWorker(threading.Thread):
         # === store debug flag ===
         self.debug_draw_regions = debug_draw_regions
         self.debug_minimap_fallback = debug_minimap_fallback
+        self.debug_monster_zone = debug_monster_zone
 
     def active_interval(self) -> float:
         if self.fast_capture_event is not None and self.fast_capture_event.is_set():
@@ -378,6 +381,14 @@ class CaptureWorker(threading.Thread):
                         draw.rectangle(
                             (int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)),
                             outline=(0, 255, 0),
+                            width=2
+                        )
+                    # Pink: monster search zone (middle third of the window)
+                    if self.debug_monster_zone is not None:
+                        x1, y1, x2, y2 = self.debug_monster_zone
+                        draw.rectangle(
+                            (int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)),
+                            outline=(255, 105, 180),
                             width=2
                         )
                 # Do NOT draw anything on variable `image` here, original image stays clean for opencv

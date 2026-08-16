@@ -1,0 +1,31 @@
+# Virtual environment (multi-GB) — never commit
+venv313/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Runtime logs
+*.log
+elevated_result.txt
+work-check.txt
+
+# Debug/test captures (regenerable)
+*.png
+work-shot.png
+
+# Local helper probes
+capture_compare.py
+capture_probe.py
+capture_probe_elevated.vbs
+pw_test.py
+pw_game.png
+monitors.py
+allwin.py
+winrect.py
+
+# Weights: keep best.pt (trained model), ONNX is regenerable
+weights/*.onnx

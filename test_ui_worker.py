@@ -125,6 +125,222 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(recorded, ["left_most_pos"])
         self.assertNotIn(("layer2", "left_most_pos"), worker._unlocked_points)
 
+    def test_monster_apply_bounds_updates_detector_config(self) -> None:
+        from monster_detector import MonsterDetector
+
+        detector = MonsterDetector()
+        worker = UiWorker.__new__(UiWorker)
+        worker.monster_detector = detector
+        worker._monster_apply_bounds(0, (170, 80, 80), (10, 255, 255))
+        self.assertEqual(detector.configs[0].hsv_lower, (170, 80, 80))
+        self.assertEqual(detector.configs[0].hsv_upper, (10, 255, 255))
+        self.assertEqual(len(detector.configs), 1)
+
+    def test_monster_apply_bounds_second_slot_adds_band(self) -> None:
+        from monster_detector import MonsterDetector
+
+        detector = MonsterDetector()
+        worker = UiWorker.__new__(UiWorker)
+        worker.monster_detector = detector
+        worker._monster_apply_bounds(1, (100, 100, 100), (130, 255, 255))
+        self.assertEqual(len(detector.configs), 2)
+        self.assertEqual(detector.configs[1].hsv_lower, (100, 100, 100))
+        # Slot 0 keeps its original band.
+        self.assertEqual(len(detector.configs[0].hsv_lower), 3)
+
+    def test_monster_apply_bounds_keeps_search_zone(self) -> None:
+        from monster_detector import DEFAULT_MONSTER_ZONE, MonsterDetector
+
+        detector = MonsterDetector()
+        worker = UiWorker.__new__(UiWorker)
+        worker.monster_detector = detector
+        worker._monster_apply_bounds(0, (0, 100, 100), (30, 255, 255))
+        self.assertEqual(detector.configs[0].search_zone, DEFAULT_MONSTER_ZONE)
+
+    def test_monster_ingest_saves_applies_and_previews(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+        from monster_profiles import MonsterProfileStore
+
+        class Detector:
+            def __init__(self) -> None:
+                self.configs = [None]
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Box:
+            def __init__(self) -> None:
+                self.image = None
+
+            def delete(self, _tag):
+                pass
+
+            def create_image(self, *args, **kwargs):
+                self.image = kwargs.get("image")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = MonsterProfileStore(Path(directory))
+            worker = UiWorker.__new__(UiWorker)
+            worker.monster_profile_store = store
+            worker.monster_detector = Detector()
+            worker._monster_status = Label()
+            worker._monster_boxes = [Box()]
+            worker._monster_box_names = [""]
+            worker._monster_apply_bounds = lambda slot, lower, upper, **kwargs: setattr(
+                worker.monster_detector, "configs", [
+                    (lower, upper) for _ in worker.monster_detector.configs
+                ]
+            )
+            worker._monster_box_set_image = lambda slot, image: setattr(
+                worker._monster_boxes[slot], "image", image
+            )
+
+            image = Image.new("RGB", (40, 40), (200, 160, 40))
+            worker._monster_ingest(image, "bee", 0)
+
+            self.assertIsNotNone(worker.monster_detector.configs[0])
+            self.assertIsNotNone(worker._monster_boxes[0].image)
+            self.assertEqual(worker._monster_box_names[0], "bee")
+            self.assertIn("bee", worker._monster_status.text)
+            self.assertEqual(store.names(), ["bee"])
+
+    def test_monster_paste_uses_first_empty_slot(self) -> None:
+        worker = UiWorker.__new__(UiWorker)
+        worker._monster_box_names = ["bee", "", ""]
+        self.assertEqual(worker._monster_first_empty_slot(), 1)
+        worker._monster_box_names = ["a", "b", "c"]
+        self.assertEqual(worker._monster_first_empty_slot(), 0)
+
+    def test_monster_ingest_without_store_reports_unavailable(self) -> None:
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        from PIL import Image
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.monster_profile_store = None
+        worker._monster_status = Label()
+        worker._monster_ingest(Image.new("RGB", (10, 10)), "bee", 0)
+        self.assertIn("unavailable", worker._monster_status.text)
+
+    def test_yolo_start_launches_subprocess_and_stop_terminates(self) -> None:
+        import subprocess
+        from unittest import mock
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.state = "normal"
+
+            def configure(self, *, state: str) -> None:
+                self.state = state
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._yolo_process = None
+        worker._yolo_threshold_var = type(
+            "Var", (), {"get": lambda self: "0.33", "set": lambda self, v: None}
+        )()
+        worker._yolo_status = Label()
+        worker._yolo_run_button = Button()
+        worker._yolo_stop_button = Button()
+
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None  # running
+        with mock.patch("subprocess.Popen", return_value=fake_proc) as popen:
+            worker._yolo_start()
+            args = popen.call_args[0][0]
+            self.assertIn("--threshold", args)
+            self.assertIn("0.33", args)
+        self.assertEqual(worker._yolo_run_button.state, "disabled")
+        self.assertEqual(worker._yolo_stop_button.state, "normal")
+        self.assertIn("running", worker._yolo_status.text)
+
+        fake_proc.poll.return_value = 0  # exited
+        worker._yolo_stop()
+        self.assertEqual(worker._yolo_run_button.state, "normal")
+        self.assertEqual(worker._yolo_stop_button.state, "disabled")
+        self.assertIn("stopped", worker._yolo_status.text)
+
+    def test_monster_motion_activates_without_picture(self) -> None:
+        from monster_detector import MonsterDetector
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        detector = MonsterDetector()
+        worker = UiWorker.__new__(UiWorker)
+        worker.monster_detector = detector
+        worker._monster_status = Label()
+        worker._monster_method_var = type(
+            "Var", (), {"get": lambda self: "motion"}
+        )()
+
+        worker._monster_on_method_change()
+
+        self.assertEqual(detector.configs[0].method, "motion")
+        self.assertTrue(detector.configs[0].enabled)
+        self.assertIn("motion", worker._monster_status.text.lower())
+
+    def test_monster_clear_slot_disables_band_and_deletes_profile(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+        from monster_detector import DEFAULT_MONSTER_ZONE, MonsterDetector
+        from monster_profiles import MonsterProfileStore
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = MonsterProfileStore(Path(directory))
+            detector = MonsterDetector()
+            worker = UiWorker.__new__(UiWorker)
+            worker.monster_profile_store = store
+            worker.monster_detector = detector
+            worker._monster_box_names = ["bee", "", ""]
+            worker._monster_boxes = [None, None, None]
+            worker._monster_box_photos = [None, None, None]
+            worker._monster_clear_buttons = [None, None, None]
+            worker._monster_status = Label()
+            worker._draw_monster_box_placeholder = lambda slot: None
+
+            store.save("bee", Image.new("RGB", (10, 10), (200, 160, 40)))
+            worker._monster_apply_bounds(0, (0, 100, 100), (30, 255, 255))
+            self.assertTrue(detector.configs[0].enabled)
+
+            worker._monster_clear_slot(0)
+
+            self.assertFalse(detector.configs[0].enabled)
+            self.assertEqual(worker._monster_box_names[0], "")
+            self.assertEqual(store.names(), [])
+            self.assertIn("Removed", worker._monster_status.text)
+
     def test_reset_has_no_confirmation_and_stops_before_clearing(self) -> None:
         calls = []
 
