@@ -122,13 +122,6 @@ def parse_args() -> argparse.Namespace:
     # ==== ADDED ==== debug flag for drawing capture region rectangles
     parser.add_argument("--debug-capture-regions", action="store_true",
                         help="draw rectangles on captured frame showing all ROI capture regions for debugging")
-    # ==== ADDED ==== monster detection tuning
-    parser.add_argument("--monster-hsv-min", type=str, default=None,
-                        help="OpenCV HSV lower bound as 'H,S,V' (default: permissive mask)")
-    parser.add_argument("--monster-hsv-max", type=str, default=None,
-                        help="OpenCV HSV upper bound as 'H,S,V' (default: permissive mask)")
-    parser.add_argument("--monster-interval", type=float, default=1.0,
-                        help="seconds between monster detection analyses (default: 1.0 = 1 fps)")
     return parser.parse_args()
 
 
@@ -173,13 +166,6 @@ def main() -> int:
     from map_structure_tracker import MapStructureTracker
     from patrol_control import PatrolController
     from ui_worker import UiLogHandler, UiWorker
-    from monster_detector import (
-        MonsterConfig,
-        MonsterDetector,
-        MonsterWorker,
-        DEFAULT_MONSTER_ZONE,
-    )
-    from monster_profiles import MonsterProfileStore
 
     stop_event = threading.Event()
     climb_attack_lock = threading.Lock()
@@ -189,9 +175,8 @@ def main() -> int:
     game_focused = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
-    monster_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
-    subscribers = [movement_frames, status_frames, monster_frames]
+    subscribers = [movement_frames, status_frames]
     if not args.no_ui:
         subscribers.append(ui_frames)
     bus = FrameBus(subscribers)
@@ -251,23 +236,6 @@ def main() -> int:
     )
     movement_diamond_tracker = DiamondSizeTracker()
     ui_diamond_tracker = DiamondSizeTracker()
-    monster_config = MonsterConfig(search_zone=DEFAULT_MONSTER_ZONE)
-    if args.monster_hsv_min is not None or args.monster_hsv_max is not None:
-        def _parse_hsv(text: str) -> tuple[int, int, int]:
-            values = [int(part.strip()) for part in text.split(",")]
-            if len(values) != 3:
-                raise ValueError(f"expected 'H,S,V', got {text!r}")
-            return (values[0], values[1], values[2])
-        monster_config = MonsterConfig(
-            method="histogram",
-            search_zone=DEFAULT_MONSTER_ZONE,
-            hsv_lower=_parse_hsv(args.monster_hsv_min) if args.monster_hsv_min else monster_config.hsv_lower,
-            hsv_upper=_parse_hsv(args.monster_hsv_max) if args.monster_hsv_max else monster_config.hsv_upper,
-        )
-    monster_detector = MonsterDetector(monster_config)
-    logging.info("monster zone=%s method=%s hsv=%s..%s",
-                 tuple(round(v, 3) for v in DEFAULT_MONSTER_ZONE),
-                 monster_config.method, monster_config.hsv_lower, monster_config.hsv_upper)
     logging.info("map=%s patrol=%s route=%s", map_profile["map_name"],
                  map_profile.get("patrol_enabled", False),
                  " -> ".join(map_profile.get("route_order", [])))
@@ -287,7 +255,6 @@ def main() -> int:
         # ==== ADDED pass debug flag into capture worker ====
         debug_draw_regions=args.debug_capture_regions,
         debug_minimap_fallback=MINIMAP_FALLBACK_REGION, # <------ ADD THIS LINE
-        debug_monster_zone=DEFAULT_MONSTER_ZONE,
     )
 
     def prepare_map_session() -> None:
@@ -345,14 +312,6 @@ def main() -> int:
         ))
     else:
         logging.info("attack worker temporarily disabled")
-    monster_worker = MonsterWorker(
-        monster_frames,
-        stop_event,
-        detector=monster_detector,
-        debug_dir=args.debug_dir,
-        automation_active_event=automation_active,
-        interval=args.monster_interval,
-    )
     core_workers = [
         capture_worker,
         MovementWorker(
@@ -429,7 +388,6 @@ def main() -> int:
             detector=status_detector,
             automation_active_event=automation_active,
         ),
-        monster_worker,
         *attack_workers,
         FocusWorker(
             key_sender,
@@ -459,13 +417,6 @@ def main() -> int:
             on_capture_now=capture_worker.capture_now,
             log_queue=ui_log_handler.messages if ui_log_handler is not None else None,
             automation_active_event=automation_active,
-            monster_detector=monster_detector,
-            monster_profile_store=MonsterProfileStore(
-                args.recording_configuration.parent
-                / "recording-assets"
-                / "monsters"
-            ),
-            monster_worker=monster_worker,
         )
     )
 

@@ -19,8 +19,6 @@ from map_identity import MapIdentityStore
 from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
-from monster_detector import DEFAULT_MONSTER_ZONE, MonsterConfig, MonsterDetector
-from monster_profiles import MonsterProfileStore
 
 
 LOG = logging.getLogger(__name__)
@@ -301,9 +299,6 @@ class UiWorker(threading.Thread):
         on_capture_now: Optional[Callable[[], Any]] = None,
         log_queue: Optional["queue.Queue[str]"] = None,
         automation_active_event: Optional[threading.Event] = None,
-        monster_detector: Optional[MonsterDetector] = None,
-        monster_profile_store: Optional[MonsterProfileStore] = None,
-        monster_worker: Optional[Any] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -320,10 +315,6 @@ class UiWorker(threading.Thread):
         self.on_capture_now = on_capture_now
         self.log_queue = log_queue
         self.automation_active_event = automation_active_event
-        self.monster_detector = monster_detector
-        self.monster_profile_store = monster_profile_store
-        self.monster_worker = monster_worker
-        self._photo_monster: Any = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -344,15 +335,7 @@ class UiWorker(threading.Thread):
             from tkinter import ttk
             self._ttk = ttk
 
-            try:
-                from tkinterdnd2 import TkinterDnD
-
-                root = TkinterDnD.Tk()
-                self._monster_dnd_enabled = True
-            except Exception:
-                root = tk.Tk()
-                self._monster_dnd_enabled = False
-                LOG.info("tkinterdnd2 not available; monster drag & drop disabled")
+            root = tk.Tk()
             self._root = root
             root.title("Maple Assistant Debug UI")
             screen_width = root.winfo_screenwidth()
@@ -415,101 +398,6 @@ class UiWorker(threading.Thread):
             info.pack(fill="x", pady=(0, 8))
             self._info_label = ttk.Label(info, text="Waiting for first frame…", justify="left")
             self._info_label.pack(anchor="w")
-
-            monster_panel = ttk.LabelFrame(container, text="Monster upload", padding=10)
-            monster_panel.pack(fill="x", pady=(0, 8))
-            # Detection strategy shared by all slots.
-            method_row = ttk.Frame(monster_panel)
-            method_row.pack(anchor="w", pady=(0, 6))
-            ttk.Label(method_row, text="Method:").pack(side="left", padx=(0, 6))
-            self._monster_method_var = tk.StringVar(value="silhouette")
-            self._monster_method_combo = ttk.Combobox(
-                method_row,
-                textvariable=self._monster_method_var,
-                state="readonly",
-                width=16,
-                values=("silhouette", "motion", "histogram", "color", "template"),
-            )
-            self._monster_method_combo.pack(side="left")
-            self._monster_method_combo.bind(
-                "<<ComboboxSelected>>", self._monster_on_method_change
-            )
-            ttk.Label(
-                method_row,
-                text="  silhouette = closed outlines (map-agnostic) · motion = "
-                     "anything that moved · histogram = color distribution · "
-                     "color = HSV band · template = sprite match",
-            ).pack(side="left", padx=(6, 0))
-            # Three square drop-zone boxes, one per monster profile: click to
-            # pick a file or Ctrl+V to paste the clipboard image into the
-            # first empty box.  After an upload the box shows the picture and
-            # stays visible for the next upload.
-            boxes_row = ttk.Frame(monster_panel)
-            boxes_row.pack(anchor="w", pady=(0, 8))
-            drop_size = 118
-            self._monster_boxes: list[Any] = []
-            self._monster_box_photos: list[Any] = []
-            self._monster_box_names: list[str] = []
-            self._monster_clear_buttons: list[Any] = []
-            for slot in range(3):
-                box = tk.Canvas(
-                    boxes_row,
-                    width=drop_size,
-                    height=drop_size,
-                    background="#f4f4f4",
-                    highlightthickness=1,
-                    highlightbackground="#b0b0b0",
-                    cursor="hand2",
-                )
-                box.pack(side="left", padx=(0, 8))
-                self._monster_boxes.append(box)
-                self._monster_box_photos.append(None)
-                self._monster_box_names.append("")
-                self._draw_monster_box_placeholder(slot)
-                box.bind(
-                    "<Button-1>",
-                    lambda _event, slot=slot: self._monster_select_file(slot),
-                )
-                # Small X at the top-right to remove this monster picture.
-                clear_button = tk.Button(
-                    box,
-                    text="✕",
-                    font=("Segoe UI", 10, "bold"),
-                    fg="#c03030",
-                    bd=0,
-                    relief="flat",
-                    cursor="hand2",
-                    command=lambda slot=slot: self._monster_clear_slot(slot),
-                )
-                clear_button.place(relx=1.0, x=-4, y=4, anchor="ne")
-                self._monster_clear_buttons.append(clear_button)
-                if self._monster_dnd_enabled:
-                    from tkinterdnd2 import DND_FILES
-
-                    box.drop_target_register(DND_FILES)
-                    box.dnd_bind(
-                        "<<Drop>>",
-                        lambda event, slot=slot: self._monster_on_drop(event, slot),
-                    )
-                    box.dnd_bind(
-                        "<<DropEnter>>", self._monster_on_drag_enter
-                    )
-                    box.dnd_bind(
-                        "<<DropLeave>>", self._monster_on_drag_leave
-                    )
-            self._monster_status = ttk.Label(
-                monster_panel,
-                text=("Three monster slots — click a box or Ctrl+V to upload.\n"
-                      "(Drag & drop is blocked by Windows while the assistant\n"
-                      "runs elevated — use the file dialog or paste instead.)"),
-                justify="left",
-            )
-            self._monster_status.pack(anchor="w")
-            # Ctrl+V anywhere in the window pastes the clipboard image into
-            # the first empty box.
-            root.bind("<Control-v>", self._monster_on_ctrl_v, add="+")
-            # Motion detection (the default) starts immediately, no picture.
-            self._monster_on_method_change()
 
             yolo_panel = ttk.LabelFrame(container, text="YOLO detection (maplestory-worlds-automation)", padding=10)
             yolo_panel.pack(fill="x", pady=(0, 8))
@@ -677,55 +565,7 @@ class UiWorker(threading.Thread):
                 LOG.exception("could not update debug UI")
         self._drain_logs()
         self._refresh_automation_status()
-        self._refresh_monster_status()
         root.after(self.refresh_ms, self._poll)
-
-    def _refresh_monster_status(self) -> None:
-        """Show live monster count and per-slot HSV bands in the UI."""
-
-        if not hasattr(self, "_monster_status") or self.monster_detector is None:
-            return
-        parts = []
-        last_ingest = getattr(self, "_monster_last_ingest", "")
-        if last_ingest:
-            parts.append(last_ingest)
-        for slot, config in enumerate(self.monster_detector.configs):
-            name = ""
-            if slot < len(getattr(self, "_monster_box_names", [])):
-                name = self._monster_box_names[slot]
-            label = f"Slot {slot + 1}"
-            if name:
-                label += f" ({name})"
-            if not config.enabled:
-                parts.append(f"{label}: empty")
-            else:
-                method = (config.method or "color")
-                if method == "motion":
-                    parts.append(f"{label}: [motion] anything that moves")
-                elif method == "silhouette":
-                    parts.append(f"{label}: [silhouette] closed outlines")
-                else:
-                    parts.append(
-                        f"{label}: [{method}] HSV {config.hsv_lower} .. {config.hsv_upper}"
-                    )
-        parts.append("Zone: middle third of the window")
-        monster_worker = getattr(self, "monster_worker", None)
-        if monster_worker is not None:
-            count = len(monster_worker.latest)
-            coverage = monster_worker.latest_zone_coverage
-            parts.append(f"Detected: {count}")
-            if coverage > 0.10:
-                parts.append(
-                    f"⚠ Band covers {100*coverage:.0f}% of the zone — "
-                    "background included? Upload a picture where the monster "
-                    "fills most of the frame."
-                )
-            elif coverage > 0.0:
-                parts.append(f"Zone coverage: {100*coverage:.1f}%")
-        text = "\n".join(parts)
-        if text != getattr(self, "_last_monster_status_text", None):
-            self._last_monster_status_text = text
-            self._monster_status.configure(text=text)
 
     def _refresh_automation_status(self) -> None:
         if not hasattr(self, "_automation_status_label"):
@@ -870,94 +710,6 @@ class UiWorker(threading.Thread):
                   f"x={recorded.x:.6f}, y={recorded.y:.6f}")
         )
         self._refresh_patrol_controls()
-
-    def _draw_monster_box_placeholder(self, slot: int) -> None:
-        """Draw the dashed border and centered plus icon in a drop box."""
-
-        if not hasattr(self, "_monster_boxes") or slot >= len(self._monster_boxes):
-            return
-        box = self._monster_boxes[slot]
-        box.delete("all")
-        size = int(box["width"])
-        box.create_rectangle(
-            4, 4, size - 4, size - 4,
-            outline="#b0b0b0", width=2, dash=(4, 3),
-        )
-        center = size // 2
-        box.create_text(
-            center, center, text="+",
-            font=("Segoe UI", 40), fill="#909090",
-        )
-        if slot < len(self._monster_clear_buttons):
-            self._monster_clear_buttons[slot].place_forget()
-
-    def _monster_box_set_image(self, slot: int, image: Image.Image) -> None:
-        """Show the uploaded image inside the box; box stays reusable."""
-
-        if not hasattr(self, "_monster_boxes") or slot >= len(self._monster_boxes):
-            return
-        box = self._monster_boxes[slot]
-        size = int(box["width"]) - 12
-        preview = image.copy()
-        preview.thumbnail((size, size), Image.Resampling.NEAREST)
-        photo = ImageTk.PhotoImage(preview)
-        self._monster_box_photos[slot] = photo
-        box.delete("all")
-        box.create_image(
-            int(box["width"]) // 2,
-            int(box["height"]) // 2,
-            image=photo,
-        )
-        if slot < len(self._monster_clear_buttons):
-            # Re-show the X button above the picture.
-            self._monster_clear_buttons[slot].place(
-                relx=1.0, x=-4, y=4, anchor="ne"
-            )
-
-    def _monster_on_drag_enter(self, _event: Any) -> None:
-        for box in getattr(self, "_monster_boxes", []):
-            box.configure(highlightbackground="#ff69b4")
-
-    def _monster_on_drag_leave(self, _event: Any) -> None:
-        for box in getattr(self, "_monster_boxes", []):
-            box.configure(highlightbackground="#b0b0b0")
-
-    def _monster_on_drop(self, event: Any, slot: int) -> None:
-        for box in getattr(self, "_monster_boxes", []):
-            box.configure(highlightbackground="#b0b0b0")
-        data = getattr(event, "data", None)
-        LOG.info("monster drop event slot=%s data=%r", slot, data)
-        if not data:
-            self._monster_status.configure(text="Drop contained no file.")
-            return
-        # tkdnd reports paths as a braced Tcl list: {C:/a.png} {C:/b.png}.
-        # Split robustly: braced list when braces are present, else whitespace.
-        paths: list[str] = []
-        try:
-            if self._root is not None and hasattr(self._root, "tk"):
-                paths = list(self._root.tk.splitlist(data))
-        except Exception:
-            pass
-        if not paths:
-            import re
-
-            if "{" in data:
-                paths = re.findall(r"\{([^}]*)\}", data)
-            else:
-                paths = data.split()
-        for raw in paths:
-            path = str(raw).strip()
-            if not path:
-                continue
-            # Strip a file:// URI scheme that some drag sources report.
-            if path.lower().startswith("file://"):
-                path = path[7:]
-            path = path.strip('"')
-            if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif")):
-                LOG.info("monster drop accepted path=%s", path)
-                self._monster_ingest_file(path, slot)
-                return
-        self._monster_status.configure(text="Drop a PNG/JPG/BMP/GIF image.")
 
     def _yolo_settings_path(self) -> Path:
         """JSON file holding the YOLO panel settings."""
@@ -1141,192 +893,6 @@ class UiWorker(threading.Thread):
                 text="Stop detection before changing Show Detection; "
                      "restart Run to apply."
             )
-
-    def _monster_selected_method(self) -> str:
-        """Return the method selected in the dropdown (default motion)."""
-
-        var = getattr(self, "_monster_method_var", None)
-        method = var.get() if var is not None else "silhouette"
-        if method not in ("color", "histogram", "template", "motion", "silhouette"):
-            return "silhouette"
-        return method
-
-    def _monster_on_method_change(self, _event: Any = None) -> None:
-        """React to a method dropdown change.
-
-        Motion detection needs no reference picture: it is activated directly
-        on slot 1.  The picture-based methods keep whatever is uploaded.
-        """
-
-        method = self._monster_selected_method()
-        if method in ("motion", "silhouette") and self.monster_detector is not None:
-            self.monster_detector.set_config(
-                0, MonsterConfig(method=method,
-                                 search_zone=DEFAULT_MONSTER_ZONE)
-            )
-            if method == "motion":
-                self._monster_last_ingest = (
-                    "✓ Motion detection active — anything that moves is a monster."
-                )
-            else:
-                self._monster_last_ingest = (
-                    "✓ Silhouette detection active — closed outlines, "
-                    "map-agnostic."
-                )
-            self._monster_status.configure(text=self._monster_last_ingest)
-            LOG.info("monster method changed to %s (no picture needed)", method)
-
-    def _monster_first_empty_slot(self) -> int:
-        """Return the first box without an uploaded image, else 0."""
-
-        for slot, name in enumerate(getattr(self, "_monster_box_names", [])):
-            if not name:
-                return slot
-        return 0
-
-    def _monster_on_ctrl_v(self, _event: Any) -> str:
-        self._monster_paste_clipboard()
-        # Return "break" so a focused text widget never also pastes raw text.
-        return "break"
-
-    def _monster_apply_bounds(
-        self, slot: int, lower, upper,
-        method: str = "color", template_image: Optional[Image.Image] = None,
-    ) -> None:
-        """Apply detection settings to one band of the live monster detector."""
-
-        if self.monster_detector is None:
-            return
-        config = MonsterConfig(
-            method=method,
-            search_zone=DEFAULT_MONSTER_ZONE,
-            hsv_lower=tuple(int(v) for v in lower),
-            hsv_upper=tuple(int(v) for v in upper),
-            template_image=template_image,
-        )
-        # Fill any gaps before ``slot`` with disabled bands so slot indices
-        # always line up with the UI boxes.
-        while len(self.monster_detector.configs) <= slot:
-            self.monster_detector.add_config(MonsterConfig(enabled=False))
-        self.monster_detector.set_config(slot, config)
-        LOG.info("monster settings applied slot=%s method=%s: %s .. %s",
-                 slot, method, config.hsv_lower, config.hsv_upper)
-
-    def _monster_clear_slot(self, slot: int) -> None:
-        """Remove the monster picture: clear the box, disable the band, and
-        delete the saved profile."""
-
-        if (not hasattr(self, "_monster_boxes")
-                or slot >= len(self._monster_boxes)):
-            return
-        name = ""
-        if slot < len(self._monster_box_names):
-            name = self._monster_box_names[slot]
-        # Disable the detector band for this slot.
-        if self.monster_detector is not None:
-            while len(self.monster_detector.configs) <= slot:
-                self.monster_detector.add_config(MonsterConfig(enabled=False))
-            self.monster_detector.set_config(slot, MonsterConfig(enabled=False))
-        # Delete the saved profile so it does not linger on disk.
-        if name and self.monster_profile_store is not None:
-            try:
-                self.monster_profile_store.delete(name)
-            except OSError:
-                LOG.warning("could not delete monster profile %s", name,
-                            exc_info=True)
-        self._monster_box_names[slot] = ""
-        self._monster_box_photos[slot] = None
-        self._draw_monster_box_placeholder(slot)
-        self._monster_last_ingest = f"✕ Removed monster from slot {slot + 1}."
-        self._monster_status.configure(text=self._monster_last_ingest)
-        LOG.info("monster slot %s cleared (profile %r)", slot, name)
-
-    def _monster_ingest(self, image: Image.Image, source_name: str,
-                        slot: int = 0) -> None:
-        """Save an image as a profile, apply its bounds, and show it."""
-
-        if self.monster_profile_store is None:
-            self._monster_status.configure(text="Monster profile store unavailable.")
-            return
-        try:
-            saved_name, bounds = self.monster_profile_store.save(
-                source_name, image
-            )
-        except OSError as exc:
-            self._monster_status.configure(text=f"Cannot save profile: {exc}")
-            return
-        self._monster_apply_bounds(
-            slot, *bounds,
-            method=self._monster_selected_method(),
-            template_image=image,
-        )
-        self._monster_box_set_image(slot, image)
-        self._monster_box_names[slot] = saved_name
-        self._monster_last_ingest = (
-            f"✓ Slot {slot + 1}: Monster {saved_name!r} loaded "
-            f"({self._monster_selected_method()}). "
-            f"HSV {bounds[0]} .. {bounds[1]}"
-        )
-        self._monster_status.configure(text=self._monster_last_ingest)
-        LOG.info("monster profile saved slot=%s: %s bounds=%s..%s",
-                 slot, saved_name, bounds[0], bounds[1])
-
-    def _monster_ingest_file(self, path: str, slot: int = 0) -> None:
-        try:
-            image = Image.open(path).convert("RGB")
-        except OSError as exc:
-            self._monster_status.configure(text=f"Cannot open image: {exc}")
-            return
-        self._monster_ingest(image, Path(path).stem, slot)
-
-    def _monster_select_file(self, slot: int = 0) -> None:
-        """Pick an image file, save it as a profile, and apply its bounds."""
-
-        import tkinter.filedialog as filedialog
-
-        path = filedialog.askopenfilename(
-            title="Select a monster image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif"),
-                       ("All files", "*.*")],
-        )
-        if not path:
-            return
-        self._monster_ingest_file(path, slot)
-
-    def _monster_paste_clipboard(self) -> None:
-        """Paste an image from the clipboard into the first empty box."""
-
-        try:
-            from PIL import ImageGrab
-
-            clipboard = ImageGrab.grabclipboard()
-        except Exception as exc:
-            self._monster_status.configure(text=f"Clipboard read failed: {exc}")
-            return
-        if clipboard is None:
-            self._monster_status.configure(text="Clipboard contains no image.")
-            return
-        image = None
-        if isinstance(clipboard, Image.Image):
-            image = clipboard.convert("RGB")
-        elif isinstance(clipboard, (list, tuple)) and clipboard:
-            # Windows may expose a copied file path instead of pixels.
-            first = str(clipboard[0])
-            if first.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".gif")):
-                try:
-                    image = Image.open(first).convert("RGB")
-                except OSError as exc:
-                    self._monster_status.configure(
-                        text=f"Cannot open pasted file {first!r}: {exc}"
-                    )
-                    return
-        if image is None:
-            self._monster_status.configure(text="Clipboard contains no image.")
-            return
-        slot = self._monster_first_empty_slot()
-        self._monster_ingest(
-            image, f"pasted-{datetime.now().strftime('%H%M%S')}", slot
-        )
 
     def _record_or_unlock(self, layer_name: str, boundary: str) -> None:
         """Use one embedded button to unlock, then record and relock."""
