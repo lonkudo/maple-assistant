@@ -126,17 +126,45 @@ def main() -> int:
             img = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             dets = bot.detect_objects(img)
+            character = bot.detect_character(img)
+            target = bot.attack_decision(
+                dets, character, attack_range=args.attack_range
+            )
             preview = bot._draw_detections(img.copy(), dets)
+            if character is not None:
+                # Draw the player box in bright green with a label.
+                x1, y1, x2, y2 = character.bbox
+                cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(
+                    preview,
+                    f"PLAYER conf={character.confidence:.2f}",
+                    (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 0), 2,
+                )
+            if target is not None:
+                # Highlight the chosen attack target in red outline.
+                x1, y1, x2, y2 = target.bbox
+                cv2.rectangle(preview, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6),
+                              (0, 0, 255), 2)
             preview = draw_attack_range(
                 preview, args.attack_range, args.attack_line_height
             )
             cv2.putText(
                 preview,
-                f"THRESHOLD: {conf:.2f} | MOBS: {len(dets)} | bright={gray.mean():.0f}",
+                f"THRESHOLD: {conf:.2f} | MOBS: {len(dets)} | "
+                f"TARGET: {'YES' if target else 'NO'} | "
+                f"PLAYER: {'YES' if character else 'NO'} | "
+                f"bright={gray.mean():.0f}",
                 (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3,
             )
             for d in dets:
                 print(f"MOB conf={d.confidence:.2f} box={d.bbox}")
+            if character is not None:
+                print(f"PLAYER conf={character.confidence:.2f} "
+                      f"center={character.center}")
+            if target is not None:
+                print(f"TARGET SELECTED conf={target.confidence:.2f} "
+                      f"box={target.bbox}")
             if not args.no_show:
                 cv2.imshow("LIVE mob detection - ESC to exit", preview)
                 key = cv2.waitKey(1) & 0xFF

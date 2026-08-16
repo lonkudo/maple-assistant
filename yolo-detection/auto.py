@@ -299,7 +299,82 @@ class OptimizedMapleBot:
         except Exception as e:
             logger.error(f"物件偵測失敗: {e}")
             return []
-    
+
+    def detect_character(self, img: np.ndarray) -> Optional[Detection]:
+        """Return the most likely player character position.
+
+        Runs the model without the mob-only filter and picks the best
+        ``character`` box: highest confidence among those nearest the screen
+        center (the player is typically centered in MapleStory).  Returns
+        ``None`` when no character is detected.
+        """
+
+        if self.model is None:
+            return None
+        try:
+            results = self.model(img, verbose=False)
+            candidates = []
+            center_x, center_y = self.monitor['width'] // 2, self.monitor['height'] // 2
+            for result in results:
+                boxes = result.boxes
+                if boxes is None:
+                    continue
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    if self.model.names[cls] != 'character':
+                        continue
+                    conf = float(box.conf[0])
+                    if conf < self.confidence_threshold:
+                        continue
+                    xyxy = [int(v) for v in box.xyxy[0].cpu().numpy().tolist()]
+                    detection_center = ((xyxy[0] + xyxy[2]) // 2,
+                                        (xyxy[1] + xyxy[3]) // 2)
+                    distance = np.sqrt(
+                        (detection_center[0] - center_x) ** 2
+                        + (detection_center[1] - center_y) ** 2
+                    )
+                    candidates.append(Detection(
+                        bbox=xyxy, confidence=conf, class_id=cls,
+                        class_name='character', center=detection_center,
+                        distance_from_center=float(distance),
+                    ))
+            if not candidates:
+                return None
+            # Prefer the highest confidence; break ties toward screen center.
+            candidates.sort(
+                key=lambda d: (d.confidence, -d.distance_from_center),
+                reverse=True,
+            )
+            return candidates[0]
+        except Exception as e:
+            logger.error(f"角色偵測失敗: {e}")
+            return None
+
+    def attack_decision(
+        self, mobs: List[Detection], character: Optional[Detection],
+        attack_range: int = 800,
+    ) -> Optional[Detection]:
+        """Return the best mob to attack, or None.
+
+        A mob is attackable only when its center is within ``attack_range``
+        pixels of the character position.  Among attackable mobs the one
+        nearest the character wins.  Without a character position no mob is
+        attackable.
+        """
+
+        if character is None or not mobs:
+            return None
+        cx, cy = character.center
+        attackable = []
+        for mob in mobs:
+            mx, my = mob.center
+            distance = np.sqrt((mx - cx) ** 2 + (my - cy) ** 2)
+            if distance <= attack_range:
+                attackable.append((float(distance), mob))
+        if not attackable:
+            return None
+        attackable.sort(key=lambda item: item[0])
+        return attackable[0][1]
     def _prioritize_detections(self, detections: List[Detection]) -> List[Detection]:
         """按優先級和距離排序偵測結果"""
         priority_map = {name: i for i, name in enumerate(self.config.get('automation.priority_targets', []))}
