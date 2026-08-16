@@ -24,7 +24,7 @@
   },
   "layers": {
     "layer1": {
-      "y_tolerance": 0.02,
+      "y_tolerance": 0.025,
       "calibration_status": "complete",
       "left_most_pos": {
         "x": 0.245562,
@@ -99,7 +99,7 @@
       }
     },
     "layer2": {
-      "y_tolerance": 0.02,
+      "y_tolerance": 0.025,
       "calibration_status": "complete",
       "left_most_pos": {
         "x": 0.275148,
@@ -174,7 +174,7 @@
       }
     },
     "layer3": {
-      "y_tolerance": 0.02,
+      "y_tolerance": 0.025,
       "calibration_status": "final_layer_ready",
       "left_most_pos": {
         "x": 0.328402,

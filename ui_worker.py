@@ -1016,9 +1016,15 @@ class UiWorker(threading.Thread):
                 "from auto import ConfigManager; "
                 "m = ConfigManager(r'%s'); "
                 "m.set('detection_behavior.confidence_threshold', %r); "
-                "sys.exit(0 if m.save() else 1)"
+                "ok = m.save(); "
+                "v = ConfigManager(r'%s').get("
+                "'detection_behavior.confidence_threshold'); "
+                "print('VERIFY', v); "
+                "sys.exit(0 if (ok and abs(float(v) - %r) < 1e-6) else 3)"
             ) % (
                 str(yolo_root),
+                str(yolo_root / "config.yaml"),
+                threshold,
                 str(yolo_root / "config.yaml"),
                 threshold,
             )
@@ -1031,11 +1037,13 @@ class UiWorker(threading.Thread):
                 ),
             )
             if result.returncode == 0:
-                LOG.info("threshold %.3f written to %s",
+                LOG.info("threshold %.3f written + verified in %s",
                          threshold, yolo_root / "config.yaml")
             else:
-                LOG.warning("config.yaml threshold update failed: %s",
-                            result.stderr.strip())
+                LOG.warning("config.yaml threshold update failed "
+                            "(rc=%s): %s",
+                            result.returncode,
+                            (result.stdout + result.stderr).strip())
         except Exception:
             LOG.warning("could not update config.yaml threshold", exc_info=True)
 

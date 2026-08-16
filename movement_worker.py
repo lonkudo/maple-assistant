@@ -1427,6 +1427,15 @@ class MovementWorker(threading.Thread):
         return False
 
     def _on_first_layer(self, observation: MinimapObservation) -> bool:
+        """True when the marker has reached the first (bottom) layer.
+
+        The first layer is the bottom of the route, so arrival means the
+        marker's Y is AT or BELOW the recorded band (dropping further is
+        impossible - the character is standing on it).  A strict symmetric
+        tolerance failed when the drop landed a few pixels below the
+        recorded ``layer_y``, leaving the bot pressing Alt+Down forever.
+        """
+
         if observation.player is None or self.first_layer is None:
             return False
         layer = self.important_positions.get(self.first_layer)
@@ -1435,10 +1444,10 @@ class MovementWorker(threading.Thread):
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):
-            return abs(
-                observation.world_y_diamonds - float(layer["layer_world_y"])
-            ) <= float(layer.get("world_y_tolerance", 0.75))
-        return abs(observation.player.y - float(layer["layer_y"])) <= float(
+            return observation.world_y_diamonds >= float(
+                layer["layer_world_y"]
+            ) - float(layer.get("world_y_tolerance", 0.75))
+        return observation.player.y >= float(layer["layer_y"]) - float(
             layer.get("y_tolerance", 0.020000)
         )
 

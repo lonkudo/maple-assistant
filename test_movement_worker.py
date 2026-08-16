@@ -105,6 +105,29 @@ class MovementTests(unittest.TestCase):
             ("up", "alt"), ("up", "down"),
         ])
 
+    def test_on_first_layer_accepts_marker_below_recorded_y(self):
+        # The drop landed a few pixels BELOW the recorded layer_y (0.685 vs
+        # 0.662).  The first layer is the bottom: being at-or-below the band
+        # must count as arrived, or the bot presses Alt+Down forever.
+        positions = {
+            "layer1": {"layer_y": 0.66185, "y_tolerance": 0.02,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+            "layer2": {"layer_y": .56, "y_tolerance": .02,
+                       "left_most_pos": {"x": .3, "y": .56},
+                       "right_most_pos": {"x": .6, "y": .56}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+            final_layer_action="drop_to_first_layer", first_layer="layer1",
+        )
+        below = MinimapObservation(Point(.79, 0.684971), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._on_first_layer(below))
+        # Still on an upper layer: not arrived.
+        upper = MinimapObservation(Point(.79, .56), None, .9, (0, 0, 1, 1))
+        self.assertFalse(worker._on_first_layer(upper))
+
     def test_final_layer_drops_instead_of_targeting_rope_then_resets(self):
         positions = {
             "layer1": {"layer_y": .70, "y_tolerance": .02,
