@@ -1,6 +1,7 @@
 import queue
 import threading
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import numpy as np
@@ -111,6 +112,8 @@ class MovementTests(unittest.TestCase):
         # must count as arrived, or the bot presses Alt+Down forever.
         positions = {
             "layer1": {"layer_y": 0.66185, "y_tolerance": 0.02,
+                       "layer_world_y": 5.495099,
+                       "world_y_tolerance": 0.75,
                        "left_most_pos": {"x": .2, "y": .70},
                        "right_most_pos": {"x": .8, "y": .70}},
             "layer2": {"layer_y": .56, "y_tolerance": .02,
@@ -126,6 +129,46 @@ class MovementTests(unittest.TestCase):
         self.assertTrue(worker._on_first_layer(below))
         # Still on an upper layer: not arrived.
         upper = MinimapObservation(Point(.79, .56), None, .9, (0, 0, 1, 1))
+        self.assertFalse(worker._on_first_layer(upper))
+
+    def test_on_first_layer_marker_y_wins_over_stale_world_y(self):
+        # The marker is EXACTLY on layer1's recorded layer_y, but the world-Y
+        # tracker is stale (still reading layer2's value).  The marker path
+        # must win - a single world-Y path would never recognize arrival.
+        positions = {
+            "layer1": {"layer_y": 0.66185, "y_tolerance": 0.025,
+                       "layer_world_y": 5.495099,
+                       "world_y_tolerance": 0.75,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+            "layer2": {"layer_y": .552023, "y_tolerance": .025,
+                       "layer_world_y": 2.461896,
+                       "world_y_tolerance": 0.75,
+                       "left_most_pos": {"x": .3, "y": .56},
+                       "right_most_pos": {"x": .6, "y": .56}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer1", "layer2"],
+            final_layer_action="drop_to_first_layer", first_layer="layer1",
+        )
+        # Marker at layer1's y; world-Y still reports layer2's stale value.
+        on_first = MinimapObservation(
+            Point(.79, 0.66185), None, .9, (0, 0, 1, 1)
+        )
+        on_first = replace(
+            on_first,
+            world_y_diamonds=2.461896,   # stale layer2 reading
+            structure_confidence=0.9,
+        )
+        self.assertTrue(worker._on_first_layer(on_first))
+        # Both signals say upper layer: not arrived.
+        upper = MinimapObservation(Point(.79, .552), None, .9, (0, 0, 1, 1))
+        upper = replace(
+            upper,
+            world_y_diamonds=2.461896,
+            structure_confidence=0.9,
+        )
         self.assertFalse(worker._on_first_layer(upper))
 
     def test_final_layer_drops_instead_of_targeting_rope_then_resets(self):

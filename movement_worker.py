@@ -1434,9 +1434,13 @@ class MovementWorker(threading.Thread):
 
         The first layer is the bottom of the route, so arrival means the
         marker's Y is AT or BELOW the recorded band (dropping further is
-        impossible - the character is standing on it).  A strict symmetric
-        tolerance failed when the drop landed a few pixels below the
-        recorded ``layer_y``, leaving the bot pressing Alt+Down forever.
+        impossible - the character is standing on it).  Both signals are
+        OR-ed: the marker-Y check (reliable - the character is visibly on
+        the platform) and the world-Y check (can drift when the structure
+        tracker lags).  A strict symmetric tolerance or a single world-Y
+        path failed when the drop landed a few pixels below the recorded
+        ``layer_y`` / the world-Y estimate was stale, leaving the bot
+        pressing Alt+Down forever.
         """
 
         if observation.player is None or self.first_layer is None:
@@ -1444,15 +1448,19 @@ class MovementWorker(threading.Thread):
         layer = self.important_positions.get(self.first_layer)
         if not isinstance(layer, dict) or "layer_y" not in layer:
             return False
+        marker_arrived = observation.player.y >= float(
+            layer["layer_y"]
+        ) - float(layer.get("y_tolerance", 0.020000))
+        if marker_arrived:
+            return True
+        # Fall back to the world-Y signal when it is tracked and confident.
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):
             return observation.world_y_diamonds >= float(
                 layer["layer_world_y"]
             ) - float(layer.get("world_y_tolerance", 0.75))
-        return observation.player.y >= float(layer["layer_y"]) - float(
-            layer.get("y_tolerance", 0.020000)
-        )
+        return False
 
     def _reset_route_loop(self) -> None:
         self._route_layer_index = self._route_layers.index(self.first_layer)
