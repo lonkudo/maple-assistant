@@ -922,6 +922,7 @@ class MovementWorker(threading.Thread):
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Any = None,
         automation_active_event: Optional[threading.Event] = None,
+        moving_active_event: Optional[threading.Event] = None,
         attack_state_path: Optional[str] = None,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
@@ -1001,6 +1002,9 @@ class MovementWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
+        # Set while the character is actively walking (left/right decisions),
+        # used by the pickup worker to only tap Z during movement.
+        self.moving_active_event = moving_active_event
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).
         self._attack_state = (
@@ -1018,6 +1022,20 @@ class MovementWorker(threading.Thread):
         self._last_climb_attempt = float("-inf")
         self._climb_state = ClimbState()
         self._rope_approach_direction: Optional[str] = None
+
+    def _update_moving_event(self, decision: MovementDecision) -> None:
+        """Drive the walking-state event used to gate Z pickup."""
+
+        if self.moving_active_event is None:
+            return
+        if decision.key in ("left", "right"):
+            if not self.moving_active_event.is_set():
+                LOG.debug("moving: pickup Z enabled")
+            self.moving_active_event.set()
+        else:
+            if self.moving_active_event.is_set():
+                LOG.debug("not moving: pickup Z paused")
+            self.moving_active_event.clear()
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
@@ -1423,6 +1441,8 @@ class MovementWorker(threading.Thread):
                         self.climbing_active_event.clear()
                     if self.dropping_active_event is not None:
                         self.dropping_active_event.clear()
+                    if self.moving_active_event is not None:
+                        self.moving_active_event.clear()
                     continue
                 # Attack priority: while the YOLO attack worker reports an
                 # active target, hold patrol movement entirely so the
@@ -1436,6 +1456,8 @@ class MovementWorker(threading.Thread):
                             self.climbing_active_event.clear()
                         if self.dropping_active_event is not None:
                             self.dropping_active_event.clear()
+                        if self.moving_active_event is not None:
+                            self.moving_active_event.clear()
                         self._release_climb_up()
                         continue
                     if self._attack_paused_last:
@@ -1634,6 +1656,10 @@ class MovementWorker(threading.Thread):
                         self.climbing_active_event.set()
                     else:
                         self.climbing_active_event.clear()
+                # Walking state for the pickup worker: Z is only tapped while
+                # the character is actually moving left/right (patrol walk or
+                # rope approach), never while idle/aligned/climbing.
+                self._update_moving_event(decision)
                 if self.near_rope_event is not None:
                     if inside_rope_zone:
                         if not self.near_rope_event.is_set():

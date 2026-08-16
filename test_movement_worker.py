@@ -117,6 +117,26 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_layer_index, 0)
         self.assertEqual(worker._route_phase, "left")
 
+    def test_moving_event_follows_left_right_decisions(self):
+        import threading
+
+        moving = threading.Event()
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, moving_active_event=moving,
+        )
+        self.assertFalse(moving.is_set())
+        # Walking decisions raise the flag.
+        worker._update_moving_event(MovementDecision("left", "patrol"))
+        self.assertTrue(moving.is_set())
+        worker._update_moving_event(MovementDecision("right", "rope"))
+        self.assertTrue(moving.is_set())
+        # Idle/aligned/climb decisions lower it again.
+        worker._update_moving_event(MovementDecision(None, "aligned"))
+        self.assertFalse(moving.is_set())
+        worker._update_moving_event(MovementDecision("climb", "rope"))
+        self.assertFalse(moving.is_set())
+
     def test_attack_state_pause_gate(self):
         import tempfile
         from pathlib import Path

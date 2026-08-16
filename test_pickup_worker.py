@@ -72,14 +72,51 @@ class PickupWorkerTests(unittest.TestCase):
         sender = FakeSender()
         stop = threading.Event()
         automation = threading.Event()  # not set: patrol paused
+        moving = threading.Event()
+        moving.set()
         worker = PickupWorker(sender, stop, 0.25,
                               automation_active_event=automation,
+                              moving_active_event=moving,
                               initial_offset=0.25)
         worker.start()
         time.sleep(0.30)
         self.assertEqual(sender.events, [])
         stop.set()
         worker.join(1)
+
+    def test_not_moving_blocks_pickup(self):
+        sender = FakeSender()
+        stop = threading.Event()
+        automation = threading.Event()
+        automation.set()
+        moving = threading.Event()  # not set: character idle/aligned
+        worker = PickupWorker(sender, stop, 0.25,
+                              automation_active_event=automation,
+                              moving_active_event=moving,
+                              initial_offset=0.25)
+        worker.start()
+        time.sleep(0.30)
+        self.assertEqual(sender.events, [])
+        stop.set()
+        worker.join(1)
+
+    def test_moving_enables_pickup(self):
+        sender = FakeSender()
+        stop = threading.Event()
+        automation = threading.Event()
+        automation.set()
+        moving = threading.Event()
+        moving.set()  # character is walking left/right
+        worker = PickupWorker(sender, stop, 0.25,
+                              automation_active_event=automation,
+                              moving_active_event=moving,
+                              initial_offset=0.25)
+        worker.start()
+        time.sleep(0.30)
+        stop.set()
+        worker.join(1)
+        self.assertGreaterEqual(len(sender.events), 2)
+        self.assertEqual(sender.events[:2], [("down", "z"), ("up", "z")])
 
     def test_default_pickup_clock_is_half_interval_offset(self):
         worker = PickupWorker(FakeSender(), threading.Event(), 1.0)

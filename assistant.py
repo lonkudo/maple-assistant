@@ -174,6 +174,7 @@ def main() -> int:
     climb_attack_lock = threading.Lock()
     climbing_active = threading.Event()
     dropping_active = threading.Event()
+    moving_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -326,6 +327,7 @@ def main() -> int:
             climbing_active_event=climbing_active,
             dropping_active_event=dropping_active,
             automation_active_event=automation_active,
+            moving_active_event=moving_active,
         ))
     core_workers = [
         capture_worker,
@@ -395,6 +397,7 @@ def main() -> int:
             diamond_size_tracker=movement_diamond_tracker,
             structure_tracker=structure_tracker,
             automation_active_event=automation_active,
+            moving_active_event=moving_active,
             attack_state_path=str(
                 Path(__file__).with_name("work") / "attack_state.json"
             ),

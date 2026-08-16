@@ -1,8 +1,10 @@
 """Independent timed Z-pickup worker for patrol.
 
 Repeatedly taps Z (the classic MapleStory pickup key) on a monotonic timer
-while patrol automation is active, so dropped items on the ground are
-picked up as the character walks its route.
+while the character is actively walking during patrol, so dropped items on
+the ground are picked up as the character moves left/right or approaches a
+rope.  Z is NOT pressed while the character is idle, aligned, climbing, or
+dropping.
 
 Like ``AttackWorker``, this module owns no screenshots, no direction keys,
 and no analysis - it is a pure timed key tapper that yields to climb/drop
@@ -32,6 +34,7 @@ class PickupWorker(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         dropping_active_event: Optional[threading.Event] = None,
         automation_active_event: Optional[threading.Event] = None,
+        moving_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
     ) -> None:
         super().__init__(name="pickup-worker", daemon=True)
@@ -41,6 +44,7 @@ class PickupWorker(threading.Thread):
         self.climbing_active_event = climbing_active_event
         self.dropping_active_event = dropping_active_event
         self.automation_active_event = automation_active_event
+        self.moving_active_event = moving_active_event
         self.initial_offset = (
             self.pickup_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
@@ -77,6 +81,9 @@ class PickupWorker(threading.Thread):
             if (self.automation_active_event is not None
                     and not self.automation_active_event.is_set()):
                 pass  # patrol paused from the UI: no pickup spam
+            elif (self.moving_active_event is not None
+                    and not self.moving_active_event.is_set()):
+                LOG.debug("pickup skipped: character not walking")
             elif (self.climbing_active_event is not None
                     and self.climbing_active_event.is_set()):
                 LOG.debug("pickup skipped: jump-climb input is active")
