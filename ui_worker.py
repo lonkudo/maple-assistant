@@ -375,6 +375,12 @@ class UiWorker(threading.Thread):
             style = ttk.Style(root)
             style.configure("Locked.TButton", foreground="#777777")
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
+            # Show Detection toggle: grey (inactive) until checked.
+            style.configure("Off.TCheckbutton", foreground="#999999")
+            style.map(
+                "Off.TCheckbutton",
+                foreground=[("selected", "#000000"), ("!selected", "#999999")],
+            )
             action_row = ttk.Frame(controls)
             action_row.pack(fill="x", pady=(0, 8))
             self._start_patrol_button = ttk.Button(
@@ -521,7 +527,40 @@ class UiWorker(threading.Thread):
             self._yolo_stop_button = ttk.Button(
                 yolo_row, text="Stop", command=self._yolo_stop, state="disabled"
             )
-            self._yolo_stop_button.pack(side="left")
+            self._yolo_stop_button.pack(side="left", padx=(0, 8))
+            # Show-detection toggle: grey/inactive by default; only when
+            # activated does Run open the visible detection window.
+            self._yolo_show_var = tk.BooleanVar(value=False)
+            self._yolo_show_button = ttk.Checkbutton(
+                yolo_row,
+                text="Show Detection",
+                variable=self._yolo_show_var,
+                command=self._yolo_sync_show_button,
+            )
+            self._yolo_show_button.pack(side="left")
+            self._yolo_show_button.configure(style="Off.TCheckbutton")
+            # Attack range: horizontal slider (progress-bar style) that sets the
+            # width of the attack range line drawn on the detection window.
+            range_row = ttk.Frame(yolo_panel)
+            range_row.pack(fill="x", pady=(6, 0))
+            ttk.Label(range_row, text="Attack Range:").pack(
+                side="left", padx=(0, 6)
+            )
+            self._yolo_attack_range_var = tk.IntVar(value=800)
+            self._yolo_attack_range_slider = ttk.Scale(
+                range_row,
+                from_=200,
+                to=2000,
+                orient="horizontal",
+                variable=self._yolo_attack_range_var,
+                command=self._yolo_on_range_change,
+            )
+            self._yolo_attack_range_slider.pack(side="left", fill="x",
+                                                expand=True, padx=(0, 8))
+            self._yolo_attack_range_label = ttk.Label(
+                range_row, text="800 px", width=8
+            )
+            self._yolo_attack_range_label.pack(side="left")
             self._yolo_status = ttk.Label(
                 yolo_panel, text="YOLO detection stopped.", justify="left"
             )
@@ -873,6 +912,14 @@ class UiWorker(threading.Thread):
                 return
         self._monster_status.configure(text="Drop a PNG/JPG/BMP/GIF image.")
 
+    def _yolo_on_range_change(self, _value: str = "") -> None:
+        """Update the attack-range label as the slider moves."""
+
+        if not hasattr(self, "_yolo_attack_range_label"):
+            return
+        value = int(self._yolo_attack_range_var.get())
+        self._yolo_attack_range_label.configure(text=f"{value} px")
+
     def _yolo_start(self) -> None:
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
 
@@ -898,8 +945,13 @@ class UiWorker(threading.Thread):
         creationflags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows: no console window
             creationflags = subprocess.CREATE_NO_WINDOW
+        cmd = [str(python), str(script), "--threshold", f"{threshold}"]
+        if not self._yolo_show_var.get():
+            cmd.append("--no-show")
+        attack_range = int(self._yolo_attack_range_var.get())
+        cmd.extend(["--attack-range", f"{attack_range}"])
         self._yolo_process = subprocess.Popen(
-            [str(python), str(script), "--threshold", f"{threshold}"],
+            cmd,
             cwd=str(yolo_root),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -907,12 +959,13 @@ class UiWorker(threading.Thread):
         )
         self._yolo_run_button.configure(state="disabled")
         self._yolo_stop_button.configure(state="normal")
+        mode = "visible window" if self._yolo_show_var.get() else "headless"
         self._yolo_status.configure(
-            text=f"YOLO detection running (threshold {threshold:.2f}). "
-                 "Close the detection window or press Stop."
+            text=f"YOLO detection running ({mode}, threshold {threshold:.2f}). "
+                 "Press Stop to terminate."
         )
-        LOG.info("yolo detection started threshold=%.2f pid=%s",
-                 threshold, self._yolo_process.pid)
+        LOG.info("yolo detection started threshold=%.2f show=%s pid=%s",
+                 threshold, self._yolo_show_var.get(), self._yolo_process.pid)
 
     def _yolo_stop(self) -> None:
         """Terminate the YOLO detection subprocess."""
@@ -937,6 +990,23 @@ class UiWorker(threading.Thread):
         self._yolo_stop_button.configure(state="disabled")
         self._yolo_status.configure(text="YOLO detection stopped.")
         LOG.info("yolo detection stopped")
+
+    def _yolo_sync_show_button(self) -> None:
+        """Toggle the grey/inactive look based on the checked state."""
+
+        if not hasattr(self, "_yolo_show_button"):
+            return
+        if self._yolo_show_var.get():
+            self._yolo_show_button.configure(style="TCheckbutton")
+        else:
+            self._yolo_show_button.configure(style="Off.TCheckbutton")
+        running = (self._yolo_process is not None
+                   and self._yolo_process.poll() is None)
+        if running:
+            self._yolo_status.configure(
+                text="Stop detection before changing Show Detection; "
+                     "restart Run to apply."
+            )
 
     def _monster_selected_method(self) -> str:
         """Return the method selected in the dropdown (default motion)."""

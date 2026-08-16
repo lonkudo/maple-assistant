@@ -257,6 +257,8 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._yolo_threshold_var = type(
             "Var", (), {"get": lambda self: "0.33", "set": lambda self, v: None}
         )()
+        worker._yolo_show_var = type("Var", (), {"get": lambda self: False})()
+        worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 800})()
         worker._yolo_status = Label()
         worker._yolo_run_button = Button()
         worker._yolo_stop_button = Button()
@@ -268,6 +270,9 @@ class UiLogHandlerTests(unittest.TestCase):
             args = popen.call_args[0][0]
             self.assertIn("--threshold", args)
             self.assertIn("0.33", args)
+            self.assertIn("--no-show", args)  # show toggle off by default
+            self.assertIn("--attack-range", args)
+            self.assertIn("800", args)
         self.assertEqual(worker._yolo_run_button.state, "disabled")
         self.assertEqual(worker._yolo_stop_button.state, "normal")
         self.assertIn("running", worker._yolo_status.text)
@@ -277,6 +282,44 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(worker._yolo_run_button.state, "normal")
         self.assertEqual(worker._yolo_stop_button.state, "disabled")
         self.assertIn("stopped", worker._yolo_status.text)
+
+    def test_yolo_show_toggle_adds_visible_mode(self) -> None:
+        from unittest import mock
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.state = "normal"
+
+            def configure(self, *, state: str = None, style: str = None) -> None:
+                if state is not None:
+                    self.state = state
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._yolo_process = None
+        worker._yolo_threshold_var = type(
+            "Var", (), {"get": lambda self: "0.4", "set": lambda self, v: None}
+        )()
+        worker._yolo_show_var = type("Var", (), {"get": lambda self: True})()
+        worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 1200})()
+        worker._yolo_status = Label()
+        worker._yolo_run_button = Button()
+        worker._yolo_stop_button = Button()
+
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        with mock.patch("subprocess.Popen", return_value=fake_proc) as popen:
+            worker._yolo_start()
+            args = popen.call_args[0][0]
+            self.assertNotIn("--no-show", args)  # show enabled -> window mode
+            self.assertIn("--attack-range", args)
+            self.assertIn("1200", args)
 
     def test_monster_motion_activates_without_picture(self) -> None:
         from monster_detector import MonsterDetector

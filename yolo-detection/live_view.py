@@ -37,7 +37,48 @@ def parse_args() -> argparse.Namespace:
                         help="confidence threshold override (default: config.yaml)")
     parser.add_argument("--fps", type=float, default=10.0,
                         help="frames per second (default 10)")
+    parser.add_argument("--no-show", action="store_true",
+                        help="run without the preview window (headless)")
+    parser.add_argument("--attack-range", type=int, default=800,
+                        help="attack range width in pixels, centered on screen "
+                             "(default 800)")
+    parser.add_argument("--attack-line-height", type=float, default=0.72,
+                        help="vertical position of the attack range line as a "
+                             "fraction of frame height (default 0.72)")
     return parser.parse_args()
+
+
+def draw_attack_range(
+    img: np.ndarray, attack_range: int, line_height: float
+) -> np.ndarray:
+    """Draw the attack range line centered on the screen.
+
+    A horizontal cyan line spans ``attack_range`` pixels centered on the
+    frame, with end ticks and a label.  Used to suggest how far the bot can
+    attack in the width direction.
+    """
+
+    height, width = img.shape[:2]
+    center_x = width // 2
+    y = int(height * max(0.05, min(0.95, line_height)))
+    half = max(10, int(attack_range // 2))
+    left = max(0, center_x - half)
+    right = min(width - 1, center_x + half)
+    color = (255, 255, 0)  # cyan
+    # Main range line.
+    cv2.line(img, (left, y), (right, y), color, 3)
+    # End ticks.
+    tick = max(8, int(height * 0.02))
+    cv2.line(img, (left, y - tick), (left, y + tick), color, 2)
+    cv2.line(img, (right, y - tick), (right, y + tick), color, 2)
+    # Center marker (player position reference).
+    cv2.line(img, (center_x, y - tick // 2), (center_x, y + tick // 2),
+             (0, 255, 255), 2)
+    # Label.
+    cv2.putText(img, f"ATTACK RANGE: {attack_range}px",
+                (center_x - half, y - tick - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    return img
 
 
 def main() -> int:
@@ -52,7 +93,8 @@ def main() -> int:
     bot.model.conf = conf
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
-    print(f"live view: region={region} threshold={conf} fps={args.fps} (ESC to quit)")
+    print(f"live view: region={region} threshold={conf} fps={args.fps} "
+          f"show={not args.no_show} (ESC to quit)")
 
     with mss.MSS() as sct:
         while True:
@@ -62,6 +104,9 @@ def main() -> int:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             dets = bot.detect_objects(img)
             preview = bot._draw_detections(img.copy(), dets)
+            preview = draw_attack_range(
+                preview, args.attack_range, args.attack_line_height
+            )
             cv2.putText(
                 preview,
                 f"THRESHOLD: {conf:.2f} | MOBS: {len(dets)} | bright={gray.mean():.0f}",
@@ -69,15 +114,17 @@ def main() -> int:
             )
             for d in dets:
                 print(f"MOB conf={d.confidence:.2f} box={d.bbox}")
-            cv2.imshow("LIVE mob detection - ESC to exit", preview)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:
-                break
+            if not args.no_show:
+                cv2.imshow("LIVE mob detection - ESC to exit", preview)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    break
             elapsed = time.time() - t0
             if elapsed < interval:
                 time.sleep(interval - elapsed)
 
-    cv2.destroyAllWindows()
+    if not args.no_show:
+        cv2.destroyAllWindows()
     print("live view closed")
     return 0
 
