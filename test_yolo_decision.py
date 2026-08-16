@@ -218,6 +218,32 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertTrue(ex.attack(char, right))
         self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
 
+    def test_failed_injection_returns_false_and_logs(self):
+        ex = self._executor(cooldown=0.0)
+        char = make_detection("character", 400, 400)
+        mob = make_detection("mob", 600, 400)
+        calls = {"n": 0}
+
+        def failing_tap(key, hold):
+            calls["n"] += 1
+            raise OSError(87, "SendInput injected 0/1 events")
+
+        ex._tap = failing_tap
+        self.assertFalse(ex.attack(char, mob))
+        self.assertEqual(calls["n"], 1)
+
+    def test_real_sendinput_injects(self):
+        # Smoke test against the actual Win32 SendInput used by the game
+        # path: the corrected 40-byte INPUT struct must inject exactly one
+        # event per call (verified by SendInput's return value).
+        import ctypes
+        from attack_executor import _send_scan_code, _SCAN
+
+        scan, extended = _SCAN["ctrl"]
+        _send_scan_code(scan, key_up=False, extended=extended)
+        _send_scan_code(scan, key_up=True, extended=extended)
+        self.assertTrue(True)  # no OSError == injection succeeded
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ Run with ``--attack`` in live_view.py::
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import logging
 import time
 from pathlib import Path
@@ -34,39 +35,83 @@ _SCAN = {
     "right": (0x4D, True),
 }
 
-# KEYEVENTF_* flags for SendInput.
-_KEYEVENTF_EXTENDEDKEY = 0x0001
-_KEYEVENTF_KEYUP = 0x0002
-_KEYEVENTF_SCANCODE = 0x0008
-_INPUT_KEYBOARD = 1
+ULONG_PTR = wintypes.WPARAM
 
 
 class _KEYBDINPUT(ctypes.Structure):
     _fields_ = [
-        ("wVk", ctypes.c_ushort),
-        ("wScan", ctypes.c_ushort),
-        ("dwFlags", ctypes.c_ulong),
-        ("time", ctypes.c_ulong),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUT_UNION(ctypes.Union):
+    # All members are required: the union size must match Win32 INPUT
+    # (40 bytes on 64-bit Windows), even when only `ki` is used.
+    _fields_ = [
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
     ]
 
 
 class _INPUT(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong), ("ki", _KEYBDINPUT)]
+    _anonymous_ = ("union",)
+    _fields_ = [("type", wintypes.DWORD), ("union", _INPUT_UNION)]
+
+
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_SCANCODE = 0x0008
 
 
 def _send_scan_code(scan_code: int, key_up: bool, extended: bool) -> None:
-    """Inject one keyboard event via SendInput (no pywin32 needed)."""
+    """Inject one hardware-like keyboard transition with Win32 SendInput.
+
+    Byte-for-byte the same implementation as the assistant's
+    ``WindowKeySender`` (status_worker.py), which is known to deliver keys
+    to the game.  Raises OSError when SendInput injects fewer events than
+    requested so callers never log a fake "attack" on a failed injection.
+    """
 
     flags = _KEYEVENTF_SCANCODE
-    if key_up:
-        flags |= _KEYEVENTF_KEYUP
     if extended:
         flags |= _KEYEVENTF_EXTENDEDKEY
-    inp = _INPUT()
-    inp.type = _INPUT_KEYBOARD
-    inp.ki = _KEYBDINPUT(0, scan_code, flags, 0, None)
-    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    if key_up:
+        flags |= _KEYEVENTF_KEYUP
+    event = _INPUT(type=1, ki=_KEYBDINPUT(0, scan_code, flags, 0, 0))
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (
+        wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int
+    )
+    user32.SendInput.restype = wintypes.UINT
+    ctypes.set_last_error(0)
+    sent = user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(_INPUT))
+    if sent != 1:
+        error_code = ctypes.get_last_error()
+        raise OSError(error_code, f"SendInput injected {sent}/1 events")
 
 
 class AttackExecutor:
@@ -279,10 +324,14 @@ class AttackExecutor:
                 return False
 
         facing = self.facing_for(character, target)
-        if facing is not None and facing != self._facing:
-            self._tap(facing, self.face_hold)
-            self._facing = facing
-        self._tap(self.attack_key, self.attack_hold)
+        try:
+            if facing is not None and facing != self._facing:
+                self._tap(facing, self.face_hold)
+                self._facing = facing
+            self._tap(self.attack_key, self.attack_hold)
+        except OSError as exc:
+            LOG.error("attack FAILED: %s", exc)
+            return False
         self._last_attack = now
         LOG.info("attack: key=%s facing=%s target=%.0f,%.0f",
                  self.attack_key, self._facing,
