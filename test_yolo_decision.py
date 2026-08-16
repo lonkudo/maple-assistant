@@ -87,23 +87,36 @@ class CharacterStabilizationTests(unittest.TestCase):
         from auto import OptimizedMapleBot
 
         bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
-        # The true player moved slightly from (400,400); a high-confidence
-        # false positive sits far away.  Continuity must win.
-        true_player = make_detection("character", 420, 410, conf=0.6)
-        false_positive = make_detection("character", 1500, 900, conf=0.95)
+        # Both candidates are near screen center; the true player is the one
+        # continuous with the previous position.
+        true_player = make_detection("character", 1180, 880, conf=0.6)
+        false_positive = make_detection("character", 1000, 850, conf=0.95)
         best = bot._score_character_candidates(
-            [false_positive, true_player], (400, 400), 2561, 1601
+            [false_positive, true_player], (1200, 885), 2561, 1601
         )
         self.assertIs(best, true_player)
 
-    def test_no_previous_position_falls_back_to_confidence(self):
+    def test_center_proximity_beats_far_high_confidence(self):
         from auto import OptimizedMapleBot
 
         bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
-        low = make_detection("character", 400, 400, conf=0.5)
-        high = make_detection("character", 1500, 900, conf=0.9)
-        best = bot._score_character_candidates([low, high], None, 2561, 1601)
-        self.assertIs(best, high)
+        # The player is at screen center (camera follows); another player at
+        # the far edge must NOT win even with higher confidence.
+        player = make_detection("character", 1280, 880, conf=0.6)
+        other_player = make_detection("character", 2300, 300, conf=0.95)
+        best = bot._score_character_candidates(
+            [other_player, player], None, 2561, 1601
+        )
+        self.assertIs(best, player)
+
+    def test_no_previous_position_uses_center(self):
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        center = make_detection("character", 1280, 880, conf=0.5)
+        corner = make_detection("character", 100, 100, conf=0.9)
+        best = bot._score_character_candidates([corner, center], None, 2561, 1601)
+        self.assertIs(best, center)
 
     def test_median_smoothing_kills_jitter(self):
         from auto import OptimizedMapleBot

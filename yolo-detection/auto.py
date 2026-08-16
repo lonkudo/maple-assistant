@@ -315,25 +315,35 @@ class OptimizedMapleBot:
     ) -> Detection:
         """Score character candidates; returns the best one.
 
-        Continuity with the previously accepted position is the strongest
-        signal (the real player moves smoothly); confidence and screen-center
-        proximity break ties.
+        The camera follows the player in MapleStory, so the real player is
+        almost always near the screen center.  Screen-center proximity is
+        therefore the dominant signal; continuity with the previously accepted
+        position is a secondary tie-breaker (it follows smooth motion and
+        rejects flickering false positives), and raw confidence is last.
         """
 
+        center_ref = (monitor_width / 2.0, monitor_height * 0.55)
+        max_ref_dist = float(np.hypot(monitor_width, monitor_height) / 2.0)
+
         def score(candidate: Detection) -> float:
-            s = candidate.confidence
+            # Center proximity: 1.0 at screen center -> 0.0 at the corners.
+            ref_dist = float(np.hypot(
+                candidate.center[0] - center_ref[0],
+                candidate.center[1] - center_ref[1],
+            ))
+            center_score = max(0.0, 1.0 - ref_dist / max(1.0, max_ref_dist))
+            s = 1.2 * center_score
+            # Continuity: bonus for being near the last accepted position.
             if previous is not None:
                 dx = candidate.center[0] - previous[0]
                 dy = candidate.center[1] - previous[1]
                 dist = float(np.hypot(dx, dy))
-                continuity = 0.5 * max(
-                    0.0, 1.0 - dist / max(1, monitor_width * 0.15)
+                continuity = max(
+                    0.0, 1.0 - dist / max(1.0, monitor_width * 0.20)
                 )
-                s += continuity
-            s += 0.05 * max(
-                0.0,
-                1.0 - candidate.distance_from_center / max(1, monitor_height * 0.5),
-            )
+                s += 0.5 * continuity
+            # Confidence: mild final tie-breaker.
+            s += 0.2 * candidate.confidence
             return s
 
         return max(candidates, key=score)
