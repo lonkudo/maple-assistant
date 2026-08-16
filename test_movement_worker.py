@@ -233,17 +233,46 @@ class MovementTests(unittest.TestCase):
             important_positions={}, rope_state_path=str(tmp),
             rope_jump_px=140.0, on_rope_px=50.0,
         )
-        # Character overlays the rope (gap 30px <= on_rope 50): no-op
-        # decision handed to patrol (which holds Up and climbs).
+        # Character overlays the rope (gap 30px) WHILE CLIMBING (Up held):
+        # no-op decision, patrol keeps holding Up.
+        worker._climb_state.up_held = True
         state.write(True, rope_x=1310.0, char_x=1280.0)
         decision = worker._yolo_rope_action()
         self.assertIsNotNone(decision)
         self.assertIsNone(decision.key)
         self.assertIn("on rope", decision.reason)
-        # Just outside the dead zone (gap 60px): jump fires again.
+        # Idle character at the same gap must JUMP to grab the rope (the
+        # original bug: idle + small gap waited forever at layer1).
+        worker._climb_state.up_held = False
+        worker._climb_state.phase = "idle"
+        decision = worker._yolo_rope_action()
+        self.assertEqual(decision.key, "jump_climb_right")
+        # Just outside the dead zone while climbing (gap 60px): jump resumes.
+        worker._climb_state.up_held = True
         state.write(True, rope_x=1340.0, char_x=1280.0)
         decision = worker._yolo_rope_action()
         self.assertEqual(decision.key, "jump_climb_right")
+
+    def test_yolo_jump_direction_stable_for_tiny_gaps(self):
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import RopeStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "rope_state.json"
+        state = RopeStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, rope_state_path=str(tmp),
+            rope_jump_px=140.0, on_rope_px=50.0,
+        )
+        # First jump right, then a tiny gap flips sign: direction must stay
+        # right (no left/right thrash on box noise).
+        state.write(True, rope_x=1340.0, char_x=1280.0)
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_right")
+        state.write(True, rope_x=1283.0, char_x=1280.0)  # gap +3px
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_right")
+        state.write(True, rope_x=1277.0, char_x=1280.0)  # gap -3px (noise)
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_right")
 
     def test_patrol_busy_hysteresis_holds_after_idle_reset(self):
         import tempfile

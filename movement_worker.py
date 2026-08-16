@@ -1041,6 +1041,7 @@ class MovementWorker(threading.Thread):
         # flipping the jump direction as the character passes the rope X and
         # yanking it off the rope mid-climb.
         self.on_rope_px = max(10.0, min(float(on_rope_px), self.rope_jump_px))
+        self._rope_jump_direction: Optional[str] = None
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
@@ -1077,11 +1078,13 @@ class MovementWorker(threading.Thread):
         Compares the character's screen X with the rope's screen X (both
         from the YOLO subprocess) - never the minimap position:
 
-        - |gap| <= on_rope_px : the character overlays the rope - return a
-          no-op decision so patrol's climb state machine holds Up and
-          climbs (no jump)
-        - on_rope_px < |gap| <= rope_jump_px : jump onto the rope, in the
-          real screen direction (left or right)
+        - while a climb is in progress (Up held / non-idle phase) and the
+          character overlays the rope (|gap| <= on_rope_px) : return a
+          no-op decision so patrol's climb state keeps holding Up
+        - otherwise, when |gap| <= rope_jump_px : jump onto the rope, in
+          the real screen direction (left or right).  This includes the
+          initial grab from the ground: an idle character aligned with the
+          rope (small gap) must still JUMP to attach, never wait.
         - otherwise (too far / stale / no rope) : return None, meaning the
           patrol (minimap) walk plan takes over
         """
@@ -1091,8 +1094,13 @@ class MovementWorker(threading.Thread):
         gap = self._rope_state.screen_gap()
         if gap is None:
             return None
-        if abs(gap) <= self.on_rope_px:
-            # On the rope: no jump - patrol holds Up and climbs.
+        climbing = bool(
+            self._climb_state.up_held
+            or self._climb_state.phase != "idle"
+        )
+        if climbing and abs(gap) <= self.on_rope_px:
+            # Already attached and overlaying the rope: no jump - patrol
+            # keeps holding Up and climbs.
             LOG.info("YOLO rope: on rope (gap=%+.0fpx); patrol climbs", gap)
             return MovementDecision(
                 None, "YOLO: on rope; patrol holds Up to climb"
@@ -1103,12 +1111,19 @@ class MovementWorker(threading.Thread):
             LOG.debug("YOLO rope: gap=%+.0fpx too large; patrol walks", gap)
             return None
         direction = "right" if gap > 0 else "left"
+        # Tiny gaps (< 5px) jitter sign frame-to-frame (YOLO box noise);
+        # keep the last jump direction instead of flipping the jump left/
+        # right on every frame.
+        if abs(gap) < 5.0 and self._rope_jump_direction is not None:
+            direction = self._rope_jump_direction
+        self._rope_jump_direction = direction
         decision = MovementDecision(
             f"jump_climb_{direction}",
             f"YOLO rope gap {gap:+.0f}px; jump {direction} onto rope",
             self.minimum_final_hold_seconds,
         )
-        LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s", gap, direction)
+        LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s (climbing=%s)",
+                 gap, direction, climbing)
         return decision
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:

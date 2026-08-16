@@ -4,7 +4,7 @@
   "detection_fps": 20,
   "zone_width": 100,
   "zone_height": 28,
-  "zone_shift_y": 15,
+  "zone_shift_y": -3,
   "show_detection": true,
   "auto_attack": true,
   "attack_key": "ctrl"
