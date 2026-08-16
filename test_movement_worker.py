@@ -209,17 +209,17 @@ class MovementTests(unittest.TestCase):
             rope_jump_px=140.0,
         )
         # No state yet: fall back to the patrol (minimap) plan.
-        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        self.assertIsNone(worker._yolo_rope_action())
         # Small real gap -> jump in the real direction (YOLO's only job).
         state.write(True, rope_x=1340.0, char_x=1280.0)
-        decision, _ = worker._yolo_rope_decision()
+        decision = worker._yolo_rope_action()
         self.assertEqual(decision.key, "jump_climb_right")
         # Large real gap -> NO YOLO decision: patrol walks to the zone.
         state.write(True, rope_x=2000.0, char_x=1280.0)
-        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        self.assertIsNone(worker._yolo_rope_action())
         # Rope not visible -> fall back to the patrol plan.
         state.write(False)
-        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        self.assertIsNone(worker._yolo_rope_action())
 
     def test_yolo_on_rope_dead_zone_hands_climb_to_patrol(self):
         import tempfile
@@ -233,12 +233,16 @@ class MovementTests(unittest.TestCase):
             important_positions={}, rope_state_path=str(tmp),
             rope_jump_px=140.0, on_rope_px=50.0,
         )
-        # Character overlays the rope (gap 30px <= on_rope 50): NO jump.
+        # Character overlays the rope (gap 30px <= on_rope 50): no-op
+        # decision handed to patrol (which holds Up and climbs).
         state.write(True, rope_x=1310.0, char_x=1280.0)
-        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        decision = worker._yolo_rope_action()
+        self.assertIsNotNone(decision)
+        self.assertIsNone(decision.key)
+        self.assertIn("on rope", decision.reason)
         # Just outside the dead zone (gap 60px): jump fires again.
         state.write(True, rope_x=1340.0, char_x=1280.0)
-        decision, _ = worker._yolo_rope_decision()
+        decision = worker._yolo_rope_action()
         self.assertEqual(decision.key, "jump_climb_right")
 
     def test_attack_state_pause_gate(self):

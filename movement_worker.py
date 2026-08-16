@@ -1058,34 +1058,37 @@ class MovementWorker(threading.Thread):
                 LOG.debug("not moving: pickup Z paused")
             self.moving_active_event.clear()
 
-    def _yolo_rope_decision(self) -> tuple[Optional[MovementDecision], Optional[float]]:
-        """YOLO's ONLY rope job: decide the jump onto the rope.
+    def _yolo_rope_action(self) -> Optional[MovementDecision]:
+        """Decide the rope action from YOLO SCREEN positions only.
 
-        Called only when the minimap plan has already decided to jump (we
-        are inside the rope jump zone) and no climb is in progress.  Returns
-        ``(decision, target_x)``; ``(None, None)`` when YOLO rope state is
-        unavailable/stale or the real gap is too large - in both cases the
-        caller falls back to the patrol (minimap) plan, which owns walking
-        and climbing.  When fresh and the character is close enough to the
-        rope, YOLO supplies the jump direction from the real screen gap,
-        targeting the rope nearest the character's X.
+        Compares the character's screen X with the rope's screen X (both
+        from the YOLO subprocess) - never the minimap position:
+
+        - |gap| <= on_rope_px : the character overlays the rope - return a
+          no-op decision so patrol's climb state machine holds Up and
+          climbs (no jump)
+        - on_rope_px < |gap| <= rope_jump_px : jump onto the rope, in the
+          real screen direction (left or right)
+        - otherwise (too far / stale / no rope) : return None, meaning the
+          patrol (minimap) walk plan takes over
         """
 
         if self._rope_state is None or not self._rope_state.is_fresh():
-            return None, None
+            return None
         gap = self._rope_state.screen_gap()
         if gap is None:
-            return None, None
-        # ON the rope: no jump.  The character overlays the rope, so YOLO
-        # hands off - patrol's climb state machine holds Up and climbs.
+            return None
         if abs(gap) <= self.on_rope_px:
+            # On the rope: no jump - patrol holds Up and climbs.
             LOG.info("YOLO rope: on rope (gap=%+.0fpx); patrol climbs", gap)
-            return None, None
+            return MovementDecision(
+                None, "YOLO: on rope; patrol holds Up to climb"
+            )
         if abs(gap) > self.rope_jump_px:
             # Too far to jump: hand the approach back to patrol (minimap
             # walk).  YOLO never issues walking nudges - that is patrol's job.
             LOG.debug("YOLO rope: gap=%+.0fpx too large; patrol walks", gap)
-            return None, None
+            return None
         direction = "right" if gap > 0 else "left"
         decision = MovementDecision(
             f"jump_climb_{direction}",
@@ -1093,7 +1096,7 @@ class MovementWorker(threading.Thread):
             self.minimum_final_hold_seconds,
         )
         LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s", gap, direction)
-        return decision, None
+        return decision
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
@@ -1667,53 +1670,40 @@ class MovementWorker(threading.Thread):
                     )
                     active_target_x = None
                 elif route_is_rope and route_target_x is not None:
-                    if observation.player is not None:
-                        live_gap = route_target_x - observation.player.x
-                        if live_gap > 1e-9:
-                            self._rope_approach_direction = "right"
-                        elif live_gap < -1e-9:
-                            self._rope_approach_direction = "left"
-                    rope_plan = move_towards_rope(
-                        observation,
-                        route_target_x,
-                        rope_inner_distance,
-                        aligned_direction=self._rope_approach_direction,
-                        inner_range=rope_inner_distance,
-                        horizontal_tolerance=self._current_horizontal_tolerance,
-                        minimum_confidence=self.minimum_confidence,
-                        movement_hold_seconds=self.movement_hold_seconds,
-                        minimum_final_hold_seconds=self.minimum_final_hold_seconds,
-                        minimum_movement_hold_seconds=self.minimum_movement_hold_seconds,
-                        estimated_minimap_speed=self.estimated_minimap_speed,
-                        final_calculation_distance=self._current_final_calculation_distance,
-                        estimated_final_speed=self.estimated_final_speed,
-                        final_move_safety_gain=self.final_move_safety_gain,
-                    )
-                    decision = rope_plan.decision
-                    active_target_x = rope_plan.target_x
-                    # YOLO rope gate - YOLO's ONLY job is the jump itself:
-                    # inside the rope jump zone (patrol decided to jump), YOLO
-                    # supplies the real jump direction when the character is
-                    # close enough to the rope.  Walking to the zone is pure
-                    # patrol logic; once the character is on the rope,
-                    # preserve_persistent_climb below hands the climb (held
-                    # Up) back to patrol.
-                    if decision.key in ("jump_climb_left", "jump_climb_right"):
-                        yolo_decision, yolo_target_x = self._yolo_rope_decision()
-                        if yolo_decision is not None:
-                            decision = yolo_decision
-                            active_target_x = yolo_target_x
-                        elif self._rope_state is not None and self._rope_state.is_fresh():
-                            # Fresh YOLO state but no jump decision: either
-                            # the character is ON the rope (hand the climb to
-                            # patrol - no jump) or too far (patrol walks).
-                            gap = self._rope_state.screen_gap()
-                            if gap is not None and abs(gap) <= self.on_rope_px:
-                                decision = MovementDecision(
-                                    None,
-                                    "YOLO: on rope; patrol holds Up to climb",
-                                )
-                                active_target_x = None
+                    # YOLO climb logic: decide purely from SCREEN positions
+                    # (character X vs rope X from the YOLO subprocess).  The
+                    # minimap is NOT used for the jump decision - only as a
+                    # fallback walk plan when YOLO is stale or the rope is
+                    # too far to jump.
+                    yolo_action = self._yolo_rope_action()
+                    if yolo_action is not None:
+                        decision = yolo_action
+                        active_target_x = None
+                    else:
+                        if observation.player is not None:
+                            live_gap = route_target_x - observation.player.x
+                            if live_gap > 1e-9:
+                                self._rope_approach_direction = "right"
+                            elif live_gap < -1e-9:
+                                self._rope_approach_direction = "left"
+                        rope_plan = move_towards_rope(
+                            observation,
+                            route_target_x,
+                            rope_inner_distance,
+                            aligned_direction=self._rope_approach_direction,
+                            inner_range=rope_inner_distance,
+                            horizontal_tolerance=self._current_horizontal_tolerance,
+                            minimum_confidence=self.minimum_confidence,
+                            movement_hold_seconds=self.movement_hold_seconds,
+                            minimum_final_hold_seconds=self.minimum_final_hold_seconds,
+                            minimum_movement_hold_seconds=self.minimum_movement_hold_seconds,
+                            estimated_minimap_speed=self.estimated_minimap_speed,
+                            final_calculation_distance=self._current_final_calculation_distance,
+                            estimated_final_speed=self.estimated_final_speed,
+                            final_move_safety_gain=self.final_move_safety_gain,
+                        )
+                        decision = rope_plan.decision
+                        active_target_x = rope_plan.target_x
                 else:
                     assert route_target_x is not None
                     target_y = observation.player.y if observation.player is not None else 0.0
