@@ -93,4 +93,79 @@ class AttackStateFile:
         return (float(raw[0]), float(raw[1]))
 
 
-__all__ = ["AttackStateFile"]
+class RopeStateFile:
+    """Read/write the shared YOLO rope-state JSON.
+
+    The YOLO subprocess publishes the rope's screen position (and the
+    character's screen X) every frame; the patrol worker consumes it to
+    gate the inner-gap jump on the real screen gap instead of the coarse
+    minimap estimate.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+
+    def write(
+        self,
+        visible: bool,
+        rope_x: Optional[float] = None,
+        rope_y: Optional[float] = None,
+        char_x: Optional[float] = None,
+        char_y: Optional[float] = None,
+    ) -> None:
+        """Persist the current rope state (atomic temp+rename)."""
+
+        data = {
+            "visible": bool(visible),
+            "ts": time.time(),
+            "rope_x": float(rope_x) if rope_x is not None else None,
+            "rope_y": float(rope_y) if rope_y is not None else None,
+            "char_x": float(char_x) if char_x is not None else None,
+            "char_y": float(char_y) if char_y is not None else None,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self.path.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def read(self) -> Optional[dict]:
+        """Return the raw state dict, or None when unreadable/missing."""
+
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def is_fresh(self, max_age: float = 0.6) -> bool:
+        """True when the subprocess reported within the last ``max_age`` s."""
+
+        data = self.read()
+        if not data:
+            return False
+        age = time.time() - float(data.get("ts", 0.0))
+        return 0.0 <= age <= max_age
+
+    def screen_gap(self) -> Optional[float]:
+        """Return rope_x - char_x (positive = rope to the right), or None."""
+
+        data = self.read()
+        if not data or not data.get("visible"):
+            return None
+        rx = data.get("rope_x")
+        cx = data.get("char_x")
+        if rx is None or cx is None:
+            return None
+        return float(rx) - float(cx)
+
+
+__all__ = ["AttackStateFile", "RopeStateFile"]

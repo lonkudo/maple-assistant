@@ -105,6 +105,8 @@ monitoring:
 detection_behavior:
   # 信賴度閾值：只保留信心度高於此值的物件
   confidence_threshold: 0.33
+  # 太小的 box 視為誤判的掉落物，不攻擊 (像素)
+  min_mob_box_px: 20
   # 只保留 mob 類別的偵測結果
   detect_only_mobs: true
   # 只在畫面中央區域偵測 (0.0-1.0 比例)

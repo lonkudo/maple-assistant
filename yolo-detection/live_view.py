@@ -88,6 +88,10 @@ def parse_args() -> argparse.Namespace:
                         help="draw every detected class (character/environment/"
                              "item/mob/npc/ui) each with its own color, no zone "
                              "filter or tracker (attack still uses mobs only)")
+    parser.add_argument("--rope-state", default=None,
+                        help="path to write YOLO rope state JSON for the patrol "
+                             "worker (gates the inner-gap jump on the real "
+                             "screen gap)")
     return parser.parse_args()
 
 
@@ -172,6 +176,7 @@ def main() -> int:
 
     executor = None
     attack_state = None
+    rope_state = None
     if args.attack:
         from attack_executor import AttackExecutor
 
@@ -195,6 +200,11 @@ def main() -> int:
             print(f"auto-attack enabled, but game window NOT focused "
                   f"(title={args.window_title!r}) - attack will try to "
                   "refocus every few seconds")
+    if args.rope_state:
+        from combat_coordination import RopeStateFile
+
+        rope_state = RopeStateFile(args.rope_state)
+        print(f"rope state publishing to {args.rope_state}")
     print(f"live view: region={region} threshold={conf} fps={args.fps} "
           f"show={not args.no_show} zone="
           f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "
@@ -250,6 +260,22 @@ def main() -> int:
                     attack_state.write(True, target.center)
                 else:
                     attack_state.write(False)
+            # Publish YOLO rope state so the patrol worker can gate the
+            # inner-gap jump on the real screen gap.
+            if rope_state is not None:
+                rope = bot.detect_rope(img)
+                if rope is not None:
+                    rope_state.write(
+                        True,
+                        rope_x=float(rope.center[0]),
+                        rope_y=float(rope.center[1]),
+                        char_x=(float(character.center[0])
+                                if character is not None else None),
+                        char_y=(float(character.center[1])
+                                if character is not None else None),
+                    )
+                else:
+                    rope_state.write(False)
             preview = draw_attack_range(
                 preview, args.attack_range, args.attack_line_height,
                 character=character,

@@ -465,6 +465,63 @@ class OptimizedMapleBot:
             logger.error(f"角色偵測失敗: {e}")
             return None
 
+    def detect_rope(
+        self, img: np.ndarray, min_height: int = 80
+    ) -> Optional[Detection]:
+        """Find the rope (tall narrow environment box) near the character.
+
+        Ropes in MapleStory are tall, thin ``environment`` detections.  We
+        return the rope-like box whose center X is closest to the character
+        (or screen center when the character is not visible).  Used to gate
+        the inner-gap jump on the real screen gap instead of the minimap
+        estimate.
+        """
+
+        if self.model is None:
+            return None
+        try:
+            results = self.model(
+                img, conf=self.confidence_threshold, verbose=False
+            )
+        except Exception as e:
+            logger.error(f"rope 偵測失敗: {e}")
+            return None
+        character = self.detect_character(img)
+        char_x = (
+            character.center[0]
+            if character is not None
+            else self.monitor['width'] // 2
+        )
+        candidates = []
+        for result in results:
+            boxes = result.boxes
+            if boxes is None:
+                continue
+            for box in boxes:
+                cls = int(box.cls[0].cpu().numpy())
+                if self.model.names[cls] != 'environment':
+                    continue
+                conf = float(box.conf[0].cpu().numpy())
+                if conf < self.confidence_threshold:
+                    continue
+                xyxy = [int(v) for v in box.xyxy[0].cpu().numpy().tolist()]
+                x1, y1, x2, y2 = xyxy
+                width = x2 - x1
+                height = y2 - y1
+                # Rope-like: clearly taller than wide, with a real height.
+                if height < min_height or height < 2.5 * width:
+                    continue
+                center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                candidates.append((abs(center[0] - char_x), Detection(
+                    bbox=xyxy, confidence=conf, class_id=cls,
+                    class_name='environment', center=center,
+                    distance_from_center=float(abs(center[0] - char_x)),
+                )))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
     def attack_decision(
         self, mobs: List[Detection], character: Optional[Detection],
         attack_range: int = 800,
@@ -479,14 +536,25 @@ class OptimizedMapleBot:
         a mob outside the line is never attacked.  Among attackable mobs the
         one nearest the character wins.  Without a character position no mob
         is attackable.
+
+        Mobs smaller than ``detection_behavior.min_mob_box_px`` on either
+        side are ignored: dropped items are frequently misclassified as
+        mobs, and those boxes are tiny.
         """
 
         if character is None or not mobs:
             return None
+        config = getattr(self, "config", {}) or {}
+        min_box = float(config.get(
+            'detection_behavior.min_mob_box_px', 20.0
+        ))
         cx, cy = character.center
         half = max(10.0, float(attack_range) / 2.0)
         attackable = []
         for mob in mobs:
+            x1, y1, x2, y2 = mob.bbox
+            if (x2 - x1) < min_box or (y2 - y1) < min_box:
+                continue  # too small: likely a misclassified drop
             mx, my = mob.center
             dx = mx - cx
             dy = my - cy

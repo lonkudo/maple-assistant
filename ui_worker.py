@@ -892,6 +892,11 @@ class UiWorker(threading.Thread):
         if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows: no console window
             creationflags = subprocess.CREATE_NO_WINDOW
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
+        # Always publish YOLO rope state: the patrol worker uses it to gate
+        # the inner-gap jump on the real screen gap.
+        cmd.extend(["--rope-state", str(
+            Path(__file__).resolve().parent / "work" / "rope_state.json"
+        )])
         if not self._yolo_show_var.get():
             cmd.append("--no-show")
         if hasattr(self, "_yolo_full_classes_var") and self._yolo_full_classes_var.get():

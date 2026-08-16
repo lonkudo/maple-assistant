@@ -22,7 +22,7 @@ from PIL import Image
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from patrol_control import CoordinateLayout
 
-from combat_coordination import AttackStateFile
+from combat_coordination import AttackStateFile, RopeStateFile
 
 
 LOG = logging.getLogger(__name__)
@@ -924,6 +924,8 @@ class MovementWorker(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         moving_active_event: Optional[threading.Event] = None,
         attack_state_path: Optional[str] = None,
+        rope_state_path: Optional[str] = None,
+        rope_jump_px: float = 140.0,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1012,6 +1014,13 @@ class MovementWorker(threading.Thread):
             if attack_state_path else None
         )
         self._attack_paused_last = False
+        # YOLO rope state: gates the inner-gap jump on the real screen gap.
+        # rope_jump_px = max |screen gap| that still counts as "at the rope".
+        self._rope_state = (
+            RopeStateFile(rope_state_path)
+            if rope_state_path else None
+        )
+        self.rope_jump_px = max(20.0, float(rope_jump_px))
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
@@ -1041,6 +1050,37 @@ class MovementWorker(threading.Thread):
             if self.moving_active_event.is_set():
                 LOG.debug("not moving: pickup Z paused")
             self.moving_active_event.clear()
+
+    def _yolo_rope_decision(self) -> tuple[Optional[MovementDecision], Optional[float]]:
+        """Gate the inner-gap jump on the YOLO rope screen gap.
+
+        Returns ``(decision, target_x)``; ``(None, None)`` when YOLO rope
+        state is unavailable/stale, so the caller falls back to the minimap
+        plan.  When fresh: a small real gap -> jump inward in the real
+        direction; a large gap -> keep walking toward the rope.
+        """
+
+        if self._rope_state is None or not self._rope_state.is_fresh():
+            return None, None
+        gap = self._rope_state.screen_gap()
+        if gap is None:
+            return None, None
+        direction = "right" if gap > 0 else "left"
+        if abs(gap) <= self.rope_jump_px:
+            decision = MovementDecision(
+                f"jump_climb_{direction}",
+                f"YOLO rope gap {gap:+.0f}px; jump {direction} inward",
+                self.minimum_final_hold_seconds,
+            )
+            LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s", gap, direction)
+            return decision, None
+        decision = MovementDecision(
+            direction,
+            f"YOLO rope gap {gap:+.0f}px too large; walk {direction}",
+            self.movement_hold_seconds,
+        )
+        LOG.info("YOLO rope walk: gap=%+.0fpx dir=%s", gap, direction)
+        return decision, None
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
@@ -1638,6 +1678,15 @@ class MovementWorker(threading.Thread):
                     )
                     decision = rope_plan.decision
                     active_target_x = rope_plan.target_x
+                    # YOLO rope gate: the minimap inner band is a coarse
+                    # estimate, so the inner-gap jump often fires too early or
+                    # in the wrong direction.  When the YOLO subprocess sees
+                    # the actual rope on screen, jump only when the real
+                    # screen gap is small, and use the real direction.
+                    yolo_decision, yolo_target_x = self._yolo_rope_decision()
+                    if yolo_decision is not None:
+                        decision = yolo_decision
+                        active_target_x = yolo_target_x
                 else:
                     assert route_target_x is not None
                     target_y = observation.player.y if observation.player is not None else 0.0

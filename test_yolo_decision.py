@@ -111,6 +111,31 @@ class AttackDecisionTests(unittest.TestCase):
         above = make_detection("mob", 1290, 100)       # dy=-780 > 400
         self.assertIsNone(bot.attack_decision([above], character, 800))
 
+    def test_tiny_box_like_drop_is_not_attacked(self):
+        # Dropped items are misclassified as mobs but their boxes are tiny;
+        # the min-box gate rejects them (default 20px per side).
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        bot.config = {}
+        character = make_detection("character", 1280, 880)
+        tiny = Detection(
+            bbox=[1290, 890, 1305, 905],  # 15x15 px
+            confidence=0.9, class_id=3, class_name="mob",
+            center=(1297, 897), distance_from_center=0.0,
+        )
+        self.assertIsNone(bot.attack_decision([tiny], character, 800))
+
+    def test_normal_sized_mob_still_attacked(self):
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        bot.config = {}
+        character = make_detection("character", 1280, 880)
+        mob = make_detection("mob", 1350, 890)  # 60x80 box
+        target = bot.attack_decision([mob], character, 800)
+        self.assertIs(target, mob)
+
 
 class CharacterStabilizationTests(unittest.TestCase):
     def setUp(self):
@@ -447,6 +472,56 @@ class FullClassDetectionTests(unittest.TestCase):
         dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8))
         # mob is the only class, but the tracker needs 3 frames to confirm.
         self.assertEqual(dets, [])
+
+    def test_detect_rope_finds_tall_environment_box(self):
+        import numpy as np
+
+        bot = self._make_bot()
+        # A tall narrow environment box (rope) plus a wide platform box.
+        class FakeBox:
+            def __init__(self, xyxy, conf, cls):
+                self.xyxy = [self._t(xyxy)]
+                self.conf = [self._t(np.float64(conf))]
+                self.cls = [self._t(np.float64(cls))]
+
+            @staticmethod
+            def _t(v):
+                class Tensor:
+                    def __init__(self, val):
+                        self._v = val
+
+                    def cpu(self):
+                        return self
+
+                    def numpy(self):
+                        return self._v
+
+                return Tensor(v)
+
+        class FakeBoxes:
+            def __iter__(self):
+                yield FakeBox(np.array([600, 100, 616, 500]), 0.8, 1)   # rope
+                yield FakeBox(np.array([100, 400, 900, 430]), 0.9, 1)  # platform
+
+        class FakeResult:
+            boxes = FakeBoxes()
+
+        class FakeResults:
+            def __iter__(self):
+                yield FakeResult()
+
+        bot.model = type("M", (), {
+            "names": bot.model.names,
+            "__call__": lambda self, img, conf, verbose: FakeResults(),
+        })()
+        bot.detect_character = lambda img: None  # fall back to screen center
+        rope = bot.detect_rope(np.zeros((720, 1280, 3), dtype=np.uint8))
+        self.assertIsNotNone(rope)
+        self.assertEqual(rope.class_name, "environment")
+        # The wide platform box (h=30 < 2.5*w) must be rejected; the rope
+        # (h=400, w=16) wins.
+        x1, y1, x2, y2 = rope.bbox
+        self.assertGreater(y2 - y1, 300)
 
 
 if __name__ == "__main__":

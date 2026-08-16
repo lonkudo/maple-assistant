@@ -182,6 +182,32 @@ class MovementTests(unittest.TestCase):
         worker._update_moving_event(MovementDecision("climb", "rope"))
         self.assertFalse(moving.is_set())
 
+    def test_yolo_rope_jump_gate(self):
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import RopeStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "rope_state.json"
+        state = RopeStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, rope_state_path=str(tmp),
+            rope_jump_px=140.0,
+        )
+        # No state yet: fall back to the minimap plan.
+        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+        # Small real gap -> jump in the real direction.
+        state.write(True, rope_x=1340.0, char_x=1280.0)
+        decision, _ = worker._yolo_rope_decision()
+        self.assertEqual(decision.key, "jump_climb_right")
+        # Large real gap -> keep walking toward the rope.
+        state.write(True, rope_x=1600.0, char_x=1280.0)
+        decision, _ = worker._yolo_rope_decision()
+        self.assertEqual(decision.key, "right")
+        # Rope not visible -> fall back to the minimap plan.
+        state.write(False)
+        self.assertEqual(worker._yolo_rope_decision(), (None, None))
+
     def test_attack_state_pause_gate(self):
         import tempfile
         from pathlib import Path

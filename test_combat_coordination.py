@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from combat_coordination import AttackStateFile
+from combat_coordination import AttackStateFile, RopeStateFile
 
 
 class AttackStateFileTests(unittest.TestCase):
@@ -54,6 +54,42 @@ class AttackStateFileTests(unittest.TestCase):
         state = AttackStateFile(str(path))
         self.assertFalse(state.is_active())
         self.assertIsNone(state.target())
+
+
+class RopeStateFileTests(unittest.TestCase):
+    def _path(self):
+        import tempfile
+        from pathlib import Path
+
+        return Path(tempfile.mkdtemp()) / "rope_state.json"
+
+    def test_write_and_screen_gap(self):
+        path = self._path()
+        state = RopeStateFile(str(path))
+        state.write(True, rope_x=1400.0, char_x=1280.0)
+        self.assertTrue(state.is_fresh())
+        self.assertAlmostEqual(state.screen_gap(), 120.0)
+
+    def test_invisible_has_no_gap(self):
+        path = self._path()
+        state = RopeStateFile(str(path))
+        state.write(False)
+        self.assertTrue(state.is_fresh())
+        self.assertIsNone(state.screen_gap())
+
+    def test_missing_file_is_not_fresh(self):
+        state = RopeStateFile(str(self._path()))
+        self.assertFalse(state.is_fresh())
+        self.assertIsNone(state.screen_gap())
+
+    def test_stale_file_is_not_fresh(self):
+        path = self._path()
+        state = RopeStateFile(str(path))
+        state.write(True, rope_x=1400.0, char_x=1280.0)
+        data = state.read()
+        data["ts"] = time.time() - 60.0
+        path.write_text(__import__("json").dumps(data), encoding="utf-8")
+        self.assertFalse(state.is_fresh(max_age=1.0))
 
 
 if __name__ == "__main__":
