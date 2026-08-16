@@ -75,15 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zone-shift-y", type=float, default=None,
                         help="vertical shift of the zone center as a fraction "
                              "of frame height, -0.5..0.5 (positive = down)")
-    parser.add_argument("--mob-confirm-frames", type=int, default=None,
-                        help="frames a mob must persist before being trusted "
-                             "(default 3; rejects flash false positives)")
-    parser.add_argument("--mob-miss-hold", type=int, default=None,
-                        help="frames a confirmed mob survives a miss before "
-                             "disappearing (default 3)")
-    parser.add_argument("--mob-match-px", type=float, default=None,
-                        help="max center distance to treat detections as the "
-                             "same mob across frames (default 100)")
     parser.add_argument("--rope-state", default=None,
                         help="path to write YOLO rope state JSON for the patrol "
                              "worker (gates the inner-gap jump on the real "
@@ -160,13 +151,6 @@ def main() -> int:
         zone["height_fraction"] = max(0.1, min(1.0, args.zone_height))
     if args.zone_shift_y is not None:
         zone["shift_y"] = max(-0.5, min(0.5, args.zone_shift_y))
-    # Mob temporal confirmation tuning (applied live to the tracker).
-    if args.mob_confirm_frames is not None:
-        bot._mob_tracker.confirm_frames = max(1, args.mob_confirm_frames)
-    if args.mob_miss_hold is not None:
-        bot._mob_tracker.miss_hold = max(0, args.mob_miss_hold)
-    if args.mob_match_px is not None:
-        bot._mob_tracker.match_px = max(10.0, args.mob_match_px)
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
 

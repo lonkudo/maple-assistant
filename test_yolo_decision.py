@@ -303,78 +303,6 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertTrue(True)  # no OSError == injection succeeded
 
 
-class MobTrackerTests(unittest.TestCase):
-    """Temporal confirmation: flash detections must not reach the bot."""
-
-    def setUp(self):
-        _require_auto()
-
-    def _tracker(self, **kwargs):
-        from mob_tracker import MobTracker
-
-        return MobTracker(**kwargs)
-
-    def test_single_frame_flash_is_rejected(self):
-        tracker = self._tracker()
-        mob = make_detection("mob", 500, 500)
-        # One frame only (the flash) -> never confirmed.
-        self.assertEqual(tracker.update([mob]), [])
-        # A clear frame, then the flash returns briefly: still rejected.
-        self.assertEqual(tracker.update([]), [])
-        self.assertEqual(tracker.update([mob]), [])
-        self.assertEqual(tracker.update([mob]), [])  # 2 consecutive, not 3
-
-    def test_mob_confirmed_after_three_frames(self):
-        tracker = self._tracker()
-        mob = make_detection("mob", 500, 500)
-        self.assertEqual(tracker.update([mob]), [])
-        self.assertEqual(tracker.update([mob]), [])
-        confirmed = tracker.update([mob])
-        self.assertEqual(len(confirmed), 1)
-        self.assertIs(confirmed[0], mob)
-
-    def test_confirmed_mob_survives_miss_hold(self):
-        tracker = self._tracker()
-        mob = make_detection("mob", 500, 500)
-        for _ in range(3):
-            tracker.update([mob])
-        # One missing frame: the confirmed mob is held.
-        held = tracker.update([])
-        self.assertEqual(len(held), 1)
-        # Too many missing frames: it disappears.
-        tracker.update([])
-        tracker.update([])
-        tracker.update([])
-        self.assertEqual(tracker.update([]), [])
-
-    def test_two_mobs_tracked_independently(self):
-        tracker = self._tracker()
-        mob_a = make_detection("mob", 300, 400)
-        mob_b = make_detection("mob", 1200, 700)
-        for _ in range(3):
-            tracker.update([mob_a, mob_b])
-        # mob_a dies (missed for miss_hold+1 frames); mob_b persists.
-        for _ in range(4):
-            held = tracker.update([mob_b])
-        self.assertEqual(len(held), 1)
-        self.assertIs(held[0], mob_b)
-
-    def test_moving_mob_matches_by_proximity(self):
-        tracker = self._tracker(match_px=100)
-        # The mob moves up to match_px between frames; still one track.
-        tracker.update([make_detection("mob", 500, 500)])
-        tracker.update([make_detection("mob", 560, 520)])
-        confirmed = tracker.update([make_detection("mob", 620, 540)])
-        self.assertEqual(len(confirmed), 1)
-
-    def test_reset_forgets_tracks(self):
-        tracker = self._tracker()
-        mob = make_detection("mob", 500, 500)
-        for _ in range(3):
-            tracker.update([mob])
-        tracker.reset()
-        self.assertEqual(tracker.update([mob]), [])
-
 
 class FullClassDetectionTests(unittest.TestCase):
     """include_all=True returns every class without zone/tracker filters."""
@@ -408,7 +336,6 @@ class FullClassDetectionTests(unittest.TestCase):
         bot.performance_monitor = type(
             "PM", (), {"record_detection_time": lambda self, t: None}
         )()
-        bot._mob_tracker = __import__("mob_tracker").MobTracker()
         return bot
 
     @staticmethod
@@ -470,8 +397,8 @@ class FullClassDetectionTests(unittest.TestCase):
         bot = self._make_bot()
         bot.config["detection_behavior"]["detect_only_mobs"] = True
         dets = bot.detect_objects(np.zeros((720, 1280, 3), dtype=np.uint8))
-        # mob is the only class, but the tracker needs 3 frames to confirm.
-        self.assertEqual(dets, [])
+        # mob is the only class returned (no temporal confirmation anymore).
+        self.assertEqual([d.class_name for d in dets], ["mob"])
 
     def test_detect_rope_finds_tall_environment_box(self):
         import numpy as np
