@@ -134,5 +134,78 @@ class CharacterStabilizationTests(unittest.TestCase):
         self.assertEqual(xs[len(xs) // 2], 1000)
 
 
+class AttackExecutorTests(unittest.TestCase):
+    """Dry-run tests: never inject real keys."""
+
+    def setUp(self):
+        _require_auto()
+
+    def _executor(self, **kwargs):
+        from attack_executor import AttackExecutor
+
+        # Dry run + patched foreground check: no real input is ever sent.
+        ex = AttackExecutor("\u5192\u9669\u5c9b\u6000\u65e7\u670d",
+                            dry_run=True, **kwargs)
+        ex._taps = []
+        ex._tap = lambda key, hold: ex._taps.append((key, round(hold, 3)))
+        return ex
+
+    def test_facing_for_returns_direction(self):
+        ex = self._executor()
+        char = make_detection("character", 400, 400)
+        right = make_detection("mob", 600, 400)
+        left = make_detection("mob", 200, 400)
+        above = make_detection("mob", 402, 100)  # |dx| < 8 dead zone
+        self.assertEqual(ex.facing_for(char, right), "right")
+        self.assertEqual(ex.facing_for(char, left), "left")
+        self.assertIsNone(ex.facing_for(char, above))
+
+    def test_attack_turns_toward_target_then_presses_ctrl(self):
+        ex = self._executor(cooldown=0.0)
+        char = make_detection("character", 400, 400)
+        right = make_detection("mob", 600, 400)
+        self.assertTrue(ex.attack(char, right))
+        self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
+
+    def test_attack_skips_turn_when_already_facing(self):
+        ex = self._executor(cooldown=0.0)
+        char = make_detection("character", 400, 400)
+        left = make_detection("mob", 200, 400)
+        ex.attack(char, left)  # turns left
+        ex._taps.clear()
+        # Still on the left: only ctrl, no extra turn tap.
+        self.assertTrue(ex.attack(char, left))
+        self.assertEqual(ex._taps, [("ctrl", 0.08)])
+
+    def test_attack_respects_cooldown(self):
+        ex = self._executor(cooldown=10.0)
+        char = make_detection("character", 400, 400)
+        mob = make_detection("mob", 600, 400)
+        self.assertTrue(ex.attack(char, mob))
+        ex._taps.clear()
+        # Inside the cooldown window: no keys sent.
+        self.assertFalse(ex.attack(char, mob))
+        self.assertEqual(ex._taps, [])
+
+    def test_attack_blocked_when_game_not_foreground(self):
+        ex = self._executor(cooldown=0.0)
+        ex.is_game_foreground = lambda: False
+        char = make_detection("character", 400, 400)
+        mob = make_detection("mob", 600, 400)
+        self.assertFalse(ex.attack(char, mob))
+        self.assertEqual(ex._taps, [])
+
+    def test_reset_facing_forgets_direction(self):
+        ex = self._executor(cooldown=0.0)
+        char = make_detection("character", 400, 400)
+        right = make_detection("mob", 600, 400)
+        ex.attack(char, right)
+        ex.reset_facing()
+        ex._taps.clear()
+        # Facing forgotten: turns right again before attacking.
+        self.assertTrue(ex.attack(char, right))
+        self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
+
+
 if __name__ == "__main__":
     unittest.main()

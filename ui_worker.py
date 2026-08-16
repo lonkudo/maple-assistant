@@ -431,6 +431,17 @@ class UiWorker(threading.Thread):
             )
             self._yolo_show_button.pack(side="left")
             self._yolo_show_button.configure(style="Off.TCheckbutton")
+            # Auto-attack toggle: grey/inactive by default; when activated the
+            # YOLO process faces the target and presses Ctrl within range.
+            self._yolo_attack_var = tk.BooleanVar(value=False)
+            self._yolo_attack_button = ttk.Checkbutton(
+                yolo_row,
+                text="Auto Attack",
+                variable=self._yolo_attack_var,
+                command=self._yolo_sync_show_button,
+            )
+            self._yolo_attack_button.pack(side="left", padx=(8, 0))
+            self._yolo_attack_button.configure(style="Off.TCheckbutton")
             # Attack range: horizontal slider (progress-bar style) that sets the
             # width of the attack range line drawn on the detection window.
             range_row = ttk.Frame(yolo_panel)
@@ -738,6 +749,9 @@ class UiWorker(threading.Thread):
                 self._yolo_zone_shift_y_var.set(int(data["zone_shift_y"]))
             if "show_detection" in data:
                 self._yolo_show_var.set(bool(data["show_detection"]))
+            if "auto_attack" in data:
+                if hasattr(self, "_yolo_attack_var"):
+                    self._yolo_attack_var.set(bool(data["auto_attack"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed yolo settings", exc_info=True)
             return
@@ -757,6 +771,10 @@ class UiWorker(threading.Thread):
             "zone_height": int(self._yolo_zone_h_var.get()),
             "zone_shift_y": int(self._yolo_zone_shift_y_var.get()),
             "show_detection": bool(self._yolo_show_var.get()),
+            "auto_attack": bool(
+                self._yolo_attack_var.get()
+                if hasattr(self, "_yolo_attack_var") else False
+            ),
         }
         path = self._yolo_settings_path()
         try:
@@ -826,6 +844,8 @@ class UiWorker(threading.Thread):
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
         if not self._yolo_show_var.get():
             cmd.append("--no-show")
+        if hasattr(self, "_yolo_attack_var") and self._yolo_attack_var.get():
+            cmd.append("--attack")
         attack_range = int(self._yolo_attack_range_var.get())
         cmd.extend(["--attack-range", f"{attack_range}"])
         zone_w = max(0.1, min(1.0, int(self._yolo_zone_w_var.get()) / 100.0))
@@ -885,6 +905,11 @@ class UiWorker(threading.Thread):
             self._yolo_show_button.configure(style="TCheckbutton")
         else:
             self._yolo_show_button.configure(style="Off.TCheckbutton")
+        if hasattr(self, "_yolo_attack_button"):
+            if self._yolo_attack_var.get():
+                self._yolo_attack_button.configure(style="TCheckbutton")
+            else:
+                self._yolo_attack_button.configure(style="Off.TCheckbutton")
         self._yolo_save_settings()
         running = (self._yolo_process is not None
                    and self._yolo_process.poll() is None)

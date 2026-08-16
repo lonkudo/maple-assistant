@@ -43,6 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-range", type=int, default=800,
                         help="attack range width in pixels, centered on screen "
                              "(default 800)")
+    parser.add_argument("--attack", action="store_true",
+                        help="enable auto-attack: face the target (left/right) "
+                             "then press Ctrl while the game is focused")
+    parser.add_argument("--attack-cooldown", type=float, default=0.6,
+                        help="minimum seconds between attacks (default 0.6)")
+    parser.add_argument("--window-title", default="\u5192\u9669\u5c9b\u6000\u65e7\u670d",
+                        help="game window title used for the foreground check "
+                             "(default: \u5192\u9669\u5c9b\u6000\u65e7\u670d)")
     parser.add_argument("--attack-line-height", type=float, default=0.72,
                         help="vertical position of the attack range line as a "
                              "fraction of frame height (default 0.72)")
@@ -123,10 +131,20 @@ def main() -> int:
         zone["shift_y"] = max(-0.5, min(0.5, args.zone_shift_y))
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
+
+    executor = None
+    if args.attack:
+        from attack_executor import AttackExecutor
+
+        executor = AttackExecutor(
+            args.window_title,
+            cooldown=args.attack_cooldown,
+        )
     print(f"live view: region={region} threshold={conf} fps={args.fps} "
           f"show={not args.no_show} zone="
           f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "
-          f"shift_y={zone.get('shift_y', 0.0)} (ESC to quit)")
+          f"shift_y={zone.get('shift_y', 0.0)} "
+          f"attack={'ON' if executor else 'OFF'} (ESC to quit)")
 
     with mss.MSS() as sct:
         while True:
@@ -155,6 +173,12 @@ def main() -> int:
                 x1, y1, x2, y2 = target.bbox
                 cv2.rectangle(preview, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6),
                               (0, 0, 255), 2)
+                # Auto-attack: face the monster and press Ctrl.  Only fires
+                # when the game window is focused and the cooldown elapsed.
+                if executor is not None and character is not None:
+                    if executor.attack(character, target):
+                        print(f"ATTACK pressed ctrl, facing="
+                              f"{executor._facing}")
             preview = draw_attack_range(
                 preview, args.attack_range, args.attack_line_height,
                 character=character,
