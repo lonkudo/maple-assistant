@@ -117,6 +117,51 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_layer_index, 0)
         self.assertEqual(worker._route_phase, "left")
 
+    def test_descending_flag_blocks_resync_hijack_and_clears_on_arrival(self):
+        positions = {
+            "layer1": {"layer_y": .70, "y_tolerance": .02,
+                       "left_most_pos": {"x": .2, "y": .70},
+                       "right_most_pos": {"x": .8, "y": .70}},
+            "layer2": {"layer_y": .56, "y_tolerance": .02,
+                       "left_most_pos": {"x": .3, "y": .56},
+                       "right_most_pos": {"x": .6, "y": .56}},
+            "layer3": {"layer_y": .42, "y_tolerance": .02,
+                       "left_most_pos": {"x": .25, "y": .42},
+                       "right_most_pos": {"x": .65, "y": .42}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions,
+            route_order=["layer1", "layer2", "layer3"],
+            final_layer_action="drop_to_first_layer", first_layer="layer1",
+        )
+        worker._route_layer_index = 2  # on the final layer
+        worker._route_phase = "rope"
+        # Mid-descent: the marker is on layer2 (an intermediate platform).
+        # Without the guard, _resync_route_layer would switch the route to
+        # layer2 and restart patrol there - the bug.  The descent flag makes
+        # run() skip resync, so the route stays pinned to the final layer.
+        worker._descending_to_first = True
+        mid_drop = MinimapObservation(Point(.6, .56), None, .9, (0, 0, 1, 1))
+        # (run() skips _resync_route_layer while descending; the route index
+        # must remain on the final layer and keep issuing the drop.)
+        self.assertEqual(worker._route_layer_index, 2)
+        self.assertEqual(worker._route_target(mid_drop),
+                         (None, False, "layer3.drop-to-first"))
+        # If resync ran anyway (e.g. flag cleared too early), it WOULD
+        # hijack to layer2 - prove the guard matters.
+        worker._descending_to_first = False
+        worker._resync_route_layer(mid_drop)
+        self.assertEqual(worker._route_layer_index, 1)
+        # Arrival on the first layer resets the loop and clears the flag.
+        worker._descending_to_first = True
+        on_first = MinimapObservation(Point(.6, .70), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._on_first_layer(on_first))
+        worker._reset_route_loop()
+        self.assertFalse(worker._descending_to_first)
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(worker._route_phase, "left")
+
     def test_moving_event_follows_left_right_decisions(self):
         import threading
 

@@ -1022,6 +1022,11 @@ class MovementWorker(threading.Thread):
         self._last_climb_attempt = float("-inf")
         self._climb_state = ClimbState()
         self._rope_approach_direction: Optional[str] = None
+        # Set while the character is dropping from the final layer all the
+        # way down to the first layer.  While descending, layer resync is
+        # suppressed so an intermediate platform cannot hijack the descent
+        # and restart patrol on a middle layer.
+        self._descending_to_first = False
 
     def _update_moving_event(self, decision: MovementDecision) -> None:
         """Drive the walking-state event used to gate Z pickup."""
@@ -1358,6 +1363,7 @@ class MovementWorker(threading.Thread):
         self._route_phase = "left"
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
+        self._descending_to_first = False
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
 
     def _advance_after_climb(self) -> None:
@@ -1551,14 +1557,23 @@ class MovementWorker(threading.Thread):
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.
-                self._resync_route_layer(observation)
+                # While descending to the first layer, resync is suppressed:
+                # intermediate platforms must not hijack the drop and restart
+                # patrol on a middle layer.
+                if not self._descending_to_first:
+                    self._resync_route_layer(observation)
                 observation = self._pin_stationary_layer_world_y(observation)
                 route_target_x, route_is_rope, route_label = self._route_target(observation)
                 if self._advance_route_endpoint(observation, route_target_x):
                     route_target_x, route_is_rope, route_label = self._route_target(observation)
-                if route_label.endswith(".drop-to-first") and self._on_first_layer(observation):
-                    self._reset_route_loop()
-                    route_target_x, route_is_rope, route_label = self._route_target(observation)
+                if route_label.endswith(".drop-to-first"):
+                    if not self._descending_to_first:
+                        LOG.info("final layer patrol done; descending to %s",
+                                 self.first_layer)
+                        self._descending_to_first = True
+                    if self._on_first_layer(observation):
+                        self._reset_route_loop()
+                        route_target_x, route_is_rope, route_label = self._route_target(observation)
                 if self.near_rope_inner_range is not None:
                     rope_inner_distance = self.near_rope_inner_range
                 elif coordinate_layout is not None and self.near_rope_diamonds is not None:
