@@ -489,6 +489,26 @@ class UiWorker(threading.Thread):
                 range_row, text="800 px", width=8
             )
             self._yolo_attack_range_label.pack(side="left")
+            # Detection frequency: frames per second, 2-30, middle = 10 fps
+            # (the default).  Lower = less GPU load, slower reaction.
+            fps_row = ttk.Frame(yolo_panel)
+            fps_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(fps_row, text="Detection FPS:").pack(
+                side="left", padx=(0, 6)
+            )
+            self._yolo_fps_var = tk.IntVar(value=10)
+            self._yolo_fps_slider = ttk.Scale(
+                fps_row,
+                from_=2,
+                to=30,
+                orient="horizontal",
+                variable=self._yolo_fps_var,
+                command=self._yolo_on_fps_change,
+            )
+            self._yolo_fps_slider.pack(side="left", fill="x",
+                                       expand=True, padx=(0, 8))
+            self._yolo_fps_label = ttk.Label(fps_row, text="10 fps", width=8)
+            self._yolo_fps_label.pack(side="left")
             # Detection zone size: width and height sliders (progress-bar
             # style) that scale the detection area as a fraction of the frame.
             zone_row = ttk.Frame(yolo_panel)
@@ -766,6 +786,9 @@ class UiWorker(threading.Thread):
                 self._yolo_threshold_var.set(float(data["threshold"]))
             if "attack_range" in data:
                 self._yolo_attack_range_var.set(int(data["attack_range"]))
+            if "detection_fps" in data:
+                if hasattr(self, "_yolo_fps_var"):
+                    self._yolo_fps_var.set(int(data["detection_fps"]))
             if "zone_width" in data:
                 self._yolo_zone_w_var.set(int(data["zone_width"]))
             if "zone_height" in data:
@@ -795,6 +818,8 @@ class UiWorker(threading.Thread):
         data = {
             "threshold": float(self._yolo_threshold_var.get()),
             "attack_range": int(self._yolo_attack_range_var.get()),
+            "detection_fps": int(self._yolo_fps_var.get())
+            if hasattr(self, "_yolo_fps_var") else 10,
             "zone_width": int(self._yolo_zone_w_var.get()),
             "zone_height": int(self._yolo_zone_h_var.get()),
             "zone_shift_y": int(self._yolo_zone_shift_y_var.get()),
@@ -832,6 +857,14 @@ class UiWorker(threading.Thread):
             return
         value = int(self._yolo_attack_range_var.get())
         self._yolo_attack_range_label.configure(text=f"{value} px")
+
+    def _yolo_on_fps_change(self, _value: str = "") -> None:
+        """Update the detection-FPS label as the slider moves."""
+
+        if not hasattr(self, "_yolo_fps_label"):
+            return
+        value = int(self._yolo_fps_var.get())
+        self._yolo_fps_label.configure(text=f"{value} fps")
 
     def _yolo_on_zone_change(self, _value: str = "") -> None:
         """Update the zone size labels as the sliders move."""
@@ -874,6 +907,8 @@ class UiWorker(threading.Thread):
         if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows: no console window
             creationflags = subprocess.CREATE_NO_WINDOW
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
+        if hasattr(self, "_yolo_fps_var"):
+            cmd.extend(["--fps", f"{int(self._yolo_fps_var.get())}"])
         # Always publish YOLO rope state: the patrol worker uses it to gate
         # the inner-gap jump on the real screen gap.
         cmd.extend(["--rope-state", str(
