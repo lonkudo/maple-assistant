@@ -413,7 +413,6 @@ class UiWorker(threading.Thread):
                 variable=self._yolo_threshold_var,
                 command=self._yolo_on_threshold_change,
             )
-            self._yolo_threshold_slider.configure(resolution=0.01)
             self._yolo_threshold_slider.pack(side="left", fill="x",
                                              expand=True, padx=(0, 8))
             self._yolo_threshold_label = ttk.Label(yolo_row, text="0.40", width=6)
@@ -848,7 +847,8 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_yolo_threshold_label"):
             return
-        value = float(self._yolo_threshold_var.get())
+        value = round(float(self._yolo_threshold_var.get()), 2)
+        self._yolo_threshold_var.set(value)
         self._yolo_threshold_label.configure(text=f"{value:.2f}")
 
     def _yolo_on_range_change(self, _value: str = "") -> None:
