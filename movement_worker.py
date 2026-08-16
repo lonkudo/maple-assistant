@@ -1054,10 +1054,16 @@ class MovementWorker(threading.Thread):
     def _yolo_rope_decision(self) -> tuple[Optional[MovementDecision], Optional[float]]:
         """Gate the inner-gap jump on the YOLO rope screen gap.
 
-        Returns ``(decision, target_x)``; ``(None, None)`` when YOLO rope
-        state is unavailable/stale, so the caller falls back to the minimap
-        plan.  When fresh: a small real gap -> jump inward in the real
-        direction; a large gap -> keep walking toward the rope.
+        Called only when the minimap plan has already decided to jump (we
+        are inside the rope jump zone).  Returns ``(decision, target_x)``;
+        ``(None, None)`` when YOLO rope state is unavailable/stale, so the
+        caller falls back to the minimap jump plan.  When fresh:
+
+        - small real gap  -> jump inward toward the nearest rope, using the
+          real direction (the rope whose X is nearest the character)
+        - large real gap  -> a short nudge toward the rope, then re-evaluate
+          next frame (never a long fixed hold; the minimap band estimate
+          may be off, and a long walk would overshoot)
         """
 
         if self._rope_state is None or not self._rope_state.is_fresh():
@@ -1074,12 +1080,19 @@ class MovementWorker(threading.Thread):
             )
             LOG.info("YOLO rope jump: gap=%+.0fpx dir=%s", gap, direction)
             return decision, None
+        # Inside the zone but the real gap is still large: take a short,
+        # bounded nudge so the next frame re-checks instead of overshooting.
+        nudge = float(np.clip(
+            abs(gap) / 1000.0, self.minimum_final_hold_seconds, 0.35
+        ))
         decision = MovementDecision(
             direction,
-            f"YOLO rope gap {gap:+.0f}px too large; walk {direction}",
-            self.movement_hold_seconds,
+            f"YOLO rope gap {gap:+.0f}px too large; nudge {direction} "
+            f"{nudge:.3f}s",
+            nudge,
         )
-        LOG.info("YOLO rope walk: gap=%+.0fpx dir=%s", gap, direction)
+        LOG.info("YOLO rope nudge: gap=%+.0fpx dir=%s hold=%.3fs",
+                 gap, direction, nudge)
         return decision, None
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
@@ -1678,15 +1691,17 @@ class MovementWorker(threading.Thread):
                     )
                     decision = rope_plan.decision
                     active_target_x = rope_plan.target_x
-                    # YOLO rope gate: the minimap inner band is a coarse
-                    # estimate, so the inner-gap jump often fires too early or
-                    # in the wrong direction.  When the YOLO subprocess sees
-                    # the actual rope on screen, jump only when the real
-                    # screen gap is small, and use the real direction.
-                    yolo_decision, yolo_target_x = self._yolo_rope_decision()
-                    if yolo_decision is not None:
-                        decision = yolo_decision
-                        active_target_x = yolo_target_x
+                    # YOLO rope gate: ONLY inside the rope jump zone (the
+                    # minimap plan decided to jump).  Walking to the zone is
+                    # pure patrol logic - YOLO must not override the
+                    # calculated approach holds.  When the YOLO subprocess
+                    # sees the actual rope on screen, jump only when the real
+                    # screen gap is small, in the real direction.
+                    if decision.key in ("jump_climb_left", "jump_climb_right"):
+                        yolo_decision, yolo_target_x = self._yolo_rope_decision()
+                        if yolo_decision is not None:
+                            decision = yolo_decision
+                            active_target_x = yolo_target_x
                 else:
                     assert route_target_x is not None
                     target_y = observation.player.y if observation.player is not None else 0.0

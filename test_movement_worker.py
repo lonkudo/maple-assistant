@@ -200,10 +200,11 @@ class MovementTests(unittest.TestCase):
         state.write(True, rope_x=1340.0, char_x=1280.0)
         decision, _ = worker._yolo_rope_decision()
         self.assertEqual(decision.key, "jump_climb_right")
-        # Large real gap -> keep walking toward the rope.
-        state.write(True, rope_x=1600.0, char_x=1280.0)
+        # Large real gap -> short bounded nudge, never a long fixed hold.
+        state.write(True, rope_x=2000.0, char_x=1280.0)
         decision, _ = worker._yolo_rope_decision()
         self.assertEqual(decision.key, "right")
+        self.assertLessEqual(decision.duration, 0.35)
         # Rope not visible -> fall back to the minimap plan.
         state.write(False)
         self.assertEqual(worker._yolo_rope_decision(), (None, None))
