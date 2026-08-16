@@ -135,6 +135,7 @@ class AttackExecutor:
         cooldown: float = 0.6,
         refocus_interval: float = 3.0,
         turn_settle: float = 0.15,
+        patrol_state_path: Optional[str] = None,
         log_path: Optional[str] = None,
         dry_run: bool = False,
     ) -> None:
@@ -151,6 +152,18 @@ class AttackExecutor:
         self._facing: Optional[str] = None  # last direction we turned toward
         self._last_attack = 0.0
         self._last_refocus = 0.0
+        # Cross-process patrol state: when the patrol worker reports the
+        # character is climbing/dropping, attacks are blocked so the attack
+        # keys never fight the climb.
+        self._patrol_state = None
+        if patrol_state_path:
+            try:
+                from combat_coordination import PatrolStateFile
+
+                self._patrol_state = PatrolStateFile(patrol_state_path)
+            except Exception:
+                LOG.warning("patrol state unavailable; attacks not gated",
+                            exc_info=True)
         if log_path:
             self._enable_file_log(log_path)
 
@@ -312,6 +325,11 @@ class AttackExecutor:
 
         now = time.monotonic()
         if now - self._last_attack < self.cooldown:
+            return False
+        # Block attacks while patrol is climbing/dropping: the character is
+        # on a rope or mid-drop, and an attack key would fight the climb.
+        if self._patrol_state is not None and self._patrol_state.is_busy():
+            LOG.debug("attack blocked: patrol climbing/dropping")
             return False
         if not self.is_game_foreground():
             if now - self._last_refocus >= self.refocus_interval:

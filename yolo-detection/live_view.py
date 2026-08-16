@@ -79,6 +79,9 @@ def parse_args() -> argparse.Namespace:
                         help="path to write YOLO rope state JSON for the patrol "
                              "worker (gates the inner-gap jump on the real "
                              "screen gap)")
+    parser.add_argument("--patrol-state", default=None,
+                        help="path to read patrol state JSON (blocks attacks "
+                             "while the character is climbing/dropping)")
     return parser.parse_args()
 
 
@@ -167,6 +170,7 @@ def main() -> int:
             args.window_title,
             attack_key=args.attack_key,
             cooldown=args.attack_cooldown,
+            patrol_state_path=args.patrol_state,
             log_path=log_path,
         )
         if args.attack_state:

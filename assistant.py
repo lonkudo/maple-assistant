@@ -404,6 +404,9 @@ def main() -> int:
             rope_state_path=str(
                 Path(__file__).with_name("work") / "rope_state.json"
             ),
+            patrol_state_path=str(
+                Path(__file__).with_name("work") / "patrol_state.json"
+            ),
             rope_jump_px=float(
                 map_profile.get("rope", {}).get("jump_px", 140)
             ),

@@ -254,6 +254,25 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertFalse(ex.attack(char, mob))
         self.assertEqual(ex._taps, [])
 
+    def test_attack_blocked_when_patrol_climbing(self):
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import PatrolStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "patrol_state.json"
+        state = PatrolStateFile(str(tmp))
+        ex = self._executor(cooldown=0.0, patrol_state_path=str(tmp))
+        char = make_detection("character", 400, 400)
+        mob = make_detection("mob", 600, 400)
+        # Patrol climbing: attack is blocked.
+        state.write(True, "climb")
+        self.assertFalse(ex.attack(char, mob))
+        self.assertEqual(ex._taps, [])
+        # Patrol idle: attack fires.
+        state.write(False)
+        self.assertTrue(ex.attack(char, mob))
+        self.assertNotEqual(ex._taps, [])
+
     def test_attack_refocuses_then_attacks(self):
         ex = self._executor(cooldown=0.0, turn_settle=0.0)
         # Not focused first, but refocus succeeds: attack must still fire.

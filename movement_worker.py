@@ -22,7 +22,7 @@ from PIL import Image
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from patrol_control import CoordinateLayout
 
-from combat_coordination import AttackStateFile, RopeStateFile
+from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
 
 
 LOG = logging.getLogger(__name__)
@@ -925,6 +925,7 @@ class MovementWorker(threading.Thread):
         moving_active_event: Optional[threading.Event] = None,
         attack_state_path: Optional[str] = None,
         rope_state_path: Optional[str] = None,
+        patrol_state_path: Optional[str] = None,
         rope_jump_px: float = 140.0,
         on_rope_px: float = 50.0,
     ) -> None:
@@ -1020,6 +1021,12 @@ class MovementWorker(threading.Thread):
         self._rope_state = (
             RopeStateFile(rope_state_path)
             if rope_state_path else None
+        )
+        # Cross-process patrol state: published so the YOLO attack worker
+        # blocks attacks while the character is climbing/dropping.
+        self._patrol_state = (
+            PatrolStateFile(patrol_state_path)
+            if patrol_state_path else None
         )
         self.rope_jump_px = max(20.0, float(rope_jump_px))
         # When the character's screen X is within this many pixels of the
@@ -1505,6 +1512,8 @@ class MovementWorker(threading.Thread):
                         self.dropping_active_event.clear()
                     if self.moving_active_event is not None:
                         self.moving_active_event.clear()
+                    if self._patrol_state is not None:
+                        self._patrol_state.write(False)
                     continue
                 # Attack priority: while the YOLO attack worker reports an
                 # active target, hold patrol movement entirely so the
@@ -1737,6 +1746,16 @@ class MovementWorker(threading.Thread):
                         self.climbing_active_event.set()
                     else:
                         self.climbing_active_event.clear()
+                # Publish the patrol state so the YOLO attack worker blocks
+                # attacks while the character is climbing or dropping.
+                if self._patrol_state is not None:
+                    patrol_busy = bool(
+                        climb_decision_active
+                        or self._climb_state.phase != "idle"
+                        or (self.dropping_active_event is not None
+                            and self.dropping_active_event.is_set())
+                    )
+                    self._patrol_state.write(patrol_busy, decision.key)
                 # Walking state for the pickup worker: Z is only tapped while
                 # the character is actually moving left/right (patrol walk or
                 # rope approach), never while idle/aligned/climbing.

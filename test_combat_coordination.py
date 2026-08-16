@@ -5,7 +5,11 @@ import time
 import unittest
 from pathlib import Path
 
-from combat_coordination import AttackStateFile, RopeStateFile
+from combat_coordination import (
+    AttackStateFile,
+    PatrolStateFile,
+    RopeStateFile,
+)
 
 
 class AttackStateFileTests(unittest.TestCase):
@@ -90,6 +94,39 @@ class RopeStateFileTests(unittest.TestCase):
         data["ts"] = time.time() - 60.0
         path.write_text(__import__("json").dumps(data), encoding="utf-8")
         self.assertFalse(state.is_fresh(max_age=1.0))
+
+
+class PatrolStateFileTests(unittest.TestCase):
+    def _path(self):
+        import tempfile
+        from pathlib import Path
+
+        return Path(tempfile.mkdtemp()) / "patrol_state.json"
+
+    def test_busy_when_climbing(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        state.write(True, "climb")
+        self.assertTrue(state.is_busy())
+
+    def test_idle_not_busy(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        state.write(False)
+        self.assertFalse(state.is_busy())
+
+    def test_missing_file_not_busy(self):
+        state = PatrolStateFile(str(self._path()))
+        self.assertFalse(state.is_busy())
+
+    def test_stale_busy_is_ignored(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        state.write(True, "climb")
+        data = state.read()
+        data["ts"] = time.time() - 60.0
+        path.write_text(__import__("json").dumps(data), encoding="utf-8")
+        self.assertFalse(state.is_busy(max_age=1.0))
 
 
 if __name__ == "__main__":

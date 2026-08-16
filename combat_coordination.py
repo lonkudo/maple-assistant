@@ -93,6 +93,59 @@ class AttackStateFile:
         return (float(raw[0]), float(raw[1]))
 
 
+class PatrolStateFile:
+    """Read/write the shared patrol-state JSON.
+
+    The patrol worker publishes whether the character is busy climbing or
+    dropping; the YOLO attack worker reads it and blocks attacks while the
+    character is on a rope (attacking would fight the climb).
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+
+    def write(self, busy: bool, action: Optional[str] = None) -> None:
+        """Persist the current patrol state (atomic temp+rename)."""
+
+        data = {
+            "busy": bool(busy),
+            "action": action,
+            "ts": time.time(),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self.path.parent), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def read(self) -> Optional[dict]:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def is_busy(self, max_age: float = 1.0) -> bool:
+        """True when patrol is climbing/dropping (recent + busy)."""
+
+        data = self.read()
+        if not data or not data.get("busy"):
+            return False
+        age = time.time() - float(data.get("ts", 0.0))
+        return 0.0 <= age <= max_age
+
+
+__all__ = ["AttackStateFile", "RopeStateFile", "PatrolStateFile"]
+
+
 class RopeStateFile:
     """Read/write the shared YOLO rope-state JSON.
 
@@ -166,6 +219,3 @@ class RopeStateFile:
         if rx is None or cx is None:
             return None
         return float(rx) - float(cx)
-
-
-__all__ = ["AttackStateFile", "RopeStateFile"]
