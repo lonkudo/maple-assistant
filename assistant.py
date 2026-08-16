@@ -104,6 +104,9 @@ def parse_args() -> argparse.Namespace:
                         help="seconds between Ctrl attacks (default: 2)")
     parser.add_argument("--enable-attack", action="store_true",
                         help="enable the independent Ctrl attack worker (off by default)")
+    parser.add_argument("--pickup-interval", type=float, default=1.0,
+                        help="seconds between Z pickup taps while patrolling "
+                             "(default: 1.0; 0 disables pickup)")
     parser.add_argument("--dry-run", action="store_true",
                         help="analyze/log only; default sends keyboard events")
     parser.add_argument("--debug-dir", type=Path)
@@ -312,6 +315,18 @@ def main() -> int:
         ))
     else:
         logging.info("attack worker temporarily disabled")
+    pickup_workers = []
+    if args.pickup_interval > 0:
+        from pickup_worker import PickupWorker
+
+        pickup_workers.append(PickupWorker(
+            key_sender,
+            stop_event,
+            args.pickup_interval,
+            climbing_active_event=climbing_active,
+            dropping_active_event=dropping_active,
+            automation_active_event=automation_active,
+        ))
     core_workers = [
         capture_worker,
         MovementWorker(
@@ -392,6 +407,7 @@ def main() -> int:
             automation_active_event=automation_active,
         ),
         *attack_workers,
+        *pickup_workers,
         FocusWorker(
             key_sender,
             stop_event,

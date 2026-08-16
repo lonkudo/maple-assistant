@@ -37,6 +37,7 @@ class WindowKeySender:
         "left": (0x4B, True), "up": (0x48, True),
         "right": (0x4D, True), "down": (0x50, True),
         "delete": (0x53, True), "end": (0x4F, True),
+        "z": (0x2C, False), "space": (0x39, False),
     }
 
     def __init__(
