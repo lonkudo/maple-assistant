@@ -104,6 +104,30 @@ class ConfigManager:
         except (KeyError, TypeError):
             return default
 
+    def set(self, key_path: str, value) -> None:
+        """Set a dotted-path config value, creating intermediate dicts."""
+        keys = key_path.split('.')
+        node = self.config
+        for key in keys[:-1]:
+            child = node.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                node[key] = child
+            node = child
+        node[keys[-1]] = value
+
+    def save(self) -> bool:
+        """Write the current config back to the YAML file."""
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(
+                    self.config, f, allow_unicode=True, sort_keys=False
+                )
+            return True
+        except Exception as e:
+            logger.error(f"保存配置失敗: {e}")
+            return False
+
 class PerformanceMonitor:
     """性能監控器"""
     

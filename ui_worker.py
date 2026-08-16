@@ -413,6 +413,7 @@ class UiWorker(threading.Thread):
                 variable=self._yolo_threshold_var,
                 command=self._yolo_on_threshold_change,
             )
+            self._yolo_threshold_slider.configure(resolution=0.01)
             self._yolo_threshold_slider.pack(side="left", fill="x",
                                              expand=True, padx=(0, 8))
             self._yolo_threshold_label = ttk.Label(yolo_row, text="0.40", width=6)
@@ -816,7 +817,7 @@ class UiWorker(threading.Thread):
         """Persist current YOLO panel values to the local JSON file."""
 
         data = {
-            "threshold": float(self._yolo_threshold_var.get()),
+            "threshold": round(float(self._yolo_threshold_var.get()), 2),
             "attack_range": int(self._yolo_attack_range_var.get()),
             "detection_fps": int(self._yolo_fps_var.get())
             if hasattr(self, "_yolo_fps_var") else 10,
@@ -961,10 +962,40 @@ class UiWorker(threading.Thread):
         """Persist the current YOLO panel values and confirm on screen."""
 
         self._yolo_save_settings()
+        self._yolo_save_threshold_to_config()
         if hasattr(self, "_yolo_status"):
             self._yolo_status.configure(
                 text="Configuration saved - it will be restored next launch."
             )
+
+    def _yolo_save_threshold_to_config(self) -> None:
+        """Write the UI threshold into the YOLO detection config.yaml.
+
+        config.yaml's ``detection_behavior.confidence_threshold`` is the
+        source of truth the model reads on startup; keep it in sync with the
+        slider so the saved threshold survives even without --threshold.
+        """
+
+        try:
+            import sys
+
+            yolo_root = Path(__file__).resolve().parent / "yolo-detection"
+            sys.path.insert(0, str(yolo_root))
+            from auto import ConfigManager
+
+            manager = ConfigManager(str(yolo_root / "config.yaml"))
+            manager.set(
+                "detection_behavior.confidence_threshold",
+                float(self._yolo_threshold_var.get()),
+            )
+            if manager.save():
+                LOG.info("threshold %.3f written to %s",
+                         float(self._yolo_threshold_var.get()),
+                         yolo_root / "config.yaml")
+            else:
+                LOG.warning("could not save threshold to config.yaml")
+        except Exception:
+            LOG.warning("could not update config.yaml threshold", exc_info=True)
 
     def _yolo_stop(self) -> None:
         """Terminate the YOLO detection subprocess."""

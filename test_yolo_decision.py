@@ -417,6 +417,29 @@ class FullClassDetectionTests(unittest.TestCase):
         # mob is the only class returned (no temporal confirmation anymore).
         self.assertEqual([d.class_name for d in dets], ["mob"])
 
+    def test_config_manager_set_and_save_threshold(self):
+        import tempfile
+        from pathlib import Path
+        import yaml
+        from auto import ConfigManager
+
+        tmp = Path(tempfile.mkdtemp()) / "config.yaml"
+        tmp.write_text(
+            "detection_behavior:\n  confidence_threshold: 0.33\n",
+            encoding="utf-8",
+        )
+        manager = ConfigManager(str(tmp))
+        manager.set("detection_behavior.confidence_threshold", 0.64)
+        self.assertTrue(manager.save())
+        reloaded = yaml.safe_load(tmp.read_text(encoding="utf-8"))
+        self.assertAlmostEqual(
+            reloaded["detection_behavior"]["confidence_threshold"], 0.64
+        )
+        # Dotted get on the fresh manager reflects the new value.
+        self.assertAlmostEqual(
+            manager.get("detection_behavior.confidence_threshold"), 0.64
+        )
+
     def test_out_of_zone_environment_and_mobs_excluded(self):
         import numpy as np
 

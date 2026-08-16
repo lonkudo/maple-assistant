@@ -1,20 +1,14 @@
-# MapleStory Worlds 自動化系統配置文件
-
-# 模型設定
 model:
-  default_path: "weights/best.pt"
-  confidence_threshold: 0.15  # 提高信賴度閾值
+  default_path: weights/best.pt
+  confidence_threshold: 0.15
   iou_threshold: 0.45
-  device: "auto"  # auto, cpu, cuda
-
-# 視窗設定
+  device: auto
 window:
   default:
     left: 0
     top: 0
-    width: 2561  # full physical screen (150% DPI of 1707x1067 logical)
+    width: 2561
     height: 1601
-  # 預設遊戲視窗位置（可根據不同解析度調整）
   presets:
     small:
       left: 100
@@ -41,98 +35,77 @@ window:
       top: 180
       width: 1280
       height: 720
-
-# 按鍵設定 (根據您的遊戲配置更新)
 controls:
-  pickup_key: "space"       # 撿取物品按鍵 (請確認)
-  interact_key: "space"     # 與 NPC 互動按鍵
-  attack_key: "z"           # 攻擊按鍵
-  attack_method: "key"      # 攻擊方式：使用 Z 鍵攻擊
-  
-  # 移動按鍵
+  pickup_key: space
+  interact_key: space
+  attack_key: z
+  attack_method: key
   movement_keys:
-    left: "left"           # 向左移動
-    right: "right"         # 向右移動
-    jump: "x"              # 跳躍 (X 鍵)
-    up: "up"               # 向上 (爬繩/梯子)
-    down: "down"           # 向下 (跳下平台)
-  
-  # 技能和動作按鍵
+    left: left
+    right: right
+    jump: x
+    up: up
+    down: down
   skill_keys:
-    skill_1: "ctrl"        # 技能1
-    skill_2: "1"           # 技能2  
-    skill_3: "2"           # 技能3
-    skill_4: "3"           # 技能4
-    potion: "delete"       # 藥水
-    
-  # 系統按鍵
+    skill_1: ctrl
+    skill_2: '1'
+    skill_3: '2'
+    skill_4: '3'
+    potion: delete
   system_keys:
-    inventory: "i"         # 背包
-    status: "s"           # 狀態視窗
-    chat: "enter"         # 聊天
-
-# 自動化行為設定
+    inventory: i
+    status: s
+    chat: enter
 automation:
-  action_delay: 0.3  # 動作間隔秒數
-  scan_interval: 0.1  # 掃描間隔
-  max_detection_distance: 200  # 最大偵測距離
-  priority_targets: ["mob"]  # 只攻擊怪物
-  
-  # 尋找怪物設定
+  action_delay: 0.3
+  scan_interval: 0.1
+  max_detection_distance: 200
+  priority_targets:
+  - mob
   mob_hunting:
-    enable: true  # 啟用主動尋找怪物
-    search_pattern: "horizontal"  # 搜尋模式: horizontal, vertical, random
-    move_distance: 100  # 每次移動距離 (像素)
-    search_delay: 2.0  # 搜尋間隔 (秒)
-    max_search_time: 10  # 最大搜尋時間 (秒)
-    return_to_center: true  # 搜尋後是否返回中心
-  
-# 安全設定
+    enable: true
+    search_pattern: horizontal
+    move_distance: 100
+    search_delay: 2.0
+    max_search_time: 10
+    return_to_center: true
 safety:
   enable_failsafe: true
   emergency_stop_corner: true
-  max_runtime_hours: 2  # 最大連續運行時間
-  screenshot_log: false  # 是否保存截圖日誌
-
-# 監控設定
+  max_runtime_hours: 2
+  screenshot_log: false
 monitoring:
-  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
-  save_interval: 30  # 監控數據保存間隔（秒）
+  log_level: INFO
+  save_interval: 30
   max_log_size_mb: 100
   enable_performance_monitor: true
-
-# 偵測行為設定
 detection_behavior:
-  # 信賴度閾值：只保留信心度高於此值的物件
-  confidence_threshold: 0.33
-  # 太小的 box 視為誤判的掉落物，不攻擊 (像素)
+  confidence_threshold: 0.5
   min_mob_box_px: 20
-  # 只保留 mob 類別的偵測結果
   detect_only_mobs: true
-  # 只在畫面中央區域偵測 (0.0-1.0 比例)
   center_zone:
     enabled: true
-    width_fraction: 0.6   # 中央區域寬度佔畫面比例
-    height_fraction: 0.6  # 中央區域高度佔畫面比例
+    width_fraction: 0.6
+    height_fraction: 0.6
   character:
-    action: "ignore"
+    action: ignore
     log: true
   environment:
-    action: "ignore"
+    action: ignore
     log: false
   item:
-    action: "ignore"     # 只偵測不執行動作
+    action: ignore
     log: true
     max_distance: 150
   mob:
-    action: "attack"     # 只保留攻擊怪物
+    action: attack
     log: true
     max_distance: 200
     attack_delay: 0.5
   npc:
-    action: "ignore"     # 只偵測不執行動作
+    action: ignore
     log: true
     interaction_delay: 1.0
   ui:
-    action: "ignore"
-    log: false 
+    action: ignore
+    log: false
