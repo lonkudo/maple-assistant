@@ -253,7 +253,9 @@ class OptimizedMapleBot:
         detect_only_mobs = bool(self.config.get('detection_behavior.detect_only_mobs', True))
 
         try:
-            results = self.model(img, verbose=False)
+            results = self.model(
+                img, conf=self.confidence_threshold, verbose=False
+            )
             detections = []
 
             # 計算畫面中心點
@@ -363,7 +365,9 @@ class OptimizedMapleBot:
         if self.model is None:
             return None
         try:
-            results = self.model(img, verbose=False)
+            results = self.model(
+                img, conf=self.confidence_threshold, verbose=False
+            )
             candidates = []
             center_x, center_y = self.monitor['width'] // 2, self.monitor['height'] // 2
             for result in results:
