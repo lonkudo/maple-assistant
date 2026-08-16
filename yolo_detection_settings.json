@@ -1,5 +1,5 @@
 {
-  "threshold": 0.51,
+  "threshold": 0.5,
   "attack_range": 1006,
   "detection_fps": 20,
   "zone_width": 100,

@@ -331,6 +331,15 @@ class AttackExecutor:
         if self._patrol_state is not None and self._patrol_state.is_busy():
             LOG.debug("attack blocked: patrol climbing/dropping")
             return False
+        # Sync the facing belief with patrol: patrol walk taps and jump-climbs
+        # also turn the character, so the cached _facing can go stale and a
+        # needed turn would be skipped (character attacks the wrong way).
+        if self._patrol_state is not None:
+            patrol_facing = self._patrol_state.facing()
+            if patrol_facing is not None and patrol_facing != self._facing:
+                LOG.debug("facing synced from patrol: %s -> %s",
+                          self._facing, patrol_facing)
+                self._facing = patrol_facing
         if not self.is_game_foreground():
             if now - self._last_refocus >= self.refocus_interval:
                 self._last_refocus = now

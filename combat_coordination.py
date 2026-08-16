@@ -104,12 +104,18 @@ class PatrolStateFile:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
 
-    def write(self, busy: bool, action: Optional[str] = None) -> None:
+    def write(
+        self,
+        busy: bool,
+        action: Optional[str] = None,
+        facing: Optional[str] = None,
+    ) -> None:
         """Persist the current patrol state (atomic temp+rename)."""
 
         data = {
             "busy": bool(busy),
             "action": action,
+            "facing": facing,
             "ts": time.time(),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +147,18 @@ class PatrolStateFile:
             return False
         age = time.time() - float(data.get("ts", 0.0))
         return 0.0 <= age <= max_age
+
+    def facing(self, max_age: float = 2.0) -> Optional[str]:
+        """Last facing direction the patrol set (left/right), if fresh."""
+
+        data = self.read()
+        if not data:
+            return None
+        age = time.time() - float(data.get("ts", 0.0))
+        if not (0.0 <= age <= max_age):
+            return None
+        facing = data.get("facing")
+        return facing if facing in ("left", "right") else None
 
 
 __all__ = ["AttackStateFile", "RopeStateFile", "PatrolStateFile"]

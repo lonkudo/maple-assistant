@@ -1034,6 +1034,9 @@ class MovementWorker(threading.Thread):
         # attempts cannot unblock the attack mid-rope.
         self._patrol_busy_hold = max(0.5, float(patrol_busy_hold))
         self._patrol_busy_until = 0.0
+        # Last horizontal direction patrol moved the character (left/right),
+        # published so the YOLO attack worker can sync its facing belief.
+        self._patrol_facing: Optional[str] = None
         self.rope_jump_px = max(20.0, float(rope_jump_px))
         # When the character's screen X is within this many pixels of the
         # rope, it is considered ON the rope: YOLO stops jumping and patrol's
@@ -1797,7 +1800,18 @@ class MovementWorker(threading.Thread):
                     patrol_busy = bool(
                         busy_now or now_mono < self._patrol_busy_until
                     )
-                    self._patrol_state.write(patrol_busy, decision.key)
+                    # Track the last horizontal direction the character was
+                    # moved, so the attack worker can sync its facing belief
+                    # (patrol walk taps also turn the character).
+                    if decision.key in ("left", "right"):
+                        self._patrol_facing = decision.key
+                    elif decision.key in ("jump_climb_left", "jump_climb_right"):
+                        self._patrol_facing = decision.key.removeprefix(
+                            "jump_climb_"
+                        )
+                    self._patrol_state.write(
+                        patrol_busy, decision.key, self._patrol_facing
+                    )
                 # Walking state for the pickup worker: Z is only tapped while
                 # the character is actually moving left/right (patrol walk or
                 # rope approach), never while idle/aligned/climbing.

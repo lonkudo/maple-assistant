@@ -225,6 +225,32 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertTrue(ex.attack(char, right))
         self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
 
+    def test_facing_synced_from_patrol_before_attack(self):
+        # Desync bug: executor cached facing=right, but patrol walked the
+        # character left.  A monster on the RIGHT would then be attacked
+        # without a turn.  The patrol-facing sync must trigger the turn.
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import PatrolStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "patrol_state.json"
+        state = PatrolStateFile(str(tmp))
+        ex = self._executor(cooldown=0.0, turn_settle=0.0,
+                            patrol_state_path=str(tmp))
+        char = make_detection("character", 400, 400)
+        right = make_detection("mob", 600, 400)
+        # Executor believes it faces right (from an earlier attack).
+        self.assertTrue(ex.attack(char, right))
+        self.assertEqual(ex._facing, "right")
+        ex._taps.clear()
+        # Patrol walked the character left: publish facing=left.
+        state.write(False, "left", "left")
+        # Monster still on the right: facing must be re-synced and the turn
+        # tap must fire.
+        self.assertTrue(ex.attack(char, right))
+        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
+        self.assertEqual(ex._facing, "right")
+
     def test_attack_skips_turn_when_already_facing(self):
         ex = self._executor(cooldown=0.0, turn_settle=0.0)
         char = make_detection("character", 400, 400)

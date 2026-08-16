@@ -128,6 +128,22 @@ class PatrolStateFileTests(unittest.TestCase):
         path.write_text(__import__("json").dumps(data), encoding="utf-8")
         self.assertFalse(state.is_busy(max_age=1.0))
 
+    def test_facing_roundtrip(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        state.write(False, "left", "left")
+        self.assertEqual(state.facing(), "left")
+        state.write(False, "right", "right")
+        self.assertEqual(state.facing(), "right")
+
+    def test_facing_missing_or_invalid(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        state.write(False, "climb", None)
+        self.assertIsNone(state.facing())
+        state.write(False, "drop", "up")
+        self.assertIsNone(state.facing())
+
 
 if __name__ == "__main__":
     unittest.main()
