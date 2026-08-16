@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import logging
 import queue
 import threading
@@ -606,6 +607,8 @@ class UiWorker(threading.Thread):
                 yolo_panel, text="YOLO detection stopped.", justify="left"
             )
             self._yolo_status.pack(anchor="w", pady=(6, 0))
+            # Restore previously saved YOLO panel settings (threshold, ranges).
+            self._yolo_load_settings()
 
             ttk.Label(container, text="Detected minimap").pack(anchor="w")
             self._minimap_label = ttk.Label(container)
@@ -953,6 +956,62 @@ class UiWorker(threading.Thread):
                 return
         self._monster_status.configure(text="Drop a PNG/JPG/BMP/GIF image.")
 
+    def _yolo_settings_path(self) -> Path:
+        """JSON file holding the YOLO panel settings."""
+
+        return Path(__file__).resolve().parent / "yolo_detection_settings.json"
+
+    def _yolo_load_settings(self) -> None:
+        """Restore saved YOLO panel values from the local JSON file."""
+
+        try:
+            data = json.loads(
+                self._yolo_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return
+        try:
+            if "threshold" in data:
+                self._yolo_threshold_var.set(str(data["threshold"]))
+            if "attack_range" in data:
+                self._yolo_attack_range_var.set(int(data["attack_range"]))
+            if "zone_width" in data:
+                self._yolo_zone_w_var.set(int(data["zone_width"]))
+            if "zone_height" in data:
+                self._yolo_zone_h_var.set(int(data["zone_height"]))
+            if "zone_shift_y" in data:
+                self._yolo_zone_shift_y_var.set(int(data["zone_shift_y"]))
+            if "show_detection" in data:
+                self._yolo_show_var.set(bool(data["show_detection"]))
+        except (KeyError, TypeError, ValueError):
+            LOG.warning("ignored malformed yolo settings", exc_info=True)
+            return
+        # Refresh the slider labels to match the loaded values.
+        self._yolo_on_range_change()
+        self._yolo_on_zone_change()
+        self._yolo_sync_show_button()
+        LOG.info("yolo settings loaded from %s", self._yolo_settings_path())
+
+    def _yolo_save_settings(self) -> None:
+        """Persist current YOLO panel values to the local JSON file."""
+
+        data = {
+            "threshold": float(self._yolo_threshold_var.get()),
+            "attack_range": int(self._yolo_attack_range_var.get()),
+            "zone_width": int(self._yolo_zone_w_var.get()),
+            "zone_height": int(self._yolo_zone_h_var.get()),
+            "zone_shift_y": int(self._yolo_zone_shift_y_var.get()),
+            "show_detection": bool(self._yolo_show_var.get()),
+        }
+        path = self._yolo_settings_path()
+        try:
+            path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            LOG.info("yolo settings saved to %s", path)
+        except OSError:
+            LOG.warning("could not save yolo settings to %s", path, exc_info=True)
+
     def _yolo_on_range_change(self, _value: str = "") -> None:
         """Update the attack-range label as the slider moves."""
 
@@ -1028,6 +1087,7 @@ class UiWorker(threading.Thread):
         )
         LOG.info("yolo detection started threshold=%.2f show=%s pid=%s",
                  threshold, self._yolo_show_var.get(), self._yolo_process.pid)
+        self._yolo_save_settings()
 
     def _yolo_stop(self) -> None:
         """Terminate the YOLO detection subprocess."""

@@ -339,6 +339,82 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("--zone-shift-y", args)
             self.assertIn("0.20", args)
 
+    def test_yolo_settings_save_and_load_roundtrip(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.state = "normal"
+
+            def configure(self, *, state: str = None, style: str = None) -> None:
+                if state is not None:
+                    self.state = state
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = UiWorker.__new__(UiWorker)
+            worker._yolo_process = None
+            worker._yolo_threshold_var = Var("0.35")
+            worker._yolo_attack_range_var = Var(900)
+            worker._yolo_zone_w_var = Var(70)
+            worker._yolo_zone_h_var = Var(55)
+            worker._yolo_zone_shift_y_var = Var(15)
+            worker._yolo_show_var = Var(True)
+            worker._yolo_status = Label()
+            worker._yolo_run_button = Button()
+            worker._yolo_stop_button = Button()
+
+            def fake_path(self):
+                return Path(directory) / "yolo_detection_settings.json"
+
+            with mock.patch.object(UiWorker, "_yolo_settings_path", fake_path):
+                worker._yolo_save_settings()
+                saved = Path(directory) / "yolo_detection_settings.json"
+                self.assertTrue(saved.is_file())
+
+                # A fresh worker loads the saved values back.
+                loader = UiWorker.__new__(UiWorker)
+                loader._yolo_process = None
+                loader._yolo_threshold_var = Var("0.4")
+                loader._yolo_attack_range_var = Var(800)
+                loader._yolo_zone_w_var = Var(60)
+                loader._yolo_zone_h_var = Var(60)
+                loader._yolo_zone_shift_y_var = Var(0)
+                loader._yolo_show_var = Var(False)
+                loader._yolo_status = Label()
+                loader._yolo_run_button = Button()
+                loader._yolo_stop_button = Button()
+                loader._yolo_on_range_change = lambda *a: None
+                loader._yolo_on_zone_change = lambda *a: None
+                loader._yolo_sync_show_button = lambda: None
+                with mock.patch.object(UiWorker, "_yolo_settings_path", fake_path):
+                    loader._yolo_load_settings()
+
+                self.assertEqual(loader._yolo_threshold_var.get(), "0.35")
+                self.assertEqual(loader._yolo_attack_range_var.get(), 900)
+                self.assertEqual(loader._yolo_zone_w_var.get(), 70)
+                self.assertEqual(loader._yolo_zone_h_var.get(), 55)
+                self.assertEqual(loader._yolo_zone_shift_y_var.get(), 15)
+                self.assertTrue(loader._yolo_show_var.get())
+
     def test_monster_motion_activates_without_picture(self) -> None:
         from monster_detector import MonsterDetector
 
