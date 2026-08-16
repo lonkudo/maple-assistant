@@ -145,7 +145,11 @@ class OptimizedMapleBot:
         
         # 從配置載入設定
         self.monitor = self.config.get('window.default')
-        self.confidence_threshold = self.config.get('model.confidence_threshold', 0.6)
+        # 閾值屬偵測行為設定；若未定義則回退到 model 區塊的舊值
+        self.confidence_threshold = self.config.get(
+            'detection_behavior.confidence_threshold',
+            self.config.get('model.confidence_threshold', 0.6),
+        )
         self.action_delay = self.config.get('automation.action_delay', 0.3)
         self.scan_interval = self.config.get('automation.scan_interval', 0.1)
         self.max_runtime = self.config.get('safety.max_runtime_hours', 2) * 3600

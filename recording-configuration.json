@@ -5,7 +5,8 @@
   "climbing_enabled": true,
   "route_order": [
     "layer1",
-    "layer2"
+    "layer2",
+    "layer3"
   ],
   "final_layer_action": "drop_to_first_layer",
   "first_layer": "layer1",
@@ -174,7 +175,7 @@
     },
     "layer3": {
       "y_tolerance": 0.02,
-      "calibration_status": "awaiting_left_rope_right",
+      "calibration_status": "final_layer_ready",
       "left_most_pos": {
         "x": 0.328402,
         "y": 0.447977,
@@ -201,7 +202,29 @@
       "layer_y": 0.447977,
       "layer_y_source": "manual-ui",
       "layer_world_y": -0.272153,
-      "world_y_tolerance": 0.75
+      "world_y_tolerance": 0.75,
+      "right_most_pos": {
+        "x": 0.630178,
+        "y": 0.447977,
+        "source": "manual-ui",
+        "world_y": -0.272153,
+        "observed_world_y": -0.128821,
+        "tracking_confidence": 0.946606,
+        "coordinate_v2": {
+          "x_diamond": 4.416667,
+          "y_diamond": -0.75,
+          "recorded_layout": {
+            "analysis_width": 169.0,
+            "analysis_height": 173.0,
+            "canvas_left": 7.0,
+            "canvas_top": 12.0,
+            "canvas_width": 146.0,
+            "canvas_height": 140.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      }
     }
   }
 }

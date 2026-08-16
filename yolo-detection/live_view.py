@@ -136,7 +136,9 @@ def main() -> int:
     except Exception:
         pass
     conf = (args.threshold if args.threshold is not None
-            else float(bot.config.get("model.confidence_threshold", 0.45)))
+            else float(bot.config.get(
+                "detection_behavior.confidence_threshold",
+                bot.config.get("model.confidence_threshold", 0.45))))
     # The UI threshold must drive BOTH the model's prediction filter and
     # auto.py's own confidence gate (detect_objects/detect_character read
     # self.confidence_threshold, not model.conf).

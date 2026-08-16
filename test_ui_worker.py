@@ -303,7 +303,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 with mock.patch.object(UiWorker, "_yolo_settings_path", fake_path):
                     loader._yolo_load_settings()
 
-                self.assertEqual(loader._yolo_threshold_var.get(), "0.35")
+                self.assertEqual(loader._yolo_threshold_var.get(), 0.35)
                 self.assertEqual(loader._yolo_attack_range_var.get(), 900)
                 self.assertEqual(loader._yolo_zone_w_var.get(), 70)
                 self.assertEqual(loader._yolo_zone_h_var.get(), 55)

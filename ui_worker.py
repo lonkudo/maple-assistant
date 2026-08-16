@@ -404,14 +404,19 @@ class UiWorker(threading.Thread):
             yolo_row = ttk.Frame(yolo_panel)
             yolo_row.pack(fill="x")
             ttk.Label(yolo_row, text="Threshold:").pack(side="left", padx=(0, 6))
-            self._yolo_threshold_var = tk.StringVar(value="0.4")
-            yolo_threshold = ttk.Entry(
-                yolo_row, textvariable=self._yolo_threshold_var, width=8
+            self._yolo_threshold_var = tk.DoubleVar(value=0.4)
+            self._yolo_threshold_slider = ttk.Scale(
+                yolo_row,
+                from_=0.05,
+                to=0.95,
+                orient="horizontal",
+                variable=self._yolo_threshold_var,
+                command=self._yolo_on_threshold_change,
             )
-            yolo_threshold.pack(side="left", padx=(0, 10))
-            yolo_threshold.bind(
-                "<KeyRelease>", self._yolo_on_threshold_change
-            )
+            self._yolo_threshold_slider.pack(side="left", fill="x",
+                                             expand=True, padx=(0, 8))
+            self._yolo_threshold_label = ttk.Label(yolo_row, text="0.40", width=6)
+            self._yolo_threshold_label.pack(side="left", padx=(0, 10))
             self._yolo_run_button = ttk.Button(
                 yolo_row, text="Run", command=self._yolo_start
             )
@@ -758,7 +763,7 @@ class UiWorker(threading.Thread):
             return
         try:
             if "threshold" in data:
-                self._yolo_threshold_var.set(str(data["threshold"]))
+                self._yolo_threshold_var.set(float(data["threshold"]))
             if "attack_range" in data:
                 self._yolo_attack_range_var.set(int(data["attack_range"]))
             if "zone_width" in data:
@@ -813,9 +818,12 @@ class UiWorker(threading.Thread):
             LOG.warning("could not save yolo settings to %s", path, exc_info=True)
 
     def _yolo_on_threshold_change(self, _event: Any = None) -> None:
-        """Threshold typing: no longer auto-saves (Save Config persists)."""
+        """Update the threshold label as the slider moves (no auto-save)."""
 
-        return
+        if not hasattr(self, "_yolo_threshold_label"):
+            return
+        value = float(self._yolo_threshold_var.get())
+        self._yolo_threshold_label.configure(text=f"{value:.2f}")
 
     def _yolo_on_range_change(self, _value: str = "") -> None:
         """Update the attack-range label as the slider moves."""
@@ -849,8 +857,8 @@ class UiWorker(threading.Thread):
         threshold = 0.4
         try:
             threshold = float(self._yolo_threshold_var.get())
-        except ValueError:
-            self._yolo_threshold_var.set("0.4")
+        except (ValueError, TypeError):
+            self._yolo_threshold_var.set(0.4)
             threshold = 0.4
         yolo_root = Path(__file__).resolve().parent / "yolo-detection"
         python = yolo_root / "venv313" / "Scripts" / "python.exe"

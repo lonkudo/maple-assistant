@@ -103,6 +103,8 @@ monitoring:
 
 # 偵測行為設定
 detection_behavior:
+  # 信賴度閾值：只保留信心度高於此值的物件
+  confidence_threshold: 0.33
   # 只保留 mob 類別的偵測結果
   detect_only_mobs: true
   # 只在畫面中央區域偵測 (0.0-1.0 比例)
