@@ -273,6 +273,46 @@ class AttackExecutorTests(unittest.TestCase):
         self.assertTrue(ex.attack(char, mob))
         self.assertNotEqual(ex._taps, [])
 
+    def test_attack_blocked_when_mutex_held_by_patrol(self):
+        import threading
+        import time
+        from input_mutex import InputControlMutex, MUTEX_NAME
+
+        name = MUTEX_NAME + ".test-attack"
+        patrol_mutex = InputControlMutex(name)
+        # The executor gets its OWN instance bound to the same name, like
+        # the separate attack process would.
+        ex = self._executor(cooldown=0.0,
+                            input_mutex=InputControlMutex(name))
+        char = make_detection("character", 400, 400)
+        mob = make_detection("mob", 600, 400)
+        held = threading.Event()
+        release = threading.Event()
+
+        def patrol_holds():
+            patrol_mutex.try_acquire(0)
+            held.set()
+            release.wait(2)
+            patrol_mutex.release()
+
+        try:
+            holder = threading.Thread(target=patrol_holds)
+            holder.start()
+            self.assertTrue(held.wait(1))
+            # Patrol (another thread) owns the keyboard: attack must skip.
+            self.assertFalse(ex.attack(char, mob))
+            self.assertEqual(ex._taps, [])
+            release.set()
+            holder.join(2)
+            # Mutex free: attack acquires, fires, and releases it.
+            self.assertTrue(ex.attack(char, mob))
+            self.assertNotEqual(ex._taps, [])
+            self.assertFalse(ex._input_mutex.held)
+        finally:
+            release.set()
+            patrol_mutex.close()
+            ex._input_mutex.close()
+
     def test_attack_refocuses_then_attacks(self):
         ex = self._executor(cooldown=0.0, turn_settle=0.0)
         # Not focused first, but refocus succeeds: attack must still fire.

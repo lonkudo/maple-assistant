@@ -177,6 +177,11 @@ def main() -> int:
     moving_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
+    # Cross-process input-control mutex shared with the YOLO attack worker:
+    # only one worker owns the keyboard at any instant.
+    from input_mutex import InputControlMutex
+
+    _patrol_input_mutex = InputControlMutex()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -407,6 +412,7 @@ def main() -> int:
             patrol_state_path=str(
                 Path(__file__).with_name("work") / "patrol_state.json"
             ),
+            input_mutex=_patrol_input_mutex,
             rope_jump_px=float(
                 map_profile.get("rope", {}).get("jump_px", 140)
             ),

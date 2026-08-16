@@ -926,6 +926,7 @@ class MovementWorker(threading.Thread):
         attack_state_path: Optional[str] = None,
         rope_state_path: Optional[str] = None,
         patrol_state_path: Optional[str] = None,
+        input_mutex: Optional[Any] = None,
         rope_jump_px: float = 140.0,
         on_rope_px: float = 50.0,
     ) -> None:
@@ -1028,6 +1029,10 @@ class MovementWorker(threading.Thread):
             PatrolStateFile(patrol_state_path)
             if patrol_state_path else None
         )
+        # Cross-process input-control mutex: only one worker (patrol or
+        # attack) owns the keyboard at any instant.
+        self._input_mutex = input_mutex
+        self._input_held = False
         self.rope_jump_px = max(20.0, float(rope_jump_px))
         # When the character's screen X is within this many pixels of the
         # rope, it is considered ON the rope: YOLO stops jumping and patrol's
@@ -1064,6 +1069,38 @@ class MovementWorker(threading.Thread):
             if self.moving_active_event.is_set():
                 LOG.debug("not moving: pickup Z paused")
             self.moving_active_event.clear()
+
+    def _acquire_input(self, timeout_ms: int = 200) -> bool:
+        """Take the cross-process input mutex before sending keys."""
+
+        if self._input_mutex is None:
+            return True
+        if self._input_held:
+            return True
+        if self._input_mutex.try_acquire(timeout_ms):
+            self._input_held = True
+            return True
+        LOG.debug("movement blocked: attack owns input")
+        return False
+
+    def _release_input(self) -> None:
+        """Release the input mutex after a single-frame tap."""
+
+        if self._input_mutex is not None and self._input_held:
+            self._input_mutex.release()
+            self._input_held = False
+
+    def _action_spans_frames(self, decision: MovementDecision) -> bool:
+        """True when the action keeps the mutex across frames.
+
+        Climb/drop actions own the keyboard for their whole duration (the
+        persistent Up hold / drop chord), so the mutex stays held; plain
+        left/right taps release it immediately after sending.
+        """
+
+        return decision.key in (
+            "climb", "jump_climb_left", "jump_climb_right", "drop"
+        )
 
     def _yolo_rope_action(self) -> Optional[MovementDecision]:
         """Decide the rope action from YOLO SCREEN positions only.
@@ -1811,61 +1848,72 @@ class MovementWorker(threading.Thread):
                     LOG.warning("movement waiting: %s", decision.reason)
                 now = time.monotonic()
                 if decision.key and now - self._last_send >= self.movement_cooldown:
-                    if decision.key == "drop":
-                        if now - self._last_drop_attempt < self.drop_retry_seconds:
-                            continue
-                        self._last_drop_attempt = now
-                        if self.climbing_active_event is not None:
-                            self.climbing_active_event.set()
-                        if self.dropping_active_event is not None:
-                            self.dropping_active_event.set()
-                        if self.climb_attack_lock is None:
-                            _drop_through_platform(
-                                self.key_sender, self.drop_chord_hold_seconds
-                            )
-                        else:
-                            with self.climb_attack_lock:
+                    if not self._acquire_input():
+                        # The attack worker owns the keyboard this instant:
+                        # skip the movement send (retry next frame).
+                        continue
+                    try:
+                        if decision.key == "drop":
+                            if now - self._last_drop_attempt < self.drop_retry_seconds:
+                                continue
+                            self._last_drop_attempt = now
+                            if self.climbing_active_event is not None:
+                                self.climbing_active_event.set()
+                            if self.dropping_active_event is not None:
+                                self.dropping_active_event.set()
+                            if self.climb_attack_lock is None:
                                 _drop_through_platform(
                                     self.key_sender, self.drop_chord_hold_seconds
                                 )
-                    elif decision.key in ("climb", "jump_climb_left", "jump_climb_right"):
-                        if now - self._last_climb_attempt < 2.0:
-                            continue
-                        self._last_climb_attempt = now
-                        if self._climb_state.phase == "idle":
-                            self._reanchor_tracker_to_current_layer()
-                        # Direction comes from character X versus Rope X. At
-                        # an exactly quantized X, retain the last observed side
-                        # of approach instead of using a fixed right-first rule.
-                        preferred_direction = self._rope_approach_direction
-                        if observation.player is not None and route_target_x is not None:
-                            live_gap = route_target_x - observation.player.x
-                            if live_gap > 1e-9:
-                                preferred_direction = "right"
-                            elif live_gap < -1e-9:
-                                preferred_direction = "left"
-                        result = climb(
-                            self.key_sender,
-                            observation,
-                            self._climb_state,
-                            climb_duration=self.climb_up_hold_seconds,
-                            nudge_duration=self.climb_nudge_seconds,
-                            y_change_required=self.climb_y_change_required,
-                            world_y_change_required=self.climb_world_y_change_required,
-                            world_y_stall_change_required=(
-                                self.climb_world_y_stall_change_required
-                            ),
-                            world_y_stall_frames=self.climb_world_y_stall_frames,
-                            action_lock=self.climb_attack_lock,
-                            preferred_direction=preferred_direction,
-                            failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,
-                            persistent_up=True,
-                        )
-                        LOG.info("climb recovery state: %s", result)
-                        if result == "succeeded" and self._route_layers:
-                            self._advance_after_climb()
-                    else:
-                        _send_tap(self.key_sender, decision)
+                            else:
+                                with self.climb_attack_lock:
+                                    _drop_through_platform(
+                                        self.key_sender, self.drop_chord_hold_seconds
+                                    )
+                        elif decision.key in ("climb", "jump_climb_left", "jump_climb_right"):
+                            if now - self._last_climb_attempt < 2.0:
+                                continue
+                            self._last_climb_attempt = now
+                            if self._climb_state.phase == "idle":
+                                self._reanchor_tracker_to_current_layer()
+                            # Direction comes from character X versus Rope X. At
+                            # an exactly quantized X, retain the last observed side
+                            # of approach instead of using a fixed right-first rule.
+                            preferred_direction = self._rope_approach_direction
+                            if observation.player is not None and route_target_x is not None:
+                                live_gap = route_target_x - observation.player.x
+                                if live_gap > 1e-9:
+                                    preferred_direction = "right"
+                                elif live_gap < -1e-9:
+                                    preferred_direction = "left"
+                            result = climb(
+                                self.key_sender,
+                                observation,
+                                self._climb_state,
+                                climb_duration=self.climb_up_hold_seconds,
+                                nudge_duration=self.climb_nudge_seconds,
+                                y_change_required=self.climb_y_change_required,
+                                world_y_change_required=self.climb_world_y_change_required,
+                                world_y_stall_change_required=(
+                                    self.climb_world_y_stall_change_required
+                                ),
+                                world_y_stall_frames=self.climb_world_y_stall_frames,
+                                action_lock=self.climb_attack_lock,
+                                preferred_direction=preferred_direction,
+                                failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,
+                                persistent_up=True,
+                            )
+                            LOG.info("climb recovery state: %s", result)
+                            if result == "succeeded" and self._route_layers:
+                                self._advance_after_climb()
+                        else:
+                            _send_tap(self.key_sender, decision)
+                    finally:
+                        # Hold the mutex while climbing/dropping (the action
+                        # spans frames: persistent Up hold / drop chord);
+                        # release it for single-frame taps.
+                        if not self._action_spans_frames(decision):
+                            self._release_input()
                     self._last_send = now
             except Exception:
                 # A bad frame must not kill the safety/control thread.
@@ -1880,6 +1928,7 @@ class MovementWorker(threading.Thread):
             self.climbing_active_event.clear()
         if self.dropping_active_event is not None:
             self.dropping_active_event.clear()
+        self._release_input()
         LOG.info("movement worker stopped")
 
 
