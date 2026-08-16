@@ -46,8 +46,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack", action="store_true",
                         help="enable auto-attack: face the target (left/right) "
                              "then press Ctrl while the game is focused")
+    parser.add_argument("--attack-key", default="ctrl",
+                        help="key pressed to attack: ctrl/alt/left/right "
+                             "(default ctrl)")
     parser.add_argument("--attack-cooldown", type=float, default=0.6,
                         help="minimum seconds between attacks (default 0.6)")
+    parser.add_argument("--attack-log", default=None,
+                        help="path to append attack diagnostics (default: "
+                             "attack.log next to this script)")
     parser.add_argument("--window-title", default="\u5192\u9669\u5c9b\u6000\u65e7\u670d",
                         help="game window title used for the foreground check "
                              "(default: \u5192\u9669\u5c9b\u6000\u65e7\u670d)")
@@ -136,10 +142,22 @@ def main() -> int:
     if args.attack:
         from attack_executor import AttackExecutor
 
+        log_path = args.attack_log
+        if log_path is None:
+            log_path = str(Path(__file__).resolve().parent / "attack.log")
         executor = AttackExecutor(
             args.window_title,
+            attack_key=args.attack_key,
             cooldown=args.attack_cooldown,
+            log_path=log_path,
         )
+        if executor.select_window():
+            print(f"auto-attack enabled: game window focused "
+                  f"(title={args.window_title!r})")
+        else:
+            print(f"auto-attack enabled, but game window NOT focused "
+                  f"(title={args.window_title!r}) - attack will try to "
+                  "refocus every few seconds")
     print(f"live view: region={region} threshold={conf} fps={args.fps} "
           f"show={not args.no_show} zone="
           f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "

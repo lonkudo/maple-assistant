@@ -269,6 +269,8 @@ class UiLogHandlerTests(unittest.TestCase):
             worker._yolo_zone_h_var = Var(55)
             worker._yolo_zone_shift_y_var = Var(15)
             worker._yolo_show_var = Var(True)
+            worker._yolo_attack_var = Var(True)
+            worker._yolo_attack_key_var = Var("alt")
             worker._yolo_status = Label()
             worker._yolo_run_button = Button()
             worker._yolo_stop_button = Button()
@@ -290,6 +292,8 @@ class UiLogHandlerTests(unittest.TestCase):
                 loader._yolo_zone_h_var = Var(60)
                 loader._yolo_zone_shift_y_var = Var(0)
                 loader._yolo_show_var = Var(False)
+                loader._yolo_attack_var = Var(False)
+                loader._yolo_attack_key_var = Var("ctrl")
                 loader._yolo_status = Label()
                 loader._yolo_run_button = Button()
                 loader._yolo_stop_button = Button()
@@ -305,6 +309,58 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertEqual(loader._yolo_zone_h_var.get(), 55)
                 self.assertEqual(loader._yolo_zone_shift_y_var.get(), 15)
                 self.assertTrue(loader._yolo_show_var.get())
+                self.assertTrue(loader._yolo_attack_var.get())
+                self.assertEqual(loader._yolo_attack_key_var.get(), "alt")
+
+    def test_yolo_save_config_confirms_and_persists(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = UiWorker.__new__(UiWorker)
+            worker._yolo_threshold_var = Var("0.42")
+            worker._yolo_attack_range_var = Var(1000)
+            worker._yolo_zone_w_var = Var(60)
+            worker._yolo_zone_h_var = Var(26)
+            worker._yolo_zone_shift_y_var = Var(1)
+            worker._yolo_show_var = Var(True)
+            worker._yolo_attack_var = Var(True)
+            worker._yolo_attack_key_var = Var("ctrl")
+            worker._yolo_status = Label()
+
+            def fake_path(self):
+                return Path(directory) / "yolo_detection_settings.json"
+
+            with mock.patch.object(UiWorker, "_yolo_settings_path", fake_path):
+                worker._yolo_save_config()
+                saved = Path(directory) / "yolo_detection_settings.json"
+                self.assertTrue(saved.is_file())
+                import json
+
+                data = json.loads(saved.read_text(encoding="utf-8"))
+                self.assertEqual(data["threshold"], 0.42)
+                self.assertEqual(data["attack_range"], 1000)
+                self.assertTrue(data["auto_attack"])
+                self.assertEqual(data["attack_key"], "ctrl")
+                self.assertIn("Configuration saved", worker._yolo_status.text)
 
     def test_reset_has_no_confirmation_and_stops_before_clearing(self) -> None:
         calls = []

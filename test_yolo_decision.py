@@ -190,10 +190,22 @@ class AttackExecutorTests(unittest.TestCase):
     def test_attack_blocked_when_game_not_foreground(self):
         ex = self._executor(cooldown=0.0)
         ex.is_game_foreground = lambda: False
+        ex.select_window = lambda: False  # refocus also fails
         char = make_detection("character", 400, 400)
         mob = make_detection("mob", 600, 400)
         self.assertFalse(ex.attack(char, mob))
         self.assertEqual(ex._taps, [])
+
+    def test_attack_refocuses_then_attacks(self):
+        ex = self._executor(cooldown=0.0)
+        # Not focused first, but refocus succeeds: attack must still fire.
+        state = {"fg": False}
+        ex.is_game_foreground = lambda: state["fg"]
+        ex.select_window = lambda: (state.__setitem__("fg", True) or True)
+        char = make_detection("character", 400, 400)
+        mob = make_detection("mob", 600, 400)
+        self.assertTrue(ex.attack(char, mob))
+        self.assertEqual(ex._taps, [("right", 0.05), ("ctrl", 0.08)])
 
     def test_reset_facing_forgets_direction(self):
         ex = self._executor(cooldown=0.0)

@@ -431,17 +431,37 @@ class UiWorker(threading.Thread):
             )
             self._yolo_show_button.pack(side="left")
             self._yolo_show_button.configure(style="Off.TCheckbutton")
-            # Auto-attack toggle: grey/inactive by default; when activated the
-            # YOLO process faces the target and presses Ctrl within range.
+            # Save configuration: persist the current YOLO panel values so
+            # they are restored next launch (no need to re-tune every time).
+            self._yolo_save_button = ttk.Button(
+                yolo_row, text="Save Config", command=self._yolo_save_config
+            )
+            self._yolo_save_button.pack(side="left", padx=(8, 0))
+            # Auto-attack row: toggle + attack key, on its own line so it is
+            # always visible.  Grey/inactive by default; when activated the
+            # YOLO process faces the target and presses the attack key.
+            attack_row = ttk.Frame(yolo_panel)
+            attack_row.pack(fill="x", pady=(6, 0))
             self._yolo_attack_var = tk.BooleanVar(value=False)
             self._yolo_attack_button = ttk.Checkbutton(
-                yolo_row,
+                attack_row,
                 text="Auto Attack",
                 variable=self._yolo_attack_var,
                 command=self._yolo_sync_show_button,
             )
-            self._yolo_attack_button.pack(side="left", padx=(8, 0))
+            self._yolo_attack_button.pack(side="left")
             self._yolo_attack_button.configure(style="Off.TCheckbutton")
+            ttk.Label(attack_row, text="Attack Key:").pack(
+                side="left", padx=(10, 4)
+            )
+            self._yolo_attack_key_var = tk.StringVar(value="ctrl")
+            attack_key_entry = ttk.Entry(
+                attack_row, textvariable=self._yolo_attack_key_var, width=8
+            )
+            attack_key_entry.pack(side="left", padx=(0, 8))
+            attack_key_entry.bind(
+                "<KeyRelease>", self._yolo_on_threshold_change
+            )
             # Attack range: horizontal slider (progress-bar style) that sets the
             # width of the attack range line drawn on the detection window.
             range_row = ttk.Frame(yolo_panel)
@@ -752,6 +772,9 @@ class UiWorker(threading.Thread):
             if "auto_attack" in data:
                 if hasattr(self, "_yolo_attack_var"):
                     self._yolo_attack_var.set(bool(data["auto_attack"]))
+            if "attack_key" in data:
+                if hasattr(self, "_yolo_attack_key_var"):
+                    self._yolo_attack_key_var.set(str(data["attack_key"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed yolo settings", exc_info=True)
             return
@@ -774,6 +797,10 @@ class UiWorker(threading.Thread):
             "auto_attack": bool(
                 self._yolo_attack_var.get()
                 if hasattr(self, "_yolo_attack_var") else False
+            ),
+            "attack_key": (
+                self._yolo_attack_key_var.get().strip()
+                if hasattr(self, "_yolo_attack_key_var") else "ctrl"
             ),
         }
         path = self._yolo_settings_path()
@@ -846,6 +873,13 @@ class UiWorker(threading.Thread):
             cmd.append("--no-show")
         if hasattr(self, "_yolo_attack_var") and self._yolo_attack_var.get():
             cmd.append("--attack")
+            attack_key = "ctrl"
+            if hasattr(self, "_yolo_attack_key_var"):
+                attack_key = (self._yolo_attack_key_var.get().strip()
+                              or "ctrl")
+            cmd.extend(["--attack-key", attack_key])
+            cmd.extend(["--attack-log",
+                        str(yolo_root / "attack.log")])
         attack_range = int(self._yolo_attack_range_var.get())
         cmd.extend(["--attack-range", f"{attack_range}"])
         zone_w = max(0.1, min(1.0, int(self._yolo_zone_w_var.get()) / 100.0))
@@ -864,13 +898,24 @@ class UiWorker(threading.Thread):
         self._yolo_run_button.configure(state="disabled")
         self._yolo_stop_button.configure(state="normal")
         mode = "visible window" if self._yolo_show_var.get() else "headless"
+        attack = ("auto-attack ON" if hasattr(self, "_yolo_attack_var")
+                  and self._yolo_attack_var.get() else "attack OFF")
         self._yolo_status.configure(
-            text=f"YOLO detection running ({mode}, threshold {threshold:.2f}). "
-                 "Press Stop to terminate."
+            text=f"YOLO detection running ({mode}, {attack}, "
+                 f"threshold {threshold:.2f}). Press Stop to terminate."
         )
         LOG.info("yolo detection started threshold=%.2f show=%s pid=%s",
                  threshold, self._yolo_show_var.get(), self._yolo_process.pid)
         self._yolo_save_settings()
+
+    def _yolo_save_config(self) -> None:
+        """Persist the current YOLO panel values and confirm on screen."""
+
+        self._yolo_save_settings()
+        if hasattr(self, "_yolo_status"):
+            self._yolo_status.configure(
+                text="Configuration saved - it will be restored next launch."
+            )
 
     def _yolo_stop(self) -> None:
         """Terminate the YOLO detection subprocess."""
