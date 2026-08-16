@@ -135,6 +135,10 @@ class UiLogHandlerTests(unittest.TestCase):
             def reset_recording(self):
                 calls.append(("reset",))
 
+            @staticmethod
+            def map_name() -> str:
+                return ""
+
         class Label:
             def configure(self, **_kwargs):
                 pass

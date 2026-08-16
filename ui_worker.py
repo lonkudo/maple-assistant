@@ -684,6 +684,10 @@ class UiWorker(threading.Thread):
             self.on_patrol_stop()
         try:
             self.patrol_controller.reset_recording()
+            # A reset starts a fresh recording for the current map; adopt the
+            # map name now on disk (it may have been edited or re-identified
+            # since the UI started) so identity checks use the current name.
+            self.configured_map_name = self.patrol_controller.map_name()
             if getattr(self, "structure_tracker", None) is not None:
                 self.structure_tracker.reset(delete_reference=True)
             if getattr(self, "map_identity_store", None) is not None:

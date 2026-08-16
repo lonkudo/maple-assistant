@@ -36,12 +36,12 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
-    def test_rope_honey_zone_jumps_only_between_inner_and_outer_edges(self):
+    def test_rope_climb_triggers_inside_inner_gap_only(self):
         rope_x = .5
         in_band = MinimapObservation(
             Point(rope_x - .0220, .5), None, .9, (0, 0, 1, 1)
         )
-        too_close = MinimapObservation(
+        within_inner = MinimapObservation(
             Point(rope_x - .0210, .5), None, .9, (0, 0, 1, 1)
         )
         too_far = MinimapObservation(
@@ -51,15 +51,18 @@ class MovementTests(unittest.TestCase):
         band_plan = move_towards_rope(
             in_band, rope_x, .0229, inner_range=.0215
         )
-        close_plan = move_towards_rope(
-            too_close, rope_x, .0229, inner_range=.0215
+        inner_plan = move_towards_rope(
+            within_inner, rope_x, .0229, inner_range=.0215
         )
         far_plan = move_towards_rope(
             too_far, rope_x, .0229, inner_range=.0215
         )
 
-        self.assertEqual(band_plan.decision.key, "jump_climb_right")
-        self.assertEqual(close_plan.decision.key, "left")
+        # Outside the inner gap the character walks toward the inner edge.
+        self.assertEqual(band_plan.decision.key, "right")
+        self.assertAlmostEqual(band_plan.target_x, rope_x - .0215, places=6)
+        # Inside the inner gap the climb attempt happens immediately.
+        self.assertEqual(inner_plan.decision.key, "jump_climb_right")
         self.assertEqual(far_plan.decision.key, "right")
 
     def test_horizontal_correction_cannot_cancel_attached_climb(self):

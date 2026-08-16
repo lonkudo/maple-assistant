@@ -260,7 +260,9 @@ def main() -> int:
     def prepare_map_session() -> None:
         """Verify the recorded map name and re-anchor transient world Y."""
 
-        configured_name = str(map_profile.get("map_name", "")).strip()
+        # Read the live profile, not the startup snapshot: a reset or map
+        # re-identification updates the shared file while the app runs.
+        configured_name = patrol_controller.map_name()
         fresh_frame = capture_worker.capture_now()
         detection = minimap_detector.detect(fresh_frame.image)
         title_image = fresh_frame.image.crop(detection.map_name_box)
@@ -283,7 +285,7 @@ def main() -> int:
             )
 
         snapshot = patrol_controller.snapshot()
-        anchor_name = str(map_profile.get("first_layer") or (
+        anchor_name = str(patrol_controller.first_layer() or (
             snapshot.route_order[0] if snapshot.route_order else ""
         ))
         anchor_layer = snapshot.layers.get(anchor_name, {})
@@ -359,9 +361,6 @@ def main() -> int:
             near_rope_inner_range=float(
                 rope_profile.get("inner_range", rope_profile["near_range"])
             ),
-            near_rope_outer_range=float(
-                rope_profile.get("outer_range", rope_profile["near_range"])
-            ),
             near_rope_diamonds=calibration.get("near_rope_diamonds"),
             climb_attack_lock=climb_attack_lock,
             climbing_active_event=climbing_active,
@@ -375,7 +374,7 @@ def main() -> int:
             drop_chord_hold_seconds=float(
                 calibration.get("drop_chord_hold_seconds", 0.10)
             ),
-            drop_retry_seconds=float(calibration.get("drop_retry_seconds", 1.0)),
+            drop_retry_seconds=float(calibration.get("drop_retry_seconds", 1.5)),
             minimap_detector=minimap_detector,
             patrol_controller=patrol_controller,
             diamond_size_tracker=movement_diamond_tracker,

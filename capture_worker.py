@@ -31,8 +31,8 @@ class WindowCaptureError(RuntimeError):
 class CapturedFrame:
     """One immutable publication describing a captured game frame.
 
-    The PIL image itself should be treated as read‑only by subscribers.
-    ``captured_monotonic`` is suitable for elapsed‑time calculations while
+    The PIL image itself should be treated as read-only by subscribers.
+    ``captured_monotonic`` is suitable for elapsed-time calculations while
     ``captured_at`` is an absolute UTC timestamp suitable for logs/files.
     """
 
@@ -101,7 +101,7 @@ class FrameBus:
 
 
 def remap_normalized_box(box: NormalizedBox, crop: NormalizedBox) -> NormalizedBox:
-    """Map a full‑client normalized box into normalized cropped‑frame units."""
+    """Map a full-client normalized box into normalized cropped-frame units."""
 
     crop_left, crop_top, crop_right, crop_bottom = crop
     crop_width = crop_right - crop_left
@@ -172,7 +172,7 @@ def capture_window(
     width = max(1, source_right - source_x)
     height = max(1, source_bottom - source_y)
 
-    # GetDC(hwnd) has its origin at the client area's upper‑left. GetWindowDC
+    # GetDC(hwnd) has its origin at the client area's upper-left. GetWindowDC
     # would include borders/title bar and offset the pixels from window_rect.
     window_dc = win32gui.GetDC(hwnd)
     source_dc = win32ui.CreateDCFromHandle(window_dc)
@@ -232,7 +232,7 @@ class CaptureWorker(threading.Thread):
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
-        super().__init__(name="screen‑capture", daemon=False)
+        super().__init__(name="screen-capture", daemon=False)
         self.window_title = window_title
         self.interval = float(interval)
         self.bus = bus
@@ -296,7 +296,7 @@ class CaptureWorker(threading.Thread):
             capture_interval = self.active_interval()
             now = time.monotonic()
             if next_capture - now > capture_interval:
-                # A fast‑capture action just began. Do not wait out the prior
+                # A fast-capture action just began. Do not wait out the prior
                 # normal patrol deadline before switching cadence.
                 next_capture = now
             forced = self._capture_requested.is_set()
@@ -428,7 +428,7 @@ class CaptureWorker(threading.Thread):
     def _save_debug_frame(self, frame: CapturedFrame) -> None:
         assert self.debug_dir is not None
         stamp = frame.captured_at.strftime("%Y%m%dT%H%M%S.%fZ")
-        path = self.debug_dir / f"frame‑{frame.sequence:06d}‑{stamp}.png"
+        path = self.debug_dir / f"frame-{frame.sequence:06d}-{stamp}.png"
         previous = self._last_debug_path
         self._last_debug_path = None
         if previous is not None and previous != path:
@@ -458,7 +458,7 @@ class CaptureWorker(threading.Thread):
         """Remove only screenshots created by an earlier interrupted run."""
 
         assert self.debug_dir is not None
-        for path in self.debug_dir.glob("frame‑*.png"):
+        for path in self.debug_dir.glob("frame-*.png"):
             try:
                 if path.is_file() and not path.is_symlink():
                     path.unlink()

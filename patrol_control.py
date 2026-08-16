@@ -157,8 +157,19 @@ class PatrolController:
         """Clear all recorded route points and return to one empty layer."""
 
         with self._lock:
+            # The map name is a user-assigned label for the current map and
+            # may have been edited on disk while the app was running.  Reset
+            # only the route/layers, never clobber the map identity label.
+            try:
+                on_disk = json.loads(
+                    self.profile_path.read_text(encoding="utf-8")
+                )
+                map_name = str(on_disk.get("map_name", "")).strip()
+            except (OSError, ValueError, TypeError):
+                map_name = str(self._profile.get("map_name", "")).strip()
             self._enabled = False
             self._selected_layer = "layer1"
+            self._profile["map_name"] = map_name
             self._profile["route_order"] = []
             self._profile["first_layer"] = "layer1"
             self._profile["layers"] = {
@@ -178,6 +189,25 @@ class PatrolController:
                 "outer_range": outer_range,
             }
             self._persist_locked()
+
+    def map_name(self) -> str:
+        with self._lock:
+            return str(self._profile.get("map_name", "")).strip()
+
+    def rope_zone(self) -> tuple[Optional[float], float]:
+        """Return the configured (rope X, inner climb gap) in analysis units."""
+
+        with self._lock:
+            rope = self._profile.get("rope", {})
+            raw_x = rope.get("x")
+            rope_x = float(raw_x) if raw_x is not None else None
+            near = float(rope.get("near_range", 0.022500))
+            inner = float(rope.get("inner_range", near))
+            return rope_x, min(near, max(0.0, inner))
+
+    def first_layer(self) -> str:
+        with self._lock:
+            return str(self._profile.get("first_layer", "")).strip()
 
     def snapshot_layers(self) -> dict[str, Any]:
         return self.snapshot().layers

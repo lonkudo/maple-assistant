@@ -132,11 +132,37 @@ class MinimapDetector:
             self._last_good_at = time.monotonic()
         return detection
 
+    def _analysis_crop(self, image: Image.Image) -> tuple[Image.Image, Optional[Box]]:
+        """Return the image OpenCV analyzes plus its offset inside the frame.
+
+        On a full-client capture the minimap is a small part of the frame; a
+        whole-frame resize would shrink it below the minimum contour size and
+        detection would always fall back.  Analyze the fallback region (where
+        the minimap lives) at the working resolution instead, and remember the
+        crop origin so boxes can be mapped back to full-frame coordinates.
+        """
+
+        if not self.dedicated_crop or self.opencv_size is None:
+            return image, None
+        width, height = image.size
+        left, top, right, bottom = self.fallback_region
+        crop_box = _clamp_box(
+            (round(left * width), round(top * height),
+             round(right * width), round(bottom * height)),
+            width,
+            height,
+        )
+        if image.size[0] <= self.opencv_size[0] * 2 \
+                and image.size[1] <= self.opencv_size[1] * 2:
+            # The capture is already a tight minimap crop; search it whole.
+            return image, None
+        return image.crop(crop_box), crop_box
+
     def detect(self, image: Image.Image) -> MinimapDetection:
         original_size = image.size
-        cv_image = image
-        if self.opencv_size is not None and image.size != self.opencv_size:
-            cv_image = image.resize(self.opencv_size, Image.Resampling.BILINEAR)
+        cv_image, crop_box = self._analysis_crop(image)
+        if self.opencv_size is not None and cv_image.size != self.opencv_size:
+            cv_image = cv_image.resize(self.opencv_size, Image.Resampling.BILINEAR)
         rgb = np.asarray(cv_image.convert("RGB"))
         height, width = rgb.shape[:2]
         search_width = (
@@ -260,10 +286,25 @@ class MinimapDetector:
             height,
         )
         working_size = (width, height)
-        window_box = _scale_box(window_box, working_size, original_size)
-        analysis_box = _scale_box(analysis_box, working_size, original_size)
-        canvas_box = _scale_box(canvas_box, working_size, original_size)
-        map_name_box = _scale_box(map_name_box, working_size, original_size)
+
+        def to_original(box: Box) -> Box:
+            if crop_box is None:
+                return _scale_box(box, working_size, original_size)
+            crop_width = crop_box[2] - crop_box[0]
+            crop_height = crop_box[3] - crop_box[1]
+            scaled = _scale_box(box, working_size, (crop_width, crop_height))
+            left, top, right, bottom = scaled
+            return _clamp_box(
+                (left + crop_box[0], top + crop_box[1],
+                 right + crop_box[0], bottom + crop_box[1]),
+                original_size[0],
+                original_size[1],
+            )
+
+        window_box = to_original(window_box)
+        analysis_box = to_original(analysis_box)
+        canvas_box = to_original(canvas_box)
+        map_name_box = to_original(map_name_box)
         map_name = self._read_map_name(image, map_name_box)
         confidence = float(np.clip(0.55 + rectangularity * 0.45, 0.0, 1.0))
         return self._remember_good(MinimapDetection(
@@ -293,11 +334,26 @@ class MinimapDetector:
         )
         # The fallback region is the historical analysis crop, not the entire
         # minimap frame. It remains safe for movement if OpenCV cannot localize.
+        # The map-name title sits in a strip at the top of the minimap; keep
+        # the identity crop to that static strip instead of the whole region so
+        # recorded signatures never include the scrolling map canvas below it.
+        region_width = analysis_box[2] - analysis_box[0]
+        region_height = analysis_box[3] - analysis_box[1]
+        map_name_box = _clamp_box(
+            (
+                analysis_box[0] + round(region_width * 0.14),
+                analysis_box[1] + round(region_height * 0.105),
+                analysis_box[0] + round(region_width * 0.98),
+                analysis_box[1] + round(region_height * 0.32),
+            ),
+            width,
+            height,
+        )
         return MinimapDetection(
             window_box=analysis_box,
             analysis_box=analysis_box,
             canvas_box=analysis_box,
-            map_name_box=analysis_box,
+            map_name_box=map_name_box,
             confidence=0.0,
             source="fallback",
         )

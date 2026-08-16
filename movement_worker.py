@@ -185,7 +185,12 @@ def move_towards_rope(
     inner_range: float = 0.0,
     **movement_options: Any,
 ) -> RopeMovementPlan:
-    """Move into the rope band, then jump inward only from within it."""
+    """Move into the inner rope band, then jump inward from within it.
+
+    Only the inner gap gates the climb attempt: the outer honey-zone band is
+    removed.  Outside the inner band the character simply walks toward the
+    band edge; there is no "back away" stage.
+    """
 
     player = observation.player
     if player is None:
@@ -193,12 +198,12 @@ def move_towards_rope(
             "detect", None, rope_x, None,
             MovementDecision(None, "yellow marker missing or uncertain"),
         )
-    outer_range = max(0.0, float(near_range))
-    inner_range = min(outer_range, max(0.0, float(inner_range)))
-    left_outer = rope_x - outer_range
-    right_outer = rope_x + outer_range
-    left_inner = rope_x - inner_range
-    right_inner = rope_x + inner_range
+    near_range = max(0.0, float(near_range))
+    inner_range = max(0.0, float(inner_range))
+    # Without an explicit inner gap the approach band is the single gate.
+    band = inner_range if inner_range > 0 else near_range
+    left_inner = rope_x - band
+    right_inner = rope_x + band
     rope_gap = rope_x - player.x
     absolute_gap = abs(rope_gap)
     minimum_confidence = float(movement_options.get("minimum_confidence", 0.55))
@@ -208,33 +213,22 @@ def move_towards_rope(
             MovementDecision(None, "yellow marker missing or uncertain"),
         )
 
-    if inner_range - 1e-9 <= absolute_gap <= outer_range + 1e-9:
+    if absolute_gap <= band + 1e-9:
         direction = "right" if rope_gap > 1e-9 else "left" if rope_gap < -1e-9 else aligned_direction
         if direction not in ("left", "right"):
             direction = "right"
-        edge = left_outer if direction == "right" else right_outer
         return RopeMovementPlan(
-            "climb", player, edge, edge - player.x,
+            "climb", player, rope_x, rope_gap,
             MovementDecision(
                 f"jump_climb_{direction}",
                 f"inside rope band; jump {direction} inward",
                 float(movement_options.get("minimum_final_hold_seconds", 0.08)),
             ),
         )
-    if player.x < left_outer - 1e-9:
-        edge, direction = left_outer, "right"
-    elif player.x > right_outer + 1e-9:
-        edge, direction = right_outer, "left"
-    elif player.x < rope_x:
-        # Too close on the left side: back away into the band.
-        edge, direction = left_inner, "left"
-    elif player.x > rope_x:
-        # Too close on the right side: back away into the band.
-        edge, direction = right_inner, "right"
-    elif aligned_direction == "right":
-        edge, direction = left_inner, "left"
+    if player.x < left_inner - 1e-9:
+        edge, direction = left_inner, "right"
     else:
-        edge, direction = right_inner, "right"
+        edge, direction = right_inner, "left"
 
     # Outside the near-rope zone, keep using the full fixed movement hold.
     # Shorten the hold only in the final edge-calculation zone immediately
@@ -908,7 +902,6 @@ class MovementWorker(threading.Thread):
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
         near_rope_inner_range: Optional[float] = None,
-        near_rope_outer_range: Optional[float] = None,
         near_rope_diamonds: Optional[float] = None,
         climb_attack_lock: Optional[threading.Lock] = None,
         climbing_active_event: Optional[threading.Event] = None,
@@ -971,10 +964,6 @@ class MovementWorker(threading.Thread):
         self.near_rope_inner_range = (
             float(near_rope_inner_range)
             if near_rope_inner_range is not None else None
-        )
-        self.near_rope_outer_range = (
-            float(near_rope_outer_range)
-            if near_rope_outer_range is not None else None
         )
         self.near_rope_diamonds = (
             float(near_rope_diamonds) if near_rope_diamonds is not None else None
@@ -1535,18 +1524,12 @@ class MovementWorker(threading.Thread):
                         if self.near_rope_range is not None
                         else self.estimated_final_speed * self.near_rope_seconds
                     )
-                rope_outer_distance = (
-                    self.near_rope_outer_range
-                    if self.near_rope_outer_range is not None
-                    else rope_inner_distance
-                )
                 inside_rope_zone = bool(
                     observation.player is not None
                     and route_is_rope
                     and route_target_x is not None
-                    and rope_inner_distance - 1e-9
-                    <= abs(route_target_x - observation.player.x)
-                    <= rope_outer_distance + 1e-9
+                    and abs(route_target_x - observation.player.x)
+                    <= rope_inner_distance + 1e-9
                 )
                 if not inside_rope_zone and self._climb_state.failed_shift_used:
                     # A new approach may use one correction again. Staying in
@@ -1576,7 +1559,7 @@ class MovementWorker(threading.Thread):
                     rope_plan = move_towards_rope(
                         observation,
                         route_target_x,
-                        rope_outer_distance,
+                        rope_inner_distance,
                         aligned_direction=self._rope_approach_direction,
                         inner_range=rope_inner_distance,
                         horizontal_tolerance=self._current_horizontal_tolerance,
