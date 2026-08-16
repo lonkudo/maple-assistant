@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-line-height", type=float, default=0.72,
                         help="vertical position of the attack range line as a "
                              "fraction of frame height (default 0.72)")
+    parser.add_argument("--zone-width", type=float, default=None,
+                        help="detection zone width fraction 0.1-1.0 "
+                             "(default: config.yaml center_zone)")
+    parser.add_argument("--zone-height", type=float, default=None,
+                        help="detection zone height fraction 0.1-1.0 "
+                             "(default: config.yaml center_zone)")
     return parser.parse_args()
 
 
@@ -91,10 +97,22 @@ def main() -> int:
     conf = (args.threshold if args.threshold is not None
             else float(bot.config.get("model.confidence_threshold", 0.45)))
     bot.model.conf = conf
+    # Override the detection zone size from CLI if provided.
+    zone = bot.config.config.get("detection_behavior", {}).get("center_zone")
+    if zone is None:
+        zone = {}
+        bot.config.config.setdefault("detection_behavior", {})["center_zone"] = zone
+    zone["enabled"] = True
+    if args.zone_width is not None:
+        zone["width_fraction"] = max(0.1, min(1.0, args.zone_width))
+    if args.zone_height is not None:
+        zone["height_fraction"] = max(0.1, min(1.0, args.zone_height))
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
     print(f"live view: region={region} threshold={conf} fps={args.fps} "
-          f"show={not args.no_show} (ESC to quit)")
+          f"show={not args.no_show} zone="
+          f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "
+          f"(ESC to quit)")
 
     with mss.MSS() as sct:
         while True:

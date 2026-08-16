@@ -561,6 +561,34 @@ class UiWorker(threading.Thread):
                 range_row, text="800 px", width=8
             )
             self._yolo_attack_range_label.pack(side="left")
+            # Detection zone size: width and height sliders (progress-bar
+            # style) that scale the detection area as a fraction of the frame.
+            zone_row = ttk.Frame(yolo_panel)
+            zone_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(zone_row, text="Zone Width:").pack(side="left", padx=(0, 6))
+            self._yolo_zone_w_var = tk.IntVar(value=60)
+            self._yolo_zone_w_slider = ttk.Scale(
+                zone_row, from_=20, to=100, orient="horizontal",
+                variable=self._yolo_zone_w_var,
+                command=self._yolo_on_zone_change,
+            )
+            self._yolo_zone_w_slider.pack(side="left", fill="x", expand=True,
+                                          padx=(0, 8))
+            self._yolo_zone_w_label = ttk.Label(zone_row, text="60%", width=8)
+            self._yolo_zone_w_label.pack(side="left")
+            zone_row2 = ttk.Frame(yolo_panel)
+            zone_row2.pack(fill="x", pady=(4, 0))
+            ttk.Label(zone_row2, text="Zone Height:").pack(side="left", padx=(0, 6))
+            self._yolo_zone_h_var = tk.IntVar(value=60)
+            self._yolo_zone_h_slider = ttk.Scale(
+                zone_row2, from_=20, to=100, orient="horizontal",
+                variable=self._yolo_zone_h_var,
+                command=self._yolo_on_zone_change,
+            )
+            self._yolo_zone_h_slider.pack(side="left", fill="x", expand=True,
+                                          padx=(0, 8))
+            self._yolo_zone_h_label = ttk.Label(zone_row2, text="60%", width=8)
+            self._yolo_zone_h_label.pack(side="left")
             self._yolo_status = ttk.Label(
                 yolo_panel, text="YOLO detection stopped.", justify="left"
             )
@@ -920,6 +948,16 @@ class UiWorker(threading.Thread):
         value = int(self._yolo_attack_range_var.get())
         self._yolo_attack_range_label.configure(text=f"{value} px")
 
+    def _yolo_on_zone_change(self, _value: str = "") -> None:
+        """Update the zone size labels as the sliders move."""
+
+        if not hasattr(self, "_yolo_zone_w_label"):
+            return
+        w = int(self._yolo_zone_w_var.get())
+        h = int(self._yolo_zone_h_var.get())
+        self._yolo_zone_w_label.configure(text=f"{w}%")
+        self._yolo_zone_h_label.configure(text=f"{h}%")
+
     def _yolo_start(self) -> None:
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
 
@@ -950,6 +988,10 @@ class UiWorker(threading.Thread):
             cmd.append("--no-show")
         attack_range = int(self._yolo_attack_range_var.get())
         cmd.extend(["--attack-range", f"{attack_range}"])
+        zone_w = max(0.1, min(1.0, int(self._yolo_zone_w_var.get()) / 100.0))
+        zone_h = max(0.1, min(1.0, int(self._yolo_zone_h_var.get()) / 100.0))
+        cmd.extend(["--zone-width", f"{zone_w:.2f}",
+                    "--zone-height", f"{zone_h:.2f}"])
         self._yolo_process = subprocess.Popen(
             cmd,
             cwd=str(yolo_root),

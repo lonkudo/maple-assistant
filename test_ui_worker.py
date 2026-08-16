@@ -259,6 +259,8 @@ class UiLogHandlerTests(unittest.TestCase):
         )()
         worker._yolo_show_var = type("Var", (), {"get": lambda self: False})()
         worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 800})()
+        worker._yolo_zone_w_var = type("Var", (), {"get": lambda self: 60})()
+        worker._yolo_zone_h_var = type("Var", (), {"get": lambda self: 60})()
         worker._yolo_status = Label()
         worker._yolo_run_button = Button()
         worker._yolo_stop_button = Button()
@@ -273,6 +275,10 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("--no-show", args)  # show toggle off by default
             self.assertIn("--attack-range", args)
             self.assertIn("800", args)
+            self.assertIn("--zone-width", args)
+            self.assertIn("0.60", args)
+            self.assertIn("--zone-height", args)
+            self.assertIn("0.60", args)
         self.assertEqual(worker._yolo_run_button.state, "disabled")
         self.assertEqual(worker._yolo_stop_button.state, "normal")
         self.assertIn("running", worker._yolo_status.text)
@@ -308,6 +314,8 @@ class UiLogHandlerTests(unittest.TestCase):
         )()
         worker._yolo_show_var = type("Var", (), {"get": lambda self: True})()
         worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 1200})()
+        worker._yolo_zone_w_var = type("Var", (), {"get": lambda self: 80})()
+        worker._yolo_zone_h_var = type("Var", (), {"get": lambda self: 50})()
         worker._yolo_status = Label()
         worker._yolo_run_button = Button()
         worker._yolo_stop_button = Button()
@@ -320,6 +328,10 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertNotIn("--no-show", args)  # show enabled -> window mode
             self.assertIn("--attack-range", args)
             self.assertIn("1200", args)
+            self.assertIn("--zone-width", args)
+            self.assertIn("0.80", args)
+            self.assertIn("--zone-height", args)
+            self.assertIn("0.50", args)
 
     def test_monster_motion_activates_without_picture(self) -> None:
         from monster_detector import MonsterDetector
