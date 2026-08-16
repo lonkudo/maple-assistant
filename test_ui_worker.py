@@ -261,6 +261,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 800})()
         worker._yolo_zone_w_var = type("Var", (), {"get": lambda self: 60})()
         worker._yolo_zone_h_var = type("Var", (), {"get": lambda self: 60})()
+        worker._yolo_zone_shift_y_var = type("Var", (), {"get": lambda self: 0})()
         worker._yolo_status = Label()
         worker._yolo_run_button = Button()
         worker._yolo_stop_button = Button()
@@ -279,6 +280,8 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("0.60", args)
             self.assertIn("--zone-height", args)
             self.assertIn("0.60", args)
+            self.assertIn("--zone-shift-y", args)
+            self.assertIn("0.00", args)
         self.assertEqual(worker._yolo_run_button.state, "disabled")
         self.assertEqual(worker._yolo_stop_button.state, "normal")
         self.assertIn("running", worker._yolo_status.text)
@@ -316,6 +319,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 1200})()
         worker._yolo_zone_w_var = type("Var", (), {"get": lambda self: 80})()
         worker._yolo_zone_h_var = type("Var", (), {"get": lambda self: 50})()
+        worker._yolo_zone_shift_y_var = type("Var", (), {"get": lambda self: 20})()
         worker._yolo_status = Label()
         worker._yolo_run_button = Button()
         worker._yolo_stop_button = Button()
@@ -332,6 +336,8 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("0.80", args)
             self.assertIn("--zone-height", args)
             self.assertIn("0.50", args)
+            self.assertIn("--zone-shift-y", args)
+            self.assertIn("0.20", args)
 
     def test_monster_motion_activates_without_picture(self) -> None:
         from monster_detector import MonsterDetector

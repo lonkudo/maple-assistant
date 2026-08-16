@@ -589,6 +589,19 @@ class UiWorker(threading.Thread):
                                           padx=(0, 8))
             self._yolo_zone_h_label = ttk.Label(zone_row2, text="60%", width=8)
             self._yolo_zone_h_label.pack(side="left")
+            zone_row3 = ttk.Frame(yolo_panel)
+            zone_row3.pack(fill="x", pady=(4, 0))
+            ttk.Label(zone_row3, text="Zone Shift Y:").pack(side="left", padx=(0, 6))
+            self._yolo_zone_shift_y_var = tk.IntVar(value=0)
+            self._yolo_zone_shift_y_slider = ttk.Scale(
+                zone_row3, from_=-50, to=50, orient="horizontal",
+                variable=self._yolo_zone_shift_y_var,
+                command=self._yolo_on_zone_change,
+            )
+            self._yolo_zone_shift_y_slider.pack(side="left", fill="x",
+                                                expand=True, padx=(0, 8))
+            self._yolo_zone_shift_y_label = ttk.Label(zone_row3, text="0%", width=8)
+            self._yolo_zone_shift_y_label.pack(side="left")
             self._yolo_status = ttk.Label(
                 yolo_panel, text="YOLO detection stopped.", justify="left"
             )
@@ -957,6 +970,11 @@ class UiWorker(threading.Thread):
         h = int(self._yolo_zone_h_var.get())
         self._yolo_zone_w_label.configure(text=f"{w}%")
         self._yolo_zone_h_label.configure(text=f"{h}%")
+        if hasattr(self, "_yolo_zone_shift_y_label"):
+            shift = int(self._yolo_zone_shift_y_var.get())
+            self._yolo_zone_shift_y_label.configure(
+                text=f"{shift:+d}%" if shift else "0%"
+            )
 
     def _yolo_start(self) -> None:
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
@@ -992,6 +1010,8 @@ class UiWorker(threading.Thread):
         zone_h = max(0.1, min(1.0, int(self._yolo_zone_h_var.get()) / 100.0))
         cmd.extend(["--zone-width", f"{zone_w:.2f}",
                     "--zone-height", f"{zone_h:.2f}"])
+        shift_y = max(-0.5, min(0.5, int(self._yolo_zone_shift_y_var.get()) / 100.0))
+        cmd.extend(["--zone-shift-y", f"{shift_y:.2f}"])
         self._yolo_process = subprocess.Popen(
             cmd,
             cwd=str(yolo_root),

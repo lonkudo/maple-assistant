@@ -51,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zone-height", type=float, default=None,
                         help="detection zone height fraction 0.1-1.0 "
                              "(default: config.yaml center_zone)")
+    parser.add_argument("--zone-shift-y", type=float, default=None,
+                        help="vertical shift of the zone center as a fraction "
+                             "of frame height, -0.5..0.5 (positive = down)")
     return parser.parse_args()
 
 
@@ -107,12 +110,14 @@ def main() -> int:
         zone["width_fraction"] = max(0.1, min(1.0, args.zone_width))
     if args.zone_height is not None:
         zone["height_fraction"] = max(0.1, min(1.0, args.zone_height))
+    if args.zone_shift_y is not None:
+        zone["shift_y"] = max(-0.5, min(0.5, args.zone_shift_y))
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
     print(f"live view: region={region} threshold={conf} fps={args.fps} "
           f"show={not args.no_show} zone="
           f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "
-          f"(ESC to quit)")
+          f"shift_y={zone.get('shift_y', 0.0)} (ESC to quit)")
 
     with mss.MSS() as sct:
         while True:

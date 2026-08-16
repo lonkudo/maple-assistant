@@ -230,12 +230,18 @@ class OptimizedMapleBot:
         zone_enabled = bool(center_zone.get('enabled', False))
         zone_w = float(center_zone.get('width_fraction', 0.6))
         zone_h = float(center_zone.get('height_fraction', 0.6))
+        # Vertical shift of the zone center as a fraction of frame height;
+        # positive moves the zone down, negative moves it up.
+        zone_shift_y = float(center_zone.get('shift_y', 0.0))
+        zone_shift_y = max(-0.5, min(0.5, zone_shift_y))
         zone_w = max(0.1, min(1.0, zone_w))
         zone_h = max(0.1, min(1.0, zone_h))
         zone_left = int((self.monitor['width'] * (1 - zone_w)) / 2)
-        zone_top = int((self.monitor['height'] * (1 - zone_h)) / 2)
+        zone_top = int(self.monitor['height'] * ((1 - zone_h) / 2 + zone_shift_y))
         zone_right = self.monitor['width'] - zone_left
-        zone_bottom = self.monitor['height'] - zone_top
+        zone_bottom = int(self.monitor['height'] * ((1 + zone_h) / 2 + zone_shift_y))
+        zone_top = max(0, min(zone_top, zone_bottom - 1))
+        zone_bottom = max(zone_top + 1, min(self.monitor['height'], zone_bottom))
 
         # 只偵測 mob 的開關
         detect_only_mobs = bool(self.config.get('detection_behavior.detect_only_mobs', True))
@@ -605,12 +611,16 @@ class OptimizedMapleBot:
         if center_zone.get('enabled', False):
             zone_w = float(center_zone.get('width_fraction', 0.6))
             zone_h = float(center_zone.get('height_fraction', 0.6))
+            zone_shift_y = float(center_zone.get('shift_y', 0.0))
+            zone_shift_y = max(-0.5, min(0.5, zone_shift_y))
             zone_w = max(0.1, min(1.0, zone_w))
             zone_h = max(0.1, min(1.0, zone_h))
             zx1 = int((width * (1 - zone_w)) / 2)
-            zy1 = int((height * (1 - zone_h)) / 2)
+            zy1 = int(height * ((1 - zone_h) / 2 + zone_shift_y))
             zx2 = width - zx1
-            zy2 = height - zy1
+            zy2 = int(height * ((1 + zone_h) / 2 + zone_shift_y))
+            zy1 = max(0, min(zy1, zy2 - 1))
+            zy2 = max(zy1 + 1, min(height, zy2))
             cv2.rectangle(img, (zx1, zy1), (zx2, zy2), (0, 255, 255), 1)
             cv2.putText(img, 'CENTER ZONE', (zx1 + 5, zy1 + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
