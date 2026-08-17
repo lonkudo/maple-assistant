@@ -527,7 +527,7 @@ class UiWorker(threading.Thread):
                 command=lambda: self._bind_capture_begin(
                     attack_key_button, self._yolo_attack_key_var,
                     "_yolo_attack_key_previous",
-                    lambda: self._yolo_on_threshold_change(),
+                    self._yolo_on_attack_key_change,
                 ),
             )
             attack_key_button.pack(side="left", padx=(0, 8))
@@ -1140,6 +1140,16 @@ class UiWorker(threading.Thread):
             self._yolo_attack_key_button.configure(
                 text=self._yolo_attack_key_var.get()
             )
+
+    def _yolo_on_attack_key_change(self) -> None:
+        """Attack key was re-bound: refresh labels AND persist immediately.
+
+        The key binding must survive an assistant restart (the old handler
+        only refreshed labels - the binding reset to 'ctrl' next launch).
+        """
+
+        self._yolo_on_threshold_change()
+        self._yolo_save_settings()
 
     def _yolo_on_range_change(self, _value: str = "") -> None:
         """Update the attack-range label as the slider moves."""
