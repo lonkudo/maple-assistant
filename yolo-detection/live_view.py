@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-line-height", type=float, default=0.72,
                         help="vertical position of the attack range line as a "
                              "fraction of frame height (default 0.72)")
+    parser.add_argument("--min-mob-size", type=int, default=None,
+                        help="ignore mob detections smaller than this many "
+                             "pixels on either side (default: config.yaml "
+                             "detection_behavior.min_mob_box_px)")
     parser.add_argument("--zone-width", type=float, default=None,
                         help="detection zone width fraction 0.1-1.0 "
                              "(default: config.yaml center_zone)")
@@ -154,6 +158,12 @@ def main() -> int:
         zone["height_fraction"] = max(0.1, min(1.0, args.zone_height))
     if args.zone_shift_y is not None:
         zone["shift_y"] = max(-0.5, min(0.5, args.zone_shift_y))
+    # Minimum mob box size: the attack decision ignores mobs smaller than
+    # this on either side (dropped items are often misclassified as mobs
+    # and their boxes are tiny).
+    if args.min_mob_size is not None:
+        behavior = bot.config.config.setdefault("detection_behavior", {})
+        behavior["min_mob_box_px"] = max(1, int(args.min_mob_size))
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
 

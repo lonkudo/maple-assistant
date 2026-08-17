@@ -191,6 +191,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._yolo_show_var = type("Var", (), {"get": lambda self: False})()
         worker._yolo_fps_var = type("Var", (), {"get": lambda self: 15})()
         worker._yolo_attack_range_var = type("Var", (), {"get": lambda self: 800})()
+        worker._yolo_min_mob_var = type("Var", (), {"get": lambda self: 60})()
         worker._yolo_zone_w_var = type("Var", (), {"get": lambda self: 60})()
         worker._yolo_zone_h_var = type("Var", (), {"get": lambda self: 60})()
         worker._yolo_zone_shift_y_var = type("Var", (), {"get": lambda self: 0})()
@@ -210,6 +211,8 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("15", args)
             self.assertIn("--attack-range", args)
             self.assertIn("800", args)
+            self.assertIn("--min-mob-size", args)
+            self.assertIn("60", args)
             self.assertIn("--zone-width", args)
             self.assertIn("0.60", args)
             self.assertIn("--zone-height", args)
@@ -308,6 +311,7 @@ class UiLogHandlerTests(unittest.TestCase):
             worker._yolo_process = None
             worker._yolo_threshold_var = Var("0.35")
             worker._yolo_attack_range_var = Var(900)
+            worker._yolo_min_mob_var = Var(90)
             worker._yolo_zone_w_var = Var(70)
             worker._yolo_zone_h_var = Var(55)
             worker._yolo_zone_shift_y_var = Var(15)
@@ -331,6 +335,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 loader._yolo_process = None
                 loader._yolo_threshold_var = Var("0.4")
                 loader._yolo_attack_range_var = Var(800)
+                loader._yolo_min_mob_var = Var(60)
                 loader._yolo_zone_w_var = Var(60)
                 loader._yolo_zone_h_var = Var(60)
                 loader._yolo_zone_shift_y_var = Var(0)
@@ -341,6 +346,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 loader._yolo_run_button = Button()
                 loader._yolo_stop_button = Button()
                 loader._yolo_on_range_change = lambda *a: None
+                loader._yolo_on_min_mob_change = lambda *a: None
                 loader._yolo_on_zone_change = lambda *a: None
                 loader._yolo_sync_show_button = lambda: None
                 with mock.patch.object(UiWorker, "_yolo_settings_path", fake_path):
@@ -348,6 +354,7 @@ class UiLogHandlerTests(unittest.TestCase):
 
                 self.assertEqual(loader._yolo_threshold_var.get(), 0.35)
                 self.assertEqual(loader._yolo_attack_range_var.get(), 900)
+                self.assertEqual(loader._yolo_min_mob_var.get(), 90)
                 self.assertEqual(loader._yolo_zone_w_var.get(), 70)
                 self.assertEqual(loader._yolo_zone_h_var.get(), 55)
                 self.assertEqual(loader._yolo_zone_shift_y_var.get(), 15)

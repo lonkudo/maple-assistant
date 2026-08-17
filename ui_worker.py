@@ -554,6 +554,29 @@ class UiWorker(threading.Thread):
                 range_row, text="800 px", width=8
             )
             self._yolo_attack_range_label.pack(side="left")
+            # Minimum mob size: horizontal slider (progress-bar style) that
+            # filters out tiny detections (dropped items are frequently
+            # misclassified as mobs and their boxes are small).
+            mob_size_row = ttk.Frame(yolo_panel)
+            mob_size_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(mob_size_row, text="Min Mob Size:").pack(
+                side="left", padx=(0, 6)
+            )
+            self._yolo_min_mob_var = tk.IntVar(value=60)
+            self._yolo_min_mob_slider = ttk.Scale(
+                mob_size_row,
+                from_=10,
+                to=200,
+                orient="horizontal",
+                variable=self._yolo_min_mob_var,
+                command=self._yolo_on_min_mob_change,
+            )
+            self._yolo_min_mob_slider.pack(side="left", fill="x",
+                                           expand=True, padx=(0, 8))
+            self._yolo_min_mob_label = ttk.Label(
+                mob_size_row, text="60 px", width=8
+            )
+            self._yolo_min_mob_label.pack(side="left")
             # Detection frequency: frames per second, 2-30, middle = 10 fps
             # (the default).  Lower = less GPU load, slower reaction.
             fps_row = ttk.Frame(yolo_panel)
@@ -932,6 +955,9 @@ class UiWorker(threading.Thread):
                 self._yolo_threshold_var.set(float(data["threshold"]))
             if "attack_range" in data:
                 self._yolo_attack_range_var.set(int(data["attack_range"]))
+            if "min_mob_size" in data:
+                if hasattr(self, "_yolo_min_mob_var"):
+                    self._yolo_min_mob_var.set(int(data["min_mob_size"]))
             if "detection_fps" in data:
                 if hasattr(self, "_yolo_fps_var"):
                     self._yolo_fps_var.set(int(data["detection_fps"]))
@@ -954,6 +980,7 @@ class UiWorker(threading.Thread):
             return
         # Refresh the slider labels to match the loaded values.
         self._yolo_on_range_change()
+        self._yolo_on_min_mob_change()
         self._yolo_on_zone_change()
         self._yolo_sync_show_button()
         # Refresh the attack-key bind button label (the var was set above).
@@ -1102,6 +1129,8 @@ class UiWorker(threading.Thread):
         data = {
             "threshold": round(float(self._yolo_threshold_var.get()), 2),
             "attack_range": int(self._yolo_attack_range_var.get()),
+            "min_mob_size": int(self._yolo_min_mob_var.get())
+            if hasattr(self, "_yolo_min_mob_var") else 60,
             "detection_fps": int(self._yolo_fps_var.get())
             if hasattr(self, "_yolo_fps_var") else 10,
             "zone_width": int(self._yolo_zone_w_var.get()),
@@ -1159,6 +1188,14 @@ class UiWorker(threading.Thread):
         value = int(self._yolo_attack_range_var.get())
         self._yolo_attack_range_label.configure(text=f"{value} px")
 
+    def _yolo_on_min_mob_change(self, _value: str = "") -> None:
+        """Update the minimum-mob-size label as the slider moves."""
+
+        if not hasattr(self, "_yolo_min_mob_label"):
+            return
+        value = int(self._yolo_min_mob_var.get())
+        self._yolo_min_mob_label.configure(text=f"{value} px")
+
     def _yolo_on_fps_change(self, _value: str = "") -> None:
         """Update the detection-FPS label as the slider moves."""
 
@@ -1210,6 +1247,9 @@ class UiWorker(threading.Thread):
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
         if hasattr(self, "_yolo_fps_var"):
             cmd.extend(["--fps", f"{int(self._yolo_fps_var.get())}"])
+        if hasattr(self, "_yolo_min_mob_var"):
+            cmd.extend(["--min-mob-size",
+                        f"{int(self._yolo_min_mob_var.get())}"])
         # Always publish YOLO rope state: the patrol worker uses it to gate
         # the inner-gap jump on the real screen gap.
         cmd.extend(["--rope-state", str(
