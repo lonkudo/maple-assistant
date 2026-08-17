@@ -623,23 +623,14 @@ class UiWorker(threading.Thread):
             hp_use_button.pack(side="left")
             ttk.Label(hp_row, text="Key:").pack(side="left", padx=(8, 4))
             self._hp_key_var = tk.StringVar(value="delete")
-            hp_key_entry = ttk.Entry(
-                hp_row, textvariable=self._hp_key_var, width=12,
-                state="readonly",
-            )
-            hp_key_entry.pack(side="left", padx=(0, 10))
-            hp_key_entry.bind(
-                "<FocusIn>",
-                lambda e: self._drug_key_capture_begin(
-                    self._hp_key_var, "_hp_key_previous", e
+            hp_key_button = ttk.Button(
+                hp_row, text=self._hp_key_var.get(), width=14,
+                command=lambda: self._drug_key_capture_begin(
+                    hp_key_button, self._hp_key_var, "_hp_key_previous"
                 ),
             )
-            hp_key_entry.bind(
-                "<KeyPress>",
-                lambda e: self._drug_key_capture(
-                    self._hp_key_var, "_hp_key_previous", e
-                ),
-            )
+            hp_key_button.pack(side="left", padx=(0, 10))
+            self._hp_key_button = hp_key_button
             ttk.Label(hp_row, text="drink when HP <").pack(side="left")
             self._hp_threshold_var = tk.IntVar(value=50)
             hp_threshold_slider = ttk.Scale(
@@ -661,23 +652,14 @@ class UiWorker(threading.Thread):
             mp_use_button.pack(side="left")
             ttk.Label(mp_row, text="Key:").pack(side="left", padx=(8, 4))
             self._mp_key_var = tk.StringVar(value="end")
-            mp_key_entry = ttk.Entry(
-                mp_row, textvariable=self._mp_key_var, width=12,
-                state="readonly",
-            )
-            mp_key_entry.pack(side="left", padx=(0, 10))
-            mp_key_entry.bind(
-                "<FocusIn>",
-                lambda e: self._drug_key_capture_begin(
-                    self._mp_key_var, "_mp_key_previous", e
+            mp_key_button = ttk.Button(
+                mp_row, text=self._mp_key_var.get(), width=14,
+                command=lambda: self._drug_key_capture_begin(
+                    mp_key_button, self._mp_key_var, "_mp_key_previous"
                 ),
             )
-            mp_key_entry.bind(
-                "<KeyPress>",
-                lambda e: self._drug_key_capture(
-                    self._mp_key_var, "_mp_key_previous", e
-                ),
-            )
+            mp_key_button.pack(side="left", padx=(0, 10))
+            self._mp_key_button = mp_key_button
             ttk.Label(mp_row, text="drink when MP <").pack(side="left")
             self._mp_threshold_var = tk.IntVar(value=30)
             mp_threshold_slider = ttk.Scale(
@@ -961,27 +943,43 @@ class UiWorker(threading.Thread):
         return Path(__file__).resolve().parent / "drug_settings.json"
 
     def _drug_key_capture_begin(
-        self, var: tk.StringVar, previous_attr: str, _event: Any
+        self, button: Any, var: tk.StringVar, previous_attr: str
     ) -> None:
-        """Enter key-capture mode: remember the old binding, show a hint."""
+        """Enter key-capture mode on one button press.
 
+        The button is locked (disabled) while capturing; the next key press
+        anywhere binds it, Escape/unsupported keys restore the old binding.
+        """
+
+        if getattr(self, "_drug_capturing", False):
+            return
+        self._drug_capturing = True
+        self._drug_capture_target = (button, var, previous_attr)
         setattr(self, previous_attr, var.get())
-        var.set("press a key...")
+        button.configure(text="press a key...", state="disabled")
+        root = getattr(self, "_root", None)
+        if root is not None:
+            root.bind("<KeyPress>", self._drug_capture_key_handler)
 
-    def _drug_key_capture(
-        self, var: tk.StringVar, previous_attr: str, event: Any
-    ) -> str:
-        """Bind the pressed key (Escape/unsupported restores the old one)."""
+    def _drug_capture_key_handler(self, event: Any) -> str:
+        """Bind the pressed key and unlock the button; show the result."""
 
+        target = getattr(self, "_drug_capture_target", None)
+        if target is None:
+            return ""
+        button, var, previous_attr = target
         key = keysym_to_scan_key(str(getattr(event, "keysym", "")))
         if key is not None:
             var.set(key)
             self._drug_on_change()
         else:
             var.set(getattr(self, previous_attr, var.get()))
+        button.configure(text=var.get(), state="normal")
+        self._drug_capturing = False
+        self._drug_capture_target = None
         root = getattr(self, "_root", None)
         if root is not None:
-            root.focus_set()
+            root.unbind("<KeyPress>")
         return "break"
 
     def _drug_on_change(self, _event: Any = None) -> None:
@@ -993,6 +991,10 @@ class UiWorker(threading.Thread):
         mp_percent = int(self._mp_threshold_var.get())
         self._hp_threshold_label.configure(text=f"{hp_percent}%")
         self._mp_threshold_label.configure(text=f"{mp_percent}%")
+        if hasattr(self, "_hp_key_button"):
+            self._hp_key_button.configure(text=self._hp_key_var.get())
+        if hasattr(self, "_mp_key_button"):
+            self._mp_key_button.configure(text=self._mp_key_var.get())
         data = {
             "hp_key": self._hp_key_var.get().strip(),
             "mp_key": self._mp_key_var.get().strip(),
