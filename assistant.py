@@ -476,6 +476,7 @@ def main() -> int:
             attack_worker=attack_worker,
             movement_worker=movement_worker,
             shutdown_worker=shutdown_worker,
+            key_sender=key_sender,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

@@ -727,6 +727,97 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertIn(["disabled"], loader._shutdown_slider.states)
                 self.assertIn("disabled", loader._shutdown_status.text)
 
+    def test_channel_switch_button_runs_fixed_procedure(self) -> None:
+        from unittest import mock
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.state = "normal"
+
+            def configure(self, *, state: str = None, text: str = None) -> None:
+                if state is not None:
+                    self.state = state
+
+        class Root:
+            def __init__(self) -> None:
+                self.scheduled = []
+
+            def after(self, delay, fn):
+                if delay == 0:
+                    fn()
+                else:
+                    self.scheduled.append((delay, fn))
+
+        class FakeSender:
+            def __init__(self) -> None:
+                self.pressed = []
+                self.input_enabled = False
+                self.selected = 0
+
+            def enable_input(self) -> None:
+                self.input_enabled = True
+
+            def select_window(self) -> bool:
+                self.selected += 1
+                return True
+
+            def press(self, key, duration=0.025):
+                self.pressed.append(key)
+                return True
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.key_sender = FakeSender()
+        worker._root = Root()
+        worker._channel_switching = False
+        worker._channel_switch_status = Label()
+        worker._channel_switch_button = Button()
+
+        with mock.patch("ui_worker.random.randint", side_effect=[3, 8]), \
+                mock.patch("channel_switch.time.sleep"):
+            worker._channel_switch_run()
+
+        self.assertEqual(worker.key_sender.pressed, [
+            "esc", "enter",
+            "left", "left", "left",
+            "down", "down", "down", "down", "down", "down", "down", "down",
+            "enter",
+        ])
+        self.assertTrue(worker.key_sender.input_enabled)
+        self.assertEqual(worker.key_sender.selected, 1)  # game foregrounded
+        self.assertIn("done", worker._channel_switch_status.text)
+        self.assertEqual(worker._channel_switch_button.state, "normal")
+
+    def test_channel_switch_headless_reports_not_wired(self) -> None:
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.key_sender = None
+        worker._root = None
+        worker._channel_switching = False
+        worker._channel_switch_status = Label()
+        worker._channel_switch_button = type(
+            "Button", (),
+            {"state": "normal",
+             "configure": lambda self, **kw: None},
+        )()
+
+        worker._channel_switch_run()
+
+        self.assertIn("not wired", worker._channel_switch_status.text)
+        self.assertFalse(worker._channel_switching)
+
 
 if __name__ == "__main__":
     unittest.main()

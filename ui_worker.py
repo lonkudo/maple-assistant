@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import logging
 import queue
+import random
 import re
 import threading
 import time
@@ -22,6 +23,7 @@ from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
+from channel_switch import channel_switch_procedure
 
 
 LOG = logging.getLogger(__name__)
@@ -352,6 +354,7 @@ class UiWorker(threading.Thread):
         attack_worker: Any = None,
         movement_worker: Any = None,
         shutdown_worker: Any = None,
+        key_sender: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -381,6 +384,10 @@ class UiWorker(threading.Thread):
         # Shutdown worker (ShutdownWorker) the Additional Functions panel
         # arms: enabled flag + hours are applied live.
         self.shutdown_worker = shutdown_worker
+        # Raw key sender used by the Additional Functions "Switch Channel"
+        # button to run the fixed channel-switch procedure.
+        self.key_sender = key_sender
+        self._channel_switching = False
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -844,6 +851,26 @@ class UiWorker(threading.Thread):
             )
             self._shutdown_status.pack(anchor="w", pady=(6, 0))
             self._shutdown_load_settings()
+
+            # Fixed channel-switch procedure (esc -> enter -> random
+            # left/down -> enter -> wait 3s).  A button, not a key binding:
+            # clicking it stops the patrol, foregrounds the game and runs
+            # the sequence in a background thread.
+            channel_row = ttk.Frame(extra_panel)
+            channel_row.pack(fill="x", pady=(6, 0))
+            self._channel_switch_button = ttk.Button(
+                channel_row, text="Switch Channel",
+                command=self._channel_switch_click,
+            )
+            self._channel_switch_button.pack(side="left", padx=(0, 8))
+            ttk.Label(
+                channel_row,
+                text="esc -> enter -> random left/down -> enter (waits 3s)",
+            ).pack(side="left")
+            self._channel_switch_status = ttk.Label(
+                extra_panel, text="Channel switch: idle.", justify="left"
+            )
+            self._channel_switch_status.pack(anchor="w", pady=(4, 0))
 
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
@@ -1520,6 +1547,80 @@ class UiWorker(threading.Thread):
         self._shutdown_on_change()
         LOG.info("additional functions settings loaded from %s",
                  self._shutdown_settings_path())
+
+    def _channel_switch_click(self) -> None:
+        """Stop patrol (UI thread), then run the fixed procedure in a thread."""
+
+        if getattr(self, "_channel_switching", False):
+            return
+        # Automation must not fight the procedure's keys: stop the patrol on
+        # the UI thread first (this also disables live input).
+        if (self.patrol_controller is not None
+                and self.patrol_controller.is_enabled()):
+            self._stop_patrol()
+        self._channel_switching = True
+        if hasattr(self, "_channel_switch_button"):
+            self._channel_switch_button.configure(state="disabled")
+        self._channel_switch_status.configure(
+            text="Channel switch: preparing..."
+        )
+        threading.Thread(
+            target=self._channel_switch_run, daemon=True
+        ).start()
+
+    def _channel_switch_run(self) -> None:
+        """Background: foreground the game and run the fixed procedure."""
+
+        def update(text: str) -> None:
+            root = getattr(self, "_root", None)
+            if root is not None:
+                root.after(
+                    0, lambda: self._channel_switch_status.configure(text=text)
+                )
+            else:
+                self._channel_switch_status.configure(text=text)
+
+        try:
+            sender = getattr(self, "key_sender", None)
+            if sender is None:
+                update("Channel switch: key sender not wired (headless run).")
+                return
+            sender.enable_input()
+            if not sender.select_window():
+                update("Channel switch failed: game window not found.")
+                return
+            left = random.randint(1, 10)
+            down = random.randint(1, 10)
+            update(f"Channel switch: esc enter left x{left} down x{down} "
+                   "enter - waiting 3s")
+            ok = channel_switch_procedure(
+                sender,
+                left_count=left,
+                down_count=down,
+                on_press=lambda key, ok_: LOG.info(
+                    "channel switch press %s ok=%s", key, ok_
+                ),
+            )
+            if ok:
+                update("Channel switch done - check the game.")
+            else:
+                update("Channel switch blocked: game window not foreground.")
+        except Exception as exc:
+            LOG.warning("channel switch failed: %s", exc)
+            update(f"Channel switch failed: {exc}")
+        finally:
+            root = getattr(self, "_root", None)
+            if root is not None:
+                root.after(0, self._channel_switch_finished)
+            else:
+                self._channel_switch_finished()
+
+    def _channel_switch_finished(self) -> None:
+        """Re-enable the button when the procedure finished."""
+
+        self._channel_switching = False
+        if hasattr(self, "_channel_switch_button"):
+            self._channel_switch_button.configure(state="normal")
 
     def _yolo_save_settings(self) -> None:
         """Persist current YOLO panel values to the local JSON file."""
