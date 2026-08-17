@@ -1,4 +1,4 @@
-"""Fixed channel-switch procedure: esc -> enter -> random left/down -> enter -> enter -> wait.
+"""Fixed channel-switch procedure: esc -> enter -> random left/down -> enter -> esc -> wait.
 
 Reusable by the assistant UI button (Additional Functions panel) and the
 standalone CLI test (work/channel_switch_test.py).  This is a FIXED
@@ -28,7 +28,7 @@ def channel_switch_procedure(
 ) -> bool:
     """Run the fixed channel switch; True when every key was sent.
 
-    Sequence: esc -> enter -> left x N -> down x M -> enter -> enter ->
+    Sequence: esc -> enter -> left x N -> down x M -> enter -> esc ->
     wait ``wait`` seconds, with N/M random 1-10 unless overridden.  Keys
     are sent through ``sender.press`` (scan-code sender).  Returns False
     as soon as a key is blocked (e.g. the game lost focus mid-procedure).
@@ -44,7 +44,7 @@ def channel_switch_procedure(
         ["esc", "enter"]
         + ["left"] * left_count
         + ["down"] * down_count
-        + ["enter", "enter"]
+        + ["enter", "esc"]
     )
     for key in keys:
         ok = bool(sender.press(key, duration=hold))

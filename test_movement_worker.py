@@ -632,7 +632,7 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(sender.pressed[:3],
                              ["delete", "delete", "delete"])
             self.assertEqual(sender.pressed[3:], [
-                "esc", "enter", "left", "left", "down", "enter", "enter",
+                "esc", "enter", "left", "left", "down", "enter", "esc",
             ])
             self.assertFalse(worker._player_switch_active)
             self.assertGreater(worker._last_other_player_switch,
@@ -737,8 +737,9 @@ class MovementTests(unittest.TestCase):
                                       return_value=2):
                 worker._trigger_other_player_switch(1)
 
-            # New channel still busy: switched twice (max attempts), then gave up.
-            self.assertEqual(sender.pressed.count("esc"), 2)
+            # New channel still busy: switched twice (max attempts), then gave
+            # up.  Each switch has one left press (randint side effects).
+            self.assertEqual(sender.pressed.count("left"), 2)
             self.assertFalse(worker._player_switch_active)
 
     def test_trigger_switch_guards_active_and_cooldown(self):

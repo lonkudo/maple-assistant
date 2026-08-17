@@ -32,7 +32,7 @@ class ChannelSwitchTests(unittest.TestCase):
             "esc", "enter",
             "left", "left", "left",
             "down", "down", "down", "down", "down", "down", "down", "down",
-            "enter", "enter",
+            "enter", "esc",
         ])
         # One sleep per key (15) + the final 3s wait.
         self.assertEqual(sleep.call_count, 16)
@@ -46,10 +46,11 @@ class ChannelSwitchTests(unittest.TestCase):
         downs = [k for k in sender.pressed if k == "down"]
         self.assertTrue(1 <= len(lefts) <= 10)
         self.assertTrue(1 <= len(downs) <= 10)
-        # Structure: esc, enter, lefts, downs, enter.
+        # Structure: esc, enter, lefts, downs, enter, esc.
         self.assertEqual(sender.pressed[0], "esc")
         self.assertEqual(sender.pressed[1], "enter")
-        self.assertEqual(sender.pressed[-1], "enter")
+        self.assertEqual(sender.pressed[-2], "enter")
+        self.assertEqual(sender.pressed[-1], "esc")
 
     def test_on_press_callback_receives_every_key(self):
         sender = FakeSender()
