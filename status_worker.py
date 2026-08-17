@@ -20,6 +20,16 @@ from PIL import Image
 
 LOG = logging.getLogger(__name__)
 
+# Keys the UI bind buttons may capture - game-usable hotkeys only: the
+# modifiers, navigation/edit keys, and the 1-9 number row above the
+# letters.  Everything else (letters, F-keys, numpad, punctuation) is
+# intentionally not bindable to avoid conflicts with game bindings.
+BINDABLE_KEYS = frozenset({
+    "shift", "ctrl", "alt", "space", "delete", "end",
+    "pagedown", "pageup", "home", "insert",
+    "1", "2", "3", "4", "5", "6", "7", "8", "9",
+})
+
 
 class KeySender(Protocol):
     """Small interface shared by the movement and status workers."""
@@ -687,7 +697,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         if field_name.endswith("key"):
             if value:
                 key = str(value).casefold()
-                if key in WindowKeySender._SCAN:
+                if key in WindowKeySender._SCAN and key in BINDABLE_KEYS:
                     kwargs[field_name] = key
         elif isinstance(value, bool):
             kwargs[field_name] = value
@@ -707,5 +717,5 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
 
 __all__: Sequence[str] = (
     "BarStatusDetector", "StatusConfig", "StatusReading", "StatusWorker",
-    "WindowKeySender", "apply_drug_settings",
+    "WindowKeySender", "apply_drug_settings", "BINDABLE_KEYS",
 )

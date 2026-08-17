@@ -20,7 +20,7 @@ from map_identity import MapIdentityStore
 from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
-from status_worker import apply_drug_settings, WindowKeySender
+from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 
 
 LOG = logging.getLogger(__name__)
@@ -282,11 +282,12 @@ def layer_display_order(layer_names: list[str]) -> tuple[str, ...]:
 
 
 def keysym_to_scan_key(keysym: str) -> Optional[str]:
-    """Map a Tk keysym to a supported scan-code key name, or None.
+    """Map a Tk keysym to a bindable scan-code key name, or None.
 
-    Every physical key is bindable (modifiers, F-keys, numpad, punctuation).
-    Escape is the only exception - it cancels key capture and restores the
-    previous binding.
+    Only the game-usable hotkeys are bindable (``BINDABLE_KEYS``: shift /
+    ctrl / alt / space / delete / end / pageup / pagedown / home / insert
+    and the 1-9 number row).  Escape cancels key capture and restores the
+    previous binding; every other key is ignored.
     """
 
     if not keysym:
@@ -295,21 +296,21 @@ def keysym_to_scan_key(keysym: str) -> Optional[str]:
         "Control_L": "ctrl", "Control_R": "ctrl",
         "Alt_L": "alt", "Alt_R": "alt",
         "Shift_L": "shift", "Shift_R": "shift",
-        "Return": "enter", "KP_Enter": "kp_enter",
         "BackSpace": "backspace", "Caps_Lock": "caps",
         "Prior": "pageup", "Next": "pagedown",
+        "Return": "enter",
         "KP_0": "kp_0", "KP_1": "kp_1", "KP_2": "kp_2",
         "KP_3": "kp_3", "KP_4": "kp_4", "KP_5": "kp_5",
         "KP_6": "kp_6", "KP_7": "kp_7", "KP_8": "kp_8",
         "KP_9": "kp_9",
         "KP_Add": "kp_add", "KP_Subtract": "kp_subtract",
         "KP_Multiply": "kp_multiply", "KP_Divide": "kp_divide",
-        "KP_Decimal": "kp_decimal",
+        "KP_Enter": "kp_enter", "KP_Decimal": "kp_decimal",
     }.get(keysym, keysym)
-    if normalized in WindowKeySender._SCAN:
-        return normalized
-    lowered = normalized.lower()
-    return lowered if lowered in WindowKeySender._SCAN else None
+    candidate = normalized.lower()
+    if candidate in WindowKeySender._SCAN and candidate in BINDABLE_KEYS:
+        return candidate
+    return None
 
 
 def rope_unavailable_hint() -> str:

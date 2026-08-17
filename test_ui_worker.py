@@ -29,25 +29,30 @@ class UiLogHandlerTests(unittest.TestCase):
             ("layer2", "layer1"),
         )
 
-    def test_keysym_to_scan_key_maps_pressed_keys(self) -> None:
+    def test_keysym_to_scan_key_limits_to_bindable_hotkeys(self) -> None:
+        # Game-usable hotkeys bind: modifiers, nav/edit, space, 1-9.
         self.assertEqual(keysym_to_scan_key("1"), "1")
-        self.assertEqual(keysym_to_scan_key("q"), "q")
-        self.assertEqual(keysym_to_scan_key("F4"), "f4")
-        self.assertEqual(keysym_to_scan_key("Delete"), "delete")
-        self.assertEqual(keysym_to_scan_key("End"), "end")
-        self.assertEqual(keysym_to_scan_key("Control_L"), "ctrl")
-        self.assertEqual(keysym_to_scan_key("Alt_R"), "alt")
+        self.assertEqual(keysym_to_scan_key("9"), "9")
         self.assertEqual(keysym_to_scan_key("Shift_L"), "shift")
         self.assertEqual(keysym_to_scan_key("Shift_R"), "shift")
-        self.assertEqual(keysym_to_scan_key("Q"), "q")
-        self.assertEqual(keysym_to_scan_key("Return"), "enter")
-        self.assertEqual(keysym_to_scan_key("Tab"), "tab")
-        self.assertEqual(keysym_to_scan_key("KP_7"), "kp_7")
-        self.assertEqual(keysym_to_scan_key("KP_Add"), "kp_add")
-        self.assertEqual(keysym_to_scan_key("minus"), "minus")
+        self.assertEqual(keysym_to_scan_key("Control_L"), "ctrl")
+        self.assertEqual(keysym_to_scan_key("Alt_R"), "alt")
+        self.assertEqual(keysym_to_scan_key("Delete"), "delete")
+        self.assertEqual(keysym_to_scan_key("End"), "end")
         self.assertEqual(keysym_to_scan_key("Prior"), "pageup")
-        # Escape and shifted symbols (exclam = shift+1) are not bindable:
-        # the previous binding must stay.
+        self.assertEqual(keysym_to_scan_key("Next"), "pagedown")
+        self.assertEqual(keysym_to_scan_key("Home"), "home")
+        self.assertEqual(keysym_to_scan_key("Insert"), "insert")
+        self.assertEqual(keysym_to_scan_key("space"), "space")
+        # Everything else is NOT bindable (letters, F-keys, numpad, "0",
+        # punctuation, Escape): the previous binding must stay.
+        self.assertIsNone(keysym_to_scan_key("q"))
+        self.assertIsNone(keysym_to_scan_key("Q"))
+        self.assertIsNone(keysym_to_scan_key("F4"))
+        self.assertIsNone(keysym_to_scan_key("0"))
+        self.assertIsNone(keysym_to_scan_key("Tab"))
+        self.assertIsNone(keysym_to_scan_key("KP_7"))
+        self.assertIsNone(keysym_to_scan_key("minus"))
         self.assertIsNone(keysym_to_scan_key("Escape"))
         self.assertIsNone(keysym_to_scan_key("exclam"))
         self.assertIsNone(keysym_to_scan_key(""))

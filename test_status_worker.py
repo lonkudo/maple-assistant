@@ -111,18 +111,19 @@ class StatusTests(unittest.TestCase):
     def test_apply_drug_settings_maps_percent_to_ratio_and_validates_keys(self) -> None:
         config = StatusConfig()
         updated = apply_drug_settings(config, {
-            "hp_key": "1", "mp_key": "f4",
+            "hp_key": "1", "mp_key": "space",
             "hp_threshold": 55, "mp_threshold": 20,
             "hp_enabled": False, "mp_enabled": True,
         })
         self.assertEqual(updated.hp_key, "1")
-        self.assertEqual(updated.mp_key, "f4")
+        self.assertEqual(updated.mp_key, "space")
         self.assertAlmostEqual(updated.hp_ratio_threshold, 0.55)
         self.assertAlmostEqual(updated.mp_ratio_threshold, 0.20)
         self.assertFalse(updated.hp_enabled)
         self.assertTrue(updated.mp_enabled)
-        # Unsupported key is ignored: the existing binding stays.
-        unchanged = apply_drug_settings(config, {"hp_key": "not-a-key"})
+        # Keys outside the bindable whitelist are ignored: the existing
+        # binding stays.
+        unchanged = apply_drug_settings(config, {"hp_key": "q"})
         self.assertEqual(unchanged.hp_key, config.hp_key)
 
     def test_new_scan_codes_cover_potion_keys(self) -> None:
