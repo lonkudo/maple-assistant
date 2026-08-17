@@ -657,8 +657,6 @@ class MovementTests(unittest.TestCase):
                 "esc", "enter", "left", "left", "down", "enter", "esc",
             ])
             self.assertFalse(worker._player_switch_active)
-            self.assertGreater(worker._last_other_player_switch,
-                               float("-inf"))
 
     def test_switch_restarts_patrol_from_first_layer(self):
         import json
@@ -674,6 +672,12 @@ class MovementTests(unittest.TestCase):
 
             def press(self, key, duration=0.025):
                 self.pressed.append(key)
+                return True
+
+            def key_down(self, key):
+                return True
+
+            def key_up(self, key):
                 return True
 
         class FakeThread:
@@ -692,12 +696,12 @@ class MovementTests(unittest.TestCase):
 
         positions = {
             "layer1": {
-                "layer_world_y": 11.32,
+                "layer_world_y": 11.32, "layer_y": .7, "y_tolerance": .02,
                 "left_most_pos": {"x": .2, "y": .7},
                 "right_most_pos": {"x": .8, "y": .7},
             },
             "layer2": {
-                "layer_world_y": -17.15,
+                "layer_world_y": -17.15, "layer_y": .5, "y_tolerance": .02,
                 "left_most_pos": {"x": .2, "y": .5},
                 "right_most_pos": {"x": .8, "y": .5},
             },
@@ -724,6 +728,11 @@ class MovementTests(unittest.TestCase):
             worker._route_layer_index = 1
             worker._route_phase = "right"
             worker._left_excursion_active = True
+            # The new channel spawned the character ON layer1 already: the
+            # drop ends on its first check.
+            worker.last_observation = MinimapObservation(
+                Point(.5, .7), None, .9, (0, 0, 1, 1)
+            )
             with mock.patch("movement_worker.threading.Thread", FakeThread), \
                     mock.patch("channel_switch.random.randint",
                                side_effect=[1, 1]), \
@@ -842,7 +851,7 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(sender.pressed.count("left"), 2)
             self.assertFalse(worker._player_switch_active)
 
-    def test_trigger_switch_guards_active_and_cooldown(self):
+    def test_trigger_switch_guards_against_double_fire(self):
         from unittest import mock
 
         worker = MovementWorker(
@@ -854,15 +863,55 @@ class MovementTests(unittest.TestCase):
             worker._trigger_other_player_switch(1)
             run.assert_not_called()
         worker._player_switch_active = False
-        worker._last_other_player_switch = time.monotonic()
-        with mock.patch.object(worker, "_run_other_player_switch") as run:
-            worker._trigger_other_player_switch(1)
-            run.assert_not_called()
-        # After the cooldown the switch fires.
-        worker._last_other_player_switch = float("-inf")
         with mock.patch.object(worker, "_run_other_player_switch") as run:
             worker._trigger_other_player_switch(1)
             run.assert_called_once()
+
+    def test_switch_drop_ends_when_marker_reaches_first_layer(self):
+        from unittest import mock
+
+        class FakeSender:
+            def __init__(self):
+                self.events = []
+
+            def key_down(self, key):
+                self.events.append(("down", key))
+                return True
+
+            def key_up(self, key):
+                self.events.append(("up", key))
+                return True
+
+        positions = {
+            "layer1": {
+                "layer_y": .7, "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            },
+            "layer2": {
+                "layer_y": .5, "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+        }
+        sender = FakeSender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions=positions, route_order=["layer1", "layer2"],
+            first_layer="layer1",
+        )
+        # The marker is visible; first check: still on layer2 -> drop;
+        # second check: on layer1 -> stop.
+        worker.last_observation = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1)
+        )
+        with mock.patch.object(worker, "_on_first_layer",
+                               side_effect=[False, True]), \
+                mock.patch("movement_worker.time.sleep"):
+            worker._drop_to_first_layer()
+        # Exactly one Alt+Down chord, then stop.
+        self.assertEqual(sender.events.count(("down", "down")), 1)
+        self.assertEqual(sender.events.count(("down", "alt")), 1)
 
     def test_yolo_rope_jump_gate(self):
         import tempfile

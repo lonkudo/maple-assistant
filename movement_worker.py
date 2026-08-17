@@ -1240,7 +1240,6 @@ class MovementWorker(threading.Thread):
         rope_approach_creep_seconds: float = 0.25,
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
-        other_player_switch_cooldown_seconds: float = 5.0,
         other_player_drug_taps: int = 3,
         other_player_drug_gap_seconds: float = 1.0,
         other_player_hp_threshold: float = 0.70,
@@ -1381,10 +1380,6 @@ class MovementWorker(threading.Thread):
         self._other_player_check_enabled = bool(other_player_check_enabled)
         self._left_excursion_active = False
         self._player_switch_active = False
-        self._last_other_player_switch = float("-inf")
-        self.other_player_switch_cooldown_seconds = max(
-            0.0, float(other_player_switch_cooldown_seconds)
-        )
         self.other_player_drug_taps = max(1, int(other_player_drug_taps))
         self.other_player_drug_gap_seconds = max(
             0.1, float(other_player_drug_gap_seconds)
@@ -1561,13 +1556,8 @@ class MovementWorker(threading.Thread):
     def _trigger_other_player_switch(self, count: int) -> None:
         """Start the channel switch in a background thread (guarded once)."""
 
-        now = time.monotonic()
         if self._player_switch_active:
             LOG.info("player switch skipped: already switching")
-            return
-        if (now - self._last_other_player_switch
-                < self.other_player_switch_cooldown_seconds):
-            LOG.info("player switch skipped: cooling down")
             return
         self._player_switch_active = True
         LOG.warning("OTHER PLAYER detected on the minimap (%d); "
@@ -1577,13 +1567,15 @@ class MovementWorker(threading.Thread):
         ).start()
 
     def _run_other_player_switch(self) -> None:
-        """Background: drug (if HP low), switch, re-check, then resume.
+        """Background: switch until clean, drop to layer1, restart patrol.
 
-        After each channel switch the NEW channel is scanned for other
-        players (red diamonds) again; while any are present the switch
-        repeats, up to ``other_player_switch_max_attempts``.  Before each
-        switch an HP drug is eaten only when the current HP is below
-        ``other_player_hp_threshold`` (70%).
+        No cooldown: while the NEW channel still has other players (red
+        diamonds) the switch repeats immediately, up to
+        ``other_player_switch_max_attempts`` per trigger.  Before each
+        switch an HP drug is eaten only when HP is below
+        ``other_player_hp_threshold`` (70%).  Once a channel is clean the
+        character is dropped down to layer1 (it can spawn on ANY layer of
+        the new channel), then the patrol restarts from layer1.
         """
 
         try:
@@ -1591,6 +1583,7 @@ class MovementWorker(threading.Thread):
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
             switched = False
+            clean = False
             attempts = 0
             while attempts < self.other_player_switch_max_attempts:
                 attempts += 1
@@ -1609,6 +1602,7 @@ class MovementWorker(threading.Thread):
                 time.sleep(self.other_player_switch_settle_seconds)
                 count = self._other_players_on_latest_frame()
                 if count == 0:
+                    clean = True
                     LOG.warning("player channel switch done (attempt %d); "
                                 "new channel clean", attempts)
                     break
@@ -1618,19 +1612,52 @@ class MovementWorker(threading.Thread):
             else:
                 LOG.warning("player channel switch gave up after %d attempts",
                             self.other_player_switch_max_attempts)
+            if switched and clean:
+                # The character may not respawn at layer1: drop down to it
+                # first, then restart the patrol from a clean layer1 state
+                # (route + world-Y anchor reset).
+                self._drop_to_first_layer()
+                self._restart_patrol_from_first_layer()
         except Exception:
             LOG.exception("player channel switch failed")
         finally:
-            # A channel change respawns the character at the map entry
-            # (layer1): reset the route + world-Y anchor to the first layer
-            # so the patrol restarts cleanly instead of continuing on a stale
-            # upper-layer state.
-            if switched:
-                self._restart_patrol_from_first_layer()
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(True)
             self._player_switch_active = False
-            self._last_other_player_switch = time.monotonic()
+
+    def _drop_to_first_layer(self) -> None:
+        """Drop through platforms until the character stands on layer1.
+
+        After a channel change the character can spawn on ANY layer (not
+        necessarily layer1).  Repeated Alt+Down chords fall through the
+        platforms; the loop ends when the minimap marker reaches layer1's
+        band (marker-Y check, robust against the stale world-Y anchor
+        right after a channel change).  Capped so a stuck character cannot
+        drop forever.
+        """
+
+        if (self.first_layer is None
+                or self.first_layer not in self._route_layers):
+            return
+        max_attempts = 30
+        for attempt in range(1, max_attempts + 1):
+            obs = self.last_observation
+            if obs is not None and self._on_first_layer(obs):
+                LOG.info("channel-switch drop: reached %s (attempt %d)",
+                         self.first_layer, attempt)
+                return
+            LOG.info("channel-switch drop: attempt %d/%d (Alt+Down)",
+                     attempt, max_attempts)
+            try:
+                _drop_through_platform(
+                    self.key_sender, self.drop_chord_hold_seconds
+                )
+            except Exception:
+                LOG.warning("drop suppressed during channel-switch descent",
+                            exc_info=True)
+            time.sleep(self.drop_retry_seconds)
+        LOG.warning("channel-switch drop: gave up after %d attempts",
+                    max_attempts)
 
     def _restart_patrol_from_first_layer(self) -> None:
         """Reset the route + world-Y anchor to the first layer (post-switch)."""
