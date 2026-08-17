@@ -21,11 +21,12 @@ from PIL import Image
 LOG = logging.getLogger(__name__)
 
 # Keys the UI bind buttons may capture - game-usable hotkeys only: the
-# modifiers, navigation/edit keys, and the 1-9 number row above the
-# letters.  Everything else (letters, F-keys, numpad, punctuation) is
-# intentionally not bindable to avoid conflicts with game bindings.
+# modifiers (except alt, which is the jump key), navigation/edit keys, and
+# the 1-9 number row above the letters.  Everything else (letters, F-keys,
+# numpad, punctuation) is intentionally not bindable to avoid conflicts
+# with game bindings.
 BINDABLE_KEYS = frozenset({
-    "shift", "ctrl", "alt", "space", "delete", "end",
+    "shift", "ctrl", "space", "delete", "end",
     "pagedown", "pageup", "home", "insert",
     "1", "2", "3", "4", "5", "6", "7", "8", "9",
 })

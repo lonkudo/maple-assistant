@@ -36,7 +36,9 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(keysym_to_scan_key("Shift_L"), "shift")
         self.assertEqual(keysym_to_scan_key("Shift_R"), "shift")
         self.assertEqual(keysym_to_scan_key("Control_L"), "ctrl")
-        self.assertEqual(keysym_to_scan_key("Alt_R"), "alt")
+        # Alt is the jump key in-game: NOT bindable.
+        self.assertIsNone(keysym_to_scan_key("Alt_L"))
+        self.assertIsNone(keysym_to_scan_key("Alt_R"))
         self.assertEqual(keysym_to_scan_key("Delete"), "delete")
         self.assertEqual(keysym_to_scan_key("End"), "end")
         self.assertEqual(keysym_to_scan_key("Prior"), "pageup")
