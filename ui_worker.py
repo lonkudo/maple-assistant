@@ -944,6 +944,11 @@ class UiWorker(threading.Thread):
         self._yolo_on_range_change()
         self._yolo_on_zone_change()
         self._yolo_sync_show_button()
+        # Refresh the attack-key bind button label (the var was set above).
+        if hasattr(self, "_yolo_attack_key_button"):
+            self._yolo_attack_key_button.configure(
+                text=self._yolo_attack_key_var.get()
+            )
         LOG.info("yolo settings loaded from %s", self._yolo_settings_path())
 
     @staticmethod
