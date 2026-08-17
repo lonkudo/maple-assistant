@@ -281,6 +281,26 @@ def layer_display_order(layer_names: list[str]) -> tuple[str, ...]:
     return tuple(reversed(sorted(layer_names, key=_layer_number)))
 
 
+def keysym_to_scan_key(keysym: str) -> Optional[str]:
+    """Map a Tk keysym to a supported scan-code key name, or None.
+
+    Handles modifier names (Control_L -> ctrl), F-keys (F4 -> f4) and
+    case.  Modifiers-only or unmapped keysyms (Escape, shift+1 -> exclam)
+    return None so the previous binding is kept.
+    """
+
+    if not keysym:
+        return None
+    normalized = {
+        "Control_L": "ctrl", "Control_R": "ctrl",
+        "Alt_L": "alt", "Alt_R": "alt",
+    }.get(keysym, keysym)
+    if normalized in WindowKeySender._SCAN:
+        return normalized
+    lowered = normalized.lower()
+    return lowered if lowered in WindowKeySender._SCAN else None
+
+
 def rope_unavailable_hint() -> str:
     return "Add a layer to enable Rope recording."
 
@@ -604,10 +624,22 @@ class UiWorker(threading.Thread):
             ttk.Label(hp_row, text="Key:").pack(side="left", padx=(8, 4))
             self._hp_key_var = tk.StringVar(value="delete")
             hp_key_entry = ttk.Entry(
-                hp_row, textvariable=self._hp_key_var, width=6
+                hp_row, textvariable=self._hp_key_var, width=12,
+                state="readonly",
             )
             hp_key_entry.pack(side="left", padx=(0, 10))
-            hp_key_entry.bind("<KeyRelease>", self._drug_on_change)
+            hp_key_entry.bind(
+                "<FocusIn>",
+                lambda e: self._drug_key_capture_begin(
+                    self._hp_key_var, "_hp_key_previous", e
+                ),
+            )
+            hp_key_entry.bind(
+                "<KeyPress>",
+                lambda e: self._drug_key_capture(
+                    self._hp_key_var, "_hp_key_previous", e
+                ),
+            )
             ttk.Label(hp_row, text="drink when HP <").pack(side="left")
             self._hp_threshold_var = tk.IntVar(value=50)
             hp_threshold_slider = ttk.Scale(
@@ -630,10 +662,22 @@ class UiWorker(threading.Thread):
             ttk.Label(mp_row, text="Key:").pack(side="left", padx=(8, 4))
             self._mp_key_var = tk.StringVar(value="end")
             mp_key_entry = ttk.Entry(
-                mp_row, textvariable=self._mp_key_var, width=6
+                mp_row, textvariable=self._mp_key_var, width=12,
+                state="readonly",
             )
             mp_key_entry.pack(side="left", padx=(0, 10))
-            mp_key_entry.bind("<KeyRelease>", self._drug_on_change)
+            mp_key_entry.bind(
+                "<FocusIn>",
+                lambda e: self._drug_key_capture_begin(
+                    self._mp_key_var, "_mp_key_previous", e
+                ),
+            )
+            mp_key_entry.bind(
+                "<KeyPress>",
+                lambda e: self._drug_key_capture(
+                    self._mp_key_var, "_mp_key_previous", e
+                ),
+            )
             ttk.Label(mp_row, text="drink when MP <").pack(side="left")
             self._mp_threshold_var = tk.IntVar(value=30)
             mp_threshold_slider = ttk.Scale(
@@ -915,6 +959,30 @@ class UiWorker(threading.Thread):
     @staticmethod
     def _drug_settings_path() -> Path:
         return Path(__file__).resolve().parent / "drug_settings.json"
+
+    def _drug_key_capture_begin(
+        self, var: tk.StringVar, previous_attr: str, _event: Any
+    ) -> None:
+        """Enter key-capture mode: remember the old binding, show a hint."""
+
+        setattr(self, previous_attr, var.get())
+        var.set("press a key...")
+
+    def _drug_key_capture(
+        self, var: tk.StringVar, previous_attr: str, event: Any
+    ) -> str:
+        """Bind the pressed key (Escape/unsupported restores the old one)."""
+
+        key = keysym_to_scan_key(str(getattr(event, "keysym", "")))
+        if key is not None:
+            var.set(key)
+            self._drug_on_change()
+        else:
+            var.set(getattr(self, previous_attr, var.get()))
+        root = getattr(self, "_root", None)
+        if root is not None:
+            root.focus_set()
+        return "break"
 
     def _drug_on_change(self, _event: Any = None) -> None:
         """Update labels, persist, and apply the drug settings live."""

@@ -4,6 +4,7 @@ import unittest
 from ui_worker import (
     UiLogHandler,
     UiWorker,
+    keysym_to_scan_key,
     layer_display_order,
     patrol_button_states,
     record_button_is_locked,
@@ -27,6 +28,21 @@ class UiLogHandlerTests(unittest.TestCase):
             layer_display_order(["layer2", "layer1"]),
             ("layer2", "layer1"),
         )
+
+    def test_keysym_to_scan_key_maps_pressed_keys(self) -> None:
+        self.assertEqual(keysym_to_scan_key("1"), "1")
+        self.assertEqual(keysym_to_scan_key("q"), "q")
+        self.assertEqual(keysym_to_scan_key("F4"), "f4")
+        self.assertEqual(keysym_to_scan_key("Delete"), "delete")
+        self.assertEqual(keysym_to_scan_key("End"), "end")
+        self.assertEqual(keysym_to_scan_key("Control_L"), "ctrl")
+        self.assertEqual(keysym_to_scan_key("Alt_R"), "alt")
+        self.assertEqual(keysym_to_scan_key("Q"), "q")
+        # Escape and shifted symbols (exclam = shift+1) are not bindable:
+        # the previous binding must stay.
+        self.assertIsNone(keysym_to_scan_key("Escape"))
+        self.assertIsNone(keysym_to_scan_key("exclam"))
+        self.assertIsNone(keysym_to_scan_key(""))
 
     def test_final_rope_hover_hint_tells_user_how_to_enable_it(self) -> None:
         self.assertEqual(
