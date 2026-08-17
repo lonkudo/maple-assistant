@@ -1,0 +1,5 @@
+{
+  "attack_mode": "yolo",
+  "interval_seconds": 3.0,
+  "attack_key": "ctrl"
+}

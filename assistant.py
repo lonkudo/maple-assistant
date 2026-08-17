@@ -307,16 +307,18 @@ def main() -> int:
             float(anchor_world_y),
         )
     attack_workers = []
-    if args.enable_attack:
-        attack_workers.append(AttackWorker(
-            key_sender,
-            stop_event,
-            args.attack_interval,
-            climbing_active_event=climbing_active,
-            automation_active_event=automation_active,
-        ))
-    else:
-        logging.info("attack worker temporarily disabled")
+    # The fixed-rate attack worker always exists so the UI can toggle it
+    # live (Fixed Attack panel).  Without --enable-attack it starts disabled
+    # and only waits; the panel flips ``enabled`` when the mode is selected.
+    attack_worker = AttackWorker(
+        key_sender,
+        stop_event,
+        args.attack_interval,
+        climbing_active_event=climbing_active,
+        automation_active_event=automation_active,
+    )
+    attack_worker.enabled = bool(args.enable_attack)
+    attack_workers.append(attack_worker)
     pickup_workers = []
     if args.pickup_interval > 0:
         from pickup_worker import PickupWorker
@@ -462,6 +464,7 @@ def main() -> int:
             structure_tracker=structure_tracker,
             map_identity_store=map_identity_store,
             status_worker=status_worker,
+            attack_worker=attack_worker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

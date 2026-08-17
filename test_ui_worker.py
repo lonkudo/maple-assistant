@@ -445,6 +445,189 @@ class UiLogHandlerTests(unittest.TestCase):
         ])
         self.assertEqual(worker._unlocked_points, set())
 
+    def test_fixed_attack_mode_greys_yolo_panel_and_applies_worker(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str = None, style: str = None) -> None:
+                if text is not None:
+                    self.text = text
+
+        class FakeWidget:
+            def __init__(self) -> None:
+                self.states = []
+
+            def state(self, args) -> None:
+                self.states.append(args)
+
+        class FakePanel:
+            def __init__(self) -> None:
+                self.children = [FakeWidget(), FakeWidget()]
+
+            def winfo_children(self):
+                return self.children
+
+        class FakeAttackWorker:
+            def __init__(self) -> None:
+                self.enabled = False
+                self.attack_interval = 3.0
+                self.attack_key = "ctrl"
+
+            def set_key(self, key):
+                self.attack_key = key
+                return True
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.attack_worker = FakeAttackWorker()
+        worker._attack_mode_var = Var("yolo")
+        worker._fixed_interval_var = Var(3.0)
+        worker._fixed_attack_key_var = Var("ctrl")
+        worker._fixed_interval_label = Label()
+        worker._fixed_key_button = Button()
+        worker._fixed_status = Label()
+        worker._yolo_status = Label()
+        worker._yolo_panel = FakePanel()
+
+        worker._fixed_attack_key_var.set("shift")
+        worker._fixed_interval_var.set(2.5)
+        worker._attack_mode_var.set("fixed")
+
+        def fake_path(self):
+            return Path(tempfile.gettempdir()) / "test_fixed_grey_settings.json"
+
+        with mock.patch.object(UiWorker, "_fixed_settings_path", fake_path):
+            worker._fixed_on_mode_change()
+
+            # Fixed mode applied to the worker live.
+            self.assertTrue(worker.attack_worker.enabled)
+            self.assertEqual(worker.attack_worker.attack_interval, 2.5)
+            self.assertEqual(worker.attack_worker.attack_key, "shift")
+            # YOLO panel greyed out; status line reflects the mode.
+            for child in worker._yolo_panel.children:
+                self.assertIn(["disabled"], child.states)
+            self.assertIn("Fixed attack active", worker._fixed_status.text)
+            self.assertIn("every 2.5s", worker._fixed_status.text)
+
+            # Switching back to YOLO restores the panel and disables the worker.
+            worker._attack_mode_var.set("yolo")
+            worker._fixed_on_mode_change()
+            self.assertFalse(worker.attack_worker.enabled)
+            for child in worker._yolo_panel.children:
+                self.assertIn(["!disabled"], child.states)
+            self.assertIn("inactive", worker._fixed_status.text)
+
+    def test_fixed_attack_settings_roundtrip(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str = None, style: str = None) -> None:
+                if text is not None:
+                    self.text = text
+
+        class FakePanel:
+            def __init__(self) -> None:
+                self.children = []
+
+            def winfo_children(self):
+                return self.children
+
+        class FakeAttackWorker:
+            def __init__(self) -> None:
+                self.enabled = False
+                self.attack_interval = 3.0
+                self.attack_key = "ctrl"
+
+            def set_key(self, key):
+                self.attack_key = key
+                return True
+
+        def make_worker() -> UiWorker:
+            w = UiWorker.__new__(UiWorker)
+            w.attack_worker = FakeAttackWorker()
+            w._attack_mode_var = Var("yolo")
+            w._fixed_interval_var = Var(3.0)
+            w._fixed_attack_key_var = Var("ctrl")
+            w._fixed_interval_label = Label()
+            w._fixed_key_button = Button()
+            w._fixed_status = Label()
+            w._yolo_status = Label()
+            w._yolo_panel = FakePanel()
+            return w
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = make_worker()
+            worker._attack_mode_var.set("fixed")
+            worker._fixed_interval_var.set(4.5)
+            worker._fixed_attack_key_var.set("delete")
+
+            def fake_path(self):
+                return Path(directory) / "fixed_attack_settings.json"
+
+            with mock.patch.object(UiWorker, "_fixed_settings_path", fake_path):
+                worker._fixed_on_change()
+                saved = Path(directory) / "fixed_attack_settings.json"
+                self.assertTrue(saved.is_file())
+                data = json.loads(saved.read_text(encoding="utf-8"))
+                self.assertEqual(data["attack_mode"], "fixed")
+                self.assertEqual(data["interval_seconds"], 4.5)
+                self.assertEqual(data["attack_key"], "delete")
+
+                loader = make_worker()
+                with mock.patch.object(UiWorker, "_fixed_settings_path", fake_path):
+                    loader._fixed_load_settings()
+
+                self.assertEqual(loader._attack_mode_var.get(), "fixed")
+                self.assertEqual(loader._fixed_interval_var.get(), 4.5)
+                self.assertEqual(loader._fixed_attack_key_var.get(), "delete")
+                self.assertTrue(loader.attack_worker.enabled)
+                self.assertEqual(loader.attack_worker.attack_interval, 4.5)
+                self.assertEqual(loader.attack_worker.attack_key, "delete")
+
 
 if __name__ == "__main__":
     unittest.main()

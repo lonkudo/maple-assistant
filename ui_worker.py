@@ -348,6 +348,7 @@ class UiWorker(threading.Thread):
         structure_tracker: Optional[MapStructureTracker] = None,
         map_identity_store: Optional[MapIdentityStore] = None,
         status_worker: Any = None,
+        attack_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -367,6 +368,9 @@ class UiWorker(threading.Thread):
         # Status worker whose detector config the Drug panel edits live
         # (potions keys + trigger percents).
         self.status_worker = status_worker
+        # Fixed-rate attack worker (AttackWorker) the Fixed Attack panel
+        # toggles: enabled flag, interval and attack key are applied live.
+        self.attack_worker = attack_worker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -462,6 +466,9 @@ class UiWorker(threading.Thread):
 
             yolo_panel = ttk.LabelFrame(container, text="YOLO detection (maplestory-worlds-automation)", padding=10)
             yolo_panel.pack(fill="x", pady=(0, 8))
+            # Reference kept so the Fixed Attack panel can grey this whole
+            # panel out when the fixed-rate mode is selected.
+            self._yolo_panel = yolo_panel
             yolo_row = ttk.Frame(yolo_panel)
             yolo_row.pack(fill="x")
             ttk.Label(yolo_row, text="Threshold:").pack(side="left", padx=(0, 6))
@@ -644,6 +651,69 @@ class UiWorker(threading.Thread):
             self._yolo_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved YOLO panel settings (threshold, ranges).
             self._yolo_load_settings()
+
+            # Fixed Attack panel: choose the attack engine. Either the YOLO
+            # detection mode (mob detection + auto attack) or a fixed-rate
+            # attack that taps the attack key every N seconds. Selecting the
+            # fixed mode greys out the YOLO panel; the fixed worker lives in
+            # the assistant process (AttackWorker) and is applied live.
+            fixed_panel = ttk.LabelFrame(
+                container, text="Fixed Attack", padding=10
+            )
+            fixed_panel.pack(fill="x", pady=(0, 8))
+            mode_row = ttk.Frame(fixed_panel)
+            mode_row.pack(fill="x")
+            ttk.Label(mode_row, text="Attack Mode:").pack(
+                side="left", padx=(0, 8)
+            )
+            self._attack_mode_var = tk.StringVar(value="yolo")
+            ttk.Radiobutton(
+                mode_row, text="YOLO Detection", value="yolo",
+                variable=self._attack_mode_var,
+                command=self._fixed_on_mode_change,
+            ).pack(side="left", padx=(0, 12))
+            ttk.Radiobutton(
+                mode_row, text="Fixed Attack", value="fixed",
+                variable=self._attack_mode_var,
+                command=self._fixed_on_mode_change,
+            ).pack(side="left")
+            fixed_key_row = ttk.Frame(fixed_panel)
+            fixed_key_row.pack(fill="x", pady=(6, 0))
+            ttk.Label(fixed_key_row, text="Attack Key:").pack(
+                side="left", padx=(0, 4)
+            )
+            self._fixed_attack_key_var = tk.StringVar(value="ctrl")
+            fixed_key_button = ttk.Button(
+                fixed_key_row, text=self._fixed_attack_key_var.get(),
+                width=10, style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    fixed_key_button, self._fixed_attack_key_var,
+                    "_fixed_attack_key_previous",
+                    lambda: self._fixed_on_change(),
+                ),
+            )
+            fixed_key_button.pack(side="left", padx=(0, 10))
+            self._fixed_key_button = fixed_key_button
+            ttk.Label(fixed_key_row, text="Every").pack(side="left")
+            # Fixed attack period: horizontal slider (progress-bar style),
+            # 0.5-10 s, default 3 s.
+            self._fixed_interval_var = tk.DoubleVar(value=3.0)
+            fixed_interval_slider = ttk.Scale(
+                fixed_key_row, from_=0.5, to=10.0, orient="horizontal",
+                variable=self._fixed_interval_var,
+                command=self._fixed_on_change,
+            )
+            fixed_interval_slider.pack(side="left", fill="x",
+                                       expand=True, padx=(0, 8))
+            self._fixed_interval_label = ttk.Label(
+                fixed_key_row, text="3.0s", width=6
+            )
+            self._fixed_interval_label.pack(side="left")
+            self._fixed_status = ttk.Label(
+                fixed_panel, text="Fixed attack inactive.", justify="left"
+            )
+            self._fixed_status.pack(anchor="w", pady=(6, 0))
+            self._fixed_load_settings()
 
             # Drug (HP/MP potion) panel: key binds + percent trigger sliders.
             # The StatusWorker taps the bound key when the bar ratio drops
@@ -989,6 +1059,151 @@ class UiWorker(threading.Thread):
                 text=self._yolo_attack_key_var.get()
             )
         LOG.info("yolo settings loaded from %s", self._yolo_settings_path())
+
+    @staticmethod
+    def _fixed_settings_path() -> Path:
+        """JSON file holding the Fixed Attack panel settings."""
+
+        return Path(__file__).resolve().parent / "fixed_attack_settings.json"
+
+    def _fixed_collect_data(self) -> dict:
+        """Current Fixed Attack panel values as a settings dict."""
+
+        return {
+            "attack_mode": str(self._attack_mode_var.get()),
+            "interval_seconds": round(
+                float(self._fixed_interval_var.get()), 1
+            ),
+            "attack_key": self._fixed_attack_key_var.get().strip(),
+        }
+
+    def _fixed_on_change(self, _value: str = "") -> None:
+        """Update labels, persist, and apply the fixed-attack settings live."""
+
+        if not hasattr(self, "_fixed_interval_label"):
+            return
+        interval = float(self._fixed_interval_var.get())
+        self._fixed_interval_label.configure(text=f"{interval:.1f}s")
+        if hasattr(self, "_fixed_key_button"):
+            self._fixed_key_button.configure(
+                text=self._fixed_attack_key_var.get()
+            )
+        data = self._fixed_collect_data()
+        self._fixed_save_settings(data)
+        self._fixed_apply_to_worker(data)
+        self._fixed_refresh_grey()
+
+    def _fixed_on_mode_change(self) -> None:
+        """Attack mode radio changed: same as any other change."""
+
+        self._fixed_on_change()
+
+    def _fixed_save_settings(self, data: dict) -> None:
+        """Persist the Fixed Attack panel values to the local JSON file."""
+
+        try:
+            self._fixed_settings_path().write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            LOG.warning("could not save fixed attack settings", exc_info=True)
+
+    def _fixed_apply_to_worker(self, data: dict) -> None:
+        """Apply the fixed-attack settings to the AttackWorker live."""
+
+        worker = getattr(self, "attack_worker", None)
+        if worker is None:
+            self._fixed_status.configure(
+                text="Fixed attack: worker not wired (headless run)."
+            )
+            return
+        mode = str(data.get("attack_mode", "yolo"))
+        worker.enabled = bool(mode == "fixed")
+        worker.attack_interval = max(
+            0.25, float(data.get("interval_seconds", 3.0))
+        )
+        key = str(data.get("attack_key", "ctrl")).strip()
+        if not worker.set_key(key):
+            LOG.warning("fixed attack key %r unsupported; keeping %r",
+                        key, worker.attack_key)
+
+    def _fixed_refresh_grey(self) -> None:
+        """Grey the YOLO panel + update status lines for the active mode."""
+
+        fixed_mode = str(self._attack_mode_var.get()) == "fixed"
+        if fixed_mode:
+            # Only one attack engine at a time: selecting Fixed Attack stops
+            # a running YOLO detection subprocess.
+            proc = getattr(self, "_yolo_process", None)
+            if proc is not None and proc.poll() is None:
+                self._yolo_stop()
+        panel = getattr(self, "_yolo_panel", None)
+        if panel is not None:
+            self._set_panel_state(panel, fixed_mode)
+        if hasattr(self, "_fixed_status"):
+            if fixed_mode:
+                self._fixed_status.configure(
+                    text=(f"Fixed attack active - pressing "
+                          f"{self._fixed_attack_key_var.get()} every "
+                          f"{float(self._fixed_interval_var.get()):.1f}s. "
+                          "YOLO detection disabled.")
+                )
+            else:
+                self._fixed_status.configure(
+                    text="Fixed attack inactive - YOLO detection mode."
+                )
+        if hasattr(self, "_yolo_status"):
+            if fixed_mode:
+                self._yolo_status.configure(
+                    text="Disabled - Fixed Attack mode selected."
+                )
+            else:
+                self._yolo_status.configure(text="YOLO detection stopped.")
+
+    def _set_panel_state(self, panel: Any, disabled: bool) -> None:
+        """Enable/disable every widget inside *panel* (ttk or tk)."""
+
+        state = "disabled" if disabled else "!disabled"
+        for child in panel.winfo_children():
+            try:
+                child.state([state])
+            except Exception:
+                try:
+                    child.configure(
+                        state="disabled" if disabled else "normal"
+                    )
+                except Exception:
+                    pass
+
+    def _fixed_load_settings(self) -> None:
+        """Restore saved Fixed Attack panel values and apply them live."""
+
+        try:
+            data = json.loads(
+                self._fixed_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            data = {}
+        try:
+            if "attack_mode" in data:
+                mode = str(data["attack_mode"])
+                if mode in ("yolo", "fixed"):
+                    self._attack_mode_var.set(mode)
+            if "interval_seconds" in data:
+                self._fixed_interval_var.set(
+                    float(data["interval_seconds"])
+                )
+            if "attack_key" in data:
+                key = str(data["attack_key"]).strip()
+                if key in BINDABLE_KEYS:
+                    self._fixed_attack_key_var.set(key)
+        except (KeyError, TypeError, ValueError):
+            LOG.warning("ignored malformed fixed attack settings",
+                        exc_info=True)
+            return
+        self._fixed_on_change()
+        LOG.info("fixed attack settings loaded from %s",
+                 self._fixed_settings_path())
 
     @staticmethod
     def _drug_settings_path() -> Path:

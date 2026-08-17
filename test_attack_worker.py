@@ -25,6 +25,41 @@ class AttackWorkerTests(unittest.TestCase):
         self.assertTrue(worker.attack_once())
         self.assertEqual(sender.events, [("down", "ctrl"), ("up", "ctrl")])
 
+    def test_attack_once_uses_configured_key(self):
+        sender = FakeSender()
+        worker = AttackWorker(sender, threading.Event(), attack_key="shift")
+        self.assertTrue(worker.attack_once())
+        self.assertEqual(sender.events, [("down", "shift"), ("up", "shift")])
+
+    def test_set_key_validates_against_sender_scan_map(self):
+        class ScannedSender(FakeSender):
+            _SCAN = {"ctrl": (0x1D, False), "shift": (0x2A, False)}
+
+        worker = AttackWorker(ScannedSender(), threading.Event())
+        self.assertTrue(worker.set_key("Shift"))
+        self.assertEqual(worker.attack_key, "shift")
+        self.assertFalse(worker.set_key("home"))  # not in the fake scan map
+        self.assertEqual(worker.attack_key, "shift")
+
+    def test_unsupported_constructor_key_falls_back_to_ctrl(self):
+        class ScannedSender(FakeSender):
+            _SCAN = {"ctrl": (0x1D, False)}
+
+        worker = AttackWorker(ScannedSender(), threading.Event(),
+                              attack_key="nope")
+        self.assertEqual(worker.attack_key, "ctrl")
+
+    def test_disabled_worker_never_attacks(self):
+        sender = FakeSender()
+        stop = threading.Event()
+        worker = AttackWorker(sender, stop, .25, initial_offset=.25)
+        worker.enabled = False
+        worker.start()
+        time.sleep(.30)
+        stop.set()
+        worker.join(1)
+        self.assertEqual(sender.events, [])
+
     def test_timer_runs_without_frames(self):
         sender = FakeSender()
         stop = threading.Event()
