@@ -509,13 +509,17 @@ class UiWorker(threading.Thread):
                 side="left", padx=(10, 4)
             )
             self._yolo_attack_key_var = tk.StringVar(value="ctrl")
-            attack_key_entry = ttk.Entry(
-                attack_row, textvariable=self._yolo_attack_key_var, width=8
+            attack_key_button = ttk.Button(
+                attack_row, text=self._yolo_attack_key_var.get(), width=10,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    attack_key_button, self._yolo_attack_key_var,
+                    "_yolo_attack_key_previous",
+                    lambda: self._yolo_on_threshold_change(),
+                ),
             )
-            attack_key_entry.pack(side="left", padx=(0, 8))
-            attack_key_entry.bind(
-                "<KeyRelease>", self._yolo_on_threshold_change
-            )
+            attack_key_button.pack(side="left", padx=(0, 8))
+            self._yolo_attack_key_button = attack_key_button
             # Attack range: horizontal slider (progress-bar style) that sets the
             # width of the attack range line drawn on the detection window.
             range_row = ttk.Frame(yolo_panel)
@@ -625,8 +629,10 @@ class UiWorker(threading.Thread):
             self._hp_key_var = tk.StringVar(value="delete")
             hp_key_button = ttk.Button(
                 hp_row, text=self._hp_key_var.get(), width=14,
-                command=lambda: self._drug_key_capture_begin(
-                    hp_key_button, self._hp_key_var, "_hp_key_previous"
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    hp_key_button, self._hp_key_var, "_hp_key_previous",
+                    lambda: self._drug_on_change(),
                 ),
             )
             hp_key_button.pack(side="left", padx=(0, 10))
@@ -654,8 +660,10 @@ class UiWorker(threading.Thread):
             self._mp_key_var = tk.StringVar(value="end")
             mp_key_button = ttk.Button(
                 mp_row, text=self._mp_key_var.get(), width=14,
-                command=lambda: self._drug_key_capture_begin(
-                    mp_key_button, self._mp_key_var, "_mp_key_previous"
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    mp_key_button, self._mp_key_var, "_mp_key_previous",
+                    lambda: self._drug_on_change(),
                 ),
             )
             mp_key_button.pack(side="left", padx=(0, 10))
@@ -942,41 +950,45 @@ class UiWorker(threading.Thread):
     def _drug_settings_path() -> Path:
         return Path(__file__).resolve().parent / "drug_settings.json"
 
-    def _drug_key_capture_begin(
-        self, button: Any, var: tk.StringVar, previous_attr: str
+    def _bind_capture_begin(
+        self, button: Any, var: tk.StringVar, previous_attr: str,
+        on_change: Optional[Callable[[], None]] = None,
     ) -> None:
-        """Enter key-capture mode on one button press.
+        """Unlock a key button: one click arms it for recording.
 
-        The button is locked (disabled) while capturing; the next key press
-        anywhere binds it, Escape/unsupported keys restore the old binding.
+        The button shows "press a key..."; the NEXT key press records it,
+        Escape/unsupported keys restore the previous binding, and the button
+        returns to LOCKED mode (grey, shows the key).  A second click while
+        armed is ignored.
         """
 
-        if getattr(self, "_drug_capturing", False):
+        if getattr(self, "_key_capturing", False):
             return
-        self._drug_capturing = True
-        self._drug_capture_target = (button, var, previous_attr)
+        self._key_capturing = True
+        self._key_capture_target = (button, var, previous_attr, on_change)
         setattr(self, previous_attr, var.get())
-        button.configure(text="press a key...", state="disabled")
+        button.configure(text="press a key...", style="TButton")
         root = getattr(self, "_root", None)
         if root is not None:
-            root.bind("<KeyPress>", self._drug_capture_key_handler)
+            root.bind("<KeyPress>", self._key_capture_handler)
 
-    def _drug_capture_key_handler(self, event: Any) -> str:
-        """Bind the pressed key and unlock the button; show the result."""
+    def _key_capture_handler(self, event: Any) -> str:
+        """Record the pressed key and return the button to locked mode."""
 
-        target = getattr(self, "_drug_capture_target", None)
+        target = getattr(self, "_key_capture_target", None)
         if target is None:
             return ""
-        button, var, previous_attr = target
+        button, var, previous_attr, on_change = target
         key = keysym_to_scan_key(str(getattr(event, "keysym", "")))
         if key is not None:
             var.set(key)
-            self._drug_on_change()
+            if on_change is not None:
+                on_change()
         else:
             var.set(getattr(self, previous_attr, var.get()))
-        button.configure(text=var.get(), state="normal")
-        self._drug_capturing = False
-        self._drug_capture_target = None
+        button.configure(text=var.get(), style="Locked.TButton")
+        self._key_capturing = False
+        self._key_capture_target = None
         root = getattr(self, "_root", None)
         if root is not None:
             root.unbind("<KeyPress>")
@@ -1105,6 +1117,12 @@ class UiWorker(threading.Thread):
         value = round(float(self._yolo_threshold_var.get()), 2)
         self._yolo_threshold_var.set(value)
         self._yolo_threshold_label.configure(text=f"{value:.2f}")
+        # Keep the attack-key bind button label in sync (it is also invoked
+        # when a new attack key is recorded).
+        if hasattr(self, "_yolo_attack_key_button"):
+            self._yolo_attack_key_button.configure(
+                text=self._yolo_attack_key_var.get()
+            )
 
     def _yolo_on_range_change(self, _value: str = "") -> None:
         """Update the attack-range label as the slider moves."""
