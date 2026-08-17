@@ -37,6 +37,131 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_run_climb_step_releases_false_attach_on_noop_frame(self):
+        # The attached no-op decision (key=None) never entered the send
+        # block, so climb() (and the fell-back/stall release) never ran.
+        # _run_climb_step must be driven on no-op frames too.
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        worker = MovementWorker(queue.Queue(), sender, threading.Event(),
+                                important_positions={})
+        worker._climb_state = ClimbState(
+            phase="climbing-up", baseline_y=.66, up_held=True,
+            recent_y=[.66, .64, .645],
+        )
+        obs = MinimapObservation(Point(.48, .655), None, .9, (0, 0, 1, 1))
+        result = worker._run_climb_step(obs, None, None)
+        self.assertEqual(result, "climb-stalled-retry")
+        self.assertEqual(worker._climb_state.phase, "idle")
+        self.assertNotIn("up", sender.owned)
+
+    def test_walk_hold_releases_early_when_attack_takes_over(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from combat_coordination import AttackStateFile
+
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def is_target_focused(self): return True
+
+        tmp = Path(tempfile.mkdtemp()) / "attack_state.json"
+        attack = AttackStateFile(str(tmp))
+        attack.write(False)
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={}, attack_state_path=str(tmp),
+        )
+        # Full hold without attack: key down, held ~1s, key up.
+        started = time.monotonic()
+        self.assertTrue(worker._send_walk_hold(
+            MovementDecision("left", "walk", 1.0)))
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+        self.assertEqual(sender.events, [("down", "left"), ("up", "left")])
+        # Attack takes over mid-hold: the movement key must release early
+        # (~20ms) so the attack can turn the character and hit a monster
+        # behind it.
+        sender.events = []
+        attack.write(False)
+
+        def activate_attack():
+            time.sleep(0.1)
+            attack.write(True, (100.0, 100.0))
+
+        starter = threading.Thread(target=activate_attack)
+        starter.start()
+        started = time.monotonic()
+        self.assertTrue(worker._send_walk_hold(
+            MovementDecision("left", "walk", 2.0)))
+        elapsed = time.monotonic() - started
+        starter.join()
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(sender.events, [("down", "left"), ("up", "left")])
+        attack.write(False)
+
+    def test_walk_hold_pushes_through_when_attack_window_exceeded(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from combat_coordination import AttackStateFile
+
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def is_target_focused(self): return True
+
+        tmp = Path(tempfile.mkdtemp()) / "attack_state.json"
+        attack = AttackStateFile(str(tmp))
+        attack.write(True, (100.0, 100.0))  # target active
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={}, attack_state_path=str(tmp),
+            attack_block_max_seconds=0.3,
+        )
+        # The attack has already been active past its window: the patrol
+        # pushes through and the walk key is NOT released early.
+        worker._attack_active_since = time.monotonic() - 1.0
+        started = time.monotonic()
+        self.assertTrue(worker._send_walk_hold(
+            MovementDecision("left", "walk", 1.0)))
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+        self.assertEqual(sender.events, [("down", "left"), ("up", "left")])
+        attack.write(False)
+
+    def test_reset_route_loop_clears_dropping_flag(self):
+        # After the drop phase reaches layer1 a new loop starts - the
+        # dropping flag must clear, otherwise the patrol stays busy forever
+        # and the YOLO attack is blocked ("attack blocked: patrol
+        # climbing/dropping" - the character never attacks).
+        dropping = threading.Event()
+        dropping.set()
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer1": {
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }},
+            route_order=["layer1"], first_layer="layer1",
+            dropping_active_event=dropping,
+        )
+        self.assertTrue(dropping.is_set())
+        worker._reset_route_loop()
+        self.assertFalse(dropping.is_set())
+        self.assertEqual(worker._route_phase, "left")
+
     def test_rope_climb_triggers_inside_inner_gap_only(self):
         rope_x = .5
         in_band = MinimapObservation(
@@ -74,6 +199,24 @@ class MovementTests(unittest.TestCase):
 
         self.assertIsNone(protected.key)
         self.assertIn("Up remains held", protected.reason)
+
+    def test_walk_deferred_while_up_held_during_grab(self):
+        # Mid-grab (Up held, not attached yet): a walk decision must not
+        # reach the sender and release Up - that made the character stop at
+        # the middle of climbing.
+        state = ClimbState(phase="check-primary-up", up_held=True)
+        walk = MovementDecision("left", "minimap walk plan", 2.0)
+
+        protected = preserve_persistent_climb(state, walk)
+
+        self.assertIsNone(protected.key)
+        self.assertIn("Up remains held", protected.reason)
+        # Climb decisions still pass through so the state machine advances.
+        jump = MovementDecision("jump_climb_up", "yolo jump", 0.08)
+        self.assertEqual(preserve_persistent_climb(state, jump), jump)
+        # Once Up is released the walk is allowed again.
+        state.up_held = False
+        self.assertEqual(preserve_persistent_climb(state, walk), walk)
 
     def test_yolo_jump_decision_hands_climb_to_patrol(self):
         # Once the character is on the rope (climbing-up, Up held), even a
@@ -299,8 +442,9 @@ class MovementTests(unittest.TestCase):
             important_positions={}, rope_state_path=str(tmp),
             rope_jump_px=140.0, on_rope_px=50.0,
         )
-        # Character overlays the rope (gap 30px) WHILE CLIMBING (Up held):
-        # no-op decision, patrol keeps holding Up.
+        # Character overlays the rope (gap 30px) WHILE CLIMBING (attached,
+        # Up held): no-op decision, patrol keeps holding Up.
+        worker._climb_state.phase = "climbing-up"
         worker._climb_state.up_held = True
         state.write(True, rope_x=1310.0, char_x=1280.0)
         decision = worker._yolo_rope_action()
@@ -309,17 +453,23 @@ class MovementTests(unittest.TestCase):
         self.assertIn("on rope", decision.reason)
         # Idle character at the same gap must JUMP to grab the rope (the
         # original bug: idle + small gap waited forever at layer1).
-        worker._climb_state.up_held = False
-        worker._climb_state.phase = "idle"
+        worker._climb_state = ClimbState()
         decision = worker._yolo_rope_action()
         self.assertEqual(decision.key, "jump_climb_right")
-        # Just outside the dead zone while climbing (gap 60px): jump resumes.
-        worker._climb_state.up_held = True
+        # Mid-retry phase (failed grab, Up still held, still near the rope):
+        # NOT a no-op - the state machine must keep advancing (verification,
+        # retry chord, stall release), otherwise the character freezes.
+        worker._climb_state = ClimbState(phase="check-primary-up", up_held=True)
+        state.write(True, rope_x=1283.0, char_x=1280.0)  # gap +3px
+        decision = worker._yolo_rope_action()
+        self.assertEqual(decision.key, "jump_climb_up")
+        # Just outside the dead zone while attached (gap 60px): jump resumes.
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
         state.write(True, rope_x=1340.0, char_x=1280.0)
         decision = worker._yolo_rope_action()
         self.assertEqual(decision.key, "jump_climb_right")
 
-    def test_yolo_jump_direction_stable_for_tiny_gaps(self):
+    def test_yolo_under_rope_jumps_straight_up(self):
         import tempfile
         from pathlib import Path
         from combat_coordination import RopeStateFile
@@ -331,14 +481,67 @@ class MovementTests(unittest.TestCase):
             important_positions={}, rope_state_path=str(tmp),
             rope_jump_px=140.0, on_rope_px=50.0,
         )
-        # First jump right, then a tiny gap flips sign: direction must stay
-        # right (no left/right thrash on box noise).
-        state.write(True, rope_x=1340.0, char_x=1280.0)
+        # Far enough that a directional jump is required.
+        state.write(True, rope_x=1340.0, char_x=1280.0)  # gap +60px
         self.assertEqual(worker._yolo_rope_action().key, "jump_climb_right")
+        # Inside the +-10px center gap (box noise flips the sign): straight
+        # up, never a left/right chord.
         state.write(True, rope_x=1283.0, char_x=1280.0)  # gap +3px
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_up")
+        state.write(True, rope_x=1277.0, char_x=1280.0)  # gap -3px
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_up")
+        state.write(True, rope_x=1272.0, char_x=1280.0)  # gap -8px
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_up")
+        # Just outside the center gap: directional jump resumes.
+        state.write(True, rope_x=1265.0, char_x=1280.0)  # gap -15px
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_left")
+
+    def test_yolo_box_overlap_forces_straight_up_jump(self):
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import RopeStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "rope_state.json"
+        state = RopeStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, rope_state_path=str(tmp),
+            rope_jump_px=140.0, on_rope_px=50.0,
+        )
+        # Gap 30px (outside the 10px under-rope gap) but the character box
+        # horizontally overlaps the rope box: standing right under the rope
+        # -> must be a straight-up jump, never a left/right chord.
+        state.write(True, rope_x=1360.0, char_x=1330.0,
+                    rope_box=(1355.0, 100.0, 1365.0, 500.0),
+                    char_box=(1300.0, 600.0, 1360.0, 700.0))
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_up")
+        # No overlap and gap outside the under-rope band (but within jump
+        # range): directional jump.
+        state.write(True, rope_x=1420.0, char_x=1320.0,
+                    rope_box=(1415.0, 100.0, 1425.0, 500.0),
+                    char_box=(1300.0, 600.0, 1340.0, 700.0))
         self.assertEqual(worker._yolo_rope_action().key, "jump_climb_right")
-        state.write(True, rope_x=1277.0, char_x=1280.0)  # gap -3px (noise)
-        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_right")
+
+    def test_climb_failed_cycles_restart_route_at_left_most(self):
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, route_order=[],
+        )
+        worker._route_phase = "rope"
+        # Two failures: still trying at the rope.
+        self.assertFalse(worker._climb_cycle_failed())
+        self.assertFalse(worker._climb_cycle_failed())
+        self.assertEqual(worker._route_phase, "rope")
+        # Third consecutive failure: restart patrol from left-most so the
+        # character walks away and re-approaches the rope from the edge.
+        self.assertTrue(worker._climb_cycle_failed())
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(worker._climb_state.phase, "idle")
+        # A successful walk resets the counter: the next rope approach starts
+        # with a fresh budget of attempts.
+        worker._climb_failures = 2
+        worker._climb_cycle_reset()
+        self.assertFalse(worker._climb_cycle_failed())
 
     def test_patrol_busy_hysteresis_holds_after_idle_reset(self):
         import tempfile
@@ -388,8 +591,8 @@ class MovementTests(unittest.TestCase):
         self.assertFalse(worker._attack_state.is_active())
 
     def test_attack_defers_to_active_climb(self):
-        # Mid-climb (Up held): an active attack must NOT pause/release the
-        # climb - releasing Up stopped the character on the rope.
+        # Mid-climb (Up held, attached): an active attack must NOT pause/
+        # release the climb - releasing Up stopped the character on the rope.
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(),
             important_positions={},
@@ -397,7 +600,13 @@ class MovementTests(unittest.TestCase):
         worker._climb_state.phase = "climbing-up"
         worker._climb_state.up_held = True
         self.assertTrue(worker._attack_should_defer_to_climb())
-        # Idle: no deferral.
+        # Mid-grab after a jump (Up held, not attached yet): also defer -
+        # releasing Up mid-grab makes the character fall off the rope.
+        worker._climb_state.phase = "check-primary-up"
+        worker._climb_state.up_held = True
+        self.assertTrue(worker._attack_should_defer_to_climb())
+        # Idle, Up not held: no deferral - the attack keeps priority and the
+        # character fights instead of jumping in place.
         worker._climb_state.phase = "idle"
         worker._climb_state.up_held = False
         self.assertFalse(worker._attack_should_defer_to_climb())
@@ -652,6 +861,20 @@ class MovementTests(unittest.TestCase):
             "jump_climb_left",
         )
 
+    def test_rope_plan_walks_not_jumps_when_climb_not_allowed(self):
+        rope_x = .492647
+        in_band = MinimapObservation(
+            Point(rope_x - .005, .70), None, .9, (0, 0, 1, 1)
+        )
+        # Fresh YOLO owns the jump: the minimap plan inside the band must
+        # only walk (creep), never issue a jump that races the YOLO logic.
+        plan = move_towards_rope(in_band, rope_x, .0325, allow_climb=False)
+        self.assertEqual(plan.stage, "move-to-rope-edge")
+        self.assertEqual(plan.decision.key, "right")
+        # With climbing allowed the same position jumps straight up.
+        plan = move_towards_rope(in_band, rope_x, .0325, allow_climb=True)
+        self.assertEqual(plan.decision.key, "jump_climb_up")
+
     def test_directional_jump_holds_up_immediately_without_gap(self):
         class Sender:
             dry_run = True
@@ -676,6 +899,27 @@ class MovementTests(unittest.TestCase):
         sleep.assert_called_once_with(.10)
         self.assertEqual(sender.events[-1], ("press", "up", .45))
 
+    def test_under_rope_up_chord_is_alt_up_not_sideways(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def press(self, key, duration=0): self.events.append(("press", key, duration)); return True
+
+        sender, state = Sender(), ClimbState()
+        start = MinimapObservation(Point(.49, .70), None, .9, (0, 0, 1, 1))
+        with patch("movement_worker.time.sleep"):
+            result = climb(sender, start, state,
+                           preferred_direction="up", persistent_up=True)
+        self.assertEqual(result, "up-toward-rope")
+        # Alt+Up chord only - never a left/right key.
+        downs = [k for kind, k in sender.events if kind == "down"]
+        self.assertIn("up", downs)
+        self.assertIn("alt", downs)
+        self.assertNotIn("left", downs)
+        self.assertNotIn("right", downs)
+
     def test_persistent_climb_keeps_up_owned_until_next_layer(self):
         class Sender:
             dry_run = True
@@ -695,6 +939,11 @@ class MovementTests(unittest.TestCase):
                                    preferred_direction="right", persistent_up=True),
                              "right-toward-rope")
             self.assertIn("up", sender.owned)
+            # Attach needs 2 consecutive rising frames (marker Y up + X
+            # aligned): first frame confirms, second commits.
+            self.assertEqual(climb(sender, moving, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "holding-up-awaiting-progress")
             self.assertEqual(climb(sender, moving, state,
                                    preferred_direction="right", persistent_up=True),
                              "climbing-up")
@@ -722,11 +971,47 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(climb(sender, start, state,
                                    preferred_direction="right", persistent_up=True),
                              "right-toward-rope")
+            # Marker stays centered; world Y advances.  Confirmation needs
+            # 2 consecutive frames.
+            self.assertEqual(climb(sender, scrolling, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "holding-up-awaiting-progress")
             self.assertEqual(climb(sender, scrolling, state,
                                    preferred_direction="right", persistent_up=True),
                              "climbing-up")
         self.assertEqual(state.phase, "climbing-up")
         self.assertIn("up", sender.owned)
+
+    def test_attach_requires_marker_x_aligned_with_rope(self):
+        # The reported bug: marker Y/world Y rose, so the old Y-only check
+        # declared "attached" while the marker X was far from the rope X
+        # (0.50 vs rope 0.38) - the character stood on the ground holding Up
+        # forever.  Attach must require the minimap X to be close to the rope.
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender, state = Sender(), ClimbState()
+        start = MinimapObservation(Point(.50, .70), None, .9, (0, 0, 1, 1))
+        rose_but_misaligned = MinimapObservation(
+            Point(.50, .66), None, .9, (0, 0, 1, 1)  # X far from rope .38
+        )
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, start, state,
+                                   preferred_direction="right", persistent_up=True,
+                                   rope_x=.38),
+                             "right-toward-rope")
+            for _ in range(6):
+                result = climb(sender, rose_but_misaligned, state,
+                               preferred_direction="right",
+                               persistent_up=True, rope_x=.38)
+                # Never "attached" despite the rising Y: X is 0.12 away
+                # from the rope, so the character is NOT on it.
+                self.assertNotEqual(result, "climbing-up")
+        self.assertNotEqual(state.phase, "climbing-up")
 
     def test_stalled_world_y_releases_up_and_restarts_recovery(self):
         class Sender:
@@ -753,6 +1038,82 @@ class MovementTests(unittest.TestCase):
                          "climb-stalled-retry")
         self.assertEqual(state.phase, "idle")
         self.assertNotIn("up", sender.owned)
+
+    def test_stalled_screen_y_releases_up_and_restarts_recovery(self):
+        # No world-Y reference (structure_confidence 0): a failed grab fires
+        # the attach check mid-jump-arc, the marker falls back, and the Up
+        # key must be released so the character jumps again instead of
+        # freezing forever holding Up.
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        state = ClimbState(
+            phase="climbing-up",
+            baseline_y=.70,
+            up_held=True,
+        )
+        fell_back = MinimapObservation(
+            Point(.48, .70), None, .9, (0, 0, 1, 1)  # marker back at baseline
+        )
+        self.assertEqual(climb(sender, fell_back, state, persistent_up=True),
+                         "climbing-up")
+        self.assertEqual(climb(sender, fell_back, state, persistent_up=True),
+                         "climb-stalled-retry")
+        self.assertEqual(state.phase, "idle")
+        self.assertNotIn("up", sender.owned)
+
+    def test_marker_fell_back_from_jump_peak_releases_up_immediately(self):
+        # The 4-frame Y window: the marker rose to .64 then fell back (Y
+        # increasing again) - the grab failed, the character is NOT on the
+        # rope.  Up must be released immediately, not after the stall grace.
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        state = ClimbState(
+            phase="climbing-up",
+            baseline_y=.66,
+            up_held=True,
+            recent_y=[.66, .64, .645],  # peak .64, now descending
+        )
+        falling = MinimapObservation(Point(.48, .655), None, .9, (0, 0, 1, 1))
+        self.assertEqual(climb(sender, falling, state, persistent_up=True),
+                         "climb-stalled-retry")
+        self.assertEqual(state.phase, "idle")
+        self.assertNotIn("up", sender.owned)
+        self.assertEqual(state.recent_y, [])
+
+    def test_marker_still_rising_window_keeps_climbing(self):
+        # The window keeps decreasing (still rising): genuinely on the rope,
+        # Up stays held.
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        state = ClimbState(
+            phase="climbing-up",
+            baseline_y=.66,
+            up_held=True,
+            recent_y=[.66, .65, .64],
+        )
+        rising = MinimapObservation(Point(.48, .63), None, .9, (0, 0, 1, 1))
+        self.assertEqual(climb(sender, rising, state, persistent_up=True),
+                         "climbing-up")
+        self.assertEqual(state.phase, "climbing-up")
+        self.assertIn("up", sender.owned)
 
     def test_persistent_climb_waits_for_capture_lag_before_releasing_up(self):
         class Sender:
@@ -880,18 +1241,27 @@ class MovementTests(unittest.TestCase):
         self.assertTrue(worker._next_layer_reached(
             MinimapObservation(Point(.49, .565341), None, .9, (0, 0, 1, 1))))
 
-    def test_aligned_marker_keeps_last_approach_direction(self):
+    def test_aligned_marker_jumps_straight_up(self):
         rope_x = .492647
         aligned = MinimapObservation(Point(rope_x, .70), None, .9, (0, 0, 1, 1))
+        # Exactly under the rope: straight-up jump, never a left/right chord.
         self.assertEqual(
-            move_towards_rope(aligned, rope_x, .032500,
-                              aligned_direction="right").decision.key,
-            "jump_climb_right",
+            move_towards_rope(aligned, rope_x, .032500).decision.key,
+            "jump_climb_up",
         )
+        # Inside the +-0.01 center gap: still straight up.
+        close = MinimapObservation(Point(rope_x - .005, .70), None, .9,
+                                   (0, 0, 1, 1))
         self.assertEqual(
-            move_towards_rope(aligned, rope_x, .032500,
-                              aligned_direction="left").decision.key,
-            "jump_climb_left",
+            move_towards_rope(close, rope_x, .032500).decision.key,
+            "jump_climb_up",
+        )
+        # Outside the center gap (0.012): normal directional jump.
+        off = MinimapObservation(Point(rope_x - .012, .70), None, .9,
+                                 (0, 0, 1, 1))
+        self.assertEqual(
+            move_towards_rope(off, rope_x, .032500).decision.key,
+            "jump_climb_right",
         )
 
     def test_layer_route_is_left_then_right_then_rope(self):
@@ -1134,7 +1504,8 @@ class MovementTests(unittest.TestCase):
         aligned = MinimapObservation(Point(.5, .7), Point(.509, .7), .9, (0, 0, 1, 1))
         self.assertEqual(plan_movement(left).key, "left")
         self.assertEqual(plan_movement(left).duration, 2.0)
-        self.assertEqual(plan_movement(aligned).key, "jump_climb_right")
+        # Gap .009 is inside the +-0.01 center gap: straight up, not right.
+        self.assertEqual(plan_movement(aligned).key, "jump_climb_up")
 
     def test_direction_uses_configured_hold_duration(self):
         observation = MinimapObservation(Point(.2, .7), None, .9, (0, 0, 1, 1))
@@ -1199,7 +1570,8 @@ class MovementTests(unittest.TestCase):
         observation = MinimapObservation(Point(.70, .70), None, .90, (0, 0, 1, 1))
         self.assertEqual(plan_movement(observation, fixed_target_x=.25).key, "left")
         aligned = MinimapObservation(Point(.251, .70), None, .90, (0, 0, 1, 1))
-        self.assertEqual(plan_movement(aligned, fixed_target_x=.25).key, "jump_climb_left")
+        self.assertEqual(plan_movement(aligned, fixed_target_x=.25).key,
+                         "jump_climb_up")
 
     def test_capture_frame_contract(self):
         # This intentionally uses the integration's immutable frame wrapper.
@@ -1389,9 +1761,11 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(plan_movement(
             outside, fixed_target_x=target, horizontal_tolerance=.0025,
             final_calculation_distance=.0025).key, "right")
+        # Inside the tight rope range the character is under the rope:
+        # the jump is straight up, not a right chord.
         self.assertEqual(plan_movement(
             inside, fixed_target_x=target, horizontal_tolerance=.0025,
-            final_calculation_distance=.0025).key, "jump_climb_right")
+            final_calculation_distance=.0025).key, "jump_climb_up")
 
 
 if __name__ == "__main__":

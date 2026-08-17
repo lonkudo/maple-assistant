@@ -1,4 +1,4 @@
-"""Tests for character detection and attack decisions (no model needed).
+﻿"""Tests for character detection and attack decisions (no model needed).
 
 These tests import ``auto`` (which needs torch/ultralytics), so they run
 under the yolo venv::
@@ -223,7 +223,7 @@ class AttackExecutorTests(unittest.TestCase):
         char = make_detection("character", 400, 400)
         right = make_detection("mob", 600, 400)
         self.assertTrue(ex.attack(char, right))
-        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
+        self.assertEqual(ex._taps, [("right", 0.10), ("ctrl", 0.1)])
 
     def test_attack_turns_when_patrol_moved_character(self):
         # Patrol walked the character left (publishing facing=left), then a
@@ -247,7 +247,7 @@ class AttackExecutorTests(unittest.TestCase):
         state.write(False, "left", "left")
         # Monster still on the right: the turn tap must fire every attack.
         self.assertTrue(ex.attack(char, right))
-        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
+        self.assertEqual(ex._taps, [("right", 0.10), ("ctrl", 0.1)])
         self.assertEqual(ex._facing, "right")
 
     def test_attack_always_turns_toward_target(self):
@@ -259,7 +259,7 @@ class AttackExecutorTests(unittest.TestCase):
         # Every attack turns toward the target first - never trust a cached
         # facing to skip the turn (the game is the source of truth).
         self.assertTrue(ex.attack(char, left))
-        self.assertEqual(ex._taps, [("left", 0.08), ("ctrl", 0.1)])
+        self.assertEqual(ex._taps, [("left", 0.10), ("ctrl", 0.1)])
 
     def test_attack_respects_cooldown(self):
         ex = self._executor(cooldown=10.0)
@@ -308,7 +308,7 @@ class AttackExecutorTests(unittest.TestCase):
         char = make_detection("character", 400, 400)
         mob = make_detection("mob", 600, 400)
         self.assertTrue(ex.attack(char, mob))
-        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
+        self.assertEqual(ex._taps, [("right", 0.10), ("ctrl", 0.1)])
 
     def test_reset_facing_forgets_direction(self):
         ex = self._executor(cooldown=0.0, turn_settle=0.0)
@@ -319,7 +319,7 @@ class AttackExecutorTests(unittest.TestCase):
         ex._taps.clear()
         # Facing forgotten: turns right again before attacking.
         self.assertTrue(ex.attack(char, right))
-        self.assertEqual(ex._taps, [("right", 0.08), ("ctrl", 0.1)])
+        self.assertEqual(ex._taps, [("right", 0.10), ("ctrl", 0.1)])
 
     def test_failed_injection_returns_false_and_logs(self):
         ex = self._executor(cooldown=0.0)
@@ -591,3 +591,4 @@ class FullClassDetectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -130,7 +130,7 @@ class AttackExecutor:
         window_title: str,
         *,
         attack_key: str = "ctrl",
-        face_hold: float = 0.08,
+        face_hold: float = 0.10,
         attack_hold: float = 0.1,
         cooldown: float = 0.6,
         refocus_interval: float = 3.0,

@@ -86,14 +86,27 @@ Per frame:
    - walking to an endpoint → `left` / `right` tap (calculated hold)
    - final layer done → drop through platforms down to first layer
      (`_descending_to_first` flag suppresses resync hijack until layer1)
-   - **rope approach**: YOLO asked FIRST via `_yolo_rope_action()`:
-     - |gap| <= on_rope_px  → no-op decision → patrol's climb state holds Up
-     - on_rope < |gap| <= jump_px → `jump_climb_left/right` (screen-based)
-     - gap too large / stale → minimap `move_towards_rope` walk plan
-   - climb: `climb()` runs the directional jump chord, then `persistent_up`
-     holds Up; `preserve_persistent_climb` keeps Up held while climbing;
-     stall detection releases Up if world-Y stops advancing.
-6. Publish `patrol_state.json` (busy = climbing/dropping).
+   - **rope approach** — two exclusive modes, one gate:
+     - **JUMP-TO-ROPE** fires ONLY when the minimap patrol zone says the
+       character is in the jumping zone (`inside_rope_zone` = inner band).
+       The YOLO screen gap never triggers a jump on its own; it only picks
+       the direction when fresh: |gap| <= under_rope_px → `jump_climb_up`
+       (straight Alt+Up); under_rope < |gap| <= jump_px →
+       `jump_climb_left/right`; attached on rope → no-op, patrol holds Up.
+       YOLO stale → minimap band jump (allow_climb=True).
+     - **MOVE-TO-ROPE** (outside the zone): walk only - short creep taps
+       (`rope_approach_creep_seconds`, default 0.25s, shorter near the
+       window) with `allow_climb=False` so it can never jump early.
+     - While the climb state machine owns Up (`up_held`), walk proposals
+       are deferred (`preserve_persistent_climb`) and the attack waits
+       (`_attack_should_defer_to_climb`) - releasing Up mid-grab/mid-climb
+       made the character fall off the rope.
+   - climb: `climb()` runs the jump chord (straight Alt+Up when under the
+     rope, else the directional chord), then `persistent_up` holds Up;
+     `preserve_persistent_climb` keeps Up held while climbing; stall
+     detection releases Up if world-Y stops advancing.
+6. Publish `patrol_state.json` (busy = attached on rope or dropping only;
+   moving to the rope and jump attempts leave attack free).
 7. Send the movement key through the shared WindowKeySender (foreground
    checked; dry-run safe).
 
@@ -127,10 +140,11 @@ mob/character/rope sensing on the main screen.
 patrol walks layer1 left→right → reaches rope zone
   → YOLO sees rope: gap in range → jump_climb (screen direction)
   → character on rope (gap <= on_rope) → YOLO silent, patrol holds Up
-  → climbs to layer2 (patrol_state busy → attack blocked)
+  → climbs to layer2 (patrol_state busy → attack blocked ONLY while
+    attached on the rope / dropping; moving and jumping keep attack priority)
   → layer2 patrol, etc. → final layer → drop down to layer1 → repeat
-any mob in range while walking:
-  → attack_state active → patrol pauses movement
+any mob in range while walking (or while moving/jumping to the rope):
+  → attack_state active → patrol pauses movement (unless attached on rope)
   → executor faces, presses Ctrl, clears target
   → target gone → patrol resumes
 ```

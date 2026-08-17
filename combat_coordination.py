@@ -183,8 +183,21 @@ class RopeStateFile:
         rope_y: Optional[float] = None,
         char_x: Optional[float] = None,
         char_y: Optional[float] = None,
+        rope_box: Optional[tuple] = None,
+        char_box: Optional[tuple] = None,
     ) -> None:
-        """Persist the current rope state (atomic temp+rename)."""
+        """Persist the current rope state (atomic temp+rename).
+
+        ``rope_box``/``char_box`` are (x1, y1, x2, y2) screen boxes; the
+        patrol worker uses their X extents to detect "right under the rope"
+        by horizontal box overlap (the center gap can read 10-40px from
+        box-center offsets even when the character stands directly under).
+        """
+
+        def _box_pair(box: Optional[tuple]) -> Optional[list]:
+            if box is None:
+                return None
+            return [float(v) for v in box[:4]]
 
         data = {
             "visible": bool(visible),
@@ -193,6 +206,8 @@ class RopeStateFile:
             "rope_y": float(rope_y) if rope_y is not None else None,
             "char_x": float(char_x) if char_x is not None else None,
             "char_y": float(char_y) if char_y is not None else None,
+            "rope_box": _box_pair(rope_box),
+            "char_box": _box_pair(char_box),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
@@ -237,3 +252,22 @@ class RopeStateFile:
         if rx is None or cx is None:
             return None
         return float(rx) - float(cx)
+
+    def x_overlap(self) -> bool:
+        """True when the character box X-range overlaps the rope box X-range.
+
+        Standing directly under the rope the character's box overlaps the
+        thin rope box horizontally, even though the box CENTERS can differ
+        by 10-40px (which would wrongly suggest a sideways jump).
+        """
+
+        data = self.read()
+        if not data or not data.get("visible"):
+            return False
+        rope_box = data.get("rope_box")
+        char_box = data.get("char_box")
+        if not rope_box or not char_box:
+            return False
+        rx1, _, rx2, _ = rope_box
+        cx1, _, cx2, _ = char_box
+        return bool(cx1 <= rx2 and rx1 <= cx2)

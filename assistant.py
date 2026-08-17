@@ -104,9 +104,9 @@ def parse_args() -> argparse.Namespace:
                         help="seconds between Ctrl attacks (default: 2)")
     parser.add_argument("--enable-attack", action="store_true",
                         help="enable the independent Ctrl attack worker (off by default)")
-    parser.add_argument("--pickup-interval", type=float, default=1.0,
-                        help="seconds between Z pickup taps while patrolling "
-                             "(default: 1.0; 0 disables pickup)")
+    parser.add_argument("--pickup-interval", type=float, default=0.2,
+                        help="pickup Z hold length in seconds while walking "
+                             "(default: 0.2; 0 disables pickup)")
     parser.add_argument("--dry-run", action="store_true",
                         help="analyze/log only; default sends keyboard events")
     parser.add_argument("--debug-dir", type=Path)
@@ -175,6 +175,7 @@ def main() -> int:
     climbing_active = threading.Event()
     dropping_active = threading.Event()
     moving_active = threading.Event()
+    pickup_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -328,6 +329,7 @@ def main() -> int:
             dropping_active_event=dropping_active,
             automation_active_event=automation_active,
             moving_active_event=moving_active,
+            pickup_active_event=pickup_active,
         ))
     core_workers = [
         capture_worker,
@@ -373,6 +375,12 @@ def main() -> int:
             climb_failed_shift_right_seconds=float(
                 calibration.get("climb_failed_shift_right_seconds", 0.01)
             ),
+            climb_attempt_interval_seconds=float(
+                calibration.get("climb_attempt_interval_seconds", 1.0)
+            ),
+            climb_failed_cycles_reset=int(
+                calibration.get("climb_failed_cycles_reset", 3)
+            ),
             near_rope_seconds=float(calibration.get("near_rope_seconds", 0.5)),
             near_rope_range=float(rope_profile["near_range"]),
             near_rope_inner_range=float(
@@ -398,8 +406,12 @@ def main() -> int:
             structure_tracker=structure_tracker,
             automation_active_event=automation_active,
             moving_active_event=moving_active,
+            pickup_active_event=pickup_active,
             attack_state_path=str(
                 Path(__file__).with_name("work") / "attack_state.json"
+            ),
+            attack_block_max_seconds=float(
+                calibration.get("attack_block_max_seconds", 4.0)
             ),
             rope_state_path=str(
                 Path(__file__).with_name("work") / "rope_state.json"
@@ -409,6 +421,15 @@ def main() -> int:
             ),
             rope_jump_px=float(
                 map_profile.get("rope", {}).get("jump_px", 140)
+            ),
+            on_rope_px=float(
+                map_profile.get("rope", {}).get("on_rope_px", 50)
+            ),
+            under_rope_px=float(
+                map_profile.get("rope", {}).get("under_rope_px", 10)
+            ),
+            rope_approach_creep_seconds=float(
+                calibration.get("rope_approach_creep_seconds", 0.25)
             ),
         ),
         StatusWorker(

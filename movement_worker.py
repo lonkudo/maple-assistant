@@ -9,7 +9,7 @@ the sender remains responsible for checking/focusing the configured window.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import logging
 import queue
 import threading
@@ -183,8 +183,9 @@ def move_towards_rope(
     observation: MinimapObservation,
     rope_x: float,
     near_range: float,
-    aligned_direction: Optional[str] = None,
     inner_range: float = 0.0,
+    under_rope_tolerance: float = 0.01,
+    allow_climb: bool = True,
     **movement_options: Any,
 ) -> RopeMovementPlan:
     """Move into the inner rope band, then jump inward from within it.
@@ -192,6 +193,16 @@ def move_towards_rope(
     Only the inner gap gates the climb attempt: the outer honey-zone band is
     removed.  Outside the inner band the character simply walks toward the
     band edge; there is no "back away" stage.
+
+    When the character is right under the rope (|gap| <= under_rope_tolerance,
+    default +-0.01 minimap units) the climb is a straight jump up
+    (``jump_climb_up``) instead of a left/right chord - a directional jump
+    from directly under the rope just pushes the character past it.
+
+    ``allow_climb=False`` (used while the YOLO screen gap is fresh and owns
+    the jump decision) makes the inside-band case a short creep walk toward
+    the rope instead of a jump, so the minimap plan can never race the YOLO
+    jump logic.
     """
 
     player = observation.player
@@ -216,9 +227,31 @@ def move_towards_rope(
         )
 
     if absolute_gap <= band + 1e-9:
-        direction = "right" if rope_gap > 1e-9 else "left" if rope_gap < -1e-9 else aligned_direction
-        if direction not in ("left", "right"):
-            direction = "right"
+        if not allow_climb:
+            # Fresh YOLO owns the jump decision: the minimap plan must only
+            # walk here, creeping toward the rope center so the character
+            # enters the screen-gap jump window.  A minimap jump issued from
+            # inside this band would race the YOLO jump (the two coordinate
+            # systems disagree near the rope).
+            direction = "right" if rope_gap > 1e-9 else "left"
+            return RopeMovementPlan(
+                "move-to-rope-edge", player, rope_x, rope_gap,
+                MovementDecision(
+                    direction,
+                    f"inside band; creep {direction} into jump range",
+                    float(movement_options.get("minimum_final_hold_seconds", 0.08)),
+                ),
+            )
+        if absolute_gap <= under_rope_tolerance + 1e-9:
+            return RopeMovementPlan(
+                "climb", player, rope_x, rope_gap,
+                MovementDecision(
+                    "jump_climb_up",
+                    "right under rope; jump straight up",
+                    float(movement_options.get("minimum_final_hold_seconds", 0.08)),
+                ),
+            )
+        direction = "right" if rope_gap > 1e-9 else "left"
         return RopeMovementPlan(
             "climb", player, rope_x, rope_gap,
             MovementDecision(
@@ -281,6 +314,8 @@ class ClimbState:
     failed_shift_used: bool = False
     up_held: bool = False
     progress_check_frames: int = 0
+    attach_frames: int = 0
+    recent_y: list[float] = field(default_factory=list)
     target_layer_frames: int = 0
     target_layer_since: Optional[float] = None
     last_world_y: Optional[float] = None
@@ -291,9 +326,23 @@ def preserve_persistent_climb(
     state: ClimbState,
     proposed: MovementDecision,
 ) -> MovementDecision:
-    """Never let a horizontal recalculation cancel an attached rope climb."""
+    """Never let a horizontal recalculation cancel an attached rope climb.
 
-    if state.phase in ("climbing-up", "arrival-compensation") and state.up_held:
+    While the climb state machine owns the Up key (``up_held``), a walk
+    decision must not release it mid-grab/mid-climb - the character would
+    fall off the rope.  Walk proposals are deferred; climb/jump proposals
+    pass through so the state machine keeps advancing (verification,
+    retries, stall detection).
+    """
+
+    if not state.up_held:
+        return proposed
+    if proposed.key in ("left", "right"):
+        return MovementDecision(
+            None,
+            "Up remains held; horizontal walk deferred until climb resolves",
+        )
+    if state.phase in ("climbing-up", "arrival-compensation"):
         return MovementDecision(
             None,
             "Up remains held until the next recorded layer is confirmed",
@@ -396,12 +445,24 @@ def climb(
     preferred_direction: Optional[str] = None,
     failed_cycle_right_seconds: float = 0.01,
     persistent_up: bool = False,
+    rope_x: Optional[float] = None,
+    rope_x_tolerance: float = 0.025,
+    climb_attach_frames: int = 2,
 ) -> str:
     """Try to grab the rope and verify it from the next minimap screenshot.
 
-    There is no centered Alt+Up attempt. The first attempt is always a
-    simultaneous directional jump toward the rope. Screenshots between
-    attempts verify upward Y; failure then tries the opposite direction.
+    The first attempt is the jump appropriate to the character's position:
+    a straight Alt+Up jump when directly under the rope (preferred_direction
+    ``"up"``), otherwise a simultaneous directional jump toward the rope.
+    Screenshots between attempts verify upward Y; failure then tries the
+    opposite direction.
+
+    "Attached" is verified from the MINIMAP, never from Y alone: the yellow
+    diamond's X must be close to the rope X (``rope_x`` within
+    ``rope_x_tolerance``) AND it must rise (upward Y) for
+    ``climb_attach_frames`` consecutive frames.  A Y-only check falsely
+    attached while the character stood beside the rope (world-Y tracker
+    noise) and froze it holding Up on the ground.
     """
 
     player = observation.player
@@ -419,7 +480,10 @@ def climb(
             return send_all()
 
     if state.phase == "idle":
-        direction = preferred_direction if preferred_direction in ("left", "right") else "left"
+        direction = (
+            preferred_direction
+            if preferred_direction in ("left", "right", "up") else "left"
+        )
         def jump_toward() -> bool:
             return _directional_jump_climb(
                 sender, direction, nudge_duration, climb_duration, persistent_up
@@ -439,6 +503,8 @@ def climb(
             state.phase = next_phase
             state.up_held = persistent_up
             state.progress_check_frames = 0
+            state.attach_frames = 0
+            state.recent_y = []
             state.last_world_y = state.baseline_world_y
             state.stalled_frames = 0
             return result
@@ -469,7 +535,42 @@ def climb(
     if persistent_up and state.up_held and state.phase == "arrival-compensation":
         return "arrival-compensation"
 
+    # 4-frame marker-Y window for the ON-ROPE check: if the marker falls
+    # back from its recent peak (Y increases again), the grab failed and the
+    # character is NOT on the rope - never confirm/keep "climbing" then.
+    if persistent_up and state.up_held:
+        if observation.player is not None:
+            state.recent_y.append(player.y)
+            if len(state.recent_y) > 4:
+                state.recent_y.pop(0)
+        fell_back = bool(
+            len(state.recent_y) >= 2
+            and observation.player is not None
+            and player.y >= min(state.recent_y) + y_change_required
+        )
+    else:
+        fell_back = False
+
     if persistent_up and state.up_held and state.phase == "climbing-up":
+        if fell_back:
+            # The marker descended from its jump peak: the grab failed and
+            # the character fell back.  Release Up immediately and restart
+            # the recovery - holding Up here froze the character under the
+            # rope after a failed jump.
+            key_up = getattr(sender, "key_up", None)
+            if key_up is not None:
+                key_up("up")
+            state.phase = "idle"
+            state.baseline_y = None
+            state.baseline_world_y = None
+            state.up_held = False
+            state.progress_check_frames = 0
+            state.attach_frames = 0
+            state.last_world_y = None
+            state.stalled_frames = 0
+            state.recent_y = []
+            LOG.warning("CLIMB grab failed: marker fell back; restarting recovery")
+            return "climb-stalled-retry"
         if (observation.world_y_diamonds is not None
                 and observation.structure_confidence >= 0.12):
             if state.last_world_y is not None:
@@ -494,28 +595,79 @@ def climb(
                     "CLIMB stalled: world Y stopped advancing; restarting rope recovery"
                 )
                 return "climb-stalled-retry"
+        else:
+            # No reliable world-Y reference: fall back to screen Y.  The
+            # attach check can fire mid-jump-arc (the marker rises then falls
+            # back on a failed grab); without this stall the Up key stays
+            # held forever and the character never jumps again.
+            if baseline is None or baseline - player.y >= y_change_required:
+                state.stalled_frames = 0
+            else:
+                state.stalled_frames += 1
+                if state.stalled_frames >= max(1, int(world_y_stall_frames)):
+                    key_up = getattr(sender, "key_up", None)
+                    if key_up is not None:
+                        key_up("up")
+                    state.phase = "idle"
+                    state.baseline_y = None
+                    state.baseline_world_y = None
+                    state.up_held = False
+                    state.progress_check_frames = 0
+                    state.last_world_y = None
+                    state.stalled_frames = 0
+                    LOG.warning(
+                        "CLIMB stalled: screen Y stopped advancing; "
+                        "restarting rope recovery"
+                    )
+                    return "climb-stalled-retry"
         return "climbing-up"
 
     if persistent_up and state.up_held:
         state.progress_check_frames += 1
+        # ATTACH = minimap marker horizontally aligned with the rope AND
+        # rising (upward Y) for climb_attach_frames consecutive frames.
+        # Y-only checks falsely "attached" while the character stood beside
+        # the rope (world-Y tracker noise) and froze it holding Up.
+        if rope_x is not None and observation.player is not None:
+            x_gap = abs(observation.player.x - rope_x)
+            x_aligned = x_gap <= rope_x_tolerance
+        else:
+            x_gap = None
+            x_aligned = True
+        marker_rising = (
+            baseline is not None
+            and baseline - player.y >= y_change_required
+        )
         if (state.baseline_world_y is not None
                 and observation.world_y_diamonds is not None
                 and observation.structure_confidence >= 0.12):
-            upward_progress = (
+            world_progress = (
                 state.baseline_world_y - observation.world_y_diamonds
             )
-            attached = upward_progress >= world_y_change_required
-            progress_detail = f"world Y +{upward_progress:.3f} diamonds"
+            world_rising = world_progress >= world_y_change_required
+            progress_detail = f"world Y +{world_progress:.3f} diamonds"
         else:
-            upward_progress = baseline - player.y if baseline is not None else 0.0
-            attached = upward_progress >= y_change_required
-            progress_detail = f"screen Y +{upward_progress:.6f}"
-        if attached:
-            state.phase = "climbing-up"
-            state.last_world_y = observation.world_y_diamonds
-            state.stalled_frames = 0
-            LOG.info("CLIMB attached: keeping Up held (%s)", progress_detail)
-            return "climbing-up"
+            world_progress = 0.0
+            world_rising = False
+            progress_detail = (
+                f"screen Y +{baseline - player.y:.6f}"
+                if baseline is not None else "screen Y n/a"
+            )
+        if x_aligned and (marker_rising or world_rising) and not fell_back:
+            state.attach_frames += 1
+            if state.attach_frames >= max(1, int(climb_attach_frames)):
+                state.phase = "climbing-up"
+                state.last_world_y = observation.world_y_diamonds
+                state.stalled_frames = 0
+                LOG.info(
+                    "CLIMB attached: keeping Up held (x_gap=%s %s)",
+                    f"{x_gap:.4f}" if x_gap is not None else "n/a",
+                    progress_detail,
+                )
+                return "climbing-up"
+            # First confirmation frame: keep Up held, verify again next frame.
+            return "holding-up-awaiting-progress"
+        state.attach_frames = 0
         # Phase-correlation and the game animation can lag the jump chord by
         # several minimap frames. Keep Up owned during that grace period;
         # releasing it on the first centered-diamond frame makes the character
@@ -532,10 +684,14 @@ def climb(
     if state.phase == "climbing-up":
         return "climbing-up"
 
-    if state.phase in ("check-right", "check-primary-right", "check-primary-left"):
+    if state.phase in (
+        "check-right", "check-primary-right", "check-primary-left",
+        "check-primary-up",
+    ):
         # Recalculate from the newest screenshot. Never blindly reverse the
         # prior jump: if the character remains left of the rope, retry Right;
-        # if it is now right of the rope, retry Left.
+        # if it is now right of the rope, retry Left.  A failed straight-up
+        # jump degrades to a Right chord (matches the old aligned default).
         if preferred_direction in ("left", "right"):
             retry_direction = preferred_direction
         else:
@@ -561,6 +717,8 @@ def climb(
             state.phase = "check-opposite"
             state.up_held = persistent_up
             state.progress_check_frames = 0
+            state.attach_frames = 0
+            state.recent_y = []
             state.last_world_y = state.baseline_world_y
             state.stalled_frames = 0
             return f"{retry_direction}-retry-toward-rope"
@@ -572,6 +730,7 @@ def climb(
         state.phase = "idle"
         state.baseline_y = None
         state.baseline_world_y = None
+        state.up_held = False
         state.progress_check_frames = 0
         state.last_world_y = None
         state.stalled_frames = 0
@@ -752,6 +911,7 @@ def plan_movement(
     estimated_final_speed: float = 0.205,
     final_move_safety_gain: float = 0.95,
     jump_when_near: bool = True,
+    under_rope_tolerance: float = 0.01,
 ) -> MovementDecision:
     if observation.player is None or observation.confidence < minimum_confidence:
         return MovementDecision(None, "yellow marker missing or uncertain")
@@ -765,9 +925,16 @@ def plan_movement(
     comparison_epsilon = 1e-9
     if abs(delta_x) <= horizontal_tolerance + comparison_epsilon:
         if jump_when_near:
-            # The route approaches the rope from the right after completing
-            # right-most, so an exactly aligned/coarsely quantized marker uses
-            # a leftward chord rather than the removed centered jump.
+            # Right under the rope (within the tiny under-rope band) the
+            # character jumps straight up - a left/right chord from directly
+            # under the rope shoves it past the rope.  Slightly off-center it
+            # still jumps toward the rope side.
+            if abs(delta_x) <= under_rope_tolerance + comparison_epsilon:
+                return MovementDecision(
+                    "jump_climb_up",
+                    "right under rope; jump straight up",
+                    minimum_final_hold_seconds,
+                )
             direction = "right" if delta_x > 0 else "left"
             return MovementDecision(
                 f"jump_climb_{direction}",
@@ -871,6 +1038,88 @@ def _send_tap(sender: Any, decision: MovementDecision) -> bool:
 class MovementWorker(threading.Thread):
     """Consume only the newest frame and issue at most one short tap per frame."""
 
+    def _run_climb_step(
+        self,
+        observation: MinimapObservation,
+        route_target_x: Optional[float],
+        preferred_direction: Optional[str],
+    ) -> str:
+        """Advance the persistent climb state machine one frame."""
+
+        result = climb(
+            self.key_sender,
+            observation,
+            self._climb_state,
+            climb_duration=self.climb_up_hold_seconds,
+            nudge_duration=self.climb_nudge_seconds,
+            y_change_required=self.climb_y_change_required,
+            world_y_change_required=self.climb_world_y_change_required,
+            world_y_stall_change_required=(
+                self.climb_world_y_stall_change_required
+            ),
+            world_y_stall_frames=self.climb_world_y_stall_frames,
+            action_lock=self.climb_attack_lock,
+            preferred_direction=preferred_direction,
+            failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,
+            persistent_up=True,
+            rope_x=route_target_x,
+        )
+        LOG.info("climb recovery state: %s", result)
+        if result == "succeeded" and self._route_layers:
+            self._advance_after_climb()
+            self._climb_cycle_reset()
+        elif result == "failed-cycle-no-more-shift":
+            # Both jump directions failed and the one-time correction is
+            # used up: a stuck-under-the-rope character restarts the route
+            # at left-most after a few cycles instead of jumping in place.
+            self._climb_cycle_failed()
+        return result
+
+    def _send_walk_hold(self, decision: MovementDecision) -> bool:
+        """Hold a walk key, releasing EARLY when the YOLO attack takes over.
+
+        Patrol walk taps can run for up to ``movement_hold_seconds`` (2s); a
+        blocking hold would keep the character walking while the attack tries
+        to face a monster behind it.  This hold polls the attack state and
+        releases the movement key within ~20ms of the attack selecting a
+        target, so the attack logic can turn the character and attack; patrol
+        resumes on the next frame after the target clears (the top-of-loop
+        attack gate skips movement while the attack is active).
+        """
+
+        if decision.key not in ("left", "right"):
+            return _send_tap(self.key_sender, decision)
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning("movement suppressed: target window is not safely selected")
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_down is None or key_up is None:
+            return _send_tap(self.key_sender, decision)
+        claimed = key_down(decision.key) is not False
+        if not claimed:
+            return False
+        deadline = time.monotonic() + max(0.01, float(decision.duration))
+        try:
+            while time.monotonic() < deadline:
+                if self.stop_event.is_set():
+                    break
+                if self._attack_state is not None:
+                    attack_now = self._attack_state.is_active()
+                    if attack_now:
+                        if self._attack_active_since is None:
+                            self._attack_active_since = time.monotonic()
+                        if (time.monotonic() - self._attack_active_since
+                                <= self.attack_block_max_seconds):
+                            LOG.info("walk key released early: attack took over")
+                            break
+                    else:
+                        self._attack_active_since = None
+                time.sleep(0.02)
+            return True
+        finally:
+            key_up(decision.key)
+
     def __init__(
         self,
         frame_queue: "queue.Queue[Any]",
@@ -894,13 +1143,15 @@ class MovementWorker(threading.Thread):
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 2,
         climb_layer_confirm_frames: int = 3,
-        climb_layer_confirm_seconds: float = 2.0,
+        climb_layer_confirm_seconds: float = 0.5,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
         climb_world_y_stall_change_required: float = 0.15,
         climb_world_y_stall_frames: int = 2,
         climb_failed_shift_right_seconds: float = 0.01,
+        climb_attempt_interval_seconds: float = 1.0,
+        climb_failed_cycles_reset: int = 3,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
         near_rope_inner_range: Optional[float] = None,
@@ -909,6 +1160,8 @@ class MovementWorker(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         dropping_active_event: Optional[threading.Event] = None,
         near_rope_event: Optional[threading.Event] = None,
+        moving_active_event: Optional[threading.Event] = None,
+        pickup_active_event: Optional[threading.Event] = None,
         important_positions: Optional[dict[str, Any]] = None,
         route_order: Optional[list[str]] = None,
         patrol_enabled: bool = True,
@@ -922,13 +1175,15 @@ class MovementWorker(threading.Thread):
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Any = None,
         automation_active_event: Optional[threading.Event] = None,
-        moving_active_event: Optional[threading.Event] = None,
         attack_state_path: Optional[str] = None,
+        attack_block_max_seconds: float = 4.0,
         rope_state_path: Optional[str] = None,
         patrol_state_path: Optional[str] = None,
         patrol_busy_hold: float = 3.0,
         rope_jump_px: float = 140.0,
         on_rope_px: float = 50.0,
+        under_rope_px: float = 10.0,
+        rope_approach_creep_seconds: float = 0.25,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -968,6 +1223,15 @@ class MovementWorker(threading.Thread):
         self.climb_world_y_stall_change_required = climb_world_y_stall_change_required
         self.climb_world_y_stall_frames = max(1, int(climb_world_y_stall_frames))
         self.climb_failed_shift_right_seconds = climb_failed_shift_right_seconds
+        # Fresh climb attempts are rate-limited to this interval; an
+        # in-progress climb state machine advances every frame instead.
+        self.climb_attempt_interval_seconds = max(
+            0.2, float(climb_attempt_interval_seconds)
+        )
+        # Consecutive full failed climb cycles before the route restarts at
+        # left-most and re-approaches the rope (see _climb_cycle_failed).
+        self.climb_failed_cycles_reset = max(1, int(climb_failed_cycles_reset))
+        self._climb_failures = 0
         self.near_rope_seconds = near_rope_seconds
         self.near_rope_range = near_rope_range
         self.near_rope_inner_range = (
@@ -1010,6 +1274,11 @@ class MovementWorker(threading.Thread):
         # Set while the character is actively walking (left/right decisions),
         # used by the pickup worker to only tap Z during movement.
         self.moving_active_event = moving_active_event
+        # Set while the pickup worker physically holds Z.  Climb/jump/drop
+        # keys wait for it to clear so Z can never overlap the Up hold and
+        # interrupt a rope grab (a Z keydown fires a skill even for a few ms).
+        self.pickup_active_event = pickup_active_event
+        self._pickup_z_force_after = 0.0
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).
         self._attack_state = (
@@ -1017,7 +1286,12 @@ class MovementWorker(threading.Thread):
             if attack_state_path else None
         )
         self._attack_paused_last = False
-        # YOLO rope state: gates the inner-gap jump on the real screen gap.
+        # The attack keeps priority over patrol movement for a BOUNDED
+        # window; past it the patrol pushes through and keeps walking, so a
+        # stuck/unreachable target cannot freeze the patrol forever (e.g.
+        # after a monster knock-down the character would stop at every move).
+        self.attack_block_max_seconds = max(0.5, float(attack_block_max_seconds))
+        self._attack_active_since: Optional[float] = None        # YOLO rope state: gates the inner-gap jump on the real screen gap.
         # rope_jump_px = max |screen gap| that still counts as "at the rope".
         self._rope_state = (
             RopeStateFile(rope_state_path)
@@ -1044,7 +1318,17 @@ class MovementWorker(threading.Thread):
         # flipping the jump direction as the character passes the rope X and
         # yanking it off the rope mid-climb.
         self.on_rope_px = max(10.0, min(float(on_rope_px), self.rope_jump_px))
-        self._rope_jump_direction: Optional[str] = None
+        # |screen gap| at which the character counts as directly UNDER the
+        # rope: jump straight up (Alt+Up) instead of a left/right chord, so
+        # the sideways jump cannot shove the character past the rope.  The
+        # default 10px is a tight center band right around the rope line.
+        self.under_rope_px = max(2.0, min(float(under_rope_px), self.on_rope_px))
+        # MOVE-TO-ROPE tap length while the YOLO screen gap is fresh: short
+        # taps re-check the gap every frame so the character creeps into the
+        # jump window instead of overshooting past the rope.
+        self.rope_approach_creep_seconds = max(
+            0.05, float(rope_approach_creep_seconds)
+        )
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
@@ -1076,16 +1360,26 @@ class MovementWorker(threading.Thread):
             self.moving_active_event.clear()
 
     def _attack_should_defer_to_climb(self) -> bool:
-        """True when an active attack must wait for a climb/drop to finish.
+        """True when an active attack must wait for the rope climb to finish.
 
-        The attack executor is already blocked by patrol_state busy while
-        climbing/dropping, so the patrol must keep holding Up and finish the
-        climb instead of releasing it (which stopped the character mid-rope).
+        While the climb state machine owns the Up key (``up_held`` - grab
+        attempt or attached climb) the attack waits: releasing Up mid-grab
+        or mid-climb makes the character fall off the rope.  Walking toward
+        the rope and the brief pause between attempts do NOT defer - there
+        the attack keeps priority, and the climb_attack_lock already
+        prevents a Ctrl from interleaving with the jump chord itself.
         """
 
         return bool(
             self._climb_state.up_held
-            or self._climb_state.phase != "idle"
+            or (self.dropping_active_event is not None
+                and self.dropping_active_event.is_set())
+        )
+
+        return bool(
+            (self._climb_state.phase in (
+                "climbing-up", "arrival-compensation",
+            ) and self._climb_state.up_held)
             or (self.dropping_active_event is not None
                 and self.dropping_active_event.is_set())
         )
@@ -1099,6 +1393,10 @@ class MovementWorker(threading.Thread):
         - while a climb is in progress (Up held / non-idle phase) and the
           character overlays the rope (|gap| <= on_rope_px) : return a
           no-op decision so patrol's climb state keeps holding Up
+        - otherwise, when the character is right under the rope
+          (|gap| <= under_rope_px) : jump straight up (Alt+Up) - a
+          left/right chord from directly under the rope shoves the
+          character past it
         - otherwise, when |gap| <= rope_jump_px : jump onto the rope, in
           the real screen direction (left or right).  This includes the
           initial grab from the ground: an idle character aligned with the
@@ -1116,8 +1414,11 @@ class MovementWorker(threading.Thread):
             self._climb_state.up_held
             or self._climb_state.phase != "idle"
         )
-        if climbing and abs(gap) <= self.on_rope_px:
-            # Already attached and overlaying the rope: no jump - patrol
+        attached = self._climb_state.phase in (
+            "climbing-up", "arrival-compensation"
+        )
+        if attached and abs(gap) <= self.on_rope_px:
+            # Genuinely attached and overlaying the rope: no jump - patrol
             # keeps holding Up and climbs.
             LOG.info("YOLO rope: on rope (gap=%+.0fpx); patrol climbs", gap)
             return MovementDecision(
@@ -1128,13 +1429,21 @@ class MovementWorker(threading.Thread):
             # walk).  YOLO never issues walking nudges - that is patrol's job.
             LOG.debug("YOLO rope: gap=%+.0fpx too large; patrol walks", gap)
             return None
+        if abs(gap) <= self.under_rope_px or self._rope_state.x_overlap():
+            # Directly under the rope (tight center gap OR the character box
+            # horizontally overlaps the thin rope box): straight-up jump.  A
+            # left/right chord here would push the character past the rope
+            # and miss the grab.  The box-overlap test catches the under-rope
+            # stance even when the box centers differ by 10-40px.
+            decision = MovementDecision(
+                "jump_climb_up",
+                f"YOLO rope gap {gap:+.0f}px; right under rope, jump straight up",
+                self.minimum_final_hold_seconds,
+            )
+            LOG.info("YOLO rope jump: gap=%+.0fpx dir=up (climbing=%s)",
+                     gap, climbing)
+            return decision
         direction = "right" if gap > 0 else "left"
-        # Tiny gaps (< 5px) jitter sign frame-to-frame (YOLO box noise);
-        # keep the last jump direction instead of flipping the jump left/
-        # right on every frame.
-        if abs(gap) < 5.0 and self._rope_jump_direction is not None:
-            direction = self._rope_jump_direction
-        self._rope_jump_direction = direction
         decision = MovementDecision(
             f"jump_climb_{direction}",
             f"YOLO rope gap {gap:+.0f}px; jump {direction} onto rope",
@@ -1295,6 +1604,11 @@ class MovementWorker(threading.Thread):
         self._climb_state = ClimbState()
         self._aligned_frames = 0
         self._rope_approach_direction = None
+        # First-vs-retry rope approach per layer: the FIRST time the
+        # character moves to the rope it walks continuously like
+        # move-to-left-most/right-most; only RETRY approaches (after a
+        # failed jump) use the small creep steps.
+        self._rope_attempted = False
         self._last_drop_attempt = float("-inf")
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
@@ -1483,7 +1797,39 @@ class MovementWorker(threading.Thread):
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
         self._descending_to_first = False
+        if self.dropping_active_event is not None:
+            # The drop phase is OVER (layer1 reached, new loop starts): the
+            # dropping flag must clear, otherwise the patrol reports busy
+            # forever and the YOLO attack stays blocked ("attack blocked:
+            # patrol climbing/dropping" -> the character never attacks).
+            self.dropping_active_event.clear()
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
+
+    def _climb_cycle_failed(self) -> bool:
+        """Count consecutive failed climb cycles at the rope.
+
+        After ``climb_failed_cycles_reset`` full failed cycles (both jump
+        directions tried, correction already used) the route restarts at
+        left-most: the character walks away from the rope and re-approaches
+        it from the edge, where the directional jump grabs reliably.  Without
+        this a character stuck under a rope the straight jump cannot reach
+        would jump in place forever and never patrol.
+        """
+
+        self._climb_failures += 1
+        if self._climb_failures < self.climb_failed_cycles_reset:
+            return False
+        self._climb_failures = 0
+        self._route_phase = "left"
+        self._climb_state = ClimbState()
+        LOG.warning(
+            "CLIMB failed %d cycles at the rope; restarting patrol from left-most",
+            self.climb_failed_cycles_reset,
+        )
+        return True
+
+    def _climb_cycle_reset(self) -> None:
+        self._climb_failures = 0
 
     def _advance_after_climb(self) -> None:
         assert self._route_layer_index is not None
@@ -1572,10 +1918,28 @@ class MovementWorker(threading.Thread):
                         self._patrol_state.write(False)
                     continue
                 # Attack priority: while the YOLO attack worker reports an
-                # active target, hold patrol movement entirely so the
-                # character stands still and fights.
+                # active target, hold patrol movement so the character stands
+                # and fights - but only for a BOUNDED window.  Past
+                # ``attack_block_max_seconds`` the patrol pushes through and
+                # keeps walking (a stuck/unreachable target must not freeze
+                # the patrol, e.g. after a monster knock-down).
                 if self._attack_state is not None:
-                    if self._attack_state.is_active():
+                    attack_active = self._attack_state.is_active()
+                    if attack_active:
+                        if self._attack_active_since is None:
+                            self._attack_active_since = time.monotonic()
+                        if (time.monotonic() - self._attack_active_since
+                                > self.attack_block_max_seconds):
+                            LOG.info(
+                                "attack active %.1fs > %.1fs: patrol pushes "
+                                "through",
+                                time.monotonic() - self._attack_active_since,
+                                self.attack_block_max_seconds,
+                            )
+                            attack_active = False
+                    else:
+                        self._attack_active_since = None
+                    if attack_active:
                         # Mid-climb/drop: finish the climb.  The attack
                         # executor is already blocked by patrol_state busy,
                         # so releasing Up here would stop the character on
@@ -1703,6 +2067,11 @@ class MovementWorker(threading.Thread):
                     if self._on_first_layer(observation):
                         self._reset_route_loop()
                         route_target_x, route_is_rope, route_label = self._route_target(observation)
+                elif (self.dropping_active_event is not None
+                        and self.dropping_active_event.is_set()):
+                    # Belt-and-braces: no drop in progress any more - the
+                    # dropping flag must not linger (it blocks the attack).
+                    self.dropping_active_event.clear()
                 if self.near_rope_inner_range is not None:
                     rope_inner_distance = self.near_rope_inner_range
                 elif coordinate_layout is not None and self.near_rope_diamonds is not None:
@@ -1728,6 +2097,10 @@ class MovementWorker(threading.Thread):
                     # A new approach may use one correction again. Staying in
                     # the zone cannot accumulate repeated Right holds.
                     self._climb_state = ClimbState()
+                if not route_is_rope:
+                    # Leaving the rope phase (next layer / new loop) starts a
+                    # fresh FIRST approach: full continuous walk again.
+                    self._rope_attempted = False
                 if route_label == "patrol-paused":
                     if self.dropping_active_event is not None:
                         self.dropping_active_event.clear()
@@ -1743,14 +2116,43 @@ class MovementWorker(threading.Thread):
                     )
                     active_target_x = None
                 elif route_is_rope and route_target_x is not None:
-                    # YOLO climb logic: decide purely from SCREEN positions
-                    # (character X vs rope X from the YOLO subprocess).  The
-                    # minimap is NOT used for the jump decision - only as a
-                    # fallback walk plan when YOLO is stale or the rope is
-                    # too far to jump.
-                    yolo_action = self._yolo_rope_action()
-                    if yolo_action is not None:
-                        decision = yolo_action
+                    # JUMP-TO-ROPE vs MOVE-TO-ROPE: the minimap patrol zone
+                    # (inside_rope_zone = the inner band) gates the JUMP.
+                    # Outside the zone the character only WALKS (creep taps,
+                    # never a jump).  Inside the zone the YOLO screen gap
+                    # only refines the jump DIRECTION (straight up vs
+                    # left/right) when fresh; it can never trigger a jump
+                    # before the character reached the minimap jumping zone.
+                    if inside_rope_zone:
+                        # JUMP-TO-ROPE inside the minimap zone: the YOLO
+                        # screen logic decides (straight up when right under
+                        # the rope - tight gap or box overlap; left/right
+                        # otherwise), with the minimap band jump as fallback
+                        # when YOLO is stale.
+                        yolo_action = self._yolo_rope_action()
+                        if yolo_action is not None:
+                            decision = yolo_action
+                        else:
+                            rope_plan = move_towards_rope(
+                                observation,
+                                route_target_x,
+                                rope_inner_distance,
+                                inner_range=rope_inner_distance,
+                                allow_climb=True,
+                                horizontal_tolerance=self._current_horizontal_tolerance,
+                                minimum_confidence=self.minimum_confidence,
+                                movement_hold_seconds=self.movement_hold_seconds,
+                                minimum_final_hold_seconds=self.minimum_final_hold_seconds,
+                                minimum_movement_hold_seconds=self.minimum_movement_hold_seconds,
+                                estimated_minimap_speed=self.estimated_minimap_speed,
+                                final_calculation_distance=self._current_final_calculation_distance,
+                                estimated_final_speed=self.estimated_final_speed,
+                                final_move_safety_gain=self.final_move_safety_gain,
+                            )
+                            decision = rope_plan.decision
+                        # A jump attempt has been made in this rope phase:
+                        # any later re-approach is a RETRY (small steps).
+                        self._rope_attempted = True
                         active_target_x = None
                     else:
                         if observation.player is not None:
@@ -1759,12 +2161,16 @@ class MovementWorker(threading.Thread):
                                 self._rope_approach_direction = "right"
                             elif live_gap < -1e-9:
                                 self._rope_approach_direction = "left"
+                        rope_state_fresh = (
+                            self._rope_state is not None
+                            and self._rope_state.is_fresh()
+                        )
                         rope_plan = move_towards_rope(
                             observation,
                             route_target_x,
                             rope_inner_distance,
-                            aligned_direction=self._rope_approach_direction,
                             inner_range=rope_inner_distance,
+                            allow_climb=not rope_state_fresh,
                             horizontal_tolerance=self._current_horizontal_tolerance,
                             minimum_confidence=self.minimum_confidence,
                             movement_hold_seconds=self.movement_hold_seconds,
@@ -1777,6 +2183,28 @@ class MovementWorker(threading.Thread):
                         )
                         decision = rope_plan.decision
                         active_target_x = rope_plan.target_x
+                        if (rope_state_fresh and self._rope_attempted
+                                and decision.key in ("left", "right")):
+                            # RETRY approach (a jump was already attempted in
+                            # this rope phase): short creep taps that re-check
+                            # the screen gap every frame so the character
+                            # walks into the jump window without overshooting
+                            # the rope.  The FIRST approach keeps the plan's
+                            # full tap (continuous walk like move-to-left-most
+                            # / right-most).
+                            creep = self.rope_approach_creep_seconds
+                            gap = self._rope_state.screen_gap()
+                            if gap is not None:
+                                agap = abs(gap)
+                                if agap <= self.rope_jump_px * 2.0:
+                                    creep = min(creep, 0.12)
+                                elif agap <= self.rope_jump_px * 4.0:
+                                    creep = min(creep, 0.25)
+                            decision = MovementDecision(
+                                decision.key,
+                                "MOVE TO ROPE (creep, retry)",
+                                creep,
+                            )
                 else:
                     assert route_target_x is not None
                     target_y = observation.player.y if observation.player is not None else 0.0
@@ -1803,7 +2231,8 @@ class MovementWorker(threading.Thread):
                 if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None
                 climb_decision_active = decision.key in (
-                    "climb", "jump_climb_left", "jump_climb_right", "drop"
+                    "climb", "jump_climb_left", "jump_climb_right",
+                    "jump_climb_up", "drop",
                 )
                 if self.climbing_active_event is not None:
                     if climb_decision_active or self._climb_state.phase != "idle":
@@ -1811,11 +2240,20 @@ class MovementWorker(threading.Thread):
                     else:
                         self.climbing_active_event.clear()
                 # Publish the patrol state so the YOLO attack worker blocks
-                # attacks while the character is climbing or dropping.
+                # attacks ONLY while the character is on the rope (attached
+                # climb) or dropping.  Moving toward the rope and the jump
+                # attempts themselves are normal combat movement: attack
+                # keeps priority there, so a passing mob is engaged instead
+                # of ignored while walking to the rope.
                 if self._patrol_state is not None:
+                    on_rope = bool(
+                        self._climb_state.phase in (
+                            "climbing-up", "arrival-compensation",
+                        )
+                        and self._climb_state.up_held
+                    )
                     busy_now = bool(
-                        climb_decision_active
-                        or self._climb_state.phase != "idle"
+                        on_rope
                         or (self.dropping_active_event is not None
                             and self.dropping_active_event.is_set())
                     )
@@ -1876,6 +2314,7 @@ class MovementWorker(threading.Thread):
                     self._aligned_frames = 0
                     self._release_climb_up()
                     self._climb_state = ClimbState()
+                    self._climb_cycle_reset()
                 self.last_observation, self.last_decision = observation, decision
                 if observation.player is not None:
                     gap = ((active_target_x - observation.player.x)
@@ -1898,6 +2337,24 @@ class MovementWorker(threading.Thread):
                     LOG.warning("movement waiting: %s", decision.reason)
                 now = time.monotonic()
                 if decision.key and now - self._last_send >= self.movement_cooldown:
+                    if decision.key in (
+                        "drop", "climb", "jump_climb_left",
+                        "jump_climb_right", "jump_climb_up",
+                    ):
+                        # Never send a climb/jump/drop key while the pickup
+                        # worker still holds Z: even a few ms of Z+Up makes
+                        # the game fire the skill and drop the rope.  Wait
+                        # for the release (bounded, then force through).
+                        if (self.pickup_active_event is not None
+                                and self.pickup_active_event.is_set()
+                                and now < self._pickup_z_force_after):
+                            if self._pickup_z_force_after == 0.0:
+                                self._pickup_z_force_after = now + 0.5
+                            LOG.debug(
+                                "climb/drop waiting for pickup Z release"
+                            )
+                            continue
+                        self._pickup_z_force_after = 0.0
                     if decision.key == "drop":
                         if now - self._last_drop_attempt < self.drop_retry_seconds:
                             continue
@@ -1915,45 +2372,55 @@ class MovementWorker(threading.Thread):
                                 _drop_through_platform(
                                     self.key_sender, self.drop_chord_hold_seconds
                                 )
-                    elif decision.key in ("climb", "jump_climb_left", "jump_climb_right"):
-                        if now - self._last_climb_attempt < 2.0:
-                            continue
-                        self._last_climb_attempt = now
+                    elif decision.key in (
+                        "climb", "jump_climb_left", "jump_climb_right",
+                        "jump_climb_up",
+                    ):
+                        # Fresh attempts are rate-limited; an in-progress
+                        # climb state machine advances every frame.
+                        if self._climb_state.phase == "idle":
+                            if now - self._last_climb_attempt < self.climb_attempt_interval_seconds:
+                                continue
+                            self._last_climb_attempt = now
                         if self._climb_state.phase == "idle":
                             self._reanchor_tracker_to_current_layer()
                         # Direction comes from character X versus Rope X. At
                         # an exactly quantized X, retain the last observed side
                         # of approach instead of using a fixed right-first rule.
                         preferred_direction = self._rope_approach_direction
-                        if observation.player is not None and route_target_x is not None:
+                        if decision.key == "jump_climb_up":
+                            # The YOLO/minimap plan decided the character is
+                            # right under the rope: jump straight up.  Do not
+                            # let the minimap live-gap fallback below override
+                            # it with a left/right chord.
+                            preferred_direction = "up"
+                        elif observation.player is not None and route_target_x is not None:
                             live_gap = route_target_x - observation.player.x
                             if live_gap > 1e-9:
                                 preferred_direction = "right"
                             elif live_gap < -1e-9:
                                 preferred_direction = "left"
-                        result = climb(
-                            self.key_sender,
-                            observation,
-                            self._climb_state,
-                            climb_duration=self.climb_up_hold_seconds,
-                            nudge_duration=self.climb_nudge_seconds,
-                            y_change_required=self.climb_y_change_required,
-                            world_y_change_required=self.climb_world_y_change_required,
-                            world_y_stall_change_required=(
-                                self.climb_world_y_stall_change_required
-                            ),
-                            world_y_stall_frames=self.climb_world_y_stall_frames,
-                            action_lock=self.climb_attack_lock,
-                            preferred_direction=preferred_direction,
-                            failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,
-                            persistent_up=True,
+                        self._run_climb_step(
+                            observation, route_target_x, preferred_direction
                         )
-                        LOG.info("climb recovery state: %s", result)
-                        if result == "succeeded" and self._route_layers:
-                            self._advance_after_climb()
+                    elif decision.key in ("left", "right"):
+                        # Cancellable walk hold: the movement key is released
+                        # within ~20ms when the attack selects a target, so
+                        # the character can face and hit a monster behind it.
+                        self._send_walk_hold(decision)
                     else:
                         _send_tap(self.key_sender, decision)
                     self._last_send = now
+                elif (decision.key is None
+                        and self._climb_state.phase != "idle"):
+                    # No-op frame (attached on-rope) while the climb state
+                    # machine is active: advance it anyway so the fell-back /
+                    # stall detection releases Up and retries.  Without this,
+                    # a failed grab froze the character holding Up forever
+                    # (the attached no-op never entered the send block).
+                    self._run_climb_step(
+                        observation, route_target_x, self._rope_approach_direction
+                    )
             except Exception:
                 # A bad frame must not kill the safety/control thread.
                 LOG.exception("movement analysis failed; no key sent")

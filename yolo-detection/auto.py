@@ -561,7 +561,7 @@ class OptimizedMapleBot:
             return None
         config = getattr(self, "config", {}) or {}
         min_box = float(config.get(
-            'detection_behavior.min_mob_box_px', 20.0
+            'detection_behavior.min_mob_box_px', 60.0
         ))
         cx, cy = character.center
         half = max(10.0, float(attack_range) / 2.0)
@@ -924,8 +924,13 @@ class OptimizedMapleBot:
             # 繪製邊界框
             cv2.rectangle(img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
 
-            # 繪製標籤
-            label = f"{class_name}: {confidence:.2f}"
+            # 繪製標籤 (mob 標籤附帶框大小，方便對照 min_mob_box_px 過濾)
+            if class_name == 'mob':
+                box_w = bbox[2] - bbox[0]
+                box_h = bbox[3] - bbox[1]
+                label = f"{class_name}: {confidence:.2f}, {box_w}x{box_h}"
+            else:
+                label = f"{class_name}: {confidence:.2f}"
             cv2.putText(img, label, (bbox[0], bbox[1] - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 

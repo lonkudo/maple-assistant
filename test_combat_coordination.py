@@ -95,6 +95,30 @@ class RopeStateFileTests(unittest.TestCase):
         path.write_text(__import__("json").dumps(data), encoding="utf-8")
         self.assertFalse(state.is_fresh(max_age=1.0))
 
+    def test_x_overlap_true_when_boxes_touch(self):
+        path = self._path()
+        state = RopeStateFile(str(path))
+        # Character standing right under the rope: box X-ranges overlap even
+        # though the centers differ (rope 1360 vs character 1330 = gap 30px).
+        state.write(True, rope_x=1360.0, char_x=1330.0,
+                    rope_box=(1355.0, 100.0, 1365.0, 500.0),
+                    char_box=(1300.0, 600.0, 1360.0, 700.0))
+        self.assertTrue(state.x_overlap())
+
+    def test_x_overlap_false_when_boxes_apart(self):
+        path = self._path()
+        state = RopeStateFile(str(path))
+        state.write(True, rope_x=1500.0, char_x=1320.0,
+                    rope_box=(1495.0, 100.0, 1505.0, 500.0),
+                    char_box=(1300.0, 600.0, 1340.0, 700.0))
+        self.assertFalse(state.x_overlap())
+
+    def test_x_overlap_false_without_boxes(self):
+        path = self._path()
+        state = RopeStateFile(str(path))
+        state.write(True, rope_x=1360.0, char_x=1320.0)
+        self.assertFalse(state.x_overlap())
+
 
 class PatrolStateFileTests(unittest.TestCase):
     def _path(self):

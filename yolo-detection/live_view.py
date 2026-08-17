@@ -237,6 +237,17 @@ def main() -> int:
                     x1, y1, x2, y2 = target.bbox
                     cv2.rectangle(preview, (x1 - 6, y1 - 6), (x2 + 6, y2 + 6),
                                   (0, 0, 255), 2)
+                    # Publish the attack state FIRST: the patrol releases its
+                    # held movement key within ~20ms of seeing it.  The settle
+                    # sleep then guarantees the walk key is UP before the
+                    # executor's facing tap - otherwise the held walk key
+                    # swallows the turn tap and the character never turns to
+                    # face a monster behind it.
+                    if (attack_state is not None
+                            and executor is not None
+                            and character is not None):
+                        attack_state.write(True, target.center)
+                        time.sleep(0.05)
                     # Auto-attack: face the monster and press Ctrl.  Only
                     # fires when the game window is focused and the cooldown
                     # elapsed.
@@ -247,9 +258,9 @@ def main() -> int:
                 # Publish the attack state for the patrol worker: active only
                 # while a target is selected (attack priority over patrol).
                 if attack_state is not None:
-                    if target is not None and character is not None:
-                        attack_state.write(True, target.center)
-                    else:
+                    if not (target is not None
+                            and executor is not None
+                            and character is not None):
                         attack_state.write(False)
                 # Publish YOLO rope state so the patrol worker can gate the
                 # inner-gap jump on the real screen gap.
@@ -264,6 +275,9 @@ def main() -> int:
                                     if character is not None else None),
                             char_y=(float(character.center[1])
                                     if character is not None else None),
+                            rope_box=tuple(rope.bbox),
+                            char_box=(tuple(character.bbox)
+                                      if character is not None else None),
                         )
                     else:
                         rope_state.write(False)
