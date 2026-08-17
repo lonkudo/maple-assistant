@@ -1115,6 +1115,38 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(state.phase, "climbing-up")
         self.assertIn("up", sender.owned)
 
+    def test_minimap_scroll_marker_y_jump_does_not_false_fell_back(self):
+        # Genuine climb: the world Y keeps advancing while the minimap
+        # scrolls and the marker Y jumps downward.  The grab must NOT be
+        # treated as failed (the old marker-only check released Up and the
+        # character fell off the rope right after attaching).
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = {"up"}
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        state = ClimbState(
+            phase="climbing-up",
+            baseline_y=.587891,
+            baseline_world_y=11.322577,
+            up_held=True,
+            recent_y=[.60, .587891],
+            last_world_y=11.0,
+        )
+        scrolled = MinimapObservation(
+            Point(.092375, .607422), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=10.48, structure_confidence=.9,
+        )
+        # Marker dropped 0.0195 (would trip the old check) but the world Y
+        # advanced 0.84: still climbing, Up stays held.
+        self.assertEqual(climb(sender, scrolled, state, persistent_up=True),
+                         "climbing-up")
+        self.assertEqual(state.phase, "climbing-up")
+        self.assertIn("up", sender.owned)
+
     def test_persistent_climb_waits_for_capture_lag_before_releasing_up(self):
         class Sender:
             dry_run = True

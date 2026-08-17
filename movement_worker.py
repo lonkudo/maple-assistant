@@ -538,13 +538,25 @@ def climb(
     # 4-frame marker-Y window for the ON-ROPE check: if the marker falls
     # back from its recent peak (Y increases again), the grab failed and the
     # character is NOT on the rope - never confirm/keep "climbing" then.
+    # The raw marker Y is NOT trusted alone: during a genuine climb the
+    # minimap can scroll and the marker Y jumps while the world Y keeps
+    # advancing.  Only treat it as a failed grab when the world Y is NOT
+    # advancing.
     if persistent_up and state.up_held:
         if observation.player is not None:
             state.recent_y.append(player.y)
             if len(state.recent_y) > 4:
                 state.recent_y.pop(0)
+        world_advancing = bool(
+            state.baseline_world_y is not None
+            and observation.world_y_diamonds is not None
+            and observation.structure_confidence >= 0.12
+            and (state.baseline_world_y - observation.world_y_diamonds)
+            >= world_y_change_required
+        )
         fell_back = bool(
-            len(state.recent_y) >= 2
+            not world_advancing
+            and len(state.recent_y) >= 2
             and observation.player is not None
             and player.y >= min(state.recent_y) + y_change_required
         )
