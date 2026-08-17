@@ -448,6 +448,8 @@ def climb(
     rope_x: Optional[float] = None,
     rope_x_tolerance: float = 0.025,
     climb_attach_frames: int = 2,
+    arrival_y: Optional[float] = None,
+    arrival_tolerance: float = 0.02,
 ) -> str:
     """Try to grab the rope and verify it from the next minimap screenshot.
 
@@ -463,6 +465,11 @@ def climb(
     ``climb_attach_frames`` consecutive frames.  A Y-only check falsely
     attached while the character stood beside the rope (world-Y tracker
     noise) and froze it holding Up on the ground.
+
+    ``arrival_y``/``arrival_tolerance`` carry the NEXT layer's marker Y: when
+    the marker settles within that band the character reached the platform
+    (not a failed grab), so the fell-back release is suppressed and the
+    layer arrival (handled by the route resync) completes the climb.
     """
 
     player = observation.player
@@ -554,8 +561,17 @@ def climb(
             and (state.baseline_world_y - observation.world_y_diamonds)
             >= world_y_change_required
         )
+        # The marker settled within the NEXT layer's band: the character
+        # reached the platform (the rope top settle is not a failed grab).
+        # The layer arrival completes the climb instead of releasing Up.
+        at_arrival = bool(
+            arrival_y is not None
+            and observation.player is not None
+            and abs(player.y - arrival_y) <= arrival_tolerance
+        )
         fell_back = bool(
             not world_advancing
+            and not at_arrival
             and len(state.recent_y) >= 2
             and observation.player is not None
             and player.y >= min(state.recent_y) + y_change_required
@@ -1050,6 +1066,22 @@ def _send_tap(sender: Any, decision: MovementDecision) -> bool:
 class MovementWorker(threading.Thread):
     """Consume only the newest frame and issue at most one short tap per frame."""
 
+    def _next_layer_arrival_band(self) -> tuple[Optional[float], float]:
+        """(marker Y, tolerance) of the NEXT route layer, or (None, 0.02)."""
+
+        if (self._route_layer_index is None
+                or self._route_layer_index + 1 >= len(self._route_layers)):
+            return None, 0.02
+        layer = self.important_positions.get(
+            self._route_layers[self._route_layer_index + 1], {}
+        )
+        if not isinstance(layer, dict) or "layer_y" not in layer:
+            return None, 0.02
+        return (
+            float(layer["layer_y"]),
+            float(layer.get("y_tolerance", 0.02)),
+        )
+
     def _run_climb_step(
         self,
         observation: MinimapObservation,
@@ -1058,6 +1090,7 @@ class MovementWorker(threading.Thread):
     ) -> str:
         """Advance the persistent climb state machine one frame."""
 
+        arrival_y, arrival_tolerance = self._next_layer_arrival_band()
         result = climb(
             self.key_sender,
             observation,
@@ -1075,6 +1108,8 @@ class MovementWorker(threading.Thread):
             failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,
             persistent_up=True,
             rope_x=route_target_x,
+            arrival_y=arrival_y,
+            arrival_tolerance=arrival_tolerance,
         )
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
@@ -1570,7 +1605,34 @@ class MovementWorker(threading.Thread):
             # even if the centered marker/scroll estimate flickers afterward.
             detected_name = expected_name
         else:
-            detected_name = self._detected_layer(observation)
+            if climb_input_active:
+                # During a climb the arrival is accepted from EITHER signal:
+                # the minimap marker Y (works when the world-Y tracker sticks
+                # to the lower layer) or the world Y (works when the minimap
+                # marker aliases on a scrolling map).  The HIGHER detected
+                # layer wins - the climb moves up, so a lower-layer reading
+                # is the stale/aliased one.
+                layers = {
+                    name: self.important_positions[name]
+                    for name in self._route_layers
+                }
+                marker_name = (
+                    detect_layer_by_y(observation.player.y, layers)
+                    if observation.player is not None else None
+                )
+                world_name = self._detected_layer(observation)
+
+                def _index(name: Optional[str]) -> int:
+                    if name is None or name not in self._route_layers:
+                        return -1
+                    return self._route_layers.index(name)
+
+                detected_name = (
+                    marker_name if _index(marker_name) >= _index(world_name)
+                    else world_name
+                )
+            else:
+                detected_name = self._detected_layer(observation)
         if detected_name is None:
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
