@@ -284,9 +284,9 @@ def layer_display_order(layer_names: list[str]) -> tuple[str, ...]:
 def keysym_to_scan_key(keysym: str) -> Optional[str]:
     """Map a Tk keysym to a supported scan-code key name, or None.
 
-    Handles modifier names (Control_L -> ctrl), F-keys (F4 -> f4) and
-    case.  Modifiers-only or unmapped keysyms (Escape, shift+1 -> exclam)
-    return None so the previous binding is kept.
+    Every physical key is bindable (modifiers, F-keys, numpad, punctuation).
+    Escape is the only exception - it cancels key capture and restores the
+    previous binding.
     """
 
     if not keysym:
@@ -294,6 +294,17 @@ def keysym_to_scan_key(keysym: str) -> Optional[str]:
     normalized = {
         "Control_L": "ctrl", "Control_R": "ctrl",
         "Alt_L": "alt", "Alt_R": "alt",
+        "Shift_L": "shift", "Shift_R": "shift",
+        "Return": "enter", "KP_Enter": "kp_enter",
+        "BackSpace": "backspace", "Caps_Lock": "caps",
+        "Prior": "pageup", "Next": "pagedown",
+        "KP_0": "kp_0", "KP_1": "kp_1", "KP_2": "kp_2",
+        "KP_3": "kp_3", "KP_4": "kp_4", "KP_5": "kp_5",
+        "KP_6": "kp_6", "KP_7": "kp_7", "KP_8": "kp_8",
+        "KP_9": "kp_9",
+        "KP_Add": "kp_add", "KP_Subtract": "kp_subtract",
+        "KP_Multiply": "kp_multiply", "KP_Divide": "kp_divide",
+        "KP_Decimal": "kp_decimal",
     }.get(keysym, keysym)
     if normalized in WindowKeySender._SCAN:
         return normalized

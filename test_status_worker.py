@@ -127,7 +127,9 @@ class StatusTests(unittest.TestCase):
 
     def test_new_scan_codes_cover_potion_keys(self) -> None:
         sender = WindowKeySender("game")
-        for key in ("1", "9", "q", "m", "f1", "f12", "end"):
+        for key in ("1", "9", "q", "m", "f1", "f12", "end",
+                    "shift", "tab", "enter", "kp_7", "kp_add",
+                    "minus", "pageup"):
             self.assertIn(key, sender._SCAN)
 
     def test_sender_is_dry_run_by_default(self) -> None:

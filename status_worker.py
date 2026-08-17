@@ -58,6 +58,27 @@ class WindowKeySender:
         "f4": (0x3E, False), "f5": (0x3F, False), "f6": (0x40, False),
         "f7": (0x41, False), "f8": (0x42, False), "f9": (0x43, False),
         "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
+        # modifiers + editing / navigation
+        "shift": (0x2A, False), "tab": (0x0F, False),
+        "caps": (0x3A, False), "enter": (0x1C, False),
+        "backspace": (0x0E, False),
+        "home": (0x47, True), "pageup": (0x49, True),
+        "pagedown": (0x51, True), "insert": (0x52, True),
+        # punctuation row
+        "minus": (0x0C, False), "equal": (0x0D, False),
+        "bracketleft": (0x1A, False), "bracketright": (0x1B, False),
+        "backslash": (0x2B, False), "semicolon": (0x27, False),
+        "apostrophe": (0x28, False), "grave": (0x29, False),
+        "comma": (0x33, False), "period": (0x34, False),
+        "slash": (0x35, False),
+        # numpad
+        "kp_0": (0x52, True), "kp_1": (0x4F, True), "kp_2": (0x50, True),
+        "kp_3": (0x51, True), "kp_4": (0x4B, True), "kp_5": (0x4C, True),
+        "kp_6": (0x4D, True), "kp_7": (0x47, True), "kp_8": (0x48, True),
+        "kp_9": (0x49, True),
+        "kp_add": (0x4E, False), "kp_subtract": (0x4A, False),
+        "kp_multiply": (0x37, False), "kp_divide": (0x35, True),
+        "kp_enter": (0x1C, True), "kp_decimal": (0x53, True),
     }
 
     def __init__(
