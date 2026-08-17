@@ -62,6 +62,36 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(large.pixel_size[0], small.pixel_size[0])
         self.assertGreater(large.pixel_size[1], small.pixel_size[1])
 
+    def test_red_diamond_detector_counts_other_players(self) -> None:
+        import numpy as np
+        from marker_detector import detect_red_diamonds
+
+        def diamond(image, cy, cx, radius, color):
+            for y in range(-radius, radius + 1):
+                for x in range(-radius, radius + 1):
+                    if abs(x) + abs(y) <= radius:
+                        image[cy + y, cx + x] = color
+
+        image = np.zeros((160, 260, 3), dtype=np.uint8)
+        # Two red player diamonds (#e30000 center).
+        diamond(image, 50, 60, 4, (227, 0, 0))
+        diamond(image, 110, 200, 3, (227, 0, 0))
+        self.assertEqual(len(detect_red_diamonds(image)), 2)
+
+    def test_red_diamond_detector_ignores_yellow_and_decorations(self) -> None:
+        import numpy as np
+        from marker_detector import detect_red_diamonds
+
+        image = np.zeros((160, 260, 3), dtype=np.uint8)
+        # The yellow player diamond and a long orange-ish decoration must not
+        # count as other players.
+        for y in range(-4, 5):
+            for x in range(-4, 5):
+                if abs(x) + abs(y) <= 4:
+                    image[60 + y, 100 + x] = (255, 255, 136)
+        image[30, 20:80] = (230, 120, 40)  # long orange strip
+        self.assertEqual(detect_red_diamonds(image), [])
+
     def test_diamond_size_tracker_smooths_animation_and_detects_zoom(self) -> None:
         tracker = DiamondSizeTracker()
         self.assertEqual(tracker.stabilize((7, 7)), (7, 7))

@@ -727,96 +727,81 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertIn(["disabled"], loader._shutdown_slider.states)
                 self.assertIn("disabled", loader._shutdown_status.text)
 
-    def test_channel_switch_button_runs_fixed_procedure(self) -> None:
+    def test_player_check_selection_persists_and_applies_to_mover(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
         from unittest import mock
 
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
         class Label:
-            def __init__(self) -> None:
-                self.text = ""
-
             def configure(self, *, text: str) -> None:
-                self.text = text
+                pass
 
-        class Button:
+        class Slider:
+            def state(self, args) -> None:
+                pass
+
+        class FakeShutdownWorker:
             def __init__(self) -> None:
-                self.state = "normal"
+                self.enabled = False
+                self.hours = 3.0
 
-            def configure(self, *, state: str = None, text: str = None) -> None:
-                if state is not None:
-                    self.state = state
+            def set_hours(self, hours) -> None:
+                self.hours = hours
 
-        class Root:
+        class FakeMover:
             def __init__(self) -> None:
-                self.scheduled = []
+                self.calls = []
 
-            def after(self, delay, fn):
-                if delay == 0:
-                    fn()
-                else:
-                    self.scheduled.append((delay, fn))
-
-        class FakeSender:
-            def __init__(self) -> None:
-                self.pressed = []
-                self.input_enabled = False
-                self.selected = 0
-
-            def enable_input(self) -> None:
-                self.input_enabled = True
-
-            def select_window(self) -> bool:
-                self.selected += 1
-                return True
-
-            def press(self, key, duration=0.025):
-                self.pressed.append(key)
-                return True
+            def set_other_player_check(self, enabled) -> None:
+                self.calls.append(enabled)
 
         worker = UiWorker.__new__(UiWorker)
-        worker.key_sender = FakeSender()
-        worker._root = Root()
-        worker._channel_switching = False
-        worker._channel_switch_status = Label()
-        worker._channel_switch_button = Button()
+        worker.shutdown_worker = FakeShutdownWorker()
+        worker.movement_worker = FakeMover()
+        worker._shutdown_enabled_var = Var(False)
+        worker._shutdown_hours_var = Var(3.0)
+        worker._shutdown_hours_label = Label()
+        worker._shutdown_slider = Slider()
+        worker._shutdown_status = Label()
+        worker._player_check_var = Var(True)
 
-        with mock.patch("ui_worker.random.randint", side_effect=[3, 8]), \
-                mock.patch("channel_switch.time.sleep"):
-            worker._channel_switch_run()
+        def fake_path(self):
+            return Path(tempfile.gettempdir()) / "test_player_check_settings.json"
 
-        self.assertEqual(worker.key_sender.pressed, [
-            "esc", "enter",
-            "left", "left", "left",
-            "down", "down", "down", "down", "down", "down", "down", "down",
-            "enter",
-        ])
-        self.assertTrue(worker.key_sender.input_enabled)
-        self.assertEqual(worker.key_sender.selected, 1)  # game foregrounded
-        self.assertIn("done", worker._channel_switch_status.text)
-        self.assertEqual(worker._channel_switch_button.state, "normal")
+        with mock.patch.object(UiWorker, "_shutdown_settings_path", fake_path):
+            worker._shutdown_on_change()
+            data = json.loads(
+                (Path(tempfile.gettempdir())
+                 / "test_player_check_settings.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertTrue(data["player_check_enabled"])
+            self.assertEqual(worker.movement_worker.calls, [True])
 
-    def test_channel_switch_headless_reports_not_wired(self) -> None:
-        class Label:
-            def __init__(self) -> None:
-                self.text = ""
-
-            def configure(self, *, text: str) -> None:
-                self.text = text
-
-        worker = UiWorker.__new__(UiWorker)
-        worker.key_sender = None
-        worker._root = None
-        worker._channel_switching = False
-        worker._channel_switch_status = Label()
-        worker._channel_switch_button = type(
-            "Button", (),
-            {"state": "normal",
-             "configure": lambda self, **kw: None},
-        )()
-
-        worker._channel_switch_run()
-
-        self.assertIn("not wired", worker._channel_switch_status.text)
-        self.assertFalse(worker._channel_switching)
+            loader = UiWorker.__new__(UiWorker)
+            loader.shutdown_worker = FakeShutdownWorker()
+            loader.movement_worker = FakeMover()
+            loader._shutdown_enabled_var = Var(False)
+            loader._shutdown_hours_var = Var(3.0)
+            loader._shutdown_hours_label = Label()
+            loader._shutdown_slider = Slider()
+            loader._shutdown_status = Label()
+            loader._player_check_var = Var(False)
+            with mock.patch.object(UiWorker, "_shutdown_settings_path", fake_path):
+                loader._shutdown_load_settings()
+            self.assertTrue(loader._player_check_var.get())
+            self.assertEqual(loader.movement_worker.calls, [True])
 
 
 if __name__ == "__main__":

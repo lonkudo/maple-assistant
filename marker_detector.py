@@ -134,4 +134,69 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
-__all__ = ["DiamondSizeTracker", "MarkerDetection", "detect_yellow_diamond"]
+def detect_red_diamonds(minimap_rgb: np.ndarray) -> list[MarkerDetection]:
+    """Return ALL red diamond markers (other players) on the minimap.
+
+    Other players render as red diamonds with a center color of #e30000
+    (227, 0, 0).  The yellow player diamond is never matched (yellow has
+    high green/blue; red requires both near zero).  Each connected red
+    component within diamond-like size/aspect limits becomes one detection;
+    unlike the yellow marker there is no "best one" - every player counts.
+    """
+
+    rgb = minimap_rgb.astype(np.int16)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    # #e30000 center with tolerance; green/blue must stay near zero so
+    # yellow/orange platform decorations are never mistaken for players.
+    red_center = (
+        (np.abs(red - 227) <= 25)
+        & (green <= 60)
+        & (blue <= 60)
+    )
+    red_body = (red >= 190) & (green <= 70) & (blue <= 70)
+    height, width = red_center.shape
+    max_span = max(18, int(round(min(width, height) * 0.14)))
+    max_pixels = max(180, max_span * max_span)
+    body_components = _components(red_body, min_pixels=3)
+    detections: list[MarkerDetection] = []
+    for component in _components(red_center, min_pixels=3):
+        ys, xs = component[:, 0], component[:, 1]
+        strict_left, strict_top = int(xs.min()), int(ys.min())
+        strict_right, strict_bottom = int(xs.max()) + 1, int(ys.max()) + 1
+        span_x, span_y = strict_right - strict_left, strict_bottom - strict_top
+        count = len(component)
+        if count > max_pixels or span_x > max_span or span_y > max_span:
+            continue
+        aspect = span_x / max(1, span_y)
+        compact = count / max(1, span_x * span_y)
+        if 0.45 <= aspect <= 2.2 and compact >= 0.20 and span_x >= 2 and span_y >= 2:
+            shape_score = max(0.0, 1.0 - abs(aspect - 1.0) / 2.0)
+            score = 0.62 * compact + 0.38 * shape_score
+            measured_box = (strict_left, strict_top, strict_right, strict_bottom)
+            for body in body_components:
+                body_ys, body_xs = body[:, 0], body[:, 1]
+                if not red_center[body_ys, body_xs].any():
+                    continue
+                body_box = (
+                    int(body_xs.min()), int(body_ys.min()),
+                    int(body_xs.max()) + 1, int(body_ys.max()) + 1,
+                )
+                body_width = body_box[2] - body_box[0]
+                body_height = body_box[3] - body_box[1]
+                overlaps_seed = not (
+                    body_box[2] <= strict_left or body_box[0] >= strict_right
+                    or body_box[3] <= strict_top or body_box[1] >= strict_bottom
+                )
+                if overlaps_seed and body_width <= max_span and body_height <= max_span:
+                    measured_box = body_box
+                    break
+            detections.append(MarkerDetection(
+                x=float(xs.mean()) / width,
+                y=float(ys.mean()) / height,
+                confidence=min(1.0, float(score)),
+                pixel_box=measured_box,
+            ))
+    return detections
+
+
+__all__ = ["DiamondSizeTracker", "MarkerDetection", "detect_yellow_diamond", "detect_red_diamonds"]

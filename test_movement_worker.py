@@ -1,5 +1,6 @@
 import queue
 import threading
+import time
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
@@ -499,6 +500,151 @@ class MovementTests(unittest.TestCase):
         worker.set_yolo_detection_active(False)
         self.assertFalse(worker._yolo_detection_active)
         self.assertIsNone(worker._yolo_rope_action())
+
+    def _red_diamond_frame(self):
+        """CapturedFrame whose whole-image minimap crop has a red diamond."""
+
+        image = np.zeros((160, 200, 3), dtype=np.uint8)
+        cy, cx, radius = 80, 100, 4
+        for y in range(-radius, radius + 1):
+            for x in range(-radius, radius + 1):
+                if abs(x) + abs(y) <= radius:
+                    image[cy + y, cx + x] = (227, 0, 0)
+        frame = object.__new__(CapturedFrame)
+        object.__setattr__(frame, "image", Image.fromarray(image))
+        return frame
+
+    def test_left_excursion_end_scans_once_for_red_diamonds(self):
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, other_player_check_enabled=True,
+        )
+        frame = self._red_diamond_frame()
+        region = (0.0, 0.0, 1.0, 1.0)
+        worker._left_excursion_active = True
+        with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
+            worker._handle_left_excursion_end(
+                frame, region, "layer1.right-most"
+            )
+            # The excursion already ended: no second scan.
+            worker._handle_left_excursion_end(
+                frame, region, "layer1.right-most"
+            )
+            # A new left excursion re-arms; finishing it scans again.
+            worker._handle_left_excursion_end(
+                frame, region, "layer1.left-most"
+            )
+            worker._handle_left_excursion_end(
+                frame, region, "layer1.right-most"
+            )
+        self.assertEqual(trig.call_count, 2)
+        self.assertEqual(trig.call_args[0][0], 1)  # one red diamond
+
+    def test_left_excursion_end_skips_when_disabled_or_clean(self):
+        from unittest import mock
+
+        # Disabled: never scans, never triggers.
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={},
+        )
+        frame = self._red_diamond_frame()
+        region = (0.0, 0.0, 1.0, 1.0)
+        worker._left_excursion_active = True
+        with mock.patch.object(worker, "_other_players_on_minimap") as scan, \
+                mock.patch.object(worker, "_trigger_other_player_switch") as trig:
+            worker._handle_left_excursion_end(frame, region, "layer1.right-most")
+            scan.assert_not_called()
+            trig.assert_not_called()
+
+        # Enabled but no red diamond on the minimap: no trigger.
+        worker.set_other_player_check(True)
+        clean = np.zeros((160, 200, 3), dtype=np.uint8)
+        frame_clean = object.__new__(CapturedFrame)
+        object.__setattr__(frame_clean, "image", Image.fromarray(clean))
+        worker._left_excursion_active = True
+        with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
+            worker._handle_left_excursion_end(
+                frame_clean, region, "layer1.right-most"
+            )
+            trig.assert_not_called()
+
+    def test_other_player_switch_flow_drugs_then_switches_then_resumes(self):
+        from unittest import mock
+
+        class FakeController:
+            def __init__(self):
+                self.enabled = True
+
+            def set_enabled(self, value):
+                self.enabled = bool(value)
+
+        class FakeSender:
+            _SCAN = {"delete": (0x53, True), "esc": (0x01, False)}
+
+            def __init__(self):
+                self.pressed = []
+
+            def press(self, key, duration=0.025):
+                self.pressed.append(key)
+                return True
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        controller = FakeController()
+        sender = FakeSender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={}, patrol_controller=controller,
+            other_player_check_enabled=True,
+        )
+        with mock.patch("movement_worker.threading.Thread", FakeThread), \
+                mock.patch("movement_worker.json.loads",
+                           return_value={"hp_key": "delete"}), \
+                mock.patch("channel_switch.random.randint",
+                           side_effect=[2, 1]), \
+                mock.patch("channel_switch.time.sleep"), \
+                mock.patch("movement_worker.time.sleep"):
+            worker._trigger_other_player_switch(1)
+
+        # Patrol was disabled during the switch and re-enabled after.
+        self.assertTrue(controller.enabled)
+        # Progressive HP drug first (3 taps), then the channel sequence.
+        self.assertEqual(sender.pressed[:3], ["delete", "delete", "delete"])
+        self.assertEqual(sender.pressed[3:], [
+            "esc", "enter", "left", "left", "down", "enter",
+        ])
+        self.assertFalse(worker._player_switch_active)
+        self.assertGreater(worker._last_other_player_switch, float("-inf"))
+
+    def test_trigger_switch_guards_active_and_cooldown(self):
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={},
+        )
+        worker._player_switch_active = True
+        with mock.patch.object(worker, "_run_other_player_switch") as run:
+            worker._trigger_other_player_switch(1)
+            run.assert_not_called()
+        worker._player_switch_active = False
+        worker._last_other_player_switch = time.monotonic()
+        with mock.patch.object(worker, "_run_other_player_switch") as run:
+            worker._trigger_other_player_switch(1)
+            run.assert_not_called()
+        # After the cooldown the switch fires.
+        worker._last_other_player_switch = float("-inf")
+        with mock.patch.object(worker, "_run_other_player_switch") as run:
+            worker._trigger_other_player_switch(1)
+            run.assert_called_once()
 
     def test_yolo_rope_jump_gate(self):
         import tempfile

@@ -10,19 +10,26 @@ the sender remains responsible for checking/focusing the configured window.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import json
 import logging
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol
 
 import numpy as np
 from PIL import Image
 
-from marker_detector import DiamondSizeTracker, detect_yellow_diamond
+from marker_detector import (
+    DiamondSizeTracker,
+    detect_red_diamonds,
+    detect_yellow_diamond,
+)
 from patrol_control import CoordinateLayout
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
+from channel_switch import channel_switch_procedure
 
 
 LOG = logging.getLogger(__name__)
@@ -1232,6 +1239,10 @@ class MovementWorker(threading.Thread):
         under_rope_px: float = 10.0,
         rope_approach_creep_seconds: float = 0.25,
         yolo_detection_active: bool = True,
+        other_player_check_enabled: bool = False,
+        other_player_switch_cooldown_seconds: float = 120.0,
+        other_player_drug_taps: int = 3,
+        other_player_drug_gap_seconds: float = 1.0,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1359,6 +1370,20 @@ class MovementWorker(threading.Thread):
         # minimap logic only (no fresh screen gap to consult).  Switched live
         # from the UI when the attack mode changes.
         self._yolo_detection_active = bool(yolo_detection_active)
+        # Other-player safety net: when red diamonds (other players) show on
+        # the minimap at the moment a move-to-left event finished, switch
+        # channel automatically.  Switched live from the UI.
+        self._other_player_check_enabled = bool(other_player_check_enabled)
+        self._left_excursion_active = False
+        self._player_switch_active = False
+        self._last_other_player_switch = float("-inf")
+        self.other_player_switch_cooldown_seconds = max(
+            0.0, float(other_player_switch_cooldown_seconds)
+        )
+        self.other_player_drug_taps = max(1, int(other_player_drug_taps))
+        self.other_player_drug_gap_seconds = max(
+            0.1, float(other_player_drug_gap_seconds)
+        )
         # Cross-process patrol state: published so the YOLO attack worker
         # blocks attacks while the character is climbing/dropping.
         self._patrol_state = (
@@ -1458,6 +1483,125 @@ class MovementWorker(threading.Thread):
             LOG.info("rope jump logic: %s",
                      "YOLO screen" if active else "minimap only")
             self._yolo_detection_active = active
+
+    def set_other_player_check(self, enabled: bool) -> None:
+        """Enable/disable the automatic channel switch on other players."""
+
+        self._other_player_check_enabled = bool(enabled)
+        LOG.info("other-player channel switch: %s",
+                 "on" if enabled else "off")
+
+    def _handle_left_excursion_end(
+        self, frame: Any, minimap_region: Any, route_label: str
+    ) -> None:
+        """Scan ONCE for other players when a move-to-left just finished.
+
+        The red-diamond scan only runs at the moment the move-to-left
+        excursion ends (the route advances from ``.left-most`` to
+        ``.right-most``) - one scan per cycle, never continuously, so the
+        minimap pixel check costs nothing the rest of the time.  When red
+        diamonds (other players) show up, the channel switch is triggered.
+        """
+
+        is_left_most = str(route_label).endswith(".left-most")
+        if is_left_most:
+            self._left_excursion_active = True
+            return
+        if not self._left_excursion_active:
+            return
+        self._left_excursion_active = False
+        if (not self._other_player_check_enabled
+                or not str(route_label).endswith(".right-most")):
+            return
+        count = self._other_players_on_minimap(frame, minimap_region)
+        if count > 0:
+            self._trigger_other_player_switch(count)
+
+    def _other_players_on_minimap(
+        self, frame: Any, minimap_region: Any
+    ) -> int:
+        """Count red diamonds (other players) in the current minimap crop."""
+
+        try:
+            image = _image_from_frame(frame)
+            minimap, _box = _crop(image, minimap_region)
+            return len(detect_red_diamonds(minimap))
+        except Exception:
+            LOG.warning("other-player scan failed", exc_info=True)
+            return 0
+
+    def _trigger_other_player_switch(self, count: int) -> None:
+        """Start the channel switch in a background thread (guarded once)."""
+
+        now = time.monotonic()
+        if self._player_switch_active:
+            LOG.info("player switch skipped: already switching")
+            return
+        if (now - self._last_other_player_switch
+                < self.other_player_switch_cooldown_seconds):
+            LOG.info("player switch skipped: cooling down")
+            return
+        self._player_switch_active = True
+        LOG.warning("OTHER PLAYER detected on the minimap (%d); "
+                    "switching channel", count)
+        threading.Thread(
+            target=self._run_other_player_switch, daemon=True
+        ).start()
+
+    def _run_other_player_switch(self) -> None:
+        """Background: drug up, switch channel, then resume the patrol."""
+
+        try:
+            # The patrol must not fight the menu navigation keys.
+            if self.patrol_controller is not None:
+                self.patrol_controller.set_enabled(False)
+            self._progressive_drug_before_switch()
+            ok = channel_switch_procedure(
+                self.key_sender,
+                on_press=lambda key, sent: LOG.info(
+                    "player-switch press %s ok=%s", key, sent
+                ),
+            )
+            if ok:
+                LOG.warning("player channel switch done; resuming patrol")
+            else:
+                LOG.warning("player channel switch blocked; resuming patrol")
+        except Exception:
+            LOG.exception("player channel switch failed")
+        finally:
+            if self.patrol_controller is not None:
+                self.patrol_controller.set_enabled(True)
+            self._player_switch_active = False
+            self._last_other_player_switch = time.monotonic()
+
+    def _progressive_drug_before_switch(self) -> None:
+        """Drink HP potions gradually so the character survives the switch.
+
+        Reads the bound HP potion key from drug_settings.json (the same file
+        the Drug panel writes) and taps it ``other_player_drug_taps`` times
+        with ``other_player_drug_gap_seconds`` between taps.
+        """
+
+        try:
+            data = json.loads(
+                (Path(__file__).resolve().parent / "drug_settings.json")
+                .read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            LOG.warning("drug settings unavailable; skipping progressive drug")
+            return
+        key = str(data.get("hp_key", "")).strip().casefold()
+        if not key:
+            return
+        scan_map = getattr(self.key_sender, "_SCAN", None)
+        if scan_map is not None and key not in scan_map:
+            LOG.warning("hp key %r not sendable; skipping drug", key)
+            return
+        LOG.info("progressive drug: %d x %s before channel switch",
+                 self.other_player_drug_taps, key)
+        for _ in range(self.other_player_drug_taps):
+            self.key_sender.press(key, duration=0.06)
+            time.sleep(self.other_player_drug_gap_seconds)
 
     def _yolo_rope_action(self) -> Optional[MovementDecision]:
         """Decide the rope action from YOLO SCREEN positions only.
@@ -2339,6 +2483,11 @@ class MovementWorker(threading.Thread):
                         )
                     decision = position_plan.decision
                     active_target_x = route_target_x
+                # Other-player safety net: one scan when a move-to-left
+                # excursion finishes, then switch channel on sighting.
+                self._handle_left_excursion_end(
+                    frame, minimap_region, route_label
+                )
                 decision = preserve_persistent_climb(self._climb_state, decision)
                 if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None
