@@ -4,6 +4,7 @@
   "patrol_enabled": false,
   "climbing_enabled": true,
   "route_order": [
+    "layer1",
     "layer2"
   ],
   "final_layer_action": "drop_to_first_layer",
@@ -23,16 +24,16 @@
   "layers": {
     "layer1": {
       "y_tolerance": 0.02,
-      "calibration_status": "awaiting_left_rope_right",
+      "calibration_status": "complete",
       "left_most_pos": {
-        "x": 0.068915,
+        "x": 0.08651,
         "y": 0.775391,
         "source": "manual-ui",
-        "world_y": 11.760774,
-        "observed_world_y": 11.760774,
-        "tracking_confidence": 0.957985,
+        "world_y": 11.322577,
+        "observed_world_y": 11.322577,
+        "tracking_confidence": 0.962654,
         "coordinate_v2": {
-          "x_diamond": -24.5,
+          "x_diamond": -23.5,
           "y_diamond": 11.75,
           "recorded_layout": {
             "analysis_width": 341.0,
@@ -49,18 +50,40 @@
       "y_tolerance_diamonds": 0.853333,
       "layer_y": 0.775391,
       "layer_y_source": "manual-ui",
-      "layer_world_y": 11.760774,
+      "layer_world_y": 11.322577,
       "world_y_tolerance": 0.75,
       "rope_pos": {
-        "x": 0.092375,
+        "x": 0.089443,
         "y": 0.775391,
         "source": "manual-ui",
-        "world_y": 11.760774,
-        "observed_world_y": 11.679058,
-        "tracking_confidence": 0.956181,
+        "world_y": 11.322577,
+        "observed_world_y": 11.27415,
+        "tracking_confidence": 0.963848,
         "coordinate_v2": {
-          "x_diamond": -23.166667,
+          "x_diamond": -23.333333,
           "y_diamond": 11.75,
+          "recorded_layout": {
+            "analysis_width": 341.0,
+            "analysis_height": 256.0,
+            "canvas_left": 0.0,
+            "canvas_top": 0.0,
+            "canvas_width": 341.0,
+            "canvas_height": 256.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      },
+      "right_most_pos": {
+        "x": 0.382698,
+        "y": 0.771484,
+        "source": "manual-ui",
+        "world_y": 11.322577,
+        "observed_world_y": 11.009609,
+        "tracking_confidence": 0.959694,
+        "coordinate_v2": {
+          "x_diamond": -6.666667,
+          "y_diamond": 11.583333,
           "recorded_layout": {
             "analysis_width": 341.0,
             "analysis_height": 256.0,
@@ -78,14 +101,14 @@
       "y_tolerance": 0.02,
       "calibration_status": "final_layer_ready",
       "left_most_pos": {
-        "x": 0.071848,
+        "x": 0.07478,
         "y": 0.611328,
         "source": "manual-ui",
-        "world_y": -26.910211,
-        "observed_world_y": -26.910211,
-        "tracking_confidence": 0.967295,
+        "world_y": -17.154373,
+        "observed_world_y": -16.985589,
+        "tracking_confidence": 0.963935,
         "coordinate_v2": {
-          "x_diamond": -24.333333,
+          "x_diamond": -24.166667,
           "y_diamond": 4.75,
           "recorded_layout": {
             "analysis_width": 341.0,
@@ -102,17 +125,17 @@
       "y_tolerance_diamonds": 0.853333,
       "layer_y": 0.611328,
       "layer_y_source": "manual-ui",
-      "layer_world_y": -26.910211,
+      "layer_world_y": -17.154373,
       "world_y_tolerance": 0.75,
       "right_most_pos": {
-        "x": 0.268328,
+        "x": 0.259531,
         "y": 0.599609,
         "source": "manual-ui",
-        "world_y": -26.910211,
-        "observed_world_y": -27.424373,
-        "tracking_confidence": 0.967959,
+        "world_y": -17.154373,
+        "observed_world_y": -17.506873,
+        "tracking_confidence": 0.961909,
         "coordinate_v2": {
-          "x_diamond": -13.166667,
+          "x_diamond": -13.666667,
           "y_diamond": 4.25,
           "recorded_layout": {
             "analysis_width": 341.0,

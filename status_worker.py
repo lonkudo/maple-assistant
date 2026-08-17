@@ -12,7 +12,7 @@ import ctypes
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Protocol, Sequence
 
 import numpy as np
@@ -38,6 +38,26 @@ class WindowKeySender:
         "right": (0x4D, True), "down": (0x50, True),
         "delete": (0x53, True), "end": (0x4F, True),
         "z": (0x2C, False), "space": (0x39, False),
+        # digit row (potion keys)
+        "1": (0x02, False), "2": (0x03, False), "3": (0x04, False),
+        "4": (0x05, False), "5": (0x06, False), "6": (0x07, False),
+        "7": (0x08, False), "8": (0x09, False), "9": (0x0A, False),
+        "0": (0x0B, False),
+        # letters
+        "q": (0x10, False), "w": (0x11, False), "e": (0x12, False),
+        "r": (0x13, False), "t": (0x14, False), "y": (0x15, False),
+        "u": (0x16, False), "i": (0x17, False), "o": (0x18, False),
+        "p": (0x19, False),
+        "a": (0x1E, False), "s": (0x1F, False), "d": (0x20, False),
+        "f": (0x21, False), "g": (0x22, False), "h": (0x23, False),
+        "j": (0x24, False), "k": (0x25, False), "l": (0x26, False),
+        "x": (0x2D, False), "c": (0x2E, False), "v": (0x2F, False),
+        "b": (0x30, False), "n": (0x31, False), "m": (0x32, False),
+        # function row
+        "f1": (0x3B, False), "f2": (0x3C, False), "f3": (0x3D, False),
+        "f4": (0x3E, False), "f5": (0x3F, False), "f6": (0x40, False),
+        "f7": (0x41, False), "f8": (0x42, False), "f9": (0x43, False),
+        "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
     }
 
     def __init__(
@@ -439,6 +459,16 @@ class StatusConfig:
     max_mp: int = 371
     hp_threshold: int = 300
     mp_threshold: int = 60
+    # Drug panel settings: keys bound to the HP/MP potion slots and the
+    # trigger thresholds as ratios (0..1 = percent/100 of the bar).  When the
+    # bar ratio drops BELOW the threshold the key is tapped (debounced by
+    # low_frames_required + potion_cooldown).
+    hp_key: str = "delete"
+    mp_key: str = "end"
+    hp_ratio_threshold: float = 0.5
+    mp_ratio_threshold: float = 0.3
+    hp_enabled: bool = True
+    mp_enabled: bool = True
     # Approximate full bar length; accepted candidates may vary substantially.
     # The observed 2560x1600 client scales to a 1707px-wide capture where each
     # fill is about 131px (131/1707 ~= 0.077).
@@ -544,19 +574,21 @@ class StatusWorker(threading.Thread):
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
 
-    def _check_resource(self, name: str, value: Optional[int], threshold: int,
-                        key: str, now: float) -> None:
-        if value is None:
+    def _check_resource(self, name: str, ratio: Optional[float],
+                        threshold_ratio: float, key: str, now: float) -> None:
+        if ratio is None:
             self._low_count[name] = 0
             return
-        self._low_count[name] = self._low_count[name] + 1 if value < threshold else 0
+        self._low_count[name] = (
+            self._low_count[name] + 1 if ratio < threshold_ratio else 0
+        )
         if (self._low_count[name] >= self.low_frames_required
                 and now - self._last_potion[name] >= self.potion_cooldown):
             if self.key_sender.tap(key):
                 self._last_potion[name] = now
                 self._low_count[name] = 0
-                LOG.warning("%s=%d below %d: used %s", name.upper(), value,
-                            threshold, key)
+                LOG.warning("%s=%.0f%% below %.0f%%: used %s", name.upper(),
+                            ratio * 100, threshold_ratio * 100, key)
 
     def _process_frame(self, frame: object) -> None:
         status_image = getattr(frame, "status_image", None)
@@ -580,8 +612,20 @@ class StatusWorker(threading.Thread):
             return
         now = time.monotonic()
         config = self.detector.config
-        self._check_resource("hp", reading.hp, config.hp_threshold, "delete", now)
-        self._check_resource("mp", reading.mp, config.mp_threshold, "end", now)
+        if config.hp_enabled:
+            self._check_resource(
+                "hp", reading.hp_ratio, config.hp_ratio_threshold,
+                config.hp_key, now,
+            )
+        else:
+            self._low_count["hp"] = 0
+        if config.mp_enabled:
+            self._check_resource(
+                "mp", reading.mp_ratio, config.mp_ratio_threshold,
+                config.mp_key, now,
+            )
+        else:
+            self._low_count["mp"] = 0
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -603,7 +647,44 @@ class StatusWorker(threading.Thread):
                     pass
 
 
+def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
+    """Return a copy of ``config`` with the drug panel settings applied.
+
+    ``data`` uses the UI's form: key names and integer percents (0..100) for
+    ``hp_threshold``/``mp_threshold``.  Unsupported or unknown keys are
+    ignored (the existing binding stays).
+    """
+
+    kwargs: dict[str, object] = {}
+    for field_name, data_key in (
+        ("hp_key", "hp_key"), ("mp_key", "mp_key"),
+        ("hp_enabled", "hp_enabled"), ("mp_enabled", "mp_enabled"),
+    ):
+        if data_key not in data:
+            continue
+        value = data[data_key]
+        if field_name.endswith("key"):
+            if value:
+                key = str(value).casefold()
+                if key in WindowKeySender._SCAN:
+                    kwargs[field_name] = key
+        elif isinstance(value, bool):
+            kwargs[field_name] = value
+    for field_name, data_key in (
+        ("hp_ratio_threshold", "hp_threshold"),
+        ("mp_ratio_threshold", "mp_threshold"),
+    ):
+        if data_key not in data:
+            continue
+        try:
+            percent = float(data[data_key])
+        except (TypeError, ValueError):
+            continue
+        kwargs[field_name] = float(np.clip(percent, 0.0, 100.0)) / 100.0
+    return replace(config, **kwargs)
+
+
 __all__: Sequence[str] = (
     "BarStatusDetector", "StatusConfig", "StatusReading", "StatusWorker",
-    "WindowKeySender",
+    "WindowKeySender", "apply_drug_settings",
 )

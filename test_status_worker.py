@@ -8,7 +8,10 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 from capture_worker import remap_normalized_box
-from status_worker import BarStatusDetector, StatusConfig, StatusWorker, WindowKeySender
+from status_worker import (
+    BarStatusDetector, StatusConfig, StatusWorker, WindowKeySender,
+    apply_drug_settings,
+)
 
 
 def status_image(hp_ratio: float, mp_ratio: float) -> Image.Image:
@@ -79,6 +82,53 @@ class StatusTests(unittest.TestCase):
         worker._process_frame(image)
         worker._process_frame(image)
         self.assertEqual(sender.keys, ["delete", "end"])
+
+    def test_drug_uses_configured_keys_and_percent_thresholds(self) -> None:
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event(),
+                              potion_cooldown=60, low_frames_required=2)
+        worker.detector.config = replace(
+            worker.detector.config,
+            hp_key="1", mp_key="2",
+            hp_ratio_threshold=0.6, mp_ratio_threshold=0.2,
+        )
+        image = status_image(0.4, 0.1)  # 40% < 60%, 10% < 20%
+        worker._process_frame(image)
+        worker._process_frame(image)
+        self.assertEqual(sender.keys, ["1", "2"])
+
+    def test_disabled_drug_never_taps(self) -> None:
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event(),
+                              potion_cooldown=60, low_frames_required=1)
+        worker.detector.config = replace(
+            worker.detector.config,
+            hp_enabled=False, mp_enabled=True, mp_ratio_threshold=0.5,
+        )
+        worker._process_frame(status_image(0.1, 0.1))
+        self.assertEqual(sender.keys, ["end"])
+
+    def test_apply_drug_settings_maps_percent_to_ratio_and_validates_keys(self) -> None:
+        config = StatusConfig()
+        updated = apply_drug_settings(config, {
+            "hp_key": "1", "mp_key": "f4",
+            "hp_threshold": 55, "mp_threshold": 20,
+            "hp_enabled": False, "mp_enabled": True,
+        })
+        self.assertEqual(updated.hp_key, "1")
+        self.assertEqual(updated.mp_key, "f4")
+        self.assertAlmostEqual(updated.hp_ratio_threshold, 0.55)
+        self.assertAlmostEqual(updated.mp_ratio_threshold, 0.20)
+        self.assertFalse(updated.hp_enabled)
+        self.assertTrue(updated.mp_enabled)
+        # Unsupported key is ignored: the existing binding stays.
+        unchanged = apply_drug_settings(config, {"hp_key": "not-a-key"})
+        self.assertEqual(unchanged.hp_key, config.hp_key)
+
+    def test_new_scan_codes_cover_potion_keys(self) -> None:
+        sender = WindowKeySender("game")
+        for key in ("1", "9", "q", "m", "f1", "f12", "end"):
+            self.assertIn(key, sender._SCAN)
 
     def test_sender_is_dry_run_by_default(self) -> None:
         sender = WindowKeySender("game")

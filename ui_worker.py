@@ -20,6 +20,7 @@ from map_identity import MapIdentityStore
 from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
+from status_worker import apply_drug_settings, WindowKeySender
 
 
 LOG = logging.getLogger(__name__)
@@ -314,6 +315,7 @@ class UiWorker(threading.Thread):
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Optional[MapStructureTracker] = None,
         map_identity_store: Optional[MapIdentityStore] = None,
+        status_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -330,6 +332,9 @@ class UiWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.map_identity_store = map_identity_store
+        # Status worker whose detector config the Drug panel edits live
+        # (potions keys + trigger percents).
+        self.status_worker = status_worker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -580,6 +585,72 @@ class UiWorker(threading.Thread):
             self._yolo_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved YOLO panel settings (threshold, ranges).
             self._yolo_load_settings()
+
+            # Drug (HP/MP potion) panel: key binds + percent trigger sliders.
+            # The StatusWorker taps the bound key when the bar ratio drops
+            # below the chosen percent (debounced by frames + cooldown).
+            drug_panel = ttk.LabelFrame(
+                container, text="Drug (HP/MP potions)", padding=10
+            )
+            drug_panel.pack(fill="x", pady=(0, 8))
+            hp_row = ttk.Frame(drug_panel)
+            hp_row.pack(fill="x")
+            self._hp_use_var = tk.BooleanVar(value=True)
+            hp_use_button = ttk.Checkbutton(
+                hp_row, text="HP", variable=self._hp_use_var,
+                command=self._drug_on_change,
+            )
+            hp_use_button.pack(side="left")
+            ttk.Label(hp_row, text="Key:").pack(side="left", padx=(8, 4))
+            self._hp_key_var = tk.StringVar(value="delete")
+            hp_key_entry = ttk.Entry(
+                hp_row, textvariable=self._hp_key_var, width=6
+            )
+            hp_key_entry.pack(side="left", padx=(0, 10))
+            hp_key_entry.bind("<KeyRelease>", self._drug_on_change)
+            ttk.Label(hp_row, text="drink when HP <").pack(side="left")
+            self._hp_threshold_var = tk.IntVar(value=50)
+            hp_threshold_slider = ttk.Scale(
+                hp_row, from_=5, to=95, orient="horizontal",
+                variable=self._hp_threshold_var,
+                command=self._drug_on_change,
+            )
+            hp_threshold_slider.pack(side="left", fill="x",
+                                     expand=True, padx=(8, 8))
+            self._hp_threshold_label = ttk.Label(hp_row, text="50%", width=6)
+            self._hp_threshold_label.pack(side="left")
+            mp_row = ttk.Frame(drug_panel)
+            mp_row.pack(fill="x", pady=(6, 0))
+            self._mp_use_var = tk.BooleanVar(value=True)
+            mp_use_button = ttk.Checkbutton(
+                mp_row, text="MP", variable=self._mp_use_var,
+                command=self._drug_on_change,
+            )
+            mp_use_button.pack(side="left")
+            ttk.Label(mp_row, text="Key:").pack(side="left", padx=(8, 4))
+            self._mp_key_var = tk.StringVar(value="end")
+            mp_key_entry = ttk.Entry(
+                mp_row, textvariable=self._mp_key_var, width=6
+            )
+            mp_key_entry.pack(side="left", padx=(0, 10))
+            mp_key_entry.bind("<KeyRelease>", self._drug_on_change)
+            ttk.Label(mp_row, text="drink when MP <").pack(side="left")
+            self._mp_threshold_var = tk.IntVar(value=30)
+            mp_threshold_slider = ttk.Scale(
+                mp_row, from_=5, to=95, orient="horizontal",
+                variable=self._mp_threshold_var,
+                command=self._drug_on_change,
+            )
+            mp_threshold_slider.pack(side="left", fill="x",
+                                     expand=True, padx=(8, 8))
+            self._mp_threshold_label = ttk.Label(mp_row, text="30%", width=6)
+            self._mp_threshold_label.pack(side="left")
+            self._drug_status = ttk.Label(
+                drug_panel, text="Drug panel ready.", justify="left"
+            )
+            self._drug_status.pack(anchor="w", pady=(6, 0))
+            # Restore previously saved drug settings and apply them live.
+            self._drug_load_settings()
 
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
@@ -840,6 +911,91 @@ class UiWorker(threading.Thread):
         self._yolo_on_zone_change()
         self._yolo_sync_show_button()
         LOG.info("yolo settings loaded from %s", self._yolo_settings_path())
+
+    @staticmethod
+    def _drug_settings_path() -> Path:
+        return Path(__file__).resolve().parent / "drug_settings.json"
+
+    def _drug_on_change(self, _event: Any = None) -> None:
+        """Update labels, persist, and apply the drug settings live."""
+
+        if not hasattr(self, "_hp_threshold_label"):
+            return
+        hp_percent = int(self._hp_threshold_var.get())
+        mp_percent = int(self._mp_threshold_var.get())
+        self._hp_threshold_label.configure(text=f"{hp_percent}%")
+        self._mp_threshold_label.configure(text=f"{mp_percent}%")
+        data = {
+            "hp_key": self._hp_key_var.get().strip(),
+            "mp_key": self._mp_key_var.get().strip(),
+            "hp_threshold": hp_percent,
+            "mp_threshold": mp_percent,
+            "hp_enabled": bool(self._hp_use_var.get()),
+            "mp_enabled": bool(self._mp_use_var.get()),
+        }
+        self._drug_save_settings(data)
+        self._drug_apply_to_worker(data)
+
+    def _drug_load_settings(self) -> None:
+        """Restore saved drug panel values and apply them live."""
+
+        try:
+            data = json.loads(
+                self._drug_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            data = {}
+        try:
+            if "hp_key" in data:
+                self._hp_key_var.set(str(data["hp_key"]))
+            if "mp_key" in data:
+                self._mp_key_var.set(str(data["mp_key"]))
+            if "hp_threshold" in data:
+                self._hp_threshold_var.set(int(data["hp_threshold"]))
+            if "mp_threshold" in data:
+                self._mp_threshold_var.set(int(data["mp_threshold"]))
+            if "hp_enabled" in data:
+                self._hp_use_var.set(bool(data["hp_enabled"]))
+            if "mp_enabled" in data:
+                self._mp_use_var.set(bool(data["mp_enabled"]))
+        except (KeyError, TypeError, ValueError):
+            LOG.warning("ignored malformed drug settings", exc_info=True)
+            return
+        self._drug_on_change()
+        LOG.info("drug settings loaded from %s", self._drug_settings_path())
+
+    def _drug_save_settings(self, data: dict) -> None:
+        """Persist the drug panel values to the local JSON file."""
+
+        try:
+            self._drug_settings_path().write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            LOG.warning("could not save drug settings", exc_info=True)
+
+    def _drug_apply_to_worker(self, data: dict) -> None:
+        """Apply the drug settings to the StatusWorker's detector config."""
+
+        worker = getattr(self, "status_worker", None)
+        if worker is None:
+            self._drug_status.configure(
+                text="Drug: status worker not wired (headless run)."
+            )
+            return
+        try:
+            config = apply_drug_settings(worker.detector.config, data)
+            worker.detector.config = config
+            self._drug_status.configure(
+                text=(
+                    f"Drug: HP<{data['hp_threshold']}% key={data['hp_key']} "
+                    f"({'on' if data['hp_enabled'] else 'off'}) | "
+                    f"MP<{data['mp_threshold']}% key={data['mp_key']} "
+                    f"({'on' if data['mp_enabled'] else 'off'})"
+                )
+            )
+        except Exception as exc:
+            LOG.warning("drug settings apply failed: %s", exc)
 
     def _yolo_save_settings(self) -> None:
         """Persist current YOLO panel values to the local JSON file."""

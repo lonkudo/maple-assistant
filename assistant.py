@@ -331,6 +331,13 @@ def main() -> int:
             moving_active_event=moving_active,
             pickup_active_event=pickup_active,
         ))
+    status_worker = StatusWorker(
+        status_frames,
+        key_sender,
+        stop_event,
+        detector=status_detector,
+        automation_active_event=automation_active,
+    )
     core_workers = [
         capture_worker,
         MovementWorker(
@@ -432,13 +439,7 @@ def main() -> int:
                 calibration.get("rope_approach_creep_seconds", 0.25)
             ),
         ),
-        StatusWorker(
-            status_frames,
-            key_sender,
-            stop_event,
-            detector=status_detector,
-            automation_active_event=automation_active,
-        ),
+        status_worker,
         *attack_workers,
         *pickup_workers,
         FocusWorker(
@@ -460,6 +461,7 @@ def main() -> int:
             diamond_size_tracker=ui_diamond_tracker,
             structure_tracker=structure_tracker,
             map_identity_store=map_identity_store,
+            status_worker=status_worker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),
