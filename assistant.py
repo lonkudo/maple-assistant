@@ -162,6 +162,7 @@ def main() -> int:
         WindowKeySender,
     )
     from attack_worker import AttackWorker
+    from shutdown_worker import ShutdownWorker
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
     from marker_detector import DiamondSizeTracker
@@ -319,6 +320,12 @@ def main() -> int:
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
+    shutdown_worker = ShutdownWorker(
+        key_sender,
+        stop_event,
+        enabled=False,
+        hours=3.0,
+    )
     pickup_workers = []
     if args.pickup_interval > 0:
         from pickup_worker import PickupWorker
@@ -445,6 +452,7 @@ def main() -> int:
         status_worker,
         *attack_workers,
         *pickup_workers,
+        shutdown_worker,
         FocusWorker(
             key_sender,
             stop_event,
@@ -467,6 +475,7 @@ def main() -> int:
             status_worker=status_worker,
             attack_worker=attack_worker,
             movement_worker=movement_worker,
+            shutdown_worker=shutdown_worker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

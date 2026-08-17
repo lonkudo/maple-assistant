@@ -9,6 +9,7 @@ import logging
 import queue
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -350,6 +351,7 @@ class UiWorker(threading.Thread):
         status_worker: Any = None,
         attack_worker: Any = None,
         movement_worker: Any = None,
+        shutdown_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -376,6 +378,9 @@ class UiWorker(threading.Thread):
         # Fixed Attack mode runs without YOLO, so the minimap logic must own
         # the rope jump there.
         self.movement_worker = movement_worker
+        # Shutdown worker (ShutdownWorker) the Additional Functions panel
+        # arms: enabled flag + hours are applied live.
+        self.shutdown_worker = shutdown_worker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -796,6 +801,50 @@ class UiWorker(threading.Thread):
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
+            # Additional Functions panel: optional extras, each gated by its
+            # own checkbox.  First one: scheduled shutdown - after X hours
+            # the game gets Alt+F4, the worker verifies the window is gone,
+            # then every worker is stopped.
+            extra_panel = ttk.LabelFrame(
+                container, text="Additional Functions", padding=10
+            )
+            extra_panel.pack(fill="x", pady=(0, 8))
+            shutdown_row = ttk.Frame(extra_panel)
+            shutdown_row.pack(fill="x")
+            self._shutdown_enabled_var = tk.BooleanVar(value=False)
+            shutdown_check = ttk.Checkbutton(
+                shutdown_row, text="Shutdown after",
+                variable=self._shutdown_enabled_var,
+                command=self._shutdown_on_change,
+            )
+            shutdown_check.pack(side="left", padx=(0, 8))
+            self._shutdown_check = shutdown_check
+            # Countdown length: horizontal slider (progress-bar style),
+            # 0.5-12 hours, default 3.
+            self._shutdown_hours_var = tk.DoubleVar(value=3.0)
+            shutdown_slider = ttk.Scale(
+                shutdown_row, from_=0.5, to=12.0, orient="horizontal",
+                variable=self._shutdown_hours_var,
+                command=self._shutdown_on_change,
+            )
+            shutdown_slider.pack(side="left", fill="x", expand=True,
+                                 padx=(0, 8))
+            self._shutdown_slider = shutdown_slider
+            self._shutdown_hours_label = ttk.Label(
+                shutdown_row, text="3.0h", width=6
+            )
+            self._shutdown_hours_label.pack(side="left")
+            ttk.Label(
+                shutdown_row, text="then close game (Alt+F4) and stop"
+            ).pack(side="left", padx=(8, 0))
+            self._shutdown_status = ttk.Label(
+                extra_panel,
+                text="Shutdown: disabled - game keeps running.",
+                justify="left",
+            )
+            self._shutdown_status.pack(anchor="w", pady=(6, 0))
+            self._shutdown_load_settings()
+
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
             if self._SHOW_MINIMAP_PREVIEW:
@@ -863,6 +912,7 @@ class UiWorker(threading.Thread):
                 LOG.exception("could not update debug UI")
         self._drain_logs()
         self._refresh_automation_status()
+        self._refresh_shutdown_status()
         root.after(self.refresh_ms, self._poll)
 
     def _refresh_automation_status(self) -> None:
@@ -1350,6 +1400,126 @@ class UiWorker(threading.Thread):
             )
         except Exception as exc:
             LOG.warning("drug settings apply failed: %s", exc)
+
+    @staticmethod
+    def _shutdown_settings_path() -> Path:
+        """JSON file holding the Additional Functions panel settings."""
+
+        return Path(__file__).resolve().parent / "additional_functions_settings.json"
+
+    def _shutdown_collect_data(self) -> dict:
+        """Current Additional Functions panel values as a settings dict."""
+
+        return {
+            "shutdown_enabled": bool(self._shutdown_enabled_var.get()),
+            "shutdown_hours": round(float(self._shutdown_hours_var.get()), 1),
+        }
+
+    def _shutdown_on_change(self, _value: str = "") -> None:
+        """Update labels, persist, and apply the shutdown settings live."""
+
+        if not hasattr(self, "_shutdown_hours_label"):
+            return
+        hours = float(self._shutdown_hours_var.get())
+        self._shutdown_hours_label.configure(text=f"{hours:.1f}h")
+        data = self._shutdown_collect_data()
+        self._shutdown_save_settings(data)
+        self._shutdown_apply_to_worker(data)
+        self._shutdown_refresh_grey()
+
+    def _shutdown_save_settings(self, data: dict) -> None:
+        """Persist the Additional Functions values to the local JSON file."""
+
+        try:
+            self._shutdown_settings_path().write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            LOG.warning("could not save additional functions settings",
+                        exc_info=True)
+
+    def _shutdown_apply_to_worker(self, data: dict) -> None:
+        """Apply the shutdown settings to the ShutdownWorker live."""
+
+        worker = getattr(self, "shutdown_worker", None)
+        if worker is None:
+            self._shutdown_status.configure(
+                text="Shutdown: worker not wired (headless run)."
+            )
+            return
+        worker.enabled = bool(data.get("shutdown_enabled", False))
+        worker.set_hours(float(data.get("shutdown_hours", 3.0)))
+        if worker.enabled:
+            self._shutdown_status.configure(
+                text=f"Shutdown armed: game closes in "
+                     f"{float(data.get('shutdown_hours', 3.0)):.1f}h "
+                     f"(Alt+F4 then stop all)."
+            )
+        else:
+            self._shutdown_status.configure(
+                text="Shutdown: disabled - game keeps running."
+            )
+
+    def _shutdown_refresh_grey(self) -> None:
+        """Grey the countdown slider when the shutdown feature is off."""
+
+        enabled = bool(self._shutdown_enabled_var.get())
+        state = "!disabled" if enabled else "disabled"
+        for widget in (self._shutdown_slider, self._shutdown_hours_label):
+            try:
+                widget.state([state])
+            except Exception:
+                try:
+                    widget.configure(
+                        state="normal" if enabled else "disabled"
+                    )
+                except Exception:
+                    pass
+
+    def _refresh_shutdown_status(self) -> None:
+        """Live countdown in the status line (called every UI poll tick)."""
+
+        if not hasattr(self, "_shutdown_status"):
+            return
+        worker = getattr(self, "shutdown_worker", None)
+        if worker is None or not worker.enabled:
+            return
+        deadline = getattr(worker, "_deadline", None)
+        if deadline is None:
+            return
+        remaining = max(0.0, deadline - time.monotonic())
+        hours = remaining / 3600.0
+        if hours >= 1.0:
+            text = f"Shutdown armed: game closes in {hours:.1f}h."
+        else:
+            minutes = int(remaining // 60.0)
+            seconds = int(remaining % 60.0)
+            text = (f"Shutdown armed: game closes in {minutes}m {seconds:02d}s.")
+        self._shutdown_status.configure(text=text)
+
+    def _shutdown_load_settings(self) -> None:
+        """Restore saved Additional Functions values and apply them live."""
+
+        try:
+            data = json.loads(
+                self._shutdown_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            data = {}
+        try:
+            if "shutdown_enabled" in data:
+                self._shutdown_enabled_var.set(
+                    bool(data["shutdown_enabled"])
+                )
+            if "shutdown_hours" in data:
+                self._shutdown_hours_var.set(float(data["shutdown_hours"]))
+        except (KeyError, TypeError, ValueError):
+            LOG.warning("ignored malformed additional functions settings",
+                        exc_info=True)
+            return
+        self._shutdown_on_change()
+        LOG.info("additional functions settings loaded from %s",
+                 self._shutdown_settings_path())
 
     def _yolo_save_settings(self) -> None:
         """Persist current YOLO panel values to the local JSON file."""

@@ -639,6 +639,94 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertEqual(loader.attack_worker.attack_interval, 4.5)
                 self.assertEqual(loader.attack_worker.attack_key, "delete")
 
+    def test_shutdown_panel_roundtrip_and_worker_apply(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Slider:
+            def __init__(self) -> None:
+                self.states = []
+
+            def state(self, args) -> None:
+                self.states.append(args)
+
+        class FakeShutdownWorker:
+            def __init__(self) -> None:
+                self.enabled = False
+                self.hours = 3.0
+                self._deadline = None
+
+            def set_hours(self, hours) -> None:
+                self.hours = hours
+                self._deadline = None
+
+        def make_worker() -> UiWorker:
+            w = UiWorker.__new__(UiWorker)
+            w.shutdown_worker = FakeShutdownWorker()
+            w._shutdown_enabled_var = Var(False)
+            w._shutdown_hours_var = Var(3.0)
+            w._shutdown_hours_label = Label()
+            w._shutdown_slider = Slider()
+            w._shutdown_status = Label()
+            return w
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = make_worker()
+            worker._shutdown_enabled_var.set(True)
+            worker._shutdown_hours_var.set(2.5)
+
+            def fake_path(self):
+                return Path(directory) / "additional_functions_settings.json"
+
+            with mock.patch.object(UiWorker, "_shutdown_settings_path",
+                                   fake_path):
+                worker._shutdown_on_change()
+                saved = Path(directory) / "additional_functions_settings.json"
+                self.assertTrue(saved.is_file())
+                data = json.loads(saved.read_text(encoding="utf-8"))
+                self.assertTrue(data["shutdown_enabled"])
+                self.assertEqual(data["shutdown_hours"], 2.5)
+                # Applied to the worker live + slider enabled + label.
+                self.assertTrue(worker.shutdown_worker.enabled)
+                self.assertEqual(worker.shutdown_worker.hours, 2.5)
+                self.assertIn("armed", worker._shutdown_status.text)
+                self.assertIn(["!disabled"], worker._shutdown_slider.states)
+
+                loader = make_worker()
+                with mock.patch.object(UiWorker, "_shutdown_settings_path",
+                                       fake_path):
+                    loader._shutdown_load_settings()
+                self.assertTrue(loader._shutdown_enabled_var.get())
+                self.assertEqual(loader._shutdown_hours_var.get(), 2.5)
+                self.assertTrue(loader.shutdown_worker.enabled)
+                self.assertEqual(loader.shutdown_worker.hours, 2.5)
+
+                # Disabling greys the slider and clears the worker flag.
+                loader._shutdown_enabled_var.set(False)
+                loader._shutdown_on_change()
+                self.assertFalse(loader.shutdown_worker.enabled)
+                self.assertIn(["disabled"], loader._shutdown_slider.states)
+                self.assertIn("disabled", loader._shutdown_status.text)
+
 
 if __name__ == "__main__":
     unittest.main()
