@@ -71,6 +71,7 @@ class WindowKeySender:
         "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
         # modifiers + editing / navigation
         "shift": (0x2A, False), "tab": (0x0F, False),
+        "esc": (0x01, False),
         "caps": (0x3A, False), "enter": (0x1C, False),
         "backspace": (0x0E, False),
         "home": (0x47, True), "pageup": (0x49, True),
