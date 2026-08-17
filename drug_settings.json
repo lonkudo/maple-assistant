@@ -1,6 +1,6 @@
 {
-  "hp_key": "3",
-  "mp_key": "3",
+  "hp_key": "delete",
+  "mp_key": "end",
   "hp_threshold": 50,
   "mp_threshold": 30,
   "hp_enabled": true,

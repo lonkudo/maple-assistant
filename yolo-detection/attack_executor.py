@@ -28,11 +28,49 @@ from typing import Optional
 LOG = logging.getLogger("attack_executor")
 
 # Set-1 keyboard scan codes.  Extended keys (arrows) need the E0 flag.
+# Must stay in sync with the UI bind buttons (any bindable key must be
+# sendable here or the detection window would crash on startup).
 _SCAN = {
-    "ctrl": (0x1D, False),
-    "alt": (0x38, False),
-    "left": (0x4B, True),
-    "right": (0x4D, True),
+    "ctrl": (0x1D, False), "alt": (0x38, False),
+    "left": (0x4B, True), "right": (0x4D, True),
+    "up": (0x48, True), "down": (0x50, True),
+    "delete": (0x53, True), "end": (0x4F, True),
+    "z": (0x2C, False), "space": (0x39, False),
+    "1": (0x02, False), "2": (0x03, False), "3": (0x04, False),
+    "4": (0x05, False), "5": (0x06, False), "6": (0x07, False),
+    "7": (0x08, False), "8": (0x09, False), "9": (0x0A, False),
+    "0": (0x0B, False),
+    "q": (0x10, False), "w": (0x11, False), "e": (0x12, False),
+    "r": (0x13, False), "t": (0x14, False), "y": (0x15, False),
+    "u": (0x16, False), "i": (0x17, False), "o": (0x18, False),
+    "p": (0x19, False),
+    "a": (0x1E, False), "s": (0x1F, False), "d": (0x20, False),
+    "f": (0x21, False), "g": (0x22, False), "h": (0x23, False),
+    "j": (0x24, False), "k": (0x25, False), "l": (0x26, False),
+    "x": (0x2D, False), "c": (0x2E, False), "v": (0x2F, False),
+    "b": (0x30, False), "n": (0x31, False), "m": (0x32, False),
+    "f1": (0x3B, False), "f2": (0x3C, False), "f3": (0x3D, False),
+    "f4": (0x3E, False), "f5": (0x3F, False), "f6": (0x40, False),
+    "f7": (0x41, False), "f8": (0x42, False), "f9": (0x43, False),
+    "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
+    "shift": (0x2A, False), "tab": (0x0F, False),
+    "caps": (0x3A, False), "enter": (0x1C, False),
+    "backspace": (0x0E, False),
+    "home": (0x47, True), "pageup": (0x49, True),
+    "pagedown": (0x51, True), "insert": (0x52, True),
+    "minus": (0x0C, False), "equal": (0x0D, False),
+    "bracketleft": (0x1A, False), "bracketright": (0x1B, False),
+    "backslash": (0x2B, False), "semicolon": (0x27, False),
+    "apostrophe": (0x28, False), "grave": (0x29, False),
+    "comma": (0x33, False), "period": (0x34, False),
+    "slash": (0x35, False),
+    "kp_0": (0x52, True), "kp_1": (0x4F, True), "kp_2": (0x50, True),
+    "kp_3": (0x51, True), "kp_4": (0x4B, True), "kp_5": (0x4C, True),
+    "kp_6": (0x4D, True), "kp_7": (0x47, True), "kp_8": (0x48, True),
+    "kp_9": (0x49, True),
+    "kp_add": (0x4E, False), "kp_subtract": (0x4A, False),
+    "kp_multiply": (0x37, False), "kp_divide": (0x35, True),
+    "kp_enter": (0x1C, True), "kp_decimal": (0x53, True),
 }
 
 ULONG_PTR = wintypes.WPARAM
@@ -142,7 +180,11 @@ class AttackExecutor:
         self.window_title = window_title
         self.attack_key = attack_key.casefold()
         if self.attack_key not in _SCAN:
-            raise ValueError(f"unsupported attack key: {attack_key}")
+            # Never let a bad attack key kill the whole detection window:
+            # fall back to Ctrl and keep running.
+            LOG.warning("unsupported attack key %r; falling back to 'ctrl'",
+                        attack_key)
+            self.attack_key = "ctrl"
         self.face_hold = max(0.01, float(face_hold))
         self.attack_hold = max(0.01, float(attack_hold))
         self.cooldown = max(0.0, float(cooldown))
