@@ -1,5 +1,5 @@
 {
   "attack_mode": "yolo",
-  "interval_seconds": 3.0,
-  "attack_key": "ctrl"
+  "interval_seconds": 2.5,
+  "attack_key": "shift"
 }

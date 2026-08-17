@@ -472,6 +472,34 @@ class MovementTests(unittest.TestCase):
         worker._update_moving_event(MovementDecision("climb", "rope"))
         self.assertFalse(moving.is_set())
 
+    def test_fixed_mode_skips_yolo_rope_logic(self):
+        # Fixed Attack mode runs without the YOLO subprocess: the screen gap
+        # must never drive the rope jump, even when a fresh rope state file
+        # exists - the minimap logic takes over entirely.
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import RopeStateFile
+
+        tmp = Path(tempfile.mkdtemp()) / "rope_state.json"
+        state = RopeStateFile(str(tmp))
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, rope_state_path=str(tmp),
+            rope_jump_px=140.0, yolo_detection_active=False,
+        )
+        # Fresh state with a tight gap would normally jump via the screen
+        # logic - in fixed mode it is ignored (minimap plan owns the jump).
+        state.write(True, rope_x=1280.0, char_x=1280.0)
+        self.assertFalse(worker._yolo_detection_active)
+        self.assertIsNone(worker._yolo_rope_action())
+        # Re-enabling YOLO detection restores the screen logic live.
+        worker.set_yolo_detection_active(True)
+        self.assertTrue(worker._yolo_detection_active)
+        self.assertEqual(worker._yolo_rope_action().key, "jump_climb_up")
+        worker.set_yolo_detection_active(False)
+        self.assertFalse(worker._yolo_detection_active)
+        self.assertIsNone(worker._yolo_rope_action())
+
     def test_yolo_rope_jump_gate(self):
         import tempfile
         from pathlib import Path

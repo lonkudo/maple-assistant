@@ -349,6 +349,7 @@ class UiWorker(threading.Thread):
         map_identity_store: Optional[MapIdentityStore] = None,
         status_worker: Any = None,
         attack_worker: Any = None,
+        movement_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -371,6 +372,10 @@ class UiWorker(threading.Thread):
         # Fixed-rate attack worker (AttackWorker) the Fixed Attack panel
         # toggles: enabled flag, interval and attack key are applied live.
         self.attack_worker = attack_worker
+        # Movement worker whose jump-rope logic follows the attack mode:
+        # Fixed Attack mode runs without YOLO, so the minimap logic must own
+        # the rope jump there.
+        self.movement_worker = movement_worker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -1137,6 +1142,14 @@ class UiWorker(threading.Thread):
             proc = getattr(self, "_yolo_process", None)
             if proc is not None and proc.poll() is None:
                 self._yolo_stop()
+        # The jump-rope logic follows the mode: YOLO screen gap when YOLO
+        # detection is the active engine, minimap logic when the fixed-rate
+        # mode (no YOLO subprocess) is selected.
+        mover = getattr(self, "movement_worker", None)
+        if mover is not None:
+            setter = getattr(mover, "set_yolo_detection_active", None)
+            if setter is not None:
+                setter(not fixed_mode)
         panel = getattr(self, "_yolo_panel", None)
         if panel is not None:
             self._set_panel_state(panel, fixed_mode)

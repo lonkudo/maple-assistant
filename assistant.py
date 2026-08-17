@@ -340,9 +340,7 @@ def main() -> int:
         detector=status_detector,
         automation_active_event=automation_active,
     )
-    core_workers = [
-        capture_worker,
-        MovementWorker(
+    movement_worker = MovementWorker(
             movement_frames,
             key_sender,
             stop_event,
@@ -440,7 +438,10 @@ def main() -> int:
             rope_approach_creep_seconds=float(
                 calibration.get("rope_approach_creep_seconds", 0.25)
             ),
-        ),
+    )
+    core_workers = [
+        capture_worker,
+        movement_worker,
         status_worker,
         *attack_workers,
         *pickup_workers,
@@ -465,6 +466,7 @@ def main() -> int:
             map_identity_store=map_identity_store,
             status_worker=status_worker,
             attack_worker=attack_worker,
+            movement_worker=movement_worker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

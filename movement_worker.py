@@ -1231,6 +1231,7 @@ class MovementWorker(threading.Thread):
         on_rope_px: float = 50.0,
         under_rope_px: float = 10.0,
         rope_approach_creep_seconds: float = 0.25,
+        yolo_detection_active: bool = True,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1353,6 +1354,11 @@ class MovementWorker(threading.Thread):
             RopeStateFile(rope_state_path)
             if rope_state_path else None
         )
+        # Whether the YOLO detection subprocess owns the jump-rope logic.
+        # Fixed Attack mode runs WITHOUT YOLO, so the rope jump must use the
+        # minimap logic only (no fresh screen gap to consult).  Switched live
+        # from the UI when the attack mode changes.
+        self._yolo_detection_active = bool(yolo_detection_active)
         # Cross-process patrol state: published so the YOLO attack worker
         # blocks attacks while the character is climbing/dropping.
         self._patrol_state = (
@@ -1440,6 +1446,19 @@ class MovementWorker(threading.Thread):
                 and self.dropping_active_event.is_set())
         )
 
+    def set_yolo_detection_active(self, active: bool) -> None:
+        """Switch the jump-rope logic between YOLO screen and minimap.
+
+        Fixed Attack mode runs without the YOLO subprocess, so there is no
+        fresh screen gap to consult: the minimap logic must own the jump.
+        """
+
+        active = bool(active)
+        if active != self._yolo_detection_active:
+            LOG.info("rope jump logic: %s",
+                     "YOLO screen" if active else "minimap only")
+            self._yolo_detection_active = active
+
     def _yolo_rope_action(self) -> Optional[MovementDecision]:
         """Decide the rope action from YOLO SCREEN positions only.
 
@@ -1461,6 +1480,10 @@ class MovementWorker(threading.Thread):
           patrol (minimap) walk plan takes over
         """
 
+        if not self._yolo_detection_active:
+            # Fixed Attack mode: no YOLO subprocess, so the screen gap does
+            # not exist - the minimap logic decides everything.
+            return None
         if self._rope_state is None or not self._rope_state.is_fresh():
             return None
         gap = self._rope_state.screen_gap()
@@ -2211,8 +2234,13 @@ class MovementWorker(threading.Thread):
                         # screen logic decides (straight up when right under
                         # the rope - tight gap or box overlap; left/right
                         # otherwise), with the minimap band jump as fallback
-                        # when YOLO is stale.
-                        yolo_action = self._yolo_rope_action()
+                        # when YOLO is stale.  In Fixed Attack mode the YOLO
+                        # subprocess is not running: the minimap logic owns
+                        # the jump (choose by current attack mode).
+                        yolo_action = (
+                            self._yolo_rope_action()
+                            if self._yolo_detection_active else None
+                        )
                         if yolo_action is not None:
                             decision = yolo_action
                         else:
@@ -2245,7 +2273,8 @@ class MovementWorker(threading.Thread):
                             elif live_gap < -1e-9:
                                 self._rope_approach_direction = "left"
                         rope_state_fresh = (
-                            self._rope_state is not None
+                            self._yolo_detection_active
+                            and self._rope_state is not None
                             and self._rope_state.is_fresh()
                         )
                         rope_plan = move_towards_rope(

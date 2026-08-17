@@ -499,8 +499,16 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.attack_key = key
                 return True
 
+        class FakeMover:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_yolo_detection_active(self, active) -> None:
+                self.calls.append(active)
+
         worker = UiWorker.__new__(UiWorker)
         worker.attack_worker = FakeAttackWorker()
+        worker.movement_worker = FakeMover()
         worker._attack_mode_var = Var("yolo")
         worker._fixed_interval_var = Var(3.0)
         worker._fixed_attack_key_var = Var("ctrl")
@@ -529,6 +537,8 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertIn(["disabled"], child.states)
             self.assertIn("Fixed attack active", worker._fixed_status.text)
             self.assertIn("every 2.5s", worker._fixed_status.text)
+            # The jump-rope logic switched to minimap (YOLO inactive).
+            self.assertEqual(worker.movement_worker.calls, [False])
 
             # Switching back to YOLO restores the panel and disables the worker.
             worker._attack_mode_var.set("yolo")
@@ -537,6 +547,7 @@ class UiLogHandlerTests(unittest.TestCase):
             for child in worker._yolo_panel.children:
                 self.assertIn(["!disabled"], child.states)
             self.assertIn("inactive", worker._fixed_status.text)
+            self.assertEqual(worker.movement_worker.calls, [False, True])
 
     def test_fixed_attack_settings_roundtrip(self) -> None:
         import json
