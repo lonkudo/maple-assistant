@@ -412,7 +412,7 @@ class UiWorker(threading.Thread):
             screen_width = root.winfo_screenwidth()
             # Default tall layout on the left/secondary monitor; the position
             # is negative so the window opens on the monitor left of primary.
-            window_height = 1000
+            window_height = 1600
             root.geometry(f"700x{window_height}-1000-500")
             root.minsize(520, 560)
             root.protocol("WM_DELETE_WINDOW", root.destroy)
