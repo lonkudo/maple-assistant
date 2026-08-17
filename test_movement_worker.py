@@ -542,6 +542,28 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(trig.call_count, 2)
         self.assertEqual(trig.call_args[0][0], 1)  # one red diamond
 
+    def test_left_excursion_end_fires_on_any_layer(self):
+        # The channel-switch detection is bound to the move-to-left-most
+        # event REGARDLESS of the layer the character is on: layer2's
+        # excursion triggers exactly like layer1's.
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, other_player_check_enabled=True,
+        )
+        frame = self._red_diamond_frame()
+        region = (0.0, 0.0, 1.0, 1.0)
+        with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
+            worker._handle_left_excursion_end(
+                frame, region, "layer2.left-most"
+            )
+            worker._handle_left_excursion_end(
+                frame, region, "layer2.right-most"
+            )
+            trig.assert_called_once()
+            self.assertEqual(trig.call_args[0][0], 1)
+
     def test_left_excursion_end_skips_when_disabled_or_clean(self):
         from unittest import mock
 
