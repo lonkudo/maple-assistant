@@ -1243,6 +1243,11 @@ class MovementWorker(threading.Thread):
         other_player_switch_cooldown_seconds: float = 120.0,
         other_player_drug_taps: int = 3,
         other_player_drug_gap_seconds: float = 1.0,
+        other_player_hp_threshold: float = 0.70,
+        other_player_switch_max_attempts: int = 3,
+        other_player_switch_settle_seconds: float = 1.0,
+        status_state_path: Optional[str] = None,
+        drug_settings_path: Optional[str] = None,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1384,6 +1389,29 @@ class MovementWorker(threading.Thread):
         self.other_player_drug_gap_seconds = max(
             0.1, float(other_player_drug_gap_seconds)
         )
+        # Before each switch, an HP drug is eaten only when the current HP
+        # ratio is below this threshold (default 70%).
+        self.other_player_hp_threshold = max(
+            0.0, min(1.0, float(other_player_hp_threshold))
+        )
+        # After a switch the new channel is re-checked for other players;
+        # the switch repeats while any show up, up to this many attempts.
+        self.other_player_switch_max_attempts = max(
+            1, int(other_player_switch_max_attempts)
+        )
+        self.other_player_switch_settle_seconds = max(
+            0.0, float(other_player_switch_settle_seconds)
+        )
+        # Shared state paths (overridable for tests): the StatusWorker's
+        # HP/MP state file and the Drug panel's settings file.
+        self.status_state_path = str(status_state_path) if status_state_path else str(
+            Path(__file__).resolve().parent / "work" / "status_state.json"
+        )
+        self.drug_settings_path = str(drug_settings_path) if drug_settings_path else str(
+            Path(__file__).resolve().parent / "drug_settings.json"
+        )
+        self._last_frame: Any = None
+        self._last_minimap_region: Any = None
         # Cross-process patrol state: published so the YOLO attack worker
         # blocks attacks while the character is climbing/dropping.
         self._patrol_state = (
@@ -1549,23 +1577,45 @@ class MovementWorker(threading.Thread):
         ).start()
 
     def _run_other_player_switch(self) -> None:
-        """Background: drug up, switch channel, then resume the patrol."""
+        """Background: drug (if HP low), switch, re-check, then resume.
+
+        After each channel switch the NEW channel is scanned for other
+        players (red diamonds) again; while any are present the switch
+        repeats, up to ``other_player_switch_max_attempts``.  Before each
+        switch an HP drug is eaten only when the current HP is below
+        ``other_player_hp_threshold`` (70%).
+        """
 
         try:
             # The patrol must not fight the menu navigation keys.
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
-            self._progressive_drug_before_switch()
-            ok = channel_switch_procedure(
-                self.key_sender,
-                on_press=lambda key, sent: LOG.info(
-                    "player-switch press %s ok=%s", key, sent
-                ),
-            )
-            if ok:
-                LOG.warning("player channel switch done; resuming patrol")
+            attempts = 0
+            while attempts < self.other_player_switch_max_attempts:
+                attempts += 1
+                self._drug_if_hp_low()
+                ok = channel_switch_procedure(
+                    self.key_sender,
+                    on_press=lambda key, sent: LOG.info(
+                        "player-switch press %s ok=%s", key, sent
+                    ),
+                )
+                if not ok:
+                    LOG.warning("player channel switch blocked; aborting")
+                    break
+                # The new channel: still other players -> switch again.
+                time.sleep(self.other_player_switch_settle_seconds)
+                count = self._other_players_on_latest_frame()
+                if count == 0:
+                    LOG.warning("player channel switch done (attempt %d); "
+                                "new channel clean", attempts)
+                    break
+                LOG.warning("other players still present after switch "
+                            "attempt %d (%d); switching again",
+                            attempts, count)
             else:
-                LOG.warning("player channel switch blocked; resuming patrol")
+                LOG.warning("player channel switch gave up after %d attempts",
+                            self.other_player_switch_max_attempts)
         except Exception:
             LOG.exception("player channel switch failed")
         finally:
@@ -1574,34 +1624,73 @@ class MovementWorker(threading.Thread):
             self._player_switch_active = False
             self._last_other_player_switch = time.monotonic()
 
-    def _progressive_drug_before_switch(self) -> None:
-        """Drink HP potions gradually so the character survives the switch.
+    def _other_players_on_latest_frame(self) -> int:
+        """Red-diamond count on the most recent loop frame (post-switch)."""
 
-        Reads the bound HP potion key from drug_settings.json (the same file
-        the Drug panel writes) and taps it ``other_player_drug_taps`` times
-        with ``other_player_drug_gap_seconds`` between taps.
+        frame = getattr(self, "_last_frame", None)
+        region = getattr(self, "_last_minimap_region", None)
+        if frame is None or region is None:
+            return 0
+        return self._other_players_on_minimap(frame, region)
+
+    def _drug_if_hp_low(self) -> None:
+        """Eat an HP drug only when the current HP is below the threshold.
+
+        Reads the latest HP ratio from the StatusWorker's shared state file
+        (work/status_state.json) and the bound HP potion key from
+        drug_settings.json; taps the key ``other_player_drug_taps`` times
+        with gaps so the character survives the channel change.
         """
 
-        try:
-            data = json.loads(
-                (Path(__file__).resolve().parent / "drug_settings.json")
-                .read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError):
-            LOG.warning("drug settings unavailable; skipping progressive drug")
+        hp = self._current_hp_ratio()
+        if hp is None:
+            LOG.info("hp unknown; skipping drug before channel switch")
             return
-        key = str(data.get("hp_key", "")).strip().casefold()
-        if not key:
+        if hp >= self.other_player_hp_threshold:
+            LOG.info("hp %.0f%% >= %.0f%%; no drug needed",
+                     hp * 100.0, self.other_player_hp_threshold * 100.0)
             return
-        scan_map = getattr(self.key_sender, "_SCAN", None)
-        if scan_map is not None and key not in scan_map:
-            LOG.warning("hp key %r not sendable; skipping drug", key)
+        key = self._hp_drug_key()
+        if key is None:
+            LOG.warning("no sendable hp drug key; skipping drug")
             return
-        LOG.info("progressive drug: %d x %s before channel switch",
-                 self.other_player_drug_taps, key)
+        LOG.warning("hp %.0f%% below %.0f%%; eating drug (%d x %s)",
+                    hp * 100.0, self.other_player_hp_threshold * 100.0,
+                    self.other_player_drug_taps, key)
         for _ in range(self.other_player_drug_taps):
             self.key_sender.press(key, duration=0.06)
             time.sleep(self.other_player_drug_gap_seconds)
+
+    def _current_hp_ratio(self) -> Optional[float]:
+        """Latest HP ratio (0..1) from the StatusWorker state file."""
+
+        try:
+            data = json.loads(
+                Path(self.status_state_path).read_text(encoding="utf-8")
+            )
+            ratio = float(data.get("hp_ratio", -1.0))
+            if 0.0 <= ratio <= 1.0:
+                return ratio
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _hp_drug_key(self) -> Optional[str]:
+        """The bound HP potion key from drug_settings.json, or None."""
+
+        try:
+            data = json.loads(
+                Path(self.drug_settings_path).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        key = str(data.get("hp_key", "")).strip().casefold()
+        if not key:
+            return None
+        scan_map = getattr(self.key_sender, "_SCAN", None)
+        if scan_map is not None and key not in scan_map:
+            return None
+        return key
 
     def _yolo_rope_action(self) -> Optional[MovementDecision]:
         """Decide the rope action from YOLO SCREEN positions only.
@@ -2230,6 +2319,10 @@ class MovementWorker(threading.Thread):
                             minimap_detection.confidence,
                         )
                         self._last_minimap_box = minimap_detection.window_box
+                # Latest frame + region kept for the post-switch re-check of
+                # other players on the new channel.
+                self._last_frame = frame
+                self._last_minimap_region = minimap_region
                 observation = analyze_minimap(frame, minimap_region)
                 if self.structure_tracker is not None and minimap_detection is not None:
                     analysis_rgb = np.asarray(

@@ -572,6 +572,9 @@ class MovementTests(unittest.TestCase):
             trig.assert_not_called()
 
     def test_other_player_switch_flow_drugs_then_switches_then_resumes(self):
+        import json
+        import tempfile
+        from pathlib import Path
         from unittest import mock
 
         class FakeController:
@@ -598,31 +601,145 @@ class MovementTests(unittest.TestCase):
             def start(self):
                 self._target()
 
-        controller = FakeController()
-        sender = FakeSender()
-        worker = MovementWorker(
-            queue.Queue(), sender, threading.Event(),
-            important_positions={}, patrol_controller=controller,
-            other_player_check_enabled=True,
-        )
-        with mock.patch("movement_worker.threading.Thread", FakeThread), \
-                mock.patch("movement_worker.json.loads",
-                           return_value={"hp_key": "delete"}), \
-                mock.patch("channel_switch.random.randint",
-                           side_effect=[2, 1]), \
-                mock.patch("channel_switch.time.sleep"), \
-                mock.patch("movement_worker.time.sleep"):
-            worker._trigger_other_player_switch(1)
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "status_state.json"
+            state_path.write_text(
+                json.dumps({"hp_ratio": 0.5}), encoding="utf-8"
+            )
+            drug_path = Path(directory) / "drug_settings.json"
+            drug_path.write_text(
+                json.dumps({"hp_key": "delete"}), encoding="utf-8"
+            )
+            controller = FakeController()
+            sender = FakeSender()
+            worker = MovementWorker(
+                queue.Queue(), sender, threading.Event(),
+                important_positions={}, patrol_controller=controller,
+                other_player_check_enabled=True,
+                status_state_path=str(state_path),
+                drug_settings_path=str(drug_path),
+            )
+            with mock.patch("movement_worker.threading.Thread", FakeThread), \
+                    mock.patch("channel_switch.random.randint",
+                               side_effect=[2, 1]), \
+                    mock.patch("channel_switch.time.sleep"), \
+                    mock.patch("movement_worker.time.sleep"):
+                worker._trigger_other_player_switch(1)
 
-        # Patrol was disabled during the switch and re-enabled after.
-        self.assertTrue(controller.enabled)
-        # Progressive HP drug first (3 taps), then the channel sequence.
-        self.assertEqual(sender.pressed[:3], ["delete", "delete", "delete"])
-        self.assertEqual(sender.pressed[3:], [
-            "esc", "enter", "left", "left", "down", "enter",
-        ])
-        self.assertFalse(worker._player_switch_active)
-        self.assertGreater(worker._last_other_player_switch, float("-inf"))
+            # Patrol was disabled during the switch and re-enabled after.
+            self.assertTrue(controller.enabled)
+            # HP 50% < 70%: progressive HP drug first (3 taps), then switch.
+            self.assertEqual(sender.pressed[:3],
+                             ["delete", "delete", "delete"])
+            self.assertEqual(sender.pressed[3:], [
+                "esc", "enter", "left", "left", "down", "enter", "enter",
+            ])
+            self.assertFalse(worker._player_switch_active)
+            self.assertGreater(worker._last_other_player_switch,
+                               float("-inf"))
+
+    def test_switch_skips_drug_when_hp_healthy(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class FakeSender:
+            _SCAN = {"delete": (0x53, True), "esc": (0x01, False)}
+
+            def __init__(self):
+                self.pressed = []
+
+            def press(self, key, duration=0.025):
+                self.pressed.append(key)
+                return True
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "status_state.json"
+            state_path.write_text(
+                json.dumps({"hp_ratio": 0.9}), encoding="utf-8"
+            )
+            drug_path = Path(directory) / "drug_settings.json"
+            drug_path.write_text(
+                json.dumps({"hp_key": "delete"}), encoding="utf-8"
+            )
+            sender = FakeSender()
+            worker = MovementWorker(
+                queue.Queue(), sender, threading.Event(),
+                important_positions={},
+                status_state_path=str(state_path),
+                drug_settings_path=str(drug_path),
+            )
+            with mock.patch("movement_worker.threading.Thread", FakeThread), \
+                    mock.patch("channel_switch.random.randint",
+                               side_effect=[1, 1]), \
+                    mock.patch("channel_switch.time.sleep"), \
+                    mock.patch("movement_worker.time.sleep"):
+                worker._trigger_other_player_switch(1)
+
+            # HP 90% >= 70%: no drug - the switch sequence starts immediately.
+            self.assertNotIn("delete", sender.pressed)
+            self.assertEqual(sender.pressed[0], "esc")
+
+    def test_switch_rechecks_and_switches_again_while_players_present(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class FakeSender:
+            _SCAN = {"delete": (0x53, True), "esc": (0x01, False)}
+
+            def __init__(self):
+                self.pressed = []
+
+            def press(self, key, duration=0.025):
+                self.pressed.append(key)
+                return True
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "status_state.json"
+            state_path.write_text(
+                json.dumps({"hp_ratio": 0.9}), encoding="utf-8"
+            )
+            drug_path = Path(directory) / "drug_settings.json"
+            drug_path.write_text(
+                json.dumps({"hp_key": "delete"}), encoding="utf-8"
+            )
+            sender = FakeSender()
+            worker = MovementWorker(
+                queue.Queue(), sender, threading.Event(),
+                important_positions={},
+                other_player_switch_max_attempts=2,
+                status_state_path=str(state_path),
+                drug_settings_path=str(drug_path),
+            )
+            with mock.patch("movement_worker.threading.Thread", FakeThread), \
+                    mock.patch("channel_switch.random.randint",
+                               side_effect=[1, 1, 1, 1]), \
+                    mock.patch("channel_switch.time.sleep"), \
+                    mock.patch("movement_worker.time.sleep"), \
+                    mock.patch.object(worker, "_other_players_on_latest_frame",
+                                      return_value=2):
+                worker._trigger_other_player_switch(1)
+
+            # New channel still busy: switched twice (max attempts), then gave up.
+            self.assertEqual(sender.pressed.count("esc"), 2)
+            self.assertFalse(worker._player_switch_active)
 
     def test_trigger_switch_guards_active_and_cooldown(self):
         from unittest import mock

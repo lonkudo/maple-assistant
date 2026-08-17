@@ -346,6 +346,9 @@ def main() -> int:
         stop_event,
         detector=status_detector,
         automation_active_event=automation_active,
+        status_state_path=str(
+            Path(__file__).with_name("work") / "status_state.json"
+        ),
     )
     movement_worker = MovementWorker(
             movement_frames,

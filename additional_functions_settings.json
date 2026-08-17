@@ -1,5 +1,5 @@
 {
   "shutdown_enabled": false,
   "shutdown_hours": 3.0,
-  "player_check_enabled": false
+  "player_check_enabled": true
 }

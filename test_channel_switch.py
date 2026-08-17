@@ -32,10 +32,10 @@ class ChannelSwitchTests(unittest.TestCase):
             "esc", "enter",
             "left", "left", "left",
             "down", "down", "down", "down", "down", "down", "down", "down",
-            "enter",
+            "enter", "enter",
         ])
-        # One sleep per key (14) + the final 3s wait.
-        self.assertEqual(sleep.call_count, 15)
+        # One sleep per key (15) + the final 3s wait.
+        self.assertEqual(sleep.call_count, 16)
 
     def test_random_counts_stay_within_1_to_10(self):
         sender = FakeSender()

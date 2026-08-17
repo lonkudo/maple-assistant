@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import logging
 import ctypes
+import json
 import queue
 import threading
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Optional, Protocol, Sequence
 
 import numpy as np
@@ -595,6 +597,7 @@ class StatusWorker(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         potion_cooldown: float = 5.0,
         low_frames_required: int = 2,
+        status_state_path: Optional[str] = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -604,6 +607,10 @@ class StatusWorker(threading.Thread):
         self.automation_active_event = automation_active_event
         self.potion_cooldown = max(0.0, potion_cooldown)
         self.low_frames_required = max(1, low_frames_required)
+        # Optional shared state file: latest HP/MP ratios, read by the
+        # movement worker so the channel-switch safety net can gate its
+        # potion on the current health.
+        self.status_state_path = status_state_path
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
 
@@ -643,6 +650,8 @@ class StatusWorker(threading.Thread):
                         self.detector.config.minimum_action_confidence)
             self._low_count = {"hp": 0, "mp": 0}
             return
+        if self.status_state_path is not None:
+            self._write_status_state(reading)
         now = time.monotonic()
         config = self.detector.config
         if config.hp_enabled:
@@ -659,6 +668,23 @@ class StatusWorker(threading.Thread):
             )
         else:
             self._low_count["mp"] = 0
+
+    def _write_status_state(self, reading: "StatusReading") -> None:
+        """Publish the latest HP/MP ratios for other workers (JSON file)."""
+
+        try:
+            data = {
+                "hp_ratio": reading.hp_ratio,
+                "mp_ratio": reading.mp_ratio,
+                "hp": reading.hp,
+                "mp": reading.mp,
+                "updated_at": time.time(),
+            }
+            Path(self.status_state_path).write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+        except OSError:
+            LOG.warning("could not write status state", exc_info=True)
 
     def run(self) -> None:
         while not self.stop_event.is_set():

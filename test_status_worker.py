@@ -203,6 +203,38 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(sender.key_up("left"))         # movement finishes
         self.assertEqual(events, [False, True])
 
+    def test_status_state_file_publishes_hp_ratio(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        sender = FakeSender()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "status_state.json"
+            worker = StatusWorker(
+                queue.Queue(), sender, threading.Event(),
+                potion_cooldown=60, low_frames_required=2,
+                status_state_path=str(state_path),
+            )
+            image = status_image(0.4, 0.1)
+            worker._process_frame(image)
+            self.assertTrue(state_path.is_file())
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(data["hp_ratio"], 0.4, places=1)
+            self.assertAlmostEqual(data["mp_ratio"], 0.1, places=1)
+
+    def test_status_state_file_skipped_when_not_configured(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        sender = FakeSender()
+        with tempfile.TemporaryDirectory() as directory:
+            worker = StatusWorker(queue.Queue(), sender, threading.Event())
+            image = status_image(0.4, 0.1)
+            worker._process_frame(image)
+            self.assertEqual(
+                list(Path(directory).glob("status_state.json")), []
+            )
 
 
 if __name__ == "__main__":
