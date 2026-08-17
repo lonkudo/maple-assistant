@@ -1252,7 +1252,16 @@ class MovementWorker(threading.Thread):
             and "left_most_pos" in value and "right_most_pos" in value
         }
         if route_order is not None:
-            self._route_layers = [name for name in route_order if name in complete_layers]
+            self._route_layers = [
+                name for name in route_order if name in complete_layers
+            ]
+            # Bottom-up by numeric suffix - never by recording order (a top
+            # layer recorded before a lower one must not patrol first).
+            self._route_layers.sort(
+                key=lambda name: int(
+                    "".join(filter(str.isdigit, name)) or 0
+                ),
+            )
         else:
             self._route_layers = sorted(
                 complete_layers,

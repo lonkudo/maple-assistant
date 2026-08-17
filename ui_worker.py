@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import logging
 import queue
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -264,9 +265,19 @@ def patrol_button_states(running: bool, can_start: bool) -> tuple[str, str]:
 
 
 def layer_display_order(layer_names: list[str]) -> tuple[str, ...]:
-    """Display the highest/newest layer above the lower layers."""
+    """Display the highest/newest layer above the lower layers.
 
-    return tuple(reversed(layer_names))
+    Ordering is by the layer's numeric position (layer1 = bottom, highest
+    number = top), NEVER by the order the points happened to be recorded in
+    - otherwise a top layer recorded before a lower one would appear below
+    it ("layer1 on top of layer2").
+    """
+
+    def _layer_number(name: str) -> int:
+        match = re.search(r"(\d+)$", name)
+        return int(match.group(1)) if match else 0
+
+    return tuple(reversed(sorted(layer_names, key=_layer_number)))
 
 
 def rope_unavailable_hint() -> str:

@@ -1384,7 +1384,11 @@ class MovementTests(unittest.TestCase):
         # The current top layer repeats patrol rather than attempting a climb.
         self.assertEqual(worker._route_target(layer2), (.3, False, "layer2.left-most"))
 
-    def test_map_profile_route_order_is_explicit(self):
+    def test_map_profile_route_order_is_normalized_bottom_up(self):
+        # Even when the recorded route_order is scrambled (top layer recorded
+        # first, e.g. "Add Layer" auto-selects the new layer), the route is
+        # always bottom-up by layer number - layer1 can never patrol above
+        # layer2.
         positions = {
             "layer1": {"left_most_pos": {"x": .1, "y": .7},
                        "right_most_pos": {"x": .9, "y": .7}},
@@ -1395,7 +1399,7 @@ class MovementTests(unittest.TestCase):
             queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
             important_positions=positions, route_order=["layer2", "layer1"],
         )
-        self.assertEqual(worker._route_layers, ["layer2", "layer1"])
+        self.assertEqual(worker._route_layers, ["layer1", "layer2"])
 
     def test_layer_is_selected_by_explicit_y_with_tolerance(self):
         positions = {

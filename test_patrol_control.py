@@ -277,6 +277,21 @@ class PatrolControllerTests(unittest.TestCase):
             controller = PatrolController(Path(directory) / "map.json", data)
             self.assertTrue(controller.can_start())
 
+    def test_snapshot_route_order_is_bottom_up_ignoring_recording_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = profile()
+            # Recorded top-first (layer2 before layer1): the snapshot must
+            # still report the route bottom-up (layer1, layer2).
+            data["route_order"] = ["layer2", "layer1"]
+            data["layers"] = {
+                "layer1": data["layers"]["layer1"],
+                "layer2": data["layers"]["layer2"],
+            }
+            controller = PatrolController(Path(directory) / "map.json", data)
+            self.assertEqual(
+                controller.snapshot().route_order, ("layer1", "layer2")
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

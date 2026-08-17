@@ -19,6 +19,15 @@ class UiLogHandlerTests(unittest.TestCase):
             ("layer3", "layer2", "layer1"),
         )
 
+    def test_display_order_ignores_recording_order(self) -> None:
+        # The top layer was recorded before the lower one (Add Layer
+        # auto-selects the new layer): layer2 must still display ABOVE
+        # layer1 - never "layer1 on top of layer2".
+        self.assertEqual(
+            layer_display_order(["layer2", "layer1"]),
+            ("layer2", "layer1"),
+        )
+
     def test_final_rope_hover_hint_tells_user_how_to_enable_it(self) -> None:
         self.assertEqual(
             rope_unavailable_hint(),

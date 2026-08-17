@@ -91,6 +91,23 @@ class PatrolController:
         self._selected_layer = route[-1] if route else next(iter(layers), "layer1")
         self._lock = threading.RLock()
 
+    def _sorted_layer_names_locked(self) -> list[str]:
+        """Bottom-up layer order by numeric suffix, never recording order.
+
+        The recorded ``route_order`` follows the order points happened to be
+        recorded in; recording the top layer before a lower one ("Add Layer"
+        auto-selects the new layer) would otherwise put layer1 above layer2
+        in the patrol route and the UI.
+        """
+
+        def _number(name: str) -> int:
+            match = re.search(r"(\d+)$", name)
+            return int(match.group(1)) if match else 0
+
+        return sorted(
+            self._profile.get("route_order", []), key=_number
+        )
+
     def snapshot(self, layout: Optional[CoordinateLayout] = None) -> PatrolSnapshot:
         with self._lock:
             layers = deepcopy(self._profile.get("layers", {}))
@@ -105,7 +122,7 @@ class PatrolController:
             return PatrolSnapshot(
                 enabled=self._enabled,
                 selected_layer=self._selected_layer,
-                route_order=tuple(self._profile.get("route_order", [])),
+                route_order=tuple(self._sorted_layer_names_locked()),
                 layers=layers,
                 climbing_enabled=bool(self._profile.get("climbing_enabled", True)),
                 final_layer_action=str(
