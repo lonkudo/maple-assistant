@@ -660,6 +660,84 @@ class MovementTests(unittest.TestCase):
             self.assertGreater(worker._last_other_player_switch,
                                float("-inf"))
 
+    def test_switch_restarts_patrol_from_first_layer(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class FakeSender:
+            _SCAN = {"delete": (0x53, True), "esc": (0x01, False)}
+
+            def __init__(self):
+                self.pressed = []
+
+            def press(self, key, duration=0.025):
+                self.pressed.append(key)
+                return True
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        class FakeTracker:
+            def __init__(self):
+                self.anchors = []
+
+            def reanchor_world_y(self, world_y):
+                self.anchors.append(world_y)
+
+        positions = {
+            "layer1": {
+                "layer_world_y": 11.32,
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            },
+            "layer2": {
+                "layer_world_y": -17.15,
+                "left_most_pos": {"x": .2, "y": .5},
+                "right_most_pos": {"x": .8, "y": .5},
+            },
+        }
+        tracker = FakeTracker()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "status_state.json"
+            state_path.write_text(
+                json.dumps({"hp_ratio": 0.9}), encoding="utf-8"
+            )
+            drug_path = Path(directory) / "drug_settings.json"
+            drug_path.write_text(
+                json.dumps({"hp_key": "delete"}), encoding="utf-8"
+            )
+            sender = FakeSender()
+            worker = MovementWorker(
+                queue.Queue(), sender, threading.Event(),
+                important_positions=positions, route_order=["layer1", "layer2"],
+                first_layer="layer1", structure_tracker=tracker,
+                status_state_path=str(state_path),
+                drug_settings_path=str(drug_path),
+            )
+            # Pretend the patrol was mid-layer2 before the switch.
+            worker._route_layer_index = 1
+            worker._route_phase = "right"
+            worker._left_excursion_active = True
+            with mock.patch("movement_worker.threading.Thread", FakeThread), \
+                    mock.patch("channel_switch.random.randint",
+                               side_effect=[1, 1]), \
+                    mock.patch("channel_switch.time.sleep"), \
+                    mock.patch("movement_worker.time.sleep"):
+                worker._trigger_other_player_switch(1)
+
+            # Post-switch: route reset to layer1/left and world Y re-anchored
+            # to layer1 - the character respawned at the map entry.
+            self.assertEqual(worker._route_layer_index, 0)
+            self.assertEqual(worker._route_phase, "left")
+            self.assertFalse(worker._left_excursion_active)
+            self.assertEqual(tracker.anchors, [11.32])
+
     def test_switch_skips_drug_when_hp_healthy(self):
         import json
         import tempfile

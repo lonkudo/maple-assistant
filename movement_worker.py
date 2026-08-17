@@ -1240,7 +1240,7 @@ class MovementWorker(threading.Thread):
         rope_approach_creep_seconds: float = 0.25,
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
-        other_player_switch_cooldown_seconds: float = 120.0,
+        other_player_switch_cooldown_seconds: float = 5.0,
         other_player_drug_taps: int = 3,
         other_player_drug_gap_seconds: float = 1.0,
         other_player_hp_threshold: float = 0.70,
@@ -1590,6 +1590,7 @@ class MovementWorker(threading.Thread):
             # The patrol must not fight the menu navigation keys.
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
+            switched = False
             attempts = 0
             while attempts < self.other_player_switch_max_attempts:
                 attempts += 1
@@ -1603,6 +1604,7 @@ class MovementWorker(threading.Thread):
                 if not ok:
                     LOG.warning("player channel switch blocked; aborting")
                     break
+                switched = True
                 # The new channel: still other players -> switch again.
                 time.sleep(self.other_player_switch_settle_seconds)
                 count = self._other_players_on_latest_frame()
@@ -1619,10 +1621,42 @@ class MovementWorker(threading.Thread):
         except Exception:
             LOG.exception("player channel switch failed")
         finally:
+            # A channel change respawns the character at the map entry
+            # (layer1): reset the route + world-Y anchor to the first layer
+            # so the patrol restarts cleanly instead of continuing on a stale
+            # upper-layer state.
+            if switched:
+                self._restart_patrol_from_first_layer()
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(True)
             self._player_switch_active = False
             self._last_other_player_switch = time.monotonic()
+
+    def _restart_patrol_from_first_layer(self) -> None:
+        """Reset the route + world-Y anchor to the first layer (post-switch)."""
+
+        if (not self._route_layers or self.first_layer is None
+                or self.first_layer not in self._route_layers):
+            return
+        self._reset_route_loop()
+        self._left_excursion_active = False
+        layer = self.important_positions.get(self.first_layer, {})
+        anchor_world_y = (
+            layer.get("layer_world_y") if isinstance(layer, dict) else None
+        )
+        if anchor_world_y is not None and self.structure_tracker is not None:
+            reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
+            start_session = getattr(
+                self.structure_tracker, "start_session", None
+            )
+            if callable(reanchor):
+                reanchor(float(anchor_world_y))
+                LOG.info("MAP LOOP reset world Y at %s=%.6f",
+                         self.first_layer, float(anchor_world_y))
+            elif callable(start_session):
+                start_session(float(anchor_world_y))
+        LOG.info("channel switch complete: patrol restarted from %s",
+                 self.first_layer)
 
     def _other_players_on_latest_frame(self) -> int:
         """Red-diamond count on the most recent loop frame (post-switch)."""
