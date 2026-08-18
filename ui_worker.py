@@ -319,7 +319,7 @@ def keysym_to_scan_key(keysym: str) -> Optional[str]:
 
 
 def rope_unavailable_hint() -> str:
-    return "Add a layer to enable Rope recording."
+    return "添加上层后即可录制绳索位置。"
 
 
 def record_button_is_locked(saved_endpoint: Any, explicitly_unlocked: bool) -> bool:
@@ -412,7 +412,7 @@ class UiWorker(threading.Thread):
 
             root = tk.Tk()
             self._root = root
-            root.title("Maple Assistant Debug UI")
+            root.title("Maple 助手 调试界面")
             screen_width = root.winfo_screenwidth()
             # Default tall layout on the left/secondary monitor; the position
             # is negative so the window opens on the monitor left of primary.
@@ -425,11 +425,11 @@ class UiWorker(threading.Thread):
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
-            title = ttk.Label(container, text="Maple Assistant", font=("Segoe UI", 16, "bold"))
+            title = ttk.Label(container, text="Maple 助手", font=("Segoe UI", 16, "bold"))
             title.pack(anchor="w")
-            ttk.Label(container, text="OpenCV minimap detection · patrol controls").pack(anchor="w")
+            ttk.Label(container, text="OpenCV 小地图检测 · 巡逻控制").pack(anchor="w")
 
-            controls = ttk.LabelFrame(container, text="Layer calibration and patrol", padding=10)
+            controls = ttk.LabelFrame(container, text="图层校准与巡逻", padding=10)
             controls.pack(fill="x", pady=(12, 8))
             style = ttk.Style(root)
             style.configure("Locked.TButton", foreground="#777777")
@@ -443,26 +443,26 @@ class UiWorker(threading.Thread):
             action_row = ttk.Frame(controls)
             action_row.pack(fill="x", pady=(0, 8))
             self._start_patrol_button = ttk.Button(
-                action_row, text="Start Patrol", command=self._start_patrol
+                action_row, text="开始巡逻", command=self._start_patrol
             )
             self._start_patrol_button.pack(side="left", padx=(0, 8))
             self._stop_patrol_button = ttk.Button(
-                action_row, text="Stop Patrol", command=self._stop_patrol
+                action_row, text="停止巡逻", command=self._stop_patrol
             )
             self._stop_patrol_button.pack(side="left", padx=(0, 8))
             self._add_layer_button = ttk.Button(
-                action_row, text="Add Layer", command=self._add_layer_above
+                action_row, text="添加图层", command=self._add_layer_above
             )
             self._add_layer_button.pack(side="left", padx=(0, 8))
             self._reset_recording_button = ttk.Button(
-                action_row, text="Reset Recording", command=self._reset_recording
+                action_row, text="重置录制", command=self._reset_recording
             )
             self._reset_recording_button.pack(side="left")
             self._layer_rows_frame = ttk.Frame(controls)
             self._layer_rows_frame.pack(fill="x")
             self._control_status = ttk.Label(
                 controls,
-                text="Record Left, Rope, and Right; then add the layer above.",
+                text="先录制 最左、绳索、最右，然后添加上方图层。",
             )
             self._control_status.pack(anchor="w", pady=(8, 0))
             self._automation_status_label = ttk.Label(controls)
@@ -471,21 +471,21 @@ class UiWorker(threading.Thread):
 
             # Detection info panel: hidden by default (kept for future use).
             if self._SHOW_DETECTION_INFO:
-                info = ttk.LabelFrame(container, text="Detection", padding=10)
+                info = ttk.LabelFrame(container, text="检测", padding=10)
                 info.pack(fill="x", pady=(0, 8))
                 self._info_label = ttk.Label(
-                    info, text="Waiting for first frame…", justify="left"
+                    info, text="等待第一帧…", justify="left"
                 )
                 self._info_label.pack(anchor="w")
 
-            yolo_panel = ttk.LabelFrame(container, text="YOLO detection (maplestory-worlds-automation)", padding=10)
+            yolo_panel = ttk.LabelFrame(container, text="YOLO 怪物检测", padding=10)
             yolo_panel.pack(fill="x", pady=(0, 8))
             # Reference kept so the Fixed Attack panel can grey this whole
             # panel out when the fixed-rate mode is selected.
             self._yolo_panel = yolo_panel
             yolo_row = ttk.Frame(yolo_panel)
             yolo_row.pack(fill="x")
-            ttk.Label(yolo_row, text="Threshold:").pack(side="left", padx=(0, 6))
+            ttk.Label(yolo_row, text="置信度阈值:").pack(side="left", padx=(0, 6))
             self._yolo_threshold_var = tk.DoubleVar(value=0.4)
             self._yolo_threshold_slider = ttk.Scale(
                 yolo_row,
@@ -500,11 +500,11 @@ class UiWorker(threading.Thread):
             self._yolo_threshold_label = ttk.Label(yolo_row, text="0.40", width=6)
             self._yolo_threshold_label.pack(side="left", padx=(0, 10))
             self._yolo_run_button = ttk.Button(
-                yolo_row, text="Run", command=self._yolo_start
+                yolo_row, text="运行", command=self._yolo_start
             )
             self._yolo_run_button.pack(side="left", padx=(0, 8))
             self._yolo_stop_button = ttk.Button(
-                yolo_row, text="Stop", command=self._yolo_stop, state="disabled"
+                yolo_row, text="停止", command=self._yolo_stop, state="disabled"
             )
             self._yolo_stop_button.pack(side="left", padx=(0, 8))
             # Show-detection toggle: grey/inactive by default; only when
@@ -512,7 +512,7 @@ class UiWorker(threading.Thread):
             self._yolo_show_var = tk.BooleanVar(value=False)
             self._yolo_show_button = ttk.Checkbutton(
                 yolo_row,
-                text="Show Detection",
+                text="显示检测画面",
                 variable=self._yolo_show_var,
                 command=self._yolo_sync_show_button,
             )
@@ -521,7 +521,7 @@ class UiWorker(threading.Thread):
             # Save configuration: persist the current YOLO panel values so
             # they are restored next launch (no need to re-tune every time).
             self._yolo_save_button = ttk.Button(
-                yolo_row, text="Save Config", command=self._yolo_save_config
+                yolo_row, text="保存配置", command=self._yolo_save_config
             )
             self._yolo_save_button.pack(side="left", padx=(8, 0))
             # Auto-attack row: toggle + attack key, on its own line so it is
@@ -532,13 +532,13 @@ class UiWorker(threading.Thread):
             self._yolo_attack_var = tk.BooleanVar(value=False)
             self._yolo_attack_button = ttk.Checkbutton(
                 attack_row,
-                text="Auto Attack",
+                text="自动攻击",
                 variable=self._yolo_attack_var,
                 command=self._yolo_sync_show_button,
             )
             self._yolo_attack_button.pack(side="left")
             self._yolo_attack_button.configure(style="Off.TCheckbutton")
-            ttk.Label(attack_row, text="Attack Key:").pack(
+            ttk.Label(attack_row, text="攻击按键:").pack(
                 side="left", padx=(10, 4)
             )
             self._yolo_attack_key_var = tk.StringVar(value="ctrl")
@@ -557,7 +557,7 @@ class UiWorker(threading.Thread):
             # width of the attack range line drawn on the detection window.
             range_row = ttk.Frame(yolo_panel)
             range_row.pack(fill="x", pady=(6, 0))
-            ttk.Label(range_row, text="Attack Range:").pack(
+            ttk.Label(range_row, text="攻击范围:").pack(
                 side="left", padx=(0, 6)
             )
             self._yolo_attack_range_var = tk.IntVar(value=800)
@@ -572,7 +572,7 @@ class UiWorker(threading.Thread):
             self._yolo_attack_range_slider.pack(side="left", fill="x",
                                                 expand=True, padx=(0, 8))
             self._yolo_attack_range_label = ttk.Label(
-                range_row, text="800 px", width=8
+                range_row, text="800 像素", width=8
             )
             self._yolo_attack_range_label.pack(side="left")
             # Minimum mob size: horizontal slider (progress-bar style) that
@@ -580,7 +580,7 @@ class UiWorker(threading.Thread):
             # misclassified as mobs and their boxes are small).
             mob_size_row = ttk.Frame(yolo_panel)
             mob_size_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(mob_size_row, text="Min Mob Size:").pack(
+            ttk.Label(mob_size_row, text="最小怪物尺寸:").pack(
                 side="left", padx=(0, 6)
             )
             self._yolo_min_mob_var = tk.IntVar(value=60)
@@ -595,14 +595,14 @@ class UiWorker(threading.Thread):
             self._yolo_min_mob_slider.pack(side="left", fill="x",
                                            expand=True, padx=(0, 8))
             self._yolo_min_mob_label = ttk.Label(
-                mob_size_row, text="60 px", width=8
+                mob_size_row, text="60 像素", width=8
             )
             self._yolo_min_mob_label.pack(side="left")
             # Detection frequency: frames per second, 2-30, middle = 10 fps
             # (the default).  Lower = less GPU load, slower reaction.
             fps_row = ttk.Frame(yolo_panel)
             fps_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(fps_row, text="Detection FPS:").pack(
+            ttk.Label(fps_row, text="检测帧率:").pack(
                 side="left", padx=(0, 6)
             )
             self._yolo_fps_var = tk.IntVar(value=10)
@@ -616,13 +616,13 @@ class UiWorker(threading.Thread):
             )
             self._yolo_fps_slider.pack(side="left", fill="x",
                                        expand=True, padx=(0, 8))
-            self._yolo_fps_label = ttk.Label(fps_row, text="10 fps", width=8)
+            self._yolo_fps_label = ttk.Label(fps_row, text="10 帧/秒", width=8)
             self._yolo_fps_label.pack(side="left")
             # Detection zone size: width and height sliders (progress-bar
             # style) that scale the detection area as a fraction of the frame.
             zone_row = ttk.Frame(yolo_panel)
             zone_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(zone_row, text="Zone Width:").pack(side="left", padx=(0, 6))
+            ttk.Label(zone_row, text="检测区宽度:").pack(side="left", padx=(0, 6))
             self._yolo_zone_w_var = tk.IntVar(value=60)
             self._yolo_zone_w_slider = ttk.Scale(
                 zone_row, from_=20, to=100, orient="horizontal",
@@ -635,7 +635,7 @@ class UiWorker(threading.Thread):
             self._yolo_zone_w_label.pack(side="left")
             zone_row2 = ttk.Frame(yolo_panel)
             zone_row2.pack(fill="x", pady=(4, 0))
-            ttk.Label(zone_row2, text="Zone Height:").pack(side="left", padx=(0, 6))
+            ttk.Label(zone_row2, text="检测区高度:").pack(side="left", padx=(0, 6))
             self._yolo_zone_h_var = tk.IntVar(value=60)
             self._yolo_zone_h_slider = ttk.Scale(
                 zone_row2, from_=20, to=100, orient="horizontal",
@@ -648,7 +648,7 @@ class UiWorker(threading.Thread):
             self._yolo_zone_h_label.pack(side="left")
             zone_row3 = ttk.Frame(yolo_panel)
             zone_row3.pack(fill="x", pady=(4, 0))
-            ttk.Label(zone_row3, text="Zone Shift Y:").pack(side="left", padx=(0, 6))
+            ttk.Label(zone_row3, text="检测区垂直偏移:").pack(side="left", padx=(0, 6))
             self._yolo_zone_shift_y_var = tk.IntVar(value=0)
             self._yolo_zone_shift_y_slider = ttk.Scale(
                 zone_row3, from_=-50, to=50, orient="horizontal",
@@ -660,7 +660,7 @@ class UiWorker(threading.Thread):
             self._yolo_zone_shift_y_label = ttk.Label(zone_row3, text="0%", width=8)
             self._yolo_zone_shift_y_label.pack(side="left")
             self._yolo_status = ttk.Label(
-                yolo_panel, text="YOLO detection stopped.", justify="left"
+                yolo_panel, text="YOLO 检测已停止。", justify="left"
             )
             self._yolo_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved YOLO panel settings (threshold, ranges).
@@ -672,28 +672,28 @@ class UiWorker(threading.Thread):
             # fixed mode greys out the YOLO panel; the fixed worker lives in
             # the assistant process (AttackWorker) and is applied live.
             fixed_panel = ttk.LabelFrame(
-                container, text="Fixed Attack", padding=10
+                container, text="固定攻击", padding=10
             )
             fixed_panel.pack(fill="x", pady=(0, 8))
             mode_row = ttk.Frame(fixed_panel)
             mode_row.pack(fill="x")
-            ttk.Label(mode_row, text="Attack Mode:").pack(
+            ttk.Label(mode_row, text="攻击模式:").pack(
                 side="left", padx=(0, 8)
             )
             self._attack_mode_var = tk.StringVar(value="yolo")
             ttk.Radiobutton(
-                mode_row, text="YOLO Detection", value="yolo",
+                mode_row, text="YOLO 检测", value="yolo",
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(0, 12))
             ttk.Radiobutton(
-                mode_row, text="Fixed Attack", value="fixed",
+                mode_row, text="固定攻击", value="fixed",
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left")
             fixed_key_row = ttk.Frame(fixed_panel)
             fixed_key_row.pack(fill="x", pady=(6, 0))
-            ttk.Label(fixed_key_row, text="Attack Key:").pack(
+            ttk.Label(fixed_key_row, text="攻击按键:").pack(
                 side="left", padx=(0, 4)
             )
             self._fixed_attack_key_var = tk.StringVar(value="ctrl")
@@ -708,7 +708,7 @@ class UiWorker(threading.Thread):
             )
             fixed_key_button.pack(side="left", padx=(0, 10))
             self._fixed_key_button = fixed_key_button
-            ttk.Label(fixed_key_row, text="Every").pack(side="left")
+            ttk.Label(fixed_key_row, text="每").pack(side="left")
             # Fixed attack period: horizontal slider (progress-bar style),
             # 0.5-10 s, default 3 s.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
@@ -724,7 +724,7 @@ class UiWorker(threading.Thread):
             )
             self._fixed_interval_label.pack(side="left")
             self._fixed_status = ttk.Label(
-                fixed_panel, text="Fixed attack inactive.", justify="left"
+                fixed_panel, text="固定攻击未启用。", justify="left"
             )
             self._fixed_status.pack(anchor="w", pady=(6, 0))
             self._fixed_load_settings()
@@ -733,7 +733,7 @@ class UiWorker(threading.Thread):
             # The StatusWorker taps the bound key when the bar ratio drops
             # below the chosen percent (debounced by frames + cooldown).
             drug_panel = ttk.LabelFrame(
-                container, text="Drug (HP/MP potions)", padding=10
+                container, text="药品 (HP/MP 药水)", padding=10
             )
             drug_panel.pack(fill="x", pady=(0, 8))
             hp_row = ttk.Frame(drug_panel)
@@ -744,7 +744,7 @@ class UiWorker(threading.Thread):
                 command=self._drug_on_change,
             )
             hp_use_button.pack(side="left")
-            ttk.Label(hp_row, text="Key:").pack(side="left", padx=(8, 4))
+            ttk.Label(hp_row, text="按键:").pack(side="left", padx=(8, 4))
             self._hp_key_var = tk.StringVar(value="delete")
             hp_key_button = ttk.Button(
                 hp_row, text=self._hp_key_var.get(), width=14,
@@ -756,7 +756,7 @@ class UiWorker(threading.Thread):
             )
             hp_key_button.pack(side="left", padx=(0, 10))
             self._hp_key_button = hp_key_button
-            ttk.Label(hp_row, text="drink when HP <").pack(side="left")
+            ttk.Label(hp_row, text="HP 低于以下时喝药:").pack(side="left")
             self._hp_threshold_var = tk.IntVar(value=50)
             hp_threshold_slider = ttk.Scale(
                 hp_row, from_=5, to=95, orient="horizontal",
@@ -775,7 +775,7 @@ class UiWorker(threading.Thread):
                 command=self._drug_on_change,
             )
             mp_use_button.pack(side="left")
-            ttk.Label(mp_row, text="Key:").pack(side="left", padx=(8, 4))
+            ttk.Label(mp_row, text="按键:").pack(side="left", padx=(8, 4))
             self._mp_key_var = tk.StringVar(value="end")
             mp_key_button = ttk.Button(
                 mp_row, text=self._mp_key_var.get(), width=14,
@@ -787,7 +787,7 @@ class UiWorker(threading.Thread):
             )
             mp_key_button.pack(side="left", padx=(0, 10))
             self._mp_key_button = mp_key_button
-            ttk.Label(mp_row, text="drink when MP <").pack(side="left")
+            ttk.Label(mp_row, text="MP 低于以下时喝药:").pack(side="left")
             self._mp_threshold_var = tk.IntVar(value=30)
             mp_threshold_slider = ttk.Scale(
                 mp_row, from_=5, to=95, orient="horizontal",
@@ -806,11 +806,11 @@ class UiWorker(threading.Thread):
             buff1_row.pack(fill="x", pady=(6, 0))
             self._buff1_use_var = tk.BooleanVar(value=False)
             buff1_use_button = ttk.Checkbutton(
-                buff1_row, text="Buff 1", variable=self._buff1_use_var,
+                buff1_row, text="增益 1", variable=self._buff1_use_var,
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
-            ttk.Label(buff1_row, text="Key:").pack(side="left", padx=(8, 4))
+            ttk.Label(buff1_row, text="按键:").pack(side="left", padx=(8, 4))
             self._buff1_key_var = tk.StringVar(value="home")
             buff1_key_button = ttk.Button(
                 buff1_row, text=self._buff1_key_var.get(), width=14,
@@ -823,7 +823,7 @@ class UiWorker(threading.Thread):
             )
             buff1_key_button.pack(side="left", padx=(0, 10))
             self._buff1_key_button = buff1_key_button
-            ttk.Label(buff1_row, text="every").pack(side="left")
+            ttk.Label(buff1_row, text="每").pack(side="left")
             # Buff refresh period in minutes (default 10): horizontal slider
             # in the same progress-bar style as the other panels.
             self._buff1_interval_var = tk.DoubleVar(value=10.0)
@@ -842,11 +842,11 @@ class UiWorker(threading.Thread):
             buff2_row.pack(fill="x", pady=(6, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
             buff2_use_button = ttk.Checkbutton(
-                buff2_row, text="Buff 2", variable=self._buff2_use_var,
+                buff2_row, text="增益 2", variable=self._buff2_use_var,
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
-            ttk.Label(buff2_row, text="Key:").pack(side="left", padx=(8, 4))
+            ttk.Label(buff2_row, text="按键:").pack(side="left", padx=(8, 4))
             self._buff2_key_var = tk.StringVar(value="insert")
             buff2_key_button = ttk.Button(
                 buff2_row, text=self._buff2_key_var.get(), width=14,
@@ -859,7 +859,7 @@ class UiWorker(threading.Thread):
             )
             buff2_key_button.pack(side="left", padx=(0, 10))
             self._buff2_key_button = buff2_key_button
-            ttk.Label(buff2_row, text="every").pack(side="left")
+            ttk.Label(buff2_row, text="每").pack(side="left")
             self._buff2_interval_var = tk.DoubleVar(value=10.0)
             buff2_interval_slider = ttk.Scale(
                 buff2_row, from_=0.5, to=30.0, orient="horizontal",
@@ -873,7 +873,7 @@ class UiWorker(threading.Thread):
             )
             self._buff2_interval_label.pack(side="left")
             self._drug_status = ttk.Label(
-                drug_panel, text="Drug panel ready.", justify="left"
+                drug_panel, text="药品面板就绪。", justify="left"
             )
             self._drug_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved drug settings and apply them live.
@@ -884,14 +884,14 @@ class UiWorker(threading.Thread):
             # the game gets Alt+F4, the worker verifies the window is gone,
             # then every worker is stopped.
             extra_panel = ttk.LabelFrame(
-                container, text="Additional Functions", padding=10
+                container, text="附加功能", padding=10
             )
             extra_panel.pack(fill="x", pady=(0, 8))
             shutdown_row = ttk.Frame(extra_panel)
             shutdown_row.pack(fill="x")
             self._shutdown_enabled_var = tk.BooleanVar(value=False)
             shutdown_check = ttk.Checkbutton(
-                shutdown_row, text="Shutdown after",
+                shutdown_row, text="运行后定时关闭",
                 variable=self._shutdown_enabled_var,
                 command=self._shutdown_on_change,
             )
@@ -913,11 +913,11 @@ class UiWorker(threading.Thread):
             )
             self._shutdown_hours_label.pack(side="left")
             ttk.Label(
-                shutdown_row, text="then close game (Alt+F4) and stop"
+                shutdown_row, text="小时后关闭游戏 (Alt+F4) 并停止"
             ).pack(side="left", padx=(8, 0))
             self._shutdown_status = ttk.Label(
                 extra_panel,
-                text="Shutdown: disabled - game keeps running.",
+                text="定时关闭: 未启用 - 游戏继续运行。",
                 justify="left",
             )
             self._shutdown_status.pack(anchor="w", pady=(6, 0))
@@ -933,7 +933,7 @@ class UiWorker(threading.Thread):
             self._player_check_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 player_row,
-                text="Auto switch channel when other players appear",
+                text="检测到其他玩家时自动切换频道",
                 variable=self._player_check_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
@@ -941,14 +941,14 @@ class UiWorker(threading.Thread):
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
             if self._SHOW_MINIMAP_PREVIEW:
-                ttk.Label(container, text="Detected minimap").pack(anchor="w")
+                ttk.Label(container, text="检测到的小地图").pack(anchor="w")
                 self._minimap_label = ttk.Label(container)
                 self._minimap_label.pack(anchor="w", pady=(4, 10))
-                ttk.Label(container, text="Map-name region").pack(anchor="w")
+                ttk.Label(container, text="地图名称区域").pack(anchor="w")
                 self._map_name_label = ttk.Label(container)
                 self._map_name_label.pack(anchor="w", pady=(4, 0))
 
-            debug_frame = ttk.LabelFrame(container, text="Debug log", padding=6)
+            debug_frame = ttk.LabelFrame(container, text="调试日志", padding=6)
             debug_frame.pack(fill="both", expand=True, pady=(10, 0))
             self._log_text = tk.Text(
                 debug_frame,
@@ -1020,11 +1020,11 @@ class UiWorker(threading.Thread):
             and self.automation_active_event.is_set()
         )
         if active:
-            text = "Automation: ACTIVE — game window selected"
+            text = "自动化: 运行中 — 已选中游戏窗口"
         elif patrol_running:
-            text = "Automation: PAUSED — select the game window to resume"
+            text = "自动化: 已暂停 — 请选中游戏窗口以恢复"
         else:
-            text = "Automation: stopped"
+            text = "自动化: 已停止"
         self._automation_status_label.configure(text=text)
 
     def _drain_logs(self) -> None:
@@ -1098,7 +1098,7 @@ class UiWorker(threading.Thread):
 
         snapshot = self.last_snapshot
         if self.on_capture_now is not None:
-            self._control_status.configure(text="Capturing current position…")
+            self._control_status.configure(text="正在捕获当前位置…")
             if self._root is not None:
                 self._root.update_idletasks()
             try:
@@ -1115,19 +1115,19 @@ class UiWorker(threading.Thread):
             except Exception as exc:
                 LOG.exception("immediate recording capture failed")
                 self._control_status.configure(
-                    text=f"Cannot record: immediate capture failed: {exc}"
+                    text=f"无法录制: 即时捕获失败: {exc}"
                 )
                 return None
         return snapshot
 
     def _record_endpoint(self, boundary: str) -> None:
         if self.patrol_controller is None:
-            self._control_status.configure(text="Patrol controller is unavailable.")
+            self._control_status.configure(text="巡逻控制器不可用。")
             return
         snapshot = self._capture_snapshot_for_recording()
         if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
             self._control_status.configure(
-                text="Cannot record: yellow diamond is not detected in the latest frame."
+                text="无法录制: 最新画面中未检测到黄色菱形标记。"
             )
             return
         try:
@@ -1148,19 +1148,19 @@ class UiWorker(threading.Thread):
         except (OSError, ValueError) as exc:
             LOG.warning("record rejected: layer=%s point=%s error=%s",
                         self.patrol_controller.selected_layer(), boundary, exc)
-            self._control_status.configure(text=f"Cannot record: {exc}")
+            self._control_status.configure(text=f"无法录制: {exc}")
             return
         labels = {
-            "left_most_pos": "Left-most",
-            "rope_pos": "Rope",
-            "right_most_pos": "Right-most",
+            "left_most_pos": "最左",
+            "rope_pos": "绳索",
+            "right_most_pos": "最右",
         }
         label = labels[boundary]
         self._unlocked_points.discard((recorded.layer, boundary))
         LOG.info("record locked: layer=%s point=%s x=%.6f y=%.6f frame=%s",
                  recorded.layer, boundary, recorded.x, recorded.y, snapshot.sequence)
         self._control_status.configure(
-            text=(f"Recorded {recorded.layer} {label}: "
+            text=(f"已录制 {recorded.layer} {label}: "
                   f"x={recorded.x:.6f}, y={recorded.y:.6f}")
         )
         self._refresh_patrol_controls()
@@ -1273,7 +1273,7 @@ class UiWorker(threading.Thread):
         worker = getattr(self, "attack_worker", None)
         if worker is None:
             self._fixed_status.configure(
-                text="Fixed attack: worker not wired (headless run)."
+                text="固定攻击: 工作线程未接入 (无界面模式)。"
             )
             return
         mode = str(data.get("attack_mode", "yolo"))
@@ -1310,22 +1310,22 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_fixed_status"):
             if fixed_mode:
                 self._fixed_status.configure(
-                    text=(f"Fixed attack active - pressing "
-                          f"{self._fixed_attack_key_var.get()} every "
-                          f"{float(self._fixed_interval_var.get()):.1f}s. "
-                          "YOLO detection disabled.")
+                    text=(f"固定攻击已启用 - 每 "
+                          f"{float(self._fixed_interval_var.get()):.1f}秒 "
+                          f"按下 {self._fixed_attack_key_var.get()}。"
+                          "YOLO 检测已禁用。")
                 )
             else:
                 self._fixed_status.configure(
-                    text="Fixed attack inactive - YOLO detection mode."
+                    text="固定攻击未启用 - 使用 YOLO 检测模式。"
                 )
         if hasattr(self, "_yolo_status"):
             if fixed_mode:
                 self._yolo_status.configure(
-                    text="Disabled - Fixed Attack mode selected."
+                    text="已禁用 - 当前选择固定攻击模式。"
                 )
             else:
-                self._yolo_status.configure(text="YOLO detection stopped.")
+                self._yolo_status.configure(text="YOLO 检测已停止。")
 
     def _set_panel_state(self, panel: Any, disabled: bool) -> None:
         """Enable/disable every widget inside *panel* (ttk or tk)."""
@@ -1393,7 +1393,7 @@ class UiWorker(threading.Thread):
         self._key_capturing = True
         self._key_capture_target = (button, var, previous_attr, on_change)
         setattr(self, previous_attr, var.get())
-        button.configure(text="press a key...", style="TButton")
+        button.configure(text="请按一个按键…", style="TButton")
         root = getattr(self, "_root", None)
         if root is not None:
             root.bind("<KeyPress>", self._key_capture_handler)
@@ -1518,7 +1518,7 @@ class UiWorker(threading.Thread):
         worker = getattr(self, "status_worker", None)
         if worker is None:
             self._drug_status.configure(
-                text="Drug: status worker not wired (headless run)."
+                text="药品: 状态工作线程未接入 (无界面模式)。"
             )
             return
         try:
@@ -1526,16 +1526,16 @@ class UiWorker(threading.Thread):
             worker.detector.config = config
             self._drug_status.configure(
                 text=(
-                    f"Drug: HP<{data['hp_threshold']}% key={data['hp_key']} "
-                    f"({'on' if data['hp_enabled'] else 'off'}) | "
-                    f"MP<{data['mp_threshold']}% key={data['mp_key']} "
-                    f"({'on' if data['mp_enabled'] else 'off'})\n"
-                    f"Buff1: key={data['buff1_key']} every "
-                    f"{data['buff1_interval']}min "
-                    f"({'on' if data['buff1_enabled'] else 'off'}) | "
-                    f"Buff2: key={data['buff2_key']} every "
-                    f"{data['buff2_interval']}min "
-                    f"({'on' if data['buff2_enabled'] else 'off'})"
+                    f"药品: HP<{data['hp_threshold']}% 按键={data['hp_key']} "
+                    f"({'开' if data['hp_enabled'] else '关'}) | "
+                    f"MP<{data['mp_threshold']}% 按键={data['mp_key']} "
+                    f"({'开' if data['mp_enabled'] else '关'})\n"
+                    f"增益1: 按键={data['buff1_key']} 每 "
+                    f"{data['buff1_interval']}分钟 "
+                    f"({'开' if data['buff1_enabled'] else '关'}) | "
+                    f"增益2: 按键={data['buff2_key']} 每 "
+                    f"{data['buff2_interval']}分钟 "
+                    f"({'开' if data['buff2_enabled'] else '关'})"
                 )
             )
         except Exception as exc:
@@ -1587,7 +1587,7 @@ class UiWorker(threading.Thread):
         worker = getattr(self, "shutdown_worker", None)
         if worker is None:
             self._shutdown_status.configure(
-                text="Shutdown: worker not wired (headless run)."
+                text="定时关闭: 工作线程未接入 (无界面模式)。"
             )
             return
         worker.enabled = bool(data.get("shutdown_enabled", False))
@@ -1600,13 +1600,13 @@ class UiWorker(threading.Thread):
                 setter(bool(data.get("player_check_enabled", False)))
         if worker.enabled:
             self._shutdown_status.configure(
-                text=f"Shutdown armed: game closes in "
-                     f"{float(data.get('shutdown_hours', 3.0)):.1f}h "
-                     f"(Alt+F4 then stop all)."
+                text=f"定时关闭已启动: 游戏将在 "
+                     f"{float(data.get('shutdown_hours', 3.0)):.1f}小时后关闭 "
+                     f"(Alt+F4 后停止所有工作线程)。"
             )
         else:
             self._shutdown_status.configure(
-                text="Shutdown: disabled - game keeps running."
+                text="定时关闭: 未启用 - 游戏继续运行。"
             )
 
     def _shutdown_refresh_grey(self) -> None:
@@ -1639,11 +1639,11 @@ class UiWorker(threading.Thread):
         remaining = max(0.0, deadline - time.monotonic())
         hours = remaining / 3600.0
         if hours >= 1.0:
-            text = f"Shutdown armed: game closes in {hours:.1f}h."
+            text = f"定时关闭已启动: 游戏将在 {hours:.1f}小时后关闭。"
         else:
             minutes = int(remaining // 60.0)
             seconds = int(remaining % 60.0)
-            text = (f"Shutdown armed: game closes in {minutes}m {seconds:02d}s.")
+            text = (f"定时关闭已启动: 游戏将在 {minutes}分 {seconds:02d}秒后关闭。")
         self._shutdown_status.configure(text=text)
 
     def _shutdown_load_settings(self) -> None:
@@ -1774,7 +1774,7 @@ class UiWorker(threading.Thread):
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
 
         if self._yolo_process is not None and self._yolo_process.poll() is None:
-            self._yolo_status.configure(text="YOLO detection is already running.")
+            self._yolo_status.configure(text="YOLO 检测已在运行中。")
             return
         threshold = 0.4
         try:
@@ -1787,7 +1787,7 @@ class UiWorker(threading.Thread):
         script = yolo_root / "live_view.py"
         if not python.is_file() or not script.is_file():
             self._yolo_status.configure(
-                text=f"YOLO project not found at {yolo_root} — check paths."
+                text=f"未找到 YOLO 项目: {yolo_root} — 请检查路径。"
             )
             return
         import subprocess
@@ -1842,12 +1842,12 @@ class UiWorker(threading.Thread):
         )
         self._yolo_run_button.configure(state="disabled")
         self._yolo_stop_button.configure(state="normal")
-        mode = "visible window" if self._yolo_show_var.get() else "headless"
-        attack = ("auto-attack ON" if hasattr(self, "_yolo_attack_var")
-                  and self._yolo_attack_var.get() else "attack OFF")
+        mode = "显示画面" if self._yolo_show_var.get() else "无窗口"
+        attack = ("自动攻击已开" if hasattr(self, "_yolo_attack_var")
+                  and self._yolo_attack_var.get() else "攻击已关")
         self._yolo_status.configure(
-            text=f"YOLO detection running ({mode}, {attack}, "
-                 f"threshold {threshold:.2f}). Press Stop to terminate."
+            text=f"YOLO 检测运行中 ({mode}, {attack}, "
+                 f"阈值 {threshold:.2f})。点击停止以结束。"
         )
         LOG.info("yolo detection started threshold=%.2f show=%s pid=%s",
                  threshold, self._yolo_show_var.get(), self._yolo_process.pid)
@@ -1859,7 +1859,7 @@ class UiWorker(threading.Thread):
         self._yolo_save_threshold_to_config()
         if hasattr(self, "_yolo_status"):
             self._yolo_status.configure(
-                text="Configuration saved - it will be restored next launch."
+                text="配置已保存 - 下次启动时自动恢复。"
             )
 
     def _yolo_save_threshold_to_config(self) -> None:
@@ -1928,7 +1928,7 @@ class UiWorker(threading.Thread):
             self._yolo_process = None
             self._yolo_run_button.configure(state="normal")
             self._yolo_stop_button.configure(state="disabled")
-            self._yolo_status.configure(text="YOLO detection stopped.")
+            self._yolo_status.configure(text="YOLO 检测已停止。")
             return
         try:
             proc.terminate()
@@ -1941,7 +1941,7 @@ class UiWorker(threading.Thread):
         self._yolo_process = None
         self._yolo_run_button.configure(state="normal")
         self._yolo_stop_button.configure(state="disabled")
-        self._yolo_status.configure(text="YOLO detection stopped.")
+        self._yolo_status.configure(text="YOLO 检测已停止。")
         LOG.info("yolo detection stopped")
 
     def _yolo_sync_show_button(self) -> None:
@@ -1962,8 +1962,7 @@ class UiWorker(threading.Thread):
                    and self._yolo_process.poll() is None)
         if running:
             self._yolo_status.configure(
-                text="Stop detection before changing Show Detection; "
-                     "restart Run to apply."
+                text="请先停止检测再修改显示选项；重新运行以生效。"
             )
 
     def _record_or_unlock(self, layer_name: str, boundary: str) -> None:
@@ -1981,8 +1980,8 @@ class UiWorker(threading.Thread):
         if record_button_is_locked(saved_endpoint, key in self._unlocked_points):
             self._unlocked_points.add(key)
             self._control_status.configure(
-                text=(f"Unlocked {layer_name} {boundary}. Click the same Record "
-                      "button again to save the current position.")
+                text=(f"已解锁 {layer_name} {boundary}。再次点击同一个录制按钮 "
+                      "即可保存当前位置。")
             )
             self._refresh_patrol_controls()
             return
@@ -1991,18 +1990,17 @@ class UiWorker(threading.Thread):
 
     def _start_patrol(self) -> None:
         if self.patrol_controller is None:
-            self._control_status.configure(text="Patrol controller is unavailable.")
+            self._control_status.configure(text="巡逻控制器不可用。")
             return
         if self.patrol_controller.is_enabled():
             return
         if not self.patrol_controller.can_start():
             self._control_status.configure(
-                text=("Cannot start: record at least one patrol point per "
-                      "layer (Left / Rope / Right). Start with nothing to "
-                      "stand still and only attack.")
+                text=("无法开始: 每层至少录制一个巡逻点 (最左 / 绳索 / 最右)。"
+                      "不录制任何点时将原地站立只进行攻击。")
             )
             return
-        self._control_status.configure(text="Selecting game window…")
+        self._control_status.configure(text="正在选择游戏窗口…")
         if self._root is not None:
             self._root.update_idletasks()
         if self.on_patrol_start is not None:
@@ -2010,12 +2008,12 @@ class UiWorker(threading.Thread):
                 self.on_patrol_start()
             except OSError as exc:
                 self._control_status.configure(
-                    text=f"Cannot start: game window selection failed: {exc}"
+                    text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
                 return
         self.patrol_controller.set_enabled(True)
         self._refresh_patrol_controls()
-        self._control_status.configure(text="Patrol started.")
+        self._control_status.configure(text="巡逻已开始。")
 
     def _stop_patrol(self) -> None:
         if self.patrol_controller is None:
@@ -2028,20 +2026,20 @@ class UiWorker(threading.Thread):
         # this the character would keep attacking after Stop Patrol.
         self._yolo_stop()
         self._refresh_patrol_controls()
-        self._control_status.configure(text="Patrol stopped.")
+        self._control_status.configure(text="巡逻已停止。")
 
     def _add_layer_above(self) -> None:
         if self.patrol_controller is None:
-            self._control_status.configure(text="Patrol controller is unavailable.")
+            self._control_status.configure(text="巡逻控制器不可用。")
             return
         try:
             layer_name = self.patrol_controller.add_layer_above()
         except (OSError, ValueError) as exc:
-            self._control_status.configure(text=f"Cannot add layer: {exc}")
+            self._control_status.configure(text=f"无法添加图层: {exc}")
             return
         self._control_status.configure(
-            text=(f"Selected {layer_name}. Move there manually and record "
-                  "any patrol points (Left / Rope / Right). Patrol is paused.")
+            text=(f"已选择 {layer_name}。请手动移动到该层并录制任意巡逻点 "
+                  "(最左 / 绳索 / 最右)。巡逻已暂停。")
         )
         self._refresh_patrol_controls()
 
@@ -2064,13 +2062,13 @@ class UiWorker(threading.Thread):
             if getattr(self, "map_identity_store", None) is not None:
                 self.map_identity_store.remove(self.configured_map_name)
         except OSError as exc:
-            self._control_status.configure(text=f"Cannot reset recording: {exc}")
+            self._control_status.configure(text=f"无法重置录制: {exc}")
             return
         self._unlocked_points.clear()
         self._layer_row_names = ()
         self._refresh_patrol_controls()
         self._control_status.configure(
-            text="Recording reset. Layer 1 is empty; patrol is stopped."
+            text="录制已重置。图层1为空；巡逻已停止。"
         )
 
     def _refresh_patrol_controls(self) -> None:
@@ -2090,15 +2088,15 @@ class UiWorker(threading.Thread):
         layer_names = list(layer_display_order(layer_names))
         self._ensure_layer_rows(tuple(layer_names))
         button_labels = {
-            "left_most_pos": "Left-most",
-            "rope_pos": "Rope",
-            "right_most_pos": "Right-most",
+            "left_most_pos": "最左",
+            "rope_pos": "绳索",
+            "right_most_pos": "最右",
         }
         final_name = self.patrol_controller.final_layer_name()
         for layer_name in layer_names:
-            suffix = "  ← selected" if layer_name == selected else ""
+            suffix = "  ← 已选择" if layer_name == selected else ""
             if layer_name == final_name:
-                suffix += "  (final)"
+                suffix += "  (最顶层)"
             self._layer_labels[layer_name].configure(text=f"{layer_name}{suffix}")
             for point, button_label in button_labels.items():
                 final_rope = point == "rope_pos" and layer_name == final_name
@@ -2114,8 +2112,8 @@ class UiWorker(threading.Thread):
                     )
                 else:
                     text = (
-                        "Rope unavailable (final)"
-                        if final_rope else f"Record {button_label}"
+                        "绳索不可用 (最顶层)"
+                        if final_rope else f"录制 {button_label}"
                     )
                 self._record_buttons[(layer_name, point)].configure(
                     text=text,
@@ -2143,9 +2141,9 @@ class UiWorker(threading.Thread):
         self._layer_row_names = layer_names
         ttk = self._ttk
         point_labels = (
-            ("left_most_pos", "Left-most"),
-            ("rope_pos", "Rope"),
-            ("right_most_pos", "Right-most"),
+            ("left_most_pos", "最左"),
+            ("rope_pos", "绳索"),
+            ("right_most_pos", "最右"),
         )
         for layer_name in layer_names:
             row = ttk.Frame(self._layer_rows_frame)
@@ -2156,7 +2154,7 @@ class UiWorker(threading.Thread):
             for point_name, point_label in point_labels:
                 button = ttk.Button(
                     row,
-                    text=f"Record {point_label}",
+                    text=f"录制 {point_label}",
                     command=lambda layer=layer_name, point=point_name: (
                         self._record_or_unlock(layer, point)
                     ),

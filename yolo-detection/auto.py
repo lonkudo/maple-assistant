@@ -23,6 +23,7 @@ from collections import deque
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from ultralytics import YOLO
+from cn_text import put_cn
 
 # 配置日誌
 logging.basicConfig(
@@ -902,8 +903,8 @@ class OptimizedMapleBot:
             zy1 = max(0, min(zy1, zy2 - 1))
             zy2 = max(zy1 + 1, min(height, zy2))
             cv2.rectangle(img, (zx1, zy1), (zx2, zy2), (0, 255, 255), 1)
-            cv2.putText(img, 'CENTER ZONE', (zx1 + 5, zy1 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            put_cn(img, '检测中心区', 'CENTER ZONE', (zx1 + 5, zy1 + 20),
+                   0.5, (0, 255, 255))
 
         for detection in detections:
             bbox = detection.bbox
@@ -925,18 +926,25 @@ class OptimizedMapleBot:
             cv2.rectangle(img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
 
             # 繪製標籤 (mob 標籤附帶框大小，方便對照 min_mob_box_px 過濾)
+            name_cn = {
+                'mob': '怪物', 'item': '物品', 'npc': 'NPC',
+                'character': '角色', 'environment': '环境', 'ui': '界面',
+            }.get(class_name, class_name)
             if class_name == 'mob':
                 box_w = bbox[2] - bbox[0]
                 box_h = bbox[3] - bbox[1]
-                label = f"{class_name}: {confidence:.2f}, {box_w}x{box_h}"
+                label_en = f"{class_name}: {confidence:.2f}, {box_w}x{box_h}"
+                label_cn = f"{name_cn}: {confidence:.2f}, {box_w}x{box_h}"
             else:
-                label = f"{class_name}: {confidence:.2f}"
-            cv2.putText(img, label, (bbox[0], bbox[1] - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                label_en = f"{class_name}: {confidence:.2f}"
+                label_cn = f"{name_cn}: {confidence:.2f}"
+            put_cn(img, label_cn, label_en, (bbox[0], bbox[1] - 10),
+                   0.5, color)
 
         # 繪製性能信息
         fps_text = f"FPS: {self.performance_monitor.current_fps}"
-        cv2.putText(img, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        put_cn(img, f"帧率: {self.performance_monitor.current_fps}", fps_text,
+               (10, 30), 0.7, (0, 255, 0))
         return img
 
     def _log_statistics(self):

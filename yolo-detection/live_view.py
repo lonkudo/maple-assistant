@@ -31,6 +31,7 @@ import numpy as np
 import mss
 
 from auto import OptimizedMapleBot, Detection
+from cn_text import put_cn
 
 INTERVAL = 0.1  # 10 fps
 
@@ -123,10 +124,10 @@ def draw_attack_range(
     # Center marker (player position reference).
     cv2.line(img, (center_x, y - tick // 2), (center_x, y + tick // 2),
              (0, 255, 255), 2)
-    # Label.
-    cv2.putText(img, f"ATTACK RANGE: {attack_range}px",
-                (center_x - half, y - tick - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    # Label (Chinese with English fallback when no CJK font is available).
+    put_cn(img, f"攻击范围: {attack_range}px",
+           f"ATTACK RANGE: {attack_range}px",
+           (center_x - half, y - tick - 8), 0.8, color)
     return img
 
 
@@ -238,11 +239,11 @@ def main() -> int:
                     # Draw the player box in bright green with a label.
                     x1, y1, x2, y2 = character.bbox
                     cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                    cv2.putText(
+                    put_cn(
                         preview,
+                        f"玩家 置信度={character.confidence:.2f}",
                         f"PLAYER conf={character.confidence:.2f}",
-                        (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (0, 255, 0), 2,
+                        (x1, y2 + 20), 0.7, (0, 255, 0),
                     )
                 if target is not None:
                     # Highlight the chosen attack target in red outline.
@@ -297,13 +298,17 @@ def main() -> int:
                     preview, args.attack_range, args.attack_line_height,
                     character=character,
                 )
-                cv2.putText(
+                put_cn(
                     preview,
+                    f"阈值: {conf:.2f} | 怪物: {len(dets)} | "
+                    f"目标: {'有' if target else '无'} | "
+                    f"玩家: {'有' if character else '无'} | "
+                    f"亮度={gray.mean():.0f}",
                     f"THRESHOLD: {conf:.2f} | MOBS: {len(dets)} | "
                     f"TARGET: {'YES' if target else 'NO'} | "
                     f"PLAYER: {'YES' if character else 'NO'} | "
                     f"bright={gray.mean():.0f}",
-                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3,
+                    (10, 70), 1.0, (0, 255, 255),
                 )
                 for d in dets:
                     print(f"MOB conf={d.confidence:.2f} box={d.bbox}")
@@ -314,7 +319,7 @@ def main() -> int:
                     print(f"TARGET SELECTED conf={target.confidence:.2f} "
                           f"box={target.bbox}")
                 if not args.no_show:
-                    cv2.imshow("LIVE mob detection - ESC to exit", preview)
+                    cv2.imshow("怪物实时检测 - 按 ESC 退出", preview)
                     key = cv2.waitKey(1) & 0xFF
                     if key == 27:
                         break

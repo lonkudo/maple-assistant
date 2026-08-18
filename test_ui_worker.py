@@ -62,7 +62,7 @@ class UiLogHandlerTests(unittest.TestCase):
     def test_final_rope_hover_hint_tells_user_how_to_enable_it(self) -> None:
         self.assertEqual(
             rope_unavailable_hint(),
-            "Add a layer to enable Rope recording.",
+            "添加上层后即可录制绳索位置。",
         )
 
     def test_dynamic_record_button_locks_from_saved_endpoint(self) -> None:
@@ -141,7 +141,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._record_or_unlock("layer1", "left_most_pos")
         self.assertIn(("layer1", "left_most_pos"), worker._unlocked_points)
         self.assertEqual(recorded, [])
-        self.assertIn("same Record button again", worker._control_status.text)
+        self.assertIn("再次点击同一个录制按钮", worker._control_status.text)
 
         worker._record_or_unlock("layer1", "left_most_pos")
         self.assertEqual(recorded, ["left_most_pos"])
@@ -223,13 +223,13 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertIn("0.00", args)
         self.assertEqual(worker._yolo_run_button.state, "disabled")
         self.assertEqual(worker._yolo_stop_button.state, "normal")
-        self.assertIn("running", worker._yolo_status.text)
+        self.assertIn("运行中", worker._yolo_status.text)
 
         fake_proc.poll.return_value = 0  # exited
         worker._yolo_stop()
         self.assertEqual(worker._yolo_run_button.state, "normal")
         self.assertEqual(worker._yolo_stop_button.state, "disabled")
-        self.assertIn("stopped", worker._yolo_status.text)
+        self.assertIn("已停止", worker._yolo_status.text)
 
     def test_yolo_show_toggle_adds_visible_mode(self) -> None:
         from unittest import mock
@@ -412,7 +412,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertEqual(data["attack_range"], 1000)
                 self.assertTrue(data["auto_attack"])
                 self.assertEqual(data["attack_key"], "ctrl")
-                self.assertIn("Configuration saved", worker._yolo_status.text)
+                self.assertIn("配置已保存", worker._yolo_status.text)
 
     def test_reset_has_no_confirmation_and_stops_before_clearing(self) -> None:
         calls = []
@@ -537,8 +537,8 @@ class UiLogHandlerTests(unittest.TestCase):
             # YOLO panel greyed out; status line reflects the mode.
             for child in worker._yolo_panel.children:
                 self.assertIn(["disabled"], child.states)
-            self.assertIn("Fixed attack active", worker._fixed_status.text)
-            self.assertIn("every 2.5s", worker._fixed_status.text)
+            self.assertIn("固定攻击已启用", worker._fixed_status.text)
+            self.assertIn("每 2.5秒", worker._fixed_status.text)
             # The jump-rope logic switched to minimap (YOLO inactive).
             self.assertEqual(worker.movement_worker.calls, [False])
 
@@ -548,7 +548,7 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertFalse(worker.attack_worker.enabled)
             for child in worker._yolo_panel.children:
                 self.assertIn(["!disabled"], child.states)
-            self.assertIn("inactive", worker._fixed_status.text)
+            self.assertIn("未启用", worker._fixed_status.text)
             self.assertEqual(worker.movement_worker.calls, [False, True])
 
     def test_fixed_attack_settings_roundtrip(self) -> None:
@@ -710,7 +710,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 # Applied to the worker live + slider enabled + label.
                 self.assertTrue(worker.shutdown_worker.enabled)
                 self.assertEqual(worker.shutdown_worker.hours, 2.5)
-                self.assertIn("armed", worker._shutdown_status.text)
+                self.assertIn("定时关闭已启动", worker._shutdown_status.text)
                 self.assertIn(["!disabled"], worker._shutdown_slider.states)
 
                 loader = make_worker()
@@ -727,7 +727,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 loader._shutdown_on_change()
                 self.assertFalse(loader.shutdown_worker.enabled)
                 self.assertIn(["disabled"], loader._shutdown_slider.states)
-                self.assertIn("disabled", loader._shutdown_status.text)
+                self.assertIn("未启用", loader._shutdown_status.text)
 
     def test_drug_buff_rows_roundtrip_and_apply_to_status_worker(self) -> None:
         import json
@@ -816,8 +816,8 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertTrue(config.buff1_enabled)
                 self.assertAlmostEqual(config.buff1_interval, 750.0)
                 self.assertEqual(config.buff1_key, "pagedown")
-                self.assertIn("Buff1", worker._drug_status.text)
-                self.assertIn("12.5min", worker._drug_status.text)
+                self.assertIn("增益1", worker._drug_status.text)
+                self.assertIn("12.5分钟", worker._drug_status.text)
 
                 loader = make_worker()
                 with mock.patch.object(UiWorker, "_drug_settings_path",
