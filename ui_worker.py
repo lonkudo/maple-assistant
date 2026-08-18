@@ -414,10 +414,9 @@ class UiWorker(threading.Thread):
             self._root = root
             root.title("Maple 助手 调试界面")
             screen_width = root.winfo_screenwidth()
-            # Default tall layout on the left/secondary monitor; the position
-            # is negative so the window opens on the monitor left of primary.
+            # 窗口固定在屏幕左上角 (0,0) 打开。
             window_height = 1600
-            root.geometry(f"700x{window_height}-1000-500")
+            root.geometry(f"700x{window_height}+0+0")
             root.minsize(520, 560)
             root.protocol("WM_DELETE_WINDOW", root.destroy)
             root.attributes("-topmost", True)
@@ -1022,7 +1021,8 @@ class UiWorker(threading.Thread):
         if active:
             text = "自动化: 运行中 — 已选中游戏窗口"
         elif patrol_running:
-            text = "自动化: 已暂停 — 请选中游戏窗口以恢复"
+            # 不显示“游戏未在前台”的提示。
+            text = ""
         else:
             text = "自动化: 已停止"
         self._automation_status_label.configure(text=text)
