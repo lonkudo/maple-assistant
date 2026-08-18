@@ -17,10 +17,10 @@ from status_worker import (
 def status_image(hp_ratio: float, mp_ratio: float) -> Image.Image:
     image = Image.new("RGB", (1000, 1000), "black")
     draw = ImageDraw.Draw(image)
-    # Detector expects a 77 px full bar at this resolution.
-    draw.rectangle((400, 970, 400 + round(77 * hp_ratio) - 1, 974),
+    # Detector expects a 51 px full bar at this resolution (0.0512 of width).
+    draw.rectangle((400, 970, 400 + round(51 * hp_ratio) - 1, 974),
                    fill=(220, 20, 20))
-    draw.rectangle((400, 985, 400 + round(77 * mp_ratio) - 1, 989),
+    draw.rectangle((400, 985, 400 + round(51 * mp_ratio) - 1, 989),
                    fill=(20, 40, 220))
     return image
 

@@ -16,11 +16,15 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-MINIMAP_CAPTURE_SIZE = (1707, 1067)
 OPENCV_ANALYSIS_SIZE = (200, 200)
 MINIMAP_FALLBACK_REGION = (0, 0, 0.2, 0.24)
 STATUS_CAPTURE_REGION = (0.36, 0.96, 0.53, 1)
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
+# Status-bar fractions are calibrated to the CLIENT WIDTH so they hold at any
+# resolution (the game HUD scales with the client).  Measured: a full HP fill
+# is about 131px on a 2560-wide client -> 131/2560 ~= 0.0512.
+FULL_BAR_CLIENT_FRACTION = 0.0512
+MIN_BAR_CLIENT_FRACTION = 0.0020
 
 
 def _acquire_single_instance_mutex(
@@ -231,11 +235,13 @@ def main() -> int:
     status_detector = BarStatusDetector(replace(
         status_defaults,
         status_roi=(0.0, 0.0, 1.0, 1.0),
+        # Client-width-relative fractions: the detector's expected bar length
+        # becomes fraction * client_width, valid at any resolution.
         full_bar_width_fraction=(
-            status_defaults.full_bar_width_fraction / status_capture_width
+            FULL_BAR_CLIENT_FRACTION / status_capture_width
         ),
         min_bar_width_fraction=(
-            status_defaults.min_bar_width_fraction / status_capture_width
+            MIN_BAR_CLIENT_FRACTION / status_capture_width
         ),
     ))
     minimap_detector = MinimapDetector(
@@ -255,7 +261,8 @@ def main() -> int:
         bus,
         stop_event,
         args.debug_dir,
-        capture_pixel_size=MINIMAP_CAPTURE_SIZE,
+        # Capture the FULL client window (no fixed-size top-left crop) so all
+        # normalized analysis regions map to the client at any resolution.
         status_capture_region=STATUS_CAPTURE_REGION,
         status_capture_interval=args.status_interval,
         capture_enabled_event=game_focused,

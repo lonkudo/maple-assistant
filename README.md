@@ -1,5 +1,11 @@
 # Maple Assistant
 
+> **Installation & resolution guide: see [INSTALL.md](INSTALL.md).** The
+> release package is self-bootstrapping — `install.ps1` finds or downloads
+> Python, creates a `.venv`, installs the requirements, and creates launchers;
+> `build_release.ps1` assembles a minimal distributable folder. Everything is
+> normalized to the game client, so 2560×1440 / 1920×1080 / 1366×768 all work.
+
 Independent workers analyze the game without relying on slow interactive computer control:
 
 1. `capture_worker.py` captures the small minimap and status regions every four seconds.

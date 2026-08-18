@@ -7,6 +7,13 @@ __pycache__/
 work/
 outputs/
 recording-assets/
+release/
+
+# local virtual environments
+.venv/
+venv/
+venv313/
+venv*/
 
 *.log
 *.pid

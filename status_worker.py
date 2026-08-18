@@ -522,11 +522,12 @@ class StatusConfig:
     buff2_interval: float = 600.0
     buff1_enabled: bool = False
     buff2_enabled: bool = False
-    # Approximate full bar length; accepted candidates may vary substantially.
-    # The observed 2560x1600 client scales to a 1707px-wide capture where each
-    # fill is about 131px (131/1707 ~= 0.077).
-    full_bar_width_fraction: float = 0.077
-    min_bar_width_fraction: float = 0.003
+    # Approximate full bar length as a fraction of the CLIENT width; the game
+    # HUD scales with the client, so this value is resolution-independent.
+    # Measured at a 2560-wide client: a full fill is about 131px
+    # (131/2560 ~= 0.0512).  Accepted candidates may vary substantially.
+    full_bar_width_fraction: float = 0.0512
+    min_bar_width_fraction: float = 0.0020
     minimum_action_confidence: float = 0.55
 
 
