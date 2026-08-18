@@ -71,21 +71,13 @@ Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundCo
 Write-Host ""
 
 if ($Zip) {
-    $zipPath = Join-Path $root "release\MapleAssistant.zip"
-    # Always remove the old zip first (with a retry in case the previous zip
-    # is briefly locked, e.g. by an open Explorer window or antivirus), so a
-    # rebuild never leaves a stale zip behind.
-    if (Test-Path $zipPath) {
-        for ($attempt = 1; $attempt -le 5; $attempt++) {
-            try {
-                Remove-Item $zipPath -Force -ErrorAction Stop
-                break
-            } catch {
-                if ($attempt -ge 5) { throw "无法删除旧的压缩包: $zipPath ($($_.Exception.Message))" }
-                Start-Sleep -Milliseconds 500
-            }
-        }
-    }
+    # 4 位随机戳：每次重建生成不同文件名，方便区分版本（如 MapleAssistant-4831.zip）。
+    $stamp = Get-Random -Minimum 1000 -Maximum 10000
+    $zipPath = Join-Path $root "release\MapleAssistant-$stamp.zip"
+    # 先删除旧的带戳压缩包（带重试，防止旧包被资源管理器/杀软短暂锁定），
+    # 重建后不会残留旧包。
+    Get-ChildItem (Join-Path $root "release") -Filter "MapleAssistant-*.zip" |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal -Force
     $zipInfo = Get-Item -LiteralPath $zipPath
     Write-Host "已压缩到 $zipPath ($([math]::Round($zipInfo.Length / 1MB, 1)) MB, $($zipInfo.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))" -ForegroundColor Green
