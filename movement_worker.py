@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 import json
 import logging
 import queue
+import random
 import threading
 import time
 from pathlib import Path
@@ -26,7 +27,7 @@ from marker_detector import (
     detect_red_diamonds,
     detect_yellow_diamond,
 )
-from patrol_control import CoordinateLayout
+from patrol_control import CoordinateLayout, _layer_present_actions
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
 from channel_switch import channel_switch_procedure
@@ -191,25 +192,32 @@ def move_towards_rope(
     rope_x: float,
     near_range: float,
     inner_range: float = 0.0,
-    under_rope_tolerance: float = 0.01,
+    under_rope_tolerance: float = 0.008,
     allow_climb: bool = True,
     **movement_options: Any,
 ) -> RopeMovementPlan:
     """Move into the inner rope band, then jump inward from within it.
 
-    Only the inner gap gates the climb attempt: the outer honey-zone band is
-    removed.  Outside the inner band the character simply walks toward the
-    band edge; there is no "back away" stage.
+    Three behavior zones around the rope:
 
-    When the character is right under the rope (|gap| <= under_rope_tolerance,
-    default +-0.01 minimap units) the climb is a straight jump up
-    (``jump_climb_up``) instead of a left/right chord - a directional jump
-    from directly under the rope just pushes the character past it.
+    - **Right on the rope** (|gap| <= ``under_rope_tolerance``, default
+      +-0.008 minimap units): jump straight up (``jump_climb_up``) - a
+      left/right chord from directly under the rope pushes the character past
+      it.
+    - **Inner band** (under_rope < |gap| <= ``inner_range``): the climb
+      attempt jumps left/right toward the rope side (``jump_climb_<side>``).
+      When ``allow_climb=False`` (fresh YOLO owns the jump decision) the plan
+      only creeps toward the rope center with a tiny random step so it never
+      races the YOLO jump.
+    - **Honey zone** (inner band < |gap| <= ``near_range``): tiny RANDOM
+      steps toward the rope - never a big walk (it would overshoot the rope)
+      and never a jump (the jump gate is not satisfied yet).
+    - **Outside the honey zone**: big walking toward the honey-zone edge
+      (full fixed holds, shortened only inside the final edge-calculation
+      zone so the character does not overshoot the band).
 
-    ``allow_climb=False`` (used while the YOLO screen gap is fresh and owns
-    the jump decision) makes the inside-band case a short creep walk toward
-    the rope instead of a jump, so the minimap plan can never race the YOLO
-    jump logic.
+    The tiny-step bounds come from ``tiny_step_min_seconds`` /
+    ``tiny_step_max_seconds`` in ``movement_options`` (defaults 0.05 / 0.15 s).
     """
 
     player = observation.player
@@ -220,10 +228,13 @@ def move_towards_rope(
         )
     near_range = max(0.0, float(near_range))
     inner_range = max(0.0, float(inner_range))
+    under_rope_tolerance = max(0.0, min(float(under_rope_tolerance), inner_range or 1.0))
     # Without an explicit inner gap the approach band is the single gate.
     band = inner_range if inner_range > 0 else near_range
-    left_inner = rope_x - band
-    right_inner = rope_x + band
+    # The honey zone (tiny-step walking band) is the wider near-range band.
+    honey = max(band, near_range)
+    left_honey = rope_x - honey
+    right_honey = rope_x + honey
     rope_gap = rope_x - player.x
     absolute_gap = abs(rope_gap)
     minimum_confidence = float(movement_options.get("minimum_confidence", 0.55))
@@ -232,6 +243,8 @@ def move_towards_rope(
             "detect", player, rope_x, rope_gap,
             MovementDecision(None, "yellow marker missing or uncertain"),
         )
+    tiny_min = max(0.01, float(movement_options.get("tiny_step_min_seconds", 0.05)))
+    tiny_max = max(tiny_min, float(movement_options.get("tiny_step_max_seconds", 0.15)))
 
     if absolute_gap <= band + 1e-9:
         if not allow_climb:
@@ -239,14 +252,15 @@ def move_towards_rope(
             # walk here, creeping toward the rope center so the character
             # enters the screen-gap jump window.  A minimap jump issued from
             # inside this band would race the YOLO jump (the two coordinate
-            # systems disagree near the rope).
+            # systems disagree near the rope).  Each creep is a tiny random
+            # step so the screen gap is re-checked every frame.
             direction = "right" if rope_gap > 1e-9 else "left"
             return RopeMovementPlan(
                 "move-to-rope-edge", player, rope_x, rope_gap,
                 MovementDecision(
                     direction,
-                    f"inside band; creep {direction} into jump range",
-                    float(movement_options.get("minimum_final_hold_seconds", 0.08)),
+                    f"inside band; tiny random step {direction} into jump range",
+                    random.uniform(tiny_min, tiny_max),
                 ),
             )
         if absolute_gap <= under_rope_tolerance + 1e-9:
@@ -267,14 +281,27 @@ def move_towards_rope(
                 float(movement_options.get("minimum_final_hold_seconds", 0.08)),
             ),
         )
-    if player.x < left_inner - 1e-9:
-        edge, direction = left_inner, "right"
+    if absolute_gap <= honey + 1e-9:
+        # Inside the honey zone but outside the jump window: tiny random
+        # steps toward the rope - never a big walk (overshoots the rope) and
+        # never a jump (the minimap/YOLO jump gate is not satisfied yet).
+        direction = "right" if rope_gap > 1e-9 else "left"
+        return RopeMovementPlan(
+            "move-to-rope-edge", player, rope_x, rope_gap,
+            MovementDecision(
+                direction,
+                f"inside honey zone; tiny random step {direction} toward rope",
+                random.uniform(tiny_min, tiny_max),
+            ),
+        )
+    if player.x < left_honey - 1e-9:
+        edge, direction = left_honey, "right"
     else:
-        edge, direction = right_inner, "left"
+        edge, direction = right_honey, "left"
 
-    # Outside the near-rope zone, keep using the full fixed movement hold.
+    # Outside the honey zone, keep using the full fixed movement hold.
     # Shorten the hold only in the final edge-calculation zone immediately
-    # before the near-zone edge. Calculating every approach from its distance
+    # before the honey-zone edge. Calculating every approach from its distance
     # made ``actual_hold`` shrink gradually across most of the platform.
     edge_gap = edge - player.x
     speed = max(0.001, float(movement_options.get("estimated_final_speed", 0.205)))
@@ -726,9 +753,13 @@ def climb(
         # Recalculate from the newest screenshot. Never blindly reverse the
         # prior jump: if the character remains left of the rope, retry Right;
         # if it is now right of the rope, retry Left.  A failed straight-up
-        # jump degrades to a Right chord (matches the old aligned default).
+        # jump retries toward the rope SIDE the character is actually on
+        # (the live minimap gap) instead of a blind "right" that shoves the
+        # character past the rope.
         if preferred_direction in ("left", "right"):
             retry_direction = preferred_direction
+        elif player is not None and rope_x is not None:
+            retry_direction = "right" if rope_x - player.x > 0 else "left"
         else:
             retry_direction = (
                 "left" if state.phase in ("check-right", "check-primary-right")
@@ -802,6 +833,12 @@ def climb(
 # included yellow monsters/items in the game world and could mistake those for
 # the player diamond.
 DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
+
+# Normalized fallback used when no CoordinateLayout exists (≈0.25 diamonds at
+# the classic 6px diamond in a ~188px analysis crop).  With a layout the value
+# is recomputed per frame from the diamond-relative setting, exactly like
+# horizontal tolerance and the rope bands.
+STAIR_JUMP_STALL_FALLBACK = 0.008
 
 
 def _image_from_frame(frame: Any) -> Image.Image:
@@ -946,7 +983,7 @@ def plan_movement(
     estimated_final_speed: float = 0.205,
     final_move_safety_gain: float = 0.95,
     jump_when_near: bool = True,
-    under_rope_tolerance: float = 0.01,
+    under_rope_tolerance: float = 0.008,
 ) -> MovementDecision:
     if observation.player is None or observation.confidence < minimum_confidence:
         return MovementDecision(None, "yellow marker missing or uncertain")
@@ -1210,6 +1247,7 @@ class MovementWorker(threading.Thread):
         near_rope_range: Optional[float] = None,
         near_rope_inner_range: Optional[float] = None,
         near_rope_diamonds: Optional[float] = None,
+        under_rope_tolerance: float = 0.008,
         climb_attack_lock: Optional[threading.Lock] = None,
         climbing_active_event: Optional[threading.Event] = None,
         dropping_active_event: Optional[threading.Event] = None,
@@ -1238,8 +1276,11 @@ class MovementWorker(threading.Thread):
         on_rope_px: float = 50.0,
         under_rope_px: float = 10.0,
         rope_approach_creep_seconds: float = 0.25,
+        rope_tiny_step_min_seconds: float = 0.05,
+        rope_tiny_step_max_seconds: float = 0.15,
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
+        other_player_check_interval_seconds: float = 60.0,
         other_player_drug_taps: int = 3,
         other_player_drug_gap_seconds: float = 1.0,
         other_player_hp_threshold: float = 0.70,
@@ -1247,6 +1288,14 @@ class MovementWorker(threading.Thread):
         other_player_switch_settle_seconds: float = 1.0,
         status_state_path: Optional[str] = None,
         drug_settings_path: Optional[str] = None,
+        stair_jump_enabled: bool = True,
+        stair_jump_stall_diamonds: float = 0.25,
+        stair_jump_stall_frames: int = 2,
+        patrol_start_grace_seconds: float = 3.0,
+        stair_jump_attempts_max: int = 3,
+        stair_jump_grace_seconds: float = 2.5,
+        stair_jump_alt_hold_seconds: float = 0.06,
+        stair_jump_lead_seconds: float = 0.15,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1304,19 +1353,27 @@ class MovementWorker(threading.Thread):
         self.near_rope_diamonds = (
             float(near_rope_diamonds) if near_rope_diamonds is not None else None
         )
+        # |minimap gap| at which the character counts as DIRECTLY under the
+        # rope: jump straight up (Alt+Up) instead of a left/right chord, so
+        # the sideways jump cannot shove the character past the rope.
+        self.under_rope_tolerance = max(
+            0.0, min(float(under_rope_tolerance), 0.05)
+        )
         self.climb_attack_lock = climb_attack_lock
         self.climbing_active_event = climbing_active_event
         self.dropping_active_event = dropping_active_event
         self.near_rope_event = near_rope_event
         self.important_positions = important_positions or {}
-        complete_layers = {
+        # A layer patrols with any non-empty subset of Left/Rope/Right; a
+        # layer with NO recorded action (or an empty profile) stands still
+        # and only attacks.
+        routable = {
             name for name, value in self.important_positions.items()
-            if isinstance(value, dict)
-            and "left_most_pos" in value and "right_most_pos" in value
+            if _layer_present_actions(value)
         }
         if route_order is not None:
             self._route_layers = [
-                name for name in route_order if name in complete_layers
+                name for name in route_order if name in routable
             ]
             # Bottom-up by numeric suffix - never by recording order (a top
             # layer recorded before a lower one must not patrol first).
@@ -1327,7 +1384,7 @@ class MovementWorker(threading.Thread):
             )
         else:
             self._route_layers = sorted(
-                complete_layers,
+                routable,
                 key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
             )
         self._route_layer_index: Optional[int] = None
@@ -1375,10 +1432,15 @@ class MovementWorker(threading.Thread):
         # from the UI when the attack mode changes.
         self._yolo_detection_active = bool(yolo_detection_active)
         # Other-player safety net: when red diamonds (other players) show on
-        # the minimap at the moment a move-to-left event finished, switch
-        # channel automatically.  Switched live from the UI.
+        # the minimap, switch channel automatically.  The scan is time-anchored
+        # (every ``other_player_check_interval_seconds``, default 60 s) instead
+        # of on every patrol cycle, so the minimap pixel check costs almost
+        # nothing.  Switched live from the UI.
         self._other_player_check_enabled = bool(other_player_check_enabled)
-        self._left_excursion_active = False
+        self.other_player_check_interval_seconds = max(
+            1.0, float(other_player_check_interval_seconds)
+        )
+        self._last_other_player_check = float("-inf")
         self._player_switch_active = False
         self.other_player_drug_taps = max(1, int(other_player_drug_taps))
         self.other_player_drug_gap_seconds = max(
@@ -1439,6 +1501,14 @@ class MovementWorker(threading.Thread):
         self.rope_approach_creep_seconds = max(
             0.05, float(rope_approach_creep_seconds)
         )
+        # Tiny random step bounds used while creeping inside the honey zone
+        # (near-rope band): short, human-like jitter instead of fixed taps.
+        self.rope_tiny_step_min_seconds = max(
+            0.01, float(rope_tiny_step_min_seconds)
+        )
+        self.rope_tiny_step_max_seconds = max(
+            self.rope_tiny_step_min_seconds, float(rope_tiny_step_max_seconds)
+        )
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._last_drop_attempt = float("-inf")
@@ -1454,13 +1524,76 @@ class MovementWorker(threading.Thread):
         # suppressed so an intermediate platform cannot hijack the descent
         # and restart patrol on a middle layer.
         self._descending_to_first = False
+        # Stair jump: during the left-most/right-most patrol walk the worker
+        # detects when the marker stops advancing while a walk hold is being
+        # issued (a stair blocks the walk) and jumps - holding the travel
+        # direction and tapping Alt - WITHOUT any recorded jump points.
+        self.stair_jump_enabled = bool(stair_jump_enabled)
+        self.stair_jump_stall_diamonds = max(0.01, float(stair_jump_stall_diamonds))
+        self.stair_jump_stall_frames = max(1, int(stair_jump_stall_frames))
+        # After Start Patrol the character stands still for a moment - that is
+        # NOT being stuck at a stair, and it should not jump onto a rope it
+        # happens to start next to.  Jumps (stair jump and rope jump_climb)
+        # are suppressed for this many seconds after the patrol (re)starts.
+        self.patrol_start_grace_seconds = max(
+            0.0, float(patrol_start_grace_seconds)
+        )
+        self._patrol_started_at: Optional[float] = None
+        self.stair_jump_attempts_max = max(1, int(stair_jump_attempts_max))
+        self.stair_jump_grace_seconds = max(0.0, float(stair_jump_grace_seconds))
+        self.stair_jump_alt_hold_seconds = max(
+            0.01, float(stair_jump_alt_hold_seconds)
+        )
+        self.stair_jump_lead_seconds = max(0.0, float(stair_jump_lead_seconds))
+        # Current-analysis-unit stall threshold (set per frame from the
+        # diamond-relative setting once a CoordinateLayout is known).
+        self._current_stair_jump_stall = STAIR_JUMP_STALL_FALLBACK
+        self._reset_stair_state()
+
+    def _reset_stair_state(self) -> None:
+        """Clear the per-approach stair-jump tracking state."""
+
+        self._stair_state = {
+            "phase_label": None,   # e.g. "layer1.right-most"; reset on change
+            "stall_frames": 0,     # consecutive no-progress frames near a stair
+            "last_x": None,        # marker X from the previous processed frame
+            "attempts": 0,         # jumps issued at the current blockage
+            "grace_until": 0.0,    # stall detection suspended until this time
+            "gave_up": False,      # attempts exhausted; stop jumping this phase
+        }
+
+    @staticmethod
+    def _is_walk_key(key: Optional[str]) -> bool:
+        """True for plain direction holds and stair-jump walk-and-hop keys."""
+
+        return key in ("left", "right") or (
+            isinstance(key, str) and key.startswith("stair_jump_")
+        )
+
+    @staticmethod
+    def _patrol_facing_for_key(key: Optional[str]) -> Optional[str]:
+        """Horizontal facing implied by a movement decision.
+
+        Returns the last direction the character was moved (for the attack
+        worker to sync its facing belief), or None for non-directional keys
+        (no-op "wait" decisions during a climb, aligned, etc.).  Must never
+        raise on a None key.
+        """
+
+        if key in ("left", "right"):
+            return key
+        if isinstance(key, str) and key.startswith("stair_jump_"):
+            return key.removeprefix("stair_jump_")
+        if key in ("jump_climb_left", "jump_climb_right"):
+            return key.removeprefix("jump_climb_")
+        return None
 
     def _update_moving_event(self, decision: MovementDecision) -> None:
         """Drive the walking-state event used to gate Z pickup."""
 
         if self.moving_active_event is None:
             return
-        if decision.key in ("left", "right"):
+        if self._is_walk_key(decision.key):
             if not self.moving_active_event.is_set():
                 LOG.debug("moving: pickup Z enabled")
             self.moving_active_event.set()
@@ -1468,6 +1601,145 @@ class MovementWorker(threading.Thread):
             if self.moving_active_event.is_set():
                 LOG.debug("not moving: pickup Z paused")
             self.moving_active_event.clear()
+
+    def _stair_jump_decision(
+        self,
+        observation: MinimapObservation,
+        route_label: str,
+        position_plan: Optional[PositionMovementPlan],
+        now: float,
+    ) -> Optional[MovementDecision]:
+        """Return a stair-jump decision when walking is blocked by a stair.
+
+        Runs only in the move-to-left-most / move-to-right-most phases.  When
+        the marker stalls (X not advancing while a walk hold is being issued)
+        for ``stair_jump_stall_frames`` consecutive frames, a stair blocks the
+        walk: return ``stair_jump_<direction>`` so the sender holds the travel
+        direction and taps Alt (jump) mid-hold to clear it.  No jump points
+        need to be recorded - any impassable stair is jumped automatically.
+        Jumps are rate-limited by a grace window and capped so a truly
+        impassable wall cannot make the character hop in place forever.
+        """
+
+        if (not self.stair_jump_enabled or observation.player is None
+                or observation.confidence < self.minimum_confidence
+                or position_plan is None
+                or position_plan.reached_or_crossed
+                or position_plan.decision.key not in ("left", "right")):
+            return None
+        # Patrol-start grace: the character standing still right after Start
+        # Patrol is not stuck at a stair - no jump until it has moved.
+        started = self._patrol_started_at
+        if (started is not None
+                and now < started + self.patrol_start_grace_seconds):
+            return None
+        if route_label.endswith(".left-most"):
+            direction = "left"
+        elif route_label.endswith(".right-most"):
+            direction = "right"
+        else:
+            return None
+        state = self._stair_state
+        if state["phase_label"] != route_label:
+            self._reset_stair_state()
+            state = self._stair_state
+            state["phase_label"] = route_label
+        px = observation.player.x
+        last_x = state["last_x"]
+        moved = last_x is not None and abs(px - last_x) >= self._current_stair_jump_stall
+        state["last_x"] = px
+        if moved:
+            # Still walking: keep going, no jump.  A marker that moved again
+            # after a blockage clears the jump budget for the next stair.
+            state["stall_frames"] = 0
+            state["attempts"] = 0
+            state["gave_up"] = False
+            return None
+        if now < state["grace_until"] or state["gave_up"]:
+            return None
+        state["stall_frames"] += 1
+        if state["stall_frames"] < self.stair_jump_stall_frames:
+            return None
+        if state["attempts"] >= self.stair_jump_attempts_max:
+            if not state["gave_up"]:
+                LOG.warning(
+                    "STAIR JUMP gave up at x=%.6f (%s): %d attempts without "
+                    "progress; the stair may be impassable",
+                    px, route_label, state["attempts"],
+                )
+                state["gave_up"] = True
+            return None
+        state["attempts"] += 1
+        state["stall_frames"] = 0
+        state["grace_until"] = now + self.stair_jump_grace_seconds
+        LOG.info(
+            "STAIR JUMP %s at x=%.6f attempt=%d/%d",
+            direction, px, state["attempts"], self.stair_jump_attempts_max,
+        )
+        return MovementDecision(
+            f"stair_jump_{direction}",
+            f"stuck at stair x={px:.6f}; jump while walking",
+            self.movement_hold_seconds,
+        )
+
+    def _send_stair_jump(self, decision: MovementDecision) -> bool:
+        """Hold the travel direction and tap Alt (jump) mid-hold.
+
+        A short direction-only lead gives the character forward momentum
+        before the Alt tap - a standing jump does not carry over the stair.
+        Mirrors ``_send_walk_hold``: the direction key is released early
+        (within ~20ms) when the YOLO attack takes over, so a mob can
+        interrupt the jump approach like any other walk.
+        """
+
+        direction = decision.key.removeprefix("stair_jump_")
+        if direction not in ("left", "right"):
+            return False
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning("movement suppressed: target window is not safely selected")
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_down is None or key_up is None:
+            LOG.warning("stair jump requires key_down() and key_up(); suppressed")
+            return False
+        claimed = key_down(direction) is not False
+        if not claimed:
+            return False
+        deadline = time.monotonic() + max(0.01, float(decision.duration))
+        alt_down = False
+        try:
+            lead = min(
+                max(0.0, self.stair_jump_lead_seconds),
+                max(0.01, float(decision.duration) * 0.5),
+            )
+            if lead > 0:
+                time.sleep(lead)
+            if key_down("alt") is not False:
+                alt_down = True
+                time.sleep(max(0.01, self.stair_jump_alt_hold_seconds))
+            while time.monotonic() < deadline:
+                if self.stop_event.is_set():
+                    break
+                if self._attack_state is not None:
+                    attack_now = self._attack_state.is_active()
+                    if attack_now:
+                        if self._attack_active_since is None:
+                            self._attack_active_since = time.monotonic()
+                        if (time.monotonic() - self._attack_active_since
+                                <= self.attack_block_max_seconds):
+                            LOG.info(
+                                "stair jump walk released early: attack took over"
+                            )
+                            break
+                    else:
+                        self._attack_active_since = None
+                time.sleep(0.02)
+            return True
+        finally:
+            if alt_down:
+                key_up("alt")
+            key_up(direction)
 
     def _attack_should_defer_to_climb(self) -> bool:
         """True when an active attack must wait for the rope climb to finish.
@@ -1514,27 +1786,24 @@ class MovementWorker(threading.Thread):
         LOG.info("other-player channel switch: %s",
                  "on" if enabled else "off")
 
-    def _handle_left_excursion_end(
-        self, frame: Any, minimap_region: Any, route_label: str
+    def _maybe_check_other_players(
+        self, now: float, frame: Any, minimap_region: Any
     ) -> None:
-        """Scan ONCE for other players when a move-to-left just finished.
+        """Time-anchored other-player scan for the automatic channel switch.
 
-        The red-diamond scan only runs at the moment the move-to-left
-        excursion ends (the route advances from ``.left-most`` to
-        ``.right-most``) - one scan per cycle, never continuously, so the
-        minimap pixel check costs nothing the rest of the time.  When red
-        diamonds (other players) show up, the channel switch is triggered.
+        The red-diamond scan is gated by ``other_player_check_interval_seconds``
+        (default 60 s) instead of running on every patrol cycle, so the minimap
+        pixel check is amortized to roughly once a minute - a deliberate
+        efficiency trade-off.  When red diamonds (other players) show up the
+        channel switch is triggered.
         """
 
-        is_left_most = str(route_label).endswith(".left-most")
-        if is_left_most:
-            self._left_excursion_active = True
+        if not self._other_player_check_enabled:
             return
-        if not self._left_excursion_active:
+        if now - self._last_other_player_check < self.other_player_check_interval_seconds:
             return
-        self._left_excursion_active = False
-        if (not self._other_player_check_enabled
-                or not str(route_label).endswith(".right-most")):
+        self._last_other_player_check = now
+        if self._player_switch_active:
             return
         count = self._other_players_on_minimap(frame, minimap_region)
         if count > 0:
@@ -1666,7 +1935,6 @@ class MovementWorker(threading.Thread):
                 or self.first_layer not in self._route_layers):
             return
         self._reset_route_loop()
-        self._left_excursion_active = False
         layer = self.important_positions.get(self.first_layer, {})
         anchor_world_y = (
             layer.get("layer_world_y") if isinstance(layer, dict) else None
@@ -2054,32 +2322,50 @@ class MovementWorker(threading.Thread):
         return detected_name
 
     def _route_target(self, observation: MinimapObservation) -> tuple[Optional[float], bool, str]:
-        """Return target X, whether near-target means climb, and route label."""
+        """Return target X, whether near-target means climb, and route label.
+
+        Left/Rope/Right are independent actions: the layer patrols exactly
+        the recorded subset (in left -> right -> rope order).  With nothing
+        recorded the worker stands still (``stand-still``) and only attacks.
+        """
 
         if not self.patrol_enabled:
             return None, False, "patrol-paused"
-        if observation.player is None or not self._route_layers:
-            return self.fixed_target_x, True, "rope"
+        if not self._route_layers:
+            # Nothing recorded on any layer: stand still (Fixed Attack / YOLO
+            # keep attacking) instead of the old fall-back-to-rope walk.
+            return None, False, "stand-still"
+        if observation.player is None:
+            return None, False, "waiting-marker"
         self._select_route_layer(observation)
         if self._route_layer_index is None or self._route_layer_index >= len(self._route_layers):
             return None, False, "route-complete"
         name = self._route_layers[self._route_layer_index]
         layer = self.important_positions[name]
+        phases = self._layer_phases(name)
+        if not phases:
+            return None, False, f"{name}.stand-still"
+        # Reconcile the current phase with what this layer actually recorded
+        # (a UI edit may have removed the phase's point, or the route reset).
+        if self._route_phase not in phases and self._route_phase != "drop":
+            LOG.info("route phase %r not recorded on %s; starting at %s",
+                     self._route_phase, name, phases[0])
+            self._route_phase = phases[0]
         if self._route_phase == "left":
             return float(layer["left_most_pos"]["x"]), False, f"{name}.left-most"
         if self._route_phase == "right":
             return float(layer["right_most_pos"]["x"]), False, f"{name}.right-most"
-        is_final = self._route_layer_index == len(self._route_layers) - 1
-        if is_final and (
-            self.final_layer_action == "repeat_patrol"
-            or (self.final_layer_action == "drop_to_first_layer"
-                and len(self._route_layers) == 1)
-        ):
-            # Recover safely if a previous run/profile left this state at rope.
-            self._route_phase = "left"
-            return float(layer["left_most_pos"]["x"]), False, f"{name}.left-most"
-        if is_final and self.final_layer_action == "drop_to_first_layer":
+        if self._route_phase == "drop":
             return None, False, f"{name}.drop-to-first"
+        is_final = self._route_layer_index == len(self._route_layers) - 1
+        if is_final:
+            # The final layer has no rope to climb: loop its own actions, or
+            # drop to the first layer when that is the configured end action.
+            if (self.final_layer_action == "drop_to_first_layer"
+                    and len(self._route_layers) > 1):
+                return None, False, f"{name}.drop-to-first"
+            self._route_phase = phases[0]
+            return self._route_target(observation)
         if not self.climbing_enabled:
             return None, False, "route-complete"
         rope = layer.get("rope_pos", {})
@@ -2096,17 +2382,24 @@ class MovementWorker(threading.Thread):
         if (self._route_layer_index is not None
                 and 0 <= self._route_layer_index < len(self._route_layers)):
             previous_name = self._route_layers[self._route_layer_index]
-        final_name = snapshot.route_order[-1] if snapshot.route_order else None
-        new_route = []
-        for name in snapshot.route_order:
-            layer = snapshot.layers.get(name)
-            if not isinstance(layer, dict):
-                continue
-            required = ("left_most_pos", "right_most_pos")
-            if name != final_name:
-                required += ("rope_pos",)
-            if all(point in layer for point in required):
-                new_route.append(name)
+        # The route is every action-bearing layer (any subset of Left/Rope/
+        # Right), in recorded bottom-up order plus any newly recorded layers.
+        routable = {
+            name for name, layer in snapshot.layers.items()
+            if _layer_present_actions(layer)
+        }
+        new_route = [name for name in snapshot.route_order if name in routable]
+        extras = sorted(
+            routable - set(new_route),
+            key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
+        )
+        new_route.extend(extras)
+        # The route must stay bottom-up by numeric suffix (never recording or
+        # route_order order): a lower layer recorded later would otherwise
+        # become the "final" layer, hide its rope, and strand the character.
+        new_route.sort(
+            key=lambda name: int("".join(filter(str.isdigit, name)) or 0)
+        )
         route_changed = new_route != self._route_layers
         self.patrol_enabled = snapshot.enabled
         self.climbing_enabled = snapshot.climbing_enabled
@@ -2122,41 +2415,73 @@ class MovementWorker(threading.Thread):
             LOG.info("patrol route updated from UI: %s",
                      " -> ".join(new_route) if new_route else "none")
 
+    def _layer_phases(self, name: str) -> list[str]:
+        """Ordered action phases for a layer from its recorded points.
+
+        Left -> Right -> Rope, but only the actions actually recorded.  The
+        final layer's rope is omitted (the snapshot already drops it), so a
+        rope-only layer climbs straight to its rope and a layer with only
+        Left/Right patrols just those.
+        """
+
+        layer = self.important_positions.get(name, {})
+        phases: list[str] = []
+        if not isinstance(layer, dict):
+            return phases
+        if isinstance(layer.get("left_most_pos"), dict):
+            phases.append("left")
+        if isinstance(layer.get("right_most_pos"), dict):
+            phases.append("right")
+        is_final = (
+            self._route_layer_index is not None
+            and self._route_layer_index == len(self._route_layers) - 1
+        )
+        if isinstance(layer.get("rope_pos"), dict) and self.climbing_enabled and not is_final:
+            phases.append("rope")
+        return phases
+
     def _advance_route_endpoint(self, observation: MinimapObservation, target_x: Optional[float]) -> bool:
         if observation.player is None or target_x is None:
             return False
+        if self._route_layer_index is None or self._route_layer_index >= len(self._route_layers):
+            return False
+        name = self._route_layers[self._route_layer_index]
+        is_final = self._route_layer_index == len(self._route_layers) - 1
         if self._route_phase == "left":
             # Passing the line counts. We intentionally do not turn this into
             # an exact-position problem at the minimap's coarse resolution.
             if observation.player.x > target_x + self._current_horizontal_tolerance:
                 return False
-            self._route_phase = "right"
-            LOG.info("route endpoint reached/crossed: left-most; next right-most")
-            return True
-        if self._route_phase == "right":
+        elif self._route_phase == "right":
             if observation.player.x < target_x - self._current_horizontal_tolerance:
                 return False
-            is_final = (
-                self._route_layer_index is not None
-                and self._route_layer_index == len(self._route_layers) - 1
-            )
-            if is_final and (
-                self.final_layer_action == "repeat_patrol"
-                or (self.final_layer_action == "drop_to_first_layer"
-                    and len(self._route_layers) == 1)
-            ):
-                self._route_phase = "left"
-                LOG.info(
-                    "route endpoint reached/crossed: right-most; "
-                    "single-layer patrol repeats at left-most"
-                )
-            elif self.climbing_enabled:
-                self._route_phase = "rope"
-                LOG.info("route endpoint reached/crossed: right-most; next rope")
-            else:
-                LOG.info("route endpoint reached/crossed: right-most; climbing disabled")
+        else:
+            # Rope phase advances through the climb machinery, not here.
+            return False
+        phases = self._layer_phases(name)
+        current = self._route_phase
+        if current in phases:
+            index = phases.index(current)
+            if index + 1 < len(phases):
+                self._route_phase = phases[index + 1]
+                LOG.info("route endpoint reached/crossed: %s; next %s",
+                         current, phases[index + 1])
+                return True
+        # End of this layer's recorded actions.
+        if (is_final and self.final_layer_action == "drop_to_first_layer"
+                and len(self._route_layers) > 1):
+            self._route_phase = "drop"
+            LOG.info("final layer patrol done; dropping to first layer")
             return True
-        return False
+        if phases:
+            # Repeat the layer's own actions: stand at a lone point, patrol a
+            # floor back-and-forth, or hold position before climbing.
+            self._route_phase = phases[0]
+            LOG.info("route endpoint reached/crossed: %s; repeating %s",
+                     current, phases[0])
+            return True
+        self._route_phase = "stand"
+        return True
 
     def _on_first_layer(self, observation: MinimapObservation) -> bool:
         """True when the marker has reached the first (bottom) layer.
@@ -2316,7 +2641,11 @@ class MovementWorker(threading.Thread):
                         self.moving_active_event.clear()
                     if self._patrol_state is not None:
                         self._patrol_state.write(False)
+                    # Each (re)start of patrol gets a fresh jump-grace window.
+                    self._patrol_started_at = None
                     continue
+                if self._patrol_started_at is None:
+                    self._patrol_started_at = time.monotonic()
                 # Attack priority: while the YOLO attack worker reports an
                 # active target, hold patrol movement so the character stands
                 # and fights - but only for a BOUNDED window.  Past
@@ -2437,6 +2766,7 @@ class MovementWorker(threading.Thread):
                 self._current_final_calculation_distance = (
                     self.final_calculation_distance
                 )
+                self._current_stair_jump_stall = STAIR_JUMP_STALL_FALLBACK
                 if coordinate_layout is not None:
                     if self.horizontal_tolerance_diamonds is not None:
                         self._current_horizontal_tolerance = (
@@ -2450,6 +2780,11 @@ class MovementWorker(threading.Thread):
                             * coordinate_layout.diamond_width
                             / coordinate_layout.analysis_width
                         )
+                    self._current_stair_jump_stall = (
+                        self.stair_jump_stall_diamonds
+                        * coordinate_layout.diamond_width
+                        / coordinate_layout.analysis_width
+                    )
                 self._sync_patrol_controller(coordinate_layout)
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
@@ -2490,6 +2825,13 @@ class MovementWorker(threading.Thread):
                         if self.near_rope_range is not None
                         else self.estimated_final_speed * self.near_rope_seconds
                     )
+                # The honey zone (tiny random step band) is the wider
+                # near-range band; the inner band is the jump gate.
+                rope_near_distance = (
+                    self.near_rope_range
+                    if self.near_rope_range is not None
+                    else rope_inner_distance
+                )
                 inside_rope_zone = bool(
                     observation.player is not None
                     and route_is_rope
@@ -2505,6 +2847,10 @@ class MovementWorker(threading.Thread):
                     # Leaving the rope phase (next layer / new loop) starts a
                     # fresh FIRST approach: full continuous walk again.
                     self._rope_attempted = False
+                # Every branch below may leave the target unset (stand-still,
+                # waiting-marker, route-complete); initialize it so the log
+                # line cannot hit an UnboundLocalError.
+                active_target_x: Optional[float] = None
                 if route_label == "patrol-paused":
                     if self.dropping_active_event is not None:
                         self.dropping_active_event.clear()
@@ -2512,6 +2858,17 @@ class MovementWorker(threading.Thread):
                     active_target_x = None
                 elif route_label == "route-complete":
                     decision = MovementDecision(None, "waiting for next layer calibration")
+                elif route_label == "stand-still" or route_label.endswith(".stand-still"):
+                    # No recorded action on the current layer (or nothing
+                    # recorded at all): hold position; the attack worker
+                    # (Fixed Attack / YOLO) keeps attacking.
+                    decision = MovementDecision(
+                        None, "no recorded patrol action; standing still"
+                    )
+                elif route_label == "waiting-marker":
+                    decision = MovementDecision(
+                        None, "waiting for the yellow marker"
+                    )
                 elif route_label.endswith(".drop-to-first"):
                     decision = MovementDecision(
                         "drop",
@@ -2545,8 +2902,9 @@ class MovementWorker(threading.Thread):
                             rope_plan = move_towards_rope(
                                 observation,
                                 route_target_x,
-                                rope_inner_distance,
+                                rope_near_distance,
                                 inner_range=rope_inner_distance,
+                                under_rope_tolerance=self.under_rope_tolerance,
                                 allow_climb=True,
                                 horizontal_tolerance=self._current_horizontal_tolerance,
                                 minimum_confidence=self.minimum_confidence,
@@ -2557,8 +2915,21 @@ class MovementWorker(threading.Thread):
                                 final_calculation_distance=self._current_final_calculation_distance,
                                 estimated_final_speed=self.estimated_final_speed,
                                 final_move_safety_gain=self.final_move_safety_gain,
+                                tiny_step_min_seconds=self.rope_tiny_step_min_seconds,
+                                tiny_step_max_seconds=self.rope_tiny_step_max_seconds,
                             )
                             decision = rope_plan.decision
+                        # Patrol-start grace: do not jump onto the rope the
+                        # character happens to start next to - let it settle
+                        # first, then resume the normal jump logic.
+                        started = self._patrol_started_at
+                        if (started is not None and decision.key
+                                and decision.key.startswith("jump_climb_")
+                                and time.monotonic()
+                                < started + self.patrol_start_grace_seconds):
+                            decision = MovementDecision(
+                                None, "patrol start grace; no jump yet"
+                            )
                         # A jump attempt has been made in this rope phase:
                         # any later re-approach is a RETRY (small steps).
                         self._rope_attempted = True
@@ -2578,8 +2949,9 @@ class MovementWorker(threading.Thread):
                         rope_plan = move_towards_rope(
                             observation,
                             route_target_x,
-                            rope_inner_distance,
+                            rope_near_distance,
                             inner_range=rope_inner_distance,
+                            under_rope_tolerance=self.under_rope_tolerance,
                             allow_climb=not rope_state_fresh,
                             horizontal_tolerance=self._current_horizontal_tolerance,
                             minimum_confidence=self.minimum_confidence,
@@ -2590,6 +2962,8 @@ class MovementWorker(threading.Thread):
                             final_calculation_distance=self._current_final_calculation_distance,
                             estimated_final_speed=self.estimated_final_speed,
                             final_move_safety_gain=self.final_move_safety_gain,
+                            tiny_step_min_seconds=self.rope_tiny_step_min_seconds,
+                            tiny_step_max_seconds=self.rope_tiny_step_max_seconds,
                         )
                         decision = rope_plan.decision
                         active_target_x = rope_plan.target_x
@@ -2636,11 +3010,20 @@ class MovementWorker(threading.Thread):
                             minimum_confidence=self.minimum_confidence,
                         )
                     decision = position_plan.decision
+                    # Stairs that block the walk: when the marker stalls at a
+                    # recorded jump-trigger X, replace the plain walk hold with
+                    # a walk-and-jump (direction held, Alt tapped mid-hold).
+                    stair_decision = self._stair_jump_decision(
+                        observation, route_label, position_plan, time.monotonic()
+                    )
+                    if stair_decision is not None:
+                        decision = stair_decision
                     active_target_x = route_target_x
-                # Other-player safety net: one scan when a move-to-left
-                # excursion finishes, then switch channel on sighting.
-                self._handle_left_excursion_end(
-                    frame, minimap_region, route_label
+                # Other-player safety net: a time-anchored scan (default every
+                # 60 s) switches channel when other players appear, without a
+                # per-frame minimap pixel cost.
+                self._maybe_check_other_players(
+                    time.monotonic(), frame, minimap_region
                 )
                 decision = preserve_persistent_climb(self._climb_state, decision)
                 if route_label in ("route-complete", "patrol-paused"):
@@ -2686,13 +3069,12 @@ class MovementWorker(threading.Thread):
                     )
                     # Track the last horizontal direction the character was
                     # moved, so the attack worker can sync its facing belief
-                    # (patrol walk taps also turn the character).
-                    if decision.key in ("left", "right"):
-                        self._patrol_facing = decision.key
-                    elif decision.key in ("jump_climb_left", "jump_climb_right"):
-                        self._patrol_facing = decision.key.removeprefix(
-                            "jump_climb_"
-                        )
+                    # (patrol walk taps also turn the character).  None-safe:
+                    # no-op "wait" decisions during a climb must not crash the
+                    # whole movement frame.
+                    facing = self._patrol_facing_for_key(decision.key)
+                    if facing is not None:
+                        self._patrol_facing = facing
                     self._patrol_state.write(
                         patrol_busy, decision.key, self._patrol_facing
                     )
@@ -2725,7 +3107,7 @@ class MovementWorker(threading.Thread):
                             f"saved rope X confirmation {self._aligned_frames}/"
                             f"{self.aligned_frames_required}",
                         )
-                elif decision.key in ("left", "right"):
+                elif self._is_walk_key(decision.key):
                     self._aligned_frames = 0
                     self._release_climb_up()
                     self._climb_state = ClimbState()
@@ -2818,6 +3200,10 @@ class MovementWorker(threading.Thread):
                         self._run_climb_step(
                             observation, route_target_x, preferred_direction
                         )
+                    elif decision.key.startswith("stair_jump_"):
+                        # Stuck at a recorded stair trigger: hold the travel
+                        # direction and tap Alt (jump) mid-hold to clear it.
+                        self._send_stair_jump(decision)
                     elif decision.key in ("left", "right"):
                         # Cancellable walk hold: the movement key is released
                         # within ~20ms when the attack selects a target, so
@@ -2854,6 +3240,7 @@ class MovementWorker(threading.Thread):
 
 __all__ = [
     "DEFAULT_MINIMAP_REGION",
+    "STAIR_JUMP_STALL_FALLBACK",
     "MinimapObservation",
     "MovementDecision",
     "MovementWorker",

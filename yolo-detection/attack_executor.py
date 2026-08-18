@@ -176,8 +176,13 @@ class AttackExecutor:
         patrol_state_path: Optional[str] = None,
         log_path: Optional[str] = None,
         dry_run: bool = False,
+        alt_transition: bool = True,
     ) -> None:
         self.window_title = window_title
+        # The Alt foreground-activation fallback presses the Alt key, which is
+        # the JUMP key in MapleStory - disable it so refocusing never makes
+        # the character jump.
+        self.alt_transition = bool(alt_transition)
         self.attack_key = attack_key.casefold()
         if self.attack_key not in _SCAN:
             # Never let a bad attack key kill the whole detection window:
@@ -294,16 +299,18 @@ class AttackExecutor:
 
             # 2) Alt transition: briefly press/release Alt, which lets
             #    Windows accept a foreground request after its lock timeout.
-            _send_scan_code(0x38, key_up=False, extended=False)
-            _send_scan_code(0x38, key_up=True, extended=False)
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                LOG.debug("Alt-assisted foreground selection refused",
-                          exc_info=True)
-            time.sleep(0.05)
-            if win32gui.GetForegroundWindow() == hwnd:
-                return True
+            #    Skipped when disabled - Alt is the game's JUMP key.
+            if self.alt_transition:
+                _send_scan_code(0x38, key_up=False, extended=False)
+                _send_scan_code(0x38, key_up=True, extended=False)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    LOG.debug("Alt-assisted foreground selection refused",
+                              exc_info=True)
+                time.sleep(0.05)
+                if win32gui.GetForegroundWindow() == hwnd:
+                    return True
 
             # 3) Thread-input attachment: final best-effort fallback.
             foreground = win32gui.GetForegroundWindow()

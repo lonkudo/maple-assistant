@@ -20,13 +20,22 @@ and wait until the displayed yellow-diamond position updates, then record
 `Left-most`, `Rope`, and `Right-most`. Recorded buttons lock automatically and
 turn grey; click the same embedded button once to unlock it, then click it again
 to record the new position. Each point is saved to six decimal places in the
-shared `recording-configuration.json`. After all three are present, `Add Layer Above`
+shared `recording-configuration.json`. `Add Layer Above`
 creates/selects the next layer and pauses patrol while it is calibrated. A new
-layer must have a smaller minimap Y than the layer below and becomes active only
-after all three of its points are recorded. `Start Patrol` then runs each layer's
-left/right route, uses that layer's own rope to climb, and changes to `Stop
-Patrol` while active. These controls never send keys from the UI thread—the
-movement worker remains the only movement executor.
+layer must have a smaller minimap Y than the layer below.
+
+**Left, Rope, and Right are independent actions.** A layer patrols exactly the
+points you record, in left → right → rope order: a layer with only `Rope`
+goes straight to its rope and climbs; a layer with only `Left` stands at the
+left-most point; a layer with `Left`+`Right` patrols that floor back and forth
+(no climb); and a layer (or whole map) with nothing recorded stands still and
+only attacks (useful with Fixed Attack or YOLO farming). The final layer's rope
+is omitted (there is nothing above it to climb to). `Start Patrol` then runs each
+layer's recorded actions, uses that layer's own rope to climb, and changes to `Stop
+Patrol` while active. `Start Patrol` is enabled as soon as every layer has at least
+one recorded point (or nothing is recorded at all, for stand-still + attack) - it
+does not require re-recording or an unlock step. These controls never send keys from
+the UI thread—the movement worker remains the only movement executor.
 
 UI-recorded points use adaptive minimap coordinates. OpenCV detects the inner
 map canvas, and the marker detector measures the full anti-aliased yellow
@@ -37,6 +46,27 @@ real zoom change immediately. Horizontal tolerance, near-rope range, final
 movement zone, and layer-Y tolerance scale with the current diamond size.
 Layers shown as `legacy layout` should be re-recorded once in the UI to gain
 adaptive width/zoom mapping; `adaptive` layers already include this metadata.
+Legacy layers still start patrol (their recorded ratios are used as-is), just
+without zoom adaptation.
+
+When enabled, the other-player safety net scans the minimap for red diamonds
+(other players) and auto-switches channel on sighting. The scan is time-anchored
+(every `other_player_check_interval_seconds`, default 60 s) instead of on every
+patrol cycle, so it costs almost no extra CPU/GPU.
+
+**Stair jumps (automatic).** Stairs that block the left/right patrol walk (the
+character bumps into them and the minimap X stops advancing) are jumped
+automatically — no jump points need to be recorded. During the
+move-to-left-most/right-most phases, when the marker stalls for
+`stair_jump_stall_frames` (default 2) no-progress frames while a walk hold is
+being issued, the worker jumps: it holds the travel direction and taps Alt
+mid-hold to carry over the stair. Jumps are grace-limited
+(`stair_jump_grace_seconds`, default 2.5 s) and capped
+(`stair_jump_attempts_max`, default 3), after which the bot logs
+`STAIR JUMP gave up ...` and keeps walking so a truly impassable wall cannot
+make the character hop in place forever. Tuning knobs
+(`stair_jump_stall_diamonds`, `stair_jump_alt_hold_seconds`,
+`stair_jump_lead_seconds`) live in `rope_calibration.json`.
 
 The assistant starts in **live mode** and presses keys using Python `SendInput`.
 
@@ -60,9 +90,12 @@ The live assistant intentionally refuses to send keys unless the configured
 game window is currently in the foreground. Losing focus pauses movement,
 attacks, potion analysis, and releases held keys without closing the debug UI;
 manually selecting the game again resumes automation. The assistant never
-steals focus to resume itself. Potion readings also require a
-confidence of at least 0.55 and two consecutive low frames, preventing an
-uncertain color match from consuming an item.
+steals focus to resume itself. Potions are the highest-priority action: they
+need two consecutive low frames, and a low-confidence read only suppresses a
+potion when NO bar is below its threshold (a near-empty bar reads as a tiny
+fill run with low confidence - exactly when the potion is needed). A blocked
+potion tap is retried (`potion_retry_attempts`, default 3) before the next low
+frame tries again.
 
 All live gameplay actions are generated inside Python through Win32 `SendInput`
 scan-code keyboard events. The assistant does not use Computer Use, mouse
@@ -80,8 +113,16 @@ final Left/Right correction and Alt+Up cannot be interrupted. HP/MP monitoring
 and potion use remain active.
 Movement uses fixed 2-second holds whenever the rope distance is greater than
 0.04 normalized minimap units. Only at distance 0.04 or less is the final hold
-calculated. Alignment uses a narrow 0.010 normalized-X tolerance—about two
-pixels in the calibrated minimap crop—confirmed twice before Alt + Up.
+calculated. Rope approach has three gap zones (configured in
+`recording-configuration.json` under `rope`): right on the rope
+(|gap| ≤ `under_rope_tolerance`, 0.008) jumps straight up; the inner band
+(|gap| ≤ `inner_range`, 0.018) jumps left/right toward the rope side; and the
+honey zone (`inner_range` < |gap| ≤ `near_range`, 0.025) creeps with **tiny
+random steps** (between `rope_tiny_step_min_seconds` /
+`rope_tiny_step_max_seconds`, defaults 0.05 / 0.15 s) to adjust position —
+outside the honey zone it uses the big walking holds. Alignment uses a narrow
+0.010 normalized-X tolerance—about two pixels in the calibrated minimap
+crop—confirmed twice before Alt + Up.
 Left and Right use adaptive holds based only on minimap X distance: 2 seconds
 when far away, 0.7 seconds at medium range, and 0.18-second corrections near
 the rope. Each hold emits a matching key-up before the next position decision.

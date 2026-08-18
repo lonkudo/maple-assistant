@@ -20,6 +20,26 @@ PATROL_EDGE_POINTS: tuple[PointKind, ...] = (
     "left_most_pos", "right_most_pos"
 )
 
+# Every point that constitutes an independent patrol action.  A layer patrols
+# with any non-empty subset of these - record only the points you want (e.g. a
+# rope-only layer climbs straight to its rope; an empty layer stands still and
+# only attacks).  Kept as a tuple of PointKind for type compatibility.
+ACTION_POINTS: tuple[PointKind, ...] = (
+    "left_most_pos", "right_most_pos", "rope_pos"
+)
+
+
+def _layer_present_actions(layer: Any) -> list[str]:
+    """Return the names of a layer's recorded action points (x/y present)."""
+
+    if not isinstance(layer, dict):
+        return []
+    return [
+        name for name in ACTION_POINTS
+        if isinstance(layer.get(name), dict)
+        and "x" in layer[name] and "y" in layer[name]
+    ]
+
 
 @dataclass(frozen=True)
 class RecordedEndpoint:
@@ -142,21 +162,15 @@ class PatrolController:
     def can_start(self) -> bool:
         with self._lock:
             route = self._profile.get("route_order", [])
-            layers = self._profile.get("layers", {})
-            layer_names = list(layers)
-            final_layer = self._final_layer_name_locked()
-            if not route or not layer_names or final_layer is None:
-                return False
-            if any(name not in route for name in layer_names):
-                return False
-            return all(
-                self._layer_has_points_locked(
-                    name,
-                    PATROL_EDGE_POINTS if name == final_layer else REQUIRED_LAYER_POINTS,
-                    adaptive=True,
-                )
-                for name in route
-            )
+            if not route:
+                # Nothing recorded is still startable: the worker stands still
+                # and only attacks (e.g. Fixed Attack / YOLO farming).
+                return True
+            # Start as soon as every routed layer has at least one recorded
+            # action point.  Adaptive coordinate_v2 is NOT required to start -
+            # the UI labels a layer "legacy layout" when it should be
+            # re-recorded, but patrol is enabled regardless.
+            return all(self.layer_is_complete(name) for name in route)
 
     def selected_layer(self) -> str:
         with self._lock:
@@ -229,29 +243,31 @@ class PatrolController:
     def snapshot_layers(self) -> dict[str, Any]:
         return self.snapshot().layers
 
+    def _adaptive_ready_locked(self, name: str) -> bool:
+        """True when every recorded action point on *name* is adaptive.
+
+        A layer is usable with any subset of Left/Rope/Right; legacy ratio-only
+        points (no coordinate_v2) are not adaptive and must be re-recorded.
+        """
+
+        layer = self._profile.get("layers", {}).get(name, {})
+        present = _layer_present_actions(layer)
+        if not present:
+            return False
+        return all(
+            isinstance(layer[point].get("coordinate_v2"), dict)
+            for point in present
+        )
+
     def layer_is_adaptive(self, layer_name: Optional[str] = None) -> bool:
         with self._lock:
-            name = layer_name or self._selected_layer
-            points = (
-                PATROL_EDGE_POINTS
-                if name == self._final_layer_name_locked()
-                else REQUIRED_LAYER_POINTS
-            )
-            return self._layer_has_points_locked(
-                name, points, adaptive=True
-            )
+            return self._adaptive_ready_locked(layer_name or self._selected_layer)
 
     def layer_is_patrol_ready(self, layer_name: Optional[str] = None) -> bool:
-        """Return whether a layer has adaptive points required for its route role."""
+        """Return whether the layer's recorded action points are all adaptive."""
 
         with self._lock:
-            name = layer_name or self._selected_layer
-            points = (
-                PATROL_EDGE_POINTS
-                if name == self._final_layer_name_locked()
-                else REQUIRED_LAYER_POINTS
-            )
-            return self._layer_has_points_locked(name, points, adaptive=True)
+            return self._adaptive_ready_locked(layer_name or self._selected_layer)
 
     def endpoint(self, layer: str, boundary: PointKind) -> Optional[RecordedEndpoint]:
         with self._lock:
@@ -294,14 +310,12 @@ class PatrolController:
             return min(candidates)[1] if candidates else None
 
     def layer_is_complete(self, layer_name: Optional[str] = None) -> bool:
+        """True when the layer has at least one recorded action point."""
+
         with self._lock:
             name = layer_name or self._selected_layer
-            points = (
-                PATROL_EDGE_POINTS
-                if name == self._final_layer_name_locked()
-                else REQUIRED_LAYER_POINTS
-            )
-            return self._layer_has_points_locked(name, points)
+            layer = self._profile.get("layers", {}).get(name, {})
+            return bool(_layer_present_actions(layer))
 
     def final_layer_name(self) -> Optional[str]:
         with self._lock:
@@ -424,9 +438,13 @@ class PatrolController:
                 and "y" in layer[name]
             ]
             if manual_y_values:
-                layer["layer_y"] = round(float(sorted(manual_y_values)[
-                    len(manual_y_values) // 2
-                ]), 6)
+                # Layer Y is the AVERAGE of the recorded points (Left/Rope/
+                # Right that exist).  A median of two points degenerates to
+                # the larger one, biasing the layer band toward one edge of
+                # the platform and making climb arrival detection miss.
+                layer["layer_y"] = round(
+                    float(sum(manual_y_values)) / len(manual_y_values), 6
+                )
                 layer["layer_y_source"] = "manual-ui"
             manual_world_values = [
                 float(layer[name]["world_y"])
@@ -436,24 +454,28 @@ class PatrolController:
                 and "world_y" in layer[name]
             ]
             if manual_world_values:
-                layer["layer_world_y"] = round(float(sorted(manual_world_values)[
-                    len(manual_world_values) // 2
-                ]), 6)
+                layer["layer_world_y"] = round(
+                    float(sum(manual_world_values)) / len(manual_world_values), 6
+                )
                 layer["world_y_tolerance"] = round(float(
                     layer.get("world_y_tolerance", 0.75)
                 ), 6)
-            patrol_edges_ready = self._layer_has_points_locked(
+            # The route includes a layer as soon as it has any action point -
+            # record only the points you want patrolled (Left and/or Right
+            # and/or Rope).
+            any_action = bool(_layer_present_actions(layer))
+            has_edges = self._layer_has_points_locked(
                 layer_name, PATROL_EDGE_POINTS
             )
-            if layer_name == self._final_layer_name_locked() and patrol_edges_ready:
+            if layer_name == self._final_layer_name_locked() and has_edges:
                 layer["calibration_status"] = "final_layer_ready"
-            elif self.layer_is_complete(layer_name):
+            elif self._layer_has_points_locked(layer_name, ("rope_pos",)):
                 layer["calibration_status"] = "complete"
-            elif patrol_edges_ready:
-                layer["calibration_status"] = "final_layer_ready"
+            elif any_action:
+                layer["calibration_status"] = "ready"
             else:
                 layer["calibration_status"] = "awaiting_left_rope_right"
-            if patrol_edges_ready:
+            if any_action:
                 route = self._profile.setdefault("route_order", [])
                 if layer_name not in route:
                     route.append(layer_name)
@@ -485,8 +507,11 @@ class PatrolController:
                 point["y"] = round(y, 6)
                 projected_y.append(y)
             if projected_y:
+                # Same average rule as the recorded layer_y: the projected
+                # layer level is the mean of the projected points so the
+                # arrival band centers on the platform, not one edge.
                 layer["layer_y"] = round(
-                    sorted(projected_y)[len(projected_y) // 2], 6
+                    float(sum(projected_y)) / len(projected_y), 6
                 )
             if "y_tolerance_diamonds" in layer:
                 layer["y_tolerance"] = round(
@@ -527,6 +552,7 @@ class PatrolController:
 
 
 __all__ = [
+    "ACTION_POINTS",
     "Boundary",
     "CoordinateLayout",
     "PatrolController",
@@ -535,4 +561,5 @@ __all__ = [
     "PATROL_EDGE_POINTS",
     "REQUIRED_LAYER_POINTS",
     "RecordedEndpoint",
+    "_layer_present_actions",
 ]

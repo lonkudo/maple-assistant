@@ -200,6 +200,9 @@ def main() -> int:
         args.window_title,
         dry_run=args.dry_run,
         input_enabled=False,
+        # Alt is the game's JUMP key - never send it during foreground
+        # selection or the character jumps every time patrol starts.
+        alt_transition=False,
     )
     calibration = json.loads(args.rope_calibration.read_text(encoding="utf-8"))
     map_profile = json.loads(
@@ -296,6 +299,13 @@ def main() -> int:
         ))
         anchor_layer = snapshot.layers.get(anchor_name, {})
         anchor_world_y = anchor_layer.get("layer_world_y")
+        if not snapshot.route_order:
+            # Nothing recorded: stand-still + attack mode.  Skip the world-Y
+            # re-anchor - there is no patrol route to anchor.
+            logging.info(
+                "MAP SESSION no patrol route recorded; standing still + attack"
+            )
+            return
         if anchor_world_y is None:
             raise OSError(
                 f"{anchor_name or 'first layer'} has no recorded world Y; "
@@ -346,6 +356,12 @@ def main() -> int:
         stop_event,
         detector=status_detector,
         automation_active_event=automation_active,
+        potion_retry_attempts=int(
+            calibration.get("potion_retry_attempts", 3)
+        ),
+        potion_retry_delay_seconds=float(
+            calibration.get("potion_retry_delay_seconds", 0.05)
+        ),
         status_state_path=str(
             Path(__file__).with_name("work") / "status_state.json"
         ),
@@ -403,6 +419,9 @@ def main() -> int:
             near_rope_inner_range=float(
                 rope_profile.get("inner_range", rope_profile["near_range"])
             ),
+            under_rope_tolerance=float(
+                rope_profile.get("under_rope_tolerance", 0.008)
+            ),
             near_rope_diamonds=calibration.get("near_rope_diamonds"),
             climb_attack_lock=climb_attack_lock,
             climbing_active_event=climbing_active,
@@ -447,6 +466,37 @@ def main() -> int:
             ),
             rope_approach_creep_seconds=float(
                 calibration.get("rope_approach_creep_seconds", 0.25)
+            ),
+            rope_tiny_step_min_seconds=float(
+                calibration.get("rope_tiny_step_min_seconds", 0.05)
+            ),
+            rope_tiny_step_max_seconds=float(
+                calibration.get("rope_tiny_step_max_seconds", 0.15)
+            ),
+            stair_jump_enabled=bool(calibration.get("stair_jump_enabled", True)),
+            stair_jump_stall_diamonds=float(
+                calibration.get("stair_jump_stall_diamonds", 0.25)
+            ),
+            stair_jump_stall_frames=int(
+                calibration.get("stair_jump_stall_frames", 2)
+            ),
+            patrol_start_grace_seconds=float(
+                calibration.get("patrol_start_grace_seconds", 3.0)
+            ),
+            stair_jump_attempts_max=int(
+                calibration.get("stair_jump_attempts_max", 3)
+            ),
+            stair_jump_grace_seconds=float(
+                calibration.get("stair_jump_grace_seconds", 2.5)
+            ),
+            stair_jump_alt_hold_seconds=float(
+                calibration.get("stair_jump_alt_hold_seconds", 0.06)
+            ),
+            stair_jump_lead_seconds=float(
+                calibration.get("stair_jump_lead_seconds", 0.15)
+            ),
+            other_player_check_interval_seconds=float(
+                calibration.get("other_player_check_interval_seconds", 60.0)
             ),
     )
     core_workers = [

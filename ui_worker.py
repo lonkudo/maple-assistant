@@ -258,11 +258,15 @@ def _box_text(box: Box) -> str:
 
 
 def patrol_button_states(running: bool, can_start: bool) -> tuple[str, str]:
-    """Return Tk states for the separate Start and Stop patrol buttons."""
+    """Return Tk states for the separate Start and Stop patrol buttons.
+
+    Stop is ALWAYS enabled: the user must always be able to stop the patrol
+    (even when it failed to fully start or only the attack is running).
+    """
 
     return (
         "normal" if can_start and not running else "disabled",
-        "normal" if running else "disabled",
+        "normal",
     )
 
 
@@ -1084,10 +1088,14 @@ class UiWorker(threading.Thread):
             self._minimap_label.configure(image=self._photo_minimap)
             self._map_name_label.configure(image=self._photo_map_name)
 
-    def _record_endpoint(self, boundary: str) -> None:
-        if self.patrol_controller is None:
-            self._control_status.configure(text="Patrol controller is unavailable.")
-            return
+    def _capture_snapshot_for_recording(self) -> "Optional[DebugSnapshot]":
+        """Return a fresh (or latest) debug snapshot with a detected diamond.
+
+        Records capture on demand so the position is current when the button
+        is clicked; the fresh snapshot is also rendered so the user sees what
+        was recorded.
+        """
+
         snapshot = self.last_snapshot
         if self.on_capture_now is not None:
             self._control_status.configure(text="Capturing current position…")
@@ -1109,7 +1117,14 @@ class UiWorker(threading.Thread):
                 self._control_status.configure(
                     text=f"Cannot record: immediate capture failed: {exc}"
                 )
-                return
+                return None
+        return snapshot
+
+    def _record_endpoint(self, boundary: str) -> None:
+        if self.patrol_controller is None:
+            self._control_status.configure(text="Patrol controller is unavailable.")
+            return
+        snapshot = self._capture_snapshot_for_recording()
         if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
             self._control_status.configure(
                 text="Cannot record: yellow diamond is not detected in the latest frame."
@@ -1982,8 +1997,9 @@ class UiWorker(threading.Thread):
             return
         if not self.patrol_controller.can_start():
             self._control_status.configure(
-                text=("Cannot start: record adaptive Left/Right on every layer "
-                      "and Rope on every layer except the final layer.")
+                text=("Cannot start: record at least one patrol point per "
+                      "layer (Left / Rope / Right). Start with nothing to "
+                      "stand still and only attack.")
             )
             return
         self._control_status.configure(text="Selecting game window…")
@@ -2007,6 +2023,10 @@ class UiWorker(threading.Thread):
         self.patrol_controller.set_enabled(False)
         if self.on_patrol_stop is not None:
             self.on_patrol_stop()
+        # Stopping patrol also stops the YOLO attack subprocess: in stand-still
+        # mode the character stands and the YOLO executor attacks, so without
+        # this the character would keep attacking after Stop Patrol.
+        self._yolo_stop()
         self._refresh_patrol_controls()
         self._control_status.configure(text="Patrol stopped.")
 
@@ -2021,7 +2041,7 @@ class UiWorker(threading.Thread):
             return
         self._control_status.configure(
             text=(f"Selected {layer_name}. Move there manually and record "
-                  "Left, Rope, and Right. Patrol is paused.")
+                  "any patrol points (Left / Rope / Right). Patrol is paused.")
         )
         self._refresh_patrol_controls()
 

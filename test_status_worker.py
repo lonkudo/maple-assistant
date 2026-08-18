@@ -9,8 +9,8 @@ from PIL import Image, ImageDraw
 
 from capture_worker import remap_normalized_box
 from status_worker import (
-    BarStatusDetector, StatusConfig, StatusWorker, WindowKeySender,
-    apply_drug_settings,
+    BarStatusDetector, StatusConfig, StatusReading, StatusWorker,
+    WindowKeySender, apply_drug_settings,
 )
 
 
@@ -107,6 +107,58 @@ class StatusTests(unittest.TestCase):
         )
         worker._process_frame(status_image(0.1, 0.1))
         self.assertEqual(sender.keys, ["end"])
+
+    def test_critical_low_ratio_eats_even_at_low_confidence(self) -> None:
+        # A near-empty bar is a tiny fill run, which reads with LOW
+        # confidence exactly when the potion is needed.  Potions are the
+        # highest priority: a low-confidence read with a bar below its
+        # threshold must still attempt the potion.
+        class FakeDetector:
+            def __init__(self, reading, config):
+                self.reading = reading
+                self.config = config
+
+            def detect(self, image):
+                return self.reading
+
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event(),
+                              potion_cooldown=60, low_frames_required=1)
+        config = replace(
+            worker.detector.config,
+            hp_ratio_threshold=0.5, mp_ratio_threshold=0.3,
+        )
+        reading = StatusReading(
+            hp=10, mp=3, hp_ratio=0.02, mp_ratio=0.01, confidence=0.20
+        )
+        worker.detector = FakeDetector(reading, config)
+        worker._process_frame(status_image(0.5, 0.2))
+        self.assertEqual(sender.keys, ["delete", "end"])
+
+    def test_blocked_potion_tap_is_retried(self) -> None:
+        # A transiently blocked potion tap (foreground flicker, momentary key
+        # ownership) must be retried instead of leaving the character unable
+        # to eat.
+        class FlakySender(FakeSender):
+            def __init__(self):
+                super().__init__()
+                self.fail_until = 1
+
+            def tap(self, key: str) -> bool:
+                if self.fail_until > 0:
+                    self.fail_until -= 1
+                    return False
+                self.keys.append(key)
+                return True
+
+        sender = FlakySender()
+        worker = StatusWorker(
+            queue.Queue(), sender, threading.Event(),
+            potion_cooldown=60, low_frames_required=1,
+            potion_retry_attempts=3, potion_retry_delay_seconds=0.0,
+        )
+        worker._process_frame(status_image(0.4, 0.1))
+        self.assertEqual(sender.keys, ["delete", "end"])
 
     def test_apply_drug_settings_maps_percent_to_ratio_and_validates_keys(self) -> None:
         config = StatusConfig()

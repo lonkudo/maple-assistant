@@ -15,6 +15,7 @@ from movement_worker import (
     ClimbState,
     MovementWorker,
     Point,
+    PositionMovementPlan,
     analyze_minimap,
     detect_marker,
     detect_layer_by_y,
@@ -252,12 +253,77 @@ class MovementTests(unittest.TestCase):
             too_far, rope_x, .0229, inner_range=.0215
         )
 
-        # Outside the inner gap the character walks toward the inner edge.
+        # Outside the inner gap but inside the honey zone: a tiny random step
+        # toward the rope center - never a big walk, never a jump.
         self.assertEqual(band_plan.decision.key, "right")
-        self.assertAlmostEqual(band_plan.target_x, rope_x - .0215, places=6)
+        self.assertAlmostEqual(band_plan.target_x, rope_x, places=6)
+        self.assertLess(band_plan.decision.duration, .2)
         # Inside the inner gap the climb attempt happens immediately.
         self.assertEqual(inner_plan.decision.key, "jump_climb_right")
+        # Beyond the honey zone the character walks toward the honey edge.
         self.assertEqual(far_plan.decision.key, "right")
+
+    def test_honey_zone_uses_tiny_random_steps_and_outside_big_walking(self):
+        rope_x, near_range, inner_range = .492600, .022500, .010000
+        # Between the inner jump gate and the honey-zone edge: tiny random
+        # step within the configured bounds - never a big walk, never a jump.
+        honey = MinimapObservation(Point(.480000, .7), None, .9, (0, 0, 1, 1))
+        plan = move_towards_rope(
+            honey, rope_x, near_range, inner_range=inner_range,
+            tiny_step_min_seconds=.05, tiny_step_max_seconds=.15,
+        )
+        self.assertEqual(plan.decision.key, "right")
+        self.assertGreaterEqual(plan.decision.duration, .05)
+        self.assertLessEqual(plan.decision.duration, .15)
+        self.assertIn("honey zone", plan.decision.reason)
+        # Outside the honey zone: big walking toward the honey edge.
+        far = MinimapObservation(Point(.300000, .7), None, .9, (0, 0, 1, 1))
+        plan = move_towards_rope(
+            far, rope_x, near_range, inner_range=inner_range,
+            movement_hold_seconds=2.0, estimated_final_speed=.205,
+        )
+        self.assertEqual(plan.decision.key, "right")
+        self.assertEqual(plan.decision.duration, 2.0)
+        self.assertAlmostEqual(plan.target_x, rope_x - near_range, places=6)
+
+    def test_rope_three_gap_zones_with_new_thresholds(self):
+        # Right on the rope (|gap| <= 0.008): jump straight up.
+        rope_x, near, inner = .492600, .025000, .018000
+        under = MinimapObservation(Point(rope_x - .007, .7), None, .9, (0, 0, 1, 1))
+        self.assertEqual(
+            move_towards_rope(under, rope_x, near, inner_range=inner).decision.key,
+            "jump_climb_up",
+        )
+        # Inner band (0.008 < |gap| <= 0.018): jump toward the rope side.
+        left_of_rope = MinimapObservation(
+            Point(rope_x - .010, .7), None, .9, (0, 0, 1, 1))
+        right_of_rope = MinimapObservation(
+            Point(rope_x + .012, .7), None, .9, (0, 0, 1, 1))
+        self.assertEqual(
+            move_towards_rope(left_of_rope, rope_x, near,
+                              inner_range=inner).decision.key,
+            "jump_climb_right",
+        )
+        self.assertEqual(
+            move_towards_rope(right_of_rope, rope_x, near,
+                              inner_range=inner).decision.key,
+            "jump_climb_left",
+        )
+        # Honey zone (0.018 < |gap| <= 0.025): tiny random step to adjust.
+        honey = MinimapObservation(
+            Point(rope_x - .020, .7), None, .9, (0, 0, 1, 1))
+        plan = move_towards_rope(honey, rope_x, near, inner_range=inner,
+                                 tiny_step_min_seconds=.05,
+                                 tiny_step_max_seconds=.15)
+        self.assertEqual(plan.decision.key, "right")
+        self.assertLess(plan.decision.duration, .2)
+        # Beyond the honey zone: big walking.
+        far = MinimapObservation(Point(rope_x - .100, .7), None, .9, (0, 0, 1, 1))
+        plan = move_towards_rope(far, rope_x, near, inner_range=inner,
+                                 movement_hold_seconds=2.0,
+                                 estimated_final_speed=.205)
+        self.assertEqual(plan.decision.key, "right")
+        self.assertEqual(plan.decision.duration, 2.0)
 
     def test_horizontal_correction_cannot_cancel_attached_climb(self):
         state = ClimbState(phase="climbing-up", up_held=True)
@@ -397,7 +463,7 @@ class MovementTests(unittest.TestCase):
             final_layer_action="drop_to_first_layer", first_layer="layer1",
         )
         worker._route_layer_index = 1
-        worker._route_phase = "rope"
+        worker._route_phase = "drop"
         on_final = MinimapObservation(Point(.6, .56), None, .9, (0, 0, 1, 1))
         self.assertEqual(worker._route_target(on_final),
                          (None, False, "layer2.drop-to-first"))
@@ -427,7 +493,7 @@ class MovementTests(unittest.TestCase):
             final_layer_action="drop_to_first_layer", first_layer="layer1",
         )
         worker._route_layer_index = 2  # on the final layer
-        worker._route_phase = "rope"
+        worker._route_phase = "drop"
         # Mid-descent: the marker is on layer2 (an intermediate platform).
         # Without the guard, _resync_route_layer would switch the route to
         # layer2 and restart patrol there - the bug.  The descent flag makes
@@ -514,57 +580,29 @@ class MovementTests(unittest.TestCase):
         object.__setattr__(frame, "image", Image.fromarray(image))
         return frame
 
-    def test_left_excursion_end_scans_once_for_red_diamonds(self):
+    def test_other_player_check_is_time_gated(self):
         from unittest import mock
 
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(),
             important_positions={}, other_player_check_enabled=True,
-        )
-        frame = self._red_diamond_frame()
-        region = (0.0, 0.0, 1.0, 1.0)
-        worker._left_excursion_active = True
-        with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
-            worker._handle_left_excursion_end(
-                frame, region, "layer1.right-most"
-            )
-            # The excursion already ended: no second scan.
-            worker._handle_left_excursion_end(
-                frame, region, "layer1.right-most"
-            )
-            # A new left excursion re-arms; finishing it scans again.
-            worker._handle_left_excursion_end(
-                frame, region, "layer1.left-most"
-            )
-            worker._handle_left_excursion_end(
-                frame, region, "layer1.right-most"
-            )
-        self.assertEqual(trig.call_count, 2)
-        self.assertEqual(trig.call_args[0][0], 1)  # one red diamond
-
-    def test_left_excursion_end_fires_on_any_layer(self):
-        # The channel-switch detection is bound to the move-to-left-most
-        # event REGARDLESS of the layer the character is on: layer2's
-        # excursion triggers exactly like layer1's.
-        from unittest import mock
-
-        worker = MovementWorker(
-            queue.Queue(), object(), threading.Event(),
-            important_positions={}, other_player_check_enabled=True,
+            other_player_check_interval_seconds=60.0,
         )
         frame = self._red_diamond_frame()
         region = (0.0, 0.0, 1.0, 1.0)
         with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
-            worker._handle_left_excursion_end(
-                frame, region, "layer2.left-most"
-            )
-            worker._handle_left_excursion_end(
-                frame, region, "layer2.right-most"
-            )
+            # First check after the interval has elapsed scans and triggers.
+            worker._maybe_check_other_players(0.0, frame, region)
             trig.assert_called_once()
-            self.assertEqual(trig.call_args[0][0], 1)
+            self.assertEqual(trig.call_args[0][0], 1)  # one red diamond
+            # A second check inside the interval does NOT scan again.
+            worker._maybe_check_other_players(30.0, frame, region)
+            trig.assert_called_once()
+            # After a full minute it scans again.
+            worker._maybe_check_other_players(61.0, frame, region)
+            self.assertEqual(trig.call_count, 2)
 
-    def test_left_excursion_end_skips_when_disabled_or_clean(self):
+    def test_other_player_check_skips_when_disabled_or_clean(self):
         from unittest import mock
 
         # Disabled: never scans, never triggers.
@@ -574,23 +612,20 @@ class MovementTests(unittest.TestCase):
         )
         frame = self._red_diamond_frame()
         region = (0.0, 0.0, 1.0, 1.0)
-        worker._left_excursion_active = True
         with mock.patch.object(worker, "_other_players_on_minimap") as scan, \
                 mock.patch.object(worker, "_trigger_other_player_switch") as trig:
-            worker._handle_left_excursion_end(frame, region, "layer1.right-most")
+            worker._maybe_check_other_players(0.0, frame, region)
             scan.assert_not_called()
             trig.assert_not_called()
 
-        # Enabled but no red diamond on the minimap: no trigger.
+        # Enabled and the interval elapsed, but no red diamond: no trigger.
         worker.set_other_player_check(True)
         clean = np.zeros((160, 200, 3), dtype=np.uint8)
         frame_clean = object.__new__(CapturedFrame)
         object.__setattr__(frame_clean, "image", Image.fromarray(clean))
-        worker._left_excursion_active = True
         with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
-            worker._handle_left_excursion_end(
-                frame_clean, region, "layer1.right-most"
-            )
+            worker._maybe_check_other_players(0.0, frame_clean, region)
+            worker._maybe_check_other_players(61.0, frame_clean, region)
             trig.assert_not_called()
 
     def test_other_player_switch_flow_drugs_then_switches_then_resumes(self):
@@ -727,7 +762,6 @@ class MovementTests(unittest.TestCase):
             # Pretend the patrol was mid-layer2 before the switch.
             worker._route_layer_index = 1
             worker._route_phase = "right"
-            worker._left_excursion_active = True
             # The new channel spawned the character ON layer1 already: the
             # drop ends on its first check.
             worker.last_observation = MinimapObservation(
@@ -744,7 +778,6 @@ class MovementTests(unittest.TestCase):
             # to layer1 - the character respawned at the map entry.
             self.assertEqual(worker._route_layer_index, 0)
             self.assertEqual(worker._route_phase, "left")
-            self.assertFalse(worker._left_excursion_active)
             self.assertEqual(tracker.anchors, [11.32])
 
     def test_switch_skips_drug_when_hp_healthy(self):
@@ -1428,6 +1461,39 @@ class MovementTests(unittest.TestCase):
         self.assertNotIn("left", downs)
         self.assertNotIn("right", downs)
 
+    def test_straight_up_failure_retries_toward_rope_side(self):
+        # A failed straight-up jump must retry toward the rope SIDE the
+        # character is actually on - never a blind "right" that pushes it
+        # away from the rope (character right of rope -> retry LEFT).
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def press(self, key, duration=0): self.events.append(("press", key, duration)); return True
+
+        sender, state = Sender(), ClimbState()
+        right_of_rope = MinimapObservation(Point(.505, .70), None, .9, (0, 0, 1, 1))
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, right_of_rope, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "up-toward-rope")
+            # Character right of the rope: the retry must jump LEFT toward it.
+            self.assertEqual(climb(sender, right_of_rope, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "left-retry-toward-rope")
+
+        sender, state = Sender(), ClimbState()
+        left_of_rope = MinimapObservation(Point(.495, .70), None, .9, (0, 0, 1, 1))
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, left_of_rope, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "up-toward-rope")
+            # Character left of the rope: the retry must jump RIGHT toward it.
+            self.assertEqual(climb(sender, left_of_rope, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "right-retry-toward-rope")
+
     def test_persistent_climb_keeps_up_owned_until_next_layer(self):
         class Sender:
             dry_run = True
@@ -1804,17 +1870,24 @@ class MovementTests(unittest.TestCase):
             "jump_climb_right",
         )
 
-    def test_layer_route_is_left_then_right_then_rope(self):
+    def test_layer_route_left_right_then_rope(self):
         positions = {
             "layer1": {
                 "left_most_pos": {"x": .2, "y": .7},
                 "right_most_pos": {"x": .8, "y": .7},
-            }
+                "rope_pos": {"x": .5, "y": .7},
+            },
+            "layer2": {
+                "left_most_pos": {"x": .3, "y": .5},
+                "right_most_pos": {"x": .6, "y": .5},
+            },
         }
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(),
             fixed_target_x=.5, important_positions=positions,
+            route_order=["layer1", "layer2"],
         )
+        worker._route_layer_index = 0
         at_left = MinimapObservation(Point(.2, .7), None, .9, (0, 0, 1, 1))
         target, is_rope, label = worker._route_target(at_left)
         self.assertEqual((target, is_rope, label), (.2, False, "layer1.left-most"))
@@ -1824,6 +1897,88 @@ class MovementTests(unittest.TestCase):
         at_right = MinimapObservation(Point(.8, .7), None, .9, (0, 0, 1, 1))
         self.assertTrue(worker._advance_route_endpoint(at_right, target))
         self.assertEqual(worker._route_target(at_right), (.5, True, "layer1.rope"))
+
+    def test_rope_only_layer_goes_directly_to_rope(self):
+        positions = {
+            "layer1": {"rope_pos": {"x": .5, "y": .7}},
+            "layer2": {"rope_pos": {"x": .6, "y": .5}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            fixed_target_x=.5, important_positions=positions,
+            route_order=["layer1", "layer2"],
+        )
+        worker._route_layer_index = 0
+        at_bottom = MinimapObservation(Point(.6, .7), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._route_target(at_bottom),
+                         (.5, True, "layer1.rope"))
+
+    def test_left_only_layer_repeats_at_left(self):
+        positions = {"layer1": {"left_most_pos": {"x": .2, "y": .7}}}
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            fixed_target_x=.5, important_positions=positions,
+            route_order=["layer1"],
+        )
+        worker._route_layer_index = 0
+        at_left = MinimapObservation(Point(.2, .7), None, .9, (0, 0, 1, 1))
+        target, is_rope, label = worker._route_target(at_left)
+        self.assertEqual((target, is_rope, label), (.2, False, "layer1.left-most"))
+        self.assertTrue(worker._advance_route_endpoint(at_left, target))
+        # No further action on the layer: it repeats at left.
+        self.assertEqual(worker._route_phase, "left")
+
+    def test_empty_route_stands_still(self):
+        # Nothing recorded: the worker holds position (Fixed Attack / YOLO
+        # keep attacking) instead of falling back to a rope walk.
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={},
+        )
+        obs = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._route_target(obs), (None, False, "stand-still"))
+
+    def test_route_sync_is_bottom_up_including_newly_recorded_layers(self):
+        # A lower layer recorded later (or with only partial points) must not
+        # become the "final" layer: the route stays bottom-up by numeric
+        # suffix, otherwise its rope is hidden and the character stands still
+        # after climbing onto it.
+        from patrol_control import PatrolSnapshot
+
+        class FakeController:
+            def snapshot(self, coordinate_layout=None):
+                return PatrolSnapshot(
+                    enabled=True,
+                    selected_layer="layer3",
+                    route_order=("layer3", "layer4"),
+                    layers={
+                        "layer1": {
+                            "right_most_pos": {"x": .4, "y": .69},
+                            "rope_pos": {"x": .2, "y": .69},
+                        },
+                        "layer2": {"rope_pos": {"x": .2, "y": .53}},
+                        "layer3": {
+                            "left_most_pos": {"x": .1, "y": .42},
+                            "right_most_pos": {"x": .4, "y": .42},
+                            "rope_pos": {"x": .16, "y": .42},
+                        },
+                        "layer4": {
+                            "left_most_pos": {"x": .1, "y": .15},
+                            "right_most_pos": {"x": .24, "y": .15},
+                        },
+                    },
+                    climbing_enabled=True,
+                    final_layer_action="drop_to_first_layer",
+                )
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            patrol_controller=FakeController(),
+        )
+        worker._sync_patrol_controller()
+        self.assertEqual(
+            worker._route_layers, ["layer1", "layer2", "layer3", "layer4"]
+        )
 
     def test_single_layer_patrol_repeats_without_climbing(self):
         positions = {
@@ -2045,10 +2200,10 @@ class MovementTests(unittest.TestCase):
 
     def test_approaches_then_climbs(self):
         left = MinimapObservation(Point(.7, .7), Point(.5, .7), .9, (0, 0, 1, 1))
-        aligned = MinimapObservation(Point(.5, .7), Point(.509, .7), .9, (0, 0, 1, 1))
+        aligned = MinimapObservation(Point(.5, .7), Point(.507, .7), .9, (0, 0, 1, 1))
         self.assertEqual(plan_movement(left).key, "left")
         self.assertEqual(plan_movement(left).duration, 2.0)
-        # Gap .009 is inside the +-0.01 center gap: straight up, not right.
+        # Gap .007 is inside the +-0.008 under-rope gap: straight up, not right.
         self.assertEqual(plan_movement(aligned).key, "jump_climb_up")
 
     def test_direction_uses_configured_hold_duration(self):
@@ -2108,7 +2263,8 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_phase, "right")
         crossed_right = MinimapObservation(Point(.83, .7), None, .9, (0, 0, 1, 1))
         self.assertTrue(worker._advance_route_endpoint(crossed_right, .8))
-        self.assertEqual(worker._route_phase, "rope")
+        # No rope recorded on this single layer: it repeats at left.
+        self.assertEqual(worker._route_phase, "left")
 
     def test_saved_rope_position_overrides_connector_detection(self):
         observation = MinimapObservation(Point(.70, .70), None, .90, (0, 0, 1, 1))
@@ -2310,6 +2466,192 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(plan_movement(
             inside, fixed_target_x=target, horizontal_tolerance=.0025,
             final_calculation_distance=.0025).key, "jump_climb_up")
+
+
+class StairJumpTests(unittest.TestCase):
+    """Stairs that block the left/right walk are jumped automatically."""
+
+    def _worker(self, **kwargs):
+        positions = {
+            "layer1": {
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }
+        }
+        defaults = dict(
+            frame_queue=queue.Queue(),
+            key_sender=object(),
+            stop_event=threading.Event(),
+            fixed_target_x=.5,
+            important_positions=positions,
+            route_order=["layer1"],
+            stair_jump_stall_frames=2,
+            stair_jump_attempts_max=3,
+        )
+        defaults.update(kwargs)
+        return MovementWorker(**defaults)
+
+    def _plan(self, px, direction, reached=False):
+        if direction == "right":
+            target = Point(.8, .7)
+            gap = .8 - px
+        else:
+            target = Point(.2, .7)
+            gap = .2 - px
+        return PositionMovementPlan(
+            f"move-to-{direction}", Point(px, .7), target, gap, reached,
+            MovementDecision(None if reached else direction, "walk", 2.0),
+        )
+
+    def test_stuck_while_walking_jumps_automatically(self):
+        # No jump points are recorded anywhere: a stuck marker (walk hold
+        # issued but X not advancing) is enough to trigger the stair jump.
+        worker = self._worker()
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        now = 100.0
+        stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        # Frame 1: no previous X yet -> one stall frame, still below the
+        # confirmation count.
+        self.assertIsNone(worker._stair_jump_decision(
+            stuck, "layer1.right-most", self._plan(.5, "right"), now))
+        # Frame 2: marker still not advancing -> confirmed stuck -> jump.
+        decision = worker._stair_jump_decision(
+            stuck, "layer1.right-most", self._plan(.5, "right"), now + 2.5)
+        self.assertEqual(decision.key, "stair_jump_right")
+        self.assertEqual(worker._stair_state["attempts"], 1)
+
+    def test_stair_jump_suppressed_during_patrol_start_grace(self):
+        # Right after Start Patrol the character stands still - that is not
+        # being stuck at a stair.  No stair jump until the grace window ends.
+        worker = self._worker(patrol_start_grace_seconds=3.0)
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        now = 100.0
+        worker._patrol_started_at = now
+        stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        plan = self._plan(.5, "right")
+        for offset in (0.0, 2.5):
+            self.assertIsNone(worker._stair_jump_decision(
+                stuck, "layer1.right-most", plan, now + offset))
+        # After the grace window the stall counter starts fresh: one confirm
+        # frame, then a genuine stall jumps.
+        self.assertIsNone(worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, now + 4.0))
+        decision = worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, now + 6.5)
+        self.assertEqual(decision.key, "stair_jump_right")
+
+    def test_moving_marker_never_jumps(self):
+        worker = self._worker()
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        now = 100.0
+        # Marker advancing: the stall counter keeps resetting.
+        for index, px in enumerate((.44, .46, .48, .50)):
+            moving = MinimapObservation(Point(px, .7), None, .9, (0, 0, 1, 1))
+            self.assertIsNone(worker._stair_jump_decision(
+                moving, "layer1.right-most", self._plan(px, "right"),
+                now + index))
+        self.assertEqual(worker._stair_state["stall_frames"], 0)
+
+    def test_stuck_jumps_only_in_left_right_phases(self):
+        # The stair jump belongs to move-to-left-most / move-to-right-most
+        # only - a rope-phase label never produces a stair jump.
+        worker = self._worker()
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        for frame in range(4):
+            self.assertIsNone(worker._stair_jump_decision(
+                stuck, "layer1.rope", self._plan(.5, "right"), 100.0 + frame))
+
+    def test_grace_period_and_attempts_cap_stop_hop_in_place(self):
+        worker = self._worker(stair_jump_stall_frames=1,
+                              stair_jump_attempts_max=2)
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        plan = self._plan(.5, "right")
+        jump1 = worker._stair_jump_decision(stuck, "layer1.right-most", plan, 10.0)
+        self.assertEqual(jump1.key, "stair_jump_right")
+        # Inside the grace window no second jump is issued.
+        self.assertIsNone(worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, 10.5))
+        # After grace the second (final) jump fires.
+        jump2 = worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, 13.0)
+        self.assertEqual(jump2.key, "stair_jump_right")
+        self.assertEqual(worker._stair_state["attempts"], 2)
+        # Attempts exhausted: no more jumps, a warning was logged.
+        self.assertIsNone(worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, 16.0))
+        self.assertTrue(worker._stair_state["gave_up"])
+
+    def test_phase_change_resets_stair_state(self):
+        worker = self._worker()
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+        worker._stair_jump_decision(
+            stuck, "layer1.right-most", self._plan(.5, "right"), 1.0)
+        worker._stair_jump_decision(
+            stuck, "layer1.right-most", self._plan(.5, "right"), 3.5)
+        self.assertEqual(worker._stair_state["attempts"], 1)
+        # A new phase label starts a fresh approach with a clean budget.
+        worker._route_phase = "left"
+        worker._stair_jump_decision(
+            stuck, "layer1.left-most", self._plan(.5, "left"), 6.0)
+        self.assertEqual(worker._stair_state["phase_label"], "layer1.left-most")
+        self.assertEqual(worker._stair_state["attempts"], 0)
+        self.assertEqual(worker._stair_state["stall_frames"], 1)
+
+    def test_send_stair_jump_holds_direction_and_taps_alt(self):
+        class Sender:
+            dry_run = False
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def is_target_focused(self): return True
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(), important_positions={},
+        )
+        worker.stair_jump_lead_seconds = 0.0
+        worker.stair_jump_alt_hold_seconds = 0.01
+        ok = worker._send_stair_jump(
+            MovementDecision("stair_jump_right", "stuck at stair", 0.05))
+        self.assertTrue(ok)
+        self.assertEqual(
+            sender.events,
+            [("down", "right"), ("down", "alt"), ("up", "alt"), ("up", "right")],
+        )
+
+    def test_stair_jump_is_treated_as_walking_by_pickup_gate(self):
+        worker = self._worker()
+        self.assertTrue(worker._is_walk_key("stair_jump_left"))
+        self.assertTrue(worker._is_walk_key("right"))
+        self.assertFalse(worker._is_walk_key("climb"))
+        self.assertFalse(worker._is_walk_key(None))
+
+    def test_patrol_facing_is_none_safe_for_noop_decision(self):
+        # A no-op "wait" decision (key=None) during a climb/rope approach must
+        # NOT crash the facing tracking - this previously raised
+        # AttributeError on decision.key.startswith("stair_jump_") and froze
+        # the movement worker every frame.
+        worker = self._worker()
+        self.assertIsNone(worker._patrol_facing_for_key(None))
+        self.assertIsNone(worker._patrol_facing_for_key("climb"))
+        self.assertIsNone(worker._patrol_facing_for_key("jump_climb_up"))
+        self.assertEqual(worker._patrol_facing_for_key("left"), "left")
+        self.assertEqual(worker._patrol_facing_for_key("right"), "right")
+        self.assertEqual(
+            worker._patrol_facing_for_key("stair_jump_right"), "right"
+        )
+        self.assertEqual(
+            worker._patrol_facing_for_key("jump_climb_left"), "left"
+        )
 
 
 if __name__ == "__main__":

@@ -3,9 +3,7 @@
   "map_name": "射手训练场 I",
   "patrol_enabled": false,
   "climbing_enabled": true,
-  "route_order": [
-    "layer1"
-  ],
+  "route_order": [],
   "final_layer_action": "drop_to_first_layer",
   "first_layer": "layer1",
   "minimap_region": [
@@ -16,63 +14,14 @@
   ],
   "rope": {
     "x": 0.5,
-    "near_range": 0.0225,
-    "inner_range": 0.015,
+    "near_range": 0.025,
+    "inner_range": 0.018,
     "outer_range": 0.0229
   },
   "layers": {
     "layer1": {
       "y_tolerance": 0.02,
-      "calibration_status": "final_layer_ready",
-      "left_most_pos": {
-        "x": 0.130319,
-        "y": 0.62426,
-        "source": "manual-ui",
-        "world_y": 4.167139,
-        "observed_world_y": 4.167139,
-        "tracking_confidence": 0.985793,
-        "coordinate_v2": {
-          "x_diamond": -10.833333,
-          "y_diamond": 4.166667,
-          "recorded_layout": {
-            "analysis_width": 188.0,
-            "analysis_height": 169.0,
-            "canvas_left": 7.0,
-            "canvas_top": 13.0,
-            "canvas_width": 165.0,
-            "canvas_height": 135.0,
-            "diamond_width": 6.0,
-            "diamond_height": 6.0
-          }
-        }
-      },
-      "y_tolerance_diamonds": 0.563333,
-      "layer_y": 0.647929,
-      "layer_y_source": "manual-ui",
-      "layer_world_y": 4.167139,
-      "world_y_tolerance": 0.75,
-      "right_most_pos": {
-        "x": 0.75266,
-        "y": 0.647929,
-        "source": "manual-ui",
-        "world_y": 4.167139,
-        "observed_world_y": 4.814927,
-        "tracking_confidence": 0.960929,
-        "coordinate_v2": {
-          "x_diamond": 8.666667,
-          "y_diamond": 4.833333,
-          "recorded_layout": {
-            "analysis_width": 188.0,
-            "analysis_height": 169.0,
-            "canvas_left": 7.0,
-            "canvas_top": 13.0,
-            "canvas_width": 165.0,
-            "canvas_height": 135.0,
-            "diamond_width": 6.0,
-            "diamond_height": 6.0
-          }
-        }
-      }
+      "calibration_status": "awaiting_left_rope_right"
     }
   }
 }

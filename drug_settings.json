@@ -1,7 +1,7 @@
 {
   "hp_key": "delete",
   "mp_key": "end",
-  "hp_threshold": 50,
+  "hp_threshold": 60,
   "mp_threshold": 30,
   "hp_enabled": true,
   "mp_enabled": true,
@@ -9,6 +9,6 @@
   "buff2_key": "insert",
   "buff1_interval": 9.0,
   "buff2_interval": 10.0,
-  "buff1_enabled": true,
+  "buff1_enabled": false,
   "buff2_enabled": false
 }

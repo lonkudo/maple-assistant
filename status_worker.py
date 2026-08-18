@@ -101,10 +101,16 @@ class WindowKeySender:
         dry_run: bool = True,
         *,
         input_enabled: bool = True,
+        alt_transition: bool = True,
     ) -> None:
         self.window_title = window_title
         self.dry_run = dry_run
         self.targets_configured_window = True
+        # The Alt foreground-activation fallback presses the Alt key, which
+        # is the JUMP key in MapleStory - a game window would jump every time
+        # it is selected.  Callers for this game disable it (alt_transition
+        # False) and rely on direct SetForegroundWindow + AttachThreadInput.
+        self.alt_transition = bool(alt_transition)
         # Window selection is serialized, but key holds are deliberately not:
         # movement and attack workers must be able to overlap their events.
         self._selection_lock = threading.Lock()
@@ -216,7 +222,10 @@ class WindowKeySender:
 
                 # A brief Alt transition lets Windows accept a foreground request
                 # after its foreground-lock timeout in most interactive sessions.
-                if win32gui.GetForegroundWindow() != hwnd:
+                # Skipped when alt_transition is disabled: the Alt key is the
+                # game's JUMP key, and pressing it would make the character jump
+                # every time the game window is selected.
+                if win32gui.GetForegroundWindow() != hwnd and self.alt_transition:
                     self._send_scan_code(0x38, key_up=False, extended=False)
                     self._send_scan_code(0x38, key_up=True, extended=False)
                     try:
@@ -606,6 +615,8 @@ class StatusWorker(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         potion_cooldown: float = 5.0,
         low_frames_required: int = 2,
+        potion_retry_attempts: int = 3,
+        potion_retry_delay_seconds: float = 0.05,
         status_state_path: Optional[str] = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
@@ -616,6 +627,13 @@ class StatusWorker(threading.Thread):
         self.automation_active_event = automation_active_event
         self.potion_cooldown = max(0.0, potion_cooldown)
         self.low_frames_required = max(1, low_frames_required)
+        # Potions are the highest-priority action: if a tap is blocked
+        # (foreground flicker, momentary key ownership) it is retried a few
+        # times before giving up, and the next low frame retries anyway.
+        self.potion_retry_attempts = max(1, int(potion_retry_attempts))
+        self.potion_retry_delay_seconds = max(
+            0.0, float(potion_retry_delay_seconds)
+        )
         # Optional shared state file: latest HP/MP ratios, read by the
         # movement worker so the channel-switch safety net can gate its
         # potion on the current health.
@@ -624,6 +642,22 @@ class StatusWorker(threading.Thread):
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
         # Monotonic timestamps of the last periodic buff tap (per buff row).
         self._last_buff = {"buff1": float("-inf"), "buff2": float("-inf")}
+
+    def _tap_potion(self, key: str) -> bool:
+        """Tap the potion key, retrying briefly if the first attempt is blocked.
+
+        Potions are the highest-priority action: a transient block (foreground
+        flicker, momentary key ownership) must not leave the character unable
+        to eat.  When all attempts fail the caller keeps the last-potion
+        timestamp stale, so the next low frame retries again anyway.
+        """
+
+        for _ in range(self.potion_retry_attempts):
+            if self.key_sender.tap(key):
+                return True
+            if self.potion_retry_delay_seconds > 0:
+                time.sleep(self.potion_retry_delay_seconds)
+        return False
 
     def _check_resource(self, name: str, ratio: Optional[float],
                         threshold_ratio: float, key: str, now: float) -> None:
@@ -635,7 +669,7 @@ class StatusWorker(threading.Thread):
         )
         if (self._low_count[name] >= self.low_frames_required
                 and now - self._last_potion[name] >= self.potion_cooldown):
-            if self.key_sender.tap(key):
+            if self._tap_potion(key):
                 self._last_potion[name] = now
                 self._low_count[name] = 0
                 LOG.warning("%s=%.0f%% below %.0f%%: used %s", name.upper(),
@@ -681,16 +715,32 @@ class StatusWorker(threading.Thread):
         reading = self.detector.detect(image)
         LOG.info("status hp=%s mp=%s confidence=%.2f", reading.hp, reading.mp,
                  reading.confidence)
-        if reading.confidence < self.detector.config.minimum_action_confidence:
-            LOG.warning("status confidence %.2f below %.2f; potion actions suppressed",
-                        reading.confidence,
-                        self.detector.config.minimum_action_confidence)
-            self._low_count = {"hp": 0, "mp": 0}
-            return
+        config = self.detector.config
+        if reading.confidence < config.minimum_action_confidence:
+            # Potions are the highest priority: a low-confidence read must NOT
+            # block eating when a bar is below its threshold - a near-empty
+            # bar is a tiny fill run, which reads with LOW confidence exactly
+            # when the potion is needed.  Only suppress when nothing critical.
+            hp_critical = (reading.hp_ratio is not None
+                           and reading.hp_ratio < config.hp_ratio_threshold)
+            mp_critical = (reading.mp_ratio is not None
+                           and reading.mp_ratio < config.mp_ratio_threshold)
+            if not hp_critical and not mp_critical:
+                LOG.warning(
+                    "status confidence %.2f below %.2f; potion actions suppressed",
+                    reading.confidence, config.minimum_action_confidence,
+                )
+                self._low_count = {"hp": 0, "mp": 0}
+                return
+            LOG.warning(
+                "status confidence %.2f low but %s below threshold; "
+                "potions still attempted",
+                reading.confidence,
+                "HP" if hp_critical else "MP",
+            )
         if self.status_state_path is not None:
             self._write_status_state(reading)
         now = time.monotonic()
-        config = self.detector.config
         if config.hp_enabled:
             self._check_resource(
                 "hp", reading.hp_ratio, config.hp_ratio_threshold,

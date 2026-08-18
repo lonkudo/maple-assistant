@@ -182,6 +182,8 @@ def main() -> int:
             cooldown=args.attack_cooldown,
             patrol_state_path=args.patrol_state,
             log_path=log_path,
+            # Alt is the game's JUMP key - never send it during refocus.
+            alt_transition=False,
         )
         if args.attack_state:
             from combat_coordination import AttackStateFile

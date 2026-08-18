@@ -69,7 +69,9 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertEqual(snapshot.route_order, ())
             self.assertEqual(tuple(snapshot.layers), ("layer1",))
             self.assertFalse(controller.layer_is_complete("layer1"))
-            self.assertFalse(controller.can_start())
+            # An empty route is still startable: the worker stands still and
+            # only attacks (Fixed Attack / YOLO mode).
+            self.assertTrue(controller.can_start())
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved["route_order"], [])
             self.assertNotIn("left_most_pos", saved["layers"]["layer1"])
@@ -175,7 +177,8 @@ class PatrolControllerTests(unittest.TestCase):
 
             self.assertEqual(controller.add_layer_above(), "layer2")
             self.assertEqual(tuple(controller.snapshot().layers), ("layer1", "layer2"))
-            self.assertFalse(controller.can_start())
+            # Empty route = stand-still + attack mode, so it is startable.
+            self.assertTrue(controller.can_start())
 
     def test_new_layer_first_point_records_its_y(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -188,6 +191,25 @@ class PatrolControllerTests(unittest.TestCase):
             controller.record_endpoint("left_most_pos", .25, .501234)
             self.assertEqual(
                 controller.snapshot().layers["layer2"]["layer_y"], .501234
+            )
+
+    def test_layer_y_is_average_of_recorded_points(self) -> None:
+        # Layer Y must be the AVERAGE of the recorded points.  A median of
+        # two points degenerates to the larger one, biasing the arrival band
+        # toward one edge of the platform and making climb arrival detection
+        # miss (the character lands on the platform between the points).
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.json"
+            data = profile()
+            data["layers"].pop("layer2")
+            data["route_order"] = []
+            data["layers"]["layer1"] = {"y_tolerance": .020000}
+            path.write_text(json.dumps(data), encoding="utf-8")
+            controller = PatrolController(path, data)
+            controller.record_endpoint("left_most_pos", .2, .40)
+            controller.record_endpoint("right_most_pos", .8, .42)
+            self.assertAlmostEqual(
+                controller.snapshot().layers["layer1"]["layer_y"], .41, places=6
             )
 
     def test_new_layer_rejects_point_not_above_lower_layer(self) -> None:
@@ -229,10 +251,13 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertTrue(controller.layer_is_adaptive("layer1"))
             self.assertTrue(controller.can_start())
 
-    def test_legacy_ratio_only_layer_cannot_start_adaptive_patrol(self) -> None:
+    def test_legacy_ratio_only_layer_starts_but_is_not_adaptive(self) -> None:
+        # Left/Rope/Right start patrol once recorded; a legacy ratio-only
+        # layer starts too but is flagged non-adaptive (re-record for zoom).
         with tempfile.TemporaryDirectory() as directory:
             controller = PatrolController(Path(directory) / "map.json", profile())
-            self.assertFalse(controller.can_start())
+            self.assertTrue(controller.can_start())
+            self.assertFalse(controller.layer_is_adaptive("layer1"))
 
     def test_final_layer_can_start_without_rope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -262,7 +287,9 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertIsNotNone(restored)
             self.assertAlmostEqual(restored.x, .51)
 
-    def test_non_final_layer_still_requires_adaptive_rope(self) -> None:
+    def test_non_final_layer_does_not_require_rope(self) -> None:
+        # Left/Rope/Right are independent: a non-final layer with only
+        # adaptive Left/Right patrols just that floor and is startable.
         with tempfile.TemporaryDirectory() as directory:
             data = profile()
             data["route_order"] = ["layer1", "layer2"]
@@ -270,12 +297,18 @@ class PatrolControllerTests(unittest.TestCase):
                 for point_name in ("left_most_pos", "right_most_pos"):
                     self._make_adaptive(data["layers"][layer_name][point_name])
             controller = PatrolController(Path(directory) / "map.json", data)
-            self.assertFalse(controller.can_start())
+            self.assertTrue(controller.can_start())
 
-            data["layers"]["layer1"]["rope_pos"] = {"x": .5, "y": .7}
+    def test_rope_only_layer_is_startable(self) -> None:
+        # Recording only a rope means the worker goes straight to the rope.
+        with tempfile.TemporaryDirectory() as directory:
+            data = profile()
+            data["route_order"] = ["layer1"]
+            data["layers"]["layer1"] = {"rope_pos": {"x": .5, "y": .7}}
             self._make_adaptive(data["layers"]["layer1"]["rope_pos"])
             controller = PatrolController(Path(directory) / "map.json", data)
             self.assertTrue(controller.can_start())
+            self.assertTrue(controller.layer_is_patrol_ready("layer1"))
 
     def test_snapshot_route_order_is_bottom_up_ignoring_recording_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
