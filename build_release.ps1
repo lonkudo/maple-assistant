@@ -1,11 +1,11 @@
-<#
+﻿<#
 .SYNOPSIS
-    Build a minimal, distributable Maple Assistant release folder.
+    打包 Maple 助手的最小发布文件夹。
 
 .DESCRIPTION
-    Copies only the files needed to run (no venvs, logs, tests, work data,
-    git metadata).  The result can be zipped and given to another user, who
-    then runs install.ps1 inside it to bootstrap Python + requirements.
+    只复制运行所需的文件（不含虚拟环境、日志、测试、work 数据、git 元数据）。
+    打包结果可压缩后交给其他用户，对方解压后运行其中的 安装.ps1 即可自动
+    安装 Python 与依赖。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File build_release.ps1
@@ -21,13 +21,15 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $out = Join-Path $root $OutDir
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out -Force | Out-Null
-Write-Host "Building release into: $out" -ForegroundColor Cyan
+Write-Host "正在打包发布目录: $out" -ForegroundColor Cyan
 
-# --- root runtime files -------------------------------------------------------
+# --- 根目录运行文件 ---------------------------------------------------------------
 $rootFiles = Get-ChildItem $root -File | Where-Object {
     $name = $_.Name
     ($_.Extension -in ".py", ".json", ".md", ".ps1", ".vbs", ".bat", ".txt") -and
-    $name -notlike "test_*" -and $name -ne "auto_system.log"
+    $name -notlike "test_*" -and $name -ne "auto_system.log" -and
+    # 以下为开发工具（含本机绝对路径），不随发布包分发。
+    $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 
@@ -41,7 +43,7 @@ Get-ChildItem (Join-Path $root "yolo-detection") -File | Where-Object {
     ) -and
     $_.Name -notlike "*.log"
 } | ForEach-Object { Copy-Item $_.FullName $yoloOut }
-# Trained model weights (best.pt ~6MB; best.onnx ~12MB optional).
+# 训练好的模型权重 (best.pt ~6MB; best.onnx ~12MB 可选)。
 $weightsIn = Join-Path $root "yolo-detection\weights"
 $weightsOut = Join-Path $yoloOut "weights"
 if (Test-Path $weightsIn) {
@@ -50,28 +52,28 @@ if (Test-Path $weightsIn) {
     Copy-Item (Join-Path $weightsIn "best.onnx") $weightsOut -ErrorAction SilentlyContinue
 }
 
-# --- recording assets (map identity references) --------------------------------
+# --- recording-assets（地图识别参考图）--------------------------------------------
 $assetsIn = Join-Path $root "recording-assets"
 if (Test-Path $assetsIn) {
     Copy-Item $assetsIn (Join-Path $out "recording-assets") -Recurse
 }
 
-# --- summary ------------------------------------------------------------------
+# --- 汇总 ----------------------------------------------------------------------
 $files = Get-ChildItem $out -Recurse -File
 $totalMB = [math]::Round(($files | Measure-Object Length -Sum).Sum / 1MB, 1)
-Write-Host "Copied $($files.Count) files ($totalMB MB)." -ForegroundColor Green
+Write-Host "已复制 $($files.Count) 个文件 ($totalMB MB)。" -ForegroundColor Green
 Write-Host ""
-Write-Host "To distribute:"
-Write-Host "  1. zip the $OutDir folder"
-Write-Host "  2. the recipient unzips it and runs:"
-Write-Host "       powershell -ExecutionPolicy Bypass -File install.ps1"
-Write-Host "     (add -Yolo for the mob-detection environment)"
-Write-Host "  3. then double-click 启动助手.bat to start." -ForegroundColor Cyan
+Write-Host "发布方法:"
+Write-Host "  1. 将 $OutDir 文件夹压缩为 zip"
+Write-Host "  2. 接收方解压后运行:"
+Write-Host "       powershell -ExecutionPolicy Bypass -File 安装.ps1"
+Write-Host "     （需要怪物检测时加 -Yolo 参数）"
+Write-Host "  3. 然后双击 启动助手.bat 即可开始。" -ForegroundColor Cyan
 Write-Host ""
 
 if ($Zip) {
     $zipPath = Join-Path $root "release\MapleAssistant.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
     Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal
-    Write-Host "Zipped to $zipPath" -ForegroundColor Green
+    Write-Host "已压缩到 $zipPath" -ForegroundColor Green
 }

@@ -1,76 +1,66 @@
-# Maple Assistant — Installation & Resolution Guide
+# Maple 助手 — 安装与分辨率指南
 
-## 1. Install (for the end user)
+## 1. 安装（给最终用户）
 
-The project is self-bootstrapping. No Python knowledge is needed.
+项目可以一键自举安装，无需任何 Python 知识。
 
-1. Unzip the release folder.
-2. Right-click **`install.ps1`** → *Run with PowerShell* (or run
-   `powershell -ExecutionPolicy Bypass -File install.ps1`).
-   - The script finds a Python 3.10–3.12 on your machine (your environment);
-     if none exists it **downloads and installs Python 3.12 automatically**
-     (winget first, python.org fallback).
-   - It creates a local `.venv` and installs the requirements
-     (numpy, Pillow, OpenCV, pywin32).
-   - It creates two launchers: **`start_assistant.bat`** and **`启动助手.bat`**.
-3. Optional mob detection (YOLO, downloads several GB of PyTorch):
-   `powershell -ExecutionPolicy Bypass -File install.ps1 -Yolo`
-   - Creates `yolo-detection\venv313` (the exact path the UI expects) and
-     installs torch/ultralytics.
-   - Put your trained model at `yolo-detection\weights\best.pt`.
-4. Double-click **`启动助手.bat`** to start. The debug UI opens; click
-   **Start Patrol** when the game window is in the foreground.
+1. 解压发布压缩包。
+2. 右键 **`安装.ps1`** → 使用 PowerShell 运行
+   （或在命令行执行 `powershell -ExecutionPolicy Bypass -File 安装.ps1`）。
+   - 脚本会查找本机已有的 Python 3.10–3.12（优先使用你的环境）；
+     找不到时会**自动下载并安装 Python 3.12**（先尝试 winget，失败则从
+     python.org 静默安装）。
+   - 创建本地 `.venv` 并安装依赖（numpy、Pillow、OpenCV、pywin32）。
+   - 自动生成两个启动器：**`start_assistant.bat`** 和 **`启动助手.bat`**。
+3. 可选：YOLO 怪物检测（需下载数 GB 的 PyTorch）：
+   `powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo`
+   - 创建 `yolo-detection\venv313`（界面期望的固定路径）并安装
+     torch/ultralytics。
+   - 把训练好的模型放到 `yolo-detection\weights\best.pt`。
+4. 双击 **`启动助手.bat`** 启动。游戏窗口在前台时点击 **开始巡逻** 即可。
 
-> The assistant works **without** the YOLO part — use the Fixed Attack panel
-> for plain farming. `-Yolo` is only for the AI mob detection.
+> **不安装 YOLO 也能正常使用**：使用「固定攻击」面板即可普通挂机。
+> `-Yolo` 仅用于 AI 怪物检测。
 
-## 2. Supported screen resolutions
+## 2. 支持的分辨率
 
-Everything is **normalized to the game client**, so it adapts to the
-resolution you play at:
+所有分析都**以游戏客户区为基准归一化**，因此会随你游玩的分辨率自动适配：
 
-| Resolution | Aspect | Status |
+| 分辨率 | 比例 | 支持情况 |
 |---|---|---|
-| 2560×1440 | 16:9 | ✓ works |
-| 1920×1080 | 16:9 | ✓ works |
-| 1366×768 | 16:9 | ✓ works |
-| 2560×1600 | 16:10 | ✓ works (the original calibration) |
+| 2560×1440 | 16:9 | ✓ 支持 |
+| 1920×1080 | 16:9 | ✓ 支持 |
+| 1366×768 | 16:9 | ✓ 支持 |
+| 2560×1600 | 16:10 | ✓ 支持（原始校准分辨率） |
 
-How it works:
+原理：
 
-- The capture now grabs the **full client window**, and every analysis region
-  (minimap, HP/MP bars) is a normalized fraction of the client. The minimap is
-  located dynamically with OpenCV contours, patrol points are stored as
-  diamond-relative offsets, and the HP/MP bar widths are fractions of the
-  client width — so none of them care about your resolution.
-- The YOLO detector is configured with a **pixel** capture region
-  (`yolo-detection\config.yaml` → `window.default`) and a pixel `--attack-range`.
-  Set these once for your resolution via the YOLO panel (they are saved to
-  `yolo_detection_settings.json` / `config.yaml`).
+- 截图改为抓取**整个客户区**，所有分析区域（小地图、HP/MP 条）都是客户区的
+  归一化比例。小地图通过 OpenCV 轮廓动态定位，巡逻点以菱形相对偏移存储，
+  HP/MP 条宽度以客户区宽度为基准——因此都与你的分辨率无关。
+- YOLO 检测器使用**像素**截图区域（`yolo-detection\config.yaml` →
+  `window.default`）和像素 `--attack-range`。请在 YOLO 面板中针对你的分辨率
+  设置一次（会保存到 `yolo_detection_settings.json` / `config.yaml`）。
 
-Things to do **once per resolution** (switching resolutions changes the UI
-scale slightly):
+**每个分辨率只需做一次**（切换分辨率会改变 UI 缩放比例）：
 
-1. Verify the minimap is detected (the UI shows the minimap preview + boxes).
-2. Verify the HP/MP numbers in the status row look right; if they read ~10%
-   off, adjust the bar-width fraction in `status_worker.py`
-   (`full_bar_width_fraction`, measured as full-bar-pixels ÷ client-width).
-3. If you re-record patrol points, record them **at the resolution you will
-   play at** — the diamond-relative storage makes them portable across
-   resolutions, but recording fresh at the target resolution is the most
-   accurate.
+1. 确认小地图能被检测到（界面上会显示小地图预览和方框）。
+2. 确认状态栏里的 HP/MP 数值正常；如果偏差约 10%，请在
+   `status_worker.py` 中调整条宽比例
+   （`full_bar_width_fraction`，取值 = 满血条像素 ÷ 客户区宽度）。
+3. 如果重新录制巡逻点，请在**将要使用的分辨率下录制**——菱形相对存储让
+   坐标可以跨分辨率使用，但在目标分辨率下重新录制最准确。
 
-## 3. Troubleshooting
+## 3. 常见问题
 
-- **"No module named X"** — the venv is incomplete: re-run `install.ps1`.
-- **Game window selection fails on Start Patrol** — the assistant never sends
-  Alt (Alt is the jump key), so focus grabbing relies on direct
-  `SetForegroundWindow`; click Start Patrol while the game window is visible.
-- **Character jumps when patrol starts** — this was fixed (no Alt during
-  window selection + a start grace period); if you still see it, check the
-  `patrol_start_grace_seconds` / `alt_transition` settings.
-- **YOLO window says venv missing** — run `install.ps1 -Yolo`.
+- **提示缺少模块 "No module named X"** — 虚拟环境不完整：重新运行 `安装.ps1`。
+- **开始巡逻时游戏窗口选择失败** — 助手不会发送 Alt 键（Alt 是跳跃键），
+  聚焦依靠直接 `SetForegroundWindow`；请在游戏窗口可见时点击开始巡逻。
+- **开始巡逻时角色会跳一下** — 此问题已修复（窗口选择不再按 Alt + 开始
+  缓冲期）；若仍出现，请检查 `patrol_start_grace_seconds` / `alt_transition`
+  设置。
+- **YOLO 提示缺少虚拟环境** — 运行 `安装.ps1 -Yolo`。
 
-## 4. Safety
+## 4. 安全声明
 
-Automation may violate a game server's rules. Use only where permitted.
+自动化可能违反游戏服务器的规则，请仅在允许的场合使用。

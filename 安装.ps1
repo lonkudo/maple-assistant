@@ -1,23 +1,23 @@
-<#
+﻿<#
 .SYNOPSIS
-    Maple Assistant bootstrap installer.
+    Maple 助手 一键安装脚本。
 
 .DESCRIPTION
-    Sets up everything needed to run the Maple Assistant on a fresh Windows
-    machine:
-      1. Finds a Python 3.10-3.12 interpreter (your environment), or installs
-         one automatically (winget, then python.org fallback).
-      2. Creates a local virtual environment (.venv).
-      3. Installs the requirements.
-      4. Creates the launchers (start_assistant.bat / 启动助手.bat).
+    在一台全新的 Windows 电脑上自动完成环境搭建：
+      1. 查找本机已有的 Python 3.10-3.12（优先使用你的环境），
+         找不到时自动下载并安装 Python 3.12（先尝试 winget，失败则从
+         python.org 静默安装）。
+      2. 创建本地虚拟环境 (.venv)。
+      3. 安装依赖库。
+      4. 生成启动器（start_assistant.bat / 启动助手.bat）。
 
-    Optional: pass -Yolo to also create the YOLO detection environment
-    (yolo-detection\venv313, downloads PyTorch - large, several GB).
+    可选：加 -Yolo 参数创建 YOLO 怪物检测环境
+    （yolo-detection\venv313，需要下载 PyTorch，体积较大，约数 GB）。
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File install.ps1
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Yolo
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Python C:\Python312\python.exe
+    powershell -ExecutionPolicy Bypass -File 安装.ps1
+    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo
+    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Python C:\Python312\python.exe
 #>
 param(
     [switch]$Yolo,
@@ -30,19 +30,19 @@ Set-Location $root
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  Maple Assistant installer" -ForegroundColor Cyan
+Write-Host "  Maple 助手 安装程序" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
 function Find-Python {
     <#
-    Return the path of a usable Python 3.10-3.12, or $null.
+    返回可用的 Python 3.10-3.12 解释器路径；找不到返回 $null。
     #>
     if ($Python) {
-        if (-not (Test-Path $Python)) { throw "Python not found at: $Python" }
+        if (-not (Test-Path $Python)) { throw "未找到 Python: $Python" }
         return (Resolve-Path $Python).Path
     }
-    # 1) The py launcher (per-user installs of Python 3.10-3.12).
+    # 1) py 启动器（用户级安装的 Python 3.10-3.12）。
     $py = Get-Command py -ErrorAction SilentlyContinue
     if ($py) {
         foreach ($ver in "3.12", "3.11", "3.10") {
@@ -50,13 +50,13 @@ function Find-Python {
             if ($exe -and (Test-Path $exe)) { return $exe }
         }
     }
-    # 2) python on PATH (only 3.10-3.12, never the WindowsApps stub).
+    # 2) PATH 中的 python（仅 3.10-3.12，忽略 WindowsApps 占位程序）。
     $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
     if ($pythonCmd -and $pythonCmd.Source -notmatch "WindowsApps") {
         $ver = (& $pythonCmd.Source -c "import sys;print('{0}.{1}'.format(*sys.version_info[:2]))" 2>$null)
         if ($ver -match "^(3\.(10|11|12))$") { return $pythonCmd.Source }
     }
-    # 3) Common install locations.
+    # 3) 常见安装位置。
     $candidates = @(
         "$env:LOCALAPPDATA\Programs\Python",
         "$env:ProgramFiles\Python312", "$env:ProgramFiles\Python311",
@@ -75,12 +75,12 @@ function Find-Python {
 
 function Install-Python {
     <#
-    Install Python 3.12 for the current user. Tries winget first, then the
-    python.org silent installer. Returns the installed python.exe path.
+    为当前用户安装 Python 3.12。先尝试 winget，再回退到 python.org
+    静默安装程序。返回安装后的 python.exe 路径。
     #>
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
-        Write-Host "Python not found - installing Python 3.12 via winget..." -ForegroundColor Yellow
+        Write-Host "未找到 Python - 正在通过 winget 安装 Python 3.12..." -ForegroundColor Yellow
         & winget install --id Python.Python.3.12 -e --silent `
             --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0) {
@@ -88,7 +88,7 @@ function Install-Python {
             if (Test-Path $exe) { return $exe }
         }
     }
-    Write-Host "Downloading Python 3.12 from python.org..." -ForegroundColor Yellow
+    Write-Host "正在从 python.org 下载 Python 3.12..." -ForegroundColor Yellow
     $url = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
     $installer = Join-Path $env:TEMP "python-3.12.10-amd64.exe"
     Invoke-WebRequest -Uri $url -OutFile $installer
@@ -96,11 +96,11 @@ function Install-Python {
         "Include_launcher=1 AssociateFiles=0 Shortcuts=0 SimpleInstall=1"
     $process = Start-Process -FilePath $installer -ArgumentList $quietArgs -Wait -PassThru
     if ($process.ExitCode -ne 0) {
-        throw "Python installer exited with code $($process.ExitCode)"
+        throw "Python 安装程序退出码为 $($process.ExitCode)"
     }
     $exe = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
     if (-not (Test-Path $exe)) {
-        throw "Python installed but python.exe not found; install Python 3.10-3.12 and re-run"
+        throw "Python 已安装但找不到 python.exe；请手动安装 Python 3.10-3.12 后重试"
     }
     return $exe
 }
@@ -108,32 +108,32 @@ function Install-Python {
 # ---- 1. Python -------------------------------------------------------------
 $python = Find-Python
 if (-not $python) { $python = Install-Python }
-Write-Host "Using Python: $python" -ForegroundColor Green
-& $python -c "import sys; print('  version:', sys.version.split()[0])"
-if ($LASTEXITCODE -ne 0) { throw "Python check failed" }
+Write-Host "使用 Python: $python" -ForegroundColor Green
+& $python -c "import sys; print('  版本:', sys.version.split()[0])"
+if ($LASTEXITCODE -ne 0) { throw "Python 检查失败" }
 
-# ---- 2. Virtual environment ------------------------------------------------
+# ---- 2. 虚拟环境 ------------------------------------------------------------
 $venvPy = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPy)) {
-    Write-Host "Creating virtual environment .venv ..." -ForegroundColor Yellow
+    Write-Host "正在创建虚拟环境 .venv ..." -ForegroundColor Yellow
     & $python -m venv .venv
-    if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
+    if ($LASTEXITCODE -ne 0) { throw "虚拟环境创建失败" }
 }
-Write-Host "Virtual environment ready."
+Write-Host "虚拟环境已就绪。"
 
-# ---- 3. Requirements --------------------------------------------------------
-Write-Host "Installing requirements (numpy, Pillow, OpenCV, pywin32) ..." -ForegroundColor Yellow
+# ---- 3. 安装依赖 -------------------------------------------------------------
+Write-Host "正在安装依赖 (numpy, Pillow, OpenCV, pywin32) ..." -ForegroundColor Yellow
 & $venvPy -m pip install --upgrade pip
 & $venvPy -m pip install -r requirements.txt
-if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+if ($LASTEXITCODE -ne 0) { throw "pip 安装失败" }
 
-# ---- 4. Launchers -----------------------------------------------------------
+# ---- 4. 生成启动器 ------------------------------------------------------------
 $bat = @"
 @echo off
-rem Maple Assistant launcher - runs the assistant with its virtual env.
+rem Maple 助手启动器 - 使用虚拟环境运行助手。
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-    echo Virtual environment missing. Run install.ps1 first.
+    echo 缺少虚拟环境，请先运行 安装.ps1。
     pause
     exit /b 1
 )
@@ -142,31 +142,31 @@ if errorlevel 1 pause
 "@
 Set-Content -Path "start_assistant.bat" -Value $bat -Encoding ASCII
 Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding Default
-Write-Host "Launchers created: start_assistant.bat / 启动助手.bat" -ForegroundColor Green
+Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -ForegroundColor Green
 
-# ---- 5. Optional YOLO environment -------------------------------------------
+# ---- 5. 可选 YOLO 环境 --------------------------------------------------------
 if ($Yolo) {
     Write-Host ""
-    Write-Host "Setting up the YOLO detection environment (torch - this downloads" -ForegroundColor Yellow
-    Write-Host "several GB and can take a long time) ..." -ForegroundColor Yellow
+    Write-Host "正在创建 YOLO 怪物检测环境（torch - 需要下载" -ForegroundColor Yellow
+    Write-Host "数 GB，耗时较长）..." -ForegroundColor Yellow
     $yoloVenv = Join-Path $root "yolo-detection\venv313\Scripts\python.exe"
     if (-not (Test-Path $yoloVenv)) {
         & $python -m venv "yolo-detection\venv313"
-        if ($LASTEXITCODE -ne 0) { throw "yolo venv creation failed" }
+        if ($LASTEXITCODE -ne 0) { throw "YOLO 虚拟环境创建失败" }
     }
     & $yoloVenv -m pip install --upgrade pip
     & $yoloVenv -m pip install -r "yolo-detection\requirements.txt"
-    if ($LASTEXITCODE -ne 0) { throw "yolo pip install failed" }
-    Write-Host "YOLO environment ready (yolo-detection\venv313)." -ForegroundColor Green
-    Write-Host "Put your trained model at yolo-detection\weights\best.pt" -ForegroundColor Yellow
+    if ($LASTEXITCODE -ne 0) { throw "YOLO pip 安装失败" }
+    Write-Host "YOLO 环境已就绪 (yolo-detection\venv313)。" -ForegroundColor Green
+    Write-Host "请将训练好的模型放到 yolo-detection\weights\best.pt" -ForegroundColor Yellow
 }
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  Installation complete." -ForegroundColor Cyan
-Write-Host "  Run 启动助手.bat (or start_assistant.bat) to start." -ForegroundColor Cyan
+Write-Host "  安装完成。" -ForegroundColor Cyan
+Write-Host "  双击 启动助手.bat（或 start_assistant.bat）即可开始。" -ForegroundColor Cyan
 if (-not $Yolo) {
-    Write-Host "  For YOLO mob detection, re-run with: install.ps1 -Yolo" -ForegroundColor Cyan
+    Write-Host "  如需 YOLO 怪物检测，请重新运行: 安装.ps1 -Yolo" -ForegroundColor Cyan
 }
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
