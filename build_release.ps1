@@ -72,7 +72,21 @@ Write-Host ""
 
 if ($Zip) {
     $zipPath = Join-Path $root "release\MapleAssistant.zip"
-    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal
-    Write-Host "已压缩到 $zipPath" -ForegroundColor Green
+    # Always remove the old zip first (with a retry in case the previous zip
+    # is briefly locked, e.g. by an open Explorer window or antivirus), so a
+    # rebuild never leaves a stale zip behind.
+    if (Test-Path $zipPath) {
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                Remove-Item $zipPath -Force -ErrorAction Stop
+                break
+            } catch {
+                if ($attempt -ge 5) { throw "无法删除旧的压缩包: $zipPath ($($_.Exception.Message))" }
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+    Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal -Force
+    $zipInfo = Get-Item -LiteralPath $zipPath
+    Write-Host "已压缩到 $zipPath ($([math]::Round($zipInfo.Length / 1MB, 1)) MB, $($zipInfo.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))" -ForegroundColor Green
 }
