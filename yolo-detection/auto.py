@@ -163,6 +163,7 @@ class OptimizedMapleBot:
     def __init__(self, config_path: str = "config.yaml"):
         self.config = ConfigManager(config_path)
         self.model = None
+        self._frame_size = None  # (width, height) of the last analysed frame
         self.running = False
         self.paused = False
         self.start_time = None
@@ -274,6 +275,11 @@ class OptimizedMapleBot:
 
         start_time = time.time()
 
+        # 所有几何量都基于真实帧尺寸（截图已是游戏窗口客户区），
+        # 不能使用 config 里的固定 window.default 尺寸。
+        h, w = img.shape[:2]
+        self._frame_size = (w, h)
+
         # 中央區域限制 (僅在畫面中央偵測)
         center_zone = self.config.get('detection_behavior.center_zone', {})
         zone_enabled = bool(center_zone.get('enabled', False))
@@ -285,12 +291,12 @@ class OptimizedMapleBot:
         zone_shift_y = max(-0.5, min(0.5, zone_shift_y))
         zone_w = max(0.1, min(1.0, zone_w))
         zone_h = max(0.1, min(1.0, zone_h))
-        zone_left = int((self.monitor['width'] * (1 - zone_w)) / 2)
-        zone_top = int(self.monitor['height'] * ((1 - zone_h) / 2 + zone_shift_y))
-        zone_right = self.monitor['width'] - zone_left
-        zone_bottom = int(self.monitor['height'] * ((1 + zone_h) / 2 + zone_shift_y))
+        zone_left = int((w * (1 - zone_w)) / 2)
+        zone_top = int(h * ((1 - zone_h) / 2 + zone_shift_y))
+        zone_right = w - zone_left
+        zone_bottom = int(h * ((1 + zone_h) / 2 + zone_shift_y))
         zone_top = max(0, min(zone_top, zone_bottom - 1))
-        zone_bottom = max(zone_top + 1, min(self.monitor['height'], zone_bottom))
+        zone_bottom = max(zone_top + 1, min(h, zone_bottom))
 
         # 只偵測 mob 的開關
         detect_only_mobs = bool(self.config.get('detection_behavior.detect_only_mobs', True))
@@ -302,7 +308,7 @@ class OptimizedMapleBot:
             detections = []
 
             # 計算畫面中心點
-            center_x, center_y = self.monitor['width'] // 2, self.monitor['height'] // 2
+            center_x, center_y = w // 2, h // 2
 
             for result in results:
                 boxes = result.boxes
@@ -415,11 +421,13 @@ class OptimizedMapleBot:
         if self.model is None:
             return None
         try:
+            h, w = img.shape[:2]
+            self._frame_size = (w, h)
             results = self.model(
                 img, conf=self.confidence_threshold, verbose=False
             )
             candidates = []
-            center_x, center_y = self.monitor['width'] // 2, self.monitor['height'] // 2
+            center_x, center_y = w // 2, h // 2
             for result in results:
                 boxes = result.boxes
                 if boxes is None:
@@ -460,8 +468,7 @@ class OptimizedMapleBot:
             previous = (self._char_smoothed.center
                         if self._char_smoothed is not None else None)
             best = self._score_character_candidates(
-                candidates, previous,
-                self.monitor['width'], self.monitor['height'],
+                candidates, previous, w, h,
             )
 
             # Median-smooth the center over recent frames to kill jitter.
@@ -482,7 +489,7 @@ class OptimizedMapleBot:
             return None
 
     def detect_rope(
-        self, img: np.ndarray, min_height: int = 80
+        self, img: np.ndarray, min_height: Optional[int] = None
     ) -> Optional[Detection]:
         """Find the rope (tall narrow environment box) near the character.
 
@@ -490,12 +497,17 @@ class OptimizedMapleBot:
         return the rope-like box whose center X is closest to the character
         (or screen center when the character is not visible).  Used to gate
         the inner-gap jump on the real screen gap instead of the minimap
-        estimate.
+        estimate.  ``min_height`` defaults to ~8% of the frame height so it
+        scales with the window size.
         """
 
         if self.model is None:
             return None
         try:
+            h, w = img.shape[:2]
+            self._frame_size = (w, h)
+            if min_height is None:
+                min_height = max(40, int(h * 0.08))
             results = self.model(
                 img, conf=self.confidence_threshold, verbose=False
             )
@@ -506,7 +518,7 @@ class OptimizedMapleBot:
         char_x = (
             character.center[0]
             if character is not None
-            else self.monitor['width'] // 2
+            else w // 2
         )
         candidates = []
         for result in results:
@@ -564,6 +576,12 @@ class OptimizedMapleBot:
         min_box = float(config.get(
             'detection_behavior.min_mob_box_px', 60.0
         ))
+        # 最小怪物尺寸按窗口宽度自动缩放：界面滑块值以参考宽度 2561px
+        # 校准（默认 60px ≈ 2.3%），小窗口按比例缩小，避免把正常怪物滤掉。
+        frame_w = getattr(self, "_frame_size", None)
+        if frame_w is not None and frame_w[0] > 0:
+            min_box = min_box * frame_w[0] / 2561.0
+        min_box = max(1.0, min_box)
         cx, cy = character.center
         half = max(10.0, float(attack_range) / 2.0)
         attackable = []
