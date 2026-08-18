@@ -1022,6 +1022,30 @@ class UiWorker(threading.Thread):
         proc = self._yolo_process
         if proc is None or proc.poll() is None:
             return
+        # 关闭上一次运行留下的日志句柄。
+        handle = getattr(self, "_yolo_launch_log", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._yolo_launch_log = None
+        # 读取 yolo_launch.log 最后一行，把真实错误显示在界面上。
+        detail = ""
+        log_path = (Path(__file__).resolve().parent
+                    / "yolo-detection" / "yolo_launch.log")
+        try:
+            lines = [ln.rstrip("\r\n") for ln in
+                     log_path.read_text(encoding="utf-8",
+                                        errors="replace").splitlines()
+                     if ln.strip()]
+            if lines:
+                last = lines[-1]
+                if len(last) > 120:
+                    last = last[-120:]
+                detail = " 错误: " + last
+        except Exception:
+            pass
         self._yolo_process = None
         if hasattr(self, "_yolo_run_button"):
             self._yolo_run_button.configure(state="normal")
@@ -1029,11 +1053,11 @@ class UiWorker(threading.Thread):
             self._yolo_stop_button.configure(state="disabled")
         if hasattr(self, "_yolo_status"):
             self._yolo_status.configure(
-                text="YOLO 检测进程已退出（可能缺少依赖）。"
-                     "请运行 安装.ps1 -Yolo 安装 YOLO 依赖。"
+                text=f"YOLO 检测进程已退出 (rc={proc.returncode}){detail}。"
+                     "详见 yolo-detection\\yolo_launch.log。"
             )
-        LOG.warning("yolo detection process exited early (rc=%s)",
-                    proc.returncode)
+        LOG.warning("yolo detection process exited early (rc=%s)%s",
+                    proc.returncode, detail)
 
     def _refresh_automation_status(self) -> None:
         if not hasattr(self, "_automation_status_label"):
@@ -1831,6 +1855,36 @@ class UiWorker(threading.Thread):
         creationflags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows: no console window
             creationflags = subprocess.CREATE_NO_WINDOW
+        # 模型文件检查：界面默认从 yolo-detection\weights\best.pt 加载。
+        weights = yolo_root / "weights" / "best.pt"
+        if not weights.is_file():
+            self._yolo_status.configure(
+                text=f"缺少模型文件: {weights} — 请把训练好的模型"
+                     "（best.pt）放到 yolo-detection\\weights\\ 目录。"
+            )
+            return
+        # 依赖预检：主环境回退时快速确认 torch/ultralytics/mss/cv2 可用
+        # （find_spec 不真正导入，秒级完成）。
+        if using_main_env:
+            try:
+                probe = subprocess.run(
+                    [str(python), "-c",
+                     "import importlib.util as u;print(all("
+                     "u.find_spec(m) is not None for m in "
+                     "('torch','ultralytics','mss','cv2')))"],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=creationflags,
+                )
+                deps_ok = (probe.returncode == 0
+                           and probe.stdout.strip().endswith("True"))
+            except Exception:
+                deps_ok = False
+            if not deps_ok:
+                self._yolo_status.configure(
+                    text="主环境缺少 YOLO 依赖（torch/ultralytics/mss/cv2）。"
+                         "请运行 安装.ps1 -Yolo 安装依赖后重试。"
+                )
+                return
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
         if hasattr(self, "_yolo_fps_var"):
             cmd.extend(["--fps", f"{int(self._yolo_fps_var.get())}"])
@@ -1869,11 +1923,19 @@ class UiWorker(threading.Thread):
                     "--zone-height", f"{zone_h:.2f}"])
         shift_y = max(-0.5, min(0.5, int(self._yolo_zone_shift_y_var.get()) / 100.0))
         cmd.extend(["--zone-shift-y", f"{shift_y:.2f}"])
+        # 把 YOLO 进程的输出（含报错）写入 yolo_launch.log，失败时可排查。
+        launch_log = yolo_root / "yolo_launch.log"
+        try:
+            log_handle = open(launch_log, "wb", buffering=0)
+        except Exception:
+            log_handle = None
+        self._yolo_launch_log = log_handle
         self._yolo_process = subprocess.Popen(
             cmd,
             cwd=str(yolo_root),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT if log_handle is not None
+            else subprocess.DEVNULL,
             creationflags=creationflags,
         )
         self._yolo_run_button.configure(state="disabled")
@@ -1963,6 +2025,13 @@ class UiWorker(threading.Thread):
         proc = self._yolo_process
         if proc is None or proc.poll() is not None:
             self._yolo_process = None
+            handle = getattr(self, "_yolo_launch_log", None)
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                self._yolo_launch_log = None
             self._yolo_run_button.configure(state="normal")
             self._yolo_stop_button.configure(state="disabled")
             self._yolo_status.configure(text="YOLO 检测已停止。")
@@ -1976,6 +2045,13 @@ class UiWorker(threading.Thread):
         except Exception as exc:
             LOG.warning("yolo stop failed: %s", exc)
         self._yolo_process = None
+        handle = getattr(self, "_yolo_launch_log", None)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            self._yolo_launch_log = None
         self._yolo_run_button.configure(state="normal")
         self._yolo_stop_button.configure(state="disabled")
         self._yolo_status.configure(text="YOLO 检测已停止。")
