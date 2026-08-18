@@ -25,6 +25,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PowerShell 7.3+ 会把外部命令的 stderr 当作终止错误（配合上面的 Stop）；
+# 关闭该行为，让 "py: no such version" 之类的探测自然失败并尝试下一个候选，
+# 而不是直接中断安装。
+$PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
@@ -43,18 +47,29 @@ function Find-Python {
         return (Resolve-Path $Python).Path
     }
     # 1) py 启动器（用户级安装的 Python 3.10-3.12）。
+    #    注意：py 探测在没有对应版本时会把 stderr 变成错误记录（配合
+    #    $ErrorActionPreference="Stop" 会直接中断），所以每个探测都要 try/catch，
+    #    失败就尝试下一个候选。
     $py = Get-Command py -ErrorAction SilentlyContinue
     if ($py) {
         foreach ($ver in "3.12", "3.11", "3.10") {
-            $exe = (& py -$ver -c "import sys;print(sys.executable)" 2>$null)
-            if ($exe -and (Test-Path $exe)) { return $exe }
+            try {
+                $exe = (& py -$ver -c "import sys;print(sys.executable)" 2>$null)
+                if ($exe -and (Test-Path $exe)) { return $exe }
+            } catch {
+                # 该版本不存在，尝试下一个。
+            }
         }
     }
     # 2) PATH 中的 python（仅 3.10-3.12，忽略 WindowsApps 占位程序）。
     $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
     if ($pythonCmd -and $pythonCmd.Source -notmatch "WindowsApps") {
-        $ver = (& $pythonCmd.Source -c "import sys;print('{0}.{1}'.format(*sys.version_info[:2]))" 2>$null)
-        if ($ver -match "^(3\.(10|11|12))$") { return $pythonCmd.Source }
+        try {
+            $ver = (& $pythonCmd.Source -c "import sys;print('{0}.{1}'.format(*sys.version_info[:2]))" 2>$null)
+            if ($ver -match "^(3\.(10|11|12))$") { return $pythonCmd.Source }
+        } catch {
+            # 该 python 无法运行或版本不符，继续。
+        }
     }
     # 3) 常见安装位置。
     $candidates = @(
@@ -128,12 +143,12 @@ Write-Host "正在安装依赖 (numpy, Pillow, OpenCV, pywin32) ..." -Foreground
 if ($LASTEXITCODE -ne 0) { throw "pip 安装失败" }
 
 # ---- 4. 生成启动器 ------------------------------------------------------------
+# 启动器内容必须为纯 ASCII：cmd 会用系统代码页解码 .bat，中文会乱码并破坏语法。
 $bat = @"
 @echo off
-rem Maple 助手启动器 - 使用虚拟环境运行助手。
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-    echo 缺少虚拟环境，请先运行 安装.ps1。
+    echo Virtual environment missing. Run install.bat first.
     pause
     exit /b 1
 )
@@ -141,7 +156,7 @@ if not exist ".venv\Scripts\python.exe" (
 if errorlevel 1 pause
 "@
 Set-Content -Path "start_assistant.bat" -Value $bat -Encoding ASCII
-Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding Default
+Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding ASCII
 Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -ForegroundColor Green
 
 # ---- 5. 可选 YOLO 环境 --------------------------------------------------------
