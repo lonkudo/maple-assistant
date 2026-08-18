@@ -504,6 +504,15 @@ class StatusConfig:
     mp_ratio_threshold: float = 0.3
     hp_enabled: bool = True
     mp_enabled: bool = True
+    # Periodic buff keys (the two extra Drug panel rows): the bound key is
+    # tapped on a TIMER (``buffN_interval`` seconds, default 10 minutes)
+    # instead of a bar-ratio threshold.  Disabled or empty keys never fire.
+    buff1_key: str = "home"
+    buff2_key: str = "insert"
+    buff1_interval: float = 600.0
+    buff2_interval: float = 600.0
+    buff1_enabled: bool = False
+    buff2_enabled: bool = False
     # Approximate full bar length; accepted candidates may vary substantially.
     # The observed 2560x1600 client scales to a 1707px-wide capture where each
     # fill is about 131px (131/1707 ~= 0.077).
@@ -613,6 +622,8 @@ class StatusWorker(threading.Thread):
         self.status_state_path = status_state_path
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
+        # Monotonic timestamps of the last periodic buff tap (per buff row).
+        self._last_buff = {"buff1": float("-inf"), "buff2": float("-inf")}
 
     def _check_resource(self, name: str, ratio: Optional[float],
                         threshold_ratio: float, key: str, now: float) -> None:
@@ -630,7 +641,33 @@ class StatusWorker(threading.Thread):
                 LOG.warning("%s=%.0f%% below %.0f%%: used %s", name.upper(),
                             ratio * 100, threshold_ratio * 100, key)
 
+    def _check_buffs(self, now: float) -> None:
+        """Tap the periodic buff keys when their timer elapses.
+
+        Time-based (unlike the HP/MP potions), so this runs before the
+        bar-confidence gate: the bound key is sent every ``buffN_interval``
+        seconds while automation is active (the run loop already gates on the
+        automation event).
+        """
+
+        config = self.detector.config
+        for name, key, interval, enabled in (
+            ("buff1", config.buff1_key, config.buff1_interval,
+             config.buff1_enabled),
+            ("buff2", config.buff2_key, config.buff2_interval,
+             config.buff2_enabled),
+        ):
+            if not enabled or not key or interval <= 0:
+                continue
+            if now - self._last_buff[name] < interval:
+                continue
+            if self.key_sender.tap(key):
+                self._last_buff[name] = now
+                LOG.warning("%s refresh: tapped %s (every %.0fs)",
+                            name.upper(), key, interval)
+
     def _process_frame(self, frame: object) -> None:
+        self._check_buffs(time.monotonic())
         status_image = getattr(frame, "status_image", None)
         if hasattr(frame, "status_image"):
             if status_image is None:
@@ -709,15 +746,19 @@ class StatusWorker(threading.Thread):
 def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
     """Return a copy of ``config`` with the drug panel settings applied.
 
-    ``data`` uses the UI's form: key names and integer percents (0..100) for
-    ``hp_threshold``/``mp_threshold``.  Unsupported or unknown keys are
-    ignored (the existing binding stays).
+    ``data`` uses the UI's form: key names, integer percents (0..100) for
+    ``hp_threshold``/``mp_threshold``, and MINUTES for the periodic buff
+    ``buff1_interval``/``buff2_interval`` (converted to seconds).  Unsupported
+    or unknown keys are ignored (the existing binding stays).
     """
 
     kwargs: dict[str, object] = {}
     for field_name, data_key in (
         ("hp_key", "hp_key"), ("mp_key", "mp_key"),
         ("hp_enabled", "hp_enabled"), ("mp_enabled", "mp_enabled"),
+        ("buff1_key", "buff1_key"), ("buff2_key", "buff2_key"),
+        ("buff1_enabled", "buff1_enabled"),
+        ("buff2_enabled", "buff2_enabled"),
     ):
         if data_key not in data:
             continue
@@ -740,6 +781,18 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         except (TypeError, ValueError):
             continue
         kwargs[field_name] = float(np.clip(percent, 0.0, 100.0)) / 100.0
+    # Periodic buff timers: UI sends minutes, the worker compares seconds.
+    for field_name, data_key in (
+        ("buff1_interval", "buff1_interval"),
+        ("buff2_interval", "buff2_interval"),
+    ):
+        if data_key not in data:
+            continue
+        try:
+            minutes = float(data[data_key])
+        except (TypeError, ValueError):
+            continue
+        kwargs[field_name] = max(0.0, minutes * 60.0)
     return replace(config, **kwargs)
 
 

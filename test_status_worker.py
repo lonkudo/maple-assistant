@@ -126,6 +126,62 @@ class StatusTests(unittest.TestCase):
         unchanged = apply_drug_settings(config, {"hp_key": "q"})
         self.assertEqual(unchanged.hp_key, config.hp_key)
 
+    def test_apply_drug_settings_maps_buff_keys_intervals_and_enabled(self) -> None:
+        config = StatusConfig()
+        updated = apply_drug_settings(config, {
+            "buff1_key": "home", "buff2_key": "space",
+            "buff1_interval": 10.0, "buff2_interval": 5.5,
+            "buff1_enabled": True, "buff2_enabled": True,
+        })
+        self.assertEqual(updated.buff1_key, "home")
+        self.assertEqual(updated.buff2_key, "space")
+        # Minutes in the UI form become seconds in the worker config.
+        self.assertAlmostEqual(updated.buff1_interval, 600.0)
+        self.assertAlmostEqual(updated.buff2_interval, 330.0)
+        self.assertTrue(updated.buff1_enabled)
+        self.assertTrue(updated.buff2_enabled)
+        # Unbindable key and malformed interval are ignored: defaults stay.
+        ignored = apply_drug_settings(config, {
+            "buff1_key": "q", "buff2_interval": "oops",
+        })
+        self.assertEqual(ignored.buff1_key, config.buff1_key)
+        self.assertEqual(ignored.buff2_interval, config.buff2_interval)
+
+    def test_periodic_buff_taps_on_interval_timer(self) -> None:
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event())
+        worker.detector.config = replace(
+            worker.detector.config,
+            buff1_key="home", buff1_interval=60.0, buff1_enabled=True,
+            buff2_key="insert", buff2_interval=60.0, buff2_enabled=True,
+        )
+        # Buffs are time-based: they fire even with full bars (no potions).
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, ["home", "insert"])
+        # Interval not elapsed yet: no repeat.
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, ["home", "insert"])
+        # Backdate both timers: next frame refreshes both buffs again.
+        worker._last_buff["buff1"] = time.monotonic() - 61.0
+        worker._last_buff["buff2"] = time.monotonic() - 61.0
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, ["home", "insert", "home", "insert"])
+
+    def test_disabled_or_unbound_buff_never_taps(self) -> None:
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event())
+        # Defaults: both buff rows disabled -> nothing fires.
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, [])
+        # Enabled but empty keys still never fire.
+        worker.detector.config = replace(
+            worker.detector.config,
+            buff1_key="", buff2_key="",
+            buff1_enabled=True, buff2_enabled=True,
+        )
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, [])
+
     def test_new_scan_codes_cover_potion_keys(self) -> None:
         sender = WindowKeySender("game")
         for key in ("1", "9", "q", "m", "f1", "f12", "end",

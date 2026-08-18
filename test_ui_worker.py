@@ -727,6 +727,111 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertIn(["disabled"], loader._shutdown_slider.states)
                 self.assertIn("disabled", loader._shutdown_status.text)
 
+    def test_drug_buff_rows_roundtrip_and_apply_to_status_worker(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from status_worker import StatusConfig
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str = None, style: str = None) -> None:
+                if text is not None:
+                    self.text = text
+
+        class FakeStatusWorker:
+            def __init__(self) -> None:
+                self.detector = type("Detector", (), {"config": StatusConfig()})()
+
+        def make_worker() -> UiWorker:
+            w = UiWorker.__new__(UiWorker)
+            w.status_worker = FakeStatusWorker()
+            w._hp_threshold_label = Label()
+            w._mp_threshold_label = Label()
+            w._hp_key_button = Button()
+            w._mp_key_button = Button()
+            w._buff1_interval_label = Label()
+            w._buff2_interval_label = Label()
+            w._buff1_key_button = Button()
+            w._buff2_key_button = Button()
+            w._hp_key_var = Var("delete")
+            w._mp_key_var = Var("end")
+            w._hp_threshold_var = Var(50)
+            w._mp_threshold_var = Var(30)
+            w._hp_use_var = Var(True)
+            w._mp_use_var = Var(True)
+            w._buff1_key_var = Var("home")
+            w._buff2_key_var = Var("insert")
+            w._buff1_interval_var = Var(10.0)
+            w._buff2_interval_var = Var(10.0)
+            w._buff1_use_var = Var(False)
+            w._buff2_use_var = Var(False)
+            w._drug_status = Label()
+            return w
+
+        with tempfile.TemporaryDirectory() as directory:
+            worker = make_worker()
+            worker._buff1_use_var.set(True)
+            worker._buff1_interval_var.set(12.5)
+            worker._buff1_key_var.set("pagedown")
+            worker._buff2_use_var.set(True)
+
+            def fake_path(self):
+                return Path(directory) / "drug_settings.json"
+
+            with mock.patch.object(UiWorker, "_drug_settings_path", fake_path):
+                worker._drug_on_change()
+                saved = Path(directory) / "drug_settings.json"
+                self.assertTrue(saved.is_file())
+                data = json.loads(saved.read_text(encoding="utf-8"))
+                self.assertTrue(data["buff1_enabled"])
+                self.assertEqual(data["buff1_interval"], 12.5)
+                self.assertEqual(data["buff1_key"], "pagedown")
+                self.assertTrue(data["buff2_enabled"])
+                # Applied LIVE to the status worker detector config.
+                config = worker.status_worker.detector.config
+                self.assertTrue(config.buff1_enabled)
+                self.assertAlmostEqual(config.buff1_interval, 750.0)
+                self.assertEqual(config.buff1_key, "pagedown")
+                self.assertIn("Buff1", worker._drug_status.text)
+                self.assertIn("12.5min", worker._drug_status.text)
+
+                loader = make_worker()
+                with mock.patch.object(UiWorker, "_drug_settings_path",
+                                       fake_path):
+                    loader._drug_load_settings()
+                self.assertTrue(loader._buff1_use_var.get())
+                self.assertEqual(loader._buff1_interval_var.get(), 12.5)
+                self.assertEqual(loader._buff1_key_var.get(), "pagedown")
+                self.assertTrue(loader._buff2_use_var.get())
+                self.assertTrue(
+                    loader.status_worker.detector.config.buff1_enabled
+                )
+                self.assertEqual(
+                    loader._buff1_interval_label.text, "12.5min"
+                )
+
     def test_player_check_selection_persists_and_applies_to_mover(self) -> None:
         import json
         import tempfile

@@ -794,6 +794,80 @@ class UiWorker(threading.Thread):
                                      expand=True, padx=(8, 8))
             self._mp_threshold_label = ttk.Label(mp_row, text="30%", width=6)
             self._mp_threshold_label.pack(side="left")
+            # Periodic buff rows: a bound key tapped on a timer.  Each row has
+            # its own "every N minutes" slider (default 10 min) that decides
+            # when the key is triggered.  Unlike HP/MP these are time-based,
+            # not bar-percent based.
+            buff1_row = ttk.Frame(drug_panel)
+            buff1_row.pack(fill="x", pady=(6, 0))
+            self._buff1_use_var = tk.BooleanVar(value=False)
+            buff1_use_button = ttk.Checkbutton(
+                buff1_row, text="Buff 1", variable=self._buff1_use_var,
+                command=self._drug_on_change,
+            )
+            buff1_use_button.pack(side="left")
+            ttk.Label(buff1_row, text="Key:").pack(side="left", padx=(8, 4))
+            self._buff1_key_var = tk.StringVar(value="home")
+            buff1_key_button = ttk.Button(
+                buff1_row, text=self._buff1_key_var.get(), width=14,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    buff1_key_button, self._buff1_key_var,
+                    "_buff1_key_previous",
+                    lambda: self._drug_on_change(),
+                ),
+            )
+            buff1_key_button.pack(side="left", padx=(0, 10))
+            self._buff1_key_button = buff1_key_button
+            ttk.Label(buff1_row, text="every").pack(side="left")
+            # Buff refresh period in minutes (default 10): horizontal slider
+            # in the same progress-bar style as the other panels.
+            self._buff1_interval_var = tk.DoubleVar(value=10.0)
+            buff1_interval_slider = ttk.Scale(
+                buff1_row, from_=0.5, to=30.0, orient="horizontal",
+                variable=self._buff1_interval_var,
+                command=self._drug_on_change,
+            )
+            buff1_interval_slider.pack(side="left", fill="x",
+                                       expand=True, padx=(8, 8))
+            self._buff1_interval_label = ttk.Label(
+                buff1_row, text="10.0min", width=8
+            )
+            self._buff1_interval_label.pack(side="left")
+            buff2_row = ttk.Frame(drug_panel)
+            buff2_row.pack(fill="x", pady=(6, 0))
+            self._buff2_use_var = tk.BooleanVar(value=False)
+            buff2_use_button = ttk.Checkbutton(
+                buff2_row, text="Buff 2", variable=self._buff2_use_var,
+                command=self._drug_on_change,
+            )
+            buff2_use_button.pack(side="left")
+            ttk.Label(buff2_row, text="Key:").pack(side="left", padx=(8, 4))
+            self._buff2_key_var = tk.StringVar(value="insert")
+            buff2_key_button = ttk.Button(
+                buff2_row, text=self._buff2_key_var.get(), width=14,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    buff2_key_button, self._buff2_key_var,
+                    "_buff2_key_previous",
+                    lambda: self._drug_on_change(),
+                ),
+            )
+            buff2_key_button.pack(side="left", padx=(0, 10))
+            self._buff2_key_button = buff2_key_button
+            ttk.Label(buff2_row, text="every").pack(side="left")
+            self._buff2_interval_var = tk.DoubleVar(value=10.0)
+            buff2_interval_slider = ttk.Scale(
+                buff2_row, from_=0.5, to=30.0, orient="horizontal",
+                variable=self._buff2_interval_var,
+                command=self._drug_on_change,
+            )
+            buff2_interval_slider.pack(side="left", fill="x",
+                                       expand=True, padx=(8, 8))
+            self._buff2_interval_label = ttk.Label(
+                buff2_row, text="10.0min", width=8
+            )
+            self._buff2_interval_label.pack(side="left")
             self._drug_status = ttk.Label(
                 drug_panel, text="Drug panel ready.", justify="left"
             )
@@ -1344,6 +1418,18 @@ class UiWorker(threading.Thread):
             self._hp_key_button.configure(text=self._hp_key_var.get())
         if hasattr(self, "_mp_key_button"):
             self._mp_key_button.configure(text=self._mp_key_var.get())
+        if hasattr(self, "_buff1_interval_label"):
+            self._buff1_interval_label.configure(
+                text=f"{self._buff1_interval_var.get():.1f}min"
+            )
+        if hasattr(self, "_buff2_interval_label"):
+            self._buff2_interval_label.configure(
+                text=f"{self._buff2_interval_var.get():.1f}min"
+            )
+        if hasattr(self, "_buff1_key_button"):
+            self._buff1_key_button.configure(text=self._buff1_key_var.get())
+        if hasattr(self, "_buff2_key_button"):
+            self._buff2_key_button.configure(text=self._buff2_key_var.get())
         data = {
             "hp_key": self._hp_key_var.get().strip(),
             "mp_key": self._mp_key_var.get().strip(),
@@ -1351,6 +1437,12 @@ class UiWorker(threading.Thread):
             "mp_threshold": mp_percent,
             "hp_enabled": bool(self._hp_use_var.get()),
             "mp_enabled": bool(self._mp_use_var.get()),
+            "buff1_key": self._buff1_key_var.get().strip(),
+            "buff2_key": self._buff2_key_var.get().strip(),
+            "buff1_interval": round(float(self._buff1_interval_var.get()), 1),
+            "buff2_interval": round(float(self._buff2_interval_var.get()), 1),
+            "buff1_enabled": bool(self._buff1_use_var.get()),
+            "buff2_enabled": bool(self._buff2_use_var.get()),
         }
         self._drug_save_settings(data)
         self._drug_apply_to_worker(data)
@@ -1377,6 +1469,18 @@ class UiWorker(threading.Thread):
                 self._hp_use_var.set(bool(data["hp_enabled"]))
             if "mp_enabled" in data:
                 self._mp_use_var.set(bool(data["mp_enabled"]))
+            if "buff1_key" in data:
+                self._buff1_key_var.set(str(data["buff1_key"]))
+            if "buff2_key" in data:
+                self._buff2_key_var.set(str(data["buff2_key"]))
+            if "buff1_interval" in data:
+                self._buff1_interval_var.set(float(data["buff1_interval"]))
+            if "buff2_interval" in data:
+                self._buff2_interval_var.set(float(data["buff2_interval"]))
+            if "buff1_enabled" in data:
+                self._buff1_use_var.set(bool(data["buff1_enabled"]))
+            if "buff2_enabled" in data:
+                self._buff2_use_var.set(bool(data["buff2_enabled"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed drug settings", exc_info=True)
             return
@@ -1410,7 +1514,13 @@ class UiWorker(threading.Thread):
                     f"Drug: HP<{data['hp_threshold']}% key={data['hp_key']} "
                     f"({'on' if data['hp_enabled'] else 'off'}) | "
                     f"MP<{data['mp_threshold']}% key={data['mp_key']} "
-                    f"({'on' if data['mp_enabled'] else 'off'})"
+                    f"({'on' if data['mp_enabled'] else 'off'})\n"
+                    f"Buff1: key={data['buff1_key']} every "
+                    f"{data['buff1_interval']}min "
+                    f"({'on' if data['buff1_enabled'] else 'off'}) | "
+                    f"Buff2: key={data['buff2_key']} every "
+                    f"{data['buff2_interval']}min "
+                    f"({'on' if data['buff2_enabled'] else 'off'})"
                 )
             )
         except Exception as exc:
