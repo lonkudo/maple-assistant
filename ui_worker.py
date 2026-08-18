@@ -414,10 +414,11 @@ class UiWorker(threading.Thread):
             self._root = root
             root.title("Maple 助手 调试界面")
             screen_width = root.winfo_screenwidth()
-            # 窗口固定在屏幕左上角 (0,0) 打开。
-            window_height = 1600
-            root.geometry(f"700x{window_height}+0+0")
-            root.minsize(520, 560)
+            # 窗口固定在屏幕左上角 (0,0) 打开。两列布局：左侧巡逻/攻击/药品/
+            # 附加功能，右侧 YOLO 怪物检测 + 调试日志，避免窗口过高。
+            window_height = 740
+            root.geometry(f"1200x{window_height}+0+0")
+            root.minsize(980, 560)
             root.protocol("WM_DELETE_WINDOW", root.destroy)
             root.attributes("-topmost", True)
             root.after(1500, lambda: root.attributes("-topmost", False))
@@ -428,7 +429,14 @@ class UiWorker(threading.Thread):
             title.pack(anchor="w")
             ttk.Label(container, text="OpenCV 小地图检测 · 巡逻控制").pack(anchor="w")
 
-            controls = ttk.LabelFrame(container, text="图层校准与巡逻", padding=10)
+            columns = ttk.Frame(container)
+            columns.pack(fill="both", expand=True, pady=(8, 0))
+            col1 = ttk.Frame(columns)
+            col1.pack(side="left", fill="both", expand=True, padx=(0, 6))
+            col2 = ttk.Frame(columns)
+            col2.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+            controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=10)
             controls.pack(fill="x", pady=(12, 8))
             style = ttk.Style(root)
             style.configure("Locked.TButton", foreground="#777777")
@@ -470,14 +478,14 @@ class UiWorker(threading.Thread):
 
             # Detection info panel: hidden by default (kept for future use).
             if self._SHOW_DETECTION_INFO:
-                info = ttk.LabelFrame(container, text="检测", padding=10)
+                info = ttk.LabelFrame(col1, text="检测", padding=10)
                 info.pack(fill="x", pady=(0, 8))
                 self._info_label = ttk.Label(
                     info, text="等待第一帧…", justify="left"
                 )
                 self._info_label.pack(anchor="w")
 
-            yolo_panel = ttk.LabelFrame(container, text="YOLO 怪物检测", padding=10)
+            yolo_panel = ttk.LabelFrame(col2, text="YOLO 怪物检测", padding=10)
             yolo_panel.pack(fill="x", pady=(0, 8))
             # Reference kept so the Fixed Attack panel can grey this whole
             # panel out when the fixed-rate mode is selected.
@@ -671,7 +679,7 @@ class UiWorker(threading.Thread):
             # fixed mode greys out the YOLO panel; the fixed worker lives in
             # the assistant process (AttackWorker) and is applied live.
             fixed_panel = ttk.LabelFrame(
-                container, text="固定攻击", padding=10
+                col1, text="固定攻击", padding=10
             )
             fixed_panel.pack(fill="x", pady=(0, 8))
             mode_row = ttk.Frame(fixed_panel)
@@ -732,7 +740,7 @@ class UiWorker(threading.Thread):
             # The StatusWorker taps the bound key when the bar ratio drops
             # below the chosen percent (debounced by frames + cooldown).
             drug_panel = ttk.LabelFrame(
-                container, text="药品 (HP/MP 药水)", padding=10
+                col1, text="药品 (HP/MP 药水)", padding=10
             )
             drug_panel.pack(fill="x", pady=(0, 8))
             hp_row = ttk.Frame(drug_panel)
@@ -883,7 +891,7 @@ class UiWorker(threading.Thread):
             # the game gets Alt+F4, the worker verifies the window is gone,
             # then every worker is stopped.
             extra_panel = ttk.LabelFrame(
-                container, text="附加功能", padding=10
+                col1, text="附加功能", padding=10
             )
             extra_panel.pack(fill="x", pady=(0, 8))
             shutdown_row = ttk.Frame(extra_panel)
@@ -940,14 +948,14 @@ class UiWorker(threading.Thread):
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
             if self._SHOW_MINIMAP_PREVIEW:
-                ttk.Label(container, text="检测到的小地图").pack(anchor="w")
-                self._minimap_label = ttk.Label(container)
+                ttk.Label(col1, text="检测到的小地图").pack(anchor="w")
+                self._minimap_label = ttk.Label(col1)
                 self._minimap_label.pack(anchor="w", pady=(4, 10))
-                ttk.Label(container, text="地图名称区域").pack(anchor="w")
-                self._map_name_label = ttk.Label(container)
+                ttk.Label(col1, text="地图名称区域").pack(anchor="w")
+                self._map_name_label = ttk.Label(col1)
                 self._map_name_label.pack(anchor="w", pady=(4, 0))
 
-            debug_frame = ttk.LabelFrame(container, text="调试日志", padding=6)
+            debug_frame = ttk.LabelFrame(col2, text="调试日志", padding=6)
             debug_frame.pack(fill="both", expand=True, pady=(10, 0))
             self._log_text = tk.Text(
                 debug_frame,
