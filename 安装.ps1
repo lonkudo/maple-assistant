@@ -169,12 +169,23 @@ Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -Foregro
 # ---- 5. 可选 YOLO 环境 --------------------------------------------------------
 if ($Yolo) {
     Write-Host ""
-    Write-Host "正在安装 YOLO 怪物检测依赖（torch - 需要下载" -ForegroundColor Yellow
-    Write-Host "数 GB，耗时较长）到主环境 .venv ..." -ForegroundColor Yellow
+    Write-Host "正在安装 YOLO 怪物检测依赖到主环境 .venv ..." -ForegroundColor Yellow
+    Write-Host "（先安装 CPU 版 PyTorch，下载约 200MB；CUDA 版约 2.5GB）" -ForegroundColor Yellow
     & $venvPy -m pip install --upgrade pip
-    & $venvPy -m pip install -r "yolo-detection\requirements.txt"
-    if ($LASTEXITCODE -ne 0) { throw "YOLO pip 安装失败" }
-    Write-Host "YOLO 环境已就绪（直接使用主环境 Python，无需单独的 venv313）。" -ForegroundColor Green
+    # CPU 版 torch/torchvision：检测用 CPU 推理足够（device: auto 会自动选）。
+    & $venvPy -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+    if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
+    # 其余依赖：跳过 torch/torchvision 行（已装 CPU 版，避免被覆盖成 CUDA 版）。
+    # 保留 opencv-python（显示检测画面需要 GUI 版 cv2.imshow）。
+    $reqs = Get-Content "yolo-detection\requirements.txt" | Where-Object {
+        $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*(torch|torchvision)\b'
+    }
+    $filtered = Join-Path $env:TEMP "yolo_reqs_filtered.txt"
+    [System.IO.File]::WriteAllLines($filtered, $reqs, [System.Text.Encoding]::ASCII)
+    & $venvPy -m pip install -r $filtered
+    if ($LASTEXITCODE -ne 0) { throw "YOLO 依赖安装失败" }
+    Remove-Item $filtered -ErrorAction SilentlyContinue
+    Write-Host "YOLO 环境已就绪（主环境 .venv，无需单独的 venv313）。" -ForegroundColor Green
     Write-Host "请将训练好的模型放到 yolo-detection\weights\best.pt" -ForegroundColor Yellow
 }
 
