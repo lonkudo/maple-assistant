@@ -166,7 +166,8 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  安装完成。" -ForegroundColor Cyan
 Write-Host "  双击 启动助手.bat（或 start_assistant.bat）即可开始。" -ForegroundColor Cyan
 if (-not $Yolo) {
-    Write-Host "  如需 YOLO 怪物检测，请重新运行: 安装.ps1 -Yolo" -ForegroundColor Cyan
+    Write-Host "  如需 YOLO 怪物检测，请重新双击 安装.bat 并加 -Yolo 参数：" -ForegroundColor Cyan
+    Write-Host "    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo" -ForegroundColor Cyan
 }
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""

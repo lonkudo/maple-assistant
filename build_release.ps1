@@ -65,10 +65,9 @@ Write-Host "已复制 $($files.Count) 个文件 ($totalMB MB)。" -ForegroundCol
 Write-Host ""
 Write-Host "发布方法:"
 Write-Host "  1. 将 $OutDir 文件夹压缩为 zip"
-Write-Host "  2. 接收方解压后运行:"
-Write-Host "       powershell -ExecutionPolicy Bypass -File 安装.ps1"
-Write-Host "     （需要怪物检测时加 -Yolo 参数）"
-Write-Host "  3. 然后双击 启动助手.bat 即可开始。" -ForegroundColor Cyan
+Write-Host "  2. 接收方解压后双击 安装.bat 即可自动安装"
+Write-Host "     （需要怪物检测时: 安装.ps1 -Yolo）"
+Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundColor Cyan
 Write-Host ""
 
 if ($Zip) {
