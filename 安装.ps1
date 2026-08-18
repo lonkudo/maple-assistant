@@ -169,17 +169,12 @@ Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -Foregro
 # ---- 5. 可选 YOLO 环境 --------------------------------------------------------
 if ($Yolo) {
     Write-Host ""
-    Write-Host "正在创建 YOLO 怪物检测环境（torch - 需要下载" -ForegroundColor Yellow
-    Write-Host "数 GB，耗时较长）..." -ForegroundColor Yellow
-    $yoloVenv = Join-Path $root "yolo-detection\venv313\Scripts\python.exe"
-    if (-not (Test-Path $yoloVenv)) {
-        & $python -m venv "yolo-detection\venv313"
-        if ($LASTEXITCODE -ne 0) { throw "YOLO 虚拟环境创建失败" }
-    }
-    & $yoloVenv -m pip install --upgrade pip
-    & $yoloVenv -m pip install -r "yolo-detection\requirements.txt"
+    Write-Host "正在安装 YOLO 怪物检测依赖（torch - 需要下载" -ForegroundColor Yellow
+    Write-Host "数 GB，耗时较长）到主环境 .venv ..." -ForegroundColor Yellow
+    & $venvPy -m pip install --upgrade pip
+    & $venvPy -m pip install -r "yolo-detection\requirements.txt"
     if ($LASTEXITCODE -ne 0) { throw "YOLO pip 安装失败" }
-    Write-Host "YOLO 环境已就绪 (yolo-detection\venv313)。" -ForegroundColor Green
+    Write-Host "YOLO 环境已就绪（直接使用主环境 Python，无需单独的 venv313）。" -ForegroundColor Green
     Write-Host "请将训练好的模型放到 yolo-detection\weights\best.pt" -ForegroundColor Yellow
 }
 

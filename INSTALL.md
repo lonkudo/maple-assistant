@@ -16,8 +16,8 @@
    - 自动生成两个启动器：**`start_assistant.bat`** 和 **`启动助手.bat`**。
 3. 可选：YOLO 怪物检测（需下载数 GB 的 PyTorch）：
    `powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo`
-   - 创建 `yolo-detection\venv313`（界面期望的固定路径）并安装
-     torch/ultralytics。
+   - 依赖会安装到**主环境 `.venv`**（与你用的 Python 3.10–3.12 相同），
+     不再需要单独的 `venv313`。
    - 把训练好的模型放到 `yolo-detection\weights\best.pt`。
 4. 双击 **`启动助手.bat`** 启动。游戏窗口在前台时点击 **开始巡逻** 即可。
    - 首次启动会弹出 **UAC 管理员权限确认**，请点击「是」——助手需要与游戏
@@ -69,7 +69,9 @@
 - **能看到按键事件但角色不动** — 权限不一致：助手以管理员运行时，游戏也必须
   「以管理员身份运行」。启动助手.bat 会自动弹出 UAC 确认；若游戏未以管理员
   运行，注入的按键会被系统丢弃。
-- **YOLO 提示缺少虚拟环境** — 运行 `安装.ps1 -Yolo`。
+- **YOLO 提示缺少运行环境** — 运行 `安装.ps1 -Yolo`（装到主环境 .venv，
+  无需单独的 venv313；界面会自动使用主环境 Python 启动 YOLO）。
+- **YOLO 进程启动后很快退出** — 多半是依赖没装全，请运行 `安装.ps1 -Yolo`。
 
 ## 4. 安全声明
 

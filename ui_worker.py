@@ -8,6 +8,7 @@ import json
 import logging
 import queue
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1013,7 +1014,26 @@ class UiWorker(threading.Thread):
         self._drain_logs()
         self._refresh_automation_status()
         self._refresh_shutdown_status()
+        self._poll_yolo_exit()
         root.after(self.refresh_ms, self._poll)
+
+    def _poll_yolo_exit(self) -> None:
+        """Detect a YOLO subprocess that died silently (usually missing deps)."""
+        proc = self._yolo_process
+        if proc is None or proc.poll() is None:
+            return
+        self._yolo_process = None
+        if hasattr(self, "_yolo_run_button"):
+            self._yolo_run_button.configure(state="normal")
+        if hasattr(self, "_yolo_stop_button"):
+            self._yolo_stop_button.configure(state="disabled")
+        if hasattr(self, "_yolo_status"):
+            self._yolo_status.configure(
+                text="YOLO 检测进程已退出（可能缺少依赖）。"
+                     "请运行 安装.ps1 -Yolo 安装 YOLO 依赖。"
+            )
+        LOG.warning("yolo detection process exited early (rc=%s)",
+                    proc.returncode)
 
     def _refresh_automation_status(self) -> None:
         if not hasattr(self, "_automation_status_label"):
@@ -1791,7 +1811,6 @@ class UiWorker(threading.Thread):
             self._yolo_threshold_var.set(0.4)
             threshold = 0.4
         yolo_root = Path(__file__).resolve().parent / "yolo-detection"
-        python = yolo_root / "venv313" / "Scripts" / "python.exe"
         script = yolo_root / "live_view.py"
         if not script.is_file():
             self._yolo_status.configure(
@@ -1799,12 +1818,14 @@ class UiWorker(threading.Thread):
                      "请确认整个文件夹已完整解压。"
             )
             return
+        python = yolo_root / "venv313" / "Scripts" / "python.exe"
+        using_main_env = False
         if not python.is_file():
-            self._yolo_status.configure(
-                text="未安装 YOLO 运行环境（缺少 venv313）。"
-                     "请双击 安装.bat 并在命令行执行 安装.ps1 -Yolo 安装。"
-            )
-            return
+            # 回退：直接使用助手当前的主环境 Python（安装.ps1 -Yolo
+            # 会把 YOLO 依赖装进 .venv，即 Python 3.10-3.12），
+            # 不再要求单独的 venv313。
+            python = Path(sys.executable)
+            using_main_env = True
         import subprocess
 
         creationflags = 0
@@ -1860,8 +1881,9 @@ class UiWorker(threading.Thread):
         mode = "显示画面" if self._yolo_show_var.get() else "无窗口"
         attack = ("自动攻击已开" if hasattr(self, "_yolo_attack_var")
                   and self._yolo_attack_var.get() else "攻击已关")
+        env_hint = "（主环境）" if using_main_env else ""
         self._yolo_status.configure(
-            text=f"YOLO 检测运行中 ({mode}, {attack}, "
+            text=f"YOLO 检测运行中 {env_hint}({mode}, {attack}, "
                  f"阈值 {threshold:.2f})。点击停止以结束。"
         )
         LOG.info("yolo detection started threshold=%.2f show=%s pid=%s",
