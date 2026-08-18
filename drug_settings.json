@@ -5,10 +5,10 @@
   "mp_threshold": 30,
   "hp_enabled": true,
   "mp_enabled": true,
-  "buff1_key": "home",
+  "buff1_key": "insert",
   "buff2_key": "insert",
-  "buff1_interval": 10.0,
+  "buff1_interval": 9.0,
   "buff2_interval": 10.0,
-  "buff1_enabled": false,
+  "buff1_enabled": true,
   "buff2_enabled": false
 }
