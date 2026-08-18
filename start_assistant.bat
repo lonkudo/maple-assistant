@@ -8,7 +8,7 @@ if errorlevel 1 (
 )
 cd /d "%~dp0"
 if not exist ".venv\Scripts\pythonw.exe" (
-    echo Virtual environment missing. Run install.bat first.
+    echo Virtual environment missing. Run the setup first.
     pause
     exit /b 1
 )

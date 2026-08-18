@@ -392,6 +392,7 @@ class UiWorker(threading.Thread):
         self.log_queue = log_queue
         self.automation_active_event = automation_active_event
         self._yolo_process: Any = None
+        self._yolo_install_proc: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
         self._photo_minimap: Any = None
@@ -667,10 +668,18 @@ class UiWorker(threading.Thread):
                                                 expand=True, padx=(0, 8))
             self._yolo_zone_shift_y_label = ttk.Label(zone_row3, text="0%", width=8)
             self._yolo_zone_shift_y_label.pack(side="left")
-            self._yolo_status = ttk.Label(
-                yolo_panel, text="YOLO 检测已停止。", justify="left"
+            # 一键安装：缺少 YOLO 依赖时点它自动安装（调用 安装.bat）。
+            yolo_status_row = ttk.Frame(yolo_panel)
+            yolo_status_row.pack(fill="x", pady=(6, 0))
+            self._yolo_install_button = ttk.Button(
+                yolo_status_row, text="一键安装 YOLO 依赖",
+                command=self._yolo_install_deps,
             )
-            self._yolo_status.pack(anchor="w", pady=(6, 0))
+            self._yolo_install_button.pack(side="left")
+            self._yolo_status = ttk.Label(
+                yolo_status_row, text="YOLO 检测已停止。", justify="left"
+            )
+            self._yolo_status.pack(side="left", padx=(8, 0))
             # Restore previously saved YOLO panel settings (threshold, ranges).
             self._yolo_load_settings()
 
@@ -1015,6 +1024,7 @@ class UiWorker(threading.Thread):
         self._refresh_automation_status()
         self._refresh_shutdown_status()
         self._poll_yolo_exit()
+        self._poll_yolo_install()
         root.after(self.refresh_ms, self._poll)
 
     def _poll_yolo_exit(self) -> None:
@@ -1058,6 +1068,57 @@ class UiWorker(threading.Thread):
             )
         LOG.warning("yolo detection process exited early (rc=%s)%s",
                     proc.returncode, detail)
+
+    def _yolo_install_deps(self) -> None:
+        """One-click install of the missing YOLO dependencies.
+
+        Launches 安装.bat in a visible console so the user can watch the
+        progress; the poll loop re-checks when it finishes.
+        """
+        proc = getattr(self, "_yolo_install_proc", None)
+        if proc is not None and proc.poll() is None:
+            self._yolo_status.configure(
+                text="安装正在进行中，请等待安装窗口完成（下载约 200MB）。"
+            )
+            return
+        install_bat = Path(__file__).resolve().parent / "安装.bat"
+        if not install_bat.is_file():
+            self._yolo_status.configure(
+                text=f"找不到安装脚本: {install_bat} — 请确认已完整解压。"
+            )
+            return
+        import subprocess
+
+        self._yolo_install_proc = subprocess.Popen(
+            [str(install_bat)],
+            cwd=str(Path(__file__).resolve().parent),
+            creationflags=0,  # 弹出可见控制台，让用户看到安装进度。
+        )
+        if hasattr(self, "_yolo_install_button"):
+            self._yolo_install_button.configure(state="disabled")
+        self._yolo_status.configure(
+            text="正在安装 YOLO 依赖（已弹出安装窗口，下载约 200MB，"
+                 "请等待其自动完成）..."
+        )
+        LOG.info("yolo dependency install launched: %s", install_bat)
+
+    def _poll_yolo_install(self) -> None:
+        """Refresh the YOLO status once the one-click install finishes."""
+        proc = getattr(self, "_yolo_install_proc", None)
+        if proc is None or proc.poll() is None:
+            return
+        self._yolo_install_proc = None
+        if hasattr(self, "_yolo_install_button"):
+            self._yolo_install_button.configure(state="normal")
+        if hasattr(self, "_yolo_status"):
+            ok = proc.returncode == 0
+            self._yolo_status.configure(
+                text="YOLO 依赖安装完成，点击「运行」开始检测。"
+                if ok else
+                f"安装未完成 (rc={proc.returncode})，"
+                "请查看安装窗口中的红色报错。"
+            )
+        LOG.info("yolo dependency install finished rc=%s", proc.returncode)
 
     def _refresh_automation_status(self) -> None:
         if not hasattr(self, "_automation_status_label"):
@@ -1845,9 +1906,8 @@ class UiWorker(threading.Thread):
         python = yolo_root / "venv313" / "Scripts" / "python.exe"
         using_main_env = False
         if not python.is_file():
-            # 回退：直接使用助手当前的主环境 Python（安装.ps1 -Yolo
-            # 会把 YOLO 依赖装进 .venv，即 Python 3.10-3.12），
-            # 不再要求单独的 venv313。
+            # 回退：直接使用助手当前的主环境 Python（安装.bat 会把 YOLO
+            # 依赖装进 .venv，即 Python 3.10-3.12），不再要求单独的 venv313。
             python = Path(sys.executable)
             using_main_env = True
         import subprocess
@@ -1881,8 +1941,8 @@ class UiWorker(threading.Thread):
                 deps_ok = False
             if not deps_ok:
                 self._yolo_status.configure(
-                    text="主环境缺少 YOLO 依赖（torch/ultralytics/mss/cv2）。"
-                         "请运行 安装.ps1 -Yolo 安装依赖后重试。"
+                    text="缺少 YOLO 依赖（torch/ultralytics/mss/cv2）。"
+                         "请点击「一键安装 YOLO 依赖」自动安装。"
                 )
                 return
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]

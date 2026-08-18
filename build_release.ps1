@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     只复制运行所需的文件（不含虚拟环境、日志、测试、work 数据、git 元数据）。
-    打包结果可压缩后交给其他用户，对方解压后运行其中的 安装.ps1 即可自动
-    安装 Python 与依赖。
+    打包结果可压缩后交给其他用户，对方解压后双击 安装.bat 即可自动安装
+    Python 与全部依赖（含 YOLO）。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File build_release.ps1
@@ -29,7 +29,8 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
     ($_.Extension -in ".py", ".json", ".md", ".ps1", ".vbs", ".bat", ".txt") -and
     $name -notlike "test_*" -and $name -ne "auto_system.log" -and
     # 以下为开发工具（含本机绝对路径），不随发布包分发。
-    $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs")
+    $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs",
+                   "build_release.ps1")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 
@@ -65,8 +66,7 @@ Write-Host "已复制 $($files.Count) 个文件 ($totalMB MB)。" -ForegroundCol
 Write-Host ""
 Write-Host "发布方法:"
 Write-Host "  1. 将 $OutDir 文件夹压缩为 zip"
-Write-Host "  2. 接收方解压后双击 install.bat 即可自动安装"
-Write-Host "     （需要怪物检测时: 安装.ps1 -Yolo）"
+Write-Host "  2. 接收方解压后双击 安装.bat 即可自动安装（含 YOLO 依赖）"
 Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundColor Cyan
 Write-Host ""
 

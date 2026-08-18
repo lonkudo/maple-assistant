@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Maple 助手 一键安装脚本。
+    Maple 助手 一键安装脚本（由 安装.bat 调用，用户无需手动运行）。
 
 .DESCRIPTION
     在一台全新的 Windows 电脑上自动完成环境搭建：
@@ -8,19 +8,16 @@
          找不到时自动下载并安装 Python 3.12（先尝试 winget，失败则从
          python.org 静默安装）。
       2. 创建本地虚拟环境 (.venv)。
-      3. 安装依赖库。
-      4. 生成启动器（start_assistant.bat / 启动助手.bat）。
-
-    可选：加 -Yolo 参数创建 YOLO 怪物检测环境
-    （yolo-detection\venv313，需要下载 PyTorch，体积较大，约数 GB）。
+      3. 安装基础依赖库。
+      4. 安装 YOLO 怪物检测依赖（CPU 版 PyTorch + mss/ultralytics 等，
+         直接装进主环境 .venv，无需单独的 venv313）。
+      5. 生成启动器（start_assistant.bat / 启动助手.bat）。
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File 安装.ps1
-    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo
-    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Python C:\Python312\python.exe
+    powershell -ExecutionPolicy Bypass -File install.ps1
+    powershell -ExecutionPolicy Bypass -File install.ps1 -Python C:\Python312\python.exe
 #>
 param(
-    [switch]$Yolo,
     [string]$Python = ""
 )
 
@@ -156,7 +153,7 @@ if errorlevel 1 (
 )
 cd /d "%~dp0"
 if not exist ".venv\Scripts\pythonw.exe" (
-    echo Virtual environment missing. Run install.bat first.
+    echo Virtual environment missing. Run the setup first.
     pause
     exit /b 1
 )
@@ -166,28 +163,26 @@ Set-Content -Path "start_assistant.bat" -Value $bat -Encoding ASCII
 Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding ASCII
 Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -ForegroundColor Green
 
-# ---- 5. 可选 YOLO 环境 --------------------------------------------------------
-if ($Yolo) {
-    Write-Host ""
-    Write-Host "正在安装 YOLO 怪物检测依赖到主环境 .venv ..." -ForegroundColor Yellow
-    Write-Host "（先安装 CPU 版 PyTorch，下载约 200MB；CUDA 版约 2.5GB）" -ForegroundColor Yellow
-    & $venvPy -m pip install --upgrade pip
-    # CPU 版 torch/torchvision：检测用 CPU 推理足够（device: auto 会自动选）。
-    & $venvPy -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-    if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
-    # 其余依赖：跳过 torch/torchvision 行（已装 CPU 版，避免被覆盖成 CUDA 版）。
-    # 保留 opencv-python（显示检测画面需要 GUI 版 cv2.imshow）。
-    $reqs = Get-Content "yolo-detection\requirements.txt" | Where-Object {
-        $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*(torch|torchvision)\b'
-    }
-    $filtered = Join-Path $env:TEMP "yolo_reqs_filtered.txt"
-    [System.IO.File]::WriteAllLines($filtered, $reqs, [System.Text.Encoding]::ASCII)
-    & $venvPy -m pip install -r $filtered
-    if ($LASTEXITCODE -ne 0) { throw "YOLO 依赖安装失败" }
-    Remove-Item $filtered -ErrorAction SilentlyContinue
-    Write-Host "YOLO 环境已就绪（主环境 .venv，无需单独的 venv313）。" -ForegroundColor Green
-    Write-Host "请将训练好的模型放到 yolo-detection\weights\best.pt" -ForegroundColor Yellow
+# ---- 5. YOLO 怪物检测依赖（始终安装，无需额外参数） ---------------------------
+Write-Host ""
+Write-Host "正在安装 YOLO 怪物检测依赖到主环境 .venv ..." -ForegroundColor Yellow
+Write-Host "（先安装 CPU 版 PyTorch，下载约 200MB；CUDA 版约 2.5GB）" -ForegroundColor Yellow
+& $venvPy -m pip install --upgrade pip
+# CPU 版 torch/torchvision：检测用 CPU 推理足够（device: auto 会自动选）。
+& $venvPy -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
+# 其余依赖：跳过 torch/torchvision 行（已装 CPU 版，避免被覆盖成 CUDA 版）。
+# 保留 opencv-python（显示检测画面需要 GUI 版 cv2.imshow）。
+$reqs = Get-Content "yolo-detection\requirements.txt" | Where-Object {
+    $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*(torch|torchvision)\b'
 }
+$filtered = Join-Path $env:TEMP "yolo_reqs_filtered.txt"
+[System.IO.File]::WriteAllLines($filtered, $reqs, [System.Text.Encoding]::ASCII)
+& $venvPy -m pip install -r $filtered
+if ($LASTEXITCODE -ne 0) { throw "YOLO 依赖安装失败" }
+Remove-Item $filtered -ErrorAction SilentlyContinue
+Write-Host "YOLO 环境已就绪（主环境 .venv，无需单独的 venv313）。" -ForegroundColor Green
+Write-Host "请将训练好的模型放到 yolo-detection\weights\best.pt" -ForegroundColor Yellow
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
@@ -195,9 +190,5 @@ Write-Host "  安装完成。" -ForegroundColor Cyan
 Write-Host "  双击 启动助手.bat（或 start_assistant.bat）即可开始。" -ForegroundColor Cyan
 Write-Host "  首次启动会弹出 UAC 管理员权限确认，请点击“是”。" -ForegroundColor Yellow
 Write-Host "  注意：游戏也必须以管理员权限运行，否则按键无法注入。" -ForegroundColor Yellow
-if (-not $Yolo) {
-    Write-Host "  如需 YOLO 怪物检测，请重新双击 安装.bat 并加 -Yolo 参数：" -ForegroundColor Cyan
-    Write-Host "    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo" -ForegroundColor Cyan
-}
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
