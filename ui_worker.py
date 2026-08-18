@@ -1785,9 +1785,16 @@ class UiWorker(threading.Thread):
         yolo_root = Path(__file__).resolve().parent / "yolo-detection"
         python = yolo_root / "venv313" / "Scripts" / "python.exe"
         script = yolo_root / "live_view.py"
-        if not python.is_file() or not script.is_file():
+        if not script.is_file():
             self._yolo_status.configure(
-                text=f"未找到 YOLO 项目: {yolo_root} — 请检查路径。"
+                text=f"缺少 yolo-detection 文件夹: {yolo_root} — "
+                     "请确认整个文件夹已完整解压。"
+            )
+            return
+        if not python.is_file():
+            self._yolo_status.configure(
+                text="未安装 YOLO 运行环境（缺少 venv313）。"
+                     "请双击 安装.bat 并在命令行执行 安装.ps1 -Yolo 安装。"
             )
             return
         import subprocess

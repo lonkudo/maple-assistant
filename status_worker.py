@@ -191,90 +191,76 @@ class WindowKeySender:
             hwnd = self._find_target_window()
             LOG.info("WINDOW SELECT: found hwnd=%s", hwnd)
             try:
-                if win32gui.IsIconic(hwnd):
-                    # ShowWindow sends a synchronous message to the game and
-                    # can freeze Tk indefinitely while the game thread is busy.
-                    # An already-visible window needs no ShowWindow call at all.
-                    win32gui.ShowWindowAsync(hwnd, win32con.SW_RESTORE)
-                    time.sleep(0.05)
-                    LOG.info("WINDOW SELECT: minimized game restored asynchronously")
-
-                # This succeeds directly on many systems and avoids needless
-                # AttachThreadInput calls (which can return ERROR_INVALID_PARAMETER).
-                if win32gui.GetForegroundWindow() != hwnd:
+                # Bring the game to the foreground WITHOUT pressing Alt (Alt is
+                # the game's JUMP key).  Windows can refuse briefly (foreground
+                # lock, or the assistant runs at a different privilege than the
+                # game), so retry direct SetForegroundWindow + thread-input
+                # attachment a few times before giving up.
+                for attempt in range(5):
                     try:
-                        # BringWindowToTop synchronously sends a window-manager
-                        # message to the target. Some games stop pumping that
-                        # message while rendering and can consequently freeze
-                        # the Tk callback forever. SetForegroundWindow is enough
-                        # here because the click gave this process foreground
-                        # activation rights.
-                        win32gui.SetForegroundWindow(hwnd)
-                    except Exception:
-                        LOG.debug("direct foreground selection was refused", exc_info=True)
-
-                # Start Patrol is clicked from our foreground Tk window, so the
-                # direct activation normally succeeds. Return immediately and
-                # avoid unnecessary Alt/AttachThreadInput fallbacks.
-                if win32gui.GetForegroundWindow() == hwnd:
-                    LOG.info("WINDOW SELECT: direct activation verified")
-                    return True
-
-                # A brief Alt transition lets Windows accept a foreground request
-                # after its foreground-lock timeout in most interactive sessions.
-                # Skipped when alt_transition is disabled: the Alt key is the
-                # game's JUMP key, and pressing it would make the character jump
-                # every time the game window is selected.
-                if win32gui.GetForegroundWindow() != hwnd and self.alt_transition:
-                    self._send_scan_code(0x38, key_up=False, extended=False)
-                    self._send_scan_code(0x38, key_up=True, extended=False)
-                    try:
-                        win32gui.SetForegroundWindow(hwnd)
-                    except Exception:
-                        LOG.debug("Alt-assisted foreground selection was refused",
-                                  exc_info=True)
-                    time.sleep(0.05)
-
-                # Thread-input attachment is only a final best-effort fallback.
-                # Failure to attach one thread must not abort the other activation
-                # methods or surface raw Win32 error 87 to the user.
-                foreground = win32gui.GetForegroundWindow()
-                if foreground != hwnd and foreground:
-                    current_tid = win32api.GetCurrentThreadId()
-                    foreground_tid = win32process.GetWindowThreadProcessId(foreground)[0]
-                    target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
-                    attached_threads: list[int] = []
-                    try:
-                        for thread_id in {foreground_tid, target_tid}:
-                            if thread_id and thread_id != current_tid:
-                                try:
-                                    win32process.AttachThreadInput(
-                                        current_tid, thread_id, True
-                                    )
-                                    attached_threads.append(thread_id)
-                                except Exception:
-                                    LOG.debug("could not attach input thread %s",
-                                              thread_id, exc_info=True)
+                        if win32gui.IsIconic(hwnd):
+                            # ShowWindow sends a synchronous message to the game
+                            # and can freeze Tk while the game thread is busy.
+                            win32gui.ShowWindowAsync(hwnd, win32con.SW_RESTORE)
+                            time.sleep(0.05)
                         try:
                             win32gui.SetForegroundWindow(hwnd)
                         except Exception:
-                            LOG.debug("attached foreground selection was refused",
+                            LOG.debug("direct foreground selection was refused",
                                       exc_info=True)
                         time.sleep(0.05)
-                    finally:
-                        for thread_id in reversed(attached_threads):
-                            try:
-                                win32process.AttachThreadInput(current_tid, thread_id, False)
-                            except Exception:
-                                LOG.debug("could not detach input thread %s", thread_id,
-                                          exc_info=True)
+                        if win32gui.GetForegroundWindow() == hwnd:
+                            LOG.info("WINDOW SELECT: activation verified")
+                            return True
+                    except Exception:
+                        LOG.debug("foreground attempt failed", exc_info=True)
 
-                if win32gui.GetForegroundWindow() != hwnd:
-                    raise OSError(
-                        "Windows refused to foreground the dynamically selected game window"
-                    )
-                LOG.info("WINDOW SELECT: fallback activation verified")
-                return True
+                    # Thread-input attachment fallback.  Failure to attach one
+                    # thread must not abort the other attempts.
+                    foreground = win32gui.GetForegroundWindow()
+                    if foreground and foreground != hwnd:
+                        current_tid = win32api.GetCurrentThreadId()
+                        foreground_tid = win32process.GetWindowThreadProcessId(
+                            foreground)[0]
+                        target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+                        attached_threads: list[int] = []
+                        try:
+                            for thread_id in {foreground_tid, target_tid}:
+                                if thread_id and thread_id != current_tid:
+                                    try:
+                                        win32process.AttachThreadInput(
+                                            current_tid, thread_id, True
+                                        )
+                                        attached_threads.append(thread_id)
+                                    except Exception:
+                                        LOG.debug(
+                                            "could not attach input thread %s",
+                                            thread_id, exc_info=True)
+                            try:
+                                win32gui.SetForegroundWindow(hwnd)
+                            except Exception:
+                                LOG.debug(
+                                    "attached foreground selection was refused",
+                                    exc_info=True)
+                            time.sleep(0.05)
+                        finally:
+                            for thread_id in reversed(attached_threads):
+                                try:
+                                    win32process.AttachThreadInput(
+                                        current_tid, thread_id, False
+                                    )
+                                except Exception:
+                                    pass
+                        if win32gui.GetForegroundWindow() == hwnd:
+                            LOG.info("WINDOW SELECT: activation verified")
+                            return True
+                    time.sleep(0.1)
+
+                raise OSError(
+                    "Windows 拒绝将游戏窗口置为前台。请确认：1) 助手与游戏以"
+                    "相同权限运行（同为管理员或同为普通用户）；2) 游戏窗口"
+                    "未被最小化或遮挡。"
+                )
             except Exception as exc:
                 raise OSError(
                     f"could not automatically select the current game window: {exc}"
