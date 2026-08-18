@@ -144,9 +144,16 @@ if ($LASTEXITCODE -ne 0) { throw "pip 安装失败" }
 
 # ---- 4. 生成启动器 ------------------------------------------------------------
 # 启动器内容必须为纯 ASCII：cmd 会用系统代码页解码 .bat，中文会乱码并破坏语法。
-# 使用 pythonw 启动助手：不显示命令行窗口，只显示图形界面。
+# 启动器会先通过 UAC 请求管理员权限（与游戏同权限注入按键才能生效），
+# 然后使用 pythonw 启动助手：不显示命令行窗口，只显示图形界面。
 $bat = @"
 @echo off
+rem Request administrator rights (UAC) so injected keys reach the game.
+net session >nul 2>&1
+if errorlevel 1 (
+    powershell -NoProfile -Command "Start-Process -FilePath '%~dp0start_assistant.bat' -Verb RunAs"
+    exit /b
+)
 cd /d "%~dp0"
 if not exist ".venv\Scripts\pythonw.exe" (
     echo Virtual environment missing. Run install.bat first.
@@ -180,6 +187,8 @@ Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  安装完成。" -ForegroundColor Cyan
 Write-Host "  双击 启动助手.bat（或 start_assistant.bat）即可开始。" -ForegroundColor Cyan
+Write-Host "  首次启动会弹出 UAC 管理员权限确认，请点击“是”。" -ForegroundColor Yellow
+Write-Host "  注意：游戏也必须以管理员权限运行，否则按键无法注入。" -ForegroundColor Yellow
 if (-not $Yolo) {
     Write-Host "  如需 YOLO 怪物检测，请重新双击 安装.bat 并加 -Yolo 参数：" -ForegroundColor Cyan
     Write-Host "    powershell -ExecutionPolicy Bypass -File 安装.ps1 -Yolo" -ForegroundColor Cyan

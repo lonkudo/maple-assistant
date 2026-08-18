@@ -1,8 +1,3 @@
 @echo off
 cd /d "%~dp0"
-if not exist ".venv\Scripts\pythonw.exe" (
-    echo Virtual environment missing. Run install.bat first.
-    pause
-    exit /b 1
-)
-start "" ".venv\Scripts\pythonw.exe" assistant.py %*
+call start_assistant.bat
