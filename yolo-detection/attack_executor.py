@@ -246,7 +246,8 @@ class AttackExecutor:
                       title, self.window_title)
             return False
         except Exception:  # pywin32 absent or no desktop session
-            LOG.warning("cannot verify foreground window", exc_info=True)
+            # 游戏窗口未找到/未启动是正常状态，不当作告警刷屏。
+            LOG.debug("cannot verify foreground window", exc_info=True)
             return False
 
     def select_window(self) -> bool:

@@ -144,16 +144,16 @@ if ($LASTEXITCODE -ne 0) { throw "pip 安装失败" }
 
 # ---- 4. 生成启动器 ------------------------------------------------------------
 # 启动器内容必须为纯 ASCII：cmd 会用系统代码页解码 .bat，中文会乱码并破坏语法。
+# 使用 pythonw 启动助手：不显示命令行窗口，只显示图形界面。
 $bat = @"
 @echo off
 cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
+if not exist ".venv\Scripts\pythonw.exe" (
     echo Virtual environment missing. Run install.bat first.
     pause
     exit /b 1
 )
-".venv\Scripts\python.exe" assistant.py %*
-if errorlevel 1 pause
+start "" ".venv\Scripts\pythonw.exe" assistant.py %*
 "@
 Set-Content -Path "start_assistant.bat" -Value $bat -Encoding ASCII
 Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding ASCII

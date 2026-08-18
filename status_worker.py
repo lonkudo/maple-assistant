@@ -293,7 +293,8 @@ class WindowKeySender:
                 self._find_target_window()
             return foreground == self.hwnd
         except Exception as exc:  # pywin32 absent, non-Windows, or desktop unavailable
-            LOG.warning("cannot verify foreground window: %s", exc)
+            # 游戏窗口未找到/未启动是正常状态，不当作告警刷屏。
+            LOG.debug("cannot verify foreground window: %s", exc)
             return False
 
     def is_target_focused(self) -> bool:
