@@ -74,9 +74,9 @@ if ($Zip) {
     # 4 位随机戳：每次重建生成不同文件名，方便区分版本（如 MapleAssistant-4831.zip）。
     $stamp = Get-Random -Minimum 1000 -Maximum 10000
     $zipPath = Join-Path $root "release\MapleAssistant-$stamp.zip"
-    # 先删除旧的带戳压缩包（带重试，防止旧包被资源管理器/杀软短暂锁定），
+    # 先删除旧的压缩包（带重试，防止旧包被资源管理器/杀软短暂锁定），
     # 重建后不会残留旧包。
-    Get-ChildItem (Join-Path $root "release") -Filter "MapleAssistant-*.zip" |
+    Get-ChildItem (Join-Path $root "release") -Filter "MapleAssistant*.zip" |
         Remove-Item -Force -ErrorAction SilentlyContinue
     Compress-Archive -Path $out -DestinationPath $zipPath -CompressionLevel Optimal -Force
     $zipInfo = Get-Item -LiteralPath $zipPath
