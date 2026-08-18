@@ -91,6 +91,31 @@ def find_game_client_rect(title: str) -> Optional[dict]:
             "width": width, "height": height}
 
 
+def fit_preview_to_screen(img: np.ndarray) -> np.ndarray:
+    """Downscale the preview so it fits on screen (never upscales).
+
+    The preview normally matches the game window size 1:1; when the game
+    window is larger than the screen it is shrunk proportionally so the
+    whole detection picture stays visible.
+    """
+    height, width = img.shape[:2]
+    user32 = ctypes.windll.user32
+    screen_w = user32.GetSystemMetrics(0)  # SM_CXSCREEN (physical px)
+    screen_h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+    max_w = max(320, screen_w - 60)   # leave room for borders
+    max_h = max(240, screen_h - 140)  # leave room for title bar + taskbar
+    scale = min(1.0, max_w / width, max_h / height)
+    if scale >= 1.0:
+        return img
+    scaled = cv2.resize(
+        img, (max(1, int(width * scale)), max(1, int(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    print(f"preview scaled to fit screen: {width}x{height} -> "
+          f"{scaled.shape[1]}x{scaled.shape[0]}", flush=True)
+    return scaled
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live YOLO mob detection view")
     parser.add_argument("--threshold", type=float, default=None,
@@ -397,7 +422,8 @@ def main() -> int:
                     print(f"TARGET SELECTED conf={target.confidence:.2f} "
                           f"box={target.bbox}")
                 if not args.no_show:
-                    cv2.imshow("怪物实时检测 - 按 ESC 退出", preview)
+                    cv2.imshow("怪物实时检测 - 按 ESC 退出",
+                               fit_preview_to_screen(preview))
                     key = cv2.waitKey(1) & 0xFF
                     if key == 27:
                         break
