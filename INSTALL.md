@@ -44,9 +44,12 @@
 - 截图改为抓取**整个客户区**，所有分析区域（小地图、HP/MP 条）都是客户区的
   归一化比例。小地图通过 OpenCV 轮廓动态定位，巡逻点以菱形相对偏移存储，
   HP/MP 条宽度以客户区宽度为基准——因此都与你的分辨率无关。
-- YOLO 检测器使用**像素**截图区域（`yolo-detection\config.yaml` →
-  `window.default`）和像素 `--attack-range`。请在 YOLO 面板中针对你的分辨率
-  设置一次（会保存到 `yolo_detection_settings.json` / `config.yaml`）。
+- YOLO 检测器**自动匹配游戏窗口的真实客户区**（每几秒刷新一次，窗口移动/
+  缩放后自动跟随），不再依赖写死的 config.yaml 尺寸；只有找不到游戏窗口时
+  才回退到 `yolo-detection\config.yaml` → `window.default`。
+  检测区宽度/高度是**相对比例**，自动随窗口尺寸生效；`--attack-range` 是
+  **像素**值，请在 YOLO 面板里按你的窗口大小设置一次（会保存到
+  `yolo_detection_settings.json` / `config.yaml`）。
 
 **每个分辨率只需做一次**（切换分辨率会改变 UI 缩放比例）：
 

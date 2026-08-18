@@ -12,6 +12,7 @@ import sys
 import io
 import time
 import ctypes
+from ctypes import wintypes
 import argparse
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,60 @@ from auto import OptimizedMapleBot, Detection
 from cn_text import put_cn
 
 INTERVAL = 0.1  # 10 fps
+
+
+# ---------------------------------------------------------------------------
+# Game-window region detection: the mss capture region must match the REAL
+# game client area on every machine (window sizes differ), so the zone
+# fractions / attack range / preview all apply to the actual game window.
+# Uses only ctypes (stdlib) - no extra dependencies.
+# ---------------------------------------------------------------------------
+
+def _find_game_hwnd(title: str) -> int:
+    """Return the top-level HWND of the game window, or 0."""
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        return hwnd
+    # Fallback: scan all top-level windows for a known title keyword.
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd_cb: int, _lparam: int) -> bool:
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd_cb, buf, 512)
+        text = buf.value or ""
+        if any(k in text for k in ("冒险", "怀旧", "MapleStory", "Maple")):
+            found.append(hwnd_cb)
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    return found[0] if found else 0
+
+
+def find_game_client_rect(title: str) -> Optional[dict]:
+    """Client-area rectangle (screen coordinates) of the game window.
+
+    Returns a mss-style dict {left, top, width, height} or None when the
+    window is missing, hidden or minimized.
+    """
+    user32 = ctypes.windll.user32
+    hwnd = _find_game_hwnd(title)
+    if not hwnd:
+        return None
+    if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return None
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return None
+    origin = wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(origin))
+    return {"left": origin.x, "top": origin.y,
+            "width": width, "height": height}
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +222,24 @@ def main() -> int:
         behavior["min_mob_box_px"] = max(1, int(args.min_mob_size))
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
+    # Live game-window region: refreshed every 30 frames (~3 s at 10 fps) so
+    # the capture exactly matches the real client area on ANY machine/window
+    # size (the hardcoded config region is only the fallback).
+    live_region = None
+    region_ticks_left = 0
+    region_notice_shown = False
+
+    def _refresh_live_region() -> None:
+        nonlocal live_region, region_ticks_left, region_notice_shown
+        region_ticks_left = 30
+        candidate = find_game_client_rect(args.window_title)
+        if candidate is not None and candidate != live_region:
+            live_region = candidate
+            print(f"game window client region: {candidate}", flush=True)
+        if candidate is None and not region_notice_shown:
+            print("game window not found - falling back to config region "
+                  f"{bot.monitor}", flush=True)
+            region_notice_shown = True
 
     executor = None
     attack_state = None
@@ -211,6 +284,11 @@ def main() -> int:
     with mss.MSS() as sct:
         while True:
             t0 = time.time()
+            region_ticks_left -= 1
+            if region_ticks_left <= 0:
+                _refresh_live_region()
+                if live_region is not None:
+                    region = live_region
             try:
                 shot = sct.grab(region)
                 img = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)
