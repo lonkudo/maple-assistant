@@ -404,6 +404,7 @@ class UiWorker(threading.Thread):
         # the controller's saved endpoint, so dynamically created rows behave
         # identically to rows present at startup.
         self._unlocked_points: set[tuple[str, str]] = set()
+        self._record_press_job: Any = None
 
     def run(self) -> None:
         try:
@@ -2032,9 +2033,28 @@ class UiWorker(threading.Thread):
                 text="请先停止检测再修改显示选项；重新运行以生效。"
             )
 
-    def _record_or_unlock(self, layer_name: str, boundary: str) -> None:
-        """Use one embedded button to unlock, then record and relock."""
+    def _record_button_press(self, layer_name: str, boundary: str) -> None:
+        """Button pressed: arm the 1s long-press timer for unlock/clear."""
+        if self.patrol_controller is None:
+            return
+        self._record_press_job = None
+        if self._root is not None:
+            self._record_press_job = self._root.after(
+                1000, lambda: self._record_button_hold(layer_name, boundary)
+            )
 
+    def _record_button_release(self, layer_name: str, boundary: str) -> None:
+        """Button released: a SHORT click records an unlocked/empty point.
+
+        A recorded (locked) point ignores short clicks - it only unlocks via
+        a 1s long press (which also clears its data).
+        """
+        if self._root is not None:
+            try:
+                self._root.after_cancel(self._record_press_job)
+            except Exception:
+                pass
+            self._record_press_job = None
         if self.patrol_controller is None:
             return
         try:
@@ -2045,15 +2065,35 @@ class UiWorker(threading.Thread):
         key = (layer_name, boundary)
         saved_endpoint = self.patrol_controller.endpoint(layer_name, boundary)
         if record_button_is_locked(saved_endpoint, key in self._unlocked_points):
-            self._unlocked_points.add(key)
             self._control_status.configure(
-                text=(f"已解锁 {layer_name} {boundary}。再次点击同一个录制按钮 "
-                      "即可保存当前位置。")
+                text=f"{layer_name} {boundary} 已录制：长按按钮 1 秒解锁并清除。"
             )
-            self._refresh_patrol_controls()
             return
         self._unlocked_points.discard(key)
         self._record_endpoint(boundary)
+
+    def _record_button_hold(self, layer_name: str, boundary: str) -> None:
+        """1s long press on a locked point: unlock AND clear its recording."""
+        if self.patrol_controller is None:
+            return
+        try:
+            self.patrol_controller.select_layer(layer_name)
+        except ValueError as exc:
+            self._control_status.configure(text=str(exc))
+            return
+        key = (layer_name, boundary)
+        saved_endpoint = self.patrol_controller.endpoint(layer_name, boundary)
+        if not record_button_is_locked(saved_endpoint, key in self._unlocked_points):
+            # 未锁定（空点/已解锁）：短按释放时已经处理录制。
+            return
+        self._unlocked_points.add(key)
+        cleared = self.patrol_controller.clear_endpoint(layer_name, boundary)
+        self._control_status.configure(
+            text=(f"已解锁并清除 {layer_name} {boundary} 的录制"
+                  + ("。" if cleared else "（无数据）。")
+                  + " 现在短按即可录制当前位置。")
+        )
+        self._refresh_patrol_controls()
 
     def _start_patrol(self) -> None:
         if self.patrol_controller is None:
@@ -2227,11 +2267,22 @@ class UiWorker(threading.Thread):
                 button = ttk.Button(
                     row,
                     text=f"录制 {point_label}",
-                    command=lambda layer=layer_name, point=point_name: (
-                        self._record_or_unlock(layer, point)
-                    ),
                 )
                 button.pack(side="left", fill="x", expand=True, padx=(0, 5))
+                # 长按 1 秒 = 解锁并清除该点录制；短按 = 录制（仅对空点/
+                # 已解锁点生效，已录制的点短按无效）。
+                button.bind(
+                    "<ButtonPress-1>",
+                    lambda event, layer=layer_name, point=point_name: (
+                        self._record_button_press(layer, point)
+                    ),
+                )
+                button.bind(
+                    "<ButtonRelease-1>",
+                    lambda event, layer=layer_name, point=point_name: (
+                        self._record_button_release(layer, point)
+                    ),
+                )
                 self._record_buttons[(layer_name, point_name)] = button
                 if point_name == "rope_pos":
                     self._rope_tooltips[layer_name] = HoverTooltip(

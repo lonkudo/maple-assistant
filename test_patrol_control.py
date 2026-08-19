@@ -95,6 +95,28 @@ class PatrolControllerTests(unittest.TestCase):
             # Inactive layer calibration remains untouched.
             self.assertEqual(saved["layers"]["layer2"]["left_most_pos"]["x"], .3)
 
+    def test_clear_endpoint_removes_point_and_updates_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.json"
+            data = profile()
+            data["route_order"] = ["layer1"]
+            path.write_text(json.dumps(data), encoding="utf-8")
+            controller = PatrolController(path, data)
+
+            self.assertIsNotNone(controller.endpoint("layer1", "left_most_pos"))
+            # 清除一个点后该点消失；层仍有 right 点，路由保留。
+            self.assertTrue(controller.clear_endpoint("layer1", "left_most_pos"))
+            self.assertIsNone(controller.endpoint("layer1", "left_most_pos"))
+            self.assertEqual(controller.snapshot().route_order, ("layer1",))
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("left_most_pos",
+                             saved["layers"]["layer1"])
+            # 清除该层最后一个点后：路由清空、状态回到等待录制。
+            self.assertTrue(controller.clear_endpoint("layer1", "right_most_pos"))
+            self.assertEqual(controller.snapshot().route_order, ())
+            # 再次清除不存在的数据返回 False。
+            self.assertFalse(controller.clear_endpoint("layer1", "left_most_pos"))
+
     def test_scroll_compensated_world_y_allows_centered_marker_on_upper_layer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "map.json"

@@ -278,6 +278,41 @@ class PatrolController:
                 return None
             return RecordedEndpoint(layer, boundary, float(value["x"]), float(value["y"]))
 
+    def clear_endpoint(self, layer: str, boundary: PointKind) -> bool:
+        """Remove a recorded point (the UI long-press unlock clears it).
+
+        Recomputes the layer's calibration status and route membership, then
+        persists - mirroring ``record_endpoint``'s bookkeeping.  Returns True
+        when a point was actually removed.
+        """
+
+        if boundary not in REQUIRED_LAYER_POINTS:
+            raise ValueError(f"unsupported patrol point: {boundary}")
+        with self._lock:
+            layers = self._profile.get("layers", {})
+            layer_data = layers.get(layer)
+            if not isinstance(layer_data, dict):
+                return False
+            removed = layer_data.pop(boundary, None) is not None
+            if removed:
+                any_action = bool(_layer_present_actions(layer_data))
+                has_edges = self._layer_has_points_locked(
+                    layer, PATROL_EDGE_POINTS
+                )
+                if layer == self._final_layer_name_locked() and has_edges:
+                    layer_data["calibration_status"] = "final_layer_ready"
+                elif self._layer_has_points_locked(layer, ("rope_pos",)):
+                    layer_data["calibration_status"] = "complete"
+                elif any_action:
+                    layer_data["calibration_status"] = "ready"
+                else:
+                    layer_data["calibration_status"] = "awaiting_left_rope_right"
+                route = self._profile.get("route_order", [])
+                if not any_action and layer in route:
+                    route.remove(layer)
+                self._persist_locked()
+            return removed
+
     def layer_for_y(self, player_y: float) -> Optional[str]:
         """Resolve an active route layer solely from calibrated Y."""
 

@@ -106,10 +106,11 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(messages[0], "message-5")
         self.assertEqual(messages[-1], "message-24")
 
-    def test_embedded_lock_click_unlocks_then_next_click_records(self) -> None:
+    def test_long_press_unlocks_and_clears_then_short_click_records(self) -> None:
         class Controller:
             selected = "layer1"
             endpoints = {("layer1", "left_most_pos"): object()}
+            cleared = []
 
             @staticmethod
             def selected_layer() -> str:
@@ -123,6 +124,12 @@ class UiLogHandlerTests(unittest.TestCase):
             def endpoint(layer_name: str, point_name: str):
                 return Controller.endpoints.get((layer_name, point_name))
 
+            @staticmethod
+            def clear_endpoint(layer_name: str, point_name: str) -> bool:
+                removed = Controller.endpoints.pop((layer_name, point_name), None)
+                Controller.cleared.append((layer_name, point_name))
+                return removed is not None
+
         class Label:
             def __init__(self) -> None:
                 self.text = ""
@@ -131,19 +138,29 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.text = text
 
         worker = UiWorker.__new__(UiWorker)
+        worker._root = None
         worker.patrol_controller = Controller()
         worker._unlocked_points = set()
+        worker._record_press_job = None
         worker._control_status = Label()
         worker._refresh_patrol_controls = lambda: None
         recorded = []
         worker._record_endpoint = recorded.append
 
-        worker._record_or_unlock("layer1", "left_most_pos")
-        self.assertIn(("layer1", "left_most_pos"), worker._unlocked_points)
+        # 短按已录制按钮：不解锁，仅提示需要长按。
+        worker._record_button_release("layer1", "left_most_pos")
+        self.assertNotIn(("layer1", "left_most_pos"), worker._unlocked_points)
         self.assertEqual(recorded, [])
-        self.assertIn("再次点击同一个录制按钮", worker._control_status.text)
+        self.assertIn("长按", worker._control_status.text)
 
-        worker._record_or_unlock("layer1", "left_most_pos")
+        # 长按 1 秒：解锁并清除该点录制。
+        worker._record_button_hold("layer1", "left_most_pos")
+        self.assertIn(("layer1", "left_most_pos"), worker._unlocked_points)
+        self.assertEqual(Controller.cleared, [("layer1", "left_most_pos")])
+        self.assertIn("已解锁并清除", worker._control_status.text)
+
+        # 再次短按：录制新位置。
+        worker._record_button_release("layer1", "left_most_pos")
         self.assertEqual(recorded, ["left_most_pos"])
 
     def test_stale_lock_without_saved_endpoint_records_on_same_click(self) -> None:
@@ -157,12 +174,14 @@ class UiLogHandlerTests(unittest.TestCase):
                 return None
 
         worker = UiWorker.__new__(UiWorker)
+        worker._root = None
         worker.patrol_controller = Controller()
         worker._unlocked_points = {("layer2", "left_most_pos")}
+        worker._record_press_job = None
         recorded = []
         worker._record_endpoint = recorded.append
 
-        worker._record_or_unlock("layer2", "left_most_pos")
+        worker._record_button_release("layer2", "left_most_pos")
 
         self.assertEqual(recorded, ["left_most_pos"])
         self.assertNotIn(("layer2", "left_most_pos"), worker._unlocked_points)
