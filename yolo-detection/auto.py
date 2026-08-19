@@ -567,16 +567,21 @@ class OptimizedMapleBot:
 
         Mobs smaller than ``detection_behavior.min_mob_box_px`` on either
         side are ignored: dropped items are frequently misclassified as
-        mobs, and those boxes are tiny.
+        mobs, and those boxes are tiny.  Mobs LARGER than
+        ``detection_behavior.max_mob_box_px`` are ignored too (environment
+        / boss / oversized boxes must not be attacked).
         """
 
         if character is None or not mobs:
             return None
         config = getattr(self, "config", {}) or {}
-        # 最小怪物尺寸（像素）：live_view 已按当前帧宽换算（百分比 × 帧宽），
-        # 这里直接使用，不再按 2561 参考宽度二次缩放。
+        # 最小/最大怪物尺寸（像素）：live_view 已按当前帧宽换算（百分比 ×
+        # 帧宽），这里直接使用。
         min_box = max(1.0, float(config.get(
             'detection_behavior.min_mob_box_px', 60.0
+        )))
+        max_box = max(min_box, float(config.get(
+            'detection_behavior.max_mob_box_px', 1e9
         )))
         cx, cy = character.center
         half = max(10.0, float(attack_range) / 2.0)
@@ -585,6 +590,8 @@ class OptimizedMapleBot:
             x1, y1, x2, y2 = mob.bbox
             if (x2 - x1) < min_box or (y2 - y1) < min_box:
                 continue  # too small: likely a misclassified drop
+            if (x2 - x1) > max_box or (y2 - y1) > max_box:
+                continue  # too large: environment/boss/oversized box
             mx, my = mob.center
             dx = mx - cx
             dy = my - cy

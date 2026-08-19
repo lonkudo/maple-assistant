@@ -1,4 +1,4 @@
-﻿"""Tests for character detection and attack decisions (no model needed).
+"""Tests for character detection and attack decisions (no model needed).
 
 These tests import ``auto`` (which needs torch/ultralytics), so they run
 under the yolo venv::
@@ -135,6 +135,29 @@ class AttackDecisionTests(unittest.TestCase):
         mob = make_detection("mob", 1350, 890)  # 60x80 box
         target = bot.attack_decision([mob], character, 800)
         self.assertIs(target, mob)
+
+    def test_oversized_box_like_environment_is_not_attacked(self):
+        # A huge box (environment / boss / oversized element) beyond the max
+        # box gate must not be targeted.
+        from auto import OptimizedMapleBot
+
+        bot = OptimizedMapleBot.__new__(OptimizedMapleBot)
+        bot.config = {
+            "detection_behavior": {
+                "min_mob_box_px": 20,
+                "max_mob_box_px": 200,
+            }
+        }
+        character = make_detection("character", 1280, 880)
+        huge = Detection(
+            bbox=[1200, 800, 1500, 950],  # 300x150 px
+            confidence=0.9, class_id=3, class_name="mob",
+            center=(1350, 875), distance_from_center=0.0,
+        )
+        self.assertIsNone(bot.attack_decision([huge], character, 800))
+        # A normal-sized mob inside the range is still attacked.
+        normal = make_detection("mob", 1350, 890)  # 60x80 box
+        self.assertIs(bot.attack_decision([normal], character, 800), normal)
 
 
 class CharacterStabilizationTests(unittest.TestCase):

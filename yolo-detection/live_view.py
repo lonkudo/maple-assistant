@@ -153,6 +153,10 @@ def parse_args() -> argparse.Namespace:
                              "PERCENTAGE of the frame width on either side "
                              "(default 2.3); real pixels are computed from "
                              "the actual game window size every frame")
+    parser.add_argument("--max-mob-size", type=float, default=None,
+                        help="ignore mob detections LARGER than this "
+                             "PERCENTAGE of the frame width on either side "
+                             "(default: 4x the min-mob-size)")
     parser.add_argument("--zone-width", type=float, default=None,
                         help="detection zone width fraction 0.1-1.0 "
                              "(default: config.yaml center_zone)")
@@ -245,6 +249,10 @@ def main() -> int:
     # 换算成真实像素——换分辨率/拉窗口后自动跟随，无需重新设置。
     attack_range_percent = max(1.0, float(args.attack_range))
     min_mob_percent = max(0.1, float(args.min_mob_size))
+    max_mob_percent = (
+        max(min_mob_percent, float(args.max_mob_size))
+        if args.max_mob_size is not None else min_mob_percent * 4.0
+    )
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
     # Live game-window region: refreshed every 30 frames (~3 s at 10 fps) so
@@ -305,7 +313,7 @@ def main() -> int:
           f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "
           f"shift_y={zone.get('shift_y', 0.0)} "
           f"attack_range={attack_range_percent:.0f}% "
-          f"min_mob={min_mob_percent:.1f}% "
+          f"min_mob={min_mob_percent:.1f}% max_mob={max_mob_percent:.1f}% "
           f"attack={'ON' if executor else 'OFF'} (ESC to quit)")
 
     with mss.MSS() as sct:
@@ -339,6 +347,9 @@ def main() -> int:
                 )
                 behavior["min_mob_box_px"] = max(
                     1, int(round(min_mob_percent / 100.0 * frame_w))
+                )
+                behavior["max_mob_box_px"] = max(
+                    1, int(round(max_mob_percent / 100.0 * frame_w))
                 )
                 character = bot.detect_character(img)
                 target = bot.attack_decision(

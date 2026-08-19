@@ -563,13 +563,13 @@ class UiWorker(threading.Thread):
                 range_row, text="30%", width=8
             )
             self._yolo_attack_range_label.pack(side="left")
-            # Minimum mob size: horizontal slider (progress-bar style) that
-            # filters out tiny detections (dropped items are frequently
-            # misclassified as mobs and their boxes are small).  Value is a
-            # PERCENTAGE of the game window width (resolution-independent).
+            # Minimum/maximum mob box size: ONE progress bar controls the
+            # minimum as a PERCENTAGE of the game window width; the maximum
+            # is 4x the minimum automatically (both are resolution-
+            # independent and applied per frame by the detector).
             mob_size_row = ttk.Frame(yolo_panel)
             mob_size_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(mob_size_row, text="最小怪物尺寸:").pack(
+            ttk.Label(mob_size_row, text="怪物尺寸范围:").pack(
                 side="left", padx=(0, 6)
             )
             self._yolo_min_mob_var = tk.IntVar(value=2)
@@ -584,7 +584,7 @@ class UiWorker(threading.Thread):
             self._yolo_min_mob_slider.pack(side="left", fill="x",
                                            expand=True, padx=(0, 8))
             self._yolo_min_mob_label = ttk.Label(
-                mob_size_row, text="2%", width=8
+                mob_size_row, text="最小 2% / 最大 8%", width=16
             )
             self._yolo_min_mob_label.pack(side="left")
             # Detection frequency: frames per second, 2-30, middle = 10 fps
@@ -1750,12 +1750,15 @@ class UiWorker(threading.Thread):
         self._yolo_attack_range_label.configure(text=f"{value}%")
 
     def _yolo_on_min_mob_change(self, _value: str = "") -> None:
-        """Update the minimum-mob-size label as the slider moves (percent)."""
+        """Update the mob-size-range label (min %, max = 4x min)."""
 
         if not hasattr(self, "_yolo_min_mob_label"):
             return
         value = int(self._yolo_min_mob_var.get())
-        self._yolo_min_mob_label.configure(text=f"{value}%")
+        max_value = min(60, value * 4)
+        self._yolo_min_mob_label.configure(
+            text=f"最小 {value}% / 最大 {max_value}%"
+        )
 
     def _yolo_on_fps_change(self, _value: str = "") -> None:
         """Update the detection-FPS label as the slider moves."""
@@ -1848,6 +1851,9 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_yolo_min_mob_var"):
             cmd.extend(["--min-mob-size",
                         f"{int(self._yolo_min_mob_var.get())}"])
+            # 最大尺寸 = 最小尺寸 × 4（同一条进度条控制）。
+            cmd.extend(["--max-mob-size",
+                        f"{min(60, int(self._yolo_min_mob_var.get()) * 4)}"])
         # Always publish YOLO rope state: the patrol worker uses it to gate
         # the inner-gap jump on the real screen gap.
         cmd.extend(["--rope-state", str(
