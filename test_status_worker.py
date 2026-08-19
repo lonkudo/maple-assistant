@@ -40,6 +40,28 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.hp, 328, delta=5)
         self.assertAlmostEqual(reading.mp, 74, delta=5)
 
+    def test_adaptive_full_bar_reference_handles_fixed_pixel_hud(self) -> None:
+        # Fixed-pixel HUD: the bars are 100px wide on a 1000px frame while the
+        # client-fraction estimate says 51px.  Once the full bar is observed
+        # the reference adapts and ratios are correct - previously every ratio
+        # clipped to 1.0 and potions never fired on such machines.
+        def frame(hp_px: int, mp_px: int) -> Image.Image:
+            image = Image.new("RGB", (1000, 1000), "black")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((400, 970, 400 + hp_px - 1, 974),
+                           fill=(220, 20, 20))
+            draw.rectangle((400, 985, 400 + mp_px - 1, 989),
+                           fill=(20, 40, 220))
+            return image
+
+        detector = BarStatusDetector()
+        first = detector.detect(frame(100, 100))  # both full: adapts refs
+        self.assertAlmostEqual(first.hp, 656, delta=5)
+        self.assertAlmostEqual(first.mp, 371, delta=5)
+        half = detector.detect(frame(50, 100))    # HP at 50% of the real bar
+        self.assertAlmostEqual(half.hp, 328, delta=10)
+        self.assertAlmostEqual(half.mp, 371, delta=5)
+
     def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
         full = status_image(0.5, 0.2)
         cropped = full.crop((0, 0, 600, 1000))

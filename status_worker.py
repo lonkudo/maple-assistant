@@ -528,6 +528,16 @@ class BarStatusDetector:
 
     def __init__(self, config: StatusConfig = StatusConfig()) -> None:
         self.config = config
+        # Adaptive full-bar reference per bar (hp/mp): the longest plausible
+        # fill run observed.  The game HUD does not always scale 1:1 with the
+        # client width (some setups keep fixed-pixel bars), so a pure
+        # client-fraction estimate can be smaller than the real bar - that
+        # clips every ratio to 1.0 and potions would never fire.  The
+        # observed full run self-calibrates to the ACTUAL bar length once the
+        # bar is reasonably full (guard: only accept runs >= 75% of the
+        # current estimate, so a tiny near-empty bar is never adopted).
+        self._full_run: dict[str, Optional[int]] = {"hp": None, "mp": None}
+        self._ref_width: int = 0
 
     @staticmethod
     def _longest_run(mask: np.ndarray) -> tuple[int, int, int]:
@@ -545,7 +555,8 @@ class BarStatusDetector:
                     best = candidate
         return best
 
-    def _ratio(self, mask: np.ndarray, frame_width: int) -> tuple[Optional[float], float]:
+    def _ratio(self, mask: np.ndarray, frame_width: int,
+               name: str) -> tuple[Optional[float], float]:
         run, row, start = self._longest_run(mask)
         minimum = frame_width * self.config.min_bar_width_fraction
         if run < minimum:
@@ -556,7 +567,23 @@ class BarStatusDetector:
         top, bottom = max(0, row - 2), min(mask.shape[0], row + 3)
         local_runs = [self._longest_run(mask[y:y + 1])[0] for y in range(top, bottom)]
         run = int(np.median([value for value in local_runs if value]))
+        # Window resized / different resolution: drop the old reference.
+        if frame_width != self._ref_width:
+            self._ref_width = frame_width
+            self._full_run[name] = None
         expected = max(1.0, frame_width * self.config.full_bar_width_fraction)
+        reference = self._full_run.get(name)
+        if reference is not None:
+            expected = max(expected, float(reference))
+        # A run close to (or beyond) the current estimate is plausibly the
+        # FULL bar on this machine: adopt it as the new reference so ratios
+        # match the REAL bar length on any resolution/HUD scale.
+        if run >= expected * 0.75:
+            if reference is None or run > reference:
+                self._full_run[name] = run
+                expected = max(expected, float(run))
+                LOG.info("status bar reference adapted (%s): full run %s px",
+                         name, run)
         ratio = float(np.clip(run / expected, 0.0, 1.0))
         confidence = min(1.0, run / minimum) * (0.75 if ratio >= 0.995 else 1.0)
         return ratio, confidence
@@ -582,8 +609,8 @@ class BarStatusDetector:
         # Saturated red/blue fills, allowing bright highlights and dark shading.
         hp_mask = (red >= 90) & (red >= green * 1.35) & (red >= blue * 1.25)
         mp_mask = (blue >= 90) & (blue >= red * 1.25) & (blue >= green * 1.10)
-        hp_ratio, hp_conf = self._ratio(hp_mask, width)
-        mp_ratio, mp_conf = self._ratio(mp_mask, width)
+        hp_ratio, hp_conf = self._ratio(hp_mask, width, "hp")
+        mp_ratio, mp_conf = self._ratio(mp_mask, width, "mp")
         hp = round(hp_ratio * self.config.max_hp) if hp_ratio is not None else None
         mp = round(mp_ratio * self.config.max_mp) if mp_ratio is not None else None
         confidence = min(hp_conf, mp_conf) if hp is not None and mp is not None else 0.0
