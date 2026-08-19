@@ -4,11 +4,11 @@
 
 .DESCRIPTION
     在一台全新的 Windows 电脑上自动完成环境搭建：
-      1. 查找本机已有的 Python 3.10-3.12（优先使用你的环境），
-         找不到时自动下载并安装 Python 3.12（先尝试 winget，失败则从
+      1. 查找本机已有的 Python 3.10-3.12（优先 3.10），
+         找不到时自动下载并安装 Python 3.10（先尝试 winget，失败则从
          python.org 静默安装）。
-      2. 创建本地虚拟环境 (.venv)。
-      3. 安装基础依赖库。
+      2. 创建本地虚拟环境 (.venv)（使用 Python 3.10 解释器启动助手）。
+      3. 安装基础依赖库（pip 使用清华镜像加速）。
       4. 安装 YOLO 怪物检测依赖（CPU 版 PyTorch + mss/ultralytics 等，
          直接装进主环境 .venv，无需单独的 venv313）。
       5. 生成启动器（start_assistant.bat / 启动助手.bat）。
@@ -43,13 +43,13 @@ function Find-Python {
         if (-not (Test-Path $Python)) { throw "未找到 Python: $Python" }
         return (Resolve-Path $Python).Path
     }
-    # 1) py 启动器（用户级安装的 Python 3.10-3.12）。
+    # 1) py 启动器（用户级安装的 Python 3.10-3.12；优先 3.10）。
     #    注意：py 探测在没有对应版本时会把 stderr 变成错误记录（配合
     #    $ErrorActionPreference="Stop" 会直接中断），所以每个探测都要 try/catch，
     #    失败就尝试下一个候选。
     $py = Get-Command py -ErrorAction SilentlyContinue
     if ($py) {
-        foreach ($ver in "3.12", "3.11", "3.10") {
+        foreach ($ver in "3.10", "3.11", "3.12") {
             try {
                 $exe = (& py -$ver -c "import sys;print(sys.executable)" 2>$null)
                 if ($exe -and (Test-Path $exe)) { return $exe }
@@ -68,12 +68,12 @@ function Find-Python {
             # 该 python 无法运行或版本不符，继续。
         }
     }
-    # 3) 常见安装位置。
+    # 3) 常见安装位置（优先 3.10）。
     $candidates = @(
         "$env:LOCALAPPDATA\Programs\Python",
-        "$env:ProgramFiles\Python312", "$env:ProgramFiles\Python311",
-        "$env:ProgramFiles\Python310",
-        "C:\Python312", "C:\Python311", "C:\Python310"
+        "$env:ProgramFiles\Python310", "$env:ProgramFiles\Python311",
+        "$env:ProgramFiles\Python312",
+        "C:\Python310", "C:\Python311", "C:\Python312"
     )
     foreach ($dir in $candidates) {
         if (Test-Path $dir) {
@@ -87,22 +87,22 @@ function Find-Python {
 
 function Install-Python {
     <#
-    为当前用户安装 Python 3.12。先尝试 winget，再回退到 python.org
-    静默安装程序。返回安装后的 python.exe 路径。
+    为当前用户安装 Python 3.10（固定用 3.10，不用最新版）。先尝试 winget，
+    再回退到 python.org 静默安装程序。返回安装后的 python.exe 路径。
     #>
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
-        Write-Host "未找到 Python - 正在通过 winget 安装 Python 3.12..." -ForegroundColor Yellow
-        & winget install --id Python.Python.3.12 -e --silent `
+        Write-Host "未找到 Python - 正在通过 winget 安装 Python 3.10..." -ForegroundColor Yellow
+        & winget install --id Python.Python.3.10 -e --silent `
             --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0) {
-            $exe = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
+            $exe = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
             if (Test-Path $exe) { return $exe }
         }
     }
-    Write-Host "正在从 python.org 下载 Python 3.12..." -ForegroundColor Yellow
-    $url = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
-    $installer = Join-Path $env:TEMP "python-3.12.10-amd64.exe"
+    Write-Host "正在从 python.org 下载 Python 3.10..." -ForegroundColor Yellow
+    $url = "https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe"
+    $installer = Join-Path $env:TEMP "python-3.10.11-amd64.exe"
     Invoke-WebRequest -Uri $url -OutFile $installer
     $quietArgs = "/quiet InstallAllUsers=0 PrependPath=0 Include_test=0 " +
         "Include_launcher=1 AssociateFiles=0 Shortcuts=0 SimpleInstall=1"
@@ -110,9 +110,9 @@ function Install-Python {
     if ($process.ExitCode -ne 0) {
         throw "Python 安装程序退出码为 $($process.ExitCode)"
     }
-    $exe = "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
+    $exe = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
     if (-not (Test-Path $exe)) {
-        throw "Python 已安装但找不到 python.exe；请手动安装 Python 3.10-3.12 后重试"
+        throw "Python 已安装但找不到 python.exe；请手动安装 Python 3.10 后重试"
     }
     return $exe
 }
@@ -134,9 +134,11 @@ if (-not (Test-Path $venvPy)) {
 Write-Host "虚拟环境已就绪。"
 
 # ---- 3. 安装依赖 -------------------------------------------------------------
+# 全部 pip 安装使用国内镜像（清华 TUNA），加速下载。
+$pipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
 Write-Host "正在安装依赖 (numpy, Pillow, OpenCV, pywin32) ..." -ForegroundColor Yellow
-& $venvPy -m pip install --upgrade pip
-& $venvPy -m pip install -r requirements.txt
+& $venvPy -m pip install --upgrade pip -i $pipMirror
+& $venvPy -m pip install -r requirements.txt -i $pipMirror
 if ($LASTEXITCODE -ne 0) { throw "pip 安装失败" }
 
 # ---- 4. 生成启动器 ------------------------------------------------------------
@@ -167,18 +169,19 @@ Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -Foregro
 Write-Host ""
 Write-Host "正在安装 YOLO 怪物检测依赖到主环境 .venv ..." -ForegroundColor Yellow
 Write-Host "（先安装 CPU 版 PyTorch，下载约 200MB；CUDA 版约 2.5GB）" -ForegroundColor Yellow
-& $venvPy -m pip install --upgrade pip
+& $venvPy -m pip install --upgrade pip -i $pipMirror
 # CPU 版 torch/torchvision：检测用 CPU 推理足够（device: auto 会自动选）。
+# torch 走官方 CPU 源（清华镜像不提供 torch 的 CPU wheel）。
 & $venvPy -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
-# 其余依赖：跳过 torch/torchvision 行（已装 CPU 版，避免被覆盖成 CUDA 版）。
-# 保留 opencv-python（显示检测画面需要 GUI 版 cv2.imshow）。
+# 其余依赖（走清华镜像）：跳过 torch/torchvision 行（已装 CPU 版，
+# 避免被覆盖成 CUDA 版）。保留 opencv-python（显示检测画面需要 GUI 版）。
 $reqs = Get-Content "yolo-detection\requirements.txt" | Where-Object {
     $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*(torch|torchvision)\b'
 }
 $filtered = Join-Path $env:TEMP "yolo_reqs_filtered.txt"
 [System.IO.File]::WriteAllLines($filtered, $reqs, [System.Text.Encoding]::ASCII)
-& $venvPy -m pip install -r $filtered
+& $venvPy -m pip install -r $filtered -i $pipMirror
 if ($LASTEXITCODE -ne 0) { throw "YOLO 依赖安装失败" }
 Remove-Item $filtered -ErrorAction SilentlyContinue
 Write-Host "YOLO 环境已就绪（主环境 .venv，无需单独的 venv313）。" -ForegroundColor Green

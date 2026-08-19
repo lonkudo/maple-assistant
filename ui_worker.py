@@ -392,7 +392,6 @@ class UiWorker(threading.Thread):
         self.log_queue = log_queue
         self.automation_active_event = automation_active_event
         self._yolo_process: Any = None
-        self._yolo_install_proc: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
         self._photo_minimap: Any = None
@@ -533,37 +532,9 @@ class UiWorker(threading.Thread):
                 yolo_row, text="保存配置", command=self._yolo_save_config
             )
             self._yolo_save_button.pack(side="left", padx=(8, 0))
-            # Auto-attack row: toggle + attack key, on its own line so it is
-            # always visible.  Grey/inactive by default; when activated the
-            # YOLO process faces the target and presses the attack key.
-            attack_row = ttk.Frame(yolo_panel)
-            attack_row.pack(fill="x", pady=(6, 0))
-            self._yolo_attack_var = tk.BooleanVar(value=False)
-            self._yolo_attack_button = ttk.Checkbutton(
-                attack_row,
-                text="自动攻击",
-                variable=self._yolo_attack_var,
-                command=self._yolo_sync_show_button,
-            )
-            self._yolo_attack_button.pack(side="left")
-            self._yolo_attack_button.configure(style="Off.TCheckbutton")
-            ttk.Label(attack_row, text="攻击按键:").pack(
-                side="left", padx=(10, 4)
-            )
-            self._yolo_attack_key_var = tk.StringVar(value="ctrl")
-            attack_key_button = ttk.Button(
-                attack_row, text=self._yolo_attack_key_var.get(), width=10,
-                style="Locked.TButton",
-                command=lambda: self._bind_capture_begin(
-                    attack_key_button, self._yolo_attack_key_var,
-                    "_yolo_attack_key_previous",
-                    self._yolo_on_attack_key_change,
-                ),
-            )
-            attack_key_button.pack(side="left", padx=(0, 8))
-            self._yolo_attack_key_button = attack_key_button
             # Attack range: horizontal slider (progress-bar style) that sets the
             # width of the attack range line drawn on the detection window.
+            # 自动攻击行为由「攻击模式」面板统一设置（YOLO 检测模式 = 自动攻击）。
             range_row = ttk.Frame(yolo_panel)
             range_row.pack(fill="x", pady=(6, 0))
             ttk.Label(range_row, text="攻击范围:").pack(
@@ -668,28 +639,22 @@ class UiWorker(threading.Thread):
                                                 expand=True, padx=(0, 8))
             self._yolo_zone_shift_y_label = ttk.Label(zone_row3, text="0%", width=8)
             self._yolo_zone_shift_y_label.pack(side="left")
-            # 一键安装：缺少 YOLO 依赖时点它自动安装（调用 安装.bat）。
-            yolo_status_row = ttk.Frame(yolo_panel)
-            yolo_status_row.pack(fill="x", pady=(6, 0))
-            self._yolo_install_button = ttk.Button(
-                yolo_status_row, text="一键安装 YOLO 依赖",
-                command=self._yolo_install_deps,
-            )
-            self._yolo_install_button.pack(side="left")
+            # 显示检测画面（可选，默认不显示）；YOLO 依赖由 安装.bat 自动安装。
             self._yolo_status = ttk.Label(
-                yolo_status_row, text="YOLO 检测已停止。", justify="left"
+                yolo_panel, text="YOLO 检测已停止。", justify="left"
             )
-            self._yolo_status.pack(side="left", padx=(8, 0))
+            self._yolo_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved YOLO panel settings (threshold, ranges).
             self._yolo_load_settings()
 
-            # Fixed Attack panel: choose the attack engine. Either the YOLO
-            # detection mode (mob detection + auto attack) or a fixed-rate
-            # attack that taps the attack key every N seconds. Selecting the
-            # fixed mode greys out the YOLO panel; the fixed worker lives in
-            # the assistant process (AttackWorker) and is applied live.
+            # Attack-mode panel: choose the attack engine. Either the YOLO
+            # detection mode (mob detection + auto attack using the attack
+            # key below) or a fixed-rate attack that taps the attack key every
+            # N seconds. Selecting the fixed mode greys out the YOLO panel;
+            # the fixed worker lives in the assistant process (AttackWorker)
+            # and is applied live.
             fixed_panel = ttk.LabelFrame(
-                col1, text="固定攻击", padding=10
+                col1, text="攻击模式", padding=10
             )
             fixed_panel.pack(fill="x", pady=(0, 8))
             mode_row = ttk.Frame(fixed_panel)
@@ -1024,7 +989,6 @@ class UiWorker(threading.Thread):
         self._refresh_automation_status()
         self._refresh_shutdown_status()
         self._poll_yolo_exit()
-        self._poll_yolo_install()
         root.after(self.refresh_ms, self._poll)
 
     def _poll_yolo_exit(self) -> None:
@@ -1068,57 +1032,6 @@ class UiWorker(threading.Thread):
             )
         LOG.warning("yolo detection process exited early (rc=%s)%s",
                     proc.returncode, detail)
-
-    def _yolo_install_deps(self) -> None:
-        """One-click install of the missing YOLO dependencies.
-
-        Launches 安装.bat in a visible console so the user can watch the
-        progress; the poll loop re-checks when it finishes.
-        """
-        proc = getattr(self, "_yolo_install_proc", None)
-        if proc is not None and proc.poll() is None:
-            self._yolo_status.configure(
-                text="安装正在进行中，请等待安装窗口完成（下载约 200MB）。"
-            )
-            return
-        install_bat = Path(__file__).resolve().parent / "安装.bat"
-        if not install_bat.is_file():
-            self._yolo_status.configure(
-                text=f"找不到安装脚本: {install_bat} — 请确认已完整解压。"
-            )
-            return
-        import subprocess
-
-        self._yolo_install_proc = subprocess.Popen(
-            [str(install_bat)],
-            cwd=str(Path(__file__).resolve().parent),
-            creationflags=0,  # 弹出可见控制台，让用户看到安装进度。
-        )
-        if hasattr(self, "_yolo_install_button"):
-            self._yolo_install_button.configure(state="disabled")
-        self._yolo_status.configure(
-            text="正在安装 YOLO 依赖（已弹出安装窗口，下载约 200MB，"
-                 "请等待其自动完成）..."
-        )
-        LOG.info("yolo dependency install launched: %s", install_bat)
-
-    def _poll_yolo_install(self) -> None:
-        """Refresh the YOLO status once the one-click install finishes."""
-        proc = getattr(self, "_yolo_install_proc", None)
-        if proc is None or proc.poll() is None:
-            return
-        self._yolo_install_proc = None
-        if hasattr(self, "_yolo_install_button"):
-            self._yolo_install_button.configure(state="normal")
-        if hasattr(self, "_yolo_status"):
-            ok = proc.returncode == 0
-            self._yolo_status.configure(
-                text="YOLO 依赖安装完成，点击「运行」开始检测。"
-                if ok else
-                f"安装未完成 (rc={proc.returncode})，"
-                "请查看安装窗口中的红色报错。"
-            )
-        LOG.info("yolo dependency install finished rc=%s", proc.returncode)
 
     def _refresh_automation_status(self) -> None:
         if not hasattr(self, "_automation_status_label"):
@@ -1311,12 +1224,6 @@ class UiWorker(threading.Thread):
                 self._yolo_zone_shift_y_var.set(int(data["zone_shift_y"]))
             if "show_detection" in data:
                 self._yolo_show_var.set(bool(data["show_detection"]))
-            if "auto_attack" in data:
-                if hasattr(self, "_yolo_attack_var"):
-                    self._yolo_attack_var.set(bool(data["auto_attack"]))
-            if "attack_key" in data:
-                if hasattr(self, "_yolo_attack_key_var"):
-                    self._yolo_attack_key_var.set(str(data["attack_key"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed yolo settings", exc_info=True)
             return
@@ -1325,11 +1232,6 @@ class UiWorker(threading.Thread):
         self._yolo_on_min_mob_change()
         self._yolo_on_zone_change()
         self._yolo_sync_show_button()
-        # Refresh the attack-key bind button label (the var was set above).
-        if hasattr(self, "_yolo_attack_key_button"):
-            self._yolo_attack_key_button.configure(
-                text=self._yolo_attack_key_var.get()
-            )
         LOG.info("yolo settings loaded from %s", self._yolo_settings_path())
 
     @staticmethod
@@ -1801,14 +1703,6 @@ class UiWorker(threading.Thread):
             "zone_height": int(self._yolo_zone_h_var.get()),
             "zone_shift_y": int(self._yolo_zone_shift_y_var.get()),
             "show_detection": bool(self._yolo_show_var.get()),
-            "auto_attack": bool(
-                self._yolo_attack_var.get()
-                if hasattr(self, "_yolo_attack_var") else False
-            ),
-            "attack_key": (
-                self._yolo_attack_key_var.get().strip()
-                if hasattr(self, "_yolo_attack_key_var") else "ctrl"
-            ),
         }
         path = self._yolo_settings_path()
         try:
@@ -1827,22 +1721,6 @@ class UiWorker(threading.Thread):
         value = round(float(self._yolo_threshold_var.get()), 2)
         self._yolo_threshold_var.set(value)
         self._yolo_threshold_label.configure(text=f"{value:.2f}")
-        # Keep the attack-key bind button label in sync (it is also invoked
-        # when a new attack key is recorded).
-        if hasattr(self, "_yolo_attack_key_button"):
-            self._yolo_attack_key_button.configure(
-                text=self._yolo_attack_key_var.get()
-            )
-
-    def _yolo_on_attack_key_change(self) -> None:
-        """Attack key was re-bound: refresh labels AND persist immediately.
-
-        The key binding must survive an assistant restart (the old handler
-        only refreshed labels - the binding reset to 'ctrl' next launch).
-        """
-
-        self._yolo_on_threshold_change()
-        self._yolo_save_settings()
 
     def _yolo_on_range_change(self, _value: str = "") -> None:
         """Update the attack-range label as the slider moves."""
@@ -1942,7 +1820,7 @@ class UiWorker(threading.Thread):
             if not deps_ok:
                 self._yolo_status.configure(
                     text="缺少 YOLO 依赖（torch/ultralytics/mss/cv2）。"
-                         "请点击「一键安装 YOLO 依赖」自动安装。"
+                         "请重新双击 安装.bat 安装全部依赖。"
                 )
                 return
         cmd = [str(python), str(script), "--threshold", f"{threshold}"]
@@ -1958,12 +1836,14 @@ class UiWorker(threading.Thread):
         )])
         if not self._yolo_show_var.get():
             cmd.append("--no-show")
-        if hasattr(self, "_yolo_attack_var") and self._yolo_attack_var.get():
+        # 自动攻击行为由「攻击模式」面板统一设置：YOLO 检测模式 = 自动攻击，
+        # 攻击按键与固定攻击共用（来自攻击模式面板）。
+        attack_key = "ctrl"
+        if hasattr(self, "_fixed_attack_key_var"):
+            attack_key = (self._fixed_attack_key_var.get().strip() or "ctrl")
+        if (getattr(self, "_attack_mode_var", None) is not None
+                and self._attack_mode_var.get() == "yolo"):
             cmd.append("--attack")
-            attack_key = "ctrl"
-            if hasattr(self, "_yolo_attack_key_var"):
-                attack_key = (self._yolo_attack_key_var.get().strip()
-                              or "ctrl")
             cmd.extend(["--attack-key", attack_key])
             cmd.extend(["--attack-log",
                         str(yolo_root / "attack.log")])
@@ -2001,8 +1881,10 @@ class UiWorker(threading.Thread):
         self._yolo_run_button.configure(state="disabled")
         self._yolo_stop_button.configure(state="normal")
         mode = "显示画面" if self._yolo_show_var.get() else "无窗口"
-        attack = ("自动攻击已开" if hasattr(self, "_yolo_attack_var")
-                  and self._yolo_attack_var.get() else "攻击已关")
+        attack = ("自动攻击已开" if (getattr(self, "_attack_mode_var", None)
+                                    is not None
+                                    and self._attack_mode_var.get() == "yolo")
+                  else "检测模式")
         env_hint = "（主环境）" if using_main_env else ""
         self._yolo_status.configure(
             text=f"YOLO 检测运行中 {env_hint}({mode}, {attack}, "
@@ -2126,11 +2008,6 @@ class UiWorker(threading.Thread):
             self._yolo_show_button.configure(style="TCheckbutton")
         else:
             self._yolo_show_button.configure(style="Off.TCheckbutton")
-        if hasattr(self, "_yolo_attack_button"):
-            if self._yolo_attack_var.get():
-                self._yolo_attack_button.configure(style="TCheckbutton")
-            else:
-                self._yolo_attack_button.configure(style="Off.TCheckbutton")
         running = (self._yolo_process is not None
                    and self._yolo_process.poll() is None)
         if running:
@@ -2185,6 +2062,11 @@ class UiWorker(threading.Thread):
                 )
                 return
         self.patrol_controller.set_enabled(True)
+        # 攻击模式为「YOLO 检测」时，开始巡逻自动启动 YOLO 检测
+        # （已在运行则跳过；缺依赖/模型会在状态栏给出提示）。
+        if (getattr(self, "_attack_mode_var", None) is not None
+                and self._attack_mode_var.get() == "yolo"):
+            self._yolo_start()
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已开始。")
 

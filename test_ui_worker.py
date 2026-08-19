@@ -318,8 +318,6 @@ class UiLogHandlerTests(unittest.TestCase):
             worker._yolo_zone_h_var = Var(55)
             worker._yolo_zone_shift_y_var = Var(15)
             worker._yolo_show_var = Var(True)
-            worker._yolo_attack_var = Var(True)
-            worker._yolo_attack_key_var = Var("alt")
             worker._yolo_status = Label()
             worker._yolo_run_button = Button()
             worker._yolo_stop_button = Button()
@@ -342,8 +340,6 @@ class UiLogHandlerTests(unittest.TestCase):
                 loader._yolo_zone_h_var = Var(60)
                 loader._yolo_zone_shift_y_var = Var(0)
                 loader._yolo_show_var = Var(False)
-                loader._yolo_attack_var = Var(False)
-                loader._yolo_attack_key_var = Var("ctrl")
                 loader._yolo_status = Label()
                 loader._yolo_run_button = Button()
                 loader._yolo_stop_button = Button()
@@ -361,8 +357,6 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertEqual(loader._yolo_zone_h_var.get(), 55)
                 self.assertEqual(loader._yolo_zone_shift_y_var.get(), 15)
                 self.assertTrue(loader._yolo_show_var.get())
-                self.assertTrue(loader._yolo_attack_var.get())
-                self.assertEqual(loader._yolo_attack_key_var.get(), "alt")
 
     def test_yolo_save_config_confirms_and_persists(self) -> None:
         import tempfile
@@ -394,8 +388,6 @@ class UiLogHandlerTests(unittest.TestCase):
             worker._yolo_zone_h_var = Var(26)
             worker._yolo_zone_shift_y_var = Var(1)
             worker._yolo_show_var = Var(True)
-            worker._yolo_attack_var = Var(True)
-            worker._yolo_attack_key_var = Var("ctrl")
             worker._yolo_status = Label()
 
             def fake_path(self):
@@ -410,8 +402,9 @@ class UiLogHandlerTests(unittest.TestCase):
                 data = json.loads(saved.read_text(encoding="utf-8"))
                 self.assertEqual(data["threshold"], 0.42)
                 self.assertEqual(data["attack_range"], 1000)
-                self.assertTrue(data["auto_attack"])
-                self.assertEqual(data["attack_key"], "ctrl")
+                # 自动攻击由攻击模式面板控制，YOLO 设置不再保存它。
+                self.assertNotIn("auto_attack", data)
+                self.assertNotIn("attack_key", data)
                 self.assertIn("配置已保存", worker._yolo_status.text)
 
     def test_reset_has_no_confirmation_and_stops_before_clearing(self) -> None:
