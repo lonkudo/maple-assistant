@@ -62,6 +62,21 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(half.hp, 328, delta=10)
         self.assertAlmostEqual(half.mp, 371, delta=5)
 
+    def test_wide_non_bar_element_does_not_lock_ratio_at_full(self):
+        # A wide blue element (HUD frame / bar-track glow) inside the ROI
+        # must NOT be measured as the MP bar - it would lock the ratio at
+        # 1.0 and MP potions would never fire.  The real fill is used.
+        image = Image.new("RGB", (1000, 1000), "black")
+        draw = ImageDraw.Draw(image)
+        # Wide blue artifact, passes the MP mask, sits in its own row band.
+        draw.rectangle((340, 975, 639, 979), fill=(60, 120, 220))
+        # Real MP fill at roughly half length (25px of the 51px estimate).
+        draw.rectangle((400, 985, 424, 989), fill=(20, 40, 220))
+        reading = BarStatusDetector().detect(image)
+        self.assertIsNotNone(reading.mp_ratio)
+        self.assertLess(reading.mp_ratio, 0.7)
+        self.assertGreater(reading.mp_ratio, 0.3)
+
     def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
         full = status_image(0.5, 0.2)
         cropped = full.crop((0, 0, 600, 1000))

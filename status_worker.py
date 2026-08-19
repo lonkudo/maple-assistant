@@ -557,21 +557,49 @@ class BarStatusDetector:
 
     def _ratio(self, mask: np.ndarray, frame_width: int,
                name: str) -> tuple[Optional[float], float]:
-        run, row, start = self._longest_run(mask)
         minimum = frame_width * self.config.min_bar_width_fraction
+        expected = max(1.0, frame_width * self.config.full_bar_width_fraction)
+        # Only bar-plausible runs count: the fill is at most ~1x the fraction
+        # estimate when full.  A WIDER red/blue element in the ROI (HUD
+        # frame, bar-track glow, character effect) would otherwise be
+        # measured as the fill and lock the ratio at 1.0 - HP/MP never
+        # drops and potions never fire.
+        bar_max = max(expected * 2.0, 60.0)
+        best = (0, -1, 0)  # (length, row, start)
+        widest = 0
+        for row_number, row in enumerate(mask):
+            padded = np.pad(row.astype(np.int8), (1, 1))
+            edges = np.diff(padded)
+            starts = np.flatnonzero(edges == 1)
+            ends = np.flatnonzero(edges == -1)
+            if starts.size:
+                index = int(np.argmax(ends - starts))
+                run_candidate = int(ends[index] - starts[index])
+                widest = max(widest, run_candidate)
+                if (minimum <= run_candidate <= bar_max
+                        and run_candidate > best[0]):
+                    best = (run_candidate, row_number, int(starts[index]))
+        run, row, start = best
         if run < minimum:
             return None, 0.0
-
+        if widest > bar_max:
+            LOG.info("status bar (%s): ignored wide run %s px; using %s px",
+                     name, widest, run)
         # Merge several neighbouring scanlines. Anti-aliasing/borders otherwise
         # make a one-row estimate unnecessarily fragile.
         top, bottom = max(0, row - 2), min(mask.shape[0], row + 3)
-        local_runs = [self._longest_run(mask[y:y + 1])[0] for y in range(top, bottom)]
-        run = int(np.median([value for value in local_runs if value]))
+        local_runs = [
+            self._longest_run(mask[y:y + 1])[0] for y in range(top, bottom)
+        ]
+        local_runs = [value for value in local_runs
+                      if minimum <= value <= bar_max]
+        if not local_runs:
+            local_runs = [run]
+        run = int(np.median(local_runs))
         # Window resized / different resolution: drop the old reference.
         if frame_width != self._ref_width:
             self._ref_width = frame_width
             self._full_run[name] = None
-        expected = max(1.0, frame_width * self.config.full_bar_width_fraction)
         reference = self._full_run.get(name)
         if reference is not None:
             expected = max(expected, float(reference))
