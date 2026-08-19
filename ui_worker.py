@@ -417,7 +417,7 @@ class UiWorker(threading.Thread):
             screen_width = root.winfo_screenwidth()
             # 窗口固定在屏幕左上角 (0,0) 打开。两列布局：左侧巡逻/攻击/药品/
             # 附加功能，右侧 YOLO 怪物检测 + 调试日志，避免窗口过高。
-            window_height = 800
+            window_height = 1000
             root.geometry(f"1200x{window_height}+0+0")
             root.minsize(980, 560)
             root.protocol("WM_DELETE_WINDOW", root.destroy)
