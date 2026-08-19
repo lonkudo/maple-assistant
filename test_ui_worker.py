@@ -142,24 +142,30 @@ class UiLogHandlerTests(unittest.TestCase):
         worker.patrol_controller = Controller()
         worker._unlocked_points = set()
         worker._record_press_job = None
+        worker._record_hold_fired = False
         worker._control_status = Label()
         worker._refresh_patrol_controls = lambda: None
         recorded = []
         worker._record_endpoint = recorded.append
 
         # 短按已录制按钮：不解锁，仅提示需要长按。
+        worker._record_button_press("layer1", "left_most_pos")
         worker._record_button_release("layer1", "left_most_pos")
         self.assertNotIn(("layer1", "left_most_pos"), worker._unlocked_points)
         self.assertEqual(recorded, [])
         self.assertIn("长按", worker._control_status.text)
 
-        # 长按 1 秒：解锁并清除该点录制。
+        # 长按 1 秒：解锁并清除该点录制；释放本次长按不得录制。
+        worker._record_button_press("layer1", "left_most_pos")
         worker._record_button_hold("layer1", "left_most_pos")
+        worker._record_button_release("layer1", "left_most_pos")
         self.assertIn(("layer1", "left_most_pos"), worker._unlocked_points)
         self.assertEqual(Controller.cleared, [("layer1", "left_most_pos")])
         self.assertIn("已解锁并清除", worker._control_status.text)
+        self.assertEqual(recorded, [])
 
-        # 再次短按：录制新位置。
+        # 重新点击：录制新位置。
+        worker._record_button_press("layer1", "left_most_pos")
         worker._record_button_release("layer1", "left_most_pos")
         self.assertEqual(recorded, ["left_most_pos"])
 
@@ -178,6 +184,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker.patrol_controller = Controller()
         worker._unlocked_points = {("layer2", "left_most_pos")}
         worker._record_press_job = None
+        worker._record_hold_fired = False
         recorded = []
         worker._record_endpoint = recorded.append
 

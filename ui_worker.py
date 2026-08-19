@@ -405,6 +405,7 @@ class UiWorker(threading.Thread):
         # identically to rows present at startup.
         self._unlocked_points: set[tuple[str, str]] = set()
         self._record_press_job: Any = None
+        self._record_hold_fired = False
 
     def run(self) -> None:
         try:
@@ -2038,16 +2039,18 @@ class UiWorker(threading.Thread):
         if self.patrol_controller is None:
             return
         self._record_press_job = None
+        self._record_hold_fired = False
         if self._root is not None:
             self._record_press_job = self._root.after(
                 1000, lambda: self._record_button_hold(layer_name, boundary)
             )
 
     def _record_button_release(self, layer_name: str, boundary: str) -> None:
-        """Button released: a SHORT click records an unlocked/empty point.
+        """Button released.
 
-        A recorded (locked) point ignores short clicks - it only unlocks via
-        a 1s long press (which also clears its data).
+        A SHORT click records an unlocked/empty point.  After a 1s long
+        press already unlocked (and cleared) the point, this same release
+        must NOT record - the user clicks again to re-record.
         """
         if self._root is not None:
             try:
@@ -2055,6 +2058,10 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
             self._record_press_job = None
+        if self._record_hold_fired:
+            # 长按解锁已在本按下的 1s 定时器里完成：释放不录制。
+            self._record_hold_fired = False
+            return
         if self.patrol_controller is None:
             return
         try:
@@ -2074,6 +2081,7 @@ class UiWorker(threading.Thread):
 
     def _record_button_hold(self, layer_name: str, boundary: str) -> None:
         """1s long press on a locked point: unlock AND clear its recording."""
+        self._record_hold_fired = True
         if self.patrol_controller is None:
             return
         try:
