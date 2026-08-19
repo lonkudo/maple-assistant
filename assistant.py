@@ -343,20 +343,7 @@ def main() -> int:
         enabled=False,
         hours=3.0,
     )
-    pickup_workers = []
-    if args.pickup_interval > 0:
-        from pickup_worker import PickupWorker
-
-        pickup_workers.append(PickupWorker(
-            key_sender,
-            stop_event,
-            args.pickup_interval,
-            climbing_active_event=climbing_active,
-            dropping_active_event=dropping_active,
-            automation_active_event=automation_active,
-            moving_active_event=moving_active,
-            pickup_active_event=pickup_active,
-        ))
+    # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。
     status_worker = StatusWorker(
         status_frames,
         key_sender,
@@ -514,7 +501,6 @@ def main() -> int:
         movement_worker,
         status_worker,
         *attack_workers,
-        *pickup_workers,
         shutdown_worker,
         FocusWorker(
             key_sender,

@@ -84,12 +84,16 @@ class MovementTests(unittest.TestCase):
             queue.Queue(), sender, threading.Event(),
             important_positions={}, attack_state_path=str(tmp),
         )
-        # Full hold without attack: key down, held ~1s, key up.
+        # Full hold without attack: key down, held ~1s, key up.  Z pickup goes
+        # down together with the direction and comes up with it.
         started = time.monotonic()
         self.assertTrue(worker._send_walk_hold(
             MovementDecision("left", "walk", 1.0)))
         self.assertGreaterEqual(time.monotonic() - started, 0.9)
-        self.assertEqual(sender.events, [("down", "left"), ("up", "left")])
+        self.assertEqual(
+            sender.events,
+            [("down", "left"), ("down", "z"), ("up", "left"), ("up", "z")],
+        )
         # Attack takes over mid-hold: the movement key must release early
         # (~20ms) so the attack can turn the character and hit a monster
         # behind it.
@@ -108,7 +112,10 @@ class MovementTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         starter.join()
         self.assertLess(elapsed, 0.5)
-        self.assertEqual(sender.events, [("down", "left"), ("up", "left")])
+        self.assertEqual(
+            sender.events,
+            [("down", "left"), ("down", "z"), ("up", "left"), ("up", "z")],
+        )
         attack.write(False)
 
     def test_walk_hold_pushes_through_when_attack_window_exceeded(self):
@@ -140,8 +147,63 @@ class MovementTests(unittest.TestCase):
         self.assertTrue(worker._send_walk_hold(
             MovementDecision("left", "walk", 1.0)))
         self.assertGreaterEqual(time.monotonic() - started, 0.9)
-        self.assertEqual(sender.events, [("down", "left"), ("up", "left")])
+        self.assertEqual(
+            sender.events,
+            [("down", "left"), ("down", "z"), ("up", "left"), ("up", "z")],
+        )
         attack.write(False)
+
+    def test_walk_hold_z_pickup_is_simultaneous_and_gated(self):
+        # Z is pressed together with the direction key and released with it;
+        # the pickup-active event is set for the whole hold (so climb/jump
+        # logic waits) and cleared afterwards.
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import AttackStateFile
+
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def is_target_focused(self): return True
+
+        tmp = Path(tempfile.mkdtemp()) / "attack_state.json"
+        attack = AttackStateFile(str(tmp))
+        attack.write(False)
+        pickup_active = threading.Event()
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={}, attack_state_path=str(tmp),
+            pickup_active_event=pickup_active,
+        )
+
+        observed = []
+
+        def watch_event():
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                if pickup_active.is_set():
+                    observed.append(True)
+                    return
+                time.sleep(0.005)
+
+        watcher = threading.Thread(target=watch_event)
+        watcher.start()
+        self.assertTrue(worker._send_walk_hold(
+            MovementDecision("right", "walk", 0.5)))
+        watcher.join()
+        self.assertTrue(observed,
+                        "pickup-active event was never set during the hold")
+        self.assertFalse(pickup_active.is_set())
+        self.assertGreaterEqual(worker._pickup_count, 1)
+        # Event order: direction down first, Z down next; direction up first,
+        # Z up next - simultaneous pairs.
+        self.assertEqual(
+            sender.events,
+            [("down", "right"), ("down", "z"), ("up", "right"), ("up", "z")],
+        )
 
     def test_reset_route_loop_clears_dropping_flag(self):
         # After the drop phase reaches layer1 a new loop starts - the

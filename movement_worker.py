@@ -1199,6 +1199,12 @@ class MovementWorker(threading.Thread):
         target, so the attack logic can turn the character and attack; patrol
         resumes on the next frame after the target clears (the top-of-loop
         attack gate skips movement while the attack is active).
+
+        Pickup is tied to the walk: Z goes down at the same moment as the
+        direction key and comes up with it.  This method is only ever called
+        for plain left/right walks (move-to-left / move-to-right /
+        move-to-rope walk), never for stair jumps or jump-to-rope - so pickup
+        happens exactly in those three phases and nowhere else.
         """
 
         if decision.key not in ("left", "right"):
@@ -1213,6 +1219,15 @@ class MovementWorker(threading.Thread):
         claimed = key_down(decision.key) is not False
         if not claimed:
             return False
+        # Z pickup: pressed at the same moment as the direction key, released
+        # together with it (simultaneous down, simultaneous up).
+        z_claimed = key_down("z") is not False
+        if z_claimed:
+            self._pickup_count += 1
+            if self.pickup_active_event is not None:
+                self.pickup_active_event.set()
+            LOG.info("pickup: Z held with %s (#%d)",
+                     decision.key, self._pickup_count)
         deadline = time.monotonic() + max(0.01, float(decision.duration))
         try:
             while time.monotonic() < deadline:
@@ -1233,6 +1248,11 @@ class MovementWorker(threading.Thread):
             return True
         finally:
             key_up(decision.key)
+            if z_claimed:
+                key_up("z")
+                if self.pickup_active_event is not None:
+                    self.pickup_active_event.clear()
+                LOG.info("pickup: Z released with %s", decision.key)
 
     def __init__(
         self,
@@ -1432,6 +1452,8 @@ class MovementWorker(threading.Thread):
         # interrupt a rope grab (a Z keydown fires a skill even for a few ms).
         self.pickup_active_event = pickup_active_event
         self._pickup_z_force_after = 0.0
+        # Z pickup counter (pickup now rides the route-walk key holds).
+        self._pickup_count = 0
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).
         self._attack_state = (
