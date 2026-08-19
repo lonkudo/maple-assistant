@@ -1887,20 +1887,17 @@ class MovementWorker(threading.Thread):
     def _maybe_check_other_players(
         self, now: float, frame: Any, minimap_region: Any
     ) -> None:
-        """Time-anchored other-player scan for the automatic channel switch.
+        """Per-frame other-player scan for the automatic channel switch.
 
-        The red-diamond scan is gated by ``other_player_check_interval_seconds``
-        (default 60 s) instead of running on every patrol cycle, so the minimap
-        pixel check is amortized to roughly once a minute - a deliberate
-        efficiency trade-off.  When red diamonds (other players) show up the
-        channel switch is triggered.
+        No cooldown: as long as red diamonds (other players) show up on the
+        minimap the channel switch fires on the very next frame.
+        ``_player_switch_active`` guards re-entry while a switch is running;
+        once it finishes the next frame re-checks and switches again if
+        players are still present ("只要有人就换线").
         """
 
         if not self._other_player_check_enabled:
             return
-        if now - self._last_other_player_check < self.other_player_check_interval_seconds:
-            return
-        self._last_other_player_check = now
         if self._player_switch_active:
             return
         count = self._other_players_on_minimap(frame, minimap_region)
@@ -3132,9 +3129,9 @@ class MovementWorker(threading.Thread):
                     "climb", "jump_climb_left", "jump_climb_right",
                     "jump_climb_up", "drop",
                 )
-                # 爬绳的整个阶段（起跳尝试、重试、附绳、到顶）以及到达下一层
-                # 后平台边缘的调整窗口内，都禁止攻击：攻击会打断跳向绳子的
-                # 起跳或刚上平台的台阶跳，导致角色在绳边/平台边缘掉下去。
+                # 爬绳的整个阶段（起跳尝试、重试、附绳、到顶）、到达下一层
+                # 后平台边缘的调整窗口，以及换线期间，都禁止攻击：攻击会
+                # 打断跳向绳子的起跳/刚上平台的台阶跳/换线菜单操作。
                 now_mono = time.monotonic()
                 climb_arrival_grace_until = 0.0
                 climb_arrival_at = getattr(self, "_climb_arrival_at", None)
@@ -3147,6 +3144,7 @@ class MovementWorker(threading.Thread):
                     climb_decision_active
                     or self._climb_state.phase != "idle"
                     or now_mono < climb_arrival_grace_until
+                    or self._player_switch_active
                 )
                 if self.climbing_active_event is not None:
                     if climbing_now:

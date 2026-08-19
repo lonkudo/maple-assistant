@@ -493,7 +493,7 @@ def main() -> int:
                 calibration.get("stair_jump_climb_arrival_grace_seconds", 2.0)
             ),
             other_player_check_interval_seconds=float(
-                calibration.get("other_player_check_interval_seconds", 60.0)
+                calibration.get("other_player_check_interval_seconds", 0.0)
             ),
     )
     core_workers = [

@@ -642,27 +642,24 @@ class MovementTests(unittest.TestCase):
         object.__setattr__(frame, "image", Image.fromarray(image))
         return frame
 
-    def test_other_player_check_is_time_gated(self):
+    def test_other_player_check_triggers_every_scan_when_players_present(self):
         from unittest import mock
 
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(),
             important_positions={}, other_player_check_enabled=True,
-            other_player_check_interval_seconds=60.0,
         )
         frame = self._red_diamond_frame()
         region = (0.0, 0.0, 1.0, 1.0)
         with mock.patch.object(worker, "_trigger_other_player_switch") as trig:
-            # First check after the interval has elapsed scans and triggers.
+            # 无冷却：连续两帧都有人 → 都触发换线。
             worker._maybe_check_other_players(0.0, frame, region)
             trig.assert_called_once()
             self.assertEqual(trig.call_args[0][0], 1)  # one red diamond
-            # A second check inside the interval does NOT scan again.
-            worker._maybe_check_other_players(30.0, frame, region)
-            trig.assert_called_once()
-            # After a full minute it scans again.
-            worker._maybe_check_other_players(61.0, frame, region)
+            worker._maybe_check_other_players(0.02, frame, region)
             self.assertEqual(trig.call_count, 2)
+            worker._maybe_check_other_players(0.04, frame, region)
+            self.assertEqual(trig.call_count, 3)
 
     def test_other_player_check_skips_when_disabled_or_clean(self):
         from unittest import mock
