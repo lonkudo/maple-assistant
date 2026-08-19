@@ -124,9 +124,10 @@ def parse_args() -> argparse.Namespace:
                         help="frames per second (default 10)")
     parser.add_argument("--no-show", action="store_true",
                         help="run without the preview window (headless)")
-    parser.add_argument("--attack-range", type=int, default=800,
-                        help="attack range width in pixels, centered on screen "
-                             "(default 800)")
+    parser.add_argument("--attack-range", type=float, default=30.0,
+                        help="attack range width as a PERCENTAGE of the frame "
+                             "width (default 30); real pixels are computed "
+                             "from the actual game window size every frame")
     parser.add_argument("--attack", action="store_true",
                         help="enable auto-attack: face the target (left/right) "
                              "then press Ctrl while the game is focused")
@@ -147,10 +148,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-line-height", type=float, default=0.72,
                         help="vertical position of the attack range line as a "
                              "fraction of frame height (default 0.72)")
-    parser.add_argument("--min-mob-size", type=int, default=None,
-                        help="ignore mob detections smaller than this many "
-                             "pixels on either side (default: config.yaml "
-                             "detection_behavior.min_mob_box_px)")
+    parser.add_argument("--min-mob-size", type=float, default=2.3,
+                        help="ignore mob detections smaller than this "
+                             "PERCENTAGE of the frame width on either side "
+                             "(default 2.3); real pixels are computed from "
+                             "the actual game window size every frame")
     parser.add_argument("--zone-width", type=float, default=None,
                         help="detection zone width fraction 0.1-1.0 "
                              "(default: config.yaml center_zone)")
@@ -239,12 +241,10 @@ def main() -> int:
         zone["height_fraction"] = max(0.1, min(1.0, args.zone_height))
     if args.zone_shift_y is not None:
         zone["shift_y"] = max(-0.5, min(0.5, args.zone_shift_y))
-    # Minimum mob box size: the attack decision ignores mobs smaller than
-    # this on either side (dropped items are often misclassified as mobs
-    # and their boxes are tiny).
-    if args.min_mob_size is not None:
-        behavior = bot.config.config.setdefault("detection_behavior", {})
-        behavior["min_mob_box_px"] = max(1, int(args.min_mob_size))
+    # 攻击范围 / 最小怪物尺寸使用"窗口宽度的百分比"，每帧按实际帧宽
+    # 换算成真实像素——换分辨率/拉窗口后自动跟随，无需重新设置。
+    attack_range_percent = max(1.0, float(args.attack_range))
+    min_mob_percent = max(0.1, float(args.min_mob_size))
     interval = max(0.05, 1.0 / max(1.0, args.fps))
     region = bot.monitor
     # Live game-window region: refreshed every 30 frames (~3 s at 10 fps) so
@@ -304,6 +304,8 @@ def main() -> int:
           f"show={not args.no_show} zone="
           f"{zone.get('width_fraction')}x{zone.get('height_fraction')} "
           f"shift_y={zone.get('shift_y', 0.0)} "
+          f"attack_range={attack_range_percent:.0f}% "
+          f"min_mob={min_mob_percent:.1f}% "
           f"attack={'ON' if executor else 'OFF'} (ESC to quit)")
 
     with mss.MSS() as sct:
@@ -327,9 +329,20 @@ def main() -> int:
             try:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 dets = bot.detect_objects(img)
+                # 按当前帧宽换算攻击范围与最小怪物尺寸的真实像素值。
+                frame_w = int(img.shape[1])
+                attack_range_px = max(
+                    10, int(round(attack_range_percent / 100.0 * frame_w))
+                )
+                behavior = bot.config.config.setdefault(
+                    "detection_behavior", {}
+                )
+                behavior["min_mob_box_px"] = max(
+                    1, int(round(min_mob_percent / 100.0 * frame_w))
+                )
                 character = bot.detect_character(img)
                 target = bot.attack_decision(
-                    dets, character, attack_range=args.attack_range
+                    dets, character, attack_range=attack_range_px
                 )
                 # Preview: character/environment/mob detections, each drawn
                 # with its own color by _draw_detections (item/npc/ui
@@ -398,7 +411,7 @@ def main() -> int:
                     else:
                         rope_state.write(False)
                 preview = draw_attack_range(
-                    preview, args.attack_range, args.attack_line_height,
+                    preview, attack_range_px, args.attack_line_height,
                     character=character,
                 )
                 put_cn(

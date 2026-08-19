@@ -312,8 +312,8 @@ class UiLogHandlerTests(unittest.TestCase):
             worker = UiWorker.__new__(UiWorker)
             worker._yolo_process = None
             worker._yolo_threshold_var = Var("0.35")
-            worker._yolo_attack_range_var = Var(900)
-            worker._yolo_min_mob_var = Var(90)
+            worker._yolo_attack_range_var = Var(30)
+            worker._yolo_min_mob_var = Var(2)
             worker._yolo_zone_w_var = Var(70)
             worker._yolo_zone_h_var = Var(55)
             worker._yolo_zone_shift_y_var = Var(15)
@@ -351,12 +351,78 @@ class UiLogHandlerTests(unittest.TestCase):
                     loader._yolo_load_settings()
 
                 self.assertEqual(loader._yolo_threshold_var.get(), 0.35)
-                self.assertEqual(loader._yolo_attack_range_var.get(), 900)
-                self.assertEqual(loader._yolo_min_mob_var.get(), 90)
+                self.assertEqual(loader._yolo_attack_range_var.get(), 30)
+                self.assertEqual(loader._yolo_min_mob_var.get(), 2)
                 self.assertEqual(loader._yolo_zone_w_var.get(), 70)
                 self.assertEqual(loader._yolo_zone_h_var.get(), 55)
                 self.assertEqual(loader._yolo_zone_shift_y_var.get(), 15)
                 self.assertTrue(loader._yolo_show_var.get())
+
+    def test_yolo_settings_migrate_old_pixel_values_to_percent(self) -> None:
+        # Pre-percent builds saved attack_range/min_mob_size in pixels (with
+        # the 2561px reference width).  Loading must convert them to %.
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Label:
+            def __init__(self) -> None:
+                self.text = ""
+
+            def configure(self, *, text: str) -> None:
+                self.text = text
+
+        class Button:
+            def __init__(self) -> None:
+                self.state = "normal"
+
+            def configure(self, *, state: str = None, style: str = None) -> None:
+                if state is not None:
+                    self.state = state
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "yolo_detection_settings.json"
+            path.write_text(json.dumps({
+                "threshold": 0.4,
+                "attack_range": 900,     # old: 900px on a 2561-wide client
+                "min_mob_size": 60,      # old: 60px
+                "detection_fps": 10,
+                "zone_width": 60, "zone_height": 60, "zone_shift_y": 0,
+                "show_detection": False,
+            }), encoding="utf-8")
+            worker = UiWorker.__new__(UiWorker)
+            worker._yolo_process = None
+            worker._yolo_threshold_var = Var("0.4")
+            worker._yolo_attack_range_var = Var(800)
+            worker._yolo_min_mob_var = Var(60)
+            worker._yolo_zone_w_var = Var(60)
+            worker._yolo_zone_h_var = Var(60)
+            worker._yolo_zone_shift_y_var = Var(0)
+            worker._yolo_show_var = Var(False)
+            worker._yolo_status = Label()
+            worker._yolo_run_button = Button()
+            worker._yolo_stop_button = Button()
+            worker._yolo_on_range_change = lambda *a: None
+            worker._yolo_on_min_mob_change = lambda *a: None
+            worker._yolo_on_zone_change = lambda *a: None
+            worker._yolo_sync_show_button = lambda: None
+            with mock.patch.object(UiWorker, "_yolo_settings_path",
+                                   lambda self: path):
+                worker._yolo_load_settings()
+            # 900px / 2561 * 100 ~= 35%; 60px / 2561 * 100 ~= 2%.
+            self.assertEqual(worker._yolo_attack_range_var.get(), 35)
+            self.assertEqual(worker._yolo_min_mob_var.get(), 2)
 
     def test_yolo_save_config_confirms_and_persists(self) -> None:
         import tempfile
@@ -383,7 +449,7 @@ class UiLogHandlerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             worker = UiWorker.__new__(UiWorker)
             worker._yolo_threshold_var = Var("0.42")
-            worker._yolo_attack_range_var = Var(1000)
+            worker._yolo_attack_range_var = Var(35)
             worker._yolo_zone_w_var = Var(60)
             worker._yolo_zone_h_var = Var(26)
             worker._yolo_zone_shift_y_var = Var(1)
@@ -401,7 +467,7 @@ class UiLogHandlerTests(unittest.TestCase):
 
                 data = json.loads(saved.read_text(encoding="utf-8"))
                 self.assertEqual(data["threshold"], 0.42)
-                self.assertEqual(data["attack_range"], 1000)
+                self.assertEqual(data["attack_range"], 35)
                 # 自动攻击由攻击模式面板控制，YOLO 设置不再保存它。
                 self.assertNotIn("auto_attack", data)
                 self.assertNotIn("attack_key", data)

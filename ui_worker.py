@@ -536,19 +536,21 @@ class UiWorker(threading.Thread):
                 show_row, text="保存配置", command=self._yolo_save_config
             )
             self._yolo_save_button.pack(side="left", padx=(8, 0))
-            # Attack range: horizontal slider (progress-bar style) that sets the
-            # width of the attack range line drawn on the detection window.
+            # Attack range: horizontal slider (progress-bar style).  Value is
+            # a PERCENTAGE of the game window width - the real pixels are
+            # computed from the actual window size at runtime, so it adapts
+            # to any resolution automatically.
             # 自动攻击行为由「攻击模式」面板统一设置（YOLO 检测模式 = 自动攻击）。
             range_row = ttk.Frame(yolo_panel)
             range_row.pack(fill="x", pady=(6, 0))
             ttk.Label(range_row, text="攻击范围:").pack(
                 side="left", padx=(0, 6)
             )
-            self._yolo_attack_range_var = tk.IntVar(value=800)
+            self._yolo_attack_range_var = tk.IntVar(value=30)
             self._yolo_attack_range_slider = ttk.Scale(
                 range_row,
-                from_=200,
-                to=2000,
+                from_=5,
+                to=80,
                 orient="horizontal",
                 variable=self._yolo_attack_range_var,
                 command=self._yolo_on_range_change,
@@ -556,22 +558,23 @@ class UiWorker(threading.Thread):
             self._yolo_attack_range_slider.pack(side="left", fill="x",
                                                 expand=True, padx=(0, 8))
             self._yolo_attack_range_label = ttk.Label(
-                range_row, text="800 像素", width=8
+                range_row, text="30%", width=8
             )
             self._yolo_attack_range_label.pack(side="left")
             # Minimum mob size: horizontal slider (progress-bar style) that
             # filters out tiny detections (dropped items are frequently
-            # misclassified as mobs and their boxes are small).
+            # misclassified as mobs and their boxes are small).  Value is a
+            # PERCENTAGE of the game window width (resolution-independent).
             mob_size_row = ttk.Frame(yolo_panel)
             mob_size_row.pack(fill="x", pady=(4, 0))
             ttk.Label(mob_size_row, text="最小怪物尺寸:").pack(
                 side="left", padx=(0, 6)
             )
-            self._yolo_min_mob_var = tk.IntVar(value=60)
+            self._yolo_min_mob_var = tk.IntVar(value=2)
             self._yolo_min_mob_slider = ttk.Scale(
                 mob_size_row,
-                from_=10,
-                to=200,
+                from_=1,
+                to=15,
                 orient="horizontal",
                 variable=self._yolo_min_mob_var,
                 command=self._yolo_on_min_mob_change,
@@ -579,7 +582,7 @@ class UiWorker(threading.Thread):
             self._yolo_min_mob_slider.pack(side="left", fill="x",
                                            expand=True, padx=(0, 8))
             self._yolo_min_mob_label = ttk.Label(
-                mob_size_row, text="60 像素", width=8
+                mob_size_row, text="2%", width=8
             )
             self._yolo_min_mob_label.pack(side="left")
             # Detection frequency: frames per second, 2-30, middle = 10 fps
@@ -1213,10 +1216,20 @@ class UiWorker(threading.Thread):
             if "threshold" in data:
                 self._yolo_threshold_var.set(float(data["threshold"]))
             if "attack_range" in data:
-                self._yolo_attack_range_var.set(int(data["attack_range"]))
+                # 旧版保存的是像素（以 2561px 参考宽校准）：>100 视为旧像素，
+                # 自动换算成百分比（像素 ÷ 2561 × 100）。
+                value = int(data["attack_range"])
+                if value > 100:
+                    value = round(value / 2561.0 * 100)
+                self._yolo_attack_range_var.set(max(5, min(80, value)))
             if "min_mob_size" in data:
                 if hasattr(self, "_yolo_min_mob_var"):
-                    self._yolo_min_mob_var.set(int(data["min_mob_size"]))
+                    value = int(data["min_mob_size"])
+                    # 旧版保存的是像素（旧滑块 10-200px，参考宽 2561）；
+                    # 新滑块范围 1-15%，>15 必为旧像素值，换算成百分比。
+                    if value > 15:
+                        value = round(value / 2561.0 * 100)
+                    self._yolo_min_mob_var.set(max(1, min(15, value)))
             if "detection_fps" in data:
                 if hasattr(self, "_yolo_fps_var"):
                     self._yolo_fps_var.set(int(data["detection_fps"]))
@@ -1727,20 +1740,20 @@ class UiWorker(threading.Thread):
         self._yolo_threshold_label.configure(text=f"{value:.2f}")
 
     def _yolo_on_range_change(self, _value: str = "") -> None:
-        """Update the attack-range label as the slider moves."""
+        """Update the attack-range label as the slider moves (percent)."""
 
         if not hasattr(self, "_yolo_attack_range_label"):
             return
         value = int(self._yolo_attack_range_var.get())
-        self._yolo_attack_range_label.configure(text=f"{value} px")
+        self._yolo_attack_range_label.configure(text=f"{value}%")
 
     def _yolo_on_min_mob_change(self, _value: str = "") -> None:
-        """Update the minimum-mob-size label as the slider moves."""
+        """Update the minimum-mob-size label as the slider moves (percent)."""
 
         if not hasattr(self, "_yolo_min_mob_label"):
             return
         value = int(self._yolo_min_mob_var.get())
-        self._yolo_min_mob_label.configure(text=f"{value} px")
+        self._yolo_min_mob_label.configure(text=f"{value}%")
 
     def _yolo_on_fps_change(self, _value: str = "") -> None:
         """Update the detection-FPS label as the slider moves."""

@@ -573,15 +573,11 @@ class OptimizedMapleBot:
         if character is None or not mobs:
             return None
         config = getattr(self, "config", {}) or {}
-        min_box = float(config.get(
+        # 最小怪物尺寸（像素）：live_view 已按当前帧宽换算（百分比 × 帧宽），
+        # 这里直接使用，不再按 2561 参考宽度二次缩放。
+        min_box = max(1.0, float(config.get(
             'detection_behavior.min_mob_box_px', 60.0
-        ))
-        # 最小怪物尺寸按窗口宽度自动缩放：界面滑块值以参考宽度 2561px
-        # 校准（默认 60px ≈ 2.3%），小窗口按比例缩小，避免把正常怪物滤掉。
-        frame_w = getattr(self, "_frame_size", None)
-        if frame_w is not None and frame_w[0] > 0:
-            min_box = min_box * frame_w[0] / 2561.0
-        min_box = max(1.0, min_box)
+        )))
         cx, cy = character.center
         half = max(10.0, float(attack_range) / 2.0)
         attackable = []
