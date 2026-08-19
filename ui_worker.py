@@ -261,13 +261,13 @@ def _box_text(box: Box) -> str:
 def patrol_button_states(running: bool, can_start: bool) -> tuple[str, str]:
     """Return Tk states for the separate Start and Stop patrol buttons.
 
-    Stop is ALWAYS enabled: the user must always be able to stop the patrol
-    (even when it failed to fully start or only the attack is running).
+    Start is enabled only when the patrol can start and is not running; Stop
+    is enabled only while the patrol is running (greyed out when stopped).
     """
 
     return (
         "normal" if can_start and not running else "disabled",
-        "normal",
+        "normal" if running else "disabled",
     )
 
 

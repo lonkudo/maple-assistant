@@ -86,9 +86,9 @@ class UiLogHandlerTests(unittest.TestCase):
         )
 
     def test_started_patrol_activates_stop_and_disables_start(self) -> None:
-        # Stop is always enabled so the user can always stop the patrol (even
-        # when it failed to fully start or only the attack is running).
-        self.assertEqual(patrol_button_states(False, True), ("normal", "normal"))
+        # Stop is enabled only while the patrol is running; it greys out when
+        # the patrol is stopped.
+        self.assertEqual(patrol_button_states(False, True), ("normal", "disabled"))
         self.assertEqual(patrol_button_states(True, True), ("disabled", "normal"))
 
     def test_log_queue_drops_oldest_messages_at_capacity(self) -> None:
