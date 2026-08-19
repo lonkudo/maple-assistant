@@ -1199,6 +1199,67 @@ class MovementWorker(threading.Thread):
             self._climb_cycle_failed()
         return result
 
+    def _rope_approach_stalled(
+        self, player_x: float, rope_x: Optional[float], route_label: str
+    ) -> bool:
+        """True when the rope-approach walk makes no X progress while the
+        character is aligned with the rope.
+
+        The character is then ON the rope mid-height (pressing left/right
+        there does not move it), so the walk+Z approach would loop forever.
+        """
+        if self._rope_approach_phase_label != route_label:
+            self._rope_approach_phase_label = route_label
+            self._rope_approach_last_x = player_x
+            self._rope_approach_stall_frames = 0
+            return False
+        last_x = self._rope_approach_last_x
+        self._rope_approach_last_x = player_x
+        if last_x is None:
+            return False
+        moved = abs(player_x - last_x) >= 0.002
+        aligned = rope_x is not None and abs(player_x - rope_x) <= 0.03
+        if moved or not aligned:
+            self._rope_approach_stall_frames = 0
+            return False
+        self._rope_approach_stall_frames += 1
+        # ~5 frames of no X progress while aligned with the rope.
+        return self._rope_approach_stall_frames >= 5
+
+    def _start_rope_stuck_climb(self, observation: MinimapObservation) -> None:
+        """The character is ON the rope mid-height: start an attached climb.
+
+        Holds Up and hands control to the climb state machine (which defers
+        all left/right walks - so NO Z is pressed while on the rope) until
+        the character climbs to the top and steps onto the platform.
+        """
+        if self._climb_state.phase != "idle":
+            return  # already climbing
+        state = self._climb_state
+        state.phase = "climbing-up"
+        state.up_held = True
+        state.baseline_y = (
+            observation.player.y if observation.player is not None else None
+        )
+        world_ok = bool(
+            observation.world_y_diamonds is not None
+            and observation.structure_confidence is not None
+            and observation.structure_confidence >= 0.12
+        )
+        state.baseline_world_y = (
+            observation.world_y_diamonds if world_ok else None
+        )
+        state.last_world_y = state.baseline_world_y
+        state.attach_frames = 2  # already attached to the rope
+        state.stalled_frames = 0
+        state.arrival_frames = 0
+        self.key_sender.key_down("up")
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
+        self._rope_stuck_recoveries += 1
+        LOG.warning("ROPE STUCK recovery #%d: character on the rope; "
+                    "climbing up (Z paused)", self._rope_stuck_recoveries)
+
     def _movement_busy_now(self) -> bool:
         """True while climbing, dropping, or settling right after a climb
         arrival.  During these windows movement must NOT yield to the attack
@@ -1487,6 +1548,15 @@ class MovementWorker(threading.Thread):
         self._pickup_z_force_after = 0.0
         # Z pickup counter (pickup now rides the route-walk key holds).
         self._pickup_count = 0
+        # Rope-approach stall recovery: when the character ends up ON the
+        # rope mid-height, the walk toward the rope never advances X - the
+        # worker must NOT keep pressing left/right+Z forever.  Track the
+        # approach X and, once stalled while aligned with the rope, switch to
+        # an attached climb (Up, no Z).
+        self._rope_approach_last_x: Optional[float] = None
+        self._rope_approach_stall_frames = 0
+        self._rope_approach_phase_label: Optional[str] = None
+        self._rope_stuck_recoveries = 0
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).
         self._attack_state = (
@@ -3314,6 +3384,18 @@ class MovementWorker(threading.Thread):
                         # direction and tap Alt (jump) mid-hold to clear it.
                         self._send_stair_jump(decision)
                     elif decision.key in ("left", "right"):
+                        # 绳上停滞恢复：角色实际已在绳上（X 与绳对齐且按方向
+                        # 键不前进）时，停止按方向键+Z，改为爬绳（Up），
+                        # 避免无限循环卡在绳中段。
+                        if (route_label.endswith(".rope")
+                                and observation.player is not None
+                                and self._rope_approach_stalled(
+                                    observation.player.x,
+                                    route_target_x,
+                                    route_label,
+                                )):
+                            self._start_rope_stuck_climb(observation)
+                            continue
                         # Cancellable walk hold: the movement key is released
                         # within ~20ms when the attack selects a target, so
                         # the character can face and hit a monster behind it.

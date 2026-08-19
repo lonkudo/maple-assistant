@@ -205,6 +205,49 @@ class MovementTests(unittest.TestCase):
             [("down", "right"), ("down", "z"), ("up", "right"), ("up", "z")],
         )
 
+    def test_rope_approach_stall_detects_on_rope_and_starts_climb(self):
+        # 角色卡在绳中段：走向绳子的方向键让 X 不再前进（角色在绳上），
+        # 停滞检测触发后必须改为爬绳（Up），不再按方向键+Z。
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = set()
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={},
+        )
+        # 角色 X 停在绳上（0.43，绳 0.449，gap 0.019）：首帧初始化，
+        # 之后连续无进展 5 帧后判定停滞。
+        for _ in range(5):
+            self.assertFalse(worker._rope_approach_stalled(
+                0.430556, 0.449074, "layer2.rope"))
+        self.assertTrue(worker._rope_approach_stalled(
+            0.430556, 0.449074, "layer2.rope"))
+        # X 前进了 → 计数器重置。
+        self.assertFalse(worker._rope_approach_stalled(
+            0.440000, 0.449074, "layer2.rope"))
+        # 不在绳的 X 附近（未对齐）→ 不判定停滞。
+        for _ in range(6):
+            self.assertFalse(worker._rope_approach_stalled(
+                0.200000, 0.449074, "layer2.rope"))
+
+        # 停滞恢复：角色在绳上 → 启动爬绳状态（Up 按住，不再发方向键）。
+        worker._climb_state.phase = "idle"
+        stuck_obs = MinimapObservation(
+            Point(0.430556, 0.397196), None, .9, (0, 0, 1, 1)
+        )
+        worker._start_rope_stuck_climb(stuck_obs)
+        self.assertEqual(worker._climb_state.phase, "climbing-up")
+        self.assertTrue(worker._climb_state.up_held)
+        self.assertIn("up", sender.owned)
+        # 重复调用不重复处理（已在爬）。
+        worker._start_rope_stuck_climb(stuck_obs)
+        self.assertEqual(worker._rope_stuck_recoveries, 1)
+
     def test_reset_route_loop_clears_dropping_flag(self):
         # After the drop phase reaches layer1 a new loop starts - the
         # dropping flag must clear, otherwise the patrol stays busy forever
