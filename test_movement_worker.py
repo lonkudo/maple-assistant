@@ -1820,13 +1820,16 @@ class MovementTests(unittest.TestCase):
             world_y_diamonds=-3.0, structure_confidence=.9,
         )
 
-        with patch("movement_worker.time.monotonic", side_effect=[0, 1.05]):
+        with patch("movement_worker.time.monotonic", side_effect=[0, 1.05, 1.05]):
             for _ in range(3):
                 self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(sender.released, [])
             self.assertEqual(worker._climb_state.phase, "arrival-compensation")
             self.assertEqual(worker._resync_route_layer(y_flicker), "layer2")
         self.assertEqual(sender.released, ["up"])
+        # The climb-arrival stamp is set so stair jumps are suppressed while
+        # the character settles on the platform edge.
+        self.assertIsNotNone(worker._climb_arrival_at)
 
     def test_next_layer_y_controls_climb_completion(self):
         positions = {

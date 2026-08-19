@@ -502,6 +502,9 @@ def main() -> int:
             stair_jump_lead_seconds=float(
                 calibration.get("stair_jump_lead_seconds", 0.15)
             ),
+            stair_jump_climb_arrival_grace_seconds=float(
+                calibration.get("stair_jump_climb_arrival_grace_seconds", 2.0)
+            ),
             other_player_check_interval_seconds=float(
                 calibration.get("other_player_check_interval_seconds", 60.0)
             ),

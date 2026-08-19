@@ -354,6 +354,10 @@ class ClimbState:
     target_layer_since: Optional[float] = None
     last_world_y: Optional[float] = None
     stalled_frames: int = 0
+    # Consecutive frames the marker sits inside the NEXT layer's arrival
+    # band while holding Up (rope-top settle).  Bounds how long the
+    # at-arrival stall suppression may hold Up before retrying.
+    arrival_frames: int = 0
 
 
 def preserve_persistent_climb(
@@ -614,6 +618,24 @@ def climb(
         fell_back = False
 
     if persistent_up and state.up_held and state.phase == "climbing-up":
+        if at_arrival:
+            # Reached the rope top: the world-Y tracker re-anchors and the
+            # screen Y is at its minimum there, so "no Y progress" is the
+            # EXPECTED state - not a stalled grab.  Keep Up held so the
+            # arrival confirmation can complete and the character steps onto
+            # the platform; releasing Up here made it fall back off the rope
+            # top (observed: 'CLIMB stalled' right at layer arrival).
+            state.arrival_frames += 1
+            if state.arrival_frames <= 30:
+                # ~3s at 10fps: the arrival confirmation (3 frames) plus the
+                # Up compensation completes well within this.  If the next
+                # layer is never confirmed, fall back to the stall retry.
+                state.stalled_frames = 0
+                state.last_world_y = observation.world_y_diamonds
+                return "climbing-up"
+            state.arrival_frames = 0
+        else:
+            state.arrival_frames = 0
         if fell_back:
             # The marker descended from its jump peak: the grab failed and
             # the character fell back.  Release Up immediately and restart
@@ -1157,6 +1179,7 @@ class MovementWorker(threading.Thread):
         )
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
+            self._climb_arrival_at = time.monotonic()
             self._advance_after_climb()
             self._climb_cycle_reset()
         elif result == "failed-cycle-no-more-shift":
@@ -1296,6 +1319,7 @@ class MovementWorker(threading.Thread):
         stair_jump_grace_seconds: float = 2.5,
         stair_jump_alt_hold_seconds: float = 0.06,
         stair_jump_lead_seconds: float = 0.15,
+        stair_jump_climb_arrival_grace_seconds: float = 2.0,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1545,6 +1569,14 @@ class MovementWorker(threading.Thread):
             0.01, float(stair_jump_alt_hold_seconds)
         )
         self.stair_jump_lead_seconds = max(0.0, float(stair_jump_lead_seconds))
+        # After a rope climb reaches the next layer the character is still
+        # settling on the platform edge - a stalled walk there is not a stair
+        # and jumping left/right can drop it off the platform.  No stair jump
+        # for this many seconds after the climb arrival.
+        self.stair_jump_climb_arrival_grace_seconds = max(
+            0.0, float(stair_jump_climb_arrival_grace_seconds)
+        )
+        self._climb_arrival_at: Optional[float] = None
         # Current-analysis-unit stall threshold (set per frame from the
         # diamond-relative setting once a CoordinateLayout is known).
         self._current_stair_jump_stall = STAIR_JUMP_STALL_FALLBACK
@@ -1632,6 +1664,15 @@ class MovementWorker(threading.Thread):
         started = self._patrol_started_at
         if (started is not None
                 and now < started + self.patrol_start_grace_seconds):
+            return None
+        # Climb-arrival grace: right after a rope climb reached the next
+        # layer the character is still on/near the platform edge - a stalled
+        # walk there is not a stair, and jumping can drop it off the
+        # platform.  No stair jump until it has moved for a moment.
+        climb_arrival = getattr(self, "_climb_arrival_at", None)
+        if (climb_arrival is not None
+                and now < climb_arrival
+                + self.stair_jump_climb_arrival_grace_seconds):
             return None
         if route_label.endswith(".left-most"):
             direction = "left"
@@ -2266,6 +2307,8 @@ class MovementWorker(threading.Thread):
             else "route-complete"
         )
         was_climbing = climb_input_active
+        if was_climbing:
+            self._climb_arrival_at = time.monotonic()
         self._release_climb_up()
         self._route_layer_index = detected_index
         self._route_phase = "left"
