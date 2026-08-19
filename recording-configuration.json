@@ -1,6 +1,6 @@
 {
   "configuration_id": "patrol_recording",
-  "map_name": "射手训练场 I",
+  "map_name": "",
   "patrol_enabled": false,
   "climbing_enabled": true,
   "route_order": [],
