@@ -1076,10 +1076,23 @@ class UiWorker(threading.Thread):
         self._log_text.configure(state="normal")
         self._log_text.insert("end", "\n".join(messages) + "\n")
         line_count = int(self._log_text.index("end-1c").split(".")[0])
-        if line_count > 250:
-            self._log_text.delete("1.0", f"{line_count - 250}.0")
+        if line_count > 30:
+            self._log_text.delete("1.0", f"{line_count - 30}.0")
         self._log_text.see("end")
         self._log_text.configure(state="disabled")
+
+    def _trim_log_lines(self, limit: int) -> None:
+        """Keep only the latest ``limit`` lines in the debug log widget."""
+        if not hasattr(self, "_log_text"):
+            return
+        try:
+            self._log_text.configure(state="normal")
+            line_count = int(self._log_text.index("end-1c").split(".")[0])
+            if line_count > limit:
+                self._log_text.delete("1.0", f"{line_count - limit}.0")
+            self._log_text.configure(state="disabled")
+        except Exception:
+            pass
 
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
@@ -2155,6 +2168,8 @@ class UiWorker(threading.Thread):
         # mode the character stands and the YOLO executor attacks, so without
         # this the character would keep attacking after Stop Patrol.
         self._yolo_stop()
+        # 每次停止巡逻：调试日志只保留最新 100 条。
+        self._trim_log_lines(100)
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已停止。")
 
