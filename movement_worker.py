@@ -3075,26 +3075,38 @@ class MovementWorker(threading.Thread):
                     "climb", "jump_climb_left", "jump_climb_right",
                     "jump_climb_up", "drop",
                 )
+                # 爬绳的整个阶段（起跳尝试、重试、附绳、到顶）以及到达下一层
+                # 后平台边缘的调整窗口内，都禁止攻击：攻击会打断跳向绳子的
+                # 起跳或刚上平台的台阶跳，导致角色在绳边/平台边缘掉下去。
+                now_mono = time.monotonic()
+                climb_arrival_grace_until = 0.0
+                climb_arrival_at = getattr(self, "_climb_arrival_at", None)
+                if climb_arrival_at is not None:
+                    climb_arrival_grace_until = (
+                        climb_arrival_at
+                        + self.stair_jump_climb_arrival_grace_seconds
+                    )
+                climbing_now = bool(
+                    climb_decision_active
+                    or self._climb_state.phase != "idle"
+                    or now_mono < climb_arrival_grace_until
+                )
                 if self.climbing_active_event is not None:
-                    if climb_decision_active or self._climb_state.phase != "idle":
+                    if climbing_now:
                         self.climbing_active_event.set()
                     else:
                         self.climbing_active_event.clear()
                 # Publish the patrol state so the YOLO attack worker blocks
-                # attacks ONLY while the character is on the rope (attached
-                # climb) or dropping.  Moving toward the rope and the jump
-                # attempts themselves are normal combat movement: attack
-                # keeps priority there, so a passing mob is engaged instead
-                # of ignored while walking to the rope.
+                # attacks during the WHOLE climbing operation: jump attempts,
+                # retries, the attached climb, and the post-arrival settle on
+                # the platform edge.  An attack pressed mid-jump cuts the
+                # character's momentum and drops it off the rope or the
+                # platform edge (observed: stair jump cut by attack right
+                # after reaching the next layer).  Walking toward the rope
+                # keeps attack priority - only the climb itself is protected.
                 if self._patrol_state is not None:
-                    on_rope = bool(
-                        self._climb_state.phase in (
-                            "climbing-up", "arrival-compensation",
-                        )
-                        and self._climb_state.up_held
-                    )
                     busy_now = bool(
-                        on_rope
+                        climbing_now
                         or (self.dropping_active_event is not None
                             and self.dropping_active_event.is_set())
                     )
@@ -3104,7 +3116,6 @@ class MovementWorker(threading.Thread):
                     # busy=false for one frame and the YOLO attack fired Ctrl
                     # exactly as the climb re-grabbed the rope, interrupting
                     # the climb.
-                    now_mono = time.monotonic()
                     if busy_now:
                         self._patrol_busy_until = now_mono + self._patrol_busy_hold
                     patrol_busy = bool(
