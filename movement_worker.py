@@ -488,6 +488,7 @@ def climb(
     climb_attach_frames: int = 2,
     arrival_y: Optional[float] = None,
     arrival_tolerance: float = 0.02,
+    arrival_in_progress: bool = False,
 ) -> str:
     """Try to grab the rope and verify it from the next minimap screenshot.
 
@@ -618,13 +619,15 @@ def climb(
         fell_back = False
 
     if persistent_up and state.up_held and state.phase == "climbing-up":
-        if at_arrival:
-            # Reached the rope top: the world-Y tracker re-anchors and the
-            # screen Y is at its minimum there, so "no Y progress" is the
-            # EXPECTED state - not a stalled grab.  Keep Up held so the
-            # arrival confirmation can complete and the character steps onto
-            # the platform; releasing Up here made it fall back off the rope
-            # top (observed: 'CLIMB stalled' right at layer arrival).
+        if at_arrival or arrival_in_progress:
+            # Reached the rope top (either the marker settled in the next
+            # layer's band, or the worker's layer-confirmation is already
+            # counting): the world-Y tracker re-anchors and the screen Y is
+            # at its minimum there, so "no Y progress" is the EXPECTED state
+            # - not a stalled grab.  Keep Up held so the arrival confirmation
+            # completes and the character steps onto the platform; releasing
+            # Up here made it fall back off the rope top (observed: 'CLIMB
+            # stalled' right at layer arrival).
             state.arrival_frames += 1
             if state.arrival_frames <= 30:
                 # ~3s at 10fps: the arrival confirmation (3 frames) plus the
@@ -1157,6 +1160,12 @@ class MovementWorker(threading.Thread):
         """Advance the persistent climb state machine one frame."""
 
         arrival_y, arrival_tolerance = self._next_layer_arrival_band()
+        # 层到达确认已经开始（worker 的图层逻辑正在计数）时，到顶的停滞
+        # 检测必须抑制：即使 arrival_y 缺失/未命中，也保持 Up 直到确认完成。
+        arrival_in_progress = bool(
+            self._climb_state.target_layer_frames > 0
+            or self._climb_state.phase == "arrival-compensation"
+        )
         result = climb(
             self.key_sender,
             observation,
@@ -1176,6 +1185,7 @@ class MovementWorker(threading.Thread):
             rope_x=route_target_x,
             arrival_y=arrival_y,
             arrival_tolerance=arrival_tolerance,
+            arrival_in_progress=arrival_in_progress,
         )
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
@@ -1188,6 +1198,24 @@ class MovementWorker(threading.Thread):
             # at left-most after a few cycles instead of jumping in place.
             self._climb_cycle_failed()
         return result
+
+    def _movement_busy_now(self) -> bool:
+        """True while climbing, dropping, or settling right after a climb
+        arrival.  During these windows movement must NOT yield to the attack
+        - an attack interrupting the walk/jump at the rope top or platform
+        edge makes the character fall (observed: walk released early right
+        after reaching the next layer, then a stair jump cut mid-air)."""
+        if (self.dropping_active_event is not None
+                and self.dropping_active_event.is_set()):
+            return True
+        if self._climb_state.phase != "idle":
+            return True
+        climb_arrival_at = getattr(self, "_climb_arrival_at", None)
+        if (climb_arrival_at is not None
+                and time.monotonic() < climb_arrival_at
+                + self.stair_jump_climb_arrival_grace_seconds):
+            return True
+        return False
 
     def _send_walk_hold(self, decision: MovementDecision) -> bool:
         """Hold a walk key, releasing EARLY when the YOLO attack takes over.
@@ -1205,6 +1233,10 @@ class MovementWorker(threading.Thread):
         for plain left/right walks (move-to-left / move-to-right /
         move-to-rope walk), never for stair jumps or jump-to-rope - so pickup
         happens exactly in those three phases and nowhere else.
+
+        During a climb/arrival window the attack never interrupts the walk
+        (``_movement_busy_now``), so the character can step off the rope top
+        onto the platform instead of stalling at the edge.
         """
 
         if decision.key not in ("left", "right"):
@@ -1233,7 +1265,8 @@ class MovementWorker(threading.Thread):
             while time.monotonic() < deadline:
                 if self.stop_event.is_set():
                     break
-                if self._attack_state is not None:
+                if (self._attack_state is not None
+                        and not self._movement_busy_now()):
                     attack_now = self._attack_state.is_active()
                     if attack_now:
                         if self._attack_active_since is None:
@@ -1784,7 +1817,9 @@ class MovementWorker(threading.Thread):
             while time.monotonic() < deadline:
                 if self.stop_event.is_set():
                     break
-                if self._attack_state is not None:
+                # 只在起跳（Alt 按下）之前允许攻击打断：跳起来之后切断
+                # 方向键会让角色在平台边缘/台阶上掉下去。
+                if not alt_down and self._attack_state is not None:
                     attack_now = self._attack_state.is_active()
                     if attack_now:
                         if self._attack_active_since is None:

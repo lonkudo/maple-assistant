@@ -1618,6 +1618,51 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(state.phase, "climbing-up")
         self.assertIn("up", sender.owned)
 
+    def test_arrival_in_progress_suppresses_top_stall(self):
+        # At the rope top the world-Y tracker stops advancing; with the
+        # worker's layer-confirmation running (arrival_in_progress=True) the
+        # stall must NOT fire - Up stays held until the arrival completes.
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = set()
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        def make_state():
+            state = ClimbState(phase="climbing-up", up_held=True)
+            state.baseline_y = .467
+            state.baseline_world_y = -.14
+            state.last_world_y = -1.0
+            state.recent_y = [.467, .45, .43]
+            return state
+
+        top = MinimapObservation(
+            Point(.48, .43), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-1.0, structure_confidence=.9,
+        )
+        with patch("movement_worker.time.sleep"):
+            # 层确认中：world Y 停滞也不触发 stall，Up 保持。
+            sender, state = Sender(), make_state()
+            self.assertEqual(climb(sender, top, state, persistent_up=True,
+                                   world_y_stall_frames=2,
+                                   arrival_in_progress=True),
+                             "climbing-up")
+            self.assertEqual(climb(sender, top, state, persistent_up=True,
+                                   world_y_stall_frames=2,
+                                   arrival_in_progress=True),
+                             "climbing-up")
+            self.assertTrue(state.up_held)
+            # 无确认状态：两帧无进展后照常触发 stall 并松开 Up。
+            sender, state = Sender(), make_state()
+            self.assertEqual(climb(sender, top, state, persistent_up=True,
+                                   world_y_stall_frames=2),
+                             "climbing-up")
+            self.assertEqual(climb(sender, top, state, persistent_up=True,
+                                   world_y_stall_frames=2),
+                             "climb-stalled-retry")
+            self.assertFalse(state.up_held)
+
     def test_attach_requires_marker_x_aligned_with_rope(self):
         # The reported bug: marker Y/world Y rose, so the old Y-only check
         # declared "attached" while the marker X was far from the rope X
