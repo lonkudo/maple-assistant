@@ -1681,7 +1681,14 @@ class UiWorker(threading.Thread):
         self._shutdown_status.configure(text=text)
 
     def _shutdown_load_settings(self) -> None:
-        """Restore saved Additional Functions values and apply them live."""
+        """Restore saved Additional Functions values and apply them live.
+
+        The scheduled-shutdown CHECKBOX is deliberately NOT restored: a
+        saved "enabled" would silently re-arm the countdown on every launch
+        and could Alt+F4 the game mid-session (observed: the game closed
+        unexpectedly while the user was interacting).  The user must tick it
+        explicitly each session; only the hour value is remembered.
+        """
 
         try:
             data = json.loads(
@@ -1690,10 +1697,7 @@ class UiWorker(threading.Thread):
         except (OSError, ValueError):
             data = {}
         try:
-            if "shutdown_enabled" in data:
-                self._shutdown_enabled_var.set(
-                    bool(data["shutdown_enabled"])
-                )
+            self._shutdown_enabled_var.set(False)
             if "shutdown_hours" in data:
                 self._shutdown_hours_var.set(float(data["shutdown_hours"]))
             if "player_check_enabled" in data and hasattr(

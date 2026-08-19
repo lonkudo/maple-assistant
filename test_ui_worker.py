@@ -802,9 +802,11 @@ class UiLogHandlerTests(unittest.TestCase):
                 with mock.patch.object(UiWorker, "_shutdown_settings_path",
                                        fake_path):
                     loader._shutdown_load_settings()
-                self.assertTrue(loader._shutdown_enabled_var.get())
+                # 定时关闭勾选状态不跨会话恢复：启动后始终为未启用（防止
+                # 上次的倒计时静默到期突然 Alt+F4）；只恢复小时数。
+                self.assertFalse(loader._shutdown_enabled_var.get())
                 self.assertEqual(loader._shutdown_hours_var.get(), 2.5)
-                self.assertTrue(loader.shutdown_worker.enabled)
+                self.assertFalse(loader.shutdown_worker.enabled)
                 self.assertEqual(loader.shutdown_worker.hours, 2.5)
 
                 # Disabling greys the slider and clears the worker flag.
