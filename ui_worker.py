@@ -459,7 +459,7 @@ class UiWorker(threading.Thread):
             )
             self._stop_patrol_button.pack(side="left", padx=(0, 8))
             self._add_layer_button = ttk.Button(
-                action_row, text="添加图层", command=self._add_layer_above
+                action_row, text="添加楼层", command=self._add_layer_above
             )
             self._add_layer_button.pack(side="left", padx=(0, 8))
             self._reset_recording_button = ttk.Button(
@@ -2094,7 +2094,7 @@ class UiWorker(threading.Thread):
         try:
             layer_name = self.patrol_controller.add_layer_above()
         except (OSError, ValueError) as exc:
-            self._control_status.configure(text=f"无法添加图层: {exc}")
+            self._control_status.configure(text=f"无法添加楼层: {exc}")
             return
         self._control_status.configure(
             text=(f"已选择 {layer_name}。请手动移动到该层并录制任意巡逻点 "
