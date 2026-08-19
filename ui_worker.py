@@ -515,11 +515,15 @@ class UiWorker(threading.Thread):
                 yolo_row, text="停止", command=self._yolo_stop, state="disabled"
             )
             self._yolo_stop_button.pack(side="left", padx=(0, 8))
+            # 显示检测画面 / 保存配置 放在独立一行：避免与小窗口/高 DPI 下
+            # 的滑条挤在同一行而被挤出面板外看不到。
+            show_row = ttk.Frame(yolo_panel)
+            show_row.pack(fill="x", pady=(6, 0))
             # Show-detection toggle: grey/inactive by default; only when
             # activated does Run open the visible detection window.
             self._yolo_show_var = tk.BooleanVar(value=False)
             self._yolo_show_button = ttk.Checkbutton(
-                yolo_row,
+                show_row,
                 text="显示检测画面",
                 variable=self._yolo_show_var,
                 command=self._yolo_sync_show_button,
@@ -529,7 +533,7 @@ class UiWorker(threading.Thread):
             # Save configuration: persist the current YOLO panel values so
             # they are restored next launch (no need to re-tune every time).
             self._yolo_save_button = ttk.Button(
-                yolo_row, text="保存配置", command=self._yolo_save_config
+                show_row, text="保存配置", command=self._yolo_save_config
             )
             self._yolo_save_button.pack(side="left", padx=(8, 0))
             # Attack range: horizontal slider (progress-bar style) that sets the

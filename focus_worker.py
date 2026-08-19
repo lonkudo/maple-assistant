@@ -29,6 +29,7 @@ class FocusWorker(threading.Thread):
         game_focused_event: threading.Event,
         poll_interval: float = 0.20,
         focus_lost_grace_seconds: float = 2.5,
+        refocus_interval_seconds: float = 1.0,
         on_focus_lost: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(name="focus-worker", daemon=True)
@@ -38,8 +39,43 @@ class FocusWorker(threading.Thread):
         self.game_focused_event = game_focused_event
         self.poll_interval = max(0.05, float(poll_interval))
         self.focus_lost_grace_seconds = max(0.0, float(focus_lost_grace_seconds))
+        self.refocus_interval_seconds = max(0.25, float(refocus_interval_seconds))
         self.on_focus_lost = on_focus_lost
         self._lost_since: Optional[float] = None
+        self._last_refocus_at: Optional[float] = None
+        self._refocus_in_flight = False
+
+    def _try_refocus(self) -> None:
+        """Bring the game window back to the foreground (async, rate-limited).
+
+        Runs in a short-lived daemon thread so the poll loop keeps releasing
+        keys and stays responsive; ``select_window`` may retry for ~1-2s.
+        """
+        if self._refocus_in_flight:
+            return
+        now = time.monotonic()
+        if (self._last_refocus_at is not None
+                and now - self._last_refocus_at < self.refocus_interval_seconds):
+            return
+        self._last_refocus_at = now
+        self._refocus_in_flight = True
+
+        def _refocus_worker() -> None:
+            try:
+                if self.key_sender.select_window():
+                    LOG.info(
+                        "AUTOMATION REFOCUS: game window brought back to "
+                        "foreground"
+                    )
+                else:
+                    LOG.debug("auto-refocus: select_window returned False")
+            except Exception as exc:
+                LOG.debug("auto-refocus failed: %s", exc)
+            finally:
+                self._refocus_in_flight = False
+
+        threading.Thread(target=_refocus_worker, name="focus-refocus",
+                         daemon=True).start()
 
     def _log_foreground_snapshot(self) -> None:
         """Best-effort log of what window currently holds the foreground."""
@@ -87,9 +123,11 @@ class FocusWorker(threading.Thread):
                         self._lost_since = None
                     previous = active
                 elif input_enabled:
-                    # Game not focused while keyboard input is armed.  Start
-                    # the grace timer on the first bad poll; a short dip
-                    # resumes silently, a sustained loss stops the run.
+                    # Game not focused while keyboard input is armed.  First
+                    # try to restore the foreground automatically; the grace
+                    # timer then decides between a transient dip (resume) and
+                    # a sustained loss (terminal stop) if refocus fails.
+                    self._try_refocus()
                     if self._lost_since is None:
                         self._lost_since = now
                         self._log_foreground_snapshot()

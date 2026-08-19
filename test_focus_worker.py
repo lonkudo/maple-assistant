@@ -9,14 +9,20 @@ class FakeSender:
     def __init__(self) -> None:
         self.enabled = True
         self.focused = True
+        self.select_ok = True
         self.release_calls = 0
         self.disable_calls = 0
+        self.select_calls = 0
 
     def input_is_enabled(self) -> bool:
         return self.enabled
 
     def is_game_foreground(self) -> bool:
         return self.focused
+
+    def select_window(self) -> bool:
+        self.select_calls += 1
+        return self.select_ok
 
     def release_all_keys(self) -> None:
         self.release_calls += 1
@@ -49,6 +55,11 @@ class FocusWorkerTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertFalse(active.is_set())
             self.assertFalse(game_focused.is_set())
+            # Auto-refocus was attempted while the game was away (async thread).
+            select_deadline = time.monotonic() + 0.5
+            while sender.select_calls < 1 and time.monotonic() < select_deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(sender.select_calls, 1)
             sender.focused = True
             self.assertTrue(active.wait(0.5))
             self.assertTrue(game_focused.is_set())
@@ -74,6 +85,9 @@ class FocusWorkerTests(unittest.TestCase):
         try:
             self.assertTrue(active.wait(0.5))
             self.assertTrue(game_focused.is_set())
+            # Auto-refocus cannot win (e.g. privilege mismatch): the terminal
+            # stop still fires after the grace window.
+            sender.select_ok = False
             sender.focused = False
             # Automation pauses immediately...
             deadline = time.monotonic() + 0.3
@@ -82,6 +96,11 @@ class FocusWorkerTests(unittest.TestCase):
             self.assertFalse(active.is_set())
             self.assertFalse(game_focused.is_set())
             self.assertGreater(sender.release_calls, 0)
+            # Refocus was attempted (async thread) but cannot win.
+            select_deadline = time.monotonic() + 0.5
+            while sender.select_calls < 1 and time.monotonic() < select_deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(sender.select_calls, 1)
             # ...and the terminal stop fires only after the grace window.
             self.assertTrue(focus_lost.wait(0.5))
             self.assertEqual(sender.disable_calls, 1)
