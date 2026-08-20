@@ -248,6 +248,43 @@ class MovementTests(unittest.TestCase):
         worker._start_rope_stuck_climb(stuck_obs)
         self.assertEqual(worker._rope_stuck_recoveries, 1)
 
+    def test_rope_approach_recovery_jumps_when_blocked_at_platform_edge(self):
+        from unittest import mock
+
+        class Sender:
+            dry_run = True
+            def __init__(self): self.owned = set()
+            def key_down(self, key): self.owned.add(key); return True
+            def key_up(self, key): self.owned.discard(key); return True
+            def press(self, key, duration=0): return True
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={"layer1": {
+                "layer_y": .67, "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .67},
+                "right_most_pos": {"x": .8, "y": .67},
+            }},
+            route_order=["layer1"],
+        )
+        worker._route_layers = ["layer1"]
+        worker._climb_state.phase = "idle"
+        # 平台边缘：角色在 layer1 平台上（Y 命中 band），X 停在绳旁无法前进
+        # → 朝绳方向起跳（交给爬绳状态机）。
+        edge = MinimapObservation(Point(.234, .67), None, .9, (0, 0, 1, 1))
+        with mock.patch.object(worker, "_run_climb_step") as climb:
+            worker._recover_rope_approach(edge, 0.215)
+            climb.assert_called_once()
+            self.assertEqual(climb.call_args[0][1], 0.215)  # rope_x
+            self.assertEqual(climb.call_args[0][2], "left")  # 朝绳方向
+        # 在绳上（Y 不在任何平台 band）→ 爬绳（Up 按住），不起跳。
+        worker._climb_state.phase = "idle"
+        on_rope_obs = MinimapObservation(Point(.43, .397), None, .9, (0, 0, 1, 1))
+        worker._recover_rope_approach(on_rope_obs, 0.449)
+        self.assertEqual(worker._climb_state.phase, "climbing-up")
+        self.assertIn("up", sender.owned)
+
     def test_self_rescue_triggers_after_20_stuck_frames_in_window(self):
         from unittest import mock
 

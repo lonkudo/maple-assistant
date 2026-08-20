@@ -1292,6 +1292,32 @@ class MovementWorker(threading.Thread):
         # ~5 frames of no X progress while aligned with the rope.
         return self._rope_approach_stall_frames >= 5
 
+    def _recover_rope_approach(
+        self, observation: MinimapObservation, rope_x: Optional[float]
+    ) -> None:
+        """Rope-approach stall recovery (two distinct cases).
+
+        The walk toward the rope is not advancing:
+        - the character is ON the rope (marker Y not on any platform band,
+          or within ~1 minimap px of the rope X) -> climb Up;
+        - the character is blocked at the PLATFORM EDGE right next to the
+          rope (it just missed the jump gate) -> jump toward the rope and
+          let the climb state machine handle the grab/retry.
+        """
+        if rope_x is None or observation.player is None:
+            return
+        if self._climb_state.phase != "idle":
+            return  # already climbing
+        gap = rope_x - observation.player.x
+        on_rope = self._detected_layer(observation) is None
+        if on_rope or abs(gap) <= 0.01:
+            self._start_rope_stuck_climb(observation)
+            return
+        direction = "right" if gap > 0 else "left"
+        LOG.warning("ROPE STUCK recovery: blocked at platform edge near the "
+                    "rope (gap=%.4f); jumping %s toward it", gap, direction)
+        self._run_climb_step(observation, rope_x, direction)
+
     def _start_rope_stuck_climb(self, observation: MinimapObservation) -> None:
         """The character is ON the rope mid-height: start an attached climb.
 
@@ -3468,9 +3494,9 @@ class MovementWorker(threading.Thread):
                         # direction and tap Alt (jump) mid-hold to clear it.
                         self._send_stair_jump(decision)
                     elif decision.key in ("left", "right"):
-                        # 绳上停滞恢复：角色实际已在绳上（X 与绳对齐且按方向
-                        # 键不前进）时，停止按方向键+Z，改为爬绳（Up），
-                        # 避免无限循环卡在绳中段。
+                        # 绳上停滞恢复：角色实际已在绳上，或正被平台边缘挡在
+                        # 绳旁边（X 不前进且与绳对齐）时，停止按方向键+Z，
+                        # 改为爬绳 / 朝绳起跳，避免无限循环。
                         if (route_label.endswith(".rope")
                                 and observation.player is not None
                                 and self._rope_approach_stalled(
@@ -3478,7 +3504,9 @@ class MovementWorker(threading.Thread):
                                     route_target_x,
                                     route_label,
                                 )):
-                            self._start_rope_stuck_climb(observation)
+                            self._recover_rope_approach(
+                                observation, route_target_x
+                            )
                             continue
                         # Cancellable walk hold: the movement key is released
                         # within ~20ms when the attack selects a target, so
