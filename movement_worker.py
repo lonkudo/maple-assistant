@@ -1199,6 +1199,72 @@ class MovementWorker(threading.Thread):
             self._climb_cycle_failed()
         return result
 
+    def _rescue_stuck_check(
+        self, observation: MinimapObservation, now: float
+    ) -> None:
+        """Self-rescue stuck detection (checked once per 5-minute window).
+
+        Long patrols can wedge the character in a corner or on a rope with
+        no position change.  Within each ``rescue_check_interval_seconds``
+        window the run of consecutive unchanged minimap positions is tracked
+        (2 minimap pixels tolerance absorbs marker jitter); if it ever
+        reaches ``rescue_stuck_frames`` (default 20) the character is stuck:
+        drop to layer1 and restart the patrol.  Frames where an attack is
+        active are skipped - movement is intentionally paused then.
+        """
+        if not self.patrol_enabled or not self._route_layers:
+            return
+        if now - self._rescue_last_check >= self.rescue_check_interval_seconds:
+            if self._rescue_max_stuck >= self.rescue_stuck_frames:
+                LOG.warning(
+                    "SELF-RESCUE: character stuck (%d unchanged frames in "
+                    "the window); dropping to layer1 and restarting patrol",
+                    self._rescue_max_stuck,
+                )
+                self._trigger_rescue()
+            self._rescue_stuck_frames = 0
+            self._rescue_max_stuck = 0
+            self._rescue_last_check = now
+        if self._attack_state is not None and self._attack_state.is_active():
+            return
+        pos = observation.player
+        if pos is None:
+            self._rescue_stuck_frames = 0
+            return
+        last = self._rescue_last_pos
+        if (last is not None
+                and abs(pos.x - last.x) < 0.02
+                and abs(pos.y - last.y) < 0.02):
+            self._rescue_stuck_frames += 1
+            self._rescue_max_stuck = max(
+                self._rescue_max_stuck, self._rescue_stuck_frames
+            )
+        else:
+            self._rescue_stuck_frames = 0
+        self._rescue_last_pos = Point(pos.x, pos.y)
+
+    def _trigger_rescue(self) -> None:
+        """Start the self-rescue in a background thread (guarded once)."""
+        if self._rescue_active:
+            return
+        self._rescue_active = True
+        threading.Thread(target=self._run_rescue, name="self-rescue",
+                         daemon=True).start()
+
+    def _run_rescue(self) -> None:
+        """Drop to layer1 and restart the patrol from a clean state."""
+        try:
+            if self.patrol_controller is not None:
+                self.patrol_controller.set_enabled(False)
+            self._drop_to_first_layer()
+            self._restart_patrol_from_first_layer()
+        except Exception:
+            LOG.exception("self-rescue failed")
+        finally:
+            if self.patrol_controller is not None:
+                self.patrol_controller.set_enabled(True)
+            self._rescue_active = False
+
     def _rope_approach_stalled(
         self, player_x: float, rope_x: Optional[float], route_label: str
     ) -> bool:
@@ -1418,6 +1484,8 @@ class MovementWorker(threading.Thread):
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
         other_player_check_interval_seconds: float = 60.0,
+        rescue_check_interval_seconds: float = 300.0,
+        rescue_stuck_frames: int = 20,
         other_player_drug_taps: int = 3,
         other_player_drug_gap_seconds: float = 1.0,
         other_player_hp_threshold: float = 0.70,
@@ -1557,6 +1625,17 @@ class MovementWorker(threading.Thread):
         self._rope_approach_stall_frames = 0
         self._rope_approach_phase_label: Optional[str] = None
         self._rope_stuck_recoveries = 0
+        # 自救：巡逻 5 分钟一检；若角色在小地图上连续 20 帧位置不变
+        # （卡在角落/绳上），自动回到第一层并重启巡逻。
+        self.rescue_check_interval_seconds = max(
+            30.0, float(rescue_check_interval_seconds)
+        )
+        self.rescue_stuck_frames = max(5, int(rescue_stuck_frames))
+        self._rescue_last_check = time.monotonic()
+        self._rescue_last_pos: Optional[Point] = None
+        self._rescue_stuck_frames = 0
+        self._rescue_max_stuck = 0
+        self._rescue_active = False
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).
         self._attack_state = (
@@ -3186,12 +3265,14 @@ class MovementWorker(threading.Thread):
                     if stair_decision is not None:
                         decision = stair_decision
                     active_target_x = route_target_x
-                # Other-player safety net: a time-anchored scan (default every
-                # 60 s) switches channel when other players appear, without a
-                # per-frame minimap pixel cost.
+                # Other-player safety net: a per-frame scan (no cooldown)
+                # switches channel when other players appear.
                 self._maybe_check_other_players(
                     time.monotonic(), frame, minimap_region
                 )
+                # Self-rescue: 5 分钟一检，角色连续 20 帧位置不变则
+                # 回到第一层重启巡逻。
+                self._rescue_stuck_check(observation, time.monotonic())
                 decision = preserve_persistent_climb(self._climb_state, decision)
                 if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None

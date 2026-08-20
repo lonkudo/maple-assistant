@@ -495,6 +495,12 @@ def main() -> int:
             other_player_check_interval_seconds=float(
                 calibration.get("other_player_check_interval_seconds", 0.0)
             ),
+            rescue_check_interval_seconds=float(
+                calibration.get("rescue_check_interval_seconds", 300.0)
+            ),
+            rescue_stuck_frames=int(
+                calibration.get("rescue_stuck_frames", 20)
+            ),
     )
     core_workers = [
         capture_worker,

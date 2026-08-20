@@ -248,6 +248,42 @@ class MovementTests(unittest.TestCase):
         worker._start_rope_stuck_climb(stuck_obs)
         self.assertEqual(worker._rope_stuck_recoveries, 1)
 
+    def test_self_rescue_triggers_after_20_stuck_frames_in_window(self):
+        from unittest import mock
+
+        # 5 分钟窗口内角色连续 20 帧位置不变（卡住）→ 触发自救；位置有
+        # 变化则计数重置；攻击期间不计。
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer1": {
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }},
+            route_order=["layer1"],
+            rescue_check_interval_seconds=300.0,
+            rescue_stuck_frames=20,
+        )
+        worker.patrol_enabled = True
+        worker._rescue_last_check = 0.0
+        worker._rescue_last_pos = None
+        stuck = MinimapObservation(Point(.5, .5), None, .9, (0, 0, 1, 1))
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            # 前 19 帧位置不变（首帧为初始化）：窗口未结束，不触发。
+            for _ in range(19):
+                worker._rescue_stuck_check(stuck, 100.0)
+            self.assertEqual(worker._rescue_max_stuck, 18)
+            rescue.assert_not_called()
+            # 连续无进展累计达到 20 帧 → 窗口结束时触发。
+            worker._rescue_stuck_check(stuck, 100.0)
+            worker._rescue_stuck_check(stuck, 100.0)
+            self.assertEqual(worker._rescue_max_stuck, 20)
+            worker._rescue_stuck_check(stuck, 400.0)  # 下一个 5 分钟窗口
+            rescue.assert_called_once()
+            # 窗口重置后：位置变化 → 计数清零。
+            moved = MinimapObservation(Point(.6, .5), None, .9, (0, 0, 1, 1))
+            worker._rescue_stuck_check(moved, 401.0)
+            self.assertEqual(worker._rescue_stuck_frames, 0)
+
     def test_reset_route_loop_clears_dropping_flag(self):
         # After the drop phase reaches layer1 a new loop starts - the
         # dropping flag must clear, otherwise the patrol stays busy forever
