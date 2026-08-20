@@ -2753,6 +2753,8 @@ class StairJumpTests(unittest.TestCase):
                 stuck, "layer1.rope", self._plan(.5, "right"), 100.0 + frame))
 
     def test_grace_period_and_attempts_cap_stop_hop_in_place(self):
+        from unittest import mock
+
         worker = self._worker(stair_jump_stall_frames=1,
                               stair_jump_attempts_max=2)
         worker._route_layer_index = 0
@@ -2769,10 +2771,13 @@ class StairJumpTests(unittest.TestCase):
             stuck, "layer1.right-most", plan, 13.0)
         self.assertEqual(jump2.key, "stair_jump_right")
         self.assertEqual(worker._stair_state["attempts"], 2)
-        # Attempts exhausted: no more jumps, a warning was logged.
-        self.assertIsNone(worker._stair_jump_decision(
-            stuck, "layer1.right-most", plan, 16.0))
-        self.assertTrue(worker._stair_state["gave_up"])
+        # Attempts exhausted: no more jumps, and the self-rescue is
+        # triggered immediately (blocked at a wall/corner).
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            self.assertIsNone(worker._stair_jump_decision(
+                stuck, "layer1.right-most", plan, 16.0))
+            self.assertTrue(worker._stair_state["gave_up"])
+            rescue.assert_called_once()
 
     def test_phase_change_resets_stair_state(self):
         worker = self._worker()

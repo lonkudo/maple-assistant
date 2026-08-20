@@ -1913,6 +1913,9 @@ class MovementWorker(threading.Thread):
                     px, route_label, state["attempts"],
                 )
                 state["gave_up"] = True
+                # 卡死自救：台阶/墙角连续跳不过去 → 立即回到第一层重启
+                # 巡逻，而不是在原地无限按方向键+Z（等 5 分钟自救太久）。
+                self._trigger_rescue()
             return None
         state["attempts"] += 1
         state["stall_frames"] = 0
