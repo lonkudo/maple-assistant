@@ -1576,6 +1576,9 @@ class MovementWorker(threading.Thread):
         # left-most and re-approaches the rope (see _climb_cycle_failed).
         self.climb_failed_cycles_reset = max(1, int(climb_failed_cycles_reset))
         self._climb_failures = 0
+        # 同一层爬楼反复失败的"重置回最左"次数：超过上限后升级为完整自救
+        # （回第一层 + 重启 + 重锚定），避免无限在同一层巡逻不爬楼。
+        self._climb_restarts = 0
         self.near_rope_seconds = near_rope_seconds
         self.near_rope_range = near_rope_range
         self.near_rope_inner_range = (
@@ -2822,14 +2825,25 @@ class MovementWorker(threading.Thread):
         self._climb_failures = 0
         self._route_phase = "left"
         self._climb_state = ClimbState()
+        self._climb_restarts += 1
         LOG.warning(
             "CLIMB failed %d cycles at the rope; restarting patrol from left-most",
             self.climb_failed_cycles_reset,
         )
+        if self._climb_restarts >= 4:
+            # 同一层爬楼反复失败：再重置回最左只会无限循环"巡逻不爬楼"。
+            # 升级为完整自救（回第一层 + 重启巡逻 + 重锚定世界Y）。
+            LOG.warning(
+                "CLIMB keeps failing (%d restarts); self-rescue: drop to "
+                "layer1 and restart patrol", self._climb_restarts,
+            )
+            self._climb_restarts = 0
+            self._trigger_rescue()
         return True
 
     def _climb_cycle_reset(self) -> None:
         self._climb_failures = 0
+        self._climb_restarts = 0
 
     def _advance_after_climb(self) -> None:
         assert self._route_layer_index is not None

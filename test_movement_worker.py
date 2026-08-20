@@ -1259,6 +1259,26 @@ class MovementTests(unittest.TestCase):
         worker._climb_cycle_reset()
         self.assertFalse(worker._climb_cycle_failed())
 
+    def test_climb_failures_escalate_to_self_rescue(self):
+        from unittest import mock
+
+        # 同一层爬楼反复失败：多次"重置回最左"后升级为完整自救，避免
+        # 无限在同一层巡逻不爬楼。
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, route_order=[],
+        )
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for _restart in range(4):
+                for _ in range(3):  # 每次重置需要 3 个失败周期
+                    worker._climb_cycle_failed()
+            rescue.assert_called_once()
+        self.assertEqual(worker._climb_restarts, 0)
+        # 爬楼成功后重启计数清零。
+        worker._climb_failures = 2
+        worker._climb_cycle_reset()
+        self.assertEqual(worker._climb_restarts, 0)
+
     def test_patrol_busy_hysteresis_holds_after_idle_reset(self):
         import tempfile
         import time
