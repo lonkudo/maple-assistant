@@ -1076,8 +1076,8 @@ class UiWorker(threading.Thread):
         self._log_text.configure(state="normal")
         self._log_text.insert("end", "\n".join(messages) + "\n")
         line_count = int(self._log_text.index("end-1c").split(".")[0])
-        if line_count > 30:
-            self._log_text.delete("1.0", f"{line_count - 30}.0")
+        if line_count > 300:
+            self._log_text.delete("1.0", f"{line_count - 300}.0")
         self._log_text.see("end")
         self._log_text.configure(state="disabled")
 
