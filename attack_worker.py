@@ -22,11 +22,10 @@ class AttackWorker(threading.Thread):
     the timer keeps running but no key is ever sent.  ``attack_interval``
     and ``attack_key`` are plain attributes the UI can also update live.
 
-    When ``attack_state_path`` is given, the worker publishes a short
-    "attack active" window to the shared attack-state JSON so the movement
-    worker pauses the patrol walk while the attack lands (same priority
-    behavior as the YOLO attack executor) - the character stands and fights
-    instead of walking through mobs while tapping the key.
+    The fixed attack NEVER pauses the patrol walk: the character attacks
+    while walking (normal MapleStory behavior).  Publishing an attack-active
+    window here made the movement worker stop every attack - with a fast
+    interval the character crawled and looked stuck at the platform edge.
     """
 
     def __init__(
@@ -39,8 +38,6 @@ class AttackWorker(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
-        attack_state_path: Optional[str] = None,
-        attack_pause_seconds: float = 0.6,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
@@ -59,11 +56,6 @@ class AttackWorker(threading.Thread):
             self.attack_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
         )
-        self.attack_pause_seconds = max(0.05, float(attack_pause_seconds))
-        self._attack_state = None
-        if attack_state_path:
-            from combat_coordination import AttackStateFile
-            self._attack_state = AttackStateFile(attack_state_path)
 
     def set_key(self, key: str) -> bool:
         """Validate + apply a new attack key; False when unsupported."""
@@ -106,17 +98,7 @@ class AttackWorker(threading.Thread):
                 LOG.info("attack skipped: jump-climb input is active")
             else:
                 LOG.info("attack repetition: %s", self.attack_key)
-                if self._attack_state is not None:
-                    # 发布"攻击激活"窗口：移动线程看到后暂停行走，角色
-                    # 停下来攻击（与 YOLO 模式一致）。
-                    self._attack_state.write(True)
-                try:
-                    self.attack_once()
-                    if self._attack_state is not None:
-                        time.sleep(self.attack_pause_seconds)
-                finally:
-                    if self._attack_state is not None:
-                        self._attack_state.write(False)
+                self.attack_once()
             next_attack = time.monotonic() + self.attack_interval
         LOG.info("attack worker stopped")
 
