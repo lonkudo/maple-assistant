@@ -234,7 +234,9 @@ class PatrolControllerTests(unittest.TestCase):
                 controller.snapshot().layers["layer1"]["layer_y"], .41, places=6
             )
 
-    def test_new_layer_rejects_point_not_above_lower_layer(self) -> None:
+    def test_new_layer_records_point_even_when_world_y_order_is_off(self) -> None:
+        # 层序检查只警告不拒绝：世界 Y 排序异常不再阻止录制（用户可能
+        # 因地图/分辨率原因需要录到"看起来不在下层之上"的位置）。
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "map.json"
             data = profile()
@@ -242,8 +244,11 @@ class PatrolControllerTests(unittest.TestCase):
             data["layers"].pop("layer2")
             controller = PatrolController(path, data)
             controller.add_layer_above()
-            with self.assertRaises(ValueError):
-                controller.record_endpoint("left_most_pos", .25, .695)
+            recorded = controller.record_endpoint("left_most_pos", .25, .695)
+            self.assertEqual(recorded.layer, "layer2")
+            self.assertIsNotNone(
+                controller.endpoint("layer2", "left_most_pos")
+            )
 
     def test_recorded_points_transform_across_width_and_diamond_size(self) -> None:
         recorded_layout = CoordinateLayout(

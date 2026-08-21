@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 import json
@@ -9,6 +10,9 @@ from pathlib import Path
 import re
 import threading
 from typing import Any, Literal, Optional
+
+
+LOG = logging.getLogger(__name__)
 
 
 PointKind = Literal["left_most_pos", "rope_pos", "right_most_pos"]
@@ -412,6 +416,9 @@ class PatrolController:
                 if "layer_world_y" in layer else observed_world_y
             )
             if isinstance(lower_layer, dict):
+                # 层序检查仅作警告，不再拒绝录制：某些地图/分辨率下世界 Y
+                # 排序与预期不符，拒绝会让用户无法录制（如 layer5 的世界 Y
+                # 不在 layer4 之下）。录制由用户负责，这里只提醒。
                 if canonical_world_y is not None and "layer_world_y" in lower_layer:
                     lower_world_y = float(lower_layer["layer_world_y"])
                     separation = max(
@@ -419,9 +426,11 @@ class PatrolController:
                         float(layer.get("world_y_tolerance", 0.75)),
                     )
                     if canonical_world_y >= lower_world_y - separation:
-                        raise ValueError(
-                            f"{layer_name} must be above {lower_name}: "
-                            f"world Y must be below {lower_world_y - separation:.6f}"
+                        LOG.warning(
+                            "%s recorded with world Y %.6f, not below %s "
+                            "(%.6f +- %.3f); layer order may be wrong",
+                            layer_name, canonical_world_y, lower_name,
+                            lower_world_y, separation,
                         )
                 elif world_y is None and "layer_y" in lower_layer:
                     lower_y = float(lower_layer["layer_y"])
@@ -430,9 +439,11 @@ class PatrolController:
                         float(layer.get("y_tolerance", 0.020000)),
                     )
                     if float(player_y) >= lower_y - separation:
-                        raise ValueError(
-                            f"{layer_name} must be above {lower_name}: "
-                            f"Y must be below {lower_y - separation:.6f}"
+                        LOG.warning(
+                            "%s recorded with Y %.6f, not below %s "
+                            "(Y=%.6f +- %.3f); layer order may be wrong",
+                            layer_name, float(player_y), lower_name,
+                            lower_y, separation,
                         )
             if "layer_y" in layer and layout is None and world_y is None:
                 gap = abs(float(layer["layer_y"]) - float(player_y))
