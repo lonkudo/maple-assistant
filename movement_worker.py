@@ -1579,6 +1579,8 @@ class MovementWorker(threading.Thread):
         # 同一层爬楼反复失败的"重置回最左"次数：超过上限后升级为完整自救
         # （回第一层 + 重启 + 重锚定），避免无限在同一层巡逻不爬楼。
         self._climb_restarts = 0
+        # 爬楼失败时记录上一次的标记 X，用于检测"X 冻结"（绳子不可达）。
+        self._climb_last_x: Optional[float] = None
         self.near_rope_seconds = near_rope_seconds
         self.near_rope_range = near_rope_range
         self.near_rope_inner_range = (
@@ -2840,6 +2842,11 @@ class MovementWorker(threading.Thread):
         it from the edge, where the directional jump grabs reliably.  Without
         this a character stuck under a rope the straight jump cannot reach
         would jump in place forever and never patrol.
+
+        When the marker X is FROZEN across cycle failures (the directional
+        jump does not move the character toward the rope at all - a wall or
+        platform edge blocks it), the rope is unreachable from this approach:
+        escalate straight to the self-rescue instead of waiting for restarts.
         """
 
         self._climb_failures += 1
@@ -2853,20 +2860,32 @@ class MovementWorker(threading.Thread):
             "CLIMB failed %d cycles at the rope; restarting patrol from left-most",
             self.climb_failed_cycles_reset,
         )
-        if self._climb_restarts >= 4:
-            # 同一层爬楼反复失败：再重置回最左只会无限循环"巡逻不爬楼"。
-            # 升级为完整自救（回第一层 + 重启巡逻 + 重锚定世界Y）。
+        # X 冻结检测：跳向绳子的过程中标记 X 纹丝不动 → 绳子从这一侧
+        # 够不到（墙/平台边缘挡住），别等 4 次重启，直接升级自救。
+        frozen_x = False
+        if self.last_observation is not None and self.last_observation.player is not None:
+            x = self.last_observation.player.x
+            if (self._climb_last_x is not None
+                    and abs(x - self._climb_last_x) < 0.001):
+                frozen_x = True
+            self._climb_last_x = x
+        if self._climb_restarts >= 4 or frozen_x:
+            # 同一层爬楼反复失败 / X 冻结（绳子不可达）：升级为完整自救
+            # （回第一层 + 重启巡逻 + 重锚定世界Y）。
             LOG.warning(
-                "CLIMB keeps failing (%d restarts); self-rescue: drop to "
-                "layer1 and restart patrol", self._climb_restarts,
+                "CLIMB keeps failing (%d restarts, frozen_x=%s); self-rescue: "
+                "drop to layer1 and restart patrol",
+                self._climb_restarts, frozen_x,
             )
             self._climb_restarts = 0
+            self._climb_last_x = None
             self._trigger_rescue()
         return True
 
     def _climb_cycle_reset(self) -> None:
         self._climb_failures = 0
         self._climb_restarts = 0
+        self._climb_last_x = None
 
     def _advance_after_climb(self) -> None:
         assert self._route_layer_index is not None

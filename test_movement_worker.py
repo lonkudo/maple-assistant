@@ -1279,6 +1279,30 @@ class MovementTests(unittest.TestCase):
         worker._climb_cycle_reset()
         self.assertEqual(worker._climb_restarts, 0)
 
+    def test_climb_frozen_x_escalates_rescue_immediately(self):
+        from unittest import mock
+        from capture_worker import CapturedFrame
+
+        # 标记 X 冻结（跳向绳子的过程中 X 纹丝不动 = 绳子不可达）：
+        # 第二次失败周期就直接升级自救，不必等 4 次重启。
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, route_order=[],
+        )
+        frame = object.__new__(CapturedFrame)
+        object.__setattr__(frame, "image", Image.fromarray(
+            np.zeros((160, 200, 3), dtype=np.uint8)))
+        worker.last_observation = MinimapObservation(
+            Point(0.432870, 0.671196), None, .9, (0, 0, 1, 1)
+        )
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for _ in range(3):
+                worker._climb_cycle_failed()   # 第一次周期失败（重置回最左）
+            for _ in range(3):
+                worker._climb_cycle_failed()   # 第二次周期：X 与上次相同 → 冻结
+            rescue.assert_called_once()
+        self.assertEqual(worker._climb_restarts, 0)
+
     def test_patrol_busy_hysteresis_holds_after_idle_reset(self):
         import tempfile
         import time
