@@ -443,8 +443,10 @@ class PatrolController:
                         f"(Y={float(layer['layer_y']):.6f} ±{tolerance:.6f})"
                     )
             point = layer.setdefault(boundary, {})
-            point["x"] = round(float(player_x), 6)
-            point["y"] = round(float(player_y), 6)
+            # 录制坐标钳制到小地图有效范围 [0.02, 0.98]：边缘附近的标记可能
+            # 换算出越界值，越界目标会让巡逻永远追着地图外走。
+            point["x"] = round(max(0.02, min(0.98, float(player_x))), 6)
+            point["y"] = round(max(0.02, min(0.98, float(player_y))), 6)
             point["source"] = "manual-ui"
             if canonical_world_y is not None:
                 point["world_y"] = round(canonical_world_y, 6)
@@ -538,8 +540,11 @@ class PatrolController:
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
-                point["x"] = round(x, 6)
-                point["y"] = round(y, 6)
+                # 钳制到小地图有效范围 [0.02, 0.98]：菱形尺寸随分辨率变化时
+                # 投影可能越界（如 -0.134），不可达目标会让角色永远追着地图
+                # 边缘外走。钳制后目标始终可达，相位能正常完成。
+                point["x"] = round(max(0.02, min(0.98, x)), 6)
+                point["y"] = round(max(0.02, min(0.98, y)), 6)
                 projected_y.append(y)
             if projected_y:
                 # Same average rule as the recorded layer_y: the projected

@@ -1938,13 +1938,13 @@ class MovementWorker(threading.Thread):
             if not state["gave_up"]:
                 LOG.warning(
                     "STAIR JUMP gave up at x=%.6f (%s): %d attempts without "
-                    "progress; the stair may be impassable",
+                    "progress; the boundary may be unreachable",
                     px, route_label, state["attempts"],
                 )
                 state["gave_up"] = True
-                # 卡死自救：台阶/墙角连续跳不过去 → 立即回到第一层重启
-                # 巡逻，而不是在原地无限按方向键+Z（等 5 分钟自救太久）。
-                self._trigger_rescue()
+                # 边界不可达（墙角/越界目标）：角色已在实际可到达的边界处，
+                # 强制完成当前相位进入下一相位，而不是无限按方向键+Z。
+                self._force_advance_phase()
             return None
         state["attempts"] += 1
         state["stall_frames"] = 0
@@ -2807,6 +2807,29 @@ class MovementWorker(threading.Thread):
             # patrol climbing/dropping" -> the character never attacks).
             self.dropping_active_event.clear()
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
+
+    def _force_advance_phase(self) -> None:
+        """Boundary unreachable (walk blocked / out-of-bounds target): the
+        character is AT the reachable boundary - complete the current phase
+        and move to the next recorded one, breaking the loop of chasing an
+        unreachable target forever."""
+        if (self._route_layer_index is None
+                or self._route_layer_index >= len(self._route_layers)):
+            return
+        name = self._route_layers[self._route_layer_index]
+        phases = self._layer_phases(name)
+        current = self._route_phase
+        if current in phases:
+            index = phases.index(current)
+            if index + 1 < len(phases):
+                self._route_phase = phases[index + 1]
+                LOG.warning("boundary %s unreachable on %s; forcing next "
+                            "phase %s", current, name, phases[index + 1])
+                return
+        if phases:
+            self._route_phase = phases[0]
+            LOG.warning("boundary %s unreachable on %s; looping %s",
+                        current, name, phases[0])
 
     def _climb_cycle_failed(self) -> bool:
         """Count consecutive failed climb cycles at the rope.
