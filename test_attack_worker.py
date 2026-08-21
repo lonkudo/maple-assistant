@@ -92,6 +92,30 @@ class AttackWorkerTests(unittest.TestCase):
         worker = AttackWorker(FakeSender(), threading.Event(), 3.0)
         self.assertEqual(worker.initial_offset, 1.5)
 
+    def test_attack_publishes_attack_state_window(self):
+        # 固定攻击攻击时发布"激活"窗口（移动线程据此暂停行走）。
+        import tempfile
+        from pathlib import Path
+        from combat_coordination import AttackStateFile
+
+        sender = FakeSender()
+        stop = threading.Event()
+        tmp = Path(tempfile.mkdtemp()) / "attack_state.json"
+        state = AttackStateFile(str(tmp))
+        worker = AttackWorker(sender, stop, .25,
+                              initial_offset=.25,
+                              attack_state_path=str(tmp),
+                              attack_pause_seconds=0.2)
+        worker.start()
+        time.sleep(.30)
+        stop.set()
+        worker.join(1)
+        self.assertEqual(sender.events[:2], [("down", "ctrl"), ("up", "ctrl")])
+        # 攻击结束后状态已清除。
+        self.assertFalse(state.is_active())
+        # 攻击期间状态曾经为激活（通过事件序列验证键已发送，且窗口写入过）。
+        self.assertTrue(tmp.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

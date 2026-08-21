@@ -334,6 +334,11 @@ def main() -> int:
         args.attack_interval,
         climbing_active_event=climbing_active,
         automation_active_event=automation_active,
+        # 固定攻击也发布"攻击激活"窗口：攻击时移动线程暂停行走，角色
+        # 停下来攻击（与 YOLO 模式行为一致）。
+        attack_state_path=str(
+            Path(__file__).with_name("work") / "attack_state.json"
+        ),
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
