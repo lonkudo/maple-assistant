@@ -75,9 +75,11 @@ class AttackWorkerTests(unittest.TestCase):
         stop = threading.Event()
         climbing = threading.Event()
         climbing.set()
+        # 抖动置 0，保证确定性时序（抖动行为单独由默认值覆盖）。
         worker = AttackWorker(sender, stop, .25,
                               climbing_active_event=climbing,
-                              initial_offset=.25)
+                              initial_offset=.25,
+                              attack_jitter_seconds=0.0)
         worker.start()
         time.sleep(.30)
         self.assertEqual(sender.events, [])

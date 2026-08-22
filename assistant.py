@@ -481,7 +481,7 @@ def main() -> int:
                 calibration.get("stair_jump_attempts_max", 3)
             ),
             stair_jump_grace_seconds=float(
-                calibration.get("stair_jump_grace_seconds", 2.5)
+                calibration.get("stair_jump_grace_seconds", 0.8)
             ),
             stair_jump_alt_hold_seconds=float(
                 calibration.get("stair_jump_alt_hold_seconds", 0.06)

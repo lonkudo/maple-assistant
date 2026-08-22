@@ -1525,7 +1525,9 @@ class MovementWorker(threading.Thread):
         stair_jump_stall_frames: int = 2,
         patrol_start_grace_seconds: float = 3.0,
         stair_jump_attempts_max: int = 3,
-        stair_jump_grace_seconds: float = 2.5,
+        # 台阶/坑边尝试间隔 0.8s（原 2.5s）：地图坑多时角色卡在边缘会等
+        # 很久才跳下一次——缩短间隔让角色更快跳出坑/边缘。
+        stair_jump_grace_seconds: float = 0.8,
         stair_jump_alt_hold_seconds: float = 0.06,
         stair_jump_lead_seconds: float = 0.15,
         stair_jump_climb_arrival_grace_seconds: float = 2.0,
