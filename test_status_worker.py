@@ -244,7 +244,12 @@ class StatusTests(unittest.TestCase):
             buff1_key="home", buff1_interval=60.0, buff1_enabled=True,
             buff2_key="insert", buff2_interval=60.0, buff2_enabled=True,
         )
-        # Buffs are time-based: they fire even with full bars (no potions).
+        # 增益不从开局立即触发（用户会先手动触发第一次）：启动后第一帧不按。
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, [])
+        # 计时器到期后按一次（回拨时间戳模拟时间流逝）。
+        worker._last_buff["buff1"] = time.monotonic() - 61.0
+        worker._last_buff["buff2"] = time.monotonic() - 61.0
         worker._process_frame(status_image(1.0, 1.0))
         self.assertEqual(sender.keys, ["home", "insert"])
         # Interval not elapsed yet: no repeat.

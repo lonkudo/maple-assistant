@@ -684,7 +684,9 @@ class StatusWorker(threading.Thread):
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
         # Monotonic timestamps of the last periodic buff tap (per buff row).
-        self._last_buff = {"buff1": float("-inf"), "buff2": float("-inf")}
+        # 增益为"定时触发"，不从开局立即触发：起始时间戳设为当前时刻，
+        # 第一个增益会在 interval 秒后才按（用户会先手动触发第一次增益）。
+        self._last_buff = {"buff1": time.monotonic(), "buff2": time.monotonic()}
 
     def _tap_potion(self, key: str) -> bool:
         """Tap the potion key, retrying briefly if the first attempt is blocked.
