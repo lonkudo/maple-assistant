@@ -859,11 +859,9 @@ def climb(
 # the player diamond.
 DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
 
-# Normalized fallback used when no CoordinateLayout exists (≈0.25 diamonds at
-# the classic 6px diamond in a ~188px analysis crop).  With a layout the value
-# is recomputed per frame from the diamond-relative setting, exactly like
-# horizontal tolerance and the rope bands.
-STAIR_JUMP_STALL_FALLBACK = 0.008
+# 卡住判定阈值：标记 X 变化 < 0.012（最小地图单位）即视为"没在动"。
+# 按帧判定（连续 3 帧 ≈ 0.75s）触发跳跃。
+STAIR_JUMP_STALL_FALLBACK = 0.012
 
 
 def _image_from_frame(frame: Any) -> Image.Image:
@@ -3098,11 +3096,9 @@ class MovementWorker(threading.Thread):
                             * coordinate_layout.diamond_width
                             / coordinate_layout.analysis_width
                         )
-                    self._current_stair_jump_stall = (
-                        self.stair_jump_stall_diamonds
-                        * coordinate_layout.diamond_width
-                        / coordinate_layout.analysis_width
-                    )
+                    # 卡住阈值固定 0.012（最小地图单位）：X 变化 < 0.012
+                    # 连续 3 帧即判定卡住并跳。
+                    self._current_stair_jump_stall = 0.012
                 self._sync_patrol_controller(coordinate_layout)
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
