@@ -1369,26 +1369,67 @@ class MovementWorker(threading.Thread):
             return True
         return False
 
+    def _release_walk_hold(self) -> None:
+        """Release the currently held walk direction (and Z) if any."""
+        key_up = getattr(self.key_sender, "key_up", None)
+        with self._hold_lock:
+            if self._walk_hold_key is not None:
+                if key_up is not None:
+                    key_up(self._walk_hold_key)
+                self._walk_hold_key = None
+            if self._walk_hold_z:
+                if key_up is not None:
+                    key_up("z")
+                self._walk_hold_z = False
+                if self.pickup_active_event is not None:
+                    self.pickup_active_event.clear()
+                LOG.info("pickup: Z released with walk")
+            self._walk_hold_until = 0.0
+
+    def _hold_manager(self) -> None:
+        """Release the walk key when its hold deadline passes or the attack
+        takes over (with the busy gate).  Runs in its own thread so the main
+        loop keeps processing minimap frames during a walk hold."""
+        while not self.stop_event.is_set():
+            time.sleep(0.02)
+            try:
+                with self._hold_lock:
+                    if self._walk_hold_key is None:
+                        continue
+                    now = time.monotonic()
+                    release = now >= self._walk_hold_until
+                    if not release and self._attack_state is not None:
+                        if (not self._movement_busy_now()
+                                and self._attack_state.is_active()):
+                            if self._attack_active_since is None:
+                                self._attack_active_since = now
+                            if (now - self._attack_active_since
+                                    <= self.attack_block_max_seconds):
+                                LOG.info(
+                                    "walk key released early: attack took over"
+                                )
+                                release = True
+                        else:
+                            self._attack_active_since = None
+                    if release:
+                        self._release_walk_hold()
+            except Exception:
+                LOG.exception("hold manager failed")
+
     def _send_walk_hold(self, decision: MovementDecision) -> bool:
-        """Hold a walk key, releasing EARLY when the YOLO attack takes over.
+        """Schedule a direction-key hold: press now, release after the
+        duration (or early on attack) via the hold-manager thread.
 
-        Patrol walk taps can run for up to ``movement_hold_seconds`` (2s); a
-        blocking hold would keep the character walking while the attack tries
-        to face a monster behind it.  This hold polls the attack state and
-        releases the movement key within ~20ms of the attack selecting a
-        target, so the attack logic can turn the character and attack; patrol
-        resumes on the next frame after the target clears (the top-of-loop
-        attack gate skips movement while the attack is active).
+        The main loop is NOT blocked - it keeps processing minimap frames,
+        so the stair/pit stall detection runs at the minimap frame rate
+        (3 frames ~= 0.75s) instead of being delayed by the hold.  Movement
+        and the jump (Alt tap) can overlap: the jump is a short chord on
+        top of the held direction.
 
-        Pickup is tied to the walk: Z goes down at the same moment as the
-        direction key and comes up with it.  This method is only ever called
-        for plain left/right walks (move-to-left / move-to-right /
-        move-to-rope walk), never for stair jumps or jump-to-rope - so pickup
-        happens exactly in those three phases and nowhere else.
-
-        During a climb/arrival window the attack never interrupts the walk
-        (``_movement_busy_now``), so the character can step off the rope top
-        onto the platform instead of stalling at the edge.
+        Pickup is tied to the walk: Z goes down with the direction and comes
+        up with it.  Only called for plain left/right walks (move-to-left /
+        move-to-right / move-to-rope walk) - never stair jumps or
+        jump-to-rope.
         """
 
         if decision.key not in ("left", "right"):
@@ -1397,47 +1438,28 @@ class MovementWorker(threading.Thread):
             LOG.warning("movement suppressed: target window is not safely selected")
             return False
         key_down = getattr(self.key_sender, "key_down", None)
-        key_up = getattr(self.key_sender, "key_up", None)
-        if key_down is None or key_up is None:
+        if key_down is None:
             return _send_tap(self.key_sender, decision)
-        claimed = key_down(decision.key) is not False
-        if not claimed:
-            return False
-        # Z pickup: pressed at the same moment as the direction key, released
-        # together with it (simultaneous down, simultaneous up).
-        z_claimed = key_down("z") is not False
-        if z_claimed:
-            self._pickup_count += 1
-            if self.pickup_active_event is not None:
-                self.pickup_active_event.set()
-            LOG.info("pickup: Z held with %s (#%d)",
-                     decision.key, self._pickup_count)
-        deadline = time.monotonic() + max(0.01, float(decision.duration))
-        try:
-            while time.monotonic() < deadline:
-                if self.stop_event.is_set():
-                    break
-                if (self._attack_state is not None
-                        and not self._movement_busy_now()):
-                    attack_now = self._attack_state.is_active()
-                    if attack_now:
-                        if self._attack_active_since is None:
-                            self._attack_active_since = time.monotonic()
-                        if (time.monotonic() - self._attack_active_since
-                                <= self.attack_block_max_seconds):
-                            LOG.info("walk key released early: attack took over")
-                            break
-                    else:
-                        self._attack_active_since = None
-                time.sleep(0.02)
-            return True
-        finally:
-            key_up(decision.key)
-            if z_claimed:
-                key_up("z")
-                if self.pickup_active_event is not None:
-                    self.pickup_active_event.clear()
-                LOG.info("pickup: Z released with %s", decision.key)
+        with self._hold_lock:
+            if self._walk_hold_key != decision.key:
+                # 换方向：先松开旧键再按新键。
+                self._release_walk_hold()
+                claimed = key_down(decision.key) is not False
+                if not claimed:
+                    return False
+                self._walk_hold_key = decision.key
+            if not self._walk_hold_z:
+                if key_down("z") is not False:
+                    self._walk_hold_z = True
+                    self._pickup_count += 1
+                    if self.pickup_active_event is not None:
+                        self.pickup_active_event.set()
+                    LOG.info("pickup: Z held with %s (#%d)",
+                             decision.key, self._pickup_count)
+            self._walk_hold_until = time.monotonic() + max(
+                0.01, float(decision.duration)
+            )
+        return True
 
     def __init__(
         self,
@@ -1648,6 +1670,13 @@ class MovementWorker(threading.Thread):
         self._pickup_z_force_after = 0.0
         # Z pickup counter (pickup now rides the route-walk key holds).
         self._pickup_count = 0
+        # 非阻塞行走 hold：主循环不再被方向键 hold 阻塞，方向键的按住/
+        # 松开交给独立的 hold 管理线程（_hold_manager）。这样主循环按
+        # 最小地图帧率跑，卡住检测（3 帧 ≈ 0.75s）不会被 2 秒 hold 拖延。
+        self._hold_lock = threading.RLock()
+        self._walk_hold_key: Optional[str] = None
+        self._walk_hold_z = False
+        self._walk_hold_until = 0.0
         # Rope-approach stall recovery: when the character ends up ON the
         # rope mid-height, the walk toward the rope never advances X - the
         # worker must NOT keep pressing left/right+Z forever.  Track the
@@ -2940,6 +2969,9 @@ class MovementWorker(threading.Thread):
 
     def run(self) -> None:
         LOG.info("movement worker started (%s)", "DRY-RUN" if getattr(self.key_sender, "dry_run", True) else "LIVE")
+        # 独立 hold 管理线程：主循环处理帧时方向键由它按/松。
+        threading.Thread(target=self._hold_manager, name="walk-hold",
+                         daemon=True).start()
         while not self.stop_event.is_set():
             try:
                 frame = self.frame_queue.get(timeout=0.25)
@@ -2949,6 +2981,7 @@ class MovementWorker(threading.Thread):
                 if (self.automation_active_event is not None
                         and not self.automation_active_event.is_set()):
                     self._release_climb_up()
+                    self._release_walk_hold()
                     if self.climbing_active_event is not None:
                         self.climbing_active_event.clear()
                     if self.dropping_active_event is not None:
@@ -3003,6 +3036,7 @@ class MovementWorker(threading.Thread):
                             if self.moving_active_event is not None:
                                 self.moving_active_event.clear()
                             self._release_climb_up()
+                            self._release_walk_hold()
                             continue
                     if self._attack_paused_last:
                         LOG.info("attack clear: patrol movement resumed")
@@ -3461,6 +3495,10 @@ class MovementWorker(threading.Thread):
                 else:
                     LOG.warning("movement waiting: %s", decision.reason)
                 now = time.monotonic()
+                # 非行走决策（爬绳/跳跃/等待等）：先松开行走 hold，
+                # 避免方向键/Z 残留。
+                if decision.key not in ("left", "right"):
+                    self._release_walk_hold()
                 if decision.key and now - self._last_send >= self.movement_cooldown:
                     if decision.key in (
                         "drop", "climb", "jump_climb_left",
@@ -3573,6 +3611,7 @@ class MovementWorker(threading.Thread):
                 except (AttributeError, ValueError):
                     pass
         self._release_climb_up()
+        self._release_walk_hold()
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
         if self.dropping_active_event is not None:

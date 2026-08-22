@@ -84,19 +84,22 @@ class MovementTests(unittest.TestCase):
             queue.Queue(), sender, threading.Event(),
             important_positions={}, attack_state_path=str(tmp),
         )
-        # Full hold without attack: key down, held ~1s, key up.  Z pickup goes
-        # down together with the direction and comes up with it.
+        # Non-blocking hold: the key is pressed immediately and the release
+        # is scheduled for the hold manager thread (the main loop keeps
+        # processing minimap frames).  Z pickup goes down with the direction.
         started = time.monotonic()
         self.assertTrue(worker._send_walk_hold(
             MovementDecision("left", "walk", 1.0)))
-        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+        self.assertLess(time.monotonic() - started, 0.5)  # 不阻塞
+        self.assertEqual(sender.events, [("down", "left"), ("down", "z")])
+        # 手动释放（模拟 hold 管理线程到期释放）。
+        worker._release_walk_hold()
         self.assertEqual(
             sender.events,
             [("down", "left"), ("down", "z"), ("up", "left"), ("up", "z")],
         )
-        # Attack takes over mid-hold: the movement key must release early
-        # (~20ms) so the attack can turn the character and hit a monster
-        # behind it.
+        # Attack takes over mid-hold: the hold manager releases the movement
+        # key early (~20ms) so the attack can turn the character.
         sender.events = []
         attack.write(False)
 
@@ -106,12 +109,20 @@ class MovementTests(unittest.TestCase):
 
         starter = threading.Thread(target=activate_attack)
         starter.start()
-        started = time.monotonic()
         self.assertTrue(worker._send_walk_hold(
             MovementDecision("left", "walk", 2.0)))
-        elapsed = time.monotonic() - started
+        self.assertEqual(sender.events, [("down", "left"), ("down", "z")])
+        # 启动 hold 管理线程：攻击激活后应提前释放方向键。
+        worker.stop_event.clear()
+        manager = threading.Thread(target=worker._hold_manager, daemon=True)
+        manager.start()
+        deadline = time.monotonic() + 1.0
+        while worker._walk_hold_key is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
         starter.join()
-        self.assertLess(elapsed, 0.5)
+        worker.stop_event.set()
+        manager.join(0.5)
+        self.assertIsNone(worker._walk_hold_key)
         self.assertEqual(
             sender.events,
             [("down", "left"), ("down", "z"), ("up", "left"), ("up", "z")],
@@ -143,10 +154,19 @@ class MovementTests(unittest.TestCase):
         # The attack has already been active past its window: the patrol
         # pushes through and the walk key is NOT released early.
         worker._attack_active_since = time.monotonic() - 1.0
-        started = time.monotonic()
         self.assertTrue(worker._send_walk_hold(
             MovementDecision("left", "walk", 1.0)))
-        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+        self.assertEqual(sender.events, [("down", "left"), ("down", "z")])
+        # 攻击已超窗口：hold 管理线程不会提前释放，只有到期才释放。
+        worker.stop_event.clear()
+        manager = threading.Thread(target=worker._hold_manager, daemon=True)
+        manager.start()
+        deadline = time.monotonic() + 1.5
+        while worker._walk_hold_key is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        worker.stop_event.set()
+        manager.join(0.5)
+        self.assertIsNone(worker._walk_hold_key)
         self.assertEqual(
             sender.events,
             [("down", "left"), ("down", "z"), ("up", "left"), ("up", "z")],
@@ -196,6 +216,10 @@ class MovementTests(unittest.TestCase):
         watcher.join()
         self.assertTrue(observed,
                         "pickup-active event was never set during the hold")
+        # Async hold model: the release happens in _hold_manager or on the
+        # next loop iteration, not inside _send_walk_hold. Simulate it here.
+        self.assertTrue(pickup_active.is_set())
+        worker._release_walk_hold()
         self.assertFalse(pickup_active.is_set())
         self.assertGreaterEqual(worker._pickup_count, 1)
         # Event order: direction down first, Z down next; direction up first,
