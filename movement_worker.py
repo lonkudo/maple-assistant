@@ -1289,8 +1289,9 @@ class MovementWorker(threading.Thread):
             self._rope_approach_stall_frames = 0
             return False
         self._rope_approach_stall_frames += 1
-        # ~5 frames of no X progress while aligned with the rope.
-        return self._rope_approach_stall_frames >= 5
+        # 卡在边缘且 X 不动时尽快起跳（2 帧，约 0.2-0.5s）：拖太久角色
+        # 会一直停在边缘刷原地。
+        return self._rope_approach_stall_frames >= 2
 
     def _recover_rope_approach(
         self, observation: MinimapObservation, rope_x: Optional[float]

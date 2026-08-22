@@ -7,6 +7,7 @@ keys and consumes no screenshots.
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from typing import Any, Optional
@@ -38,11 +39,15 @@ class AttackWorker(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
+        attack_jitter_seconds: float = 0.2,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
         self.attack_interval = max(0.25, attack_interval)
+        # 攻击间隔随机抖动 ±0.2s（t±0.2s）：让攻击节奏不像固定频率，
+        # 更像手动操作。
+        self.attack_jitter_seconds = max(0.0, float(attack_jitter_seconds))
         self.attack_key = str(attack_key).casefold()
         scan_map = getattr(key_sender, "_SCAN", None)
         if scan_map is not None and self.attack_key not in scan_map:
@@ -99,7 +104,13 @@ class AttackWorker(threading.Thread):
             else:
                 LOG.info("attack repetition: %s", self.attack_key)
                 self.attack_once()
-            next_attack = time.monotonic() + self.attack_interval
+            # 下一次攻击间隔在 t±0.2s 范围内随机变化（最低不小于 0.05s）。
+            jitter = random.uniform(
+                -self.attack_jitter_seconds, self.attack_jitter_seconds
+            )
+            next_attack = time.monotonic() + max(
+                0.05, self.attack_interval + jitter
+            )
         LOG.info("attack worker stopped")
 
 

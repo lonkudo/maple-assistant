@@ -221,8 +221,8 @@ class MovementTests(unittest.TestCase):
             important_positions={},
         )
         # 角色 X 停在绳上（0.43，绳 0.449，gap 0.019）：首帧初始化，
-        # 之后连续无进展 5 帧后判定停滞。
-        for _ in range(5):
+        # 之后连续 2 帧无进展即判定停滞（尽快起跳）。
+        for _ in range(2):
             self.assertFalse(worker._rope_approach_stalled(
                 0.430556, 0.449074, "layer2.rope"))
         self.assertTrue(worker._rope_approach_stalled(
