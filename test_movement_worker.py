@@ -1359,17 +1359,25 @@ class MovementTests(unittest.TestCase):
         )
         worker._climb_state.phase = "climbing-up"
         worker._climb_state.up_held = True
-        self.assertTrue(worker._attack_should_defer_to_climb())
+        self.assertTrue(worker._attack_should_defer())
         # Mid-grab after a jump (Up held, not attached yet): also defer -
         # releasing Up mid-grab makes the character fall off the rope.
         worker._climb_state.phase = "check-primary-up"
         worker._climb_state.up_held = True
-        self.assertTrue(worker._attack_should_defer_to_climb())
+        self.assertTrue(worker._attack_should_defer())
         # Idle, Up not held: no deferral - the attack keeps priority and the
         # character fights instead of jumping in place.
         worker._climb_state.phase = "idle"
         worker._climb_state.up_held = False
-        self.assertFalse(worker._attack_should_defer_to_climb())
+        self.assertFalse(worker._attack_should_defer())
+        # 卡在坑/边缘（台阶跳停滞中）：攻击让路，先跳出边缘。
+        worker._stair_state["stall_frames"] = 1
+        self.assertTrue(worker._attack_should_defer())
+        worker._stair_state["stall_frames"] = 0
+        worker._stair_state["attempts"] = 1
+        self.assertTrue(worker._attack_should_defer())
+        worker._stair_state["attempts"] = 0
+        self.assertFalse(worker._attack_should_defer())
 
     def test_y_only_incomplete_layer_can_be_detected(self):
         layers = {

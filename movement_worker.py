@@ -2000,24 +2000,11 @@ class MovementWorker(threading.Thread):
             if key_down("alt") is not False:
                 alt_down = True
                 time.sleep(max(0.01, self.stair_jump_alt_hold_seconds))
+            # 跳一旦开始就让它完成：中途被攻击打断会让角色卡在坑/边缘
+            # （跳跃被压制 → 超过 2 秒不动）。攻击等待这一跳。
             while time.monotonic() < deadline:
                 if self.stop_event.is_set():
                     break
-                # 只在起跳（Alt 按下）之前允许攻击打断：跳起来之后切断
-                # 方向键会让角色在平台边缘/台阶上掉下去。
-                if not alt_down and self._attack_state is not None:
-                    attack_now = self._attack_state.is_active()
-                    if attack_now:
-                        if self._attack_active_since is None:
-                            self._attack_active_since = time.monotonic()
-                        if (time.monotonic() - self._attack_active_since
-                                <= self.attack_block_max_seconds):
-                            LOG.info(
-                                "stair jump walk released early: attack took over"
-                            )
-                            break
-                    else:
-                        self._attack_active_since = None
                 time.sleep(0.02)
             return True
         finally:
@@ -2025,29 +2012,26 @@ class MovementWorker(threading.Thread):
                 key_up("alt")
             key_up(direction)
 
-    def _attack_should_defer_to_climb(self) -> bool:
-        """True when an active attack must wait for the rope climb to finish.
+    def _attack_should_defer(self) -> bool:
+        """True when an active attack must wait for a rope climb, a drop, or
+        a stuck-at-edge jump to finish.
 
         While the climb state machine owns the Up key (``up_held`` - grab
         attempt or attached climb) the attack waits: releasing Up mid-grab
-        or mid-climb makes the character fall off the rope.  Walking toward
-        the rope and the brief pause between attempts do NOT defer - there
-        the attack keeps priority, and the climb_attack_lock already
-        prevents a Ctrl from interleaving with the jump chord itself.
+        or mid-climb makes the character fall off the rope.  Same for a
+        stair/pit-edge stall: the attack gate would otherwise pause the
+        whole frame and suppress the stair-jump decision, leaving the
+        character stuck at the edge for seconds.
         """
 
+        if self._climb_state.up_held or (
+                self.dropping_active_event is not None
+                and self.dropping_active_event.is_set()):
+            return True
+        # 卡在坑/边缘（台阶跳正要发出或正在重试）：攻击先等一跳。
         return bool(
-            self._climb_state.up_held
-            or (self.dropping_active_event is not None
-                and self.dropping_active_event.is_set())
-        )
-
-        return bool(
-            (self._climb_state.phase in (
-                "climbing-up", "arrival-compensation",
-            ) and self._climb_state.up_held)
-            or (self.dropping_active_event is not None
-                and self.dropping_active_event.is_set())
+            self._stair_state.get("stall_frames", 0) >= 1
+            or self._stair_state.get("attempts", 0) > 0
         )
 
     def set_yolo_detection_active(self, active: bool) -> None:
@@ -3007,9 +2991,9 @@ class MovementWorker(threading.Thread):
                         # executor is already blocked by patrol_state busy,
                         # so releasing Up here would stop the character on
                         # the rope for nothing.
-                        if self._attack_should_defer_to_climb():
-                            LOG.debug("attack active but climbing/dropping: "
-                                      "finishing climb")
+                        if self._attack_should_defer():
+                            LOG.debug("attack active but climbing/dropping/stuck: "
+                                      "finishing climb/jump")
                         else:
                             if not self._attack_paused_last:
                                 LOG.info("attack active: patrol movement paused")
