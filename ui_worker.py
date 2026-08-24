@@ -2311,10 +2311,9 @@ class UiWorker(threading.Thread):
         }
         final_name = self.patrol_controller.final_layer_name()
         for layer_name in layer_names:
-            suffix = "  ← 已选择" if layer_name == selected else ""
-            if layer_name == final_name:
-                suffix += "  (最顶层)"
-            self._layer_labels[layer_name].configure(text=f"{layer_name}{suffix}")
+            # No "<- selected (top floor)" tag cluttering the row labels; the
+            # patrol range comboboxes carry that information now.
+            self._layer_labels[layer_name].configure(text=layer_name)
             for point, button_label in button_labels.items():
                 final_rope = point == "rope_pos" and layer_name == final_name
                 recorded = self.patrol_controller.endpoint(layer_name, point)
@@ -2347,25 +2346,41 @@ class UiWorker(threading.Thread):
 
     def _update_patrol_range_combos(self, display_names: list[str]) -> None:
         """Feed the numeric-ascending floor list into the range comboboxes and
-        restore the current range selection from the patrol controller."""
+        restore the current range selection from the patrol controller.  The
+        comboboxes display ``楼层N`` (not ``layerN``) so the range reads
+        ``楼层1 -> 楼层N`` in the UI.
+        """
         numeric = sorted(
             display_names,
             key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
         )
+        display_values = [self._patrol_display_name(name) for name in numeric]
         for combo in (self._patrol_start_combo, self._patrol_end_combo):
-            combo.configure(values=numeric)
+            combo.configure(values=display_values)
         start, end = self.patrol_controller.patrol_range()
-        self._patrol_start_var.set(start)
-        self._patrol_end_var.set(end)
+        self._patrol_start_var.set(self._patrol_display_name(start))
+        self._patrol_end_var.set(self._patrol_display_name(end))
+
+    def _patrol_display_name(self, layer_name: str) -> str:
+        """UI display for a floor name (``layer2`` -> ``楼层2``)."""
+        match = re.search(r"(\d+)$", layer_name)
+        return f"楼层{match.group(1)}" if match else layer_name
+
+    def _patrol_name_from_display(self, display: str) -> str:
+        """Reverse of ``_patrol_display_name`` (``楼层2`` -> ``layer2``)."""
+        match = re.search(r"(\d+)$", display)
+        return f"layer{match.group(1)}" if match else display
 
     def _patrol_range_changed(self, _event: Any = None) -> None:
         """Apply the UI-selected contiguous patrol floor range."""
         if self.patrol_controller is None:
             return
-        start = self._patrol_start_var.get()
-        end = self._patrol_end_var.get()
-        if not start or not end:
+        start_display = self._patrol_start_var.get()
+        end_display = self._patrol_end_var.get()
+        if not start_display or not end_display:
             return
+        start = self._patrol_name_from_display(start_display)
+        end = self._patrol_name_from_display(end_display)
         try:
             self.patrol_controller.set_patrol_range(start, end)
         except ValueError as exc:
@@ -2373,7 +2388,7 @@ class UiWorker(threading.Thread):
             self._refresh_patrol_controls()
             return
         self._control_status.configure(
-            text=f"巡逻楼层: {start} → {end}（支持连续范围，可单选一层）"
+            text=f"巡逻楼层: {start_display} → {end_display}（支持连续范围，可单选一层）"
         )
         self._refresh_patrol_controls()
 
