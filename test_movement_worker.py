@@ -542,10 +542,25 @@ class MovementTests(unittest.TestCase):
         obs = MinimapObservation(Point(0.4, 0.8), None, .9, (0, 0, 1, 1))
         worker._maybe_begin_return_if_out_of_range(obs)
         self.assertEqual(worker._return_mode, "climb-to-route")
+        self.assertEqual(worker._return_from_floor, "layer1")
         target, is_rope, label = worker._route_target(obs)
         self.assertTrue(is_rope)
         self.assertEqual(label, "return.climb")
         self.assertAlmostEqual(target, 0.5)  # layer1 rope_pos.x
+
+    def test_return_climb_keeps_from_floor_rope_when_marker_off_band(self) -> None:
+        # After a failed return-climb grab the marker settles between recorded
+        # bands: the return must KEEP targeting the from-floor rope (retry the
+        # climb) instead of waiting forever.
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._return_mode = "climb-to-route"
+        worker._return_from_floor = "layer1"
+        obs = MinimapObservation(Point(0.5, 0.62), None, .9, (0, 0, 1, 1))
+        target, is_rope, label = worker._route_target(obs)
+        self.assertTrue(is_rope)
+        self.assertEqual(label, "return.climb")
+        self.assertAlmostEqual(target, 0.5)  # layer1 rope still targeted
 
     def test_out_of_range_check_ignores_in_range_floor(self) -> None:
         worker = self._range_worker(4, "layer2", "layer3")

@@ -1996,6 +1996,10 @@ class MovementWorker(threading.Thread):
         self._fall_frames = 0
         self._fall_pending = False
         self._return_mode: Optional[str] = None  # "climb-to-route" | "drop-to-route"
+        # Floor the return started from: while climbing back, a failed
+        # grab falls the marker back to a Y between every recorded band;
+        # keep targeting this floor's own rope instead of waiting forever.
+        self._return_from_floor: Optional[str] = None
         # Stair jump: during the left-most/right-most patrol walk the worker
         # detects when the marker stops advancing while a walk hold is being
         # issued (a stair blocks the walk) and jumps - holding the travel
@@ -2834,6 +2838,7 @@ class MovementWorker(threading.Thread):
         self._route_phase = "left"
         self._climb_state = ClimbState()
         self._descending_to_first = False
+        self._return_from_floor = None
         self._aligned_frames = 0
         self._rope_approach_direction = None
         self._rope_attempted = False
@@ -2868,6 +2873,7 @@ class MovementWorker(threading.Thread):
         return None
 
     def _finish_return(self, floor: str) -> None:
+        self._return_from_floor = floor
         """After a return climb/drop reaches ``floor``: in range or not?  An
         in-range floor restarts patrol there; an out-of-range floor keeps the
         return mode pointed at the next step."""
@@ -2881,6 +2887,7 @@ class MovementWorker(threading.Thread):
                 "climb-to-route" if number < self._patrol_range_min
                 else "drop-to-route"
             )
+            self._return_from_floor = floor
             LOG.warning(
                 "RETURN TO ROUTE: still on %s outside range; %s",
                 floor,
@@ -2916,6 +2923,7 @@ class MovementWorker(threading.Thread):
                 "climb-to-route" if number < self._patrol_range_min
                 else "drop-to-route"
             )
+            self._return_from_floor = floor
             LOG.warning(
                 "FALL RECOVERY: landed on %s outside patrol range; %s",
                 floor,
@@ -2987,6 +2995,7 @@ class MovementWorker(threading.Thread):
             "climb-to-route" if number < self._patrol_range_min
             else "drop-to-route"
         )
+        self._return_from_floor = floor
         LOG.warning(
             "OUT OF PATROL RANGE: on %s outside patrol range; returning %s "
             "without attacking",
@@ -3020,7 +3029,12 @@ class MovementWorker(threading.Thread):
             # restarts patrol or keeps climbing.
             floor = self._detect_floor_all(observation)
             if floor is None:
-                return None, False, "return-climb-waiting"
+                # Failed grab: the marker settled between recorded bands.  Keep
+                # retrying the rope of the floor the return started from instead
+                # of waiting forever; a fresh floor read updates the from-floor.
+                floor = self._return_from_floor
+                if floor is None:
+                    return None, False, "return-climb-waiting"
             rope = self.important_positions.get(floor, {}).get("rope_pos", {})
             rope_x = (
                 float(rope["x"])
