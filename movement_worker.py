@@ -2962,6 +2962,39 @@ class MovementWorker(threading.Thread):
             self._resolve_fall(observation)
         self._fall_frames = 0
 
+    def _maybe_begin_return_if_out_of_range(
+        self, observation: MinimapObservation
+    ) -> None:
+        """When the marker is present, idle and on a floor OUTSIDE the
+        patrol range (e.g. patrol started there, or the character settled
+        there after a knock-back), start the return-to-range immediately -
+        don't wait for a fall event.  The return mode also blocks attacking
+        for the whole return: it drives ``climbing_now`` ->
+        ``climbing_active_event`` + ``patrol_state`` busy, which both the
+        YOLO executor and the legacy timed attack worker honour.
+        """
+        if (self._return_mode is not None
+                or self._descending_to_first
+                or self._climb_state.phase != "idle"
+                or self._climb_state.up_held
+                or observation.player is None):
+            return
+        floor = self._detect_floor_all(observation)
+        if floor is None or floor in self._route_layers:
+            return
+        number = _layer_number(floor)
+        self._return_mode = (
+            "climb-to-route" if number < self._patrol_range_min
+            else "drop-to-route"
+        )
+        LOG.warning(
+            "OUT OF PATROL RANGE: on %s outside patrol range; returning %s "
+            "without attacking",
+            floor,
+            "climbing back" if self._return_mode == "climb-to-route"
+            else "dropping back",
+        )
+
     def _route_target(self, observation: MinimapObservation) -> tuple[Optional[float], bool, str]:
         """Return target X, whether near-target means climb, and route label.
 
@@ -3533,6 +3566,9 @@ class MovementWorker(threading.Thread):
                 # re-detected and patrol restarts there, or the character
                 # returns to the patrol floor range.
                 self._track_fall(observation)
+                # Out-of-range floor with no fall in progress: start the
+                # return right away (no attacking during it).
+                self._maybe_begin_return_if_out_of_range(observation)
                 route_target_x, route_is_rope, route_label = self._route_target(observation)
                 if self._advance_route_endpoint(observation, route_target_x):
                     route_target_x, route_is_rope, route_label = self._route_target(observation)

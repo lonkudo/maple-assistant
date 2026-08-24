@@ -533,6 +533,27 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(label, "return.climb")
         self.assertAlmostEqual(target, 0.5)  # layer1 rope_pos.x
 
+    def test_out_of_range_at_start_begins_return_without_fall(self) -> None:
+        # Patrol started while the character is on layer1 but the range is
+        # [layer2..layer3]: the return must begin immediately (no fall event)
+        # and target layer1's own rope (climb back up) - not attack in place.
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        obs = MinimapObservation(Point(0.4, 0.8), None, .9, (0, 0, 1, 1))
+        worker._maybe_begin_return_if_out_of_range(obs)
+        self.assertEqual(worker._return_mode, "climb-to-route")
+        target, is_rope, label = worker._route_target(obs)
+        self.assertTrue(is_rope)
+        self.assertEqual(label, "return.climb")
+        self.assertAlmostEqual(target, 0.5)  # layer1 rope_pos.x
+
+    def test_out_of_range_check_ignores_in_range_floor(self) -> None:
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        obs = MinimapObservation(Point(0.4, 0.7), None, .9, (0, 0, 1, 1))
+        worker._maybe_begin_return_if_out_of_range(obs)
+        self.assertIsNone(worker._return_mode)  # layer2 is in range
+
     def test_same_floor_bounce_does_not_restart_patrol(self) -> None:
         positions = self._floors(2)
         worker = MovementWorker(
