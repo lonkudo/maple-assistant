@@ -6,6 +6,47 @@
 > `build_release.ps1` assembles a minimal distributable folder. Everything is
 > normalized to the game client, so 2560×1440 / 1920×1080 / 1366×768 all work.
 
+## 发布新版本 (Releasing a new build)
+
+1. **Run the tests first** — the release must be green:
+
+   ```powershell
+   python -m unittest test_movement_worker test_ui_worker test_status_worker `
+       test_minimap_detector test_assistant test_single_instance `
+       test_capture_worker test_map_identity test_map_structure_tracker
+   ```
+
+2. **Build and zip** (from the repo root):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File build_release.ps1 -Zip
+   ```
+
+   - Rebuilds `release\MapleAssistant\` from the repo root: runtime files only
+     (`.py/.json/.md/.ps1/.bat/.txt` — no tests, no `work/`, no `.venv`, no git
+     metadata).
+   - Creates `release\MapleAssistant-{dd-HH-mm}.zip` (e.g.
+     `MapleAssistant-24-19-35.zip`). The stamp is the build time
+     (day-hour-minute). Windows forbids `:` in file names, so the intended
+     `{dd:HH:mm}` format is emitted as `dd-HH-mm`. Old zips in `release\` are
+     cleaned automatically.
+
+3. **Verify the zip** (recommended before shipping):
+
+   ```powershell
+   python work/verify_zip.py release\MapleAssistant-24-19-35.zip
+   ```
+
+   Checks the expected fixes are inside and no test/dev artifacts leaked.
+
+4. **Ship**: hand the zip to others. The receiver unzips and double-clicks
+   `安装.bat`, which bootstraps Python + all dependencies (including YOLO),
+   then starts with `启动助手.bat`. See [INSTALL.md](INSTALL.md).
+
+> **Note:** `build_release.ps1` must be saved as **UTF-8 with BOM** — Windows
+> PowerShell 5.1 cannot parse the BOM-less UTF-8 Chinese comments and the
+> script fails with a code-page broken parse error.
+
 Independent workers analyze the game without relying on slow interactive computer control:
 
 1. `capture_worker.py` captures the small minimap and status regions every four seconds.
