@@ -556,7 +556,7 @@ class MovementTests(unittest.TestCase):
         worker.patrol_enabled = True
         worker._return_mode = "climb-to-route"
         worker._return_from_floor = "layer1"
-        obs = MinimapObservation(Point(0.5, 0.62), None, .9, (0, 0, 1, 1))
+        obs = MinimapObservation(Point(0.5, 0.65), None, .9, (0, 0, 1, 1))
         target, is_rope, label = worker._route_target(obs)
         self.assertTrue(is_rope)
         self.assertEqual(label, "return.climb")
