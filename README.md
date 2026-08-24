@@ -71,6 +71,8 @@ shared `recording-configuration.json`. `Add Layer Above`
 creates/selects the next layer and pauses patrol while it is calibrated. A new
 layer must have a smaller minimap Y than the layer below.
 
+**巡逻楼层范围 (Patrol floor range) + 坠落恢复 (Falling recovery).** Floors are patrolled over a **contiguous range** selected in the UI (开始楼层 → 结束楼层; a single floor is allowed). **layer1 is no longer implicitly the patrol start.** If the character falls outside the range (knocked down / walked off an edge), the worker detects the fall (rapid diamond-Y drops for `fall_detect_frames` consecutive minimap frames, defaults in `rope_calibration.json`), re-detects the floor when the fall stops, restarts patrol there if the floor is inside the range, and otherwise **returns to the range without attacking**: below the range it finds the current floor's rope and climbs back; above the range it drops (Alt+Down) until back in range. The intentional drop-to-layer1 descent is never interrupted.
+
 **Left, Rope, and Right are independent actions.** A layer patrols exactly the
 points you record, in left → right → rope order: a layer with only `Rope`
 goes straight to its rope and climbs; a layer with only `Left` stands at the

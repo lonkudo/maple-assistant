@@ -426,6 +426,14 @@ def main() -> int:
             climbing_enabled=map_profile.get("climbing_enabled", True),
             final_layer_action=map_profile.get("final_layer_action", "wait"),
             first_layer=map_profile.get("first_layer"),
+            # Contiguous patrol floor range (UI-selected): only these floors
+            # are patrolled and the character returns to the range when it
+            # falls outside it (layer1 is no longer implicitly the start).
+            patrol_start_layer=map_profile.get("patrol_start_layer"),
+            patrol_end_layer=map_profile.get("patrol_end_layer"),
+            # Falling recovery knobs (see rope_calibration.json).
+            fall_detect_frames=int(calibration.get("fall_detect_frames", 3)),
+            fall_marker_y_gain=float(calibration.get("fall_marker_y_gain", 0.015)),
             drop_chord_hold_seconds=float(
                 calibration.get("drop_chord_hold_seconds", 0.10)
             ),

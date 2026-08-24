@@ -495,6 +495,32 @@ class UiWorker(threading.Thread):
                 action_row, text="重置录制", command=self._reset_recording
             )
             self._reset_recording_button.pack(side="left")
+            # Contiguous patrol floor range: patrol ONLY the selected floors
+            # (a single floor is allowed); a fall outside the range makes the
+            # character return to it.  layer1 is no longer implicitly the
+            # patrol start.
+            range_row = ttk.Frame(controls)
+            range_row.pack(fill="x", pady=(0, 8))
+            ttk.Label(range_row, text="巡逻楼层:").pack(side="left", padx=(0, 4))
+            self._patrol_start_var = tk.StringVar()
+            self._patrol_start_combo = ttk.Combobox(
+                range_row, textvariable=self._patrol_start_var,
+                width=8, state="readonly", values=[],
+            )
+            self._patrol_start_combo.pack(side="left", padx=(0, 2))
+            self._patrol_start_combo.bind(
+                "<<ComboboxSelected>>", self._patrol_range_changed
+            )
+            ttk.Label(range_row, text="→").pack(side="left", padx=(0, 2))
+            self._patrol_end_var = tk.StringVar()
+            self._patrol_end_combo = ttk.Combobox(
+                range_row, textvariable=self._patrol_end_var,
+                width=8, state="readonly", values=[],
+            )
+            self._patrol_end_combo.pack(side="left", padx=(0, 2))
+            self._patrol_end_combo.bind(
+                "<<ComboboxSelected>>", self._patrol_range_changed
+            )
             self._layer_rows_frame = ttk.Frame(controls)
             self._layer_rows_frame.pack(fill="x")
             self._control_status = ttk.Label(
@@ -2276,6 +2302,7 @@ class UiWorker(threading.Thread):
         layer_names = list(route)
         layer_names.extend(name for name in snapshot.layers if name not in layer_names)
         layer_names = list(layer_display_order(layer_names))
+        self._update_patrol_range_combos(layer_names)
         self._ensure_layer_rows(tuple(layer_names))
         button_labels = {
             "left_most_pos": "最左",
@@ -2317,6 +2344,38 @@ class UiWorker(threading.Thread):
         self._stop_patrol_button.configure(state=stop_state)
         self._add_layer_button.configure(state="normal")
         self._reset_recording_button.configure(state="normal")
+
+    def _update_patrol_range_combos(self, display_names: list[str]) -> None:
+        """Feed the numeric-ascending floor list into the range comboboxes and
+        restore the current range selection from the patrol controller."""
+        numeric = sorted(
+            display_names,
+            key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
+        )
+        for combo in (self._patrol_start_combo, self._patrol_end_combo):
+            combo.configure(values=numeric)
+        start, end = self.patrol_controller.patrol_range()
+        self._patrol_start_var.set(start)
+        self._patrol_end_var.set(end)
+
+    def _patrol_range_changed(self, _event: Any = None) -> None:
+        """Apply the UI-selected contiguous patrol floor range."""
+        if self.patrol_controller is None:
+            return
+        start = self._patrol_start_var.get()
+        end = self._patrol_end_var.get()
+        if not start or not end:
+            return
+        try:
+            self.patrol_controller.set_patrol_range(start, end)
+        except ValueError as exc:
+            self._control_status.configure(text=f"无法选择巡逻楼层: {exc}")
+            self._refresh_patrol_controls()
+            return
+        self._control_status.configure(
+            text=f"巡逻楼层: {start} → {end}（支持连续范围，可单选一层）"
+        )
+        self._refresh_patrol_controls()
 
     def _ensure_layer_rows(self, layer_names: tuple[str, ...]) -> None:
         if layer_names == self._layer_row_names:

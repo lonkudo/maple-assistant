@@ -14,6 +14,7 @@ import json
 import logging
 import queue
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -109,7 +110,10 @@ def detect_layer_by_y(
             continue
         gap = abs(float(layer["layer_y"]) - player_y)
         tolerance = float(layer.get("y_tolerance", 0.020000))
-        if gap <= tolerance:
+        # Epsilon absorbs binary-float edge cases at the band boundary
+        # (e.g. |0.5 - 0.52| reads 0.020000000000000018 > 0.02): a
+        # landing exactly on the band edge must not flicker out of band.
+        if gap <= tolerance + 1e-9:
             candidates.append((gap, name))
     return min(candidates)[1] if candidates else None
 
@@ -129,6 +133,59 @@ def detect_layer_by_world_y(
         if gap <= tolerance:
             candidates.append((gap, name))
     return min(candidates)[1] if candidates else None
+
+
+def _layer_number(name: str) -> int:
+    """Trailing floor number of a layer name (``layer12`` -> 12)."""
+    match = re.search(r"(\d+)$", name)
+    return int(match.group(1)) if match else 0
+
+
+def _slice_patrol_range(
+    layers: list[str],
+    patrol_start_layer: Optional[str],
+    patrol_end_layer: Optional[str],
+) -> list[str]:
+    """Keep only the contiguous floor range [start .. end] of ``layers``.
+
+    ``layers`` must already be sorted bottom-up by floor number.  An unset
+    bound (or one absent from the recorded layers) defaults to the bottom /
+    top recorded floor, preserving the legacy patrol route.  A single floor
+    is allowed (start == end).
+    """
+    if not layers:
+        return layers
+    numbers = [_layer_number(name) for name in layers]
+    start_number = (
+        _layer_number(patrol_start_layer)
+        if patrol_start_layer else numbers[0]
+    )
+    end_number = (
+        _layer_number(patrol_end_layer)
+        if patrol_end_layer else numbers[-1]
+    )
+    return [
+        name for name, number in zip(layers, numbers)
+        if start_number <= number <= end_number
+    ]
+
+
+def _patrol_range_numbers(
+    layers: list[str],
+    patrol_start_layer: Optional[str],
+    patrol_end_layer: Optional[str],
+) -> tuple[int, int]:
+    """Floor-number bounds of the patrol range (defaults: bottom/top)."""
+    numbers = [_layer_number(name) for name in layers]
+    start = (
+        _layer_number(patrol_start_layer)
+        if patrol_start_layer else (numbers[0] if numbers else 0)
+    )
+    end = (
+        _layer_number(patrol_end_layer)
+        if patrol_end_layer else (numbers[-1] if numbers else 0)
+    )
+    return start, end
 
 
 def _move_to_boundary(
@@ -1188,8 +1245,15 @@ class MovementWorker(threading.Thread):
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
             self._climb_arrival_at = time.monotonic()
-            self._advance_after_climb()
             self._climb_cycle_reset()
+            if self._return_mode == "climb-to-route":
+                # Return climb landed on a higher floor: re-detect where we
+                # are instead of advancing the normal route.  An in-range
+                # floor restarts patrol; an out-of-range floor keeps climbing
+                # from the new floor's own rope.
+                self._resolve_fall(observation)
+            else:
+                self._advance_after_climb()
         elif result == "failed-cycle-no-more-shift":
             # Both jump directions failed and the one-time correction is
             # used up: a stuck-under-the-rope character restarts the route
@@ -1287,6 +1351,7 @@ class MovementWorker(threading.Thread):
         if (has_y_bands
                 and self._climb_state.phase == "idle"
                 and not self._descending_to_first
+                and self._return_mode is None
                 and detect_layer_by_y(pos.y, route_layers) is None):
             self._rescue_stuck_frames += 1
             self._rescue_max_stuck = max(
@@ -1584,6 +1649,19 @@ class MovementWorker(threading.Thread):
         climbing_enabled: bool = True,
         final_layer_action: str = "wait",
         first_layer: Optional[str] = None,
+        # Contiguous patrol floor range: only these floors are patrolled and
+        # the character returns to the range whenever it falls outside it.
+        # ``layer1`` is no longer implicitly the patrol start - any recorded
+        # floor can begin (or be the only) patrol floor.
+        patrol_start_layer: Optional[str] = None,
+        patrol_end_layer: Optional[str] = None,
+        # Fall detection for ``FALL RECOVERY``: the diamond Y dropping fast
+        # for this many consecutive frames (outside an intentional drop or
+        # climb) counts as an unexpected fall; when it stops the floor is
+        # re-detected and patrol restarts there (or the character returns to
+        # the patrol range).
+        fall_detect_frames: int = 3,
+        fall_marker_y_gain: float = 0.015,
         drop_chord_hold_seconds: float = 0.10,
         drop_retry_seconds: float = 1.0,
         minimap_detector: Any = None,
@@ -1721,12 +1799,28 @@ class MovementWorker(threading.Thread):
                 routable,
                 key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
             )
+        # Patrol only the selected contiguous floor range.  ``patrol_start_layer``
+        # defaults to the bottom recorded floor and ``patrol_end_layer`` to the
+        # top recorded floor when unset, so legacy configs keep the old route.
+        self._route_layers = _slice_patrol_range(
+            self._route_layers, patrol_start_layer, patrol_end_layer
+        )
+        self._patrol_range_min, self._patrol_range_max = _patrol_range_numbers(
+            self._route_layers, patrol_start_layer, patrol_end_layer
+        )
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
         self.patrol_enabled = patrol_enabled
         self.climbing_enabled = climbing_enabled
         self.final_layer_action = final_layer_action
-        self.first_layer = first_layer or (self._route_layers[0] if self._route_layers else None)
+        # The patrol start is the range start (``layer1`` is no longer
+        # implied): prefer the explicitly selected range start, then the
+        # legacy override, then the route bottom.
+        self.first_layer = (
+            patrol_start_layer
+            or first_layer
+            or (self._route_layers[0] if self._route_layers else None)
+        )
         self.drop_chord_hold_seconds = drop_chord_hold_seconds
         self.drop_retry_seconds = drop_retry_seconds
         self.minimap_detector = minimap_detector
@@ -1887,6 +1981,21 @@ class MovementWorker(threading.Thread):
         # suppressed so an intermediate platform cannot hijack the descent
         # and restart patrol on a middle layer.
         self._descending_to_first = False
+        # ---------- FALLING RECOVERY + RETURN TO ROUTE ----------
+        # ``_track_fall`` counts consecutive frames where the diamond Y drops
+        # fast (an unexpected fall - knocked down, missed a stair, walked off
+        # an edge).  It is suppressed while the intentional drop-to-layer1
+        # descent or a rope climb is active, so those never get interrupted.
+        # When the fall stops, the floor is re-detected: in-range floors
+        # restart patrol there; floors outside the contiguous patrol range
+        # start ``_return_mode`` (climb back up / drop back down, attacks
+        # paused) until the range is reached again.
+        self._fall_detect_frames = max(2, int(fall_detect_frames))
+        self._fall_marker_y_gain = max(0.005, float(fall_marker_y_gain))
+        self._fall_last_y: Optional[float] = None
+        self._fall_frames = 0
+        self._fall_pending = False
+        self._return_mode: Optional[str] = None  # "climb-to-route" | "drop-to-route"
         # Stair jump: during the left-most/right-most patrol walk the worker
         # detects when the marker stops advancing while a walk hold is being
         # issued (a stair blocks the walk) and jumps - holding the travel
@@ -2123,11 +2232,21 @@ class MovementWorker(threading.Thread):
         stair/pit-edge stall: the attack gate would otherwise pause the
         whole frame and suppress the stair-jump decision, leaving the
         character stuck at the edge for seconds.
+
+        Returning to the patrol floor range (``_return_mode``) also defers
+        the attack: the return climb/drop is protected exactly like a rope
+        climb, and the return walk keeps the character moving instead of
+        fighting mid-return.
         """
 
         if self._climb_state.up_held or (
                 self.dropping_active_event is not None
                 and self.dropping_active_event.is_set()):
+            return True
+        # Returning to the patrol floor range: attacks wait for the whole
+        # return (climb/drop/walk) - the character must get back to the
+        # patrol route before fighting again.
+        if self._return_mode is not None:
             return True
         # 卡在坑/边缘（台阶跳正要发出或正在重试）：攻击先等一跳。
         return bool(
@@ -2696,6 +2815,153 @@ class MovementWorker(threading.Thread):
             )
         return detected_name
 
+    def _floor_number(self, name: str) -> int:
+        return _layer_number(name)
+
+    def _in_patrol_range(self, floor: str) -> bool:
+        number = _layer_number(floor)
+        return self._patrol_range_min <= number <= self._patrol_range_max
+
+    def _current_route_floor(self) -> Optional[str]:
+        if (self._route_layer_index is None
+                or not 0 <= self._route_layer_index < len(self._route_layers)):
+            return None
+        return self._route_layers[self._route_layer_index]
+
+    def _start_patrol_on(self, floor: str) -> None:
+        """Restart patrol from ``floor`` (must be inside the patrol range)."""
+        self._route_layer_index = self._route_layers.index(floor)
+        self._route_phase = "left"
+        self._climb_state = ClimbState()
+        self._descending_to_first = False
+        self._aligned_frames = 0
+        self._rope_approach_direction = None
+        self._rope_attempted = False
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self.near_rope_event is not None:
+            self.near_rope_event.clear()
+        self._reanchor_tracker_to_current_layer()
+
+    def _detect_floor_all(self, observation: MinimapObservation) -> Optional[str]:
+        """Detect the floor over ALL recorded layers (not just the patrol
+        range), so an out-of-range landing is recognized for the return."""
+        layers = {
+            name: layer for name, layer in self.important_positions.items()
+            if isinstance(layer, dict) and "layer_y" in layer
+        }
+        if observation.player is not None:
+            name = detect_layer_by_y(observation.player.y, layers)
+            if name is not None:
+                return name
+        if (observation.world_y_diamonds is not None
+                and observation.structure_confidence >= 0.12):
+            world_layers = {
+                name: layer for name, layer in layers.items()
+                if isinstance(layer, dict) and "layer_world_y" in layer
+            }
+            return detect_layer_by_world_y(
+                observation.world_y_diamonds, world_layers
+            )
+        return None
+
+    def _finish_return(self, floor: str) -> None:
+        """After a return climb/drop reaches ``floor``: in range or not?  An
+        in-range floor restarts patrol there; an out-of-range floor keeps the
+        return mode pointed at the next step."""
+        if floor in self._route_layers:
+            self._return_mode = None
+            self._start_patrol_on(floor)
+            LOG.warning("RETURN TO ROUTE: reached %s; restarting patrol", floor)
+        else:
+            number = _layer_number(floor)
+            self._return_mode = (
+                "climb-to-route" if number < self._patrol_range_min
+                else "drop-to-route"
+            )
+            LOG.warning(
+                "RETURN TO ROUTE: still on %s outside range; %s",
+                floor,
+                "climbing back" if self._return_mode == "climb-to-route"
+                else "dropping back",
+            )
+
+    def _resolve_fall(self, observation: MinimapObservation) -> bool:
+        """Called when a fall stops: re-detect the floor and act.
+
+        In-range floor restarts patrol there (a same-floor bounce - jump /
+        small pit - is ignored and patrol continues); an out-of-range floor
+        starts the return-to-route climb/drop.  Returns False while no floor
+        can be identified yet (kept pending for the next frame).
+        """
+        floor = self._detect_floor_all(observation)
+        if floor is None:
+            return False
+        self._fall_pending = False
+        self._fall_last_y = None
+        self._fall_frames = 0
+        if self._return_mode is not None:
+            self._finish_return(floor)
+            return True
+        if floor in self._route_layers:
+            if self._current_route_floor() == floor:
+                return True  # same-floor bounce: keep patrolling
+            self._start_patrol_on(floor)
+            LOG.warning("FALL RECOVERY: landed on %s; restarting patrol", floor)
+        else:
+            number = _layer_number(floor)
+            self._return_mode = (
+                "climb-to-route" if number < self._patrol_range_min
+                else "drop-to-route"
+            )
+            LOG.warning(
+                "FALL RECOVERY: landed on %s outside patrol range; %s",
+                floor,
+                "climbing back to route"
+                if self._return_mode == "climb-to-route"
+                else "dropping back to route",
+            )
+        return True
+
+    def _track_fall(self, observation: MinimapObservation) -> None:
+        """Per-frame falling detector (see the FALLING RECOVERY state docs).
+
+        Suppressed while the intentional drop-to-layer1 descent, a return
+        drop, or an active rope climb is running - those are never
+        interrupted.  A fall is N consecutive frames of the diamond Y
+        dropping fast; once it stops the floor is re-detected and
+        ``_resolve_fall`` restarts patrol or starts the return.
+        """
+        if (self._descending_to_first
+                or self._return_mode is not None
+                or self._climb_state.phase != "idle"
+                or self._climb_state.up_held):
+            self._fall_frames = 0
+            self._fall_last_y = None
+            return
+        if observation.player is None:
+            self._fall_frames = 0
+            self._fall_last_y = None
+            return
+        y = observation.player.y
+        last = self._fall_last_y
+        self._fall_last_y = y
+        if last is None:
+            self._fall_frames = 0
+            return
+        if y - last >= self._fall_marker_y_gain:
+            self._fall_frames += 1
+            return
+        # The fall stopped (marker Y no longer dropping fast).
+        if self._fall_pending:
+            self._resolve_fall(observation)
+        elif self._fall_frames >= self._fall_detect_frames:
+            self._fall_pending = True
+            self._resolve_fall(observation)
+        self._fall_frames = 0
+
     def _route_target(self, observation: MinimapObservation) -> tuple[Optional[float], bool, str]:
         """Return target X, whether near-target means climb, and route label.
 
@@ -2712,6 +2978,23 @@ class MovementWorker(threading.Thread):
             return None, False, "stand-still"
         if observation.player is None:
             return None, False, "waiting-marker"
+        if self._return_mode == "drop-to-route":
+            return None, False, "drop-to-route"
+        if self._return_mode == "climb-to-route":
+            # Return climb: walk to and climb the CURRENT floor's own rope
+            # (the floor is below the patrol range).  When the climb lands
+            # on the next floor ``_run_climb_step`` re-detects and either
+            # restarts patrol or keeps climbing.
+            floor = self._detect_floor_all(observation)
+            if floor is None:
+                return None, False, "return-climb-waiting"
+            rope = self.important_positions.get(floor, {}).get("rope_pos", {})
+            rope_x = (
+                float(rope["x"])
+                if isinstance(rope, dict) and "x" in rope
+                else self.fixed_target_x
+            )
+            return rope_x, True, "return.climb"
         self._select_route_layer(observation)
         if self._route_layer_index is None or self._route_layer_index >= len(self._route_layers):
             return None, False, "route-complete"
@@ -2774,6 +3057,23 @@ class MovementWorker(threading.Thread):
         # become the "final" layer, hide its rope, and strand the character.
         new_route.sort(
             key=lambda name: int("".join(filter(str.isdigit, name)) or 0)
+        )
+        # Apply the contiguous patrol floor range selected in the UI: patrol
+        # only floors in [patrol_start_layer .. patrol_end_layer]; a floor
+        # outside the range makes the character return to it (falling
+        # recovery / return-to-route) instead of patrolling there.
+        new_route = _slice_patrol_range(
+            new_route,
+            snapshot.patrol_start_layer or None,
+            snapshot.patrol_end_layer or None,
+        )
+        self._patrol_range_min, self._patrol_range_max = _patrol_range_numbers(
+            new_route,
+            snapshot.patrol_start_layer or None,
+            snapshot.patrol_end_layer or None,
+        )
+        self.first_layer = snapshot.patrol_start_layer or (
+            new_route[0] if new_route else self.first_layer
         )
         route_changed = new_route != self._route_layers
         self.patrol_enabled = snapshot.enabled
@@ -3218,16 +3518,35 @@ class MovementWorker(threading.Thread):
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.
-                # While descending to the first layer, resync is suppressed:
-                # intermediate platforms must not hijack the drop and restart
-                # patrol on a middle layer.
-                if not self._descending_to_first:
+                # While descending to the first layer OR returning to the
+                # patrol range, resync is suppressed: intermediate platforms
+                # must not hijack the drop/return and restart patrol on a
+                # middle layer.
+                if not self._descending_to_first and self._return_mode is None:
                     self._resync_route_layer(observation)
                 observation = self._pin_stationary_layer_world_y(observation)
+                # Falling recovery: track rapid diamond-Y drops (an unexpected
+                # fall - knocked down / missed a stair / walked off an edge).
+                # Suppressed during the intentional drop-to-layer1, a return
+                # drop/climb and active rope climbs, so those never get
+                # interrupted.  Once a detected fall stops, the floor is
+                # re-detected and patrol restarts there, or the character
+                # returns to the patrol floor range.
+                self._track_fall(observation)
                 route_target_x, route_is_rope, route_label = self._route_target(observation)
                 if self._advance_route_endpoint(observation, route_target_x):
                     route_target_x, route_is_rope, route_label = self._route_target(observation)
-                if route_label.endswith(".drop-to-first"):
+                if route_label == "drop-to-route":
+                    # Return drop: keep dropping (Alt+Down) until the marker
+                    # re-enters the patrol floor range, then restart patrol.
+                    if self._return_mode == "drop-to-route":
+                        floor = self._detect_floor_all(observation)
+                        if floor is not None and self._in_patrol_range(floor):
+                            self._finish_return(floor)
+                            route_target_x, route_is_rope, route_label = (
+                                self._route_target(observation)
+                            )
+                elif route_label.endswith(".drop-to-first"):
                     if not self._descending_to_first:
                         LOG.info("final layer patrol done; descending to %s",
                                  self.first_layer)
@@ -3298,10 +3617,19 @@ class MovementWorker(threading.Thread):
                     decision = MovementDecision(
                         None, "waiting for the yellow marker"
                     )
-                elif route_label.endswith(".drop-to-first"):
+                elif route_label == "return-climb-waiting":
+                    # Return climb: the floor is momentarily unknown (marker
+                    # Y between bands mid-climb) - hold, no keys.
+                    decision = MovementDecision(
+                        None, "return climb; waiting for the floor marker"
+                    )
+                elif (route_label.endswith(".drop-to-first")
+                        or route_label == "drop-to-route"):
                     decision = MovementDecision(
                         "drop",
-                        f"final layer complete; repeat Alt+Down until {self.first_layer}",
+                        (f"final layer complete; repeat Alt+Down until {self.first_layer}"
+                         if route_label.endswith(".drop-to-first")
+                         else "outside patrol floor range; dropping until back in range"),
                         self.drop_chord_hold_seconds,
                     )
                     active_target_x = None
@@ -3479,6 +3807,9 @@ class MovementWorker(threading.Thread):
                     or self._climb_state.phase != "idle"
                     or now_mono < climb_arrival_grace_until
                     or self._player_switch_active
+                    # Returning to the patrol floor range never attacks: the
+                    # climb-back / drop-back is protected like a rope climb.
+                    or self._return_mode is not None
                 )
                 if self.climbing_active_event is not None:
                     if climbing_now:

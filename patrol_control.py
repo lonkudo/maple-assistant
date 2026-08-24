@@ -17,6 +17,12 @@ LOG = logging.getLogger(__name__)
 
 PointKind = Literal["left_most_pos", "rope_pos", "right_most_pos"]
 Boundary = Literal["left_most_pos", "right_most_pos"]
+
+
+def _layer_number(name: str) -> int:
+    """Trailing floor number of a layer name (``layer12`` -> 12)."""
+    match = re.search(r"(\d+)$", name)
+    return int(match.group(1)) if match else 0
 REQUIRED_LAYER_POINTS: tuple[PointKind, ...] = (
     "left_most_pos", "rope_pos", "right_most_pos"
 )
@@ -61,6 +67,8 @@ class PatrolSnapshot:
     layers: dict[str, Any]
     climbing_enabled: bool
     final_layer_action: str
+    patrol_start_layer: str = ""
+    patrol_end_layer: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +121,9 @@ class PatrolController:
         route = list(profile.get("route_order", []))
         layers = profile.get("layers", {})
         self._selected_layer = route[-1] if route else next(iter(layers), "layer1")
+        # Contiguous patrol floor range lives in the profile
+        # (``patrol_start_layer`` / ``patrol_end_layer``) so recordings, the
+        # UI and the movement worker all see the same persisted selection.
         self._lock = threading.RLock()
 
     def _sorted_layer_names_locked(self) -> list[str]:
@@ -135,10 +146,13 @@ class PatrolController:
     def snapshot(self, layout: Optional[CoordinateLayout] = None) -> PatrolSnapshot:
         with self._lock:
             layers = deepcopy(self._profile.get("layers", {}))
-            final_layer = self._final_layer_name_locked()
-            # A saved rope on the highest layer is retained on disk so it can
+            # A saved rope on the map-top layer is retained on disk so it can
             # become useful if another layer is added, but it is invisible to
-            # current UI and movement logic while that layer remains final.
+            # current UI logic while that layer is the map top.  The patrol
+            # range's own end-floor rope is omitted by the movement worker's
+            # final-floor logic instead (the last patrolled floor never
+            # climbs), so the UI keeps the old map-top semantics.
+            final_layer = self._final_layer_name_locked()
             if final_layer is not None and isinstance(layers.get(final_layer), dict):
                 layers[final_layer].pop("rope_pos", None)
             if layout is not None:
@@ -152,6 +166,8 @@ class PatrolController:
                 final_layer_action=str(
                     self._profile.get("final_layer_action", "repeat_patrol")
                 ),
+                patrol_start_layer=self.patrol_range_locked()[0],
+                patrol_end_layer=self.patrol_range_locked()[1],
             )
 
     def is_enabled(self) -> bool:
@@ -207,6 +223,10 @@ class PatrolController:
             self._profile["map_name"] = map_name
             self._profile["route_order"] = []
             self._profile["first_layer"] = "layer1"
+            # A reset wipes the patrol range too - the fresh recording starts
+            # over without a stale start/end selection.
+            self._profile["patrol_start_layer"] = ""
+            self._profile["patrol_end_layer"] = ""
             self._profile["layers"] = {
                 "layer1": {
                     "y_tolerance": 0.020000,
@@ -266,6 +286,52 @@ class PatrolController:
     def layer_is_adaptive(self, layer_name: Optional[str] = None) -> bool:
         with self._lock:
             return self._adaptive_ready_locked(layer_name or self._selected_layer)
+
+    def patrol_range_locked(self) -> tuple[str, str]:
+        """Effective contiguous patrol floor range (start, end).
+
+        Defaults to the recorded bottom/top floors when the range was never
+        set; ``patrol_start_layer``/``patrol_end_layer`` keys in the profile
+        override it.  A single floor is allowed (start == end).
+        """
+
+        route = self._sorted_layer_names_locked()
+        if not route:
+            return "", ""
+        start = str(self._profile.get("patrol_start_layer", "")).strip()
+        end = str(self._profile.get("patrol_end_layer", "")).strip()
+        if not start or start not in route:
+            start = route[0]
+        if not end or end not in route:
+            end = route[-1]
+        return start, end
+
+    def patrol_range(self) -> tuple[str, str]:
+        with self._lock:
+            return self.patrol_range_locked()
+
+    def set_patrol_range(self, start_layer: str, end_layer: str) -> None:
+        """Select the contiguous patrol floor range (start .. end).
+
+        Both floors must be recorded layers and ``start`` must not be above
+        ``end`` by floor number (a single floor is allowed).  The selection
+        persists; the movement worker patrols only this contiguous range and
+        returns to it when the character falls outside it.
+        """
+
+        with self._lock:
+            layers = self._profile.get("layers", {})
+            for name in (start_layer, end_layer):
+                if name and name not in layers:
+                    raise ValueError(f"layer not recorded: {name}")
+            if start_layer and end_layer:
+                if _layer_number(start_layer) > _layer_number(end_layer):
+                    raise ValueError(
+                        f"patrol start {start_layer} must not be above end {end_layer}"
+                    )
+            self._profile["patrol_start_layer"] = start_layer
+            self._profile["patrol_end_layer"] = end_layer
+            self._persist_locked()
 
     def layer_is_patrol_ready(self, layer_name: Optional[str] = None) -> bool:
         """Return whether the layer's recorded action points are all adaptive."""

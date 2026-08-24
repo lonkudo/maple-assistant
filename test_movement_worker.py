@@ -431,6 +431,123 @@ class MovementTests(unittest.TestCase):
         worker._climb_state.phase = "idle"
         worker._climb_state.up_held = False
 
+    def _floors(self, count: int) -> dict:
+        """Recorded floors layer1..layerN, each with left/right/rope at a
+        distinct Y (top floors have smaller Y, like a minimap)."""
+        positions: dict[str, dict[str, Any]] = {}
+        for number in range(1, count + 1):
+            name = f"layer{number}"
+            y = 0.8 - (number - 1) * 0.1
+            positions[name] = {
+                "y_tolerance": 0.02,
+                "layer_y": round(y, 6),
+                "left_most_pos": {"x": 0.3, "y": round(y, 6)},
+                "rope_pos": {"x": 0.5, "y": round(y, 6)},
+                "right_most_pos": {"x": 0.7, "y": round(y, 6)},
+            }
+        return positions
+
+    def _range_worker(self, count: int, start: str, end: str) -> MovementWorker:
+        return MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=self._floors(count),
+            route_order=[f"layer{i}" for i in range(1, count + 1)],
+            patrol_start_layer=start,
+            patrol_end_layer=end,
+            fall_detect_frames=3,
+            fall_marker_y_gain=0.015,
+        )
+
+    def test_route_layers_limited_to_contiguous_patrol_range(self) -> None:
+        worker = self._range_worker(5, "layer2", "layer4")
+        self.assertEqual(worker._route_layers,
+                         ["layer2", "layer3", "layer4"])
+        self.assertEqual(worker._patrol_range_min, 2)
+        self.assertEqual(worker._patrol_range_max, 4)
+
+    def test_single_floor_patrol_range_is_allowed(self) -> None:
+        worker = self._range_worker(5, "layer3", "layer3")
+        self.assertEqual(worker._route_layers, ["layer3"])
+        self.assertEqual(worker._patrol_range_min, 3)
+        self.assertEqual(worker._patrol_range_max, 3)
+
+    def test_falling_detection_redetects_floor_and_restarts_patrol(self) -> None:
+        positions = self._floors(2)  # layer1 y=0.8, layer2 y=0.7
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions, route_order=["layer1", "layer2"],
+            fall_detect_frames=3, fall_marker_y_gain=0.015,
+        )
+        worker.patrol_enabled = True
+        worker._route_layer_index = 1  # patrolling layer2
+        worker._route_phase = "right"
+        # One frame of falling Y (not yet detected), then 3+ fast drops; the
+        # fall "stops" when Y stabilizes on layer1 (y=0.8).
+        for y in (0.70, 0.74, 0.78, 0.80, 0.80, 0.80):
+            obs = MinimapObservation(Point(0.4, y), None, .9, (0, 0, 1, 1))
+            worker._track_fall(obs)
+        self.assertEqual(worker._fall_pending, False)
+        self.assertEqual(worker._route_layer_index, 0)  # restarted on layer1
+        self.assertEqual(worker._route_phase, "left")
+
+    def test_fall_outside_range_below_starts_return_climb(self) -> None:
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._route_layer_index = 2
+        # Fall ends on layer1 (y=0.8), below patrol range [2..3].
+        for y in (0.50, 0.58, 0.66, 0.74, 0.82, 0.82):
+            obs = MinimapObservation(Point(0.4, y), None, .9, (0, 0, 1, 1))
+            worker._track_fall(obs)
+        self.assertEqual(worker._return_mode, "climb-to-route")
+
+    def test_fall_outside_range_above_starts_return_drop(self) -> None:
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._route_layer_index = 1
+        # Fall from an unrecorded higher area ends on layer4 (y=0.5 band),
+        # above patrol range [2..3] - the return drops back down.
+        for y in (0.40, 0.44, 0.48, 0.52, 0.52, 0.52):
+            obs = MinimapObservation(Point(0.4, y), None, .9, (0, 0, 1, 1))
+            worker._track_fall(obs)
+        self.assertEqual(worker._return_mode, "drop-to-route")
+
+    def test_return_drop_to_range_reduces_floors_and_restarts(self) -> None:
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._route_layer_index = 1
+        worker._return_mode = "drop-to-route"
+        # Marker re-enters layer3 (y=0.6): the return drop finishes.
+        obs = MinimapObservation(Point(0.5, 0.6), None, .9, (0, 0, 1, 1))
+        worker._resolve_fall(obs)
+        self.assertIsNone(worker._return_mode)
+        self.assertEqual(worker._route_layer_index, 1)  # layer3 in route
+
+    def test_return_climb_targets_current_floor_rope(self) -> None:
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._return_mode = "climb-to-route"
+        # On layer1 (below range): the return target is layer1's own rope.
+        obs = MinimapObservation(Point(0.45, 0.8), None, .9, (0, 0, 1, 1))
+        target, is_rope, label = worker._route_target(obs)
+        self.assertTrue(is_rope)
+        self.assertEqual(label, "return.climb")
+        self.assertAlmostEqual(target, 0.5)  # layer1 rope_pos.x
+
+    def test_same_floor_bounce_does_not_restart_patrol(self) -> None:
+        positions = self._floors(2)
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions, route_order=["layer1", "layer2"],
+            fall_detect_frames=3, fall_marker_y_gain=0.015,
+        )
+        worker.patrol_enabled = True
+        worker._route_layer_index = 1  # patrolling layer2 (y=0.7)
+        # Jump bounce: Y rises then returns to the same floor band.
+        for y in (0.70, 0.76, 0.82, 0.76, 0.70, 0.70):
+            obs = MinimapObservation(Point(0.4, y), None, .9, (0, 0, 1, 1))
+            worker._track_fall(obs)
+        self.assertEqual(worker._route_layer_index, 1)  # unchanged
+
     def test_reset_route_loop_clears_dropping_flag(self):
         # After the drop phase reaches layer1 a new loop starts - the
         # dropping flag must clear, otherwise the patrol stays busy forever
