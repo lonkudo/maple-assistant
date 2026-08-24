@@ -345,6 +345,92 @@ class MovementTests(unittest.TestCase):
             worker._rescue_stuck_check(moved, 401.0)
             self.assertEqual(worker._rescue_stuck_frames, 0)
 
+    def test_missing_marker_counts_as_stuck_and_triggers_immediate_rescue(self):
+        # A missing yellow marker freezes the patrol: no keys are sent and the
+        # phase cannot advance.  Previously the missing-marker path RESET the
+        # stuck counter every frame, so the self-rescue never fired and a
+        # covered minimap (e.g. an in-game window opened after a long session,
+        # or a buff cast) froze the character at the boundary forever.
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer1": {
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }},
+            route_order=["layer1"],
+            rescue_check_interval_seconds=300.0,
+            rescue_stuck_frames=20,
+        )
+        worker.patrol_enabled = True
+        worker._rescue_last_check = 100.0  # far inside the first window
+        worker._rescue_last_pos = Point(.5, .5)
+        missing = MinimapObservation(None, None, 0.0, (0, 0, 1, 1))
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for _ in range(19):
+                worker._rescue_stuck_check(missing, 101.0)
+            self.assertEqual(worker._rescue_stuck_frames, 19)
+            rescue.assert_not_called()
+            # The 20th consecutive missing frame fires the rescue IMMEDIATELY,
+            # without waiting for the 5-minute window boundary.
+            worker._rescue_stuck_check(missing, 101.0)
+            rescue.assert_called_once()
+            self.assertEqual(worker._rescue_stuck_frames, 0)
+        # When the marker reappears, the counter continues normally (a
+        # position change resets it).
+        worker._rescue_last_check = 500.0
+        moved = MinimapObservation(Point(.7, .5), None, .9, (0, 0, 1, 1))
+        worker._rescue_stuck_check(moved, 501.0)
+        self.assertEqual(worker._rescue_stuck_frames, 0)
+
+    def test_off_route_marker_triggers_immediate_rescue(self):
+        # A marker present but below/above every recorded layer band means
+        # the character is off the patrol platform (fell off / minimap frame
+        # drifted).  The route stays pinned to the recorded layer, so the
+        # phantom marker can never cross the recorded boundaries - the
+        # patrol would push into the wall forever.  Off-route frames must
+        # count toward the stuck window and rescue immediately, like a
+        # missing marker, instead of being ignored.
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer1": {
+                "layer_y": .5168, "y_tolerance": .02,
+                "left_most_pos": {"x": .3351, "y": .5168},
+                "right_most_pos": {"x": .6755, "y": .5168},
+            }},
+            route_order=["layer1"],
+            rescue_check_interval_seconds=300.0,
+            rescue_stuck_frames=20,
+        )
+        worker.patrol_enabled = True
+        worker._rescue_last_check = 100.0
+        worker._rescue_last_pos = Point(.8, .5168)
+        # y=0.6302 is outside the layer1 band (0.4968 .. 0.5368).
+        off_route = MinimapObservation(Point(.8032, .6302), None, .9, (0, 0, 1, 1))
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for _ in range(19):
+                worker._rescue_stuck_check(off_route, 101.0)
+            self.assertEqual(worker._rescue_stuck_frames, 19)
+            rescue.assert_not_called()
+            # The 20th consecutive off-route frame fires the rescue
+            # IMMEDIATELY, without waiting for the 5-minute window.
+            worker._rescue_stuck_check(off_route, 101.0)
+            rescue.assert_called_once()
+            self.assertEqual(worker._rescue_stuck_frames, 0)
+        # An active climb legitimately passes between layer bands: no rescue.
+        worker._rescue_last_check = 200.0
+        worker._climb_state.phase = "climbing-up"
+        worker._climb_state.up_held = True
+        with mock.patch.object(worker, "_trigger_rescue") as rescue2:
+            for _ in range(25):
+                worker._rescue_stuck_check(off_route, 201.0)
+            rescue2.assert_not_called()
+        worker._climb_state.phase = "idle"
+        worker._climb_state.up_held = False
+
     def test_reset_route_loop_clears_dropping_flag(self):
         # After the drop phase reaches layer1 a new loop starts - the
         # dropping flag must clear, otherwise the patrol stays busy forever

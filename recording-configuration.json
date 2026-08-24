@@ -20,7 +20,7 @@
   },
   "layers": {
     "layer1": {
-      "y_tolerance": 0.02,
+      "y_tolerance": 0.05,
       "calibration_status": "awaiting_left_rope_right"
     }
   }

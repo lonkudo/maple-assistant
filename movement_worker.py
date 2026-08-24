@@ -1209,6 +1209,24 @@ class MovementWorker(threading.Thread):
         reaches ``rescue_stuck_frames`` (default 20) the character is stuck:
         drop to layer1 and restart the patrol.  Frames where an attack is
         active are skipped - movement is intentionally paused then.
+
+        A MISSING yellow marker is itself a stuck condition: with no marker
+        the worker sends no keys, the phase cannot advance, and the character
+        freezes wherever it stands (e.g. an in-game UI window covering the
+        top-left minimap after a long session).  Missing-marker frames count
+        toward the same stuck window instead of resetting it, and when the
+        run reaches ``rescue_stuck_frames`` the rescue fires IMMEDIATELY
+        (not waiting for the next 5-minute window) so a covered/missing
+        minimap cannot freeze the patrol forever.
+
+        A marker present but OFF every recorded layer band is stuck just the
+        same: the character fell off the platform / was knocked off / the
+        minimap frame drifted, and the route (still pinned to the recorded
+        layer) will chase its recorded boundaries forever since the phantom
+        marker can never cross them.  Off-route frames count toward the same
+        stuck window and also rescue immediately at ``rescue_stuck_frames``.
+        Frames with an active climb/drop are skipped - the marker legitimately
+        passes between layer bands while climbing.
         """
         if not self.patrol_enabled or not self._route_layers:
             return
@@ -1227,7 +1245,63 @@ class MovementWorker(threading.Thread):
             return
         pos = observation.player
         if pos is None:
-            self._rescue_stuck_frames = 0
+            # Marker lost while patrol is active: the character cannot move
+            # purposefully at all (no keys are sent, the phase cannot
+            # advance) - count it as stuck instead of resetting, and rescue
+            # once the run is long enough.  The immediate trigger keeps the
+            # 5-minute window from delaying the recovery.
+            self._rescue_stuck_frames += 1
+            self._rescue_max_stuck = max(
+                self._rescue_max_stuck, self._rescue_stuck_frames
+            )
+            if self._rescue_stuck_frames >= self.rescue_stuck_frames:
+                LOG.warning(
+                    "SELF-RESCUE: yellow marker missing for %d frames; "
+                    "dropping to layer1 and restarting patrol",
+                    self._rescue_stuck_frames,
+                )
+                self._rescue_stuck_frames = 0
+                self._rescue_max_stuck = 0
+                self._trigger_rescue()
+            return
+        # Off-route: the marker is present but matches NO recorded layer
+        # band (marker-Y check - the pinned world-Y must not be consulted
+        # here).  The character is off the patrol platform: it fell off /
+        # was knocked off, or the minimap frame drifted so the normalized
+        # Y no longer lands on the recorded band.  The route stays pinned
+        # to the recorded layer, so the phantom marker can never cross the
+        # recorded boundaries - the patrol would push into the wall
+        # forever (stair-jump give-up only flips left/right).  Count it as
+        # stuck and rescue once the run is long enough.  Frames with an
+        # active climb/drop are skipped: the marker legitimately passes
+        # between bands while climbing.  Only applies when the route
+        # actually defines Y bands (recorded layers always do).
+        route_layers = {
+            name: self.important_positions[name]
+            for name in self._route_layers
+        }
+        has_y_bands = any(
+            isinstance(layer, dict) and "layer_y" in layer
+            for layer in route_layers.values()
+        )
+        if (has_y_bands
+                and self._climb_state.phase == "idle"
+                and not self._descending_to_first
+                and detect_layer_by_y(pos.y, route_layers) is None):
+            self._rescue_stuck_frames += 1
+            self._rescue_max_stuck = max(
+                self._rescue_max_stuck, self._rescue_stuck_frames
+            )
+            if self._rescue_stuck_frames >= self.rescue_stuck_frames:
+                LOG.warning(
+                    "SELF-RESCUE: character off every recorded layer "
+                    "(%d frames at y=%.6f); dropping to layer1 and "
+                    "restarting patrol",
+                    self._rescue_stuck_frames, pos.y,
+                )
+                self._rescue_stuck_frames = 0
+                self._rescue_max_stuck = 0
+                self._trigger_rescue()
             return
         last = self._rescue_last_pos
         if (last is not None
@@ -2199,6 +2273,13 @@ class MovementWorker(threading.Thread):
 
         if (self.first_layer is None
                 or self.first_layer not in self._route_layers):
+            return
+        if len(self._route_layers) <= 1:
+            # Single-layer route: the character is already on the first
+            # (and only) layer - there is no lower platform to drop
+            # through.  Skipping keeps the self-rescue instant instead of
+            # pressing Alt+Down up to 30 times against the ground.
+            LOG.info("single-layer map: skipping drop to %s", self.first_layer)
             return
         max_attempts = 30
         for attempt in range(1, max_attempts + 1):

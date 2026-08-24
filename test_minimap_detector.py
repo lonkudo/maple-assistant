@@ -177,6 +177,33 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertEqual(held.analysis_box, detected.analysis_box)
         self.assertEqual(held.canvas_box, detected.canvas_box)
 
+    def test_box_smoothing_stabilizes_frame_repeats_but_adopts_resizes(self) -> None:
+        # Live logs show the minimap frame flipping between near-identical
+        # contour boxes every frame; each flip shifts the player marker AND
+        # the projected targets, stalling the rope approach.  The median
+        # filter must keep the coordinate frame stable across the flip
+        # variants, while a genuine resize jump is adopted immediately.
+        detector = MinimapDetector()
+        repeats = [
+            ((0, 0, 95, 135), (0, 20, 95, 135), (2, 40, 92, 130)),
+            ((2, 0, 92, 140), (2, 20, 92, 140), (2, 40, 90, 132)),
+            ((0, 0, 96, 137), (0, 20, 96, 137), (3, 40, 93, 131)),
+            ((2, 0, 92, 140), (2, 20, 92, 140), (2, 40, 90, 132)),
+            ((3, 0, 92, 140), (3, 20, 92, 140), (2, 40, 90, 130)),
+        ]
+        outputs = [detector._stabilize_boxes(w, a, c) for w, a, c in repeats]
+        self.assertEqual(outputs[0], repeats[0])  # first frame passes raw
+        for box in outputs[1:]:
+            width = box[0][2] - box[0][0]
+            height = box[0][3] - box[0][1]
+            self.assertLessEqual(abs(width - 90), 6)   # 90..96
+            self.assertLessEqual(abs(height - 137), 4)  # 135..140
+        # A genuine minimap resize/reposition clears the history and is
+        # adopted on the very next frame.
+        resize = ((50, 10, 300, 260), (50, 30, 300, 260), (55, 50, 295, 250))
+        jumped = detector._stabilize_boxes(*resize)
+        self.assertEqual(jumped[0], resize[0])
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

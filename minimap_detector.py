@@ -6,6 +6,7 @@ debug UI can reuse the same detector without becoming coupled to one another.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 import threading
 import time
@@ -96,6 +97,8 @@ class MinimapDetector:
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
         transient_hold_seconds: float = 1.0,
+        box_history: int = 5,
+        box_jump_ratio: float = 0.25,
     ) -> None:
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
@@ -105,6 +108,18 @@ class MinimapDetector:
             if opencv_size is not None else None
         )
         self.transient_hold_seconds = max(0.0, float(transient_hold_seconds))
+        # Median-smoothing of the detected minimap boxes.  A minimap frame can
+        # flip between near-identical contour boxes every frame; each flip
+        # shifts the coordinate frame (marker AND projected targets), which
+        # stalls the rope approach / boundary turns even though the character
+        # is moving.  Mirroring ``DiamondSizeTracker``: small jitter is
+        # median-smoothed over ``box_history`` frames; a large jump (genuine
+        # minimap resize/move) clears the history and is adopted immediately.
+        self.box_history_len = max(2, int(box_history))
+        self.box_jump_ratio = max(0.05, min(0.8, float(box_jump_ratio)))
+        self._box_history: deque[tuple[Box, Box, Box]] = deque(
+            maxlen=self.box_history_len
+        )
         self._last_good: Optional[MinimapDetection] = None
         self._last_good_image_size: Optional[tuple[int, int]] = None
         self._last_good_at = float("-inf")
@@ -157,6 +172,54 @@ class MinimapDetector:
             # The capture is already a tight minimap crop; search it whole.
             return image, None
         return image.crop(crop_box), crop_box
+
+    @staticmethod
+    def _coordinate_median(
+        history: "deque[tuple[Box, Box, Box]]", order: int
+    ) -> Box:
+        """Per-coordinate median of one box slot across the history."""
+        values = [entry[order] for entry in history]
+        return tuple(
+            sorted(coordinate)[len(values) // 2]
+            for coordinate in zip(*values)
+        )
+
+    def _stabilize_boxes(
+        self, window: Box, analysis: Box, canvas: Box
+    ) -> tuple[Box, Box, Box]:
+        """Median-smooth the detected boxes across frames.
+
+        A minimap frame can flip between near-identical contour boxes every
+        frame (the border merges with a child rectangle, an overlay adds a
+        candidate, etc.).  Each flip shifts the whole normalized coordinate
+        frame: the player marker AND the projected patrol/rope targets both
+        jump, so the rope approach gap never closes and the character stalls
+        ("MOVE TO ROPE right" forever).  Mirroring ``DiamondSizeTracker``:
+        small frame-to-frame jitter is median-smoothed; a large jump (a
+        genuine minimap resize/reposition) clears the history and is adopted
+        immediately.
+        """
+
+        with self._state_lock:
+            if self._box_history:
+                median = self._coordinate_median(self._box_history, 0)
+                deviation = max(
+                    abs(window[0] - median[0]),
+                    abs(window[1] - median[1]),
+                    abs(window[2] - median[2]),
+                    abs(window[3] - median[3]),
+                )
+                span = max(1, median[2] - median[0], median[3] - median[1])
+                if deviation / span > self.box_jump_ratio:
+                    self._box_history.clear()
+            self._box_history.append((window, analysis, canvas))
+            if len(self._box_history) < 2:
+                return window, analysis, canvas
+            return (
+                self._coordinate_median(self._box_history, 0),
+                self._coordinate_median(self._box_history, 1),
+                self._coordinate_median(self._box_history, 2),
+            )
 
     def detect(self, image: Image.Image) -> MinimapDetection:
         original_size = image.size
@@ -304,6 +367,13 @@ class MinimapDetector:
         window_box = to_original(window_box)
         analysis_box = to_original(analysis_box)
         canvas_box = to_original(canvas_box)
+        # Stabilize the coordinate frame: contour flips between near-identical
+        # minimap boxes would shift the player marker AND the projected
+        # patrol/rope targets every frame and stall the rope approach.  The
+        # map-name crop stays raw (OCR tolerates +-1-2 px wobble).
+        window_box, analysis_box, canvas_box = self._stabilize_boxes(
+            window_box, analysis_box, canvas_box
+        )
         map_name_box = to_original(map_name_box)
         map_name = self._read_map_name(image, map_name_box)
         confidence = float(np.clip(0.55 + rectangularity * 0.45, 0.0, 1.0))

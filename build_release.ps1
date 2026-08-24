@@ -71,8 +71,9 @@ Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundCo
 Write-Host ""
 
 if ($Zip) {
-    # 4 位随机戳：每次重建生成不同文件名，方便区分版本（如 MapleAssistant-4831.zip）。
-    $stamp = Get-Random -Minimum 1000 -Maximum 10000
+    # 时间戳：每次重建生成不同文件名，方便区分版本（如 MapleAssistant-29-21-05.zip）。
+    # Windows 文件名不允许冒号，故用 dd-HH-mm（日-时-分）代替 {dd:HH:mm}。
+    $stamp = Get-Date -Format "dd-HH-mm"
     $zipPath = Join-Path $root "release\MapleAssistant-$stamp.zip"
     # 先删除旧的压缩包（带重试，防止旧包被资源管理器/杀软短暂锁定），
     # 重建后不会残留旧包。

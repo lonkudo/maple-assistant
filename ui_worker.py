@@ -323,6 +323,30 @@ def rope_unavailable_hint() -> str:
     return "添加上层后即可录制绳索位置。"
 
 
+def bindable_keys_hint() -> str:
+    """Popout hint listing every currently bindable hotkey.
+
+    Shown when hovering a key-bind button (fixed attack / HP / MP / 增益
+    buff keys), mirroring the rope-record hint popout.  The list is derived
+    from ``BINDABLE_KEYS`` so it always matches what the capture actually
+    accepts.
+    """
+
+    ordered = [
+        "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        "a", "space", "ctrl", "shift", "delete", "end",
+        "home", "insert", "pageup", "pagedown",
+    ]
+    available = " / ".join(name for name in ordered if name in BINDABLE_KEYS)
+    return (
+        "可绑定按键：\n"
+        f"{available}\n\n"
+        "点击按钮后再按目标键即可绑定；\n"
+        "按 Esc 或不可绑定的键会恢复原值。\n"
+        "方向键 / Alt / Z 是移动、跳跃与拾取键，不可绑定。"
+    )
+
+
 def record_button_is_locked(saved_endpoint: Any, explicitly_unlocked: bool) -> bool:
     """Saved endpoints lock automatically unless the user explicitly unlocks."""
 
@@ -398,6 +422,9 @@ class UiWorker(threading.Thread):
         self._photo_map_name: Any = None
         self._record_buttons: dict[tuple[str, str], Any] = {}
         self._rope_tooltips: dict[str, HoverTooltip] = {}
+        # Key-bind buttons carry the bindable-hotkeys popout hint; the list
+        # keeps the tooltips alive for the whole UI lifetime.
+        self._bind_key_tooltips: list[HoverTooltip] = []
         self._layer_labels: dict[str, Any] = {}
         self._layer_row_names: tuple[str, ...] = ()
         # Only explicit unlocks need UI state. Locking itself is derived from
@@ -699,6 +726,7 @@ class UiWorker(threading.Thread):
             )
             fixed_key_button.pack(side="left", padx=(0, 10))
             self._fixed_key_button = fixed_key_button
+            self._attach_bind_hint(fixed_key_button)
             ttk.Label(fixed_key_row, text="每").pack(side="left")
             # Fixed attack period: horizontal slider (progress-bar style),
             # 0.5-10 s, default 3 s.
@@ -747,6 +775,7 @@ class UiWorker(threading.Thread):
             )
             hp_key_button.pack(side="left", padx=(0, 10))
             self._hp_key_button = hp_key_button
+            self._attach_bind_hint(hp_key_button)
             ttk.Label(hp_row, text="HP 低于以下时喝药:").pack(side="left")
             self._hp_threshold_var = tk.IntVar(value=50)
             hp_threshold_slider = ttk.Scale(
@@ -778,6 +807,7 @@ class UiWorker(threading.Thread):
             )
             mp_key_button.pack(side="left", padx=(0, 10))
             self._mp_key_button = mp_key_button
+            self._attach_bind_hint(mp_key_button)
             ttk.Label(mp_row, text="MP 低于以下时喝药:").pack(side="left")
             self._mp_threshold_var = tk.IntVar(value=30)
             mp_threshold_slider = ttk.Scale(
@@ -814,6 +844,7 @@ class UiWorker(threading.Thread):
             )
             buff1_key_button.pack(side="left", padx=(0, 10))
             self._buff1_key_button = buff1_key_button
+            self._attach_bind_hint(buff1_key_button)
             ttk.Label(buff1_row, text="每").pack(side="left")
             # Buff refresh period in minutes (default 10): horizontal slider
             # in the same progress-bar style as the other panels.
@@ -850,6 +881,7 @@ class UiWorker(threading.Thread):
             )
             buff2_key_button.pack(side="left", padx=(0, 10))
             self._buff2_key_button = buff2_key_button
+            self._attach_bind_hint(buff2_key_button)
             ttk.Label(buff2_row, text="每").pack(side="left")
             self._buff2_interval_var = tk.DoubleVar(value=10.0)
             buff2_interval_slider = ttk.Scale(
@@ -1422,6 +1454,19 @@ class UiWorker(threading.Thread):
     @staticmethod
     def _drug_settings_path() -> Path:
         return Path(__file__).resolve().parent / "drug_settings.json"
+
+    def _attach_bind_hint(self, button: Any) -> None:
+        """Attach the bindable-hotkeys popout hint to a key-bind button.
+
+        Mirrors the rope-record hint: hovering the button shows which keys
+        can actually be bound (``BINDABLE_KEYS``), so the user does not have
+        to guess.  The hint is always enabled - the binding buttons are
+        always bindable.
+        """
+
+        tooltip = HoverTooltip(button, bindable_keys_hint())
+        tooltip.set_enabled(True)
+        self._bind_key_tooltips.append(tooltip)
 
     def _bind_capture_begin(
         self, button: Any, var: tk.StringVar, previous_attr: str,

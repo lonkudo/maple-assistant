@@ -4,6 +4,7 @@ import unittest
 from ui_worker import (
     UiLogHandler,
     UiWorker,
+    bindable_keys_hint,
     keysym_to_scan_key,
     layer_display_order,
     patrol_button_states,
@@ -46,8 +47,11 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(keysym_to_scan_key("Home"), "home")
         self.assertEqual(keysym_to_scan_key("Insert"), "insert")
         self.assertEqual(keysym_to_scan_key("space"), "space")
-        # Everything else is NOT bindable (letters, F-keys, numpad, "0",
-        # punctuation, Escape): the previous binding must stay.
+        # "a" is bindable (players bind buffs/skills there).
+        self.assertEqual(keysym_to_scan_key("a"), "a")
+        self.assertEqual(keysym_to_scan_key("A"), "a")
+        # Everything else is NOT bindable (other letters, F-keys, numpad,
+        # "0", punctuation, Escape): the previous binding must stay.
         self.assertIsNone(keysym_to_scan_key("q"))
         self.assertIsNone(keysym_to_scan_key("Q"))
         self.assertIsNone(keysym_to_scan_key("F4"))
@@ -64,6 +68,14 @@ class UiLogHandlerTests(unittest.TestCase):
             rope_unavailable_hint(),
             "添加上层后即可录制绳索位置。",
         )
+
+    def test_bindable_keys_hint_lists_all_bindable_hotkeys(self) -> None:
+        hint = bindable_keys_hint()
+        for key in ("1", "9", "a", "space", "ctrl", "home", "insert"):
+            self.assertIn(key, hint)
+        # Movement/jump keys are explicitly NOT bindable and the hint says so.
+        self.assertNotIn("left", hint.split("可绑定按键：", 1)[1].split("\n\n", 1)[0])
+        self.assertIn("不可绑定", hint)
 
     def test_dynamic_record_button_locks_from_saved_endpoint(self) -> None:
         endpoint = object()
