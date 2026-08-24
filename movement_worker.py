@@ -3035,6 +3035,13 @@ class MovementWorker(threading.Thread):
                 floor = self._return_from_floor
                 if floor is None:
                     return None, False, "return-climb-waiting"
+            if floor in self._route_layers:
+                # Back inside the patrol range (the climb reached an in-range
+                # floor): END the return and restart patrol on this floor -
+                # do not keep chasing its rope.  Attack resumes with it.
+                LOG.info("RETURN TO ROUTE: climbed back to %s; restarting patrol", floor)
+                self._finish_return(floor)
+                return self._route_target(observation)
             rope = self.important_positions.get(floor, {}).get("rope_pos", {})
             rope_x = (
                 float(rope["x"])

@@ -562,6 +562,24 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(label, "return.climb")
         self.assertAlmostEqual(target, 0.5)  # layer1 rope still targeted
 
+    def test_return_climb_finishes_when_reaching_in_range_floor(self) -> None:
+        # The character climbed back up and is now ON layer2 (inside the
+        # patrol range [2..3]): the return must END and patrol restarts on
+        # layer2 - it must NOT keep chasing layer2's own rope (which
+        # before left the character creeping at the floor edge, never
+        # patrolling and never attacking).
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._return_mode = "climb-to-route"
+        worker._return_from_floor = "layer1"
+        obs = MinimapObservation(Point(0.4, 0.7), None, .9, (0, 0, 1, 1))
+        target, is_rope, label = worker._route_target(obs)
+        self.assertIsNone(worker._return_mode)      # return ended
+        self.assertEqual(worker._route_layer_index, 0)  # layer2 in route
+        self.assertEqual(worker._route_phase, "left")
+        self.assertFalse(is_rope)
+        self.assertEqual(label, "layer2.left-most")
+
     def test_out_of_range_check_ignores_in_range_floor(self) -> None:
         worker = self._range_worker(4, "layer2", "layer3")
         worker.patrol_enabled = True
