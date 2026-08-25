@@ -11,6 +11,10 @@ from ui_worker import (
     record_button_is_locked,
     rope_unavailable_hint,
     tooltip_cursor_top_right_position,
+    _clamp_window_geometry,
+    _load_window_geometry,
+    _parse_window_geometry,
+    _save_window_geometry,
 )
 
 
@@ -1008,6 +1012,94 @@ class UiLogHandlerTests(unittest.TestCase):
                 loader._shutdown_load_settings()
             self.assertTrue(loader._player_check_var.get())
             self.assertEqual(loader.movement_worker.calls, [True])
+
+
+class WindowGeometryHelperTests(unittest.TestCase):
+    def test_parse_window_geometry_accepts_position_and_negative_x(self) -> None:
+        self.assertEqual(
+            _parse_window_geometry("1200x1000+40+40"),
+            (1200, 1000, 40, 40),
+        )
+        self.assertEqual(
+            _parse_window_geometry("980x560+120-40"),
+            (980, 560, 120, -40),
+        )
+
+    def test_parse_window_geometry_rejects_malformed_input(self) -> None:
+        self.assertIsNone(_parse_window_geometry(""))
+        self.assertIsNone(_parse_window_geometry("1200x1000"))
+        self.assertIsNone(_parse_window_geometry("1200x1000+40"))
+        self.assertIsNone(_parse_window_geometry("0x0+0+0"))
+        self.assertIsNone(_parse_window_geometry("1200x0+40+40"))
+        self.assertIsNone(_parse_window_geometry("not-a-geometry"))
+
+    def test_clamp_window_geometry_keeps_window_fully_on_screen(self) -> None:
+        # A previously saved position can be off-screen after a monitor
+        # change; the restored window must always be reachable/draggable.
+        clamped = _clamp_window_geometry("1200x1000+1500+900", 1920, 1080)
+        width, height, x, y = _parse_window_geometry(clamped)
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(x + width, 1920)
+        self.assertLessEqual(y + height, 1080)
+        # The size itself is preserved when it fits.
+        self.assertEqual((width, height), (1200, 1000))
+
+    def test_clamp_window_geometry_enforces_minimum_size(self) -> None:
+        width, height, _, _ = _parse_window_geometry(
+            _clamp_window_geometry("400x300+0+0", 1920, 1080)
+        )
+        self.assertGreaterEqual(width, 980)
+        self.assertGreaterEqual(height, 560)
+
+    def test_clamp_window_geometry_falls_back_for_corrupt_input(self) -> None:
+        self.assertEqual(
+            _clamp_window_geometry("garbage", 1920, 1080),
+            "980x560+40+40",
+        )
+
+    def test_window_geometry_settings_roundtrip(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake_path = Path(directory) / "ui_window_settings.json"
+            with mock.patch(
+                "ui_worker._window_geometry_settings_path",
+                return_value=fake_path,
+            ):
+                _save_window_geometry("1100x800+60+70")
+                self.assertEqual(
+                    _load_window_geometry("1200x1000+40+40"),
+                    "1100x800+60+70",
+                )
+
+    def test_load_window_geometry_falls_back_to_default(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.json"
+            with mock.patch(
+                "ui_worker._window_geometry_settings_path",
+                return_value=missing,
+            ):
+                self.assertEqual(
+                    _load_window_geometry("1200x1000+40+40"),
+                    "1200x1000+40+40",
+                )
+            corrupt = Path(directory) / "corrupt.json"
+            corrupt.write_text("not json", encoding="utf-8")
+            with mock.patch(
+                "ui_worker._window_geometry_settings_path",
+                return_value=corrupt,
+            ):
+                self.assertEqual(
+                    _load_window_geometry("1200x1000+40+40"),
+                    "1200x1000+40+40",
+                )
 
 
 if __name__ == "__main__":

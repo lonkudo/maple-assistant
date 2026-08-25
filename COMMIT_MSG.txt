@@ -1,15 +1,13 @@
-fix: floor detection uses the recorded-point Y band (span +- tolerance), in-band-only
+fix: debug UI never steals foreground and remembers its window position/size
 
-The band is now (uppermost recorded point Y - tolerance .. lowermost point Y +
-tolerance) over left/rope/right, instead of the mean layer_y +- tolerance.
-The mean band excluded the platform ends, so the marker at an edge flipped
-between floors every frame and the route never advanced to the next layer.
-
-- movement_worker: _layer_y_band/_layer_world_y_band helpers; detect_layer_by_y
-  / detect_layer_by_world_y only accept in-band Ys; _next_layer_arrival_band
-  and _on_first_layer use the band; _next_layer_reached is band-based.
-- patrol_control: mirrored helpers; layer_for_y / layer_for_world_y only
-  accept in-band Ys.
-- test_movement_worker: fixtures align recorded point Ys with layer_y so the
-  explicit-Y, first-layer arrival, and climb-arrival tests exercise the band
-  semantics with realistic calibration data.
+- run(): remove root.attributes('-topmost') - the startup raise pulled the
+  debug UI in front of the game mid-climb, so the game lost focus, held keys
+  (up/right/z) were released and the character jumped off the rope.  The UI
+  also no longer opens pinned at +0+0: it restores the last saved geometry.
+- add pure geometry helpers (_parse_window_geometry / _clamp_window_geometry
+  / _load_window_geometry / _save_window_geometry) persisted to
+  ui_window_settings.json (periodic save + save on close), so the window is
+  movable/adjustable and is clamped back on-screen when a saved position
+  went off-screen (e.g. after a monitor change).
+- test_ui_worker: WindowGeometryHelperTests covering parse, on-screen
+  clamp, minimum size, settings roundtrip and corrupt/missing fallback.

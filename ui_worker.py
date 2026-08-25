@@ -45,6 +45,78 @@ def tooltip_cursor_top_right_position(
     return x, y
 
 
+def _window_geometry_settings_path() -> Path:
+    """Persisted debug UI window geometry (position + size)."""
+    return Path(__file__).resolve().parent / "ui_window_settings.json"
+
+
+def _parse_window_geometry(
+    geometry: str,
+) -> Optional[tuple[int, int, int, int]]:
+    """Parse a Tk geometry string ``WxH+X+Y`` -> (width, height, x, y).
+
+    Returns None for malformed or non-positive input, mirroring the
+    strictness of the loader so a corrupt settings file cannot crash the UI.
+    """
+    match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", str(geometry).strip())
+    if not match:
+        return None
+    width, height, x, y = (int(part) for part in match.groups())
+    if width <= 0 or height <= 0:
+        return None
+    return width, height, x, y
+
+
+def _clamp_window_geometry(
+    geometry: str,
+    screen_width: int = 1920,
+    screen_height: int = 1080,
+    min_width: int = 980,
+    min_height: int = 560,
+) -> str:
+    """Keep a restored window fully on-screen and at least the minimum size.
+
+    A saved position far off-screen (e.g. after a monitor change) would
+    otherwise open the debug UI somewhere invisible; the window must stay
+    editable/movable, so the clamp makes sure it can always be grabbed.
+    """
+    parsed = _parse_window_geometry(geometry)
+    if parsed is None:
+        return f"{min_width}x{min_height}+40+40"
+    width, height, x, y = parsed
+    width = max(min_width, min(width, max(min_width, screen_width)))
+    height = max(min_height, min(height, max(min_height, screen_height)))
+    x = max(0, min(x, max(0, screen_width - width - 8)))
+    y = max(0, min(y, max(0, screen_height - height - 40)))
+    return f"{width}x{height}+{x}+{y}"
+
+
+def _load_window_geometry(default_geometry: str) -> str:
+    """Return the saved debug UI geometry, or ``default_geometry`` when the
+    settings file is missing/corrupt.  Never raises."""
+    try:
+        data = json.loads(
+            _window_geometry_settings_path().read_text(encoding="utf-8")
+        )
+        geometry = data.get("geometry")
+        if isinstance(geometry, str) and _parse_window_geometry(geometry):
+            return geometry
+    except Exception:
+        pass
+    return default_geometry
+
+
+def _save_window_geometry(geometry: str) -> None:
+    """Persist the debug UI window geometry for the next startup."""
+    try:
+        _window_geometry_settings_path().write_text(
+            json.dumps({"geometry": geometry}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        LOG.debug("could not save debug UI window geometry", exc_info=True)
+
+
 def monitor_work_area_for_pointer(
     pointer_x: int,
     pointer_y: int,
@@ -444,14 +516,18 @@ class UiWorker(threading.Thread):
             self._root = root
             root.title("Maple 助手 调试界面")
             screen_width = root.winfo_screenwidth()
-            # 窗口固定在屏幕左上角 (0,0) 打开。两列布局：左侧巡逻/攻击/药品/
-            # 附加功能，右侧 YOLO 怪物检测 + 调试日志，避免窗口过高。
+            screen_height = root.winfo_screenheight()
+            # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
+            # 不会因调试窗口抢到前台而松开按键、角色跳离绳索。窗口位置与大小
+            # 按上次保存的几何恢复（可移动、可调整），默认不再固定左上角。
             window_height = 1000
-            root.geometry(f"1200x{window_height}+0+0")
+            restored = _load_window_geometry(f"1200x{window_height}+40+40")
+            root.geometry(_clamp_window_geometry(
+                restored, screen_width, screen_height,
+            ))
             root.minsize(980, 560)
-            root.protocol("WM_DELETE_WINDOW", root.destroy)
-            root.attributes("-topmost", True)
-            root.after(1500, lambda: root.attributes("-topmost", False))
+            root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
+            self._schedule_window_geometry_save(root)
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
@@ -1021,6 +1097,41 @@ class UiWorker(threading.Thread):
             self._yolo_stop()
             self._root = None
             LOG.info("UI worker stopped")
+
+    def _on_debug_window_close(self) -> None:
+        """Close handler: remember the window geometry, then destroy."""
+        root = self._root
+        if root is not None:
+            try:
+                _save_window_geometry(root.winfo_geometry())
+            except Exception:
+                LOG.debug("could not save debug UI geometry on close", exc_info=True)
+            root.destroy()
+
+    def _schedule_window_geometry_save(self, root: Any, delay_ms: int = 3000) -> None:
+        """Periodically persist the debug UI geometry while it is open.
+
+        A periodic save (rather than only on close) also keeps the position
+        when the assistant is restarted hard (kill/restart scripts), so the
+        window never snaps back to a fixed default corner.
+        """
+
+        def _tick() -> None:
+            if self._root is not root:
+                return
+            try:
+                _save_window_geometry(root.winfo_geometry())
+            except Exception:
+                LOG.debug("could not save debug UI geometry", exc_info=True)
+            try:
+                root.after(delay_ms, _tick)
+            except Exception:
+                pass
+
+        try:
+            root.after(delay_ms, _tick)
+        except Exception:
+            pass
 
     def _poll(self) -> None:
         root = self._root
