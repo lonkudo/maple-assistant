@@ -636,14 +636,14 @@ class MovementTests(unittest.TestCase):
             "layer1": {
                 "layer_world_y": 11.32, "world_y_tolerance": .75,
                 "layer_y": .775391, "y_tolerance": .02,
-                "left_most_pos": {"x": .2, "y": .5},
-                "right_most_pos": {"x": .8, "y": .5},
+                "left_most_pos": {"x": .2, "y": .775391},
+                "right_most_pos": {"x": .8, "y": .775391},
             },
             "layer2": {
                 "layer_world_y": -17.15, "world_y_tolerance": .75,
                 "layer_y": .611328, "y_tolerance": .02,
-                "left_most_pos": {"x": .2, "y": .5},
-                "right_most_pos": {"x": .8, "y": .5},
+                "left_most_pos": {"x": .2, "y": .611328},
+                "right_most_pos": {"x": .8, "y": .611328},
             },
         }
         sender = Sender()
@@ -850,8 +850,8 @@ class MovementTests(unittest.TestCase):
             "layer1": {"layer_y": 0.66185, "y_tolerance": 0.02,
                        "layer_world_y": 5.495099,
                        "world_y_tolerance": 0.75,
-                       "left_most_pos": {"x": .2, "y": .70},
-                       "right_most_pos": {"x": .8, "y": .70}},
+                       "left_most_pos": {"x": .2, "y": 0.66185},
+                       "right_most_pos": {"x": .8, "y": 0.66185}},
             "layer2": {"layer_y": .56, "y_tolerance": .02,
                        "left_most_pos": {"x": .3, "y": .56},
                        "right_most_pos": {"x": .6, "y": .56}},
@@ -875,13 +875,13 @@ class MovementTests(unittest.TestCase):
             "layer1": {"layer_y": 0.66185, "y_tolerance": 0.025,
                        "layer_world_y": 5.495099,
                        "world_y_tolerance": 0.75,
-                       "left_most_pos": {"x": .2, "y": .70},
-                       "right_most_pos": {"x": .8, "y": .70}},
+                       "left_most_pos": {"x": .2, "y": 0.66185},
+                       "right_most_pos": {"x": .8, "y": 0.66185}},
             "layer2": {"layer_y": .552023, "y_tolerance": .025,
                        "layer_world_y": 2.461896,
                        "world_y_tolerance": 0.75,
-                       "left_most_pos": {"x": .3, "y": .56},
-                       "right_most_pos": {"x": .6, "y": .56}},
+                       "left_most_pos": {"x": .3, "y": .552023},
+                       "right_most_pos": {"x": .6, "y": .552023}},
         }
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
@@ -2656,13 +2656,13 @@ class MovementTests(unittest.TestCase):
         positions = {
             "layer1": {
                 "layer_y": .698864, "y_tolerance": .020000,
-                "left_most_pos": {"x": .2, "y": .1},
-                "right_most_pos": {"x": .8, "y": .1},
+                "left_most_pos": {"x": .2, "y": .698864},
+                "right_most_pos": {"x": .8, "y": .698864},
             },
             "layer2": {
                 "layer_y": .500000, "y_tolerance": .020000,
-                "left_most_pos": {"x": .2, "y": .9},
-                "right_most_pos": {"x": .8, "y": .9},
+                "left_most_pos": {"x": .2, "y": .500000},
+                "right_most_pos": {"x": .8, "y": .500000},
             },
         }
         worker = MovementWorker(

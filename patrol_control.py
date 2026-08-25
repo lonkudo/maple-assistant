@@ -10,6 +10,37 @@ from pathlib import Path
 import re
 import threading
 from typing import Any, Literal, Optional
+def _layer_point_ys(layer: Any) -> list[float]:
+    values = []
+    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+        point = layer.get(point_name)
+        if isinstance(point, dict) and "y" in point:
+            values.append(float(point["y"]))
+    return values
+
+
+def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    values = _layer_point_ys(layer)
+    if not values and isinstance(layer, dict) and "layer_y" in layer:
+        values = [float(layer["layer_y"])]
+    if not values:
+        return None
+    return min(values) - tolerance, max(values) + tolerance
+
+
+def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    values = []
+    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+        point = layer.get(point_name)
+        if isinstance(point, dict) and "world_y" in point:
+            values.append(float(point["world_y"]))
+    if not values and isinstance(layer, dict) and "layer_world_y" in layer:
+        values = [float(layer["layer_world_y"])]
+    if not values:
+        return None
+    return min(values) - tolerance, max(values) + tolerance
+
+
 
 
 LOG = logging.getLogger(__name__)
@@ -393,9 +424,12 @@ class PatrolController:
                 layer = layers.get(name)
                 if not isinstance(layer, dict) or "layer_y" not in layer:
                     continue
-                gap = abs(float(layer["layer_y"]) - float(player_y))
-                if gap <= float(layer.get("y_tolerance", 0.020000)):
-                    candidates.append((gap, name))
+                tolerance = float(layer.get("y_tolerance", 0.020000))
+                band = _layer_y_band(layer, tolerance)
+                if band is None:
+                    continue
+                if band[0] - 1e-9 <= player_y <= band[1] + 1e-9:
+                    candidates.append((0.0, name))
             return min(candidates)[1] if candidates else None
 
     def layer_for_world_y(self, world_y: float) -> Optional[str]:
@@ -408,10 +442,12 @@ class PatrolController:
                 layer = layers.get(name)
                 if not isinstance(layer, dict) or "layer_world_y" not in layer:
                     continue
-                gap = abs(float(layer["layer_world_y"]) - float(world_y))
                 tolerance = float(layer.get("world_y_tolerance", 0.75))
-                if gap <= tolerance:
-                    candidates.append((gap, name))
+                band = _layer_world_y_band(layer, tolerance)
+                if band is None:
+                    continue
+                if band[0] - 1e-9 <= world_y <= band[1] + 1e-9:
+                    candidates.append((0.0, name))
             return min(candidates)[1] if candidates else None
 
     def layer_is_complete(self, layer_name: Optional[str] = None) -> bool:

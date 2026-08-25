@@ -98,23 +98,65 @@ class PositionMovementPlan:
     decision: MovementDecision
 
 
+def _layer_point_ys(layer: Any) -> list[float]:
+    values = []
+    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+        point = layer.get(point_name)
+        if isinstance(point, dict) and "y" in point:
+            values.append(float(point["y"]))
+    return values
+
+
+def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    """Layer band from its recorded point Ys.
+
+    band = (uppermost point Y - tolerance, lowermost point Y + tolerance).
+    A layer whose points span a Y range (wide platform / minimap
+    perspective) is fully detected while standing anywhere on the
+    platform; the old mean +- tolerance band excluded the platform ends,
+    so the marker at an edge flipped between floors every frame and the
+    route never advanced to the next layer.  Falls back to ``layer_y``
+    when the layer has no recorded points (still the mean band then).
+    """
+    values = _layer_point_ys(layer)
+    if not values and isinstance(layer, dict) and "layer_y" in layer:
+        values = [float(layer["layer_y"])]
+    if not values:
+        return None
+    return min(values) - tolerance, max(values) + tolerance
+
+
+def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    """World-Y band from recorded point world-Ys (same rule as Y)."""
+    values = []
+    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+        point = layer.get(point_name)
+        if isinstance(point, dict) and "world_y" in point:
+            values.append(float(point["world_y"]))
+    if not values and isinstance(layer, dict) and "layer_world_y" in layer:
+        values = [float(layer["layer_world_y"])]
+    if not values:
+        return None
+    return min(values) - tolerance, max(values) + tolerance
+
+
 def detect_layer_by_y(
     player_y: float,
     layers: dict[str, Any],
 ) -> Optional[str]:
-    """Return the nearest explicitly calibrated layer within its tolerance."""
+    """Return the nearest layer whose recorded-point band contains Y."""
 
     candidates = []
     for name, layer in layers.items():
         if not isinstance(layer, dict) or "layer_y" not in layer:
             continue
-        gap = abs(float(layer["layer_y"]) - player_y)
         tolerance = float(layer.get("y_tolerance", 0.020000))
-        # Epsilon absorbs binary-float edge cases at the band boundary
-        # (e.g. |0.5 - 0.52| reads 0.020000000000000018 > 0.02): a
-        # landing exactly on the band edge must not flicker out of band.
-        if gap <= tolerance + 1e-9:
-            candidates.append((gap, name))
+        band = _layer_y_band(layer, tolerance)
+        if band is None:
+            continue
+        band_min, band_max = band
+        if band_min - 1e-9 <= player_y <= band_max + 1e-9:
+            candidates.append((0.0, name))
     return min(candidates)[1] if candidates else None
 
 
@@ -128,10 +170,13 @@ def detect_layer_by_world_y(
     for name, layer in layers.items():
         if not isinstance(layer, dict) or "layer_world_y" not in layer:
             continue
-        gap = abs(float(layer["layer_world_y"]) - float(world_y))
         tolerance = float(layer.get("world_y_tolerance", 0.75))
-        if gap <= tolerance:
-            candidates.append((gap, name))
+        band = _layer_world_y_band(layer, tolerance)
+        if band is None:
+            continue
+        band_min, band_max = band
+        if band_min - 1e-9 <= world_y <= band_max + 1e-9:
+            candidates.append((0.0, name))
     return min(candidates)[1] if candidates else None
 
 
@@ -1201,9 +1246,13 @@ class MovementWorker(threading.Thread):
         )
         if not isinstance(layer, dict) or "layer_y" not in layer:
             return None, 0.02
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        if band is None:
+            return float(layer["layer_y"]), tolerance
         return (
-            float(layer["layer_y"]),
-            float(layer.get("y_tolerance", 0.02)),
+            (band[0] + band[1]) / 2.0,
+            (band[1] - band[0]) / 2.0,
         )
 
     def _run_climb_step(
@@ -3231,18 +3280,22 @@ class MovementWorker(threading.Thread):
         layer = self.important_positions.get(self.first_layer)
         if not isinstance(layer, dict) or "layer_y" not in layer:
             return False
-        marker_arrived = observation.player.y >= float(
-            layer["layer_y"]
-        ) - float(layer.get("y_tolerance", 0.020000))
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        marker_arrived = bool(
+            band is not None and observation.player.y >= band[0] - 1e-9
+        )
         if marker_arrived:
             return True
         # Fall back to the world-Y signal when it is tracked and confident.
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):
-            return observation.world_y_diamonds >= float(
-                layer["layer_world_y"]
-            ) - float(layer.get("world_y_tolerance", 0.75))
+            world_tol = float(layer.get("world_y_tolerance", 0.75))
+            world_band = _layer_world_y_band(layer, world_tol)
+            if world_band is None:
+                return False
+            return observation.world_y_diamonds >= world_band[0] - 1e-9
         return False
 
     def _reset_route_loop(self) -> None:
@@ -3355,12 +3408,19 @@ class MovementWorker(threading.Thread):
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):
-            return abs(
-                observation.world_y_diamonds - float(layer["layer_world_y"])
-            ) <= float(layer.get("world_y_tolerance", 0.75))
-        layer_y = float(layer.get("layer_y", layer["left_most_pos"]["y"]))
+            world_tol = float(layer.get("world_y_tolerance", 0.75))
+            world_band = _layer_world_y_band(layer, world_tol)
+            return bool(
+                world_band is not None
+                and world_band[0] - 1e-9 <= observation.world_y_diamonds
+                <= world_band[1] + 1e-9
+            )
         tolerance = float(layer.get("y_tolerance", 0.020000))
-        return abs(observation.player.y - layer_y) <= tolerance
+        band = _layer_y_band(layer, tolerance)
+        return bool(
+            band is not None
+            and band[0] - 1e-9 <= observation.player.y <= band[1] + 1e-9
+        )
 
     def _release_climb_up(self) -> None:
         if self._climb_state.up_held:

@@ -1,0 +1,15 @@
+fix: floor detection uses the recorded-point Y band (span +- tolerance), in-band-only
+
+The band is now (uppermost recorded point Y - tolerance .. lowermost point Y +
+tolerance) over left/rope/right, instead of the mean layer_y +- tolerance.
+The mean band excluded the platform ends, so the marker at an edge flipped
+between floors every frame and the route never advanced to the next layer.
+
+- movement_worker: _layer_y_band/_layer_world_y_band helpers; detect_layer_by_y
+  / detect_layer_by_world_y only accept in-band Ys; _next_layer_arrival_band
+  and _on_first_layer use the band; _next_layer_reached is band-based.
+- patrol_control: mirrored helpers; layer_for_y / layer_for_world_y only
+  accept in-band Ys.
+- test_movement_worker: fixtures align recorded point Ys with layer_y so the
+  explicit-Y, first-layer arrival, and climb-arrival tests exercise the band
+  semantics with realistic calibration data.
