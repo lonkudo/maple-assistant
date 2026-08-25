@@ -505,6 +505,47 @@ class MovementTests(unittest.TestCase):
         self.assertFalse(is_rope)
         self.assertEqual(label, "layer5.left-most")
 
+    def test_resync_keeps_current_layer_when_bands_overlap(self) -> None:
+        # Adjacent floors whose recorded bands overlap (same minimap Y, e.g.
+        # y=0.348958 observed on layer2 AND layer3) must NOT flip the patrol
+        # layer: the false "LAYER CHANGED: layer3 -> layer2" re-targeted
+        # layer2's points mid-layer3 patrol and stuck the character patrolling
+        # layer3 forever (the range top never finished, so no drop either).
+        positions = {
+            "layer1": {"y_tolerance": .02, "layer_y": .9,
+                       "left_most_pos": {"x": .2, "y": .9},
+                       "right_most_pos": {"x": .8, "y": .9}},
+            "layer2": {"y_tolerance": .02, "layer_y": .35,
+                       "left_most_pos": {"x": .30, "y": .35},
+                       "right_most_pos": {"x": .72, "y": .35}},
+            "layer3": {"y_tolerance": .02, "layer_y": .35,
+                       "left_most_pos": {"x": .42, "y": .35},
+                       "right_most_pos": {"x": .82, "y": .35}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions, route_order=["layer1", "layer2", "layer3"],
+            patrol_start_layer="layer2", patrol_end_layer="layer3",
+        )
+        # Patrolling layer2, marker at the overlapping Y: stays layer2.
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        on_overlap = MinimapObservation(Point(.50, .349), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._resync_route_layer(on_overlap), "layer2")
+        self.assertEqual(worker._route_layer_index, 0)
+        # Patrolling layer3 at the same Y: stays layer3 (no false return to
+        # layer2, no world-Y re-anchor, no layer flip).
+        worker._route_layer_index = 1
+        worker._route_phase = "left"
+        self.assertEqual(worker._resync_route_layer(on_overlap), "layer3")
+        self.assertEqual(worker._route_layer_index, 1)
+        # Reading clearly outside the current layer's band (below the whole
+        # range, marker Y=0.9): the resync returns None - layer1 is OUTSIDE
+        # the [layer2, layer3] route, so in-range switching is skipped and
+        # the out-of-range return logic (fall/return-to-route) handles it.
+        below = MinimapObservation(Point(.5, .9), None, .9, (0, 0, 1, 1))
+        self.assertIsNone(worker._resync_route_layer(below))
+
     def test_falling_detection_redetects_floor_and_restarts_patrol(self) -> None:
         positions = self._floors(2)  # layer1 y=0.8, layer2 y=0.7
         worker = MovementWorker(

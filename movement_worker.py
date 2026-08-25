@@ -2702,6 +2702,17 @@ class MovementWorker(threading.Thread):
         LOG.info("route starting on %s: left-most -> right-most -> rope",
                  self._route_layers[self._route_layer_index])
 
+    def _layer_band_contains(self, layer_name: str, y: float) -> bool:
+        """True when the marker Y is inside the layer's recorded-point band."""
+        layer = self.important_positions.get(layer_name)
+        if not isinstance(layer, dict) or "layer_y" not in layer:
+            return False
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        if band is None:
+            return False
+        return bool(band[0] - 1e-9 <= y <= band[1] + 1e-9)
+
     def _resync_route_layer(self, observation: MinimapObservation) -> Optional[str]:
         """Switch patrol state when the marker is detected on another layer.
 
@@ -2769,6 +2780,49 @@ class MovementWorker(threading.Thread):
                 )
             else:
                 detected_name = self._detected_layer(observation)
+                # Overlapping-band flicker guard: adjacent floors' recorded
+                # Y bands can overlap (span +- tolerance), so a Y-only reading
+                # can hit BOTH the current floor and a neighbour (observed:
+                # "LAYER CHANGED: layer3 -> layer2 at y=0.348958" while the
+                # character visibly stands on layer3).  When the CURRENT
+                # layer's own band still contains the marker Y, keep patrolling
+                # it - the switch would re-target the other floor's points and
+                # the patrol never completes.  It applies ONLY to ambiguous
+                # marker-Y-only detection: a confident scroll-compensated
+                # world-Y read (structure confidence + calibrated world Y) is
+                # still authoritative and switches floors.  Unambiguous marker
+                # readings (clearly outside the current band) still switch.
+                route_layers = {
+                    name: self.important_positions[name]
+                    for name in self._route_layers
+                }
+                world_authoritative = bool(
+                    observation.world_y_diamonds is not None
+                    and observation.structure_confidence >= 0.12
+                    and any(
+                        isinstance(layer, dict) and "layer_world_y" in layer
+                        for layer in route_layers.values()
+                    )
+                )
+                current_name = (
+                    self._route_layers[self._route_layer_index]
+                    if (self._route_layer_index is not None
+                        and 0 <= self._route_layer_index < len(self._route_layers))
+                    else None
+                )
+                if (current_name is not None
+                        and detected_name is not None
+                        and detected_name != current_name
+                        and not world_authoritative
+                        and observation.player is not None
+                        and self._layer_band_contains(
+                            current_name, observation.player.y
+                        )):
+                    LOG.info(
+                        "LAYER flicker guard: keeping %s (Y %.6f still inside "
+                        "its band)", current_name, observation.player.y
+                    )
+                    detected_name = current_name
         if detected_name is None:
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
