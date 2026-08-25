@@ -1857,6 +1857,12 @@ class MovementWorker(threading.Thread):
         self._patrol_range_min, self._patrol_range_max = _patrol_range_numbers(
             self._route_layers, patrol_start_layer, patrol_end_layer
         )
+        # Whether the UI explicitly configured a patrol floor range (both
+        # bounds selected).  An explicit range always loops: its TOP floor
+        # drops back to its FIRST floor once the patrol there finishes.
+        self._patrol_range_configured = bool(
+            patrol_start_layer and patrol_end_layer
+        )
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
         self.patrol_enabled = patrol_enabled
@@ -3121,9 +3127,13 @@ class MovementWorker(threading.Thread):
         is_final = self._route_layer_index == len(self._route_layers) - 1
         if is_final:
             # The final layer has no rope to climb: loop its own actions, or
-            # drop to the first layer when that is the configured end action.
-            if (self.final_layer_action == "drop_to_first_layer"
-                    and len(self._route_layers) > 1):
+            # drop to the first layer when that is the configured end action
+            # (an explicitly configured patrol floor range always drops back
+            # to its first floor — e.g. range [layer2, layer3] drops from
+            # layer3 back to layer2 once layer3's patrol finishes).
+            if (len(self._route_layers) > 1
+                    and (self._patrol_range_configured
+                         or self.final_layer_action == "drop_to_first_layer")):
                 return None, False, f"{name}.drop-to-first"
             self._route_phase = phases[0]
             return self._route_target(observation)
@@ -3175,6 +3185,10 @@ class MovementWorker(threading.Thread):
             snapshot.patrol_start_layer or None,
             snapshot.patrol_end_layer or None,
         )
+        # Explicitly configured range (both bounds selected in the UI): its
+        # TOP floor drops back to its FIRST floor after the patrol finishes
+        # there, looping the range instead of repeating the top floor forever.
+        self._patrol_range_configured = bool(snapshot.patrol_range_set)
         self.first_layer = snapshot.patrol_start_layer or (
             new_route[0] if new_route else self.first_layer
         )
@@ -3246,10 +3260,13 @@ class MovementWorker(threading.Thread):
                          current, phases[index + 1])
                 return True
         # End of this layer's recorded actions.
-        if (is_final and self.final_layer_action == "drop_to_first_layer"
-                and len(self._route_layers) > 1):
+        if (is_final and len(self._route_layers) > 1
+                and (self._patrol_range_configured
+                     or self.final_layer_action == "drop_to_first_layer")):
             self._route_phase = "drop"
-            LOG.info("final layer patrol done; dropping to first layer")
+            LOG.info("final layer patrol done; dropping to first layer%s",
+                     " (range top; dropping back to range first)"
+                     if self._patrol_range_configured else "")
             return True
         if phases:
             # Repeat the layer's own actions: stand at a lone point, patrol a

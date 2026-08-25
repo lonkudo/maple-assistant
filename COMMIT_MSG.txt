@@ -1,13 +1,20 @@
-fix: debug UI never steals foreground and remembers its window position/size
+fix: configured patrol range always drops from its top back to its first floor
 
-- run(): remove root.attributes('-topmost') - the startup raise pulled the
-  debug UI in front of the game mid-climb, so the game lost focus, held keys
-  (up/right/z) were released and the character jumped off the rope.  The UI
-  also no longer opens pinned at +0+0: it restores the last saved geometry.
-- add pure geometry helpers (_parse_window_geometry / _clamp_window_geometry
-  / _load_window_geometry / _save_window_geometry) persisted to
-  ui_window_settings.json (periodic save + save on close), so the window is
-  movable/adjustable and is clamped back on-screen when a saved position
-  went off-screen (e.g. after a monitor change).
-- test_ui_worker: WindowGeometryHelperTests covering parse, on-screen
-  clamp, minimum size, settings roundtrip and corrupt/missing fallback.
+The movement worker only entered the drop-to-first phase at the MAP-TOP final
+layer and only when the profile's final_layer_action was drop-to-first.  With an
+explicit patrol range [layer2, layer3] the range TOP (layer3) still carries a
+mid-map rope, so the endpoint advance moved into the rope phase and the layer3
+patrol repeated forever instead of dropping back to layer2 (the range first) -
+exactly the "character patrols layer3 all the time" symptom.
+
+- patrol_control: PatrolSnapshot now carries patrol_range_set (raw profile
+  bounds both present), so the worker can tell an explicitly configured range
+  from the full-map fallback.
+- movement_worker: new _patrol_range_configured flag (constructor + patrol
+  controller sync); _route_target and _advance_route_endpoint treat the RANGE
+  TOP as the final layer for the drop - an explicitly configured range always
+  drops to its first floor (range [2,3] -> layer3 patrol done -> drop to
+  layer2 -> restart), while an unconfigured map keeps the legacy final-layer
+  action behaviour.
+- test_movement_worker: range-top-drop (configured) and legacy-repeat
+  (unconfigured) regression tests.

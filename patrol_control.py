@@ -100,6 +100,7 @@ class PatrolSnapshot:
     final_layer_action: str
     patrol_start_layer: str = ""
     patrol_end_layer: str = ""
+    patrol_range_set: bool = False
 
 
 @dataclass(frozen=True)
@@ -199,6 +200,10 @@ class PatrolController:
                 ),
                 patrol_start_layer=self.patrol_range_locked()[0],
                 patrol_end_layer=self.patrol_range_locked()[1],
+                patrol_range_set=bool(
+                    self._profile.get("patrol_start_layer")
+                    and self._profile.get("patrol_end_layer")
+                ),
             )
 
     def is_enabled(self) -> bool:

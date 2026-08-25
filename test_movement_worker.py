@@ -471,6 +471,40 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._patrol_range_min, 3)
         self.assertEqual(worker._patrol_range_max, 3)
 
+    def test_range_top_drops_to_range_first_layer_when_configured(self) -> None:
+        # Range [layer2, layer3] (the user's case): finishing the layer3
+        # patrol must enter the drop phase and return to layer2 after the
+        # drop, NOT repeat layer3 forever.
+        worker = self._range_worker(4, "layer2", "layer3")
+        self.assertTrue(worker._patrol_range_configured)
+        self.assertEqual(worker._route_layers, ["layer2", "layer3"])
+        worker._route_layer_index = 1
+        worker._route_phase = "right"
+        crossed = MinimapObservation(Point(.75, .6), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(crossed, .7))
+        target, is_rope, label = worker._route_target(crossed)
+        self.assertIsNone(target)
+        self.assertFalse(is_rope)
+        self.assertEqual(label, "layer3.drop-to-first")
+
+    def test_range_top_repeats_when_range_not_configured(self) -> None:
+        # No range configured: the map-top final layer keeps the legacy
+        # end action (profile default repeats the layer's own patrol) -
+        # the drop must NOT auto-trigger, so old whole-map behavior is
+        # preserved.
+        worker = self._range_worker(5, None, None)
+        self.assertFalse(worker._patrol_range_configured)
+        self.assertEqual(worker._route_layers,
+                         ["layer1", "layer2", "layer3", "layer4", "layer5"])
+        worker._route_layer_index = 4
+        worker._route_phase = "right"
+        crossed = MinimapObservation(Point(.75, .5), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(crossed, .7))
+        self.assertNotEqual(worker._route_phase, "drop")
+        target, is_rope, label = worker._route_target(crossed)
+        self.assertFalse(is_rope)
+        self.assertEqual(label, "layer5.left-most")
+
     def test_falling_detection_redetects_floor_and_restarts_patrol(self) -> None:
         positions = self._floors(2)  # layer1 y=0.8, layer2 y=0.7
         worker = MovementWorker(
