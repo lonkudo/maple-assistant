@@ -2722,6 +2722,42 @@ class MovementWorker(threading.Thread):
             return False
         return bool(band[0] - 1e-9 <= y <= band[1] + 1e-9)
 
+    def _nearest_world_layer_all(self, world_y: float) -> Optional[str]:
+        """Nearest world-anchored floor over EVERY recorded layer (patrol
+        range or not).
+
+        The world-Y tracker re-anchors per floor, so after any move (climb,
+        fall/DROP even to a floor outside the patrol range, e.g. layer1) the
+        reading points at the NEW floor's anchor even when the minimap marker
+        Y aliases inside the current band.  Runs every frame: this is what
+        \"detect the layer each frame\" means for tracking the actual floor.
+        """
+        best_name: Optional[str] = None
+        best_gap: Optional[float] = None
+        for name, layer in self.important_positions.items():
+            if not isinstance(layer, dict) or "layer_world_y" not in layer:
+                continue
+            gap = abs(world_y - float(layer["layer_world_y"]))
+            if best_gap is None or gap < best_gap:
+                best_name, best_gap = name, gap
+        return best_name
+        """Nearest world-anchored layer over EVERY recorded floor.
+
+        The world tracker re-anchors per floor, so after a fall (even to a
+        floor OUTSIDE the patrol range, e.g. layer1) the reading points at
+        the new floor's own anchor even when the marker Y aliases inside the
+        current band.  Used per frame; never gated by the band guard.
+        """
+        best_name: Optional[str] = None
+        best_gap: Optional[float] = None
+        for name, layer in self.important_positions.items():
+            if not isinstance(layer, dict) or "layer_world_y" not in layer:
+                continue
+            gap = abs(world_y - float(layer["layer_world_y"]))
+            if best_gap is None or gap < best_gap:
+                best_name, best_gap = name, gap
+        return best_name
+
     def _resync_route_layer(self, observation: MinimapObservation) -> Optional[str]:
         """Switch patrol state when the marker is detected on another layer.
 
@@ -2823,6 +2859,18 @@ class MovementWorker(threading.Thread):
                 )
             else:
                 detected_name = self._detected_layer(observation)
+                # World-nearest override: every frame, over EVERY recorded
+                # floor.  After a fall the tracker re-anchors to the new floor
+                # (even layer1, outside the patrol range), so the world read
+                # points there even when the marker Y aliases inside the
+                # current band.  The flicker guard below then only protects
+                # the current floor while the world anchor still matches it.
+                world_name = (
+                    self._nearest_world_layer_all(observation.world_y_diamonds)
+                    if observation.world_y_diamonds is not None else None
+                )
+                if world_name is not None and world_name != detected_name:
+                    detected_name = world_name
                 # Overlapping-band flicker guard: adjacent floors' recorded
                 # Y bands can overlap (span +- tolerance), so a Y-only reading
                 # can hit BOTH the current floor and a neighbour (observed:
@@ -2860,7 +2908,8 @@ class MovementWorker(threading.Thread):
                         and observation.player is not None
                         and self._layer_band_contains(
                             current_name, observation.player.y
-                        )):
+                        )
+                        and (world_name is None or world_name == current_name)):
                     LOG.info(
                         "LAYER flicker guard: keeping %s (Y %.6f still inside "
                         "its band)", current_name, observation.player.y
