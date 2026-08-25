@@ -28,9 +28,11 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
     $name = $_.Name
     ($_.Extension -in ".py", ".json", ".md", ".ps1", ".vbs", ".bat", ".txt") -and
     $name -notlike "test_*" -and $name -ne "auto_system.log" -and
-    # 以下为开发工具（含本机绝对路径），不随发布包分发。
+    # 以下为开发工具/本机私有文件（含本机绝对路径或不适合分发的个人设置），
+    # 不随发布包分发。
     $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs",
-                   "build_release.ps1")
+                   "build_release.ps1", "ui_window_settings.json",
+                   "COMMIT_MSG.txt")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 
