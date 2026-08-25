@@ -122,6 +122,7 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     to ``layer_y`` when the layer has no recorded points (still the mean
     band then).
     """
+    tolerance = tolerance * Y_TOLERANCE_DETECTION_SCALE
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
@@ -971,6 +972,13 @@ DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
 # 卡住判定阈值：标记 X 变化 < 0.012（最小地图单位）即视为"没在动"。
 # 按帧判定（连续 3 帧 ≈ 0.75s）触发跳跃。
 STAIR_JUMP_STALL_FALLBACK = 0.012
+
+# 判带时 y_tolerance 的缩减系数：录制的容差先乘此系数再参与图层 Y 带
+# 计算，稍微收窄顶部余量、减小相邻层的重叠（"把 y_tolerance 调小一点"）。
+# Detection-time taper for y_tolerance: the recorded tolerance is scaled by
+# this before band math, tightening the top slack a little so adjacent
+# floors' bands overlap less.
+Y_TOLERANCE_DETECTION_SCALE = 0.75
 
 
 def _image_from_frame(frame: Any) -> Image.Image:
@@ -2774,7 +2782,32 @@ class MovementWorker(threading.Thread):
                     detect_layer_by_y(observation.player.y, layers)
                     if observation.player is not None else None
                 )
-                world_name = self._detected_layer(observation)
+                # Scroll-aliased minimap: two floors can share the SAME marker
+                # Y (here layer2/layer3 both read y=0.348958), so the Y-only
+                # read aliases to the lower floor and the climb arrival never
+                # confirms.  The world-Y tracker re-anchors per floor with
+                # DISTINCT anchors (layer2 0.103357, layer3 0.048505), so the
+                # NEAREST anchor resolves the floor even when the world bands
+                # overlap (tolerance 0.75 > floor gap).  No structure gate:
+                # any tracked world reading participates in the climb arrival.
+                def _nearest_world_layer(world_y: float) -> Optional[str]:
+                    best_name: Optional[str] = None
+                    best_gap: Optional[float] = None
+                    for name in self._route_layers:
+                        layer = self.important_positions[name]
+                        if not isinstance(layer, dict):
+                            continue
+                        if "layer_world_y" not in layer:
+                            continue
+                        gap = abs(world_y - float(layer["layer_world_y"]))
+                        if best_gap is None or gap < best_gap:
+                            best_name, best_gap = name, gap
+                    return best_name
+
+                world_name = (
+                    _nearest_world_layer(observation.world_y_diamonds)
+                    if observation.world_y_diamonds is not None else None
+                )
 
                 def _index(name: Optional[str]) -> int:
                     if name is None or name not in self._route_layers:

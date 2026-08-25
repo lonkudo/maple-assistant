@@ -1,17 +1,18 @@
-fix: layer bands lose the +tolerance bottom slack (band = topmost - tol .. lowermost)
+fix: taper y_tolerance at detection time (x0.75) and resolve climb arrival by nearest world anchor
 
-Adjacent floors' recorded Y bands overlapped at the BOTTOM edge: each band
-extended tolerance BELOW its lowermost point, reaching into the layer below
-(e.g. layer2 band .33..0.37 and layer3 band .33..0.37 both swallowed y=0.349).
-The band is now (topmost point Y - tolerance, lowermost point Y): tolerance
-is applied only ABOVE the topmost point (where climbs/drops arrive) and no
-longer below the lowermost point, so a band does not reach into the layer
-BELOW and the overlap windows shrink.
-
-- movement_worker._layer_y_band / _layer_world_y_band: return
-  (min - tolerance, max) instead of (min - tolerance, max + tolerance).
-- patrol_control._layer_y_band / _layer_world_y_band: same rule.
-- fixtures: fall/return/stale-world settle points moved from lowermost +
-  tolerance to the lowermost value itself (0.82->0.80, 0.52->0.50, world
-  -0.35->-0.40 / 0.1->0.0) - a real landing settles ON the platform, i.e.
-  at the recorded lowermost Y, not below it.
+- Adjacent floors' recorded Y bands still overlap because each layer's
+  recorded tolerance pushes the band upwards.  At DETECTION time the
+  recorded y_tolerance is now tapered x0.75 (Y_TOLERANCE_DETECTION_SCALE)
+  before band math in movement_worker._layer_y_band and
+  patrol_control._layer_y_band, tightening the top slack a little so
+  neighbouring floors' bands overlap less (把 y_tolerance 调小一点).
+  The flicker guard uses the same tapered band.
+- The 14:02 log: after reaching layer3 the climb re-attached and the
+  marker Y aliased to the layer2/layer3 shared minimap Y, so the arrival
+  confirmation stalled at "layer3 1/3" and the worker kept re-jumping to
+  the rope.  During climbs the arrival now also resolves the floor by the
+  NEAREST world anchor (layer2 0.103357 vs layer3 0.048505 - distinct
+  even when the world tolerance bands overlap) without requiring a
+  structure-confidence gate, so the layer3 arrival confirms and the climb
+  completes instead of looping.
+- test comment updated to the new band edge (0.5018 .. 0.5168).

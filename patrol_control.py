@@ -10,6 +10,15 @@ from pathlib import Path
 import re
 import threading
 from typing import Any, Literal, Optional
+
+
+# 判带时 y_tolerance 的缩减系数：录制的容差先乘此系数再参与图层 Y 带计算，
+# 稍微收窄顶部余量、减小相邻层的重叠（"把 y_tolerance 调小一点"）。
+# Detection-time taper for y_tolerance (same rule as movement_worker): the
+# recorded tolerance is scaled by this before band math.
+Y_TOLERANCE_DETECTION_SCALE = 0.75
+
+
 def _layer_point_ys(layer: Any) -> list[float]:
     values = []
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
@@ -20,6 +29,7 @@ def _layer_point_ys(layer: Any) -> list[float]:
 
 
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    tolerance = tolerance * Y_TOLERANCE_DETECTION_SCALE
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
