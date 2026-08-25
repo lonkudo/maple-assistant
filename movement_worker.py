@@ -104,6 +104,19 @@ def _layer_point_ys(layer: Any) -> list[float]:
         point = layer.get(point_name)
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
+    # Multi-stair floors (e.g. layer1: left top as tall as the mid rope,
+    # middle stair between, right stair lowest): each stair top is a valid
+    # standing height, so any recorded stair-top Y must extend the band.
+    # Mid-stair readings would otherwise fall outside the single recorded
+    # point and layer detection would deny the floor (observed: character
+    # frozen on layer1 stair, layer not recognized).
+    stair_ys = layer.get("stair_ys")
+    if isinstance(stair_ys, (list, tuple)):
+        for stair_y in stair_ys:
+            try:
+                values.append(float(stair_y))
+            except (TypeError, ValueError):
+                continue
     return values
 
 

@@ -18,6 +18,17 @@ def _layer_point_ys(layer: Any) -> list[float]:
         point = layer.get(point_name)
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
+    # Multi-stair floors (layer1 has left/middle/right stairs - left top as
+    # high as the middle rope, right stair lowest): every recorded stair-top
+    # Y belongs in the layer's band, so a mid-stair reading is still
+    # recognised as this floor instead of falling between bands.
+    stair_ys = layer.get("stair_ys")
+    if isinstance(stair_ys, (list, tuple)):
+        for stair_y in stair_ys:
+            try:
+                values.append(float(stair_y))
+            except (TypeError, ValueError):
+                continue
     return values
 
 
