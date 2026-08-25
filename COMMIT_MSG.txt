@@ -1,18 +1,23 @@
-fix: per-frame layer tracking (also during drop/return and the climb Up-hold);
-recover Y_TOLERANCE (drop the x0.75 detection-time taper)
+fix: out-of-route floors no longer crash the resync (layer1 vs patrol range [layer2..]); per-frame detection stays authoritative
 
-- run loop: _resync_route_layer now runs EVERY frame - the suppression gate
-  during the drop/return is removed, so the floor is re-read and tracked
-  every frame even mid-drop.  The flicker guard still keeps the current
-  patrol floor while the marker Y stays inside its own band, so an
-  intermediate platform (e.g. the bench mid-approach) cannot hijack the
-  drop/return and restart a middle floor's patrol.
-- climb arrival Up-hold: the fixed hold now ALSO re-reads the floor every
-  frame (tracked + logged) so the bench -> rope -> next-layer transition is
-  followed frame by frame, without switching the hold itself mid-flight
-  (that made the character fall off the rope).
-- Y_TOLERANCE recovered: the recorded tolerance is used as-is in the band
-  math again - the x0.75 detection-time taper constant and its scale line
-  are removed from movement_worker and patrol_control (bands stay
-  (topmost - tolerance, lowermost) per the earlier rule).
-- test comment updated back to the recovered band edge (0.4968 .. 0.5168).
+Observed crash (every frame):
+  File "...\movement_worker.py", line 2923, in _resync_route_layer
+    detected_index = self._route_layers.index(detected_name)
+  ValueError: 'layer1' is not in list
+
+The per-frame world override correctly reads layer1 (the character
+starts/fell on layer1 while the patrol range begins at layer2), but the
+resync then indexed that name into the patrol-route list - layer1 is NOT
+in it, so every frame crashed before any key was sent ("movement
+analysis failed; no key sent" spam at 16:03).
+
+- _resync_route_layer: a detected floor OUTSIDE the patrol route now
+  returns None instead of indexing it.  Start-on-layer1 / fall-to-layer1
+  therefore leaves the patrol state untouched, and the existing
+  out-of-range return logic (climb back using layer1's own rope) re-enters
+  layer2 before patrol starts - the expected flow (start on layer1 ->
+  return to layer2 -> patrol).
+- Per-frame world-nearest detection is unchanged and still runs every
+  frame; only the route indexing is guarded.
+- test: resync on layer1 (patrol not started, and during a layer2 patrol)
+  -> None, no crash, active layer index untouched.

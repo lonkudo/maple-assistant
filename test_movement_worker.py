@@ -546,6 +546,52 @@ class MovementTests(unittest.TestCase):
         below = MinimapObservation(Point(.5, .9), None, .9, (0, 0, 1, 1))
         self.assertIsNone(worker._resync_route_layer(below))
 
+    def test_resync_out_of_route_layer_returns_none_without_crash(self) -> None:
+        # The character starts/fell on layer1 while the patrol range is
+        # [layer2, layer3]: the per-frame world override correctly reads
+        # layer1, but layer1 is NOT in the route - indexing it crashed the
+        # worker every frame (ValueError: 'layer1' is not in list).  The
+        # resync must return None - the out-of-range return logic then
+        # climbs back to layer2 using layer1's own rope and the layer2
+        # patrol starts after that (user's expected start: return to
+        # layer2 first, then patrol).
+        positions = {
+            "layer1": {"y_tolerance": .02, "layer_y": .9,
+                       "layer_world_y": 2.0,
+                       "left_most_pos": {"x": .2, "y": .9},
+                       "right_most_pos": {"x": .8, "y": .9}},
+            "layer2": {"y_tolerance": .02, "layer_y": .349,
+                       "layer_world_y": 0.103357,
+                       "left_most_pos": {"x": .30, "y": .349},
+                       "right_most_pos": {"x": .72, "y": .349}},
+            "layer3": {"y_tolerance": .02, "layer_y": .349,
+                       "layer_world_y": 0.048505,
+                       "left_most_pos": {"x": .42, "y": .349},
+                       "right_most_pos": {"x": .82, "y": .349}},
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions, route_order=["layer1", "layer2", "layer3"],
+            patrol_start_layer="layer2", patrol_end_layer="layer3",
+        )
+        # Not yet on the route: standing on layer1 (world anchor 2.0).
+        on_layer1 = MinimapObservation(
+            Point(.76, .349), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=2.0,
+        )
+        self.assertIsNone(worker._resync_route_layer(on_layer1))
+        self.assertIsNone(worker._route_layer_index)
+        # Patrolling layer2, world moved to layer1 (fell): same None result,
+        # the layer2 patrol state stays untouched (return logic picks it up).
+        worker._route_layer_index = 1
+        worker._route_phase = "rope"
+        fell_to_layer1 = MinimapObservation(
+            Point(.60, .349), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=2.0,
+        )
+        self.assertIsNone(worker._resync_route_layer(fell_to_layer1))
+        self.assertEqual(worker._route_layer_index, 1)
+
     def test_falling_detection_redetects_floor_and_restarts_patrol(self) -> None:
         positions = self._floors(2)  # layer1 y=0.8, layer2 y=0.7
         worker = MovementWorker(

@@ -2920,6 +2920,19 @@ class MovementWorker(threading.Thread):
                 self._climb_state.target_layer_frames = 0
                 self._climb_state.target_layer_since = None
             return None
+        if detected_name not in self._route_layers:
+            # Out-of-route floor (e.g. layer1 while the patrol range starts at
+            # layer2): the world override can point at a floor OUTSIDE the
+            # route after a fall/drop, and indexing it would crash
+            # (ValueError: 'layer1' is not in list).  Never index an
+            # out-of-route floor - the out-of-range return logic (fall
+            # recovery / return-to-route) picks it up instead and climbs back
+            # to the route start (user case: character starts on layer1 and
+            # must return to layer2 before patrolling).
+            if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
+                self._climb_state.target_layer_frames = 0
+                self._climb_state.target_layer_since = None
+            return None
         detected_index = self._route_layers.index(detected_name)
         if self._route_layer_index is None:
             self._route_layer_index = detected_index
