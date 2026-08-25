@@ -39,6 +39,12 @@
 
    Checks the expected fixes are inside and no test/dev artifacts leaked.
 
+> **One-command alternative:** double-click `发布.bat` (or run
+> `release_now.ps1` from the repo root). It runs the release-gate tests,
+> rebuilds `release\MapleAssistant\` and the timestamped zip, then verifies
+> the zip — the whole flow above in one step. Use `-SkipTests` for a quick
+> repackage without re-running the gate.
+
 4. **Ship**: hand the zip to others. The receiver unzips and double-clicks
    `安装.bat`, which bootstraps Python + all dependencies (including YOLO),
    then starts with `启动助手.bat`. See [INSTALL.md](INSTALL.md).

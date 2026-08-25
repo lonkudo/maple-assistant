@@ -32,7 +32,7 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
     # 不随发布包分发。
     $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs",
                    "build_release.ps1", "ui_window_settings.json",
-                   "COMMIT_MSG.txt")
+                   "COMMIT_MSG.txt", "release_now.ps1", "发布.bat")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 
