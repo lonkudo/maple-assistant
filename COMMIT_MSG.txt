@@ -1,23 +1,37 @@
-fix: out-of-route floors no longer crash the resync (layer1 vs patrol range [layer2..]); per-frame detection stays authoritative
+fix: character position becomes a per-frame dispatch worker + stale-climb brake + return.climb stall recovery
 
-Observed crash (every frame):
-  File "...\movement_worker.py", line 2923, in _resync_route_layer
-    detected_index = self._route_layers.index(detected_name)
-  ValueError: 'layer1' is not in list
+The 16:27 log shows the freeze mechanism clearly: the character is on
+layer1 doing "MOVE TO ROPE | pos=(0.335106, 0.567708) ... action=right"
+every frame but NEVER moves - no keys are sent and no suppression warning
+fires, while the attack worker reports "jump-climb input is active" every
+frame.  The climb state machine got stuck with Up-hold active from an
+earlier failed grab attempt; that stale climb input silently swallowed
+every left/right floor walk (the direction key is gated while climb input
+is active), freezing the character on layer1 forever.  The dispatcher
+architecture also means the marker is now detected on EVERY frame
+independently of the movement loop, so a freeze can never hide the real
+position.
 
-The per-frame world override correctly reads layer1 (the character
-starts/fell on layer1 while the patrol range begins at layer2), but the
-resync then indexed that name into the patrol-route list - layer1 is NOT
-in it, so every frame crashed before any key was sent ("movement
-analysis failed; no key sent" spam at 16:03).
-
-- _resync_route_layer: a detected floor OUTSIDE the patrol route now
-  returns None instead of indexing it.  Start-on-layer1 / fall-to-layer1
-  therefore leaves the patrol state untouched, and the existing
-  out-of-range return logic (climb back using layer1's own rope) re-enters
-  layer2 before patrol starts - the expected flow (start on layer1 ->
-  return to layer2 -> patrol).
-- Per-frame world-nearest detection is unchanged and still runs every
-  frame; only the route indexing is guarded.
-- test: resync on layer1 (patrol not started, and during a layer2 patrol)
-  -> None, no crash, active layer index untouched.
+- NEW character_worker.py: CharacterWorker(thread) detects the yellow
+  player diamond on every dispatched frame (never gated by focus /
+  movement state) and publishes CharacterPosition(x, y, confidence) to a
+  positions queue.  minimap region comes from a provider (the movement
+  worker's latest stabilised region) so both workers crop the same box.
+- movement_worker: new optional character_positions queue - when wired,
+  the dispatched position overrides the worker's own per-frame marker read
+  (per-frame layer detection continues via the same observation chain).
+- movement_worker floor-walk branch: stale-climb brake - if the decision
+  is a plain left/right floor walk while the climb state still reports
+  Up held (stuck from a failed grab + focus dip that released the OS key
+  but not the state machine) and the marker Y still sits inside the
+  current route layer's band (on the floor, not on the rope arc), release
+  Up and reset the climb state before walking.
+- movement_worker rope-walk branch: the existing rope-approach stall
+  recovery now ALSO covers the return climb (route label "return.climb",
+  which is not ".rope") - a bench/fence mid-return otherwise freezes the
+  return-to-route walk forever.
+- assistant.py: character_frames added to the frame-bus subscribers;
+  CharacterWorker created (wired to movement_worker._last_minimap_region)
+  and added to core_workers; character_positions passed into
+  MovementWorker.
+- tests: 158 OK (movement + patrol + assistant suites), compile clean.

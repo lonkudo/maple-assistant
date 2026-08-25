@@ -158,6 +158,7 @@ def main() -> int:
 
     # Imports are delayed so `--help` works even before dependencies are installed.
     from capture_worker import CaptureWorker, FrameBus
+    from character_worker import CharacterWorker
     from movement_worker import MovementWorker
     from status_worker import (
         BarStatusDetector,
@@ -186,7 +187,9 @@ def main() -> int:
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
-    subscribers = [movement_frames, status_frames]
+    character_frames: queue.Queue = queue.Queue(maxsize=1)
+    character_positions: queue.Queue = queue.Queue(maxsize=1)
+    subscribers = [movement_frames, status_frames, character_frames]
     if not args.no_ui:
         subscribers.append(ui_frames)
     bus = FrameBus(subscribers)
@@ -364,6 +367,7 @@ def main() -> int:
             movement_frames,
             key_sender,
             stop_event,
+            character_positions=character_positions,
             minimap_region=minimap_region,
             fixed_target_x=float(rope_profile["x"]),
             horizontal_tolerance=float(calibration["horizontal_tolerance"]),
@@ -510,8 +514,17 @@ def main() -> int:
                 calibration.get("rescue_stuck_frames", 20)
             ),
     )
+    character_worker = CharacterWorker(
+        character_frames,
+        character_positions,
+        stop_event,
+        minimap_region_provider=lambda: getattr(
+            movement_worker, "_last_minimap_region", None
+        ),
+    )
     core_workers = [
         capture_worker,
+        character_worker,
         movement_worker,
         status_worker,
         *attack_workers,

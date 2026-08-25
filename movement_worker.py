@@ -2722,6 +2722,24 @@ class MovementWorker(threading.Thread):
             return False
         return bool(band[0] - 1e-9 <= y <= band[1] + 1e-9)
 
+    def _on_route_floor(self, y: float) -> bool:
+        """True when the marker Y sits inside the CURRENT route layer's band."""
+        if (self._route_layer_index is None
+                or not 0 <= self._route_layer_index < len(self._route_layers)):
+            return False
+        return self._layer_band_contains(
+            self._route_layers[self._route_layer_index], y
+        )
+
+    def _on_route_floor(self, y: float) -> bool:
+        """True when the marker Y sits inside the CURRENT route layer's band."""
+        if (self._route_layer_index is None
+                or not 0 <= self._route_layer_index < len(self._route_layers)):
+            return False
+        return self._layer_band_contains(
+            self._route_layers[self._route_layer_index], y
+        )
+
     def _nearest_world_layer_all(self, world_y: float) -> Optional[str]:
         """Nearest world-anchored floor over EVERY recorded layer (patrol
         range or not).
@@ -3760,6 +3778,40 @@ class MovementWorker(threading.Thread):
                              if tracking.world_y_diamonds is not None else "unknown"),
                         )
                         self._last_structure_mode = tracking.mode
+                # Dispatched character position (per-frame, focus-independent
+                # source): when the character worker is wired, its reading is
+                # the authoritative marker - it overrides whatever this
+                # worker detected on the same frame, so the position is
+                # tracked every frame even while movement is paused /
+                # suppressed (freeze fix: stale climb input / focus dips no
+                # longer hide the real marker position).
+                if self.character_positions is not None:
+                    try:
+                        dispatched = self.character_positions.get_nowait()
+                    except queue.Empty:
+                        dispatched = None
+                    if (dispatched is not None
+                            and dispatched.x is not None
+                            and dispatched.confidence >= 0.5):
+                        observation = replace(
+                            observation,
+                            player=Point(
+                                float(dispatched.x), float(dispatched.y)
+                            ),
+                            marker_confidence=dispatched.confidence,
+                            marker_pixel_size=(
+                                dispatched.marker_pixel_size
+                                if dispatched.marker_pixel_size is not None
+                                else observation.marker_pixel_size
+                            ),
+                        )
+                        if self._dispatched_position_logged is None:
+                            LOG.info(
+                                "using dispatched character position "
+                                "(x=%.6f y=%.6f confidence=%.2f)",
+                                dispatched.x, dispatched.y, dispatched.confidence,
+                            )
+                            self._dispatched_position_logged = time.monotonic()
                 coordinate_layout = None
                 if (minimap_detection is not None
                         and observation.marker_pixel_size is not None
@@ -4277,10 +4329,43 @@ class MovementWorker(threading.Thread):
                         # direction and tap Alt (jump) mid-hold to clear it.
                         self._send_stair_jump(decision)
                     elif decision.key in ("left", "right"):
+                        # 陈旧爬绳输入刹车：决策是普通左右走，但爬绳状态仍认为
+                        # Up 被按住（中途失败的抓绳尝试后焦点抖动松开了按键，状态机
+                        # 却没收到松开通知），且标记 Y 仍落在当前巡逻楼层带内（确认
+                        # 在地面而非绳弧上）时，先释放 Up 并重置爬绳状态，再继续行走。
+                        if (observation.player is not None
+                                and self._climb_state.up_held
+                                and self._on_route_floor(observation.player.y)):
+                            LOG.warning(
+                                "stale climb input on floor walk: releasing "
+                                "Up and resetting climb state"
+                            )
+                            self._release_climb_up()
+                            self._climb_state = ClimbState()
+                        # return.climb 也做绳上停滞恢复（与 .rope 同规则）：返回
+                        # 爬绳向绳子的普通行走被平台边缘/挡板卡住时，停止按方向键，
+                        # 改为朝绳跳/爬，避免无限循环。
                         # 绳上停滞恢复：角色实际已在绳上，或正被平台边缘挡在
                         # 绳旁边（X 不前进且与绳对齐）时，停止按方向键+Z，
                         # 改为爬绳 / 朝绳起跳，避免无限循环。
+                        # 陈旧爬绳输入刹车：决策是普通左右走，但爬绳状态仍认为 Up 被按住
+                        # （中途失败的抓绳尝试后焦点抖动松开了按键，状态机却没
+                        # 收到松开通知——实测 layer1 上 pos=0.335106 冻结且
+                        # 无任何按键发送）。标记 Y 仍落在当前巡逻楼层带内
+                        # （确认站在地面而非绳弧上）时，先释放 Up 并重置爬绳
+                        # 状态再继续行走；否则方向键会被爬绳输入门静默吞掉，
+                        # 角色原地不动。
+                        if (observation.player is not None
+                                and self._climb_state.up_held
+                                and self._on_route_floor(observation.player.y)):
+                            LOG.warning(
+                                "stale climb input on floor walk: releasing "
+                                "Up and resetting climb state"
+                            )
+                            self._release_climb_up()
+                            self._climb_state = ClimbState()
                         if (route_label.endswith(".rope")
+                                or route_label == "return.climb"
                                 and observation.player is not None
                                 and self._rope_approach_stalled(
                                     observation.player.x,
