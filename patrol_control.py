@@ -25,7 +25,11 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    return min(values) - tolerance, max(values) + tolerance
+    # band = (topmost point Y - tolerance, lowermost point Y): the tolerance
+    # is applied only ABOVE the topmost point (where climbs/drops arrive),
+    # not below the lowermost point, so the band does not reach into the
+    # layer BELOW - adjacent floors' bands overlap less.
+    return min(values) - tolerance, max(values)
 
 
 def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
@@ -38,7 +42,9 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
         values = [float(layer["layer_world_y"])]
     if not values:
         return None
-    return min(values) - tolerance, max(values) + tolerance
+    # Same rule as _layer_y_band: tolerance only above the topmost point,
+    # never below the lowermost point (no reach into the layer below).
+    return min(values) - tolerance, max(values)
 
 
 

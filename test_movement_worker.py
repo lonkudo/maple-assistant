@@ -408,7 +408,7 @@ class MovementTests(unittest.TestCase):
         worker.patrol_enabled = True
         worker._rescue_last_check = 100.0
         worker._rescue_last_pos = Point(.8, .5168)
-        # y=0.6302 is outside the layer1 band (0.4968 .. 0.5368).
+        # y=0.6302 is outside the layer1 band (0.4968 .. 0.5168).
         off_route = MinimapObservation(Point(.8032, .6302), None, .9, (0, 0, 1, 1))
         with mock.patch.object(worker, "_trigger_rescue") as rescue:
             for _ in range(19):
@@ -570,7 +570,7 @@ class MovementTests(unittest.TestCase):
         worker.patrol_enabled = True
         worker._route_layer_index = 2
         # Fall ends on layer1 (y=0.8), below patrol range [2..3].
-        for y in (0.50, 0.58, 0.66, 0.74, 0.82, 0.82):
+        for y in (0.50, 0.58, 0.66, 0.74, 0.80, 0.80):
             obs = MinimapObservation(Point(0.4, y), None, .9, (0, 0, 1, 1))
             worker._track_fall(obs)
         self.assertEqual(worker._return_mode, "climb-to-route")
@@ -581,7 +581,7 @@ class MovementTests(unittest.TestCase):
         worker._route_layer_index = 1
         # Fall from an unrecorded higher area ends on layer4 (y=0.5 band),
         # above patrol range [2..3] - the return drops back down.
-        for y in (0.40, 0.44, 0.48, 0.52, 0.52, 0.52):
+        for y in (0.40, 0.44, 0.48, 0.50, 0.50, 0.50):
             obs = MinimapObservation(Point(0.4, y), None, .9, (0, 0, 1, 1))
             worker._track_fall(obs)
         self.assertEqual(worker._return_mode, "drop-to-route")
@@ -1804,7 +1804,7 @@ class MovementTests(unittest.TestCase):
         worker._route_layer_index = 1
         returned = MinimapObservation(
             Point(.5, .5), None, .9, (0, 0, 1, 1),
-            world_y_diamonds=-.35, structure_confidence=.9,
+            world_y_diamonds=-.4, structure_confidence=.9,
         )
 
         self.assertEqual(worker._resync_route_layer(returned), "layer1")
@@ -2782,7 +2782,7 @@ class MovementTests(unittest.TestCase):
 
         fallen = MinimapObservation(
             Point(.5, .5), None, .9, (0, 0, 1, 1),
-            world_y_diamonds=.1, structure_confidence=.9,
+            world_y_diamonds=0.0, structure_confidence=.9,
         )
         self.assertEqual(worker._resync_route_layer(fallen), "layer1")
         self.assertEqual(worker._route_layer_index, 0)

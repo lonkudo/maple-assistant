@@ -110,24 +110,31 @@ def _layer_point_ys(layer: Any) -> list[float]:
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     """Layer band from its recorded point Ys.
 
-    band = (uppermost point Y - tolerance, lowermost point Y + tolerance).
+    band = (uppermost point Y - tolerance, lowermost point Y).
     A layer whose points span a Y range (wide platform / minimap
     perspective) is fully detected while standing anywhere on the
     platform; the old mean +- tolerance band excluded the platform ends,
     so the marker at an edge flipped between floors every frame and the
-    route never advanced to the next layer.  Falls back to ``layer_y``
-    when the layer has no recorded points (still the mean band then).
+    route never advanced to the next layer.  The tolerance is applied
+    ONLY upward (above the topmost point, where the climb/drop arrives)
+    and NOT below the lowermost point, so the band does not reach into
+    the layer BELOW - adjacent floors' bands overlap less.  Falls back
+    to ``layer_y`` when the layer has no recorded points (still the mean
+    band then).
     """
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    return min(values) - tolerance, max(values) + tolerance
+    return min(values) - tolerance, max(values)
 
 
 def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
-    """World-Y band from recorded point world-Ys (same rule as Y)."""
+    """World-Y band from recorded point world-Ys (same rule as Y:
+
+    tolerance applies only above the topmost point, not below the
+    lowermost point, so adjacent floors' bands overlap less."""
     values = []
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
         point = layer.get(point_name)
@@ -137,7 +144,7 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
         values = [float(layer["layer_world_y"])]
     if not values:
         return None
-    return min(values) - tolerance, max(values) + tolerance
+    return min(values) - tolerance, max(values)
 
 
 def detect_layer_by_y(

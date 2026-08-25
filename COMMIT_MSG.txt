@@ -1,24 +1,17 @@
-fix: overlapping floor bands no longer flip the patrol layer (flicker guard)
+fix: layer bands lose the +tolerance bottom slack (band = topmost - tol .. lowermost)
 
-Observed in the live log right after the climb to layer3:
-  LAYER CHANGED: layer3 -> layer2 at y=0.348958; restarting layer2 patrol
-  MAP LOOP reset world Y at layer2=0.103357  (while the character visibly
-  stands on layer3)
+Adjacent floors' recorded Y bands overlapped at the BOTTOM edge: each band
+extended tolerance BELOW its lowermost point, reaching into the layer below
+(e.g. layer2 band .33..0.37 and layer3 band .33..0.37 both swallowed y=0.349).
+The band is now (topmost point Y - tolerance, lowermost point Y): tolerance
+is applied only ABOVE the topmost point (where climbs/drops arrive) and no
+longer below the lowermost point, so a band does not reach into the layer
+BELOW and the overlap windows shrink.
 
-Adjacent floors' recorded Y bands can overlap (span +- tolerance), so a
-Y-only reading hits BOTH floors; the resync then re-targeted the other
-floor's patrol points mid-patrol, so the patrol never completed - the
-character was stuck patrolling layer3 forever and the range-top drop to
-layer2 never fired.
-
-- _resync_route_layer: a marker-only ambiguous reading (no confident
-  world-Y) that still falls inside the CURRENT layer's recorded band now
-  keeps the current layer instead of switching/returning.  A confident
-  world-Y structure read stays authoritative (centered/aliased marker
-  disambiguation and fall recovery are preserved), and readings clearly
-  outside the current band still switch/return.
-- test_movement_worker: overlap-band keep-current coverage (both floors,
-  ambiguous + unambiguous readings).
-
-Works together with the range-top drop fix: the layer3 patrol now
-finishes, the range top drops back to layer2, and the loop repeats.
+- movement_worker._layer_y_band / _layer_world_y_band: return
+  (min - tolerance, max) instead of (min - tolerance, max + tolerance).
+- patrol_control._layer_y_band / _layer_world_y_band: same rule.
+- fixtures: fall/return/stale-world settle points moved from lowermost +
+  tolerance to the lowermost value itself (0.82->0.80, 0.52->0.50, world
+  -0.35->-0.40 / 0.1->0.0) - a real landing settles ON the platform, i.e.
+  at the recorded lowermost Y, not below it.
