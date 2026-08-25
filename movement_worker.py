@@ -122,7 +122,6 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     to ``layer_y`` when the layer has no recorded points (still the mean
     band then).
     """
-    tolerance = tolerance * Y_TOLERANCE_DETECTION_SCALE
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
@@ -973,12 +972,7 @@ DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
 # 按帧判定（连续 3 帧 ≈ 0.75s）触发跳跃。
 STAIR_JUMP_STALL_FALLBACK = 0.012
 
-# 判带时 y_tolerance 的缩减系数：录制的容差先乘此系数再参与图层 Y 带
-# 计算，稍微收窄顶部余量、减小相邻层的重叠（"把 y_tolerance 调小一点"）。
-# Detection-time taper for y_tolerance: the recorded tolerance is scaled by
-# this before band math, tightening the top slack a little so adjacent
-# floors' bands overlap less.
-Y_TOLERANCE_DETECTION_SCALE = 0.75
+
 
 
 def _image_from_frame(frame: Any) -> Image.Image:
@@ -2755,12 +2749,21 @@ class MovementWorker(threading.Thread):
         if compensating:
             elapsed = time.monotonic() - self._climb_state.target_layer_since
             expected_name = self._route_layers[expected_next_index]
+            # Per-frame layer tracking even during the fixed Up hold: re-read
+            # the floor every frame so the bench/rope transition is followed
+            # the moment the marker or the world-Y reading moves into the
+            # next route layer.  The Up hold itself is NOT switched mid-flight
+            # (that made the character drop off the rope) - it is only
+            # tracked and logged frame by frame.
+            tracked_name = self._detected_layer(observation)
             if elapsed < self.climb_layer_confirm_seconds:
                 LOG.info(
-                    "CLIMB arrival compensation: %s %.2f/%.2fs; keeping Up held",
+                    "CLIMB arrival compensation: %s %.2f/%.2fs; keeping Up "
+                    "held (now: %s)",
                     expected_name,
                     elapsed,
                     self.climb_layer_confirm_seconds,
+                    tracked_name or "none",
                 )
                 return self._route_layers[self._route_layer_index]
             # The next layer was already confirmed. Finish the fixed Up hold
@@ -3743,12 +3746,13 @@ class MovementWorker(threading.Thread):
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.
-                # While descending to the first layer OR returning to the
-                # patrol range, resync is suppressed: intermediate platforms
-                # must not hijack the drop/return and restart patrol on a
-                # middle layer.
-                if not self._descending_to_first and self._return_mode is None:
-                    self._resync_route_layer(observation)
+                # Per-frame layer tracking, kept during the drop/return too:
+                # the flicker guard keeps the current patrol layer while the
+                # marker Y still sits inside its band, so an intermediate
+                # platform cannot hijack the drop/return; a reading that
+                # genuinely enters another route layer's band is followed
+                # frame by frame.
+                self._resync_route_layer(observation)
                 observation = self._pin_stationary_layer_world_y(observation)
                 # Falling recovery: track rapid diamond-Y drops (an unexpected
                 # fall - knocked down / missed a stair / walked off an edge).

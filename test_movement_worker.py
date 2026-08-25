@@ -408,7 +408,7 @@ class MovementTests(unittest.TestCase):
         worker.patrol_enabled = True
         worker._rescue_last_check = 100.0
         worker._rescue_last_pos = Point(.8, .5168)
-        # y=0.6302 is outside the layer1 band (0.5018 .. 0.5168).
+        # y=0.6302 is outside the layer1 band (0.4968 .. 0.5168).
         off_route = MinimapObservation(Point(.8032, .6302), None, .9, (0, 0, 1, 1))
         with mock.patch.object(worker, "_trigger_rescue") as rescue:
             for _ in range(19):
