@@ -1,202 +1,193 @@
 # Maple Assistant
 
-> **Installation & resolution guide: see [INSTALL.md](INSTALL.md).** The
-> release package is self-bootstrapping — `install.ps1` finds or downloads
-> Python, creates a `.venv`, installs the requirements, and creates launchers;
-> `build_release.ps1` assembles a minimal distributable folder. Everything is
-> normalized to the game client, so 2560×1440 / 1920×1080 / 1366×768 all work.
+Maple Assistant is a Windows desktop automation tool for a MapleStory client.
+It captures the game window, reads the minimap and HP/MP bars, follows a
+recorded multi-layer patrol route, climbs ropes, recovers from falls, collects
+items, and supports either fixed-interval or YOLO-driven attacks.
 
-## 发布新版本 (Releasing a new build)
+The runtime is resolution-adaptive: minimap geometry and the yellow player
+diamond are detected dynamically, while normalized fallback regions keep the
+assistant usable when detection confidence is low.
 
-1. **Run the tests first** — the release must be green:
+> Automation may violate a game or server's rules. Use it only where permitted.
 
-   ```powershell
-   python -m unittest test_movement_worker test_ui_worker test_status_worker `
-       test_minimap_detector test_assistant test_single_instance `
-       test_capture_worker test_map_identity test_map_structure_tracker
-   ```
+## Start here
 
-2. **Build and zip** (from the repo root):
+For a packaged release on a new Windows machine:
 
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File build_release.ps1 -Zip
-   ```
+1. Extract the complete ZIP.
+2. Double-click `安装.bat`. It finds or installs Python 3.10, creates `.venv`,
+   installs the core and YOLO dependencies, and creates the launchers.
+3. Double-click `启动助手.bat`.
+4. Bring the configured game window to the foreground.
+5. Record or verify the patrol route in the UI, then click **Start Patrol**.
 
-   - Rebuilds `release\MapleAssistant\` from the repo root: runtime files only
-     (`.py/.json/.md/.ps1/.bat/.txt` — no tests, no `work/`, no `.venv`, no git
-     metadata).
-   - Creates `release\MapleAssistant-{dd-HH-mm}.zip` (e.g.
-     `MapleAssistant-24-19-35.zip`). The stamp is the build time
-     (day-hour-minute). Windows forbids `:` in file names, so the intended
-     `{dd:HH:mm}` format is emitted as `dd-HH-mm`. Old zips in `release\` are
-     cleaned automatically.
+See [INSTALL.md](INSTALL.md) for installation and troubleshooting details.
 
-3. **Verify the zip** (recommended before shipping):
-
-   ```powershell
-   python work/verify_zip.py release\MapleAssistant-24-19-35.zip
-   ```
-
-   Checks the expected fixes are inside and no test/dev artifacts leaked.
-
-> **One-command alternative:** double-click `发布.bat` (or run
-> `release_now.ps1` from the repo root). It runs the release-gate tests,
-> rebuilds `release\MapleAssistant\` and the timestamped zip, then verifies
-> the zip — the whole flow above in one step. Use `-SkipTests` for a quick
-> repackage without re-running the gate.
-
-4. **Ship**: hand the zip to others. The receiver unzips and double-clicks
-   `安装.bat`, which bootstraps Python + all dependencies (including YOLO),
-   then starts with `启动助手.bat`. See [INSTALL.md](INSTALL.md).
-
-> **Note:** `build_release.ps1` must be saved as **UTF-8 with BOM** — Windows
-> PowerShell 5.1 cannot parse the BOM-less UTF-8 Chinese comments and the
-> script fails with a code-page broken parse error.
-
-Independent workers analyze the game without relying on slow interactive computer control:
-
-1. `capture_worker.py` captures the small minimap and status regions every four seconds.
-2. `movement_worker.py` locates the yellow minimap diamond and recommends or performs movement.
-3. `status_worker.py` monitors HP/MP and handles potions.
-4. `attack_worker.py` sends Ctrl on its own timer, independently of movement.
-5. `ui_worker.py` displays read-only debug information without blocking automation.
-
-`minimap_detector.py` uses OpenCV contour detection to locate the resizable
-top-left minimap. Movement consumes the dynamically detected analysis region;
-the old normalized rectangle is used only as a low-confidence fallback. The UI
-shows the detected minimap size, boxes, confidence, minimap preview, and cropped
-map-name area. Map-name OCR is a replaceable adapter because OpenCV locates text
-regions but does not itself recognize Chinese text.
-
-The UI also owns manual multi-layer patrol controls. Move the character by hand
-and wait until the displayed yellow-diamond position updates, then record
-`Left-most`, `Rope`, and `Right-most`. Recorded buttons lock automatically and
-turn grey; click the same embedded button once to unlock it, then click it again
-to record the new position. Each point is saved to six decimal places in the
-shared `recording-configuration.json`. `Add Layer Above`
-creates/selects the next layer and pauses patrol while it is calibrated. A new
-layer must have a smaller minimap Y than the layer below.
-
-**巡逻楼层范围 (Patrol floor range) + 坠落恢复 (Falling recovery).** Floors are patrolled over a **contiguous range** selected in the UI (开始楼层 → 结束楼层; a single floor is allowed). **layer1 is no longer implicitly the patrol start.** If the character falls outside the range (knocked down / walked off an edge), the worker detects the fall (rapid diamond-Y drops for `fall_detect_frames` consecutive minimap frames, defaults in `rope_calibration.json`), re-detects the floor when the fall stops, restarts patrol there if the floor is inside the range, and otherwise **returns to the range without attacking**: below the range it finds the current floor's rope and climbs back; above the range it drops (Alt+Down) until back in range. The intentional drop-to-layer1 descent is never interrupted.
-
-**Left, Rope, and Right are independent actions.** A layer patrols exactly the
-points you record, in left → right → rope order. By default, each layer repeats
-its recorded Left/Right patrol twice before climbing or dropping (configured by
-`patrol_cycles_per_layer` in `rope_calibration.json`): a layer with only `Rope`
-goes straight to its rope and climbs; a layer with only `Left` stands at the
-left-most point; a layer with `Left`+`Right` patrols that floor back and forth
-(no climb); and a layer (or whole map) with nothing recorded stands still and
-only attacks (useful with Fixed Attack or YOLO farming). The final layer's rope
-is omitted (there is nothing above it to climb to). `Start Patrol` then runs each
-layer's recorded actions, uses that layer's own rope to climb, and changes to `Stop
-Patrol` while active. `Start Patrol` is enabled as soon as every layer has at least
-one recorded point (or nothing is recorded at all, for stand-still + attack) - it
-does not require re-recording or an unlock step. These controls never send keys from
-the UI thread—the movement worker remains the only movement executor.
-
-UI-recorded points use adaptive minimap coordinates. OpenCV detects the inner
-map canvas, and the marker detector measures the full anti-aliased yellow
-diamond. Positions are stored as diamond-sized offsets from the canvas center,
-then projected into the current canvas at runtime. Small animation-related
-diamond-size changes are median-smoothed; a large size jump is treated as a
-real zoom change immediately. Horizontal tolerance, near-rope range, final
-movement zone, and layer-Y tolerance scale with the current diamond size.
-Layers shown as `legacy layout` should be re-recorded once in the UI to gain
-adaptive width/zoom mapping; `adaptive` layers already include this metadata.
-Legacy layers still start patrol (their recorded ratios are used as-is), just
-without zoom adaptation.
-
-When enabled, the other-player safety net scans the minimap for red diamonds
-(other players) and auto-switches channel on sighting. The scan is time-anchored
-(every `other_player_check_interval_seconds`, default 60 s) instead of on every
-patrol cycle, so it costs almost no extra CPU/GPU.
-
-**Stair jumps (automatic).** Stairs that block the left/right patrol walk (the
-character bumps into them and the minimap X stops advancing) are jumped
-automatically — no jump points need to be recorded. During the
-move-to-left-most/right-most phases, when the marker stalls for
-`stair_jump_stall_frames` (default 2) no-progress frames while a walk hold is
-being issued, the worker jumps: it holds the travel direction and taps Alt
-mid-hold to carry over the stair. Jumps are grace-limited
-(`stair_jump_grace_seconds`, default 2.5 s) and capped
-(`stair_jump_attempts_max`, default 3), after which the bot logs
-`STAIR JUMP gave up ...` and keeps walking so a truly impassable wall cannot
-make the character hop in place forever. Tuning knobs
-(`stair_jump_stall_diamonds`, `stair_jump_alt_hold_seconds`,
-`stair_jump_lead_seconds`) live in `rope_calibration.json`.
-
-The assistant starts in **live mode** and presses keys using Python `SendInput`.
+For development from the repository:
 
 ```powershell
-python assistant.py --debug-dir work/debug
+py -3.10 -m pip install -r requirements.txt
+py -3.10 assistant.py --debug-dir work/debug
 ```
 
-Disable only the debug UI when desired:
+Useful modes:
 
 ```powershell
-python assistant.py --no-ui --debug-dir work/debug
+# Analyze and display the UI without sending gameplay keys.
+py -3.10 assistant.py --dry-run --debug-dir work/debug
+
+# Run without the Tk debug UI.
+py -3.10 assistant.py --no-ui --debug-dir work/debug
+
+# Show command-line options.
+py -3.10 assistant.py --help
 ```
 
-To analyze without pressing keys, explicitly request dry-run mode:
+The application starts with live input disarmed. Input is enabled only after
+**Start Patrol** is clicked.
+
+## What the assistant does
+
+- `CaptureWorker` captures the client and publishes latest-only frames.
+- `MinimapDetector`, `marker_detector.py`, and `MapStructureTracker` locate the
+  minimap, yellow/red diamonds, and scroll-compensated map position.
+- `MovementWorker` owns patrol movement, endpoint sequencing, stair jumps,
+  rope approach/climbing, fall recovery, route return, and self-rescue.
+- `StatusWorker` reads HP/MP and sends configured potion or buff keys.
+- `AttackWorker` performs the optional fixed-rate attack mode.
+- The UI can launch `yolo-detection/live_view.py` as a second process for
+  target-aware attacks and main-screen rope sensing.
+- `FocusWorker` releases held keys on a focus dip, tries to refocus the game,
+  resumes after a short transient dip, and stops patrol after sustained loss.
+- `ShutdownWorker` optionally stops the PC after a configured duration.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
+cross-process coordination, configuration ownership, and the complete file
+inventory.
+
+## Recording and patrol behavior
+
+The shared route is stored in `recording-configuration.json`. In the UI, select
+a layer and record any desired combination of:
+
+- **Left-most**
+- **Rope**
+- **Right-most**
+
+Each recorded point is an independent action. A layer can therefore be:
+
+- empty: stand still and attack;
+- left-only: hold that patrol point;
+- left + right: patrol horizontally without climbing;
+- rope-only: go directly to the rope;
+- left + right + rope: patrol, then climb.
+
+Layers are executed in numeric bottom-to-top order. The selected patrol range
+is contiguous. A character that lands below it climbs back; one above it drops
+back. Return-to-route input suppresses attacks until the route is reached.
+
+`patrol_cycles_per_layer` in `rope_calibration.json` defaults to `2`. Every
+layer completes two full horizontal Left/Right cycles before it climbs or,
+for the top layer of the active route, drops back to the first route layer.
+The final layer's rope is intentionally not used because no patrolled layer is
+above it.
+
+Adaptive recordings include `coordinate_v2` metadata based on minimap canvas
+and diamond dimensions. Legacy ratio-only points still run, but should be
+re-recorded when the UI labels them as a legacy layout.
+
+## Movement and safety rules
+
+- Only the movement worker owns directional movement and its paired pickup
+  hold. Z is pressed and released with Left/Right during walking.
+- Rope approach uses minimap X for navigation. Fresh YOLO rope/character boxes
+  refine the jump direction and timing but do not control the route.
+- Climb arrival requires the expected next layer and stable confirmation. Up
+  remains held through a short rope-top compensation window.
+- Attack suppression ends immediately after confirmed climb arrival; the
+  separate arrival grace period only prevents an unsafe stair jump.
+- Losing focus releases every key. After refocus, movement reconciles its
+  internal hold state with the sender and re-presses externally released keys.
+- Self-rescue requires a genuinely stationary run. Off-layer readings use a
+  separate consecutive counter, so adaptive minimap drift or visible patrol
+  progress cannot cause a premature Alt+Down drop.
+- Missing or stale cross-process state files mean “not busy,” preventing a dead
+  process from permanently blocking patrol or attack.
+
+## Configuration files
+
+| File | Purpose |
+|---|---|
+| `recording-configuration.json` | Map name, recorded layers/actions, route order, patrol range, rope zones |
+| `rope_calibration.json` | Movement, climb, fall, stair-jump, rescue, and patrol-cycle tuning |
+| `drug_settings.json` | HP/MP potion keys and thresholds; buff keys and intervals |
+| `fixed_attack_settings.json` | Fixed/YOLO attack mode, attack key, fixed interval |
+| `additional_functions_settings.json` | Optional timed shutdown settings |
+| `yolo_detection_settings.json` | YOLO threshold, range, FPS, detection zone, and preview settings |
+| `yolo-detection/config.yaml` | Lower-level model/detector configuration |
+
+Runtime state and logs are written under ignored directories such as `work/`,
+`outputs/`, and `recording-assets/`. Do not assume these files are saved by Git.
+
+## Publishing a release
+
+Every project update must produce a new release and a Git commit. Run the
+canonical workflow from the repository root:
 
 ```powershell
-python assistant.py --dry-run --debug-dir work/debug
+powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
 ```
 
-The live assistant intentionally refuses to send keys unless the configured
-game window is currently in the foreground. Losing focus pauses movement,
-attacks, potion analysis, and releases held keys without closing the debug UI;
-manually selecting the game again resumes automation. The assistant never
-steals focus to resume itself. Potions are the highest-priority action: they
-need two consecutive low frames, and a low-confidence read only suppresses a
-potion when NO bar is below its threshold (a near-empty bar reads as a tiny
-fill run with low confidence - exactly when the potion is needed). A blocked
-potion tap is retried (`potion_retry_attempts`, default 3) before the next low
-frame tries again.
+`发布.bat` invokes the same script. A real release must not use `-SkipTests`.
 
-All live gameplay actions are generated inside Python through Win32 `SendInput`
-scan-code keyboard events. The assistant does not use Computer Use, mouse
-automation, UI Automation, or terminal-driven key actions.
-At live startup the Python sender finds exactly one matching MapleStory window,
-restores it when minimized, brings it to the foreground, and stores its HWND.
-Movement and attack are independent workers. Attack runs every three seconds
-throughout navigation and sends only Ctrl; it never presses or releases Left or
-Right. Therefore it cannot cancel the movement worker's direction hold.
-Ctrl and Alt+Up use a shared critical-section lock, so an attack cannot
-interrupt climbing. While the marker remains aligned, Alt+Up retries on each
-new screenshot instead of stopping permanently after one attempt.
-When minimap X distance is 0.04 or less, Ctrl attacks pause completely so the
-final Left/Right correction and Alt+Up cannot be interrupted. HP/MP monitoring
-and potion use remain active.
-Movement uses fixed 2-second holds whenever the rope distance is greater than
-0.04 normalized minimap units. Only at distance 0.04 or less is the final hold
-calculated. Rope approach has three gap zones (configured in
-`recording-configuration.json` under `rope`): right on the rope
-(|gap| ≤ `under_rope_tolerance`, 0.008) jumps straight up; the inner band
-(|gap| ≤ `inner_range`, 0.018) jumps left/right toward the rope side; and the
-honey zone (`inner_range` < |gap| ≤ `near_range`, 0.025) creeps with **tiny
-random steps** (between `rope_tiny_step_min_seconds` /
-`rope_tiny_step_max_seconds`, defaults 0.05 / 0.15 s) to adjust position —
-outside the honey zone it uses the big walking holds. Alignment uses a narrow
-0.010 normalized-X tolerance—about two pixels in the calibrated minimap
-crop—confirmed twice before Alt + Up.
-Left and Right use adaptive holds based only on minimap X distance: 2 seconds
-when far away, 0.7 seconds at medium range, and 0.18-second corrections near
-the rope. Each hold emits a matching key-up before the next position decision.
-Live logs include `key-down`, requested duration, `key-up`, and actual duration
-so the two-second hold can be verified directly.
-Climbing uses a narrow 0.008 minimap-X tolerance and requires three consecutive
-aligned screenshots before Alt + Up.
+The script performs three gated stages:
 
-`rope_calibration.json` stores reusable movement/climb timing. The shared
-`recording-configuration.json` stores the recorded layers, endpoints, ropes,
-and explicit route order instead of creating one configuration file per map.
-Add layer 2 under its
-`layers` object and append `layer2` to `route_order` after calibration.
-while the character was aligned with the rope. On every startup the movement
-worker detects the current yellow diamond, moves Left/Right toward that saved
-X, then taps Alt and holds Up for 0.45 seconds to grab and climb the rope.
+1. **Release-gate tests** using
+   `yolo-detection\venv313\Scripts\python.exe` when present, otherwise
+   `python`. Output is saved to `work\release_gate.log`; any failing test stops
+   the release.
+2. **Build and ZIP** via `build_release.ps1 -Zip`. The destination
+   `release\MapleAssistant\` is rebuilt from scratch, runtime files and model
+   weights are copied, ignored development/test artifacts are excluded, old
+   ZIPs are removed, and a new `MapleAssistant-{dd-HH-mm}.zip` is created.
+3. **ZIP verification** via `work\verify_zip.py`. A verification failure means
+   the ZIP must not be shipped.
 
-Stop safely with `Ctrl+C`. Keep the game window visible and use the default 2560x1600 client layout during initial calibration. The analyzers use normalized regions, so other 16:10 resolutions should also work.
+Important publishing details:
 
-Important: automation may violate a game server's rules. Use only where permitted.
+- `build_release.ps1` must remain UTF-8 with BOM for Windows PowerShell 5.1.
+  `release_now.ps1` repairs the BOM automatically when needed.
+- `work\verify_zip.py` is currently a required local helper inside a
+  Git-ignored directory. Confirm it exists before publishing on a fresh clone.
+- `release\` is Git-ignored. The ZIP is a delivery artifact, not part of the
+  commit.
+- A successful command prints `release ready: <absolute zip path>`.
+
+After a successful release, save the source change:
+
+```powershell
+git diff --check
+git status --short
+git add -- <changed source, tests, and documentation>
+git commit -m "describe the completed change"
+git status --short
+```
+
+The final status should be clean. Record the release ZIP name and commit hash in
+the session handoff.
+
+## Development checks
+
+Run a focused test first, then the relevant module suite. For movement work:
+
+```powershell
+py -3.10 -m unittest test_movement_worker
+```
+
+The canonical release gate is defined in `release_now.ps1`; do not maintain a
+second handwritten test list in this README. Run the release script before
+shipping even when focused tests already passed.
+
+Stop a console run with `Ctrl+C`. Keep the game visible during calibration and
+use `--dry-run` whenever input injection is not intended.

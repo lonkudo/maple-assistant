@@ -1338,13 +1338,12 @@ class MovementWorker(threading.Thread):
         (not waiting for the next 5-minute window) so a covered/missing
         minimap cannot freeze the patrol forever.
 
-        A marker present but OFF every recorded layer band is stuck just the
-        same: the character fell off the platform / was knocked off / the
-        minimap frame drifted, and the route (still pinned to the recorded
-        layer) will chase its recorded boundaries forever since the phantom
-        marker can never cross them.  Off-route frames count toward the same
-        stuck window and also rescue immediately at ``rescue_stuck_frames``.
-        Frames with an active climb/drop are skipped - the marker legitimately
+        A marker present but OFF every recorded layer band has a separate
+        consecutive stationary run: the character may have fallen off, but a
+        transient adaptive-band miss while X/Y is progressing must not inherit
+        ordinary stuck frames and drop a valid patrol floor.  A stationary
+        off-route run rescues immediately at ``rescue_stuck_frames``. Frames
+        with an active climb/drop are skipped because the marker legitimately
         passes between layer bands while climbing.
         """
         if not self.patrol_enabled or not self._route_layers:
@@ -1359,11 +1358,15 @@ class MovementWorker(threading.Thread):
                 self._trigger_rescue()
             self._rescue_stuck_frames = 0
             self._rescue_max_stuck = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_off_route_anchor = None
             self._rescue_last_check = now
         if self._attack_state is not None and self._attack_state.is_active():
             return
         pos = observation.player
         if pos is None:
+            self._rescue_off_route_frames = 0
+            self._rescue_off_route_anchor = None
             # Marker lost while patrol is active: the character cannot move
             # purposefully at all (no keys are sent, the phase cannot
             # advance) - count it as stuck instead of resetting, and rescue
@@ -1403,26 +1406,42 @@ class MovementWorker(threading.Thread):
             isinstance(layer, dict) and "layer_y" in layer
             for layer in route_layers.values()
         )
-        if (has_y_bands
+        off_route = bool(
+            has_y_bands
                 and self._climb_state.phase == "idle"
                 and not self._descending_to_first
                 and self._return_mode is None
-                and detect_layer_by_y(pos.y, route_layers) is None):
-            self._rescue_stuck_frames += 1
-            self._rescue_max_stuck = max(
-                self._rescue_max_stuck, self._rescue_stuck_frames
-            )
-            if self._rescue_stuck_frames >= self.rescue_stuck_frames:
+                and detect_layer_by_y(pos.y, route_layers) is None
+        )
+        if off_route:
+            # Adaptive minimap resizing can briefly put a valid platform just
+            # outside every projected band. Rescue only if that condition is
+            # consecutive AND the marker remains stationary. Visible X/Y
+            # progress means the patrol is still working and must not drop.
+            anchor = self._rescue_off_route_anchor
+            if (anchor is None
+                    or abs(pos.x - anchor.x) >= 0.02
+                    or abs(pos.y - anchor.y) >= 0.02):
+                self._rescue_off_route_anchor = Point(pos.x, pos.y)
+                self._rescue_off_route_frames = 1
+            else:
+                self._rescue_off_route_frames += 1
+            self._rescue_stuck_frames = 0
+            self._rescue_last_pos = None
+            if self._rescue_off_route_frames >= self.rescue_stuck_frames:
                 LOG.warning(
-                    "SELF-RESCUE: character off every recorded layer "
+                    "SELF-RESCUE: character stationary off every recorded layer "
                     "(%d frames at y=%.6f); dropping to layer1 and "
                     "restarting patrol",
-                    self._rescue_stuck_frames, pos.y,
+                    self._rescue_off_route_frames, pos.y,
                 )
-                self._rescue_stuck_frames = 0
+                self._rescue_off_route_frames = 0
+                self._rescue_off_route_anchor = None
                 self._rescue_max_stuck = 0
                 self._trigger_rescue()
             return
+        self._rescue_off_route_frames = 0
+        self._rescue_off_route_anchor = None
         last = self._rescue_last_pos
         if (last is not None
                 and abs(pos.x - last.x) < 0.02
@@ -1433,7 +1452,10 @@ class MovementWorker(threading.Thread):
             )
         else:
             self._rescue_stuck_frames = 0
-        self._rescue_last_pos = Point(pos.x, pos.y)
+            # Keep a fixed anchor throughout a no-progress run. Comparing
+            # only adjacent frames made legitimate slow walking (<0.02 per
+            # frame) look stationary forever despite large total travel.
+            self._rescue_last_pos = Point(pos.x, pos.y)
 
     def _trigger_rescue(self) -> None:
         """Start the self-rescue in a background thread (guarded once)."""
@@ -1948,6 +1970,11 @@ class MovementWorker(threading.Thread):
         self._rescue_last_pos: Optional[Point] = None
         self._rescue_stuck_frames = 0
         self._rescue_max_stuck = 0
+        # Keep transient off-layer readings separate from the ordinary stuck
+        # run. A single layer-band miss must never inherit earlier slow-walk
+        # frames and launch the destructive Alt+Down rescue.
+        self._rescue_off_route_frames = 0
+        self._rescue_off_route_anchor: Optional[Point] = None
         self._rescue_active = False
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).

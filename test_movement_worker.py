@@ -485,13 +485,13 @@ class MovementTests(unittest.TestCase):
         with mock.patch.object(worker, "_trigger_rescue") as rescue:
             for _ in range(19):
                 worker._rescue_stuck_check(off_route, 101.0)
-            self.assertEqual(worker._rescue_stuck_frames, 19)
+            self.assertEqual(worker._rescue_off_route_frames, 19)
             rescue.assert_not_called()
             # The 20th consecutive off-route frame fires the rescue
             # IMMEDIATELY, without waiting for the 5-minute window.
             worker._rescue_stuck_check(off_route, 101.0)
             rescue.assert_called_once()
-            self.assertEqual(worker._rescue_stuck_frames, 0)
+            self.assertEqual(worker._rescue_off_route_frames, 0)
         # An active climb legitimately passes between layer bands: no rescue.
         worker._rescue_last_check = 200.0
         worker._climb_state.phase = "climbing-up"
@@ -502,6 +502,73 @@ class MovementTests(unittest.TestCase):
             rescue2.assert_not_called()
         worker._climb_state.phase = "idle"
         worker._climb_state.up_held = False
+
+    def test_moving_on_transient_off_route_band_never_drops(self):
+        # Real trace: layer3 was walking left, but adaptive minimap resizing
+        # briefly put its Y outside every projected layer band. The old shared
+        # counter inherited prior slow-walk frames and launched Alt+Down before
+        # layer3 patrol finished. Cumulative X progress must keep rescue off.
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer3": {
+                "layer_y": .32, "y_tolerance": .01,
+                "left_most_pos": {"x": .425, "y": .32},
+                "right_most_pos": {"x": .75, "y": .32},
+            }},
+            route_order=["layer3"],
+            rescue_check_interval_seconds=300.0,
+            rescue_stuck_frames=20,
+        )
+        worker.patrol_enabled = True
+        worker._rescue_last_check = 100.0
+        # Prove the off-route detector cannot inherit the ordinary counter.
+        worker._rescue_stuck_frames = 19
+        worker._rescue_max_stuck = 19
+
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for frame in range(30):
+                moving = MinimapObservation(
+                    Point(.64 - frame * .01, .348958),
+                    None, .9, (0, 0, 1, 1),
+                )
+                worker._rescue_stuck_check(moving, 101.0 + frame * .25)
+            rescue.assert_not_called()
+
+        self.assertLess(worker._rescue_off_route_frames, 20)
+        self.assertEqual(worker._rescue_stuck_frames, 0)
+
+    def test_slow_cumulative_patrol_progress_is_not_stuck(self):
+        # Each frame can move less than the jitter tolerance, but progress
+        # measured from a fixed anchor eventually exceeds it and resets the
+        # run. Comparing only adjacent frames caused false self-rescues.
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer3": {
+                "layer_y": .35, "y_tolerance": .02,
+                "left_most_pos": {"x": .42, "y": .35},
+                "right_most_pos": {"x": .75, "y": .35},
+            }},
+            route_order=["layer3"],
+            rescue_check_interval_seconds=300.0,
+            rescue_stuck_frames=20,
+        )
+        worker.patrol_enabled = True
+        worker._rescue_last_check = 100.0
+
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for frame in range(50):
+                moving = MinimapObservation(
+                    Point(.70 - frame * .005, .35),
+                    None, .9, (0, 0, 1, 1),
+                )
+                worker._rescue_stuck_check(moving, 101.0 + frame * .25)
+            rescue.assert_not_called()
+
+        self.assertLess(worker._rescue_stuck_frames, 20)
 
     def _floors(self, count: int) -> dict:
         """Recorded floors layer1..layerN, each with left/right/rope at a
