@@ -780,7 +780,14 @@ class MovementTests(unittest.TestCase):
         on_layer3 = MinimapObservation(
             Point(.5, .6), None, .9, (0, 0, 1, 1)
         )
-        for _ in range(worker.climb_layer_confirm_frames):
+        with patch(
+            "movement_worker.time.monotonic",
+            side_effect=[0.0, .31, .31],
+        ):
+            for _ in range(worker.climb_layer_confirm_frames):
+                worker._resync_route_layer(on_layer3)
+            # The frame confirmation starts the 0.3-second rope-top hold;
+            # the next frame after that deadline completes the transition.
             worker._resync_route_layer(on_layer3)
         self.assertEqual(worker._route_layer_index, 1)
         self.assertEqual(worker._current_route_floor(), "layer3")
@@ -2543,7 +2550,7 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_layer_index, 1)
         self.assertEqual(sender.released, ["up"])
 
-    def test_fast_capture_does_not_shorten_layer_arrival_confirmation(self):
+    def test_climb_holds_up_for_bounded_compensation_after_confirmation(self):
         class Sender:
             def __init__(self): self.released = []
             def key_up(self, key): self.released.append(key); return True
@@ -2565,7 +2572,7 @@ class MovementTests(unittest.TestCase):
             queue.Queue(), sender, threading.Event(),
             important_positions=positions, route_order=["layer1", "layer2"],
             climb_layer_confirm_frames=3,
-            climb_layer_confirm_seconds=1.0,
+            climb_layer_confirm_seconds=.3,
         )
         worker._route_layer_index = 0
         worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
@@ -2578,24 +2585,31 @@ class MovementTests(unittest.TestCase):
             world_y_diamonds=-3.0, structure_confidence=.9,
         )
 
-        with patch("movement_worker.time.monotonic", side_effect=[0, 1.05, 1.05]):
-            # Two stable frames: still counting, Up stays held and the phase
-            # is NOT "arrival-compensation" (the timed Up hold is gone).
+        with patch(
+            "movement_worker.time.monotonic",
+            side_effect=[0.0, .15, .31, .31],
+        ):
+            # Two stable frames: still counting, Up stays held.
             self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(sender.released, [])
             self.assertEqual(worker._climb_state.phase, "climbing-up")
-            # A flicker frame breaks the consecutive run: the frame count
-            # restarts (frame-based confirmation only - no timed rescue).
+            # Before confirmation, a flicker still breaks the consecutive run.
             self.assertEqual(worker._resync_route_layer(y_flicker), "layer1")
             self.assertEqual(worker._climb_state.target_layer_frames, 0)
             self.assertEqual(sender.released, [])
-            # Three consecutive stable frames confirm the next layer: the
-            # route switches immediately and Up is released - no
-            # "arrival-compensation" phase in between.
+            # Three consecutive stable frames confirm the next layer and start
+            # the 0.3-second non-blocking Up compensation window.
             self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(worker._resync_route_layer(upper), "layer1")
-            self.assertEqual(worker._resync_route_layer(upper), "layer2")
+            self.assertEqual(worker._resync_route_layer(upper), "layer1")
+            self.assertEqual(worker._route_layer_index, 0)
+            self.assertEqual(sender.released, [])
+            # Fast frames cannot shorten the hold.  At 0.15 seconds Up is
+            # still owned; after 0.30 seconds the route advances and releases.
+            self.assertEqual(worker._resync_route_layer(y_flicker), "layer1")
+            self.assertEqual(sender.released, [])
+            self.assertEqual(worker._resync_route_layer(y_flicker), "layer2")
             self.assertEqual(worker._climb_state.phase, "idle")
             self.assertEqual(worker._route_layer_index, 1)
             self.assertEqual(sender.released, ["up"])

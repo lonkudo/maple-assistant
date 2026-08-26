@@ -390,7 +390,7 @@ def main() -> int:
                 calibration.get("climb_layer_confirm_frames", 3)
             ),
             climb_layer_confirm_seconds=float(
-                calibration.get("climb_layer_confirm_seconds", 1.0)
+                calibration.get("climb_layer_confirm_seconds", 0.3)
             ),
             climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.10)),
             climb_y_change_required=float(calibration.get("climb_y_change_required", 0.015)),

@@ -1678,7 +1678,7 @@ class MovementWorker(threading.Thread):
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 2,
         climb_layer_confirm_frames: int = 3,
-        climb_layer_confirm_seconds: float = 0.5,
+        climb_layer_confirm_seconds: float = 0.3,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
@@ -2802,13 +2802,31 @@ class MovementWorker(threading.Thread):
             self._route_layer_index + 1
             if self._route_layer_index is not None else -1
         )
-        # Arrival is confirmed ONLY by the frame-based layer-rope detection
-        # below: climb_layer_confirm_frames consecutive frames with the
-        # detected layer inside the NEXT route layer's band while climbing.
-        # The timed "arrival-compensation" Up hold is gone - no wall-clock
-        # phase and no fixed Up extension.  Once the frames confirm the next
-        # layer, the arrival switch below releases Up immediately.
-        if climb_input_active:
+        # Arrival is first confirmed by consecutive layer-detection frames.
+        # After that signal becomes stable, keep Up owned for a short bounded
+        # compensation window so the character clears the rope lip before the
+        # route advances.  This is timestamped (not a blocking sleep), so the
+        # worker continues consuming frames and coordinating other actions.
+        compensating = bool(
+            climb_input_active
+            and self._climb_state.target_layer_since is not None
+            and 0 <= expected_next_index < len(self._route_layers)
+        )
+        if compensating:
+            elapsed = time.monotonic() - self._climb_state.target_layer_since
+            expected_name = self._route_layers[expected_next_index]
+            if elapsed < self.climb_layer_confirm_seconds:
+                LOG.info(
+                    "CLIMB top compensation: %s %.2f/%.2fs; keeping Up held",
+                    expected_name,
+                    elapsed,
+                    self.climb_layer_confirm_seconds,
+                )
+                return self._route_layers[self._route_layer_index]
+            # The target was already frame-confirmed before compensation
+            # began.  Do not let one rope-top animation frame undo it.
+            detected_name = expected_name
+        elif climb_input_active:
             # During a climb the arrival is accepted from EITHER signal:
             # the minimap marker Y (works when the world-Y tracker sticks
             # to the lower layer) or the world Y (works when the minimap
@@ -2959,11 +2977,15 @@ class MovementWorker(threading.Thread):
                     self.climb_layer_confirm_frames,
                 )
                 return self._route_layers[self._route_layer_index]
-            # Frame-based arrival only: climb_layer_confirm_frames consecutive
-            # frames inside the next layer's band complete the confirmation.
-            # There is no timed Up compensation - once the frame count is met
-            # the code falls straight into the arrival switch below, which
-            # releases Up, adopts the detected layer and resets the climb.
+            if (self.climb_layer_confirm_seconds > 0
+                    and self._climb_state.target_layer_since is None):
+                self._climb_state.target_layer_since = time.monotonic()
+                LOG.info(
+                    "CLIMB layer %s confirmed; compensating Up for %.2fs",
+                    detected_name,
+                    self.climb_layer_confirm_seconds,
+                )
+                return self._route_layers[self._route_layer_index]
         elif climb_input_active:
             self._climb_state.target_layer_frames = 0
             self._climb_state.target_layer_since = None
