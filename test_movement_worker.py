@@ -722,6 +722,69 @@ class MovementTests(unittest.TestCase):
         self.assertFalse(is_rope)
         self.assertEqual(label, "layer2.left-most")
 
+    def test_return_from_layer1_resumes_layer2_then_climbs_to_layer3(self) -> None:
+        class Sender:
+            def __init__(self):
+                self.released = []
+
+            def key_up(self, key):
+                self.released.append(key)
+                return True
+
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.key_sender = Sender()
+        worker.patrol_enabled = True
+        # The fall happened while layer3 was active.  During the return the
+        # route index is deliberately stale until return mode hands patrol
+        # back to the floor that was actually reached.
+        worker._route_layer_index = 1
+        worker._route_phase = "right"
+        worker._return_mode = "climb-to-route"
+        worker._return_from_floor = "layer1"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        on_layer2 = MinimapObservation(
+            Point(.4, .7), None, .9, (0, 0, 1, 1)
+        )
+
+        # Per-frame resync reports the real floor but must not mutate the
+        # stale normal-route state while the dedicated return is active.
+        self.assertEqual(worker._resync_route_layer(on_layer2), "layer2")
+        self.assertEqual(worker._route_layer_index, 1)
+        self.assertEqual(worker._route_phase, "right")
+
+        target, is_rope, label = worker._route_target(on_layer2)
+        self.assertIsNone(worker._return_mode)
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(worker.key_sender.released, ["up"])
+        self.assertFalse(is_rope)
+        self.assertEqual(label, "layer2.left-most")
+
+        # Complete layer2's normal endpoints.  Its rope must remain the next
+        # action, and a confirmed climb must advance to layer3 rather than
+        # restarting/repeating layer2.
+        worker._advance_route_endpoint(
+            MinimapObservation(Point(.19, .7), None, .9, (0, 0, 1, 1)),
+            target,
+        )
+        right_target, _, _ = worker._route_target(on_layer2)
+        worker._advance_route_endpoint(
+            MinimapObservation(Point(.81, .7), None, .9, (0, 0, 1, 1)),
+            right_target,
+        )
+        _, is_rope, label = worker._route_target(on_layer2)
+        self.assertTrue(is_rope)
+        self.assertEqual(label, "layer2.rope")
+
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        on_layer3 = MinimapObservation(
+            Point(.5, .6), None, .9, (0, 0, 1, 1)
+        )
+        for _ in range(worker.climb_layer_confirm_frames):
+            worker._resync_route_layer(on_layer3)
+        self.assertEqual(worker._route_layer_index, 1)
+        self.assertEqual(worker._current_route_floor(), "layer3")
+
     def test_out_of_range_check_ignores_in_range_floor(self) -> None:
         worker = self._range_worker(4, "layer2", "layer3")
         worker.patrol_enabled = True

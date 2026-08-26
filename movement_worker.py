@@ -2785,6 +2785,15 @@ class MovementWorker(threading.Thread):
 
         if observation.player is None or not self._route_layers:
             return None
+        if self._return_mode is not None:
+            # Return-to-route owns the route state until it explicitly hands
+            # patrol back to an in-range floor in ``_finish_return``.  The
+            # normal resync used to see the stale pre-fall route index here
+            # (for example layer3) and turn the successful layer1 -> layer2
+            # return into a generic "layer3 -> layer2" backward transition.
+            # That reset raced the dedicated return cleanup and could leave
+            # layer2 repeating instead of advancing to layer3.
+            return self._detect_floor_all(observation)
         climb_input_active = (
             self._climb_state.up_held
             or self._climb_state.phase == "climbing-up"
@@ -3076,11 +3085,16 @@ class MovementWorker(threading.Thread):
         return None
 
     def _finish_return(self, floor: str) -> None:
-        self._return_from_floor = floor
         """After a return climb/drop reaches ``floor``: in range or not?  An
         in-range floor restarts patrol there; an out-of-range floor keeps the
         return mode pointed at the next step."""
+        self._return_from_floor = floor
         if floor in self._route_layers:
+            # A return climb can reach the route while persistent Up is still
+            # owned.  Release it before resetting the climb state; otherwise
+            # ``_start_patrol_on`` forgets the ownership flag and the physical
+            # Up key can remain held into the resumed layer2 patrol.
+            self._release_climb_up()
             self._return_mode = None
             self._start_patrol_on(floor)
             LOG.warning("RETURN TO ROUTE: reached %s; restarting patrol", floor)
