@@ -100,7 +100,7 @@ class AttackWorker(threading.Thread):
                 pass
             elif (self.climbing_active_event is not None
                     and self.climbing_active_event.is_set()):
-                LOG.info("attack skipped: jump-climb input is active")
+                LOG.info("attack skipped: climb/return input is active")
             else:
                 LOG.info("attack repetition: %s", self.attack_key)
                 self.attack_once()

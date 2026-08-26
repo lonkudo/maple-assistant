@@ -1630,6 +1630,25 @@ class MovementWorker(threading.Thread):
         if key_down is None:
             return _send_tap(self.key_sender, decision)
         with self._hold_lock:
+            # The focus worker releases all physical keys on a focus dip.  Its
+            # release happens outside this hold state, so the worker can still
+            # believe Right/Z are held after refocus and silently skip their
+            # key-downs (observed: repeated action=right with frozen X and no
+            # key-down log). Reconcile with the sender's authoritative owner
+            # table before extending an existing hold.
+            is_key_down = getattr(self.key_sender, "is_key_down", None)
+            if callable(is_key_down):
+                if (self._walk_hold_key is not None
+                        and not is_key_down(self._walk_hold_key)):
+                    LOG.info(
+                        "walk hold %s was externally released; re-arming",
+                        self._walk_hold_key,
+                    )
+                    self._walk_hold_key = None
+                if self._walk_hold_z and not is_key_down("z"):
+                    self._walk_hold_z = False
+                    if self.pickup_active_event is not None:
+                        self.pickup_active_event.clear()
             if self._walk_hold_key != decision.key:
                 # 换方向：先松开旧键再按新键。
                 self._release_walk_hold()

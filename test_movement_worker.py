@@ -39,6 +39,57 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_walk_hold_rearms_after_external_focus_release(self):
+        class Sender:
+            dry_run = True
+
+            def __init__(self):
+                self.events = []
+                self.owned = set()
+
+            def key_down(self, key):
+                self.events.append(("down", key))
+                self.owned.add(key)
+                return True
+
+            def key_up(self, key):
+                self.events.append(("up", key))
+                self.owned.discard(key)
+                return True
+
+            def is_key_down(self, key):
+                return key in self.owned
+
+            def release_all_keys(self):
+                self.owned.clear()
+
+            def is_target_focused(self):
+                return True
+
+        pickup_active = threading.Event()
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={}, pickup_active_event=pickup_active,
+        )
+        decision = MovementDecision("right", "return walk", 2.0)
+
+        self.assertTrue(worker._send_walk_hold(decision))
+        self.assertEqual(sender.owned, {"right", "z"})
+        self.assertTrue(pickup_active.is_set())
+
+        # FocusWorker releases the sender directly and cannot update the
+        # MovementWorker's private hold bookkeeping.
+        sender.release_all_keys()
+        self.assertEqual(worker._walk_hold_key, "right")
+        self.assertTrue(worker._walk_hold_z)
+
+        self.assertTrue(worker._send_walk_hold(decision))
+        self.assertEqual(sender.owned, {"right", "z"})
+        self.assertEqual(sender.events.count(("down", "right")), 2)
+        self.assertEqual(sender.events.count(("down", "z")), 2)
+        self.assertTrue(pickup_active.is_set())
+
     def test_layer_debug_logging_accepts_float_player_y(self) -> None:
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(),
