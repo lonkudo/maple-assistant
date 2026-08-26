@@ -1953,6 +1953,54 @@ class MovementTests(unittest.TestCase):
         worker._stair_state["attempts"] = 0
         self.assertFalse(worker._attack_should_defer())
 
+    def test_attack_suppression_clears_immediately_on_layer_arrival(self):
+        class Sender:
+            def key_up(self, key):
+                return True
+
+        climbing = threading.Event()
+        climbing.set()
+        positions = {
+            "layer1": {
+                "layer_y": .70,
+                "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .70},
+                "right_most_pos": {"x": .8, "y": .70},
+            },
+            "layer2": {
+                "layer_y": .50,
+                "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .50},
+                "right_most_pos": {"x": .8, "y": .50},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer1", "layer2"],
+            climbing_active_event=climbing,
+            climb_layer_confirm_frames=2,
+            climb_layer_confirm_seconds=0,
+            patrol_busy_hold=3.0,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        worker._patrol_busy_until = time.monotonic() + 3.0
+        arrived = MinimapObservation(
+            Point(.5, .50), None, .9, (0, 0, 1, 1)
+        )
+
+        self.assertEqual(worker._resync_route_layer(arrived), "layer1")
+        self.assertTrue(climbing.is_set())
+        self.assertEqual(worker._resync_route_layer(arrived), "layer2")
+        self.assertFalse(climbing.is_set())
+        self.assertEqual(worker._patrol_busy_until, 0.0)
+        self.assertFalse(worker._movement_busy_now())
+        # The arrival timestamp remains available exclusively to the stair
+        # jump grace logic; it no longer blocks attacks.
+        self.assertIsNotNone(worker._climb_arrival_at)
+
     def test_y_only_incomplete_layer_can_be_detected(self):
         layers = {
             "layer1": {"layer_y": .698864, "y_tolerance": .02},

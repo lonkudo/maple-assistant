@@ -1546,20 +1546,15 @@ class MovementWorker(threading.Thread):
                     "climbing up (Z paused)", self._rope_stuck_recoveries)
 
     def _movement_busy_now(self) -> bool:
-        """True while climbing, dropping, or settling right after a climb
-        arrival.  During these windows movement must NOT yield to the attack
-        - an attack interrupting the walk/jump at the rope top or platform
-        edge makes the character fall (observed: walk released early right
-        after reaching the next layer, then a stair jump cut mid-air)."""
+        """True only while climbing or dropping is actively in progress.
+
+        The post-arrival timestamp still suppresses unsafe stair jumps, but it
+        must not suppress attacks after the new layer has been confirmed.
+        """
         if (self.dropping_active_event is not None
                 and self.dropping_active_event.is_set()):
             return True
         if self._climb_state.phase != "idle":
-            return True
-        climb_arrival_at = getattr(self, "_climb_arrival_at", None)
-        if (climb_arrival_at is not None
-                and time.monotonic() < climb_arrival_at
-                + self.stair_jump_climb_arrival_grace_seconds):
             return True
         return False
 
@@ -3054,6 +3049,9 @@ class MovementWorker(threading.Thread):
         self._last_drop_attempt = float("-inf")
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
+        # Arrival is definitive: bypass the inter-attempt busy hysteresis so
+        # both fixed and YOLO attacks can resume on this very frame.
+        self._patrol_busy_until = 0.0
         if self.dropping_active_event is not None:
             self.dropping_active_event.clear()
         if self.near_rope_event is not None:
@@ -3167,6 +3165,7 @@ class MovementWorker(threading.Thread):
             if was_climbing:
                 self._climb_arrival_at = time.monotonic()
             self._release_climb_up()
+            self._patrol_busy_until = 0.0
             self._return_mode = None
             self._return_arrival_floor = None
             self._start_patrol_on(floor)
@@ -3748,6 +3747,9 @@ class MovementWorker(threading.Thread):
         self._route_phase = "left"
         self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
+        self._patrol_busy_until = 0.0
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
         if self._route_layer_index < len(self._route_layers):
             LOG.info("climb verified; starting %s patrol", self._route_layers[self._route_layer_index])
         else:
@@ -4319,21 +4321,14 @@ class MovementWorker(threading.Thread):
                     "climb", "jump_climb_left", "jump_climb_right",
                     "jump_climb_up", "drop",
                 )
-                # 爬绳的整个阶段（起跳尝试、重试、附绳、到顶）、到达下一层
-                # 后平台边缘的调整窗口，以及换线期间，都禁止攻击：攻击会
-                # 打断跳向绳子的起跳/刚上平台的台阶跳/换线菜单操作。
+                # Attack is blocked only while climb/drop input is active.
+                # Once a new layer is confirmed and Up is released, attack
+                # resumes immediately; the separate arrival timestamp still
+                # suppresses unsafe stair jumps while the character settles.
                 now_mono = time.monotonic()
-                climb_arrival_grace_until = 0.0
-                climb_arrival_at = getattr(self, "_climb_arrival_at", None)
-                if climb_arrival_at is not None:
-                    climb_arrival_grace_until = (
-                        climb_arrival_at
-                        + self.stair_jump_climb_arrival_grace_seconds
-                    )
                 climbing_now = bool(
                     climb_decision_active
                     or self._climb_state.phase != "idle"
-                    or now_mono < climb_arrival_grace_until
                     or self._player_switch_active
                     # Returning to the patrol floor range never attacks: the
                     # climb-back / drop-back is protected like a rope climb.
@@ -4345,13 +4340,9 @@ class MovementWorker(threading.Thread):
                     else:
                         self.climbing_active_event.clear()
                 # Publish the patrol state so the YOLO attack worker blocks
-                # attacks during the WHOLE climbing operation: jump attempts,
-                # retries, the attached climb, and the post-arrival settle on
-                # the platform edge.  An attack pressed mid-jump cuts the
-                # character's momentum and drops it off the rope or the
-                # platform edge (observed: stair jump cut by attack right
-                # after reaching the next layer).  Walking toward the rope
-                # keeps attack priority - only the climb itself is protected.
+                # attacks during the active climbing operation: jump attempts,
+                # retries, and the attached climb. Walking toward the rope and
+                # confirmed-layer patrol keep attack priority.
                 if self._patrol_state is not None:
                     busy_now = bool(
                         climbing_now
