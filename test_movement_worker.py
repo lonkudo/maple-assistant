@@ -718,7 +718,13 @@ class MovementTests(unittest.TestCase):
         worker.patrol_enabled = True
         worker._return_mode = "climb-to-route"
         worker._return_from_floor = "layer1"
+        worker.climb_layer_confirm_frames = 2
+        worker.climb_layer_confirm_seconds = 0
         obs = MinimapObservation(Point(0.4, 0.7), None, .9, (0, 0, 1, 1))
+        # One reading is not enough; the second stable frame completes this
+        # zero-compensation test case.
+        target, is_rope, label = worker._route_target(obs)
+        self.assertEqual(worker._return_mode, "climb-to-route")
         target, is_rope, label = worker._route_target(obs)
         self.assertIsNone(worker._return_mode)      # return ended
         self.assertEqual(worker._route_layer_index, 0)  # layer2 in route
@@ -756,11 +762,27 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_layer_index, 1)
         self.assertEqual(worker._route_phase, "right")
 
-        target, is_rope, label = worker._route_target(on_layer2)
+        # The first layer2 reading must not release Up. Confirm three stable
+        # frames, then keep Up held through the full 0.3-second rope-top
+        # compensation even if the marker animation would flicker.
+        with patch(
+            "movement_worker.time.monotonic",
+            side_effect=[0.0, .15, .31, .31],
+        ):
+            target, is_rope, label = worker._route_target(on_layer2)
+            self.assertEqual(worker._return_mode, "climb-to-route")
+            self.assertEqual(worker.key_sender.released, [])
+            worker._route_target(on_layer2)
+            worker._route_target(on_layer2)
+            self.assertEqual(worker.key_sender.released, [])
+            worker._route_target(on_layer2)
+            self.assertEqual(worker.key_sender.released, [])
+            target, is_rope, label = worker._route_target(on_layer2)
         self.assertIsNone(worker._return_mode)
         self.assertEqual(worker._route_layer_index, 0)
         self.assertEqual(worker._route_phase, "left")
         self.assertEqual(worker.key_sender.released, ["up"])
+        self.assertIsNotNone(worker._climb_arrival_at)
         self.assertFalse(is_rope)
         self.assertEqual(label, "layer2.left-most")
 

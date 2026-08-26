@@ -2068,6 +2068,10 @@ class MovementWorker(threading.Thread):
         # grab falls the marker back to a Y between every recorded band;
         # keep targeting this floor's own rope instead of waiting forever.
         self._return_from_floor: Optional[str] = None
+        # Stable in-range floor detected at the top of a return climb. Return
+        # climbs use the normal frame confirmation and rope-top compensation
+        # before patrol is allowed to resume.
+        self._return_arrival_floor: Optional[str] = None
         # Stair jump: during the left-most/right-most patrol walk the worker
         # detects when the marker stops advancing while a walk hold is being
         # issued (a stair blocks the walk) and jumps - holding the travel
@@ -3122,8 +3126,16 @@ class MovementWorker(threading.Thread):
             # owned.  Release it before resetting the climb state; otherwise
             # ``_start_patrol_on`` forgets the ownership flag and the physical
             # Up key can remain held into the resumed layer2 patrol.
+            was_climbing = bool(
+                self._return_mode == "climb-to-route"
+                and (self._climb_state.up_held
+                     or self._climb_state.phase != "idle")
+            )
+            if was_climbing:
+                self._climb_arrival_at = time.monotonic()
             self._release_climb_up()
             self._return_mode = None
+            self._return_arrival_floor = None
             self._start_patrol_on(floor)
             LOG.warning("RETURN TO ROUTE: reached %s; restarting patrol", floor)
         else:
@@ -3133,12 +3145,61 @@ class MovementWorker(threading.Thread):
                 else "drop-to-route"
             )
             self._return_from_floor = floor
+            self._return_arrival_floor = None
+            self._climb_state.target_layer_frames = 0
+            self._climb_state.target_layer_since = None
             LOG.warning(
                 "RETURN TO ROUTE: still on %s outside range; %s",
                 floor,
                 "climbing back" if self._return_mode == "climb-to-route"
                 else "dropping back",
             )
+
+    def _return_climb_arrival_ready(self, floor: Optional[str]) -> bool:
+        """Confirm and settle a return climb before resuming patrol."""
+
+        state = self._climb_state
+        if (state.target_layer_since is not None
+                and self._return_arrival_floor in self._route_layers):
+            elapsed = time.monotonic() - state.target_layer_since
+            if elapsed < self.climb_layer_confirm_seconds:
+                LOG.info(
+                    "RETURN CLIMB top compensation: %s %.2f/%.2fs; "
+                    "keeping Up held",
+                    self._return_arrival_floor,
+                    elapsed,
+                    self.climb_layer_confirm_seconds,
+                )
+                return False
+            return True
+
+        if floor not in self._route_layers:
+            self._return_arrival_floor = None
+            state.target_layer_frames = 0
+            state.target_layer_since = None
+            return False
+        if floor != self._return_arrival_floor:
+            self._return_arrival_floor = floor
+            state.target_layer_frames = 0
+            state.target_layer_since = None
+        state.target_layer_frames += 1
+        if state.target_layer_frames < self.climb_layer_confirm_frames:
+            LOG.info(
+                "RETURN CLIMB arrival confirmation: %s %d/%d; keeping Up held",
+                floor,
+                state.target_layer_frames,
+                self.climb_layer_confirm_frames,
+            )
+            return False
+        if self.climb_layer_confirm_seconds > 0:
+            state.target_layer_since = time.monotonic()
+            LOG.info(
+                "RETURN CLIMB layer %s confirmed; compensating Up for %.2fs",
+                floor,
+                self.climb_layer_confirm_seconds,
+            )
+            return False
+        return True
 
     def _resolve_fall(self, observation: MinimapObservation) -> bool:
         """Called when a fall stops: re-detect the floor and act.
@@ -3155,7 +3216,12 @@ class MovementWorker(threading.Thread):
         self._fall_last_y = None
         self._fall_frames = 0
         if self._return_mode is not None:
-            self._finish_return(floor)
+            if (self._return_mode == "climb-to-route"
+                    and floor in self._route_layers
+                    and not self._return_climb_arrival_ready(floor)):
+                return False
+            confirmed_floor = self._return_arrival_floor or floor
+            self._finish_return(confirmed_floor)
             return True
         if floor in self._route_layers:
             if self._current_route_floor() == floor:
@@ -3169,6 +3235,7 @@ class MovementWorker(threading.Thread):
                 else "drop-to-route"
             )
             self._return_from_floor = floor
+            self._return_arrival_floor = None
             LOG.warning(
                 "FALL RECOVERY: landed on %s outside patrol range; %s",
                 floor,
@@ -3241,6 +3308,7 @@ class MovementWorker(threading.Thread):
             else "drop-to-route"
         )
         self._return_from_floor = floor
+        self._return_arrival_floor = None
         LOG.warning(
             "OUT OF PATROL RANGE: on %s outside patrol range; returning %s "
             "without attacking",
@@ -3272,21 +3340,25 @@ class MovementWorker(threading.Thread):
             # (the floor is below the patrol range).  When the climb lands
             # on the next floor ``_run_climb_step`` re-detects and either
             # restarts patrol or keeps climbing.
-            floor = self._detect_floor_all(observation)
-            if floor is None:
+            detected_floor = self._detect_floor_all(observation)
+            if self._return_climb_arrival_ready(detected_floor):
+                floor = self._return_arrival_floor
+                assert floor is not None
+                LOG.info(
+                    "RETURN TO ROUTE: climb settled on %s; restarting patrol",
+                    floor,
+                )
+                self._finish_return(floor)
+                return self._route_target(observation)
+            floor = detected_floor
+            if floor is None or floor in self._route_layers:
                 # Failed grab: the marker settled between recorded bands.  Keep
-                # retrying the rope of the floor the return started from instead
-                # of waiting forever; a fresh floor read updates the from-floor.
+                # retrying/holding the rope of the floor the return started
+                # from. An in-range reading must first complete stable-frame
+                # confirmation and the rope-top compensation window.
                 floor = self._return_from_floor
                 if floor is None:
                     return None, False, "return-climb-waiting"
-            if floor in self._route_layers:
-                # Back inside the patrol range (the climb reached an in-range
-                # floor): END the return and restart patrol on this floor -
-                # do not keep chasing its rope.  Attack resumes with it.
-                LOG.info("RETURN TO ROUTE: climbed back to %s; restarting patrol", floor)
-                self._finish_return(floor)
-                return self._route_target(observation)
             rope = self.important_positions.get(floor, {}).get("rope_pos", {})
             rope_x = (
                 float(rope["x"])
