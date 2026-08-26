@@ -39,6 +39,27 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_layer_debug_logging_accepts_float_player_y(self) -> None:
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={}, route_order=[],
+        )
+        observation = MinimapObservation(
+            Point(.414729, .350394), None, 1.0, (0, 0, 1, 1),
+            world_y_diamonds=1.333007,
+        )
+
+        with self.assertLogs("movement_worker", level="DEBUG") as logs:
+            worker._log_detected_layer("layer1", observation)
+            worker._log_detected_layer("layer1", observation)
+
+        self.assertIn(
+            "LAYER DEBUG: now on layer1 "
+            "(player_y=0.350394 world_y=1.333007)",
+            logs.output[0],
+        )
+        self.assertIn("LAYER DEBUG: on layer1", logs.output[1])
+
     def test_run_climb_step_releases_false_attach_on_noop_frame(self):
         # The attached no-op decision (key=None) never entered the send
         # block, so climb() (and the fell-back/stall release) never ran.
@@ -2495,12 +2516,26 @@ class MovementTests(unittest.TestCase):
         )
 
         with patch("movement_worker.time.monotonic", side_effect=[0, 1.05, 1.05]):
-            for _ in range(3):
-                self.assertEqual(worker._resync_route_layer(upper), "layer1")
+            # Two stable frames: still counting, Up stays held and the phase
+            # is NOT "arrival-compensation" (the timed Up hold is gone).
+            self.assertEqual(worker._resync_route_layer(upper), "layer1")
+            self.assertEqual(worker._resync_route_layer(upper), "layer1")
             self.assertEqual(sender.released, [])
-            self.assertEqual(worker._climb_state.phase, "arrival-compensation")
-            self.assertEqual(worker._resync_route_layer(y_flicker), "layer2")
-        self.assertEqual(sender.released, ["up"])
+            self.assertEqual(worker._climb_state.phase, "climbing-up")
+            # A flicker frame breaks the consecutive run: the frame count
+            # restarts (frame-based confirmation only - no timed rescue).
+            self.assertEqual(worker._resync_route_layer(y_flicker), "layer1")
+            self.assertEqual(worker._climb_state.target_layer_frames, 0)
+            self.assertEqual(sender.released, [])
+            # Three consecutive stable frames confirm the next layer: the
+            # route switches immediately and Up is released - no
+            # "arrival-compensation" phase in between.
+            self.assertEqual(worker._resync_route_layer(upper), "layer1")
+            self.assertEqual(worker._resync_route_layer(upper), "layer1")
+            self.assertEqual(worker._resync_route_layer(upper), "layer2")
+            self.assertEqual(worker._climb_state.phase, "idle")
+            self.assertEqual(worker._route_layer_index, 1)
+            self.assertEqual(sender.released, ["up"])
         # The climb-arrival stamp is set so stair jumps are suppressed while
         # the character settles on the platform edge.
         self.assertIsNotNone(worker._climb_arrival_at)

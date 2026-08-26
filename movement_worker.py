@@ -489,7 +489,7 @@ def preserve_persistent_climb(
             None,
             "Up remains held; horizontal walk deferred until climb resolves",
         )
-    if state.phase in ("climbing-up", "arrival-compensation"):
+    if state.phase == "climbing-up":
         return MovementDecision(
             None,
             "Up remains held until the next recorded layer is confirmed",
@@ -687,9 +687,6 @@ def climb(
             return "right-retry"
         return "input-blocked"
 
-    if persistent_up and state.up_held and state.phase == "arrival-compensation":
-        return "arrival-compensation"
-
     # 4-frame marker-Y window for the ON-ROPE check: if the marker falls
     # back from its recent peak (Y increases again), the grab failed and the
     # character is NOT on the rope - never confirm/keep "climbing" then.
@@ -738,10 +735,11 @@ def climb(
             # Up here made it fall back off the rope top (observed: 'CLIMB
             # stalled' right at layer arrival).
             state.arrival_frames += 1
-            if state.arrival_frames <= 30:
-                # ~3s at 10fps: the arrival confirmation (3 frames) plus the
-                # Up compensation completes well within this.  If the next
-                # layer is never confirmed, fall back to the stall retry.
+            if state.arrival_frames <= 8:
+                # ~0.8s at 10fps: the frame-based arrival confirmation
+                # (climb_layer_confirm_frames frames, default 3) finishes well
+                # inside this bound.  Up is released the moment the worker
+                # confirms the next layer - there is no timed compensation.
                 state.stalled_frames = 0
                 state.last_world_y = observation.world_y_diamonds
                 return "climbing-up"
@@ -1277,7 +1275,6 @@ class MovementWorker(threading.Thread):
         # 检测必须抑制：即使 arrival_y 缺失/未命中，也保持 Up 直到确认完成。
         arrival_in_progress = bool(
             self._climb_state.target_layer_frames > 0
-            or self._climb_state.phase == "arrival-compensation"
         )
         result = climb(
             self.key_sender,
@@ -1761,9 +1758,11 @@ class MovementWorker(threading.Thread):
         stair_jump_alt_hold_seconds: float = 0.06,
         stair_jump_lead_seconds: float = 0.15,
         stair_jump_climb_arrival_grace_seconds: float = 2.0,
+        character_positions: Optional[queue.Queue] = None,
     ) -> None:
         super().__init__(name="movement-worker", daemon=True)
         self.frame_queue = frame_queue
+        self.character_positions = character_positions
         self.key_sender = key_sender
         self.stop_event = stop_event
         self.minimap_region = minimap_region
@@ -2032,6 +2031,8 @@ class MovementWorker(threading.Thread):
         )
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
+        self._debug_last_layer: Optional[str] = None
+        self._dispatched_position_logged: Optional[float] = None
         self._last_drop_attempt = float("-inf")
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
@@ -2615,9 +2616,7 @@ class MovementWorker(threading.Thread):
             self._climb_state.up_held
             or self._climb_state.phase != "idle"
         )
-        attached = self._climb_state.phase in (
-            "climbing-up", "arrival-compensation"
-        )
+        attached = self._climb_state.phase == "climbing-up"
         if attached and abs(gap) <= self.on_rope_px:
             # Genuinely attached and overlaying the rope: no jump - patrol
             # keeps holding Up and climbs.
@@ -2788,151 +2787,127 @@ class MovementWorker(threading.Thread):
             return None
         climb_input_active = (
             self._climb_state.up_held
-            or self._climb_state.phase in ("climbing-up", "arrival-compensation")
+            or self._climb_state.phase == "climbing-up"
         )
         expected_next_index = (
             self._route_layer_index + 1
             if self._route_layer_index is not None else -1
         )
-        compensating = (
-            climb_input_active
-            and self._climb_state.phase == "arrival-compensation"
-            and self._climb_state.target_layer_since is not None
-            and 0 <= expected_next_index < len(self._route_layers)
-        )
-        if compensating:
-            elapsed = time.monotonic() - self._climb_state.target_layer_since
-            expected_name = self._route_layers[expected_next_index]
-            # Per-frame layer tracking even during the fixed Up hold: re-read
-            # the floor every frame so the bench/rope transition is followed
-            # the moment the marker or the world-Y reading moves into the
-            # next route layer.  The Up hold itself is NOT switched mid-flight
-            # (that made the character drop off the rope) - it is only
-            # tracked and logged frame by frame.
-            tracked_name = self._detected_layer(observation)
-            if elapsed < self.climb_layer_confirm_seconds:
-                LOG.info(
-                    "CLIMB arrival compensation: %s %.2f/%.2fs; keeping Up "
-                    "held (now: %s)",
-                    expected_name,
-                    elapsed,
-                    self.climb_layer_confirm_seconds,
-                    tracked_name or "none",
-                )
-                return self._route_layers[self._route_layer_index]
-            # The next layer was already confirmed. Finish the fixed Up hold
-            # even if the centered marker/scroll estimate flickers afterward.
-            detected_name = expected_name
+        # Arrival is confirmed ONLY by the frame-based layer-rope detection
+        # below: climb_layer_confirm_frames consecutive frames with the
+        # detected layer inside the NEXT route layer's band while climbing.
+        # The timed "arrival-compensation" Up hold is gone - no wall-clock
+        # phase and no fixed Up extension.  Once the frames confirm the next
+        # layer, the arrival switch below releases Up immediately.
+        if climb_input_active:
+            # During a climb the arrival is accepted from EITHER signal:
+            # the minimap marker Y (works when the world-Y tracker sticks
+            # to the lower layer) or the world Y (works when the minimap
+            # marker aliases on a scrolling map).  The HIGHER detected
+            # layer wins - the climb moves up, so a lower-layer reading
+            # is the stale/aliased one.
+            layers = {
+                name: self.important_positions[name]
+                for name in self._route_layers
+            }
+            marker_name = (
+                detect_layer_by_y(observation.player.y, layers)
+                if observation.player is not None else None
+            )
+            # Scroll-aliased minimap: two floors can share the SAME marker
+            # Y (here layer2/layer3 both read y=0.348958), so the Y-only
+            # read aliases to the lower floor and the climb arrival never
+            # confirms.  The world-Y tracker re-anchors per floor with
+            # DISTINCT anchors (layer2 0.103357, layer3 0.048505), so the
+            # NEAREST anchor resolves the floor even when the world bands
+            # overlap (tolerance 0.75 > floor gap).  No structure gate:
+            # any tracked world reading participates in the climb arrival.
+            def _nearest_world_layer(world_y: float) -> Optional[str]:
+                best_name: Optional[str] = None
+                best_gap: Optional[float] = None
+                for name in self._route_layers:
+                    layer = self.important_positions[name]
+                    if not isinstance(layer, dict):
+                        continue
+                    if "layer_world_y" not in layer:
+                        continue
+                    gap = abs(world_y - float(layer["layer_world_y"]))
+                    if best_gap is None or gap < best_gap:
+                        best_name, best_gap = name, gap
+                return best_name
+
+            world_name = (
+                _nearest_world_layer(observation.world_y_diamonds)
+                if observation.world_y_diamonds is not None else None
+            )
+
+            def _index(name: Optional[str]) -> int:
+                if name is None or name not in self._route_layers:
+                    return -1
+                return self._route_layers.index(name)
+
+            detected_name = (
+                marker_name if _index(marker_name) >= _index(world_name)
+                else world_name
+            )
         else:
-            if climb_input_active:
-                # During a climb the arrival is accepted from EITHER signal:
-                # the minimap marker Y (works when the world-Y tracker sticks
-                # to the lower layer) or the world Y (works when the minimap
-                # marker aliases on a scrolling map).  The HIGHER detected
-                # layer wins - the climb moves up, so a lower-layer reading
-                # is the stale/aliased one.
-                layers = {
-                    name: self.important_positions[name]
-                    for name in self._route_layers
-                }
-                marker_name = (
-                    detect_layer_by_y(observation.player.y, layers)
-                    if observation.player is not None else None
+            detected_name = self._detected_layer(observation)
+            # World-nearest override: every frame, over EVERY recorded
+            # floor.  After a fall the tracker re-anchors to the new floor
+            # (even layer1, outside the patrol range), so the world read
+            # points there even when the marker Y aliases inside the
+            # current band.  The flicker guard below then only protects
+            # the current floor while the world anchor still matches it.
+            world_name = (
+                self._nearest_world_layer_all(observation.world_y_diamonds)
+                if observation.world_y_diamonds is not None else None
+            )
+            if world_name is not None and world_name != detected_name:
+                detected_name = world_name
+            # Overlapping-band flicker guard: adjacent floors' recorded
+            # Y bands can overlap (span +- tolerance), so a Y-only reading
+            # can hit BOTH the current floor and a neighbour (observed:
+            # "LAYER CHANGED: layer3 -> layer2 at y=0.348958" while the
+            # character visibly stands on layer3).  When the CURRENT
+            # layer's own band still contains the marker Y, keep patrolling
+            # it - the switch would re-target the other floor's points and
+            # the patrol never completes.  It applies ONLY to ambiguous
+            # marker-Y-only detection: a confident scroll-compensated
+            # world-Y read (structure confidence + calibrated world Y) is
+            # still authoritative and switches floors.  Unambiguous marker
+            # readings (clearly outside the current band) still switch.
+            route_layers = {
+                name: self.important_positions[name]
+                for name in self._route_layers
+            }
+            world_authoritative = bool(
+                observation.world_y_diamonds is not None
+                and observation.structure_confidence >= 0.12
+                and any(
+                    isinstance(layer, dict) and "layer_world_y" in layer
+                    for layer in route_layers.values()
                 )
-                # Scroll-aliased minimap: two floors can share the SAME marker
-                # Y (here layer2/layer3 both read y=0.348958), so the Y-only
-                # read aliases to the lower floor and the climb arrival never
-                # confirms.  The world-Y tracker re-anchors per floor with
-                # DISTINCT anchors (layer2 0.103357, layer3 0.048505), so the
-                # NEAREST anchor resolves the floor even when the world bands
-                # overlap (tolerance 0.75 > floor gap).  No structure gate:
-                # any tracked world reading participates in the climb arrival.
-                def _nearest_world_layer(world_y: float) -> Optional[str]:
-                    best_name: Optional[str] = None
-                    best_gap: Optional[float] = None
-                    for name in self._route_layers:
-                        layer = self.important_positions[name]
-                        if not isinstance(layer, dict):
-                            continue
-                        if "layer_world_y" not in layer:
-                            continue
-                        gap = abs(world_y - float(layer["layer_world_y"]))
-                        if best_gap is None or gap < best_gap:
-                            best_name, best_gap = name, gap
-                    return best_name
-
-                world_name = (
-                    _nearest_world_layer(observation.world_y_diamonds)
-                    if observation.world_y_diamonds is not None else None
-                )
-
-                def _index(name: Optional[str]) -> int:
-                    if name is None or name not in self._route_layers:
-                        return -1
-                    return self._route_layers.index(name)
-
-                detected_name = (
-                    marker_name if _index(marker_name) >= _index(world_name)
-                    else world_name
-                )
-            else:
-                detected_name = self._detected_layer(observation)
-                # World-nearest override: every frame, over EVERY recorded
-                # floor.  After a fall the tracker re-anchors to the new floor
-                # (even layer1, outside the patrol range), so the world read
-                # points there even when the marker Y aliases inside the
-                # current band.  The flicker guard below then only protects
-                # the current floor while the world anchor still matches it.
-                world_name = (
-                    self._nearest_world_layer_all(observation.world_y_diamonds)
-                    if observation.world_y_diamonds is not None else None
-                )
-                if world_name is not None and world_name != detected_name:
-                    detected_name = world_name
-                # Overlapping-band flicker guard: adjacent floors' recorded
-                # Y bands can overlap (span +- tolerance), so a Y-only reading
-                # can hit BOTH the current floor and a neighbour (observed:
-                # "LAYER CHANGED: layer3 -> layer2 at y=0.348958" while the
-                # character visibly stands on layer3).  When the CURRENT
-                # layer's own band still contains the marker Y, keep patrolling
-                # it - the switch would re-target the other floor's points and
-                # the patrol never completes.  It applies ONLY to ambiguous
-                # marker-Y-only detection: a confident scroll-compensated
-                # world-Y read (structure confidence + calibrated world Y) is
-                # still authoritative and switches floors.  Unambiguous marker
-                # readings (clearly outside the current band) still switch.
-                route_layers = {
-                    name: self.important_positions[name]
-                    for name in self._route_layers
-                }
-                world_authoritative = bool(
-                    observation.world_y_diamonds is not None
-                    and observation.structure_confidence >= 0.12
-                    and any(
-                        isinstance(layer, dict) and "layer_world_y" in layer
-                        for layer in route_layers.values()
+            )
+            current_name = (
+                self._route_layers[self._route_layer_index]
+                if (self._route_layer_index is not None
+                    and 0 <= self._route_layer_index < len(self._route_layers))
+                else None
+            )
+            if (current_name is not None
+                    and detected_name is not None
+                    and detected_name != current_name
+                    and not world_authoritative
+                    and observation.player is not None
+                    and self._layer_band_contains(
+                        current_name, observation.player.y
                     )
+                    and (world_name is None or world_name == current_name)):
+                LOG.info(
+                    "LAYER flicker guard: keeping %s (Y %.6f still inside "
+                    "its band)", current_name, observation.player.y
                 )
-                current_name = (
-                    self._route_layers[self._route_layer_index]
-                    if (self._route_layer_index is not None
-                        and 0 <= self._route_layer_index < len(self._route_layers))
-                    else None
-                )
-                if (current_name is not None
-                        and detected_name is not None
-                        and detected_name != current_name
-                        and not world_authoritative
-                        and observation.player is not None
-                        and self._layer_band_contains(
-                            current_name, observation.player.y
-                        )
-                        and (world_name is None or world_name == current_name)):
-                    LOG.info(
-                        "LAYER flicker guard: keeping %s (Y %.6f still inside "
-                        "its band)", current_name, observation.player.y
-                    )
-                    detected_name = current_name
+                detected_name = current_name
         if detected_name is None:
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
@@ -2975,15 +2950,11 @@ class MovementWorker(threading.Thread):
                     self.climb_layer_confirm_frames,
                 )
                 return self._route_layers[self._route_layer_index]
-            if not compensating and self.climb_layer_confirm_seconds > 0:
-                self._climb_state.target_layer_since = time.monotonic()
-                self._climb_state.phase = "arrival-compensation"
-                LOG.info(
-                    "CLIMB layer %s seems reached; starting %.2fs Up compensation",
-                    detected_name,
-                    self.climb_layer_confirm_seconds,
-                )
-                return self._route_layers[self._route_layer_index]
+            # Frame-based arrival only: climb_layer_confirm_frames consecutive
+            # frames inside the next layer's band complete the confirmation.
+            # There is no timed Up compensation - once the frame count is met
+            # the code falls straight into the arrival switch below, which
+            # releases Up, adopts the detected layer and resets the climb.
         elif climb_input_active:
             self._climb_state.target_layer_frames = 0
             self._climb_state.target_layer_since = None
@@ -3656,6 +3627,27 @@ class MovementWorker(threading.Thread):
         if canonical is not None and callable(reanchor):
             reanchor(canonical)
 
+    def _log_detected_layer(
+        self,
+        detected_layer_name: Optional[str],
+        observation: MinimapObservation,
+    ) -> None:
+        """Log the current layer without interrupting movement analysis."""
+
+        changed = detected_layer_name != self._debug_last_layer
+        if changed:
+            self._debug_last_layer = detected_layer_name
+        log = LOG.info if changed else LOG.debug
+        log(
+            "LAYER DEBUG: %s %s (player_y=%.6f world_y=%s)",
+            "now on" if changed else "on",
+            detected_layer_name or "none",
+            (observation.player.y if observation.player is not None
+             else float("nan")),
+            (f"{observation.world_y_diamonds:.6f}"
+             if observation.world_y_diamonds is not None else "n/a"),
+        )
+
     def run(self) -> None:
         LOG.info("movement worker started (%s)", "DRY-RUN" if getattr(self.key_sender, "dry_run", True) else "LIVE")
         # 独立 hold 管理线程：主循环处理帧时方向键由它按/松。
@@ -3798,7 +3790,7 @@ class MovementWorker(threading.Thread):
                             player=Point(
                                 float(dispatched.x), float(dispatched.y)
                             ),
-                            marker_confidence=dispatched.confidence,
+                            confidence=dispatched.confidence,
                             marker_pixel_size=(
                                 dispatched.marker_pixel_size
                                 if dispatched.marker_pixel_size is not None
@@ -3866,7 +3858,8 @@ class MovementWorker(threading.Thread):
                 # platform cannot hijack the drop/return; a reading that
                 # genuinely enters another route layer's band is followed
                 # frame by frame.
-                self._resync_route_layer(observation)
+                detected_layer_name = self._resync_route_layer(observation)
+                self._log_detected_layer(detected_layer_name, observation)
                 observation = self._pin_stationary_layer_world_y(observation)
                 # Falling recovery: track rapid diamond-Y drops (an unexpected
                 # fall - knocked down / missed a stair / walked off an edge).
