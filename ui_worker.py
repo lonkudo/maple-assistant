@@ -425,6 +425,12 @@ def record_button_is_locked(saved_endpoint: Any, explicitly_unlocked: bool) -> b
     return saved_endpoint is not None and not explicitly_unlocked
 
 
+def recorded_coordinate_text(x: float, y: float) -> str:
+    """Compact button-only display; stored coordinate precision is unchanged."""
+
+    return f"x={float(x):.4f} y={float(y):.4f}"
+
+
 class UiWorker(threading.Thread):
     """Own the independent UI loop; Tk requires ``run`` on Python's main thread."""
 
@@ -2445,7 +2451,7 @@ class UiWorker(threading.Thread):
                 if locked and recorded is not None:
                     text = (
                         f"🔒 {button_label}\n"
-                        f"x={recorded.x:.6f} y={recorded.y:.6f}"
+                        f"{recorded_coordinate_text(recorded.x, recorded.y)}"
                     )
                 else:
                     text = (
@@ -2576,5 +2582,6 @@ __all__ = [
     "patrol_button_states",
     "rope_unavailable_hint",
     "record_button_is_locked",
+    "recorded_coordinate_text",
     "tooltip_cursor_top_right_position",
 ]

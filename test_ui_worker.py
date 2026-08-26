@@ -9,6 +9,7 @@ from ui_worker import (
     layer_display_order,
     patrol_button_states,
     record_button_is_locked,
+    recorded_coordinate_text,
     rope_unavailable_hint,
     tooltip_cursor_top_right_position,
     _clamp_window_geometry,
@@ -86,6 +87,12 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertTrue(record_button_is_locked(endpoint, False))
         self.assertFalse(record_button_is_locked(endpoint, True))
         self.assertFalse(record_button_is_locked(None, False))
+
+    def test_recorded_coordinate_text_uses_four_display_decimals_only(self) -> None:
+        self.assertEqual(
+            recorded_coordinate_text(0.123456, 0.987654),
+            "x=0.1235 y=0.9877",
+        )
 
     def test_tooltip_is_at_cursor_top_right(self) -> None:
         self.assertEqual(
