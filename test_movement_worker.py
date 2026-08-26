@@ -2676,7 +2676,7 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(sender.released, [])
             self.assertEqual(worker._climb_state.phase, "climbing-up")
             # Before confirmation, a flicker still breaks the consecutive run.
-            self.assertEqual(worker._resync_route_layer(y_flicker), "layer1")
+            self.assertIsNone(worker._resync_route_layer(y_flicker))
             self.assertEqual(worker._climb_state.target_layer_frames, 0)
             self.assertEqual(sender.released, [])
             # Three consecutive stable frames confirm the next layer and start
@@ -2697,6 +2697,69 @@ class MovementTests(unittest.TestCase):
         # The climb-arrival stamp is set so stair jumps are suppressed while
         # the character settles on the platform edge.
         self.assertIsNotNone(worker._climb_arrival_at)
+
+    def test_climb_does_not_release_up_at_world_anchor_midpoint(self):
+        class Sender:
+            def __init__(self):
+                self.released = []
+
+            def key_up(self, key):
+                self.released.append(key)
+                return True
+
+        positions = {
+            "layer2": {
+                "layer_y": .505208,
+                "y_tolerance": .02,
+                "layer_world_y": .114152,
+                "left_most_pos": {"x": .3, "y": .505208},
+                "right_most_pos": {"x": .7, "y": .505208},
+            },
+            # Scrolling maps can show the same marker Y on adjacent floors;
+            # world Y must distinguish actual arrival from the rope midpoint.
+            "layer3": {
+                "layer_y": .505208,
+                "y_tolerance": .02,
+                "layer_world_y": -.807188,
+                "left_most_pos": {"x": .3, "y": .505208},
+                "right_most_pos": {"x": .7, "y": .505208},
+            },
+        }
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions=positions,
+            route_order=["layer2", "layer3"],
+            climb_layer_confirm_frames=3,
+            climb_layer_confirm_seconds=.3,
+            climb_arrival_world_tolerance=.2,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+
+        midpoint = MinimapObservation(
+            Point(.59, .505208), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-.35,
+            structure_confidence=.9,
+        )
+        for _ in range(10):
+            self.assertEqual(worker._resync_route_layer(midpoint), "layer2")
+        self.assertEqual(worker._route_layer_index, 0)
+        self.assertEqual(sender.released, [])
+
+        at_layer3 = replace(midpoint, world_y_diamonds=-.75)
+        with patch(
+            "movement_worker.time.monotonic",
+            side_effect=[0.0, .31, .31],
+        ):
+            for _ in range(worker.climb_layer_confirm_frames):
+                worker._resync_route_layer(at_layer3)
+            self.assertEqual(worker._route_layer_index, 0)
+            self.assertEqual(sender.released, [])
+            self.assertEqual(worker._resync_route_layer(at_layer3), "layer3")
+        self.assertEqual(worker._route_layer_index, 1)
+        self.assertEqual(sender.released, ["up"])
 
     def test_next_layer_y_controls_climb_completion(self):
         positions = {

@@ -1679,6 +1679,7 @@ class MovementWorker(threading.Thread):
         aligned_frames_required: int = 2,
         climb_layer_confirm_frames: int = 3,
         climb_layer_confirm_seconds: float = 0.3,
+        climb_arrival_world_tolerance: float = 0.20,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
@@ -1793,6 +1794,9 @@ class MovementWorker(threading.Thread):
         self.climb_layer_confirm_frames = max(2, int(climb_layer_confirm_frames))
         self.climb_layer_confirm_seconds = max(
             0.0, float(climb_layer_confirm_seconds)
+        )
+        self.climb_arrival_world_tolerance = max(
+            0.01, float(climb_arrival_world_tolerance)
         )
         self.climb_nudge_seconds = climb_nudge_seconds
         self.climb_y_change_required = climb_y_change_required
@@ -2834,55 +2838,84 @@ class MovementWorker(threading.Thread):
             # began.  Do not let one rope-top animation frame undo it.
             detected_name = expected_name
         elif climb_input_active:
-            # During a climb the arrival is accepted from EITHER signal:
-            # the minimap marker Y (works when the world-Y tracker sticks
-            # to the lower layer) or the world Y (works when the minimap
-            # marker aliases on a scrolling map).  The HIGHER detected
-            # layer wins - the climb moves up, so a lower-layer reading
-            # is the stale/aliased one.
-            layers = {
-                name: self.important_positions[name]
-                for name in self._route_layers
-            }
-            marker_name = (
-                detect_layer_by_y(observation.player.y, layers)
-                if observation.player is not None else None
+            # A climb can only arrive at the immediate next route layer.  The
+            # old nearest-anchor rule switched at the midpoint between floors,
+            # released Up while the character was still on the rope, and then
+            # horizontal patrol pulled it off.  Accept the next floor only
+            # from an unambiguous marker band or when world Y is tightly near
+            # that floor's calibrated anchor.
+            current_name = (
+                self._route_layers[self._route_layer_index]
+                if (self._route_layer_index is not None
+                    and 0 <= self._route_layer_index < len(self._route_layers))
+                else None
             )
-            # Scroll-aliased minimap: two floors can share the SAME marker
-            # Y (here layer2/layer3 both read y=0.348958), so the Y-only
-            # read aliases to the lower floor and the climb arrival never
-            # confirms.  The world-Y tracker re-anchors per floor with
-            # DISTINCT anchors (layer2 0.103357, layer3 0.048505), so the
-            # NEAREST anchor resolves the floor even when the world bands
-            # overlap (tolerance 0.75 > floor gap).  No structure gate:
-            # any tracked world reading participates in the climb arrival.
-            def _nearest_world_layer(world_y: float) -> Optional[str]:
-                best_name: Optional[str] = None
-                best_gap: Optional[float] = None
-                for name in self._route_layers:
-                    layer = self.important_positions[name]
-                    if not isinstance(layer, dict):
-                        continue
-                    if "layer_world_y" not in layer:
-                        continue
-                    gap = abs(world_y - float(layer["layer_world_y"]))
-                    if best_gap is None or gap < best_gap:
-                        best_name, best_gap = name, gap
-                return best_name
-
-            world_name = (
-                _nearest_world_layer(observation.world_y_diamonds)
-                if observation.world_y_diamonds is not None else None
+            expected_name = (
+                self._route_layers[expected_next_index]
+                if 0 <= expected_next_index < len(self._route_layers)
+                else None
+            )
+            marker_expected = bool(
+                expected_name is not None
+                and observation.player is not None
+                and self._layer_band_contains(
+                    expected_name, observation.player.y
+                )
+            )
+            marker_current = bool(
+                current_name is not None
+                and observation.player is not None
+                and self._layer_band_contains(
+                    current_name, observation.player.y
+                )
+            )
+            marker_unambiguous = marker_expected and not marker_current
+            marker_route_name = detect_layer_by_y(
+                observation.player.y,
+                {
+                    name: self.important_positions[name]
+                    for name in self._route_layers
+                },
+            )
+            marker_lower_fall = bool(
+                marker_route_name is not None
+                and self._route_layer_index is not None
+                and self._route_layers.index(marker_route_name)
+                    < self._route_layer_index
+                and not marker_current
             )
 
-            def _index(name: Optional[str]) -> int:
-                if name is None or name not in self._route_layers:
-                    return -1
-                return self._route_layers.index(name)
-
+            world_expected = False
+            if (expected_name is not None
+                    and observation.world_y_diamonds is not None
+                    and observation.structure_confidence >= 0.12):
+                expected_layer = self.important_positions.get(expected_name, {})
+                current_layer = self.important_positions.get(current_name, {})
+                if (isinstance(expected_layer, dict)
+                        and "layer_world_y" in expected_layer):
+                    expected_world = float(expected_layer["layer_world_y"])
+                    world_tolerance = self.climb_arrival_world_tolerance
+                    if (isinstance(current_layer, dict)
+                            and "layer_world_y" in current_layer):
+                        anchor_gap = abs(
+                            expected_world
+                            - float(current_layer["layer_world_y"])
+                        )
+                        # Closely spaced anchors need a proportionally tighter
+                        # gate; otherwise both floors fall inside the maximum.
+                        world_tolerance = min(
+                            world_tolerance,
+                            max(0.01, anchor_gap * 0.25),
+                        )
+                    world_expected = (
+                        abs(observation.world_y_diamonds - expected_world)
+                        <= world_tolerance
+                    )
             detected_name = (
-                marker_name if _index(marker_name) >= _index(world_name)
-                else world_name
+                expected_name
+                if marker_unambiguous or world_expected
+                else marker_route_name if marker_lower_fall
+                else current_name if marker_current else None
             )
         else:
             detected_name = self._detected_layer(observation)
