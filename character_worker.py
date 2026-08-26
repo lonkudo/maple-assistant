@@ -32,7 +32,10 @@ DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
 class CharacterPosition:
     """One dispatched marker reading (normalised minimap coordinates)."""
 
-    __slots__ = ("x", "y", "confidence", "marker_pixel_size")
+    __slots__ = (
+        "x", "y", "confidence", "marker_pixel_size", "frame_sequence",
+        "minimap_region",
+    )
 
     def __init__(
         self,
@@ -40,11 +43,15 @@ class CharacterPosition:
         y: Optional[float],
         confidence: float,
         marker_pixel_size: Optional[tuple[int, int]] = None,
+        frame_sequence: Optional[int] = None,
+        minimap_region: Optional[tuple[float, float, float, float]] = None,
     ) -> None:
         self.x = x
         self.y = y
         self.confidence = confidence
         self.marker_pixel_size = marker_pixel_size
+        self.frame_sequence = frame_sequence
+        self.minimap_region = minimap_region
 
 
 def _crop_minimap(image: Any, region: tuple[float, float, float, float]) -> np.ndarray:
@@ -98,9 +105,15 @@ class CharacterWorker(Thread):
                         getattr(detection, "y", None),
                         float(getattr(detection, "confidence", 0.0)),
                         getattr(detection, "marker_pixel_size", None),
+                        getattr(frame, "sequence", None),
+                        tuple(self.minimap_region),
                     )
                 else:
-                    position = CharacterPosition(None, None, 0.0)
+                    position = CharacterPosition(
+                        None, None, 0.0,
+                        frame_sequence=getattr(frame, "sequence", None),
+                        minimap_region=tuple(self.minimap_region),
+                    )
                 try:
                     self.position_queue.put_nowait(position)
                 except queue.Full:

@@ -28,6 +28,7 @@ from movement_worker import (
     preserve_persistent_climb,
     _send_tap,
     _drop_through_platform,
+    _dispatched_position_matches,
 )
 
 
@@ -39,6 +40,27 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_dispatched_marker_must_match_current_frame_and_minimap_region(self):
+        class Reading:
+            x = .42
+            y = .56
+            confidence = .9
+            frame_sequence = 7
+            minimap_region = (0.01, 0.02, 0.20, 0.24)
+
+        reading = Reading()
+        current = (0.01, 0.02, 0.20, 0.24)
+        self.assertTrue(_dispatched_position_matches(reading, 7, current))
+        self.assertFalse(_dispatched_position_matches(reading, 8, current))
+        self.assertFalse(_dispatched_position_matches(
+            reading, 7, (0.0, 0.075, 0.12, 0.24)
+        ))
+
+        # A clipped detection from the fallback crop reported marker_y=0 at
+        # patrol startup and used to overwrite the correct same-frame result.
+        reading.y = 0.0
+        self.assertFalse(_dispatched_position_matches(reading, 7, current))
+
     def test_walk_hold_rearms_after_external_focus_release(self):
         class Sender:
             dry_run = True

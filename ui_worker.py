@@ -537,10 +537,17 @@ class UiWorker(threading.Thread):
 
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
+            # The controls column used to receive half the window even though
+            # its content needs less room. A 2:3 grid makes it 40% of the
+            # available width (20% narrower than the former 50% share) and
+            # gives the debug/YOLO column the recovered space.
+            columns.columnconfigure(0, weight=2)
+            columns.columnconfigure(1, weight=3)
+            columns.rowconfigure(0, weight=1)
             col1 = ttk.Frame(columns)
-            col1.pack(side="left", fill="both", expand=True, padx=(0, 6))
+            col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
             col2 = ttk.Frame(columns)
-            col2.pack(side="left", fill="both", expand=True, padx=(6, 0))
+            col2.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
             controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=10)
             controls.pack(fill="x", pady=(12, 8))

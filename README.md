@@ -109,6 +109,9 @@ re-recorded when the UI labels them as a legacy layout.
   separate arrival grace period only prevents an unsafe stair jump.
 - Losing focus releases every key. After refocus, movement reconciles its
   internal hold state with the sender and re-presses externally released keys.
+- A secondary character-marker reading can override movement only when it
+  belongs to the same frame and detected minimap region; clipped startup
+  readings such as `marker_y=0` are ignored.
 - Self-rescue requires a genuinely stationary run. Off-layer readings use a
   separate consecutive counter, so adaptive minimap drift or visible patrol
   progress cannot cause a premature Alt+Down drop.

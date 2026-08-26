@@ -58,8 +58,10 @@ red other-player diamonds. `DiamondSizeTracker` stabilizes small marker-size
 changes but accepts large zoom changes immediately. `MapStructureTracker`
 estimates scroll-compensated world Y and can re-anchor at a recorded floor.
 
-`CharacterWorker` supplies a separately sampled marker position. Movement may
-use that dispatched position when confidence is sufficient.
+`CharacterWorker` supplies a separately sampled marker position. Movement uses
+it only when confidence is sufficient and its frame sequence and minimap region
+exactly match the movement analysis. This prevents the startup fallback crop
+from overwriting a valid layer marker with a clipped `marker_y=0` reading.
 
 ## 3. Input ownership and foreground safety
 
@@ -86,6 +88,10 @@ reconciles its private Left/Right/Z hold bookkeeping with
 `WindowKeySender.is_key_down()` before extending a hold. This re-arms keys that
 were externally released and prevents a repeated movement decision with no
 physical input.
+
+Runtime log formatting removes the redundant `-worker` suffix from thread
+names. Movement stage logs are compact (`PATROL|`, `CLIMB|`, and
+`MOVE TO ROPE|`) without alignment padding before the separator.
 
 Control ownership rules:
 

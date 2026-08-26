@@ -1,8 +1,9 @@
+import logging
 import threading
 import unittest
 from unittest.mock import patch
 
-from assistant import _start_live_input, parse_args
+from assistant import _compact_log_formatter, _start_live_input, parse_args
 
 
 class FakeSender:
@@ -23,6 +24,17 @@ class FakeSender:
 
 
 class StartLiveInputTests(unittest.TestCase):
+    def test_log_formatter_removes_only_worker_suffix(self) -> None:
+        formatter = _compact_log_formatter()
+        record = logging.LogRecord(
+            "movement_worker", logging.INFO, __file__, 1,
+            "PATROL| pos=(0.25, 0.52)", (), None,
+        )
+        record.threadName = "movement-worker"
+        rendered = formatter.format(record)
+        self.assertIn(" movement INFO PATROL|", rendered)
+        self.assertNotIn("movement-worker", rendered)
+
     def test_attack_worker_is_disabled_by_default(self) -> None:
         with patch("sys.argv", ["assistant.py"]):
             self.assertFalse(parse_args().enable_attack)

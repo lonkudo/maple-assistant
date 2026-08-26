@@ -16,6 +16,21 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
+class CompactThreadFormatter(logging.Formatter):
+    """Display worker thread names without the redundant ``-worker``."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.compact_thread_name = record.threadName.removesuffix("-worker")
+        return super().format(record)
+
+
+def _compact_log_formatter() -> logging.Formatter:
+    return CompactThreadFormatter(
+        "%(asctime)s %(compact_thread_name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
 OPENCV_ANALYSIS_SIZE = (200, 200)
 MINIMAP_FALLBACK_REGION = (0, 0, 0.2, 0.24)
 STATUS_CAPTURE_REGION = (0.36, 0.96, 0.53, 1)
@@ -137,10 +152,11 @@ def main() -> int:
     if singleton_handle is None:
         return 0
     args = parse_args()
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(_compact_log_formatter())
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(threadName)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
+        handlers=[console_handler],
     )
     log_path = Path(__file__).with_name("work") / "assistant.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,10 +166,7 @@ def main() -> int:
         backupCount=2,
         encoding="utf-8",
     )
-    file_log_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(threadName)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    ))
+    file_log_handler.setFormatter(_compact_log_formatter())
     logging.getLogger().addHandler(file_log_handler)
 
     # Imports are delayed so `--help` works even before dependencies are installed.
@@ -196,10 +209,7 @@ def main() -> int:
     ui_log_handler = None
     if not args.no_ui:
         ui_log_handler = UiLogHandler(capacity=300)
-        ui_log_handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(threadName)s %(levelname)s %(message)s",
-            datefmt="%H:%M:%S",
-        ))
+        ui_log_handler.setFormatter(_compact_log_formatter())
         logging.getLogger().addHandler(ui_log_handler)
     # The dashboard and frame analysis start without stealing focus. Keyboard
     # input is armed only after the user explicitly clicks Start Patrol.

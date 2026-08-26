@@ -68,6 +68,39 @@ class MinimapObservation:
     scroll_y_diamonds: float = 0.0
 
 
+def _dispatched_position_matches(
+    dispatched: Any,
+    frame_sequence: int,
+    minimap_region: tuple[float, float, float, float],
+) -> bool:
+    """Whether a secondary marker reading belongs to this exact analysis.
+
+    Before the detected minimap region is available, CharacterWorker uses a
+    broad fallback crop. A yellow object on that crop's edge can report a
+    confident ``y=0``. Never let a reading from another frame/region—or a
+    clipped border component—overwrite MovementWorker's current observation.
+    """
+
+    if (dispatched is None
+            or getattr(dispatched, "x", None) is None
+            or getattr(dispatched, "y", None) is None
+            or float(getattr(dispatched, "confidence", 0.0)) < 0.5):
+        return False
+    if getattr(dispatched, "frame_sequence", None) != frame_sequence:
+        return False
+    source_region = getattr(dispatched, "minimap_region", None)
+    if not isinstance(source_region, (tuple, list)) or len(source_region) != 4:
+        return False
+    if any(
+        abs(float(source) - float(current)) > 1e-9
+        for source, current in zip(source_region, minimap_region)
+    ):
+        return False
+    x = float(dispatched.x)
+    y = float(dispatched.y)
+    return 0.0 < x < 1.0 and 0.0 < y < 1.0
+
+
 @dataclass(frozen=True)
 class MovementDecision:
     key: Optional[str]
@@ -4019,9 +4052,9 @@ class MovementWorker(threading.Thread):
                         dispatched = self.character_positions.get_nowait()
                     except queue.Empty:
                         dispatched = None
-                    if (dispatched is not None
-                            and dispatched.x is not None
-                            and dispatched.confidence >= 0.5):
+                    if _dispatched_position_matches(
+                        dispatched, frame.sequence, minimap_region
+                    ):
                         observation = replace(
                             observation,
                             player=Point(
@@ -4461,7 +4494,7 @@ class MovementWorker(threading.Thread):
                                    if active_target_x is not None else "----")
                     gap_text = f"{gap:+.6f}" if gap is not None else "----"
                     LOG.info(
-                        "%-12s | pos=(%.6f, %.6f) | target=%s | gap=%s | action=%s",
+                        "%s| pos=(%.6f, %.6f) | target=%s | gap=%s | action=%s",
                         stage,
                         observation.player.x,
                         observation.player.y,
