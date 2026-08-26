@@ -133,6 +133,36 @@ class MovementTests(unittest.TestCase):
         )
         self.assertIn("LAYER DEBUG: on layer1", logs.output[1])
 
+    def test_overlapping_layer_bands_choose_nearest_recorded_floor(self):
+        layers = {
+            "layer1": {
+                "layer_y": .60, "y_tolerance": .04,
+                "left_most_pos": {"x": .2, "y": .60},
+                "right_most_pos": {"x": .8, "y": .63},
+            },
+            "layer2": {
+                "layer_y": .57, "y_tolerance": .04,
+                "left_most_pos": {"x": .2, "y": .55},
+                "right_most_pos": {"x": .8, "y": .60},
+            },
+        }
+
+        # Both bands contain these values; select by distance to the recorded
+        # floor anchor rather than alphabetic layer name.
+        self.assertEqual(detect_layer_by_y(.598958, layers), "layer1")
+        self.assertEqual(detect_layer_by_y(.571000, layers), "layer2")
+
+        world_layers = {
+            "layer1": {"layer_world_y": .20, "world_y_tolerance": .20},
+            "layer2": {"layer_world_y": .10, "world_y_tolerance": .20},
+        }
+        self.assertEqual(
+            detect_layer_by_world_y(.18, world_layers), "layer1"
+        )
+        self.assertEqual(
+            detect_layer_by_world_y(.09, world_layers), "layer2"
+        )
+
     def test_run_climb_step_releases_false_attach_on_noop_frame(self):
         # The attached no-op decision (key=None) never entered the send
         # block, so climb() (and the fell-back/stall release) never ran.

@@ -112,6 +112,9 @@ re-recorded when the UI labels them as a legacy layout.
 - A secondary character-marker reading can override movement only when it
   belongs to the same frame and detected minimap region; clipped startup
   readings such as `marker_y=0` are ignored.
+- Patrol startup detects the character's actual recorded layer from the fresh
+  adaptive minimap before anchoring world Y; it does not assume the character
+  is already on the configured first patrol layer.
 - Self-rescue requires a genuinely stationary run. Off-layer readings use a
   separate consecutive counter, so adaptive minimap drift or visible patrol
   progress cannot cause a premature Alt+Down drop.

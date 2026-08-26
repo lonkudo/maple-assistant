@@ -127,8 +127,11 @@ current minimap layout and scales layer tolerance.
 
 Map identity is handled separately by `MapIdentityStore`, using ignored
 reference images below `recording-assets/map-names/`. Starting patrol verifies
-the configured map when a reference exists. Map structure reference data under
-`recording-assets/` supports world-Y tracking.
+the configured map when a reference exists. The same fresh frame detects the
+actual current layer in the adaptive minimap layout before world Y is anchored;
+startup never assumes the character already stands on the configured first
+route layer. Map structure reference data under `recording-assets/` supports
+world-Y tracking.
 
 ## 5. Movement state machines
 

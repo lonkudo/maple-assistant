@@ -196,7 +196,13 @@ def detect_layer_by_y(
             continue
         band_min, band_max = band
         if band_min - 1e-9 <= player_y <= band_max + 1e-9:
-            candidates.append((0.0, name))
+            # Overlapping bands are common after minimap scrolling. The old
+            # constant score silently selected the alphabetically first layer,
+            # regardless of which recorded platform was actually closest.
+            reference_y = float(layer.get(
+                "layer_y", (band_min + band_max) / 2.0
+            ))
+            candidates.append((abs(player_y - reference_y), name))
     return min(candidates)[1] if candidates else None
 
 
@@ -216,7 +222,10 @@ def detect_layer_by_world_y(
             continue
         band_min, band_max = band
         if band_min - 1e-9 <= world_y <= band_max + 1e-9:
-            candidates.append((0.0, name))
+            reference_y = float(layer.get(
+                "layer_world_y", (band_min + band_max) / 2.0
+            ))
+            candidates.append((abs(world_y - reference_y), name))
     return min(candidates)[1] if candidates else None
 
 

@@ -170,9 +170,10 @@ def main() -> int:
     logging.getLogger().addHandler(file_log_handler)
 
     # Imports are delayed so `--help` works even before dependencies are installed.
+    import numpy as np
     from capture_worker import CaptureWorker, FrameBus
     from character_worker import CharacterWorker
-    from movement_worker import MovementWorker
+    from movement_worker import MovementWorker, detect_layer_by_y
     from status_worker import (
         BarStatusDetector,
         StatusConfig,
@@ -183,10 +184,10 @@ def main() -> int:
     from shutdown_worker import ShutdownWorker
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
-    from marker_detector import DiamondSizeTracker
+    from marker_detector import DiamondSizeTracker, detect_yellow_diamond
     from map_identity import MapIdentityStore
     from map_structure_tracker import MapStructureTracker
-    from patrol_control import PatrolController
+    from patrol_control import CoordinateLayout, PatrolController
     from ui_worker import UiLogHandler, UiWorker
 
     stop_event = threading.Event()
@@ -313,8 +314,39 @@ def main() -> int:
                 configured_name,
             )
 
-        snapshot = patrol_controller.snapshot()
-        anchor_name = str(patrol_controller.first_layer() or (
+        # Detect the floor on the fresh frame BEFORE setting the transient
+        # world-Y origin. Anchoring unconditionally to the configured patrol
+        # start made a character standing on layer1 look confidently like
+        # layer2; every later world-Y check then reinforced that wrong state.
+        analysis_rgb = np.asarray(
+            fresh_frame.image.crop(detection.analysis_box).convert("RGB")
+        )
+        marker = detect_yellow_diamond(analysis_rgb)
+        layout = None
+        if marker is not None:
+            analysis_left, analysis_top, analysis_right, analysis_bottom = (
+                detection.analysis_box
+            )
+            canvas_left, canvas_top, canvas_right, canvas_bottom = (
+                detection.canvas_box
+            )
+            marker_width, marker_height = marker.pixel_size
+            layout = CoordinateLayout(
+                analysis_width=analysis_right - analysis_left,
+                analysis_height=analysis_bottom - analysis_top,
+                canvas_left=canvas_left - analysis_left,
+                canvas_top=canvas_top - analysis_top,
+                canvas_width=canvas_right - canvas_left,
+                canvas_height=canvas_bottom - canvas_top,
+                diamond_width=marker_width,
+                diamond_height=marker_height,
+            )
+        snapshot = patrol_controller.snapshot(layout)
+        detected_name = (
+            detect_layer_by_y(marker.y, snapshot.layers)
+            if marker is not None else None
+        )
+        anchor_name = str(detected_name or patrol_controller.first_layer() or (
             snapshot.route_order[0] if snapshot.route_order else ""
         ))
         anchor_layer = snapshot.layers.get(anchor_name, {})
@@ -333,8 +365,10 @@ def main() -> int:
             )
         structure_tracker.start_session(float(anchor_world_y))
         logging.info(
-            "MAP SESSION re-anchoring %s at world_y=%.6f",
+            "MAP SESSION detected %s from marker_y=%s; re-anchoring "
+            "world_y=%.6f",
             anchor_name,
+            f"{marker.y:.6f}" if marker is not None else "unknown",
             float(anchor_world_y),
         )
     attack_workers = []
