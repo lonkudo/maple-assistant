@@ -16,6 +16,7 @@
   "climb_world_y_change_required": 0.75,
   "climb_world_y_stall_change_required": 0.15,
   "climb_world_y_stall_frames": 2,
+  "patrol_cycles_per_layer": 2,
   "movement_hold_seconds": 2.0,
   "minimum_final_hold_seconds": 0.08,
   "minimum_movement_hold_seconds": 0.3,

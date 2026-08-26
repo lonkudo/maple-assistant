@@ -412,6 +412,9 @@ def main() -> int:
             climb_failed_cycles_reset=int(
                 calibration.get("climb_failed_cycles_reset", 3)
             ),
+            patrol_cycles_per_layer=int(
+                calibration.get("patrol_cycles_per_layer", 2)
+            ),
             near_rope_seconds=float(calibration.get("near_rope_seconds", 0.5)),
             near_rope_range=float(rope_profile["near_range"]),
             near_rope_inner_range=float(

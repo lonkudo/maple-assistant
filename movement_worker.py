@@ -1687,6 +1687,7 @@ class MovementWorker(threading.Thread):
         climb_failed_shift_right_seconds: float = 0.01,
         climb_attempt_interval_seconds: float = 1.0,
         climb_failed_cycles_reset: int = 3,
+        patrol_cycles_per_layer: int = 2,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
         near_rope_inner_range: Optional[float] = None,
@@ -1807,6 +1808,7 @@ class MovementWorker(threading.Thread):
         # Consecutive full failed climb cycles before the route restarts at
         # left-most and re-approaches the rope (see _climb_cycle_failed).
         self.climb_failed_cycles_reset = max(1, int(climb_failed_cycles_reset))
+        self.patrol_cycles_per_layer = max(1, int(patrol_cycles_per_layer))
         self._climb_failures = 0
         # 同一层爬楼反复失败的"重置回最左"次数：超过上限后升级为完整自救
         # （回第一层 + 重启 + 重锚定），避免无限在同一层巡逻不爬楼。
@@ -1873,6 +1875,7 @@ class MovementWorker(threading.Thread):
         )
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
+        self._route_patrol_cycle = 1
         self.patrol_enabled = patrol_enabled
         self.climbing_enabled = climbing_enabled
         self.final_layer_action = final_layer_action
@@ -2957,6 +2960,7 @@ class MovementWorker(threading.Thread):
         if self._route_layer_index is None:
             self._route_layer_index = detected_index
             self._route_phase = "left"
+            self._route_patrol_cycle = 1
             LOG.info("route starting on %s: left-most -> right-most -> rope",
                      detected_name)
             return detected_name
@@ -3001,6 +3005,7 @@ class MovementWorker(threading.Thread):
         self._release_climb_up()
         self._route_layer_index = detected_index
         self._route_phase = "left"
+        self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         self._aligned_frames = 0
         self._rope_approach_direction = None
@@ -3070,6 +3075,7 @@ class MovementWorker(threading.Thread):
         """Restart patrol from ``floor`` (must be inside the patrol range)."""
         self._route_layer_index = self._route_layers.index(floor)
         self._route_phase = "left"
+        self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         self._descending_to_first = False
         self._return_from_floor = None
@@ -3388,6 +3394,7 @@ class MovementWorker(threading.Thread):
             else:
                 self._route_layer_index = None
                 self._route_phase = "left"
+                self._route_patrol_cycle = 1
             LOG.info("patrol route updated from UI: %s",
                      " -> ".join(new_route) if new_route else "none")
 
@@ -3436,6 +3443,8 @@ class MovementWorker(threading.Thread):
             return False
         phases = self._layer_phases(name)
         current = self._route_phase
+        if self._repeat_patrol_cycle_if_needed(name, phases, current):
+            return True
         if current in phases:
             index = phases.index(current)
             if index + 1 < len(phases):
@@ -3460,6 +3469,33 @@ class MovementWorker(threading.Thread):
                      current, phases[0])
             return True
         self._route_phase = "stand"
+        return True
+
+    def _repeat_patrol_cycle_if_needed(
+        self, name: str, phases: list[str], current: str
+    ) -> bool:
+        """Repeat a layer's horizontal actions before rope or drop.
+
+        One cycle is the recorded Left and/or Right sequence. Rope-only and
+        stand-still layers have no horizontal cycle and keep their existing
+        behavior.
+        """
+
+        movement_phases = [phase for phase in phases if phase in ("left", "right")]
+        if (not movement_phases
+                or current != movement_phases[-1]
+                or self._route_patrol_cycle >= self.patrol_cycles_per_layer):
+            return False
+        completed = self._route_patrol_cycle
+        self._route_patrol_cycle += 1
+        self._route_phase = movement_phases[0]
+        LOG.info(
+            "layer %s patrol cycle %d/%d complete; repeating from %s",
+            name,
+            completed,
+            self.patrol_cycles_per_layer,
+            self._route_phase,
+        )
         return True
 
     def _on_first_layer(self, observation: MinimapObservation) -> bool:
@@ -3502,6 +3538,7 @@ class MovementWorker(threading.Thread):
     def _reset_route_loop(self) -> None:
         self._route_layer_index = self._route_layers.index(self.first_layer)
         self._route_phase = "left"
+        self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
         self._descending_to_first = False
@@ -3524,6 +3561,15 @@ class MovementWorker(threading.Thread):
         name = self._route_layers[self._route_layer_index]
         phases = self._layer_phases(name)
         current = self._route_phase
+        if self._repeat_patrol_cycle_if_needed(name, phases, current):
+            LOG.warning(
+                "boundary %s unreachable on %s; starting patrol cycle %d/%d",
+                current,
+                name,
+                self._route_patrol_cycle,
+                self.patrol_cycles_per_layer,
+            )
+            return
         if current in phases:
             index = phases.index(current)
             if index + 1 < len(phases):
@@ -3557,6 +3603,7 @@ class MovementWorker(threading.Thread):
             return False
         self._climb_failures = 0
         self._route_phase = "left"
+        self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         self._climb_restarts += 1
         LOG.warning(
@@ -3594,6 +3641,7 @@ class MovementWorker(threading.Thread):
         assert self._route_layer_index is not None
         self._route_layer_index += 1
         self._route_phase = "left"
+        self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         if self._route_layer_index < len(self._route_layers):
             LOG.info("climb verified; starting %s patrol", self._route_layers[self._route_layer_index])

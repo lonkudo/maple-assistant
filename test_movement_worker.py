@@ -503,6 +503,10 @@ class MovementTests(unittest.TestCase):
         worker._route_phase = "right"
         crossed = MinimapObservation(Point(.75, .6), None, .9, (0, 0, 1, 1))
         self.assertTrue(worker._advance_route_endpoint(crossed, .7))
+        self.assertEqual(worker._route_phase, "left")
+        # Finish the second patrol cycle before the range-top drop.
+        worker._route_phase = "right"
+        self.assertTrue(worker._advance_route_endpoint(crossed, .7))
         target, is_rope, label = worker._route_target(crossed)
         self.assertIsNone(target)
         self.assertFalse(is_rope)
@@ -760,18 +764,19 @@ class MovementTests(unittest.TestCase):
         self.assertFalse(is_rope)
         self.assertEqual(label, "layer2.left-most")
 
-        # Complete layer2's normal endpoints.  Its rope must remain the next
-        # action, and a confirmed climb must advance to layer3 rather than
-        # restarting/repeating layer2.
-        worker._advance_route_endpoint(
-            MinimapObservation(Point(.19, .7), None, .9, (0, 0, 1, 1)),
-            target,
-        )
-        right_target, _, _ = worker._route_target(on_layer2)
-        worker._advance_route_endpoint(
-            MinimapObservation(Point(.81, .7), None, .9, (0, 0, 1, 1)),
-            right_target,
-        )
+        # Complete both layer2 patrol cycles. Its rope must remain the next
+        # action, and a confirmed climb must advance to layer3.
+        for _ in range(2):
+            left_target, _, _ = worker._route_target(on_layer2)
+            worker._advance_route_endpoint(
+                MinimapObservation(Point(.19, .7), None, .9, (0, 0, 1, 1)),
+                left_target,
+            )
+            right_target, _, _ = worker._route_target(on_layer2)
+            worker._advance_route_endpoint(
+                MinimapObservation(Point(.81, .7), None, .9, (0, 0, 1, 1)),
+                right_target,
+            )
         _, is_rope, label = worker._route_target(on_layer2)
         self.assertTrue(is_rope)
         self.assertEqual(label, "layer2.rope")
@@ -1144,6 +1149,60 @@ class MovementTests(unittest.TestCase):
         worker._reset_route_loop()
         self.assertEqual(worker._route_layer_index, 0)
         self.assertEqual(worker._route_phase, "left")
+
+    def test_each_layer_patrols_twice_before_rope_or_drop(self):
+        positions = {
+            "layer1": {
+                "layer_y": .70,
+                "left_most_pos": {"x": .2, "y": .70},
+                "right_most_pos": {"x": .8, "y": .70},
+                "rope_pos": {"x": .5, "y": .70},
+            },
+            "layer2": {
+                "layer_y": .56,
+                "left_most_pos": {"x": .3, "y": .56},
+                "right_most_pos": {"x": .7, "y": .56},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer1", "layer2"],
+            final_layer_action="drop_to_first_layer",
+            first_layer="layer1",
+            patrol_cycles_per_layer=2,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+
+        def cross(x, target):
+            return worker._advance_route_endpoint(
+                MinimapObservation(Point(x, .70), None, .9, (0, 0, 1, 1)),
+                target,
+            )
+
+        self.assertTrue(cross(.19, .2))
+        self.assertEqual(worker._route_phase, "right")
+        self.assertTrue(cross(.81, .8))
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(worker._route_patrol_cycle, 2)
+        self.assertTrue(cross(.19, .2))
+        self.assertEqual(worker._route_phase, "right")
+        self.assertTrue(cross(.81, .8))
+        self.assertEqual(worker._route_phase, "rope")
+
+        # The final layer also completes two horizontal cycles before drop.
+        worker._route_layer_index = 1
+        worker._route_phase = "left"
+        worker._route_patrol_cycle = 1
+        final_left = MinimapObservation(Point(.29, .56), None, .9, (0, 0, 1, 1))
+        final_right = MinimapObservation(Point(.71, .56), None, .9, (0, 0, 1, 1))
+        worker._advance_route_endpoint(final_left, .3)
+        worker._advance_route_endpoint(final_right, .7)
+        self.assertEqual(worker._route_phase, "left")
+        worker._advance_route_endpoint(final_left, .3)
+        worker._advance_route_endpoint(final_right, .7)
+        self.assertEqual(worker._route_phase, "drop")
 
     def test_descending_flag_blocks_resync_hijack_and_clears_on_arrival(self):
         positions = {
@@ -2685,6 +2744,11 @@ class MovementTests(unittest.TestCase):
         self.assertEqual((target, is_rope, label), (.8, False, "layer1.right-most"))
         at_right = MinimapObservation(Point(.8, .7), None, .9, (0, 0, 1, 1))
         self.assertTrue(worker._advance_route_endpoint(at_right, target))
+        self.assertEqual(worker._route_target(at_right),
+                         (.2, False, "layer1.left-most"))
+        # Second left -> right patrol completes before the rope is targeted.
+        self.assertTrue(worker._advance_route_endpoint(at_left, .2))
+        self.assertTrue(worker._advance_route_endpoint(at_right, .8))
         self.assertEqual(worker._route_target(at_right), (.5, True, "layer1.rope"))
 
     def test_rope_only_layer_goes_directly_to_rope(self):
