@@ -2429,9 +2429,12 @@ class UiWorker(threading.Thread):
         }
         final_name = self.patrol_controller.final_layer_name()
         for layer_name in layer_names:
-            # No "<- selected (top floor)" tag cluttering the row labels; the
-            # patrol range comboboxes carry that information now.
-            self._layer_labels[layer_name].configure(text=layer_name)
+            # Keep this label compact so all three recording buttons retain
+            # enough width in the intentionally narrower controls column.
+            # The patrol range comboboxes carry selection/top-floor details.
+            self._layer_labels[layer_name].configure(
+                text=self._patrol_display_name(layer_name)
+            )
             for point, button_label in button_labels.items():
                 final_rope = point == "rope_pos" and layer_name == final_name
                 recorded = self.patrol_controller.endpoint(layer_name, point)
@@ -2530,8 +2533,11 @@ class UiWorker(threading.Thread):
         for layer_name in layer_names:
             row = ttk.Frame(self._layer_rows_frame)
             row.pack(fill="x", pady=3)
-            label = ttk.Label(row, width=18)
-            label.pack(side="left", padx=(0, 6))
+            # ``layer1`` previously reserved 18 text columns, leaving a large
+            # blank strip and clipping the action buttons. ``楼层N`` fits in
+            # seven columns, including room for multi-digit floor numbers.
+            label = ttk.Label(row, width=7)
+            label.pack(side="left", padx=(0, 2))
             self._layer_labels[layer_name] = label
             for point_name, point_label in point_labels:
                 button = ttk.Button(
