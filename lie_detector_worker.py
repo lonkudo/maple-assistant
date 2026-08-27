@@ -1,4 +1,4 @@
-"""Five-second, full-client lie-event detector using in-memory frames only.
+"""One-second, full-client lie-event detector using in-memory frames only.
 
 At the 1075x768 reference resolution a lie event contains a 40x40 block whose
 pixels are all exactly white.  The target width and height scale independently
@@ -73,7 +73,7 @@ def detect_pure_white_square(
 
 
 class LieDetectorWorker(threading.Thread):
-    """Sample the shared full-client frame every five seconds."""
+    """Sample the shared full-client frame every second."""
 
     def __init__(
         self,
@@ -81,7 +81,7 @@ class LieDetectorWorker(threading.Thread):
         stop_event: threading.Event,
         *,
         enabled: bool = False,
-        scan_interval: float = 5.0,
+        scan_interval: float = 1.0,
         sound_path: Optional[Path] = None,
         play_alert_sound: Optional[Callable[[Path], None]] = None,
     ) -> None:
@@ -108,7 +108,7 @@ class LieDetectorWorker(threading.Thread):
             return self._enabled
 
     def set_enabled(self, enabled: bool) -> None:
-        """Apply the checkbox live; a newly enabled scan starts after 5s."""
+        """Apply the checkbox live; a newly enabled scan starts after 1s."""
 
         now = time.monotonic()
         with self._lock:

@@ -405,7 +405,7 @@ def main() -> int:
         lie_detector_frames,
         stop_event,
         enabled=False,
-        scan_interval=5.0,
+        scan_interval=1.0,
         sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
     )
     # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。

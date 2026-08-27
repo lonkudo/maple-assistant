@@ -21,7 +21,7 @@ assistant.py (primary process)
     FocusWorker        foreground gate, refocus, key release
     ShutdownWorker     optional timed shutdown
     CountdownWorker    independent repeating MP3 reminder
-    LieDetectorWorker  5-second full-client pure-white-square alarm
+    LieDetectorWorker  1-second full-client pure-white-square alarm
     supervisor-worker  stops the process if a core worker dies
 
 yolo-detection/live_view.py (optional subprocess launched by UiWorker)
@@ -51,7 +51,7 @@ game client
      -> movement_frames  -> MovementWorker
      -> status_frames    -> StatusWorker
      -> character_frames -> CharacterWorker -> character_positions
-     -> lie frames       -> LieDetectorWorker (one in-memory scan per 5s)
+     -> lie frames       -> LieDetectorWorker (one in-memory scan per second)
      -> ui_frames        -> UiWorker
 ```
 
@@ -243,7 +243,7 @@ pointer owns the scale so it does not fight the drag.
 
 `LieDetectorWorker` receives its own latest-only subscription to the existing
 full-client `FrameBus`. It does not capture again and never writes a screenshot.
-Every five seconds it scales the reference `40×40` signature from a
+Every second it scales the reference `40×40` signature from a
 `1075×768` client to the current width and height, then uses an OpenCV erosion
 over the exact-white pixel mask to find an all-white rectangle. A match beeps
 once until a later scan confirms the square has disappeared.

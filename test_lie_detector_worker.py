@@ -44,17 +44,17 @@ class LieDetectorImageTests(unittest.TestCase):
 
 
 class LieDetectorWorkerTests(unittest.TestCase):
-    def test_scans_only_when_five_second_deadline_is_due(self):
+    def test_scans_only_when_one_second_deadline_is_due(self):
         worker = LieDetectorWorker(
             queue.Queue(), threading.Event(), enabled=False,
-            scan_interval=5.0,
+            scan_interval=1.0,
         )
         worker.set_enabled(True)
         due = worker._next_scan_at
         self.assertIsNotNone(due)
         self.assertFalse(worker._take_due_scan(due - .01))
         self.assertTrue(worker._take_due_scan(due))
-        self.assertAlmostEqual(worker._next_scan_at, due + 5.0, places=3)
+        self.assertAlmostEqual(worker._next_scan_at, due + 1.0, places=3)
 
     def test_alerts_once_per_visible_event_and_rearms_when_square_clears(self):
         played = []
