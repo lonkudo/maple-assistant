@@ -20,6 +20,7 @@ assistant.py (primary process)
     AttackWorker       optional fixed-rate attack
     FocusWorker        foreground gate, refocus, key release
     ShutdownWorker     optional timed shutdown
+    CountdownWorker    independent repeating MP3 reminder
     supervisor-worker  stops the process if a core worker dies
 
 yolo-detection/live_view.py (optional subprocess launched by UiWorker)
@@ -228,6 +229,13 @@ environment.
 confirmed low readings and retries blocked sends. Its configuration also owns
 optional periodic buffs.
 
+`CountdownWorker` has no gameplay dependencies: it owns only a monotonic
+deadline, configured interval, wake event, and `sound/beep.mp3`. At expiry it
+re-arms the full interval before playing the MP3 through the Windows MCI API.
+The UI reads a locked snapshot for its live progress scale. Dragging that scale
+sets a new remaining duration within `0..interval`; UI refresh pauses while the
+pointer owns the scale so it does not fight the drag.
+
 ## 7. Cross-process coordination
 
 The primary and YOLO processes coordinate through atomically replaced,
@@ -258,7 +266,7 @@ recovery behavior.
 | `rope_calibration.json` | assistant.py -> MovementWorker tuning |
 | `drug_settings.json` | UiWorker and StatusWorker |
 | `fixed_attack_settings.json` | UiWorker and AttackWorker |
-| `additional_functions_settings.json` | UiWorker and ShutdownWorker |
+| `additional_functions_settings.json` | UiWorker, ShutdownWorker, CountdownWorker, and MovementWorker optional settings |
 | `yolo_detection_settings.json` | UiWorker and YOLO launch settings |
 | `yolo-detection/config.yaml` | OptimizedMapleBot/model settings |
 
@@ -313,6 +321,7 @@ git -c core.quotepath=false ls-files
 | `attack_worker.py` | Fixed-rate attack thread |
 | `focus_worker.py` | Foreground/refocus gate and key release |
 | `shutdown_worker.py` | Optional timed shutdown |
+| `countdown_worker.py` | Independent repeating countdown and MP3 playback |
 | `pickup_worker.py` | Legacy standalone pickup worker; not wired by assistant.py |
 | `channel_switch.py` | Channel-switch/drop recovery procedure |
 | `combat_coordination.py` | Attack, patrol, and rope state-file adapters |
@@ -332,6 +341,7 @@ git -c core.quotepath=false ls-files
 | `drug_settings.json` | Potion/buff settings |
 | `fixed_attack_settings.json` | Attack mode/key/interval |
 | `additional_functions_settings.json` | Shutdown feature settings |
+| `sound/beep.mp3` | Countdown reminder sound shipped in releases |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
 | `install.ps1`, `安装.bat` | Bootstrap Python, `.venv`, dependencies, launchers |
@@ -354,6 +364,7 @@ test_attack_worker.py
 test_capture_worker.py
 test_channel_switch.py
 test_combat_coordination.py
+test_countdown_worker.py
 test_focus_worker.py
 test_map_identity.py
 test_map_structure_tracker.py

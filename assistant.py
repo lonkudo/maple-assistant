@@ -182,6 +182,7 @@ def main() -> int:
     )
     from attack_worker import AttackWorker
     from shutdown_worker import ShutdownWorker
+    from countdown_worker import CountdownWorker
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
     from marker_detector import DiamondSizeTracker, detect_yellow_diamond
@@ -390,6 +391,12 @@ def main() -> int:
         enabled=False,
         hours=3.0,
     )
+    countdown_worker = CountdownWorker(
+        stop_event,
+        sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
+        enabled=False,
+        interval_hours=1.0,
+    )
     # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。
     status_worker = StatusWorker(
         status_frames,
@@ -579,6 +586,7 @@ def main() -> int:
         status_worker,
         *attack_workers,
         shutdown_worker,
+        countdown_worker,
         FocusWorker(
             key_sender,
             stop_event,
@@ -602,6 +610,7 @@ def main() -> int:
             attack_worker=attack_worker,
             movement_worker=movement_worker,
             shutdown_worker=shutdown_worker,
+            countdown_worker=countdown_worker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

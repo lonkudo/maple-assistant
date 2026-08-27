@@ -36,6 +36,12 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 
+# --- countdown reminder sound -----------------------------------------------
+$soundIn = Join-Path $root "sound"
+if (Test-Path $soundIn) {
+    Copy-Item $soundIn (Join-Path $out "sound") -Recurse
+}
+
 # --- yolo-detection -----------------------------------------------------------
 $yoloOut = Join-Path $out "yolo-detection"
 New-Item -ItemType Directory -Path $yoloOut -Force | Out-Null

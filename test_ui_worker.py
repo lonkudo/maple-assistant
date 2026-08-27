@@ -839,6 +839,85 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertIn(["disabled"], loader._shutdown_slider.states)
                 self.assertIn("未启用", loader._shutdown_status.text)
 
+    def test_countdown_panel_applies_interval_and_dragged_remaining(self) -> None:
+        from unittest import mock
+
+        class Var:
+            def __init__(self, value): self.value = value
+            def get(self): return self.value
+            def set(self, value): self.value = value
+
+        class Widget:
+            def __init__(self):
+                self.text = ""
+                self.states = []
+                self.options = {}
+
+            def configure(self, **kwargs):
+                self.options.update(kwargs)
+                if "text" in kwargs:
+                    self.text = kwargs["text"]
+
+            def state(self, states):
+                self.states.append(states)
+
+        class FakeCountdownWorker:
+            def __init__(self):
+                self.enabled = False
+                self.interval = 3600.0
+                self.remaining = 3600.0
+
+            def set_interval_hours(self, hours):
+                self.interval = float(hours) * 3600.0
+                self.remaining = self.interval
+
+            def set_enabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def set_remaining_seconds(self, seconds):
+                self.remaining = max(0.0, min(float(seconds), self.interval))
+
+            def snapshot(self):
+                return self.enabled, self.interval, self.remaining
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.countdown_worker = FakeCountdownWorker()
+        worker._shutdown_enabled_var = Var(False)
+        worker._shutdown_hours_var = Var(3.0)
+        worker._countdown_enabled_var = Var(True)
+        worker._countdown_interval_var = Var(1.0)
+        worker._countdown_remaining_var = Var(3600.0)
+        worker._countdown_interval_label = Widget()
+        worker._countdown_interval_slider = Widget()
+        worker._countdown_remaining_label = Widget()
+        worker._countdown_remaining_slider = Widget()
+        worker._countdown_status = Widget()
+        worker._countdown_dragging = False
+
+        with mock.patch.object(worker, "_shutdown_save_settings"):
+            worker._countdown_on_change()
+        self.assertTrue(worker.countdown_worker.enabled)
+        self.assertEqual(worker.countdown_worker.interval, 3600.0)
+        self.assertEqual(worker._countdown_interval_label.text, "1.0h")
+        self.assertEqual(worker._countdown_remaining_slider.options["to"],
+                         3600.0)
+
+        worker._countdown_drag_start()
+        worker._countdown_remaining_var.set(1200.0)
+        worker._countdown_remaining_on_drag("1200")
+        self.assertEqual(worker.countdown_worker.remaining, 1200.0)
+        self.assertEqual(worker._countdown_remaining_label.text, "20m 00s")
+        worker._countdown_drag_end()
+        worker._refresh_countdown_status()
+        self.assertIn("剩余 20m 00s", worker._countdown_status.text)
+
+        worker._countdown_enabled_var.set(False)
+        with mock.patch.object(worker, "_shutdown_save_settings"):
+            worker._countdown_on_change()
+        self.assertFalse(worker.countdown_worker.enabled)
+        self.assertIn(["disabled"],
+                      worker._countdown_remaining_slider.states)
+
     def test_drug_buff_rows_roundtrip_and_apply_to_status_worker(self) -> None:
         import json
         import tempfile

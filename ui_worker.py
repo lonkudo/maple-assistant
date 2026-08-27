@@ -459,6 +459,7 @@ class UiWorker(threading.Thread):
         attack_worker: Any = None,
         movement_worker: Any = None,
         shutdown_worker: Any = None,
+        countdown_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -488,6 +489,9 @@ class UiWorker(threading.Thread):
         # Shutdown worker (ShutdownWorker) the Additional Functions panel
         # arms: enabled flag + hours are applied live.
         self.shutdown_worker = shutdown_worker
+        # Independent repeating sound reminder. It owns no game state/input;
+        # this reference only exposes its interval/deadline to the UI.
+        self.countdown_worker = countdown_worker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -1059,6 +1063,63 @@ class UiWorker(threading.Thread):
                 justify="left",
             )
             self._shutdown_status.pack(anchor="w", pady=(6, 0))
+
+            countdown_row = ttk.Frame(extra_panel)
+            countdown_row.pack(fill="x", pady=(8, 0))
+            self._countdown_enabled_var = tk.BooleanVar(value=False)
+            self._countdown_check = ttk.Checkbutton(
+                countdown_row, text="循环声音提醒",
+                variable=self._countdown_enabled_var,
+                command=self._countdown_on_change,
+            )
+            self._countdown_check.pack(side="left", padx=(0, 8))
+            ttk.Label(countdown_row, text="间隔").pack(side="left")
+            self._countdown_interval_var = tk.DoubleVar(value=1.0)
+            self._countdown_interval_slider = ttk.Scale(
+                countdown_row, from_=0.1, to=12.0, orient="horizontal",
+                variable=self._countdown_interval_var,
+                command=self._countdown_on_change,
+            )
+            self._countdown_interval_slider.pack(
+                side="left", fill="x", expand=True, padx=(6, 8)
+            )
+            self._countdown_interval_label = ttk.Label(
+                countdown_row, text="1.0h", width=6
+            )
+            self._countdown_interval_label.pack(side="left")
+
+            remaining_row = ttk.Frame(extra_panel)
+            remaining_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(remaining_row, text="剩余时间").pack(
+                side="left", padx=(22, 8)
+            )
+            self._countdown_remaining_var = tk.DoubleVar(value=3600.0)
+            self._countdown_remaining_slider = ttk.Scale(
+                remaining_row, from_=0.0, to=3600.0,
+                orient="horizontal",
+                variable=self._countdown_remaining_var,
+                command=self._countdown_remaining_on_drag,
+            )
+            self._countdown_remaining_slider.pack(
+                side="left", fill="x", expand=True, padx=(0, 8)
+            )
+            self._countdown_dragging = False
+            self._countdown_remaining_slider.bind(
+                "<ButtonPress-1>", self._countdown_drag_start
+            )
+            self._countdown_remaining_slider.bind(
+                "<ButtonRelease-1>", self._countdown_drag_end
+            )
+            self._countdown_remaining_label = ttk.Label(
+                remaining_row, text="1h 00m", width=9
+            )
+            self._countdown_remaining_label.pack(side="left")
+            self._countdown_status = ttk.Label(
+                extra_panel,
+                text="循环提醒: 未启用。",
+                justify="left",
+            )
+            self._countdown_status.pack(anchor="w", pady=(4, 0))
             self._shutdown_load_settings()
 
             # Other-player safety net: when red diamonds (other players) show
@@ -1179,6 +1240,7 @@ class UiWorker(threading.Thread):
         self._drain_logs()
         self._refresh_automation_status()
         self._refresh_shutdown_status()
+        self._refresh_countdown_status()
         self._poll_yolo_exit()
         root.after(self.refresh_ms, self._poll)
 
@@ -1798,6 +1860,13 @@ class UiWorker(threading.Thread):
         }
         if hasattr(self, "_player_check_var"):
             data["player_check_enabled"] = bool(self._player_check_var.get())
+        if hasattr(self, "_countdown_enabled_var"):
+            data["countdown_enabled"] = bool(
+                self._countdown_enabled_var.get()
+            )
+            data["countdown_interval_hours"] = round(
+                float(self._countdown_interval_var.get()), 1
+            )
         return data
 
     def _shutdown_on_change(self, _value: str = "") -> None:
@@ -1888,6 +1957,114 @@ class UiWorker(threading.Thread):
             text = (f"定时关闭已启动: 游戏将在 {minutes}分 {seconds:02d}秒后关闭。")
         self._shutdown_status.configure(text=text)
 
+    @staticmethod
+    def _format_countdown_seconds(seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {seconds:02d}s"
+        return f"{minutes}m {seconds:02d}s"
+
+    def _countdown_on_change(self, _value: str = "") -> None:
+        """Persist/apply the repeating reminder interval and enabled state."""
+
+        if not hasattr(self, "_countdown_interval_label"):
+            return
+        hours = max(0.1, float(self._countdown_interval_var.get()))
+        self._countdown_interval_label.configure(text=f"{hours:.1f}h")
+        interval_seconds = hours * 3600.0
+        self._countdown_remaining_slider.configure(to=interval_seconds)
+        self._countdown_remaining_var.set(interval_seconds)
+        self._countdown_remaining_label.configure(
+            text=self._format_countdown_seconds(interval_seconds)
+        )
+        data = self._shutdown_collect_data()
+        self._shutdown_save_settings(data)
+        self._countdown_apply_to_worker(data)
+        self._countdown_refresh_grey()
+
+    def _countdown_apply_to_worker(self, data: dict) -> None:
+        worker = getattr(self, "countdown_worker", None)
+        if worker is None:
+            self._countdown_status.configure(
+                text="循环提醒: 工作线程未接入 (无界面模式)。"
+            )
+            return
+        hours = float(data.get("countdown_interval_hours", 1.0))
+        worker.set_interval_hours(hours)
+        worker.set_enabled(bool(data.get("countdown_enabled", False)))
+        if worker.enabled:
+            self._countdown_status.configure(
+                text=f"循环提醒已启动: 每 {hours:.1f} 小时播放 beep.mp3。"
+            )
+        else:
+            self._countdown_status.configure(text="循环提醒: 未启用。")
+
+    def _countdown_refresh_grey(self) -> None:
+        enabled = bool(self._countdown_enabled_var.get())
+        state = "!disabled" if enabled else "disabled"
+        for widget in (
+            self._countdown_interval_slider,
+            self._countdown_interval_label,
+            self._countdown_remaining_slider,
+            self._countdown_remaining_label,
+        ):
+            try:
+                widget.state([state])
+            except Exception:
+                try:
+                    widget.configure(
+                        state="normal" if enabled else "disabled"
+                    )
+                except Exception:
+                    pass
+
+    def _countdown_drag_start(self, _event: Any = None) -> None:
+        self._countdown_dragging = True
+
+    def _countdown_drag_end(self, _event: Any = None) -> None:
+        self._countdown_remaining_on_drag(
+            str(self._countdown_remaining_var.get())
+        )
+        self._countdown_dragging = False
+
+    def _countdown_remaining_on_drag(self, value: str) -> None:
+        """Move the live deadline as the user drags the remaining-time bar."""
+
+        if not bool(self._countdown_enabled_var.get()):
+            return
+        remaining = max(0.0, float(value))
+        self._countdown_remaining_label.configure(
+            text=self._format_countdown_seconds(remaining)
+        )
+        worker = getattr(self, "countdown_worker", None)
+        if worker is not None:
+            worker.set_remaining_seconds(remaining)
+
+    def _refresh_countdown_status(self) -> None:
+        """Keep the draggable bar synchronized unless it is being dragged."""
+
+        if not hasattr(self, "_countdown_status"):
+            return
+        worker = getattr(self, "countdown_worker", None)
+        if worker is None:
+            return
+        enabled, interval, remaining = worker.snapshot()
+        if not enabled:
+            return
+        self._countdown_remaining_slider.configure(to=interval)
+        if not self._countdown_dragging:
+            self._countdown_remaining_var.set(remaining)
+            self._countdown_remaining_label.configure(
+                text=self._format_countdown_seconds(remaining)
+            )
+        self._countdown_status.configure(
+            text=("循环提醒: 剩余 "
+                  f"{self._format_countdown_seconds(remaining)} / "
+                  f"间隔 {interval / 3600.0:.1f}h；到时播放并自动重置。")
+        )
+
     def _shutdown_load_settings(self) -> None:
         """Restore saved Additional Functions values and apply them live.
 
@@ -1912,11 +2089,21 @@ class UiWorker(threading.Thread):
                 self, "_player_check_var"
             ):
                 self._player_check_var.set(bool(data["player_check_enabled"]))
+            if hasattr(self, "_countdown_enabled_var"):
+                # Like scheduled shutdown, do not silently start a timer on
+                # application launch. Preserve only its configured time gap.
+                self._countdown_enabled_var.set(False)
+                if "countdown_interval_hours" in data:
+                    self._countdown_interval_var.set(float(
+                        data["countdown_interval_hours"]
+                    ))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed additional functions settings",
                         exc_info=True)
             return
         self._shutdown_on_change()
+        if hasattr(self, "_countdown_enabled_var"):
+            self._countdown_on_change()
         LOG.info("additional functions settings loaded from %s",
                  self._shutdown_settings_path())
 
