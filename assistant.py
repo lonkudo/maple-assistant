@@ -133,12 +133,15 @@ def parse_args() -> argparse.Namespace:
                         help="disable the independent OpenCV debug UI worker")
     parser.add_argument("--ui-refresh-ms", type=int, default=100,
                         help="debug UI queue polling interval (default: 100 ms)")
-    parser.add_argument("--rope-calibration", type=Path,
-                        default=Path(__file__).with_name("rope_calibration.json"))
+    parser.add_argument("--config", type=Path,
+                        default=Path(__file__).with_name("config.json"),
+                        help="single persistent configuration file")
+    parser.add_argument("--rope-calibration", type=Path, default=None,
+                        help="legacy one-run rope calibration override")
     parser.add_argument(
         "--recording-configuration", type=Path,
-        default=Path(__file__).with_name("recording-configuration.json"),
-        help="shared recorded layers, endpoints, ropes, and route order",
+        default=None,
+        help="legacy one-run recorded-route override",
     )
     parser.add_argument("--log-level", default="INFO")
     # ==== ADDED ==== debug flag for drawing capture region rectangles
@@ -184,6 +187,7 @@ def main() -> int:
     from shutdown_worker import ShutdownWorker
     from countdown_worker import CountdownWorker
     from lie_detector_worker import LieDetectorWorker
+    from config_store import get_config_store
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
     from marker_detector import DiamondSizeTracker, detect_yellow_diamond
@@ -227,13 +231,26 @@ def main() -> int:
         # selection or the character jumps every time patrol starts.
         alt_transition=False,
     )
-    calibration = json.loads(args.rope_calibration.read_text(encoding="utf-8"))
-    map_profile = json.loads(
-        args.recording_configuration.read_text(encoding="utf-8")
+    config_store = get_config_store(args.config)
+    calibration = (
+        json.loads(args.rope_calibration.read_text(encoding="utf-8"))
+        if args.rope_calibration is not None
+        else config_store.read_section("rope_calibration")
     )
-    patrol_controller = PatrolController(args.recording_configuration, map_profile)
+    map_profile = (
+        json.loads(args.recording_configuration.read_text(encoding="utf-8"))
+        if args.recording_configuration is not None
+        else config_store.read_section("recording")
+    )
+    profile_path = args.recording_configuration or args.config
+    patrol_controller = PatrolController(
+        profile_path, map_profile,
+        config_store=None if args.recording_configuration is not None
+        else config_store,
+    )
+    configuration_root = profile_path.parent
     structure_reference = (
-        args.recording_configuration.parent
+        configuration_root
         / "recording-assets"
         / "map-structure-reference.png"
     )
@@ -241,7 +258,7 @@ def main() -> int:
         structure_reference, tracking_size=OPENCV_ANALYSIS_SIZE[0]
     )
     map_identity_store = MapIdentityStore(
-        args.recording_configuration.parent / "recording-assets" / "map-names"
+        configuration_root / "recording-assets" / "map-names"
     )
 
     def stop_patrol_after_focus_loss() -> None:

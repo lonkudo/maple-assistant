@@ -8,6 +8,7 @@ work/
 outputs/
 recording-assets/
 release/
+config.json
 
 # local virtual environments
 .venv/

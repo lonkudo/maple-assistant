@@ -154,8 +154,12 @@ class PatrolController:
     active patrol layer only after Left, Rope, and Right have all been recorded.
     """
 
-    def __init__(self, profile_path: Path, profile: dict[str, Any]) -> None:
+    def __init__(
+        self, profile_path: Path, profile: dict[str, Any], *,
+        config_store: Any = None,
+    ) -> None:
         self.profile_path = Path(profile_path)
+        self.config_store = config_store
         self._profile = deepcopy(profile)
         self._enabled = bool(profile.get("patrol_enabled", False))
         route = list(profile.get("route_order", []))
@@ -256,8 +260,10 @@ class PatrolController:
             # may have been edited on disk while the app was running.  Reset
             # only the route/layers, never clobber the map identity label.
             try:
-                on_disk = json.loads(
-                    self.profile_path.read_text(encoding="utf-8")
+                on_disk = (
+                    self.config_store.read_section("recording")
+                    if self.config_store is not None
+                    else json.loads(self.profile_path.read_text(encoding="utf-8"))
                 )
                 map_name = str(on_disk.get("map_name", "")).strip()
             except (OSError, ValueError, TypeError):
@@ -711,6 +717,9 @@ class PatrolController:
             return next_name
 
     def _persist_locked(self) -> None:
+        if self.config_store is not None:
+            self.config_store.write_section("recording", self._profile)
+            return
         temporary_path = self.profile_path.with_suffix(self.profile_path.suffix + ".tmp")
         text = json.dumps(self._profile, ensure_ascii=False, indent=2) + "\n"
         temporary_path.write_text(text, encoding="utf-8")

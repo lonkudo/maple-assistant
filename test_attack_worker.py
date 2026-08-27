@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from unittest import mock
 
 from attack_worker import AttackWorker
 
@@ -93,6 +94,14 @@ class AttackWorkerTests(unittest.TestCase):
     def test_default_attack_clock_is_half_interval_offset(self):
         worker = AttackWorker(FakeSender(), threading.Event(), 3.0)
         self.assertEqual(worker.initial_offset, 1.5)
+
+    def test_random_gap_is_additive_and_capped_at_point_one_seconds(self):
+        worker = AttackWorker(FakeSender(), threading.Event())
+        self.assertEqual(worker.attack_jitter_seconds, .1)
+        with mock.patch("attack_worker.random.uniform", return_value=.1) as gap:
+            value = worker.next_delay()
+        gap.assert_called_once_with(0.0, .1)
+        self.assertEqual(value, 3.1)
 
 
 if __name__ == "__main__":

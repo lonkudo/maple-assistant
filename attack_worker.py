@@ -39,14 +39,13 @@ class AttackWorker(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
-        attack_jitter_seconds: float = 0.2,
+        attack_jitter_seconds: float = 0.1,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
         self.attack_interval = max(0.25, attack_interval)
-        # 攻击间隔随机抖动 ±0.2s（t±0.2s）：让攻击节奏不像固定频率，
-        # 更像手动操作。
+        # 下一次攻击 = configured interval + random gap (0..0.1s).
         self.attack_jitter_seconds = max(0.0, float(attack_jitter_seconds))
         self.attack_key = str(attack_key).casefold()
         scan_map = getattr(key_sender, "_SCAN", None)
@@ -84,6 +83,12 @@ class AttackWorker(threading.Thread):
             return key_up(self.attack_key) is not False
         return self.key_sender.tap(self.attack_key) is not False
 
+    def next_delay(self) -> float:
+        """Configured attack interval plus a random gap of at most 0.1s."""
+
+        random_gap = random.uniform(0.0, self.attack_jitter_seconds)
+        return max(0.05, self.attack_interval + random_gap)
+
     def run(self) -> None:
         LOG.info("attack worker started offset=%.3fs interval=%.3fs key=%s "
                  "enabled=%s",
@@ -104,13 +109,8 @@ class AttackWorker(threading.Thread):
             else:
                 LOG.info("attack repetition: %s", self.attack_key)
                 self.attack_once()
-            # 下一次攻击间隔在 t±0.2s 范围内随机变化（最低不小于 0.05s）。
-            jitter = random.uniform(
-                -self.attack_jitter_seconds, self.attack_jitter_seconds
-            )
-            next_attack = time.monotonic() + max(
-                0.05, self.attack_interval + jitter
-            )
+            # The random component is additive only: attack + random_gap.
+            next_attack = time.monotonic() + self.next_delay()
         LOG.info("attack worker stopped")
 
 

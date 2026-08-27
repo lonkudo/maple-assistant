@@ -74,7 +74,7 @@ inventory.
 
 ## Recording and patrol behavior
 
-The shared route is stored in `recording-configuration.json`. In the UI, select
+The shared route is stored in the `recording` section of `config.json`. In the UI, select
 a layer and record any desired combination of:
 
 - **Left-most**
@@ -93,7 +93,7 @@ Layers are executed in numeric bottom-to-top order. The selected patrol range
 is contiguous. A character that lands below it climbs back; one above it drops
 back. Return-to-route input suppresses attacks until the route is reached.
 
-`patrol_cycles_per_layer` in `rope_calibration.json` defaults to `2`. Every
+`patrol_cycles_per_layer` in `config.json` -> `rope_calibration` defaults to `2`. Every
 layer completes two full horizontal Left/Right cycles before it climbs or,
 for the top layer of the active route, drops back to the first route layer.
 The final layer's rope is intentionally not used because no patrolled layer is
@@ -116,6 +116,8 @@ re-recorded when the UI labels them as a legacy layout.
   remains held through a short rope-top compensation window.
 - Attack suppression ends immediately after confirmed climb arrival; the
   separate arrival grace period only prevents an unsafe stair jump.
+- Fixed attack timing is `attack interval + random gap`; the additive random
+  gap is uniformly selected from `0.0` through `0.1` seconds.
 - Losing focus releases every key. After refocus, movement reconciles its
   internal hold state with the sender and re-presses externally released keys.
 - A secondary character-marker reading can override movement only when it
@@ -130,17 +132,17 @@ re-recorded when the UI labels them as a legacy layout.
 - Missing or stale cross-process state files mean “not busy,” preventing a dead
   process from permanently blocking patrol or attack.
 
-## Configuration files
+## Configuration
 
-| File | Purpose |
-|---|---|
-| `recording-configuration.json` | Map name, recorded layers/actions, route order, patrol range, rope zones |
-| `rope_calibration.json` | Movement, climb, fall, stair-jump, rescue, and patrol-cycle tuning |
-| `drug_settings.json` | HP/MP potion keys and thresholds; buff keys and intervals |
-| `fixed_attack_settings.json` | Fixed/YOLO attack mode, attack key, fixed interval |
-| `additional_functions_settings.json` | Optional shutdown, countdown, disconnect/lie alerts, and other-player settings |
-| `yolo_detection_settings.json` | YOLO threshold, range, FPS, detection zone, and preview settings |
-| `yolo-detection/config.yaml` | Lower-level model/detector configuration |
+All application settings now live in one ignored, persistent `config.json`.
+Its sections are `recording`, `rope_calibration`, `drug`, `fixed_attack`,
+`additional_functions`, `yolo_detection`, and `ui_window`.
+
+On the first updated launch, `config_store.py` imports values from the old split
+JSON files. After that, `config.json` is authoritative. Release ZIPs exclude
+both `config.json` and the old split files, so extracting a new version over an
+installation cannot overwrite the user's configuration. The lower-level YOLO
+engine's developer-oriented `yolo-detection/config.yaml` remains separate.
 
 Runtime state and logs are written under ignored directories such as `work/`,
 `outputs/`, and `recording-assets/`. Do not assume these files are saved by Git.
@@ -177,6 +179,8 @@ Important publishing details:
   Git-ignored directory. Confirm it exists before publishing on a fresh clone.
 - `release\` is Git-ignored. The ZIP is a delivery artifact, not part of the
   commit.
+- `config.json` is user-owned and excluded from releases; never replace it
+  during an update.
 - A successful command prints `release ready: <absolute zip path>`.
 
 After a successful release, save the source change:

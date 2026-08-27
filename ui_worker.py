@@ -23,6 +23,7 @@ from map_structure_tracker import MapStructureTracker
 from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
+from config_store import config_section_file
 
 
 LOG = logging.getLogger(__name__)
@@ -45,9 +46,9 @@ def tooltip_cursor_top_right_position(
     return x, y
 
 
-def _window_geometry_settings_path() -> Path:
+def _window_geometry_settings_path() -> Any:
     """Persisted debug UI window geometry (position + size)."""
-    return Path(__file__).resolve().parent / "ui_window_settings.json"
+    return config_section_file("ui_window")
 
 
 def _parse_window_geometry(
@@ -1488,7 +1489,7 @@ class UiWorker(threading.Thread):
     def _yolo_settings_path(self) -> Path:
         """JSON file holding the YOLO panel settings."""
 
-        return Path(__file__).resolve().parent / "yolo_detection_settings.json"
+        return config_section_file("yolo_detection")
 
     def _yolo_load_settings(self) -> None:
         """Restore saved YOLO panel values from the local JSON file."""
@@ -1542,7 +1543,7 @@ class UiWorker(threading.Thread):
     def _fixed_settings_path() -> Path:
         """JSON file holding the Fixed Attack panel settings."""
 
-        return Path(__file__).resolve().parent / "fixed_attack_settings.json"
+        return config_section_file("fixed_attack")
 
     def _fixed_collect_data(self) -> dict:
         """Current Fixed Attack panel values as a settings dict."""
@@ -1693,7 +1694,7 @@ class UiWorker(threading.Thread):
 
     @staticmethod
     def _drug_settings_path() -> Path:
-        return Path(__file__).resolve().parent / "drug_settings.json"
+        return config_section_file("drug")
 
     def _attach_bind_hint(self, button: Any) -> None:
         """Attach the bindable-hotkeys popout hint to a key-bind button.
@@ -1877,7 +1878,7 @@ class UiWorker(threading.Thread):
     def _shutdown_settings_path() -> Path:
         """JSON file holding the Additional Functions panel settings."""
 
-        return Path(__file__).resolve().parent / "additional_functions_settings.json"
+        return config_section_file("additional_functions")
 
     def _shutdown_collect_data(self) -> dict:
         """Current Additional Functions panel values as a settings dict."""

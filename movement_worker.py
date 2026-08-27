@@ -32,6 +32,7 @@ from patrol_control import CoordinateLayout, _layer_present_actions
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
 from channel_switch import channel_switch_procedure
+from config_store import config_section_file
 
 
 LOG = logging.getLogger(__name__)
@@ -2095,8 +2096,9 @@ class MovementWorker(threading.Thread):
         self.status_state_path = str(status_state_path) if status_state_path else str(
             Path(__file__).resolve().parent / "work" / "status_state.json"
         )
-        self.drug_settings_path = str(drug_settings_path) if drug_settings_path else str(
-            Path(__file__).resolve().parent / "drug_settings.json"
+        self.drug_settings_path = (
+            drug_settings_path if drug_settings_path
+            else config_section_file("drug")
         )
         self._last_frame: Any = None
         self._last_minimap_region: Any = None
@@ -2684,8 +2686,11 @@ class MovementWorker(threading.Thread):
         """The bound HP potion key from drug_settings.json, or None."""
 
         try:
+            source = self.drug_settings_path
             data = json.loads(
-                Path(self.drug_settings_path).read_text(encoding="utf-8")
+                source.read_text(encoding="utf-8")
+                if hasattr(source, "read_text")
+                else Path(source).read_text(encoding="utf-8")
             )
         except (OSError, ValueError):
             return None
