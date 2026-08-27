@@ -433,6 +433,36 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._climb_state.phase, "climbing-up")
         self.assertIn("up", sender.owned)
 
+    def test_rope_approach_recovery_does_not_jump_when_rope_is_far(self):
+        from unittest import mock
+
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer1": {
+                "layer_y": .57, "y_tolerance": .02,
+                "left_most_pos": {"x": .14, "y": .57},
+                "right_most_pos": {"x": .80, "y": .57},
+            }},
+            route_order=["layer1"],
+        )
+        worker._route_layers = ["layer1"]
+        worker._climb_state.phase = "idle"
+        worker._rope_approach_stall_frames = 2
+        # Regression for the field trace: x=.143617 while the layer1 rope
+        # was x=.703723.  This is a normal platform walk, not a rope stall.
+        far = MinimapObservation(
+            Point(.143617, .57), None, .9, (0, 0, 1, 1)
+        )
+        with (
+            mock.patch.object(worker, "_run_climb_step") as climb,
+            mock.patch.object(worker, "_start_rope_stuck_climb") as attached,
+        ):
+            worker._recover_rope_approach(far, .703723)
+            climb.assert_not_called()
+            attached.assert_not_called()
+        self.assertEqual(worker._climb_state.phase, "idle")
+        self.assertEqual(worker._rope_approach_stall_frames, 0)
+
     def test_self_rescue_triggers_after_20_stuck_frames_in_window(self):
         from unittest import mock
 

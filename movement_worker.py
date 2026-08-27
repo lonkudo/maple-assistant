@@ -37,6 +37,12 @@ from channel_switch import channel_switch_procedure
 LOG = logging.getLogger(__name__)
 
 
+# Stall recovery is only valid at the rope itself.  Keeping this threshold in
+# one place prevents the stall detector and its recovery action from drifting
+# apart and turning a long rope approach into repeated jump-climb attempts.
+ROPE_STALL_ALIGNMENT_RANGE = 0.03
+
+
 class KeySender(Protocol):
     """Small interface implemented by the integration's WindowKeySender."""
 
@@ -1540,7 +1546,10 @@ class MovementWorker(threading.Thread):
         if last_x is None:
             return False
         moved = abs(player_x - last_x) >= 0.002
-        aligned = rope_x is not None and abs(player_x - rope_x) <= 0.03
+        aligned = (
+            rope_x is not None
+            and abs(player_x - rope_x) <= ROPE_STALL_ALIGNMENT_RANGE
+        )
         if moved or not aligned:
             self._rope_approach_stall_frames = 0
             return False
@@ -1566,6 +1575,18 @@ class MovementWorker(threading.Thread):
         if self._climb_state.phase != "idle":
             return  # already climbing
         gap = rope_x - observation.player.x
+        if abs(gap) > ROPE_STALL_ALIGNMENT_RANGE:
+            # Defensive second gate: callers must never convert an ordinary
+            # walk across the platform into a jump-climb loop.  This also
+            # protects against future call-site mistakes or a rope target
+            # that changes after the stall samples were collected.
+            self._rope_approach_stall_frames = 0
+            LOG.warning(
+                "ROPE STUCK recovery ignored: rope is still %.4f away; "
+                "continuing platform approach",
+                abs(gap),
+            )
+            return
         on_rope = self._detected_layer(observation) is None
         if on_rope or abs(gap) <= 0.01:
             self._start_rope_stuck_climb(observation)
@@ -4625,8 +4646,11 @@ class MovementWorker(threading.Thread):
                             )
                             self._release_climb_up()
                             self._climb_state = ClimbState()
-                        if (route_label.endswith(".rope")
-                                or route_label == "return.climb"
+                        is_rope_approach = (
+                            route_label.endswith(".rope")
+                            or route_label == "return.climb"
+                        )
+                        if (is_rope_approach
                                 and observation.player is not None
                                 and self._rope_approach_stalled(
                                     observation.player.x,

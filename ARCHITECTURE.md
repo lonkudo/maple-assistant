@@ -180,6 +180,10 @@ grace and attempt limits.
 Outside the rope zone, movement walks or creeps toward the recorded minimap X.
 Inside the zone, fresh YOLO rope/character boxes can select straight, left, or
 right jump-climb timing. Stale/missing YOLO state falls back to minimap logic.
+The platform-edge stall path requires both a rope-approach route and repeated
+no-progress samples within the rope alignment threshold. Recovery also checks
+that threshold itself, so a distant rope target always remains an ordinary
+walk and cannot enter the jump-climb state machine.
 
 The climb state machine performs the jump chord, holds Up persistently, tracks
 screen/world-Y progress, retries failed grabs, releases a stalled climb, and

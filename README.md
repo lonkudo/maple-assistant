@@ -103,6 +103,9 @@ re-recorded when the UI labels them as a legacy layout.
   hold. Z is pressed and released with Left/Right during walking.
 - Rope approach uses minimap X for navigation. Fresh YOLO rope/character boxes
   refine the jump direction and timing but do not control the route.
+- Rope-stall recovery is armed only after repeated no-progress frames within
+  the rope alignment range. While the rope is farther away, movement keeps
+  walking across the platform and cannot start a recovery jump.
 - Climb arrival requires the expected next layer and stable confirmation. Up
   remains held through a short rope-top compensation window.
 - Attack suppression ends immediately after confirmed climb arrival; the
