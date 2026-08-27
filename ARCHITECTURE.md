@@ -63,6 +63,9 @@ estimates scroll-compensated world Y and can re-anchor at a recorded floor.
 it only when confidence is sufficient and its frame sequence and minimap region
 exactly match the movement analysis. This prevents the startup fallback crop
 from overwriting a valid layer marker with a clipped `marker_y=0` reading.
+The optional disconnect alarm consumes that same detector result rather than
+capturing or detecting again. Three consecutive missing results trigger one
+background `sound/beep.mp3`; a later valid marker re-arms the next alert.
 
 ## 3. Input ownership and foreground safety
 
@@ -316,7 +319,7 @@ git -c core.quotepath=false ls-files
 | `assistant.py` | Primary entry point, dependency wiring, lifecycle, single-instance guard |
 | `capture_worker.py` | Client capture, frame bus, region mapping |
 | `movement_worker.py` | Patrol and movement state machines |
-| `character_worker.py` | Independent minimap character-position stream |
+| `character_worker.py` | Minimap character-position stream and shared-result disconnect alert |
 | `status_worker.py` | SendInput sender, status detection, potions/buffs |
 | `attack_worker.py` | Fixed-rate attack thread |
 | `focus_worker.py` | Foreground/refocus gate and key release |
@@ -364,6 +367,7 @@ test_attack_worker.py
 test_capture_worker.py
 test_channel_switch.py
 test_combat_coordination.py
+test_character_worker.py
 test_countdown_worker.py
 test_focus_worker.py
 test_map_identity.py

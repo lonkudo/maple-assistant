@@ -63,6 +63,8 @@ The application starts with live input disarmed. Input is enabled only after
 - `ShutdownWorker` optionally stops the PC after a configured duration.
 - `CountdownWorker` independently repeats an adjustable countdown, plays
   `sound/beep.mp3` at zero, and immediately resets for the next interval.
+- The optional **掉线警报** consumes `CharacterWorker`'s existing yellow-marker
+  result and plays the same beep after three consecutive missing frames.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
@@ -134,7 +136,7 @@ re-recorded when the UI labels them as a legacy layout.
 | `rope_calibration.json` | Movement, climb, fall, stair-jump, rescue, and patrol-cycle tuning |
 | `drug_settings.json` | HP/MP potion keys and thresholds; buff keys and intervals |
 | `fixed_attack_settings.json` | Fixed/YOLO attack mode, attack key, fixed interval |
-| `additional_functions_settings.json` | Optional timed shutdown, countdown reminder, and other-player settings |
+| `additional_functions_settings.json` | Optional shutdown, countdown, disconnect alert, and other-player settings |
 | `yolo_detection_settings.json` | YOLO threshold, range, FPS, detection zone, and preview settings |
 | `yolo-detection/config.yaml` | Lower-level model/detector configuration |
 
@@ -209,3 +211,8 @@ to move the current deadline anywhere from zero to the full interval. For
 example, with a `1.0h` interval, dragging the bar to `20m 00s` makes the next
 beep occur in 20 minutes. At zero, `sound/beep.mp3` plays and the bar resets to
 the full interval. The timer does not depend on patrol or attack being active.
+
+Selecting **掉线警报** reuses the normal per-frame yellow-character-diamond
+detection. Three consecutive missing frames confirm the loss and play one
+beep; the alarm re-arms after the marker is detected again. Audio runs in the
+background, so it does not slow the character detector or add another capture.

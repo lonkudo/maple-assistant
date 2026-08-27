@@ -458,6 +458,7 @@ class UiWorker(threading.Thread):
         status_worker: Any = None,
         attack_worker: Any = None,
         movement_worker: Any = None,
+        character_worker: Any = None,
         shutdown_worker: Any = None,
         countdown_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
@@ -486,6 +487,9 @@ class UiWorker(threading.Thread):
         # Fixed Attack mode runs without YOLO, so the minimap logic must own
         # the rope jump there.
         self.movement_worker = movement_worker
+        # Existing per-frame yellow-marker detector; the disconnect alarm
+        # consumes its already-computed detection result.
+        self.character_worker = character_worker
         # Shutdown worker (ShutdownWorker) the Additional Functions panel
         # arms: enabled flag + hours are applied live.
         self.shutdown_worker = shutdown_worker
@@ -1120,7 +1124,6 @@ class UiWorker(threading.Thread):
                 justify="left",
             )
             self._countdown_status.pack(anchor="w", pady=(4, 0))
-            self._shutdown_load_settings()
 
             # Other-player safety net: when red diamonds (other players) show
             # on the minimap at a move-to-left event finished, auto switch
@@ -1136,6 +1139,17 @@ class UiWorker(threading.Thread):
                 variable=self._player_check_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
+
+            disconnect_row = ttk.Frame(extra_panel)
+            disconnect_row.pack(fill="x", pady=(4, 0))
+            self._disconnect_alert_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                disconnect_row,
+                text="掉线警报",
+                variable=self._disconnect_alert_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left")
+            self._shutdown_load_settings()
 
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
@@ -1860,6 +1874,10 @@ class UiWorker(threading.Thread):
         }
         if hasattr(self, "_player_check_var"):
             data["player_check_enabled"] = bool(self._player_check_var.get())
+        if hasattr(self, "_disconnect_alert_var"):
+            data["disconnect_alert_enabled"] = bool(
+                self._disconnect_alert_var.get()
+            )
         if hasattr(self, "_countdown_enabled_var"):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
@@ -1909,6 +1927,11 @@ class UiWorker(threading.Thread):
             setter = getattr(mover, "set_other_player_check", None)
             if setter is not None:
                 setter(bool(data.get("player_check_enabled", False)))
+        character = getattr(self, "character_worker", None)
+        if character is not None:
+            setter = getattr(character, "set_disconnect_alert", None)
+            if setter is not None:
+                setter(bool(data.get("disconnect_alert_enabled", False)))
         if worker.enabled:
             self._shutdown_status.configure(
                 text=f"定时关闭已启动: 游戏将在 "
@@ -2089,6 +2112,12 @@ class UiWorker(threading.Thread):
                 self, "_player_check_var"
             ):
                 self._player_check_var.set(bool(data["player_check_enabled"]))
+            if "disconnect_alert_enabled" in data and hasattr(
+                self, "_disconnect_alert_var"
+            ):
+                self._disconnect_alert_var.set(bool(
+                    data["disconnect_alert_enabled"]
+                ))
             if hasattr(self, "_countdown_enabled_var"):
                 # Like scheduled shutdown, do not silently start a timer on
                 # application launch. Preserve only its configured time gap.

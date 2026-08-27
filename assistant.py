@@ -578,6 +578,9 @@ def main() -> int:
         minimap_region_provider=lambda: getattr(
             movement_worker, "_last_minimap_region", None
         ),
+        alert_sound_path=(
+            Path(__file__).resolve().parent / "sound" / "beep.mp3"
+        ),
     )
     core_workers = [
         capture_worker,
@@ -609,6 +612,7 @@ def main() -> int:
             status_worker=status_worker,
             attack_worker=attack_worker,
             movement_worker=movement_worker,
+            character_worker=character_worker,
             shutdown_worker=shutdown_worker,
             countdown_worker=countdown_worker,
             on_patrol_start=lambda: _start_live_input(

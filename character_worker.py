@@ -14,13 +14,16 @@ The worker never gates on focus or movement state: it only looks at frames.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import queue
+import threading
 from threading import Thread
 from typing import Any, Callable, Optional
 
 import numpy as np
 
 from marker_detector import detect_yellow_diamond
+from countdown_worker import play_mp3
 
 LOG = logging.getLogger(__name__)
 
@@ -76,6 +79,10 @@ class CharacterWorker(Thread):
         position_queue: "queue.Queue[CharacterPosition]",
         stop_event: Any,
         minimap_region_provider: Optional[Callable[[], tuple[float, float, float, float]]] = None,
+        disconnect_alert_enabled: bool = False,
+        disconnect_alert_misses: int = 3,
+        alert_sound_path: Optional[Path] = None,
+        play_alert_sound: Optional[Callable[[Path], None]] = None,
     ) -> None:
         super().__init__(name="character-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -84,6 +91,69 @@ class CharacterWorker(Thread):
         self._region_provider = minimap_region_provider
         self.minimap_region = DEFAULT_MINIMAP_REGION
         self._last_frame: Any = None
+        self._disconnect_alert_lock = threading.Lock()
+        self._disconnect_alert_enabled = bool(disconnect_alert_enabled)
+        self._disconnect_alert_misses = max(1, int(disconnect_alert_misses))
+        self._disconnect_missing_frames = 0
+        self._disconnect_alerted = False
+        self._alert_sound_path = Path(
+            alert_sound_path
+            if alert_sound_path is not None
+            else Path(__file__).resolve().parent / "sound" / "beep.mp3"
+        )
+        self._play_alert_sound = play_alert_sound or play_mp3
+
+    def set_disconnect_alert(self, enabled: bool) -> None:
+        """Enable/disable the missing-yellow-marker alarm live from the UI."""
+
+        with self._disconnect_alert_lock:
+            self._disconnect_alert_enabled = bool(enabled)
+            self._disconnect_missing_frames = 0
+            self._disconnect_alerted = False
+        LOG.info("disconnect alert %s", "enabled" if enabled else "disabled")
+
+    @property
+    def disconnect_alert_enabled(self) -> bool:
+        with self._disconnect_alert_lock:
+            return self._disconnect_alert_enabled
+
+    def _play_disconnect_alert(self) -> None:
+        try:
+            self._play_alert_sound(self._alert_sound_path)
+        except Exception:
+            LOG.warning("disconnect alert sound failed", exc_info=True)
+
+    def _update_disconnect_alert(self, detected: bool) -> None:
+        """Consume the existing marker result; never runs another detector."""
+
+        should_alert = False
+        with self._disconnect_alert_lock:
+            if not self._disconnect_alert_enabled:
+                self._disconnect_missing_frames = 0
+                self._disconnect_alerted = False
+                return
+            if detected:
+                self._disconnect_missing_frames = 0
+                self._disconnect_alerted = False
+                return
+            self._disconnect_missing_frames += 1
+            if (self._disconnect_missing_frames >= self._disconnect_alert_misses
+                    and not self._disconnect_alerted):
+                self._disconnect_alerted = True
+                should_alert = True
+        if should_alert:
+            LOG.warning(
+                "DISCONNECT ALERT: yellow character marker missing for %d "
+                "consecutive frames; playing beep",
+                self._disconnect_missing_frames,
+            )
+            # MCI playback waits until the MP3 ends. Keep marker detection at
+            # full cadence by moving only audio playback to a tiny daemon.
+            threading.Thread(
+                target=self._play_disconnect_alert,
+                name="disconnect-alert-sound",
+                daemon=True,
+            ).start()
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -99,6 +169,9 @@ class CharacterWorker(Thread):
                 image = frame.image
                 rgb = _crop_minimap(image, self.minimap_region)
                 detection = detect_yellow_diamond(rgb)
+                # The disconnect alarm consumes this exact result. There is
+                # deliberately no second crop or yellow-marker detection.
+                self._update_disconnect_alert(detection is not None)
                 if detection is not None:
                     position = CharacterPosition(
                         getattr(detection, "x", None),

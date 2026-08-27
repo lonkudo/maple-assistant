@@ -2,5 +2,6 @@
   "shutdown_enabled": false,
   "shutdown_hours": 1.5,
   "countdown_enabled": false,
-  "countdown_interval_hours": 1.0
+  "countdown_interval_hours": 1.0,
+  "disconnect_alert_enabled": false
 }

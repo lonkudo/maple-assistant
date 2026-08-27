@@ -1062,15 +1062,24 @@ class UiLogHandlerTests(unittest.TestCase):
             def set_other_player_check(self, enabled) -> None:
                 self.calls.append(enabled)
 
+        class FakeCharacter:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def set_disconnect_alert(self, enabled) -> None:
+                self.calls.append(enabled)
+
         worker = UiWorker.__new__(UiWorker)
         worker.shutdown_worker = FakeShutdownWorker()
         worker.movement_worker = FakeMover()
+        worker.character_worker = FakeCharacter()
         worker._shutdown_enabled_var = Var(False)
         worker._shutdown_hours_var = Var(3.0)
         worker._shutdown_hours_label = Label()
         worker._shutdown_slider = Slider()
         worker._shutdown_status = Label()
         worker._player_check_var = Var(True)
+        worker._disconnect_alert_var = Var(True)
 
         def fake_path(self):
             return Path(tempfile.gettempdir()) / "test_player_check_settings.json"
@@ -1083,21 +1092,27 @@ class UiLogHandlerTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
             )
             self.assertTrue(data["player_check_enabled"])
+            self.assertTrue(data["disconnect_alert_enabled"])
             self.assertEqual(worker.movement_worker.calls, [True])
+            self.assertEqual(worker.character_worker.calls, [True])
 
             loader = UiWorker.__new__(UiWorker)
             loader.shutdown_worker = FakeShutdownWorker()
             loader.movement_worker = FakeMover()
+            loader.character_worker = FakeCharacter()
             loader._shutdown_enabled_var = Var(False)
             loader._shutdown_hours_var = Var(3.0)
             loader._shutdown_hours_label = Label()
             loader._shutdown_slider = Slider()
             loader._shutdown_status = Label()
             loader._player_check_var = Var(False)
+            loader._disconnect_alert_var = Var(False)
             with mock.patch.object(UiWorker, "_shutdown_settings_path", fake_path):
                 loader._shutdown_load_settings()
             self.assertTrue(loader._player_check_var.get())
             self.assertEqual(loader.movement_worker.calls, [True])
+            self.assertTrue(loader._disconnect_alert_var.get())
+            self.assertEqual(loader.character_worker.calls, [True])
 
 
 class WindowGeometryHelperTests(unittest.TestCase):
