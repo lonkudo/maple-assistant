@@ -461,6 +461,7 @@ class UiWorker(threading.Thread):
         character_worker: Any = None,
         shutdown_worker: Any = None,
         countdown_worker: Any = None,
+        lie_detector_worker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -496,6 +497,9 @@ class UiWorker(threading.Thread):
         # Independent repeating sound reminder. It owns no game state/input;
         # this reference only exposes its interval/deadline to the UI.
         self.countdown_worker = countdown_worker
+        # Five-second white-square detector fed by the existing full-client
+        # capture bus. It never creates screenshot files.
+        self.lie_detector_worker = lie_detector_worker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -1147,6 +1151,16 @@ class UiWorker(threading.Thread):
                 disconnect_row,
                 text="掉线警报",
                 variable=self._disconnect_alert_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left")
+
+            lie_alert_row = ttk.Frame(extra_panel)
+            lie_alert_row.pack(fill="x", pady=(4, 0))
+            self._lie_alert_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                lie_alert_row,
+                text="测谎报警",
+                variable=self._lie_alert_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
             self._shutdown_load_settings()
@@ -1878,6 +1892,8 @@ class UiWorker(threading.Thread):
             data["disconnect_alert_enabled"] = bool(
                 self._disconnect_alert_var.get()
             )
+        if hasattr(self, "_lie_alert_var"):
+            data["lie_alert_enabled"] = bool(self._lie_alert_var.get())
         if hasattr(self, "_countdown_enabled_var"):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
@@ -1932,6 +1948,11 @@ class UiWorker(threading.Thread):
             setter = getattr(character, "set_disconnect_alert", None)
             if setter is not None:
                 setter(bool(data.get("disconnect_alert_enabled", False)))
+        lie_detector = getattr(self, "lie_detector_worker", None)
+        if lie_detector is not None:
+            setter = getattr(lie_detector, "set_enabled", None)
+            if setter is not None:
+                setter(bool(data.get("lie_alert_enabled", False)))
         if worker.enabled:
             self._shutdown_status.configure(
                 text=f"定时关闭已启动: 游戏将在 "
@@ -2118,6 +2139,10 @@ class UiWorker(threading.Thread):
                 self._disconnect_alert_var.set(bool(
                     data["disconnect_alert_enabled"]
                 ))
+            if "lie_alert_enabled" in data and hasattr(
+                self, "_lie_alert_var"
+            ):
+                self._lie_alert_var.set(bool(data["lie_alert_enabled"]))
             if hasattr(self, "_countdown_enabled_var"):
                 # Like scheduled shutdown, do not silently start a timer on
                 # application launch. Preserve only its configured time gap.

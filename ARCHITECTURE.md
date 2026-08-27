@@ -21,6 +21,7 @@ assistant.py (primary process)
     FocusWorker        foreground gate, refocus, key release
     ShutdownWorker     optional timed shutdown
     CountdownWorker    independent repeating MP3 reminder
+    LieDetectorWorker  5-second full-client pure-white-square alarm
     supervisor-worker  stops the process if a core worker dies
 
 yolo-detection/live_view.py (optional subprocess launched by UiWorker)
@@ -50,6 +51,7 @@ game client
      -> movement_frames  -> MovementWorker
      -> status_frames    -> StatusWorker
      -> character_frames -> CharacterWorker -> character_positions
+     -> lie frames       -> LieDetectorWorker (one in-memory scan per 5s)
      -> ui_frames        -> UiWorker
 ```
 
@@ -239,6 +241,13 @@ The UI reads a locked snapshot for its live progress scale. Dragging that scale
 sets a new remaining duration within `0..interval`; UI refresh pauses while the
 pointer owns the scale so it does not fight the drag.
 
+`LieDetectorWorker` receives its own latest-only subscription to the existing
+full-client `FrameBus`. It does not capture again and never writes a screenshot.
+Every five seconds it scales the reference `40×40` signature from a
+`1075×768` client to the current width and height, then uses an OpenCV erosion
+over the exact-white pixel mask to find an all-white rectangle. A match beeps
+once until a later scan confirms the square has disappeared.
+
 ## 7. Cross-process coordination
 
 The primary and YOLO processes coordinate through atomically replaced,
@@ -325,6 +334,7 @@ git -c core.quotepath=false ls-files
 | `focus_worker.py` | Foreground/refocus gate and key release |
 | `shutdown_worker.py` | Optional timed shutdown |
 | `countdown_worker.py` | Independent repeating countdown and MP3 playback |
+| `lie_detector_worker.py` | Resolution-scaled in-memory lie-event detection |
 | `pickup_worker.py` | Legacy standalone pickup worker; not wired by assistant.py |
 | `channel_switch.py` | Channel-switch/drop recovery procedure |
 | `combat_coordination.py` | Attack, patrol, and rope state-file adapters |
@@ -369,6 +379,7 @@ test_channel_switch.py
 test_combat_coordination.py
 test_character_worker.py
 test_countdown_worker.py
+test_lie_detector_worker.py
 test_focus_worker.py
 test_map_identity.py
 test_map_structure_tracker.py

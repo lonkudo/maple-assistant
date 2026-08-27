@@ -183,6 +183,7 @@ def main() -> int:
     from attack_worker import AttackWorker
     from shutdown_worker import ShutdownWorker
     from countdown_worker import CountdownWorker
+    from lie_detector_worker import LieDetectorWorker
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
     from marker_detector import DiamondSizeTracker, detect_yellow_diamond
@@ -203,8 +204,11 @@ def main() -> int:
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
     character_frames: queue.Queue = queue.Queue(maxsize=1)
+    lie_detector_frames: queue.Queue = queue.Queue(maxsize=1)
     character_positions: queue.Queue = queue.Queue(maxsize=1)
-    subscribers = [movement_frames, status_frames, character_frames]
+    subscribers = [
+        movement_frames, status_frames, character_frames, lie_detector_frames,
+    ]
     if not args.no_ui:
         subscribers.append(ui_frames)
     bus = FrameBus(subscribers)
@@ -396,6 +400,13 @@ def main() -> int:
         sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
         enabled=False,
         interval_hours=1.0,
+    )
+    lie_detector_worker = LieDetectorWorker(
+        lie_detector_frames,
+        stop_event,
+        enabled=False,
+        scan_interval=5.0,
+        sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
     )
     # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。
     status_worker = StatusWorker(
@@ -590,6 +601,7 @@ def main() -> int:
         *attack_workers,
         shutdown_worker,
         countdown_worker,
+        lie_detector_worker,
         FocusWorker(
             key_sender,
             stop_event,
@@ -615,6 +627,7 @@ def main() -> int:
             character_worker=character_worker,
             shutdown_worker=shutdown_worker,
             countdown_worker=countdown_worker,
+            lie_detector_worker=lie_detector_worker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

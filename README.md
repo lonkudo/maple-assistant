@@ -65,6 +65,8 @@ The application starts with live input disarmed. Input is enabled only after
   `sound/beep.mp3` at zero, and immediately resets for the next interval.
 - The optional **掉线警报** consumes `CharacterWorker`'s existing yellow-marker
   result and plays the same beep after three consecutive missing frames.
+- The optional **测谎报警** samples the shared full-client capture every five
+  seconds and alarms when it finds a resolution-scaled pure-white square.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
@@ -136,7 +138,7 @@ re-recorded when the UI labels them as a legacy layout.
 | `rope_calibration.json` | Movement, climb, fall, stair-jump, rescue, and patrol-cycle tuning |
 | `drug_settings.json` | HP/MP potion keys and thresholds; buff keys and intervals |
 | `fixed_attack_settings.json` | Fixed/YOLO attack mode, attack key, fixed interval |
-| `additional_functions_settings.json` | Optional shutdown, countdown, disconnect alert, and other-player settings |
+| `additional_functions_settings.json` | Optional shutdown, countdown, disconnect/lie alerts, and other-player settings |
 | `yolo_detection_settings.json` | YOLO threshold, range, FPS, detection zone, and preview settings |
 | `yolo-detection/config.yaml` | Lower-level model/detector configuration |
 
@@ -216,3 +218,10 @@ Selecting **掉线警报** reuses the normal per-frame yellow-character-diamond
 detection. Three consecutive missing frames confirm the loss and play one
 beep; the alarm re-arms after the marker is detected again. Audio runs in the
 background, so it does not slow the character detector or add another capture.
+
+Selecting **测谎报警** checks one in-memory full-game frame every five seconds.
+Its reference signature is a `40×40` block of entirely pure-white pixels in a
+`1075×768` client. Both target dimensions scale independently with the current
+client resolution. A visible match plays one beep; after the square disappears,
+a later match can alert again. The detector never saves screenshots, so no used
+image files remain to delete.
