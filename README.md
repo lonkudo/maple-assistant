@@ -236,8 +236,8 @@ client resolution. A visible match plays one beep; after the square disappears,
 a later match can alert again. The detector never saves screenshots, so no used
 image files remain to delete.
 
-Selecting **闪烁提醒** makes the primary screen flash blue for 0.5 seconds,
-turn off for 0.3 seconds, then flash blue for another 0.5 seconds whenever one
+Selecting **闪烁提醒** makes the primary screen flash red for 0.5 seconds,
+turn off for 0.3 seconds, then flash red for another 0.5 seconds whenever one
 of the existing beep alarms fires: the repeating countdown, 掉线警报, or 测谎报警.
 Use **测试闪烁** beside the checkbox to confirm it immediately. It is a separate
 notification worker and does not create another capture loop.

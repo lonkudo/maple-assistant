@@ -30,7 +30,7 @@ assistant.py (primary process)
     ShutdownWorker     optional timed shutdown
     CountdownWorker    independent repeating MP3 reminder
     LieDetectorWorker  1-second full-client pure-white-square alarm
-    ScreenBlinker       optional two-flash blue visual alarm
+    ScreenBlinker       optional two-flash red visual alarm
     supervisor-worker  stops the process if a core worker dies
 
 yolo-detection/live_view.py (optional subprocess launched by UiWorker)
@@ -260,8 +260,8 @@ over the exact-white pixel mask to find an all-white rectangle. A match beeps
 once until a later scan confirms the square has disappeared.
 
 `ScreenBlinker` is a separate, request-driven worker. When **闪烁提醒** is
-selected, every existing beep trigger queues a 0.5s blue full-screen flash,
-a 0.3s gap, and a final 0.5s blue flash
+selected, every existing beep trigger queues a 0.5s red full-screen flash,
+a 0.3s gap, and a final 0.5s red flash
 (countdown, disconnect alarm, and lie detector). It owns no capture or game
 input and therefore cannot delay the workers that produced the alert. It uses
 a native no-activation, topmost Win32 overlay to cover the game's virtual

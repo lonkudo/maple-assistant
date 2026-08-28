@@ -1173,7 +1173,7 @@ class UiWorker(threading.Thread):
             self._screen_blink_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 blink_row,
-                text="闪烁提醒（蓝色闪烁两次）",
+                text="闪烁提醒（红色闪烁两次）",
                 variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")

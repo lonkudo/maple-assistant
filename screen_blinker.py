@@ -1,4 +1,4 @@
-"""Optional full-screen blue visual alert shared by all beep triggers."""
+"""Optional full-screen red visual alert shared by all beep triggers."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ LOG = logging.getLogger(__name__)
 
 
 class ScreenBlinker(threading.Thread):
-    """Show a short blue full-screen overlay twice for each queued alert.
+    """Show a short red full-screen overlay twice for each queued alert.
 
     The overlay is a native topmost Win32 window. This keeps it above the game
     client; a Tk window created on a background worker may be hidden behind a
@@ -64,7 +64,7 @@ class ScreenBlinker(threading.Thread):
         return self.stop_event.wait(seconds)
 
     def _blink_twice(self) -> None:
-        """Show a native, no-activation blue overlay above the game window."""
+        """Show a native, no-activation red overlay above the game window."""
 
         if not hasattr(ctypes, "windll"):
             LOG.warning("screen blink alert requires Windows")
@@ -116,6 +116,15 @@ class ScreenBlinker(threading.Thread):
             user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
             user32.UpdateWindow.argtypes = (wintypes.HWND,)
             user32.DestroyWindow.argtypes = (wintypes.HWND,)
+            user32.GetDC.argtypes = (wintypes.HWND,)
+            user32.GetDC.restype = wintypes.HDC
+            user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+            user32.GetClientRect.argtypes = (
+                wintypes.HWND, ctypes.POINTER(wintypes.RECT),
+            )
+            user32.FillRect.argtypes = (
+                wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH,
+            )
             gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
             gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
 
@@ -123,9 +132,9 @@ class ScreenBlinker(threading.Thread):
                 return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
             callback = window_proc_type(window_proc)
-            brush = gdi32.CreateSolidBrush(0x00D77800)  # Windows COLORREF BGR
+            brush = gdi32.CreateSolidBrush(0x000000FF)  # Windows COLORREF BGR: red
             if not brush:
-                raise OSError("could not create blue overlay brush")
+                raise OSError("could not create red overlay brush")
             instance = kernel32.GetModuleHandleW(None)
             class_name = f"MapleAssistantBlueAlert{threading.get_ident()}"
             window_class = WindowClass(
@@ -135,7 +144,7 @@ class ScreenBlinker(threading.Thread):
             if not user32.RegisterClassW(ctypes.byref(window_class)):
                 error = ctypes.get_last_error()
                 if error not in (0, 1410):  # class already registered
-                    raise OSError(error, "could not register blue overlay")
+                    raise OSError(error, "could not register red overlay")
 
             # Full virtual desktop covers the game even when it is on another
             # monitor. The no-activate and tool-window flags avoid stealing
@@ -150,7 +159,7 @@ class ScreenBlinker(threading.Thread):
                 left, top, width, height, None, None, instance, None,
             )
             if not hwnd:
-                raise OSError(ctypes.get_last_error(), "could not create blue overlay")
+                raise OSError(ctypes.get_last_error(), "could not create red overlay")
         except Exception:
             LOG.warning("screen blink alert is unavailable", exc_info=True)
             return
@@ -163,6 +172,17 @@ class ScreenBlinker(threading.Thread):
                     0x0010 | 0x0040,
                 )
                 user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+                # Explicitly fill for EVERY flash. Relying on the class
+                # background after a hide/show can leave a white repaint on
+                # the second flash on some Windows desktop themes.
+                rect = wintypes.RECT()
+                hdc = user32.GetDC(hwnd)
+                if hdc:
+                    try:
+                        user32.GetClientRect(hwnd, ctypes.byref(rect))
+                        user32.FillRect(hdc, ctypes.byref(rect), brush)
+                    finally:
+                        user32.ReleaseDC(hwnd, hdc)
                 user32.UpdateWindow(hwnd)
                 if self._wait(self.flash_seconds):
                     return
