@@ -40,9 +40,11 @@ MINIMAP_FALLBACK_REGION = (0, 0, 0.22, 0.27)
 STATUS_CAPTURE_REGION = (0.36, 0.96, 0.53, 1)
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
 # Status-bar fractions are calibrated to the CLIENT WIDTH so they hold at any
-# resolution (the game HUD scales with the client).  Measured: a full HP fill
-# is about 131px on a 2560-wide client -> 131/2560 ~= 0.0512.
-FULL_BAR_CLIENT_FRACTION = 0.0512
+# resolution.  The game's HUD may retain a larger fixed-pixel scale on a
+# smaller client; 0.075 is deliberately conservative so potion thresholds
+# trigger a little early rather than dangerously late before a full bar has
+# been observed and calibrated.
+FULL_BAR_CLIENT_FRACTION = 0.075
 MIN_BAR_CLIENT_FRACTION = 0.0020
 
 

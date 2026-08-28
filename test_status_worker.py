@@ -81,6 +81,21 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(half.hp, 328, delta=10)
         self.assertAlmostEqual(half.mp, 371, delta=5)
 
+    def test_partial_bar_never_becomes_the_full_reference(self) -> None:
+        # A 60px MP fill is only 75% of the conservative 80px reference.  It
+        # must remain 75%, not be learned as "full" and reported as 100%.
+        image = Image.new("RGB", (1000, 100), "black")
+        ImageDraw.Draw(image).rectangle((100, 40, 159, 44), fill=(20, 40, 220))
+        detector = BarStatusDetector(replace(
+            StatusConfig(status_roi=(0.0, 0.0, 1.0, 1.0)),
+            full_bar_width_fraction=0.08,
+        ))
+
+        reading = detector.detect(image)
+
+        self.assertIsNone(detector._full_run["mp"])
+        self.assertAlmostEqual(reading.mp_ratio, 0.75, delta=0.03)
+
     def test_wide_non_bar_element_does_not_lock_ratio_at_full(self):
         # A wide blue element (HUD frame / bar-track glow) inside the ROI
         # must NOT be measured as the MP bar - it would lock the ratio at

@@ -575,9 +575,11 @@ class BarStatusDetector:
         # client width (some setups keep fixed-pixel bars), so a pure
         # client-fraction estimate can be smaller than the real bar - that
         # clips every ratio to 1.0 and potions would never fire.  The
-        # observed full run self-calibrates to the ACTUAL bar length once the
-        # bar is reasonably full (guard: only accept runs >= 75% of the
-        # current estimate, so a tiny near-empty bar is never adopted).
+        # observed full run self-calibrates to the ACTUAL bar length only once
+        # it is clearly wider than the conservative initial estimate.  A
+        # partially filled bar must never be adopted as "full": doing so
+        # inflates every later percentage and causes a 30% potion threshold
+        # to fire dangerously late.
         self._full_run: dict[str, Optional[int]] = {"hp": None, "mp": None}
         self._ref_width: int = 0
 
@@ -645,10 +647,12 @@ class BarStatusDetector:
         reference = self._full_run.get(name)
         if reference is not None:
             expected = max(expected, float(reference))
-        # A run close to (or beyond) the current estimate is plausibly the
-        # FULL bar on this machine: adopt it as the new reference so ratios
-        # match the REAL bar length on any resolution/HUD scale.
-        if run >= expected * 0.75:
+        # Only a run clearly beyond the conservative estimate can establish
+        # the real full-bar length.  A 75%-wide sample used to be accepted
+        # here; it then made 20% actual MP appear to be 30%+ and delayed
+        # potion use.  When uncertain, retaining the larger estimate is safe:
+        # it may drink a little early, never late.
+        if run >= expected * 1.10:
             if reference is None or run > reference:
                 self._full_run[name] = run
                 expected = max(expected, float(run))
