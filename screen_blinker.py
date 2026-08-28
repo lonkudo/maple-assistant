@@ -73,34 +73,9 @@ class ScreenBlinker(threading.Thread):
             user32 = ctypes.windll.user32
             gdi32 = ctypes.windll.gdi32
             kernel32 = ctypes.windll.kernel32
-            window_proc_type = ctypes.WINFUNCTYPE(
-                ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
-                wintypes.WPARAM, wintypes.LPARAM,
-            )
-
-            class WindowClass(ctypes.Structure):
-                _fields_ = [
-                    ("style", wintypes.UINT),
-                    ("lpfnWndProc", window_proc_type),
-                    ("cbClsExtra", ctypes.c_int),
-                    ("cbWndExtra", ctypes.c_int),
-                    ("hInstance", wintypes.HINSTANCE),
-                    ("hIcon", wintypes.HANDLE),
-                    ("hCursor", wintypes.HANDLE),
-                    ("hbrBackground", wintypes.HANDLE),
-                    ("lpszMenuName", wintypes.LPCWSTR),
-                    ("lpszClassName", wintypes.LPCWSTR),
-                ]
-
             # Explicit pointer-sized signatures are essential on 64-bit
             # Windows. ctypes otherwise treats HWNDs as 32-bit integers and
             # the overlay can be created with a truncated, unusable handle.
-            user32.DefWindowProcW.argtypes = (
-                wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-            )
-            user32.DefWindowProcW.restype = ctypes.c_ssize_t
-            user32.RegisterClassW.argtypes = (ctypes.POINTER(WindowClass),)
-            user32.RegisterClassW.restype = wintypes.ATOM
             user32.CreateWindowExW.argtypes = (
                 wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
                 wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -128,24 +103,10 @@ class ScreenBlinker(threading.Thread):
             gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
             gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
 
-            def window_proc(hwnd, message, wparam, lparam):
-                return user32.DefWindowProcW(hwnd, message, wparam, lparam)
-
-            callback = window_proc_type(window_proc)
             brush = gdi32.CreateSolidBrush(0x000000FF)  # Windows COLORREF BGR: red
             if not brush:
                 raise OSError("could not create red overlay brush")
             instance = kernel32.GetModuleHandleW(None)
-            class_name = f"MapleAssistantBlueAlert{threading.get_ident()}"
-            window_class = WindowClass(
-                0, callback, 0, 0, instance, None, None, brush,
-                None, class_name,
-            )
-            if not user32.RegisterClassW(ctypes.byref(window_class)):
-                error = ctypes.get_last_error()
-                if error not in (0, 1410):  # class already registered
-                    raise OSError(error, "could not register red overlay")
-
             # Full virtual desktop covers the game even when it is on another
             # monitor. The no-activate and tool-window flags avoid stealing
             # keyboard focus or appearing on the taskbar.
@@ -155,7 +116,7 @@ class ScreenBlinker(threading.Thread):
             height = max(1, user32.GetSystemMetrics(79))
             hwnd = user32.CreateWindowExW(
                 0x00000008 | 0x00000080 | 0x08000000,  # topmost/tool/no activate
-                class_name, None, 0x80000000,  # WS_POPUP
+                "STATIC", None, 0x80000000,  # built-in class + WS_POPUP
                 left, top, width, height, None, None, instance, None,
             )
             if not hwnd:
@@ -172,9 +133,12 @@ class ScreenBlinker(threading.Thread):
                     0x0010 | 0x0040,
                 )
                 user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+                user32.UpdateWindow(hwnd)
                 # Explicitly fill for EVERY flash. Relying on the class
                 # background after a hide/show can leave a white repaint on
-                # the second flash on some Windows desktop themes.
+                # the second flash on some Windows desktop themes. The built-
+                # in STATIC class avoids retaining a Python window callback
+                # after a previous alert has ended.
                 rect = wintypes.RECT()
                 hdc = user32.GetDC(hwnd)
                 if hdc:
@@ -183,7 +147,6 @@ class ScreenBlinker(threading.Thread):
                         user32.FillRect(hdc, ctypes.byref(rect), brush)
                     finally:
                         user32.ReleaseDC(hwnd, hdc)
-                user32.UpdateWindow(hwnd)
                 if self._wait(self.flash_seconds):
                     return
                 if flash_index + 1 >= self.flashes_per_alert:

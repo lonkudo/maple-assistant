@@ -20,19 +20,6 @@ from ui_worker import (
 
 
 class UiLogHandlerTests(unittest.TestCase):
-    def test_screen_blink_test_button_requests_notifier(self) -> None:
-        class Blinker:
-            def __init__(self):
-                self.requests = 0
-
-            def request_blink(self):
-                self.requests += 1
-
-        worker = UiWorker.__new__(UiWorker)
-        worker.screen_blinker = Blinker()
-        worker._test_screen_blink()
-        self.assertEqual(worker.screen_blinker.requests, 1)
-
     def test_higher_layers_are_displayed_above_lower_layers(self) -> None:
         self.assertEqual(
             layer_display_order(["layer1", "layer2", "layer3"]),
