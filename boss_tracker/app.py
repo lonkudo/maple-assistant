@@ -25,7 +25,6 @@ def format_seconds(seconds: float) -> str:
 
 class BossTrackerApp:
     POLL_MS = 200
-    COMPACT_WIDTH = 350
     DEFAULT_HEIGHT = 600
 
     def __init__(self, root: tk.Tk, model: BossTrackerModel) -> None:
@@ -36,17 +35,20 @@ class BossTrackerApp:
         self._closing = False
 
         root.title("BOSS 追踪")
-        root.minsize(330, 500)
+        root.minsize(1, 500)
         root.protocol("WM_DELETE_WINDOW", self.close)
         geometry = model.snapshot().get("window_geometry", "")
         match = re.match(r"^\d+x(\d+)([+-]\d+[+-]\d+)?$", geometry)
         height = max(500, int(match.group(1))) if match else self.DEFAULT_HEIGHT
         position = match.group(2) if match and match.group(2) else ""
-        root.geometry(f"{self.COMPACT_WIDTH}x{height}{position}")
 
         self._build_ui()
         self._rebuild_channels()
         self._rebuild_statistics()
+        root.update_idletasks()
+        natural_width = root.winfo_reqwidth()
+        root.geometry(f"{natural_width}x{height}{position}")
+        root.minsize(natural_width, 500)
         self._poll()
 
     def _build_ui(self) -> None:
@@ -119,7 +121,7 @@ class BossTrackerApp:
     def _fixed_entry(
         parent: tk.Misc,
         variable: tk.StringVar,
-        width_px: int = 20,
+        width_px: int = 150,
     ) -> tuple[ttk.Frame, ttk.Entry]:
         """Return an editable field constrained to an exact pixel width."""
 
@@ -129,6 +131,20 @@ class BossTrackerApp:
         entry = ttk.Entry(holder, textvariable=variable)
         entry.place(x=0, y=0, width=width_px, height=24)
         return holder, entry
+
+    @staticmethod
+    def _fixed_label(
+        parent: tk.Misc,
+        text: str,
+        width_px: int = 60,
+    ) -> tuple[ttk.Frame, ttk.Label]:
+        """Return a left-aligned label constrained to an exact pixel width."""
+
+        holder = ttk.Frame(parent, width=width_px, height=24)
+        holder.grid_propagate(False)
+        label = ttk.Label(holder, text=text, anchor="w")
+        label.place(x=0, y=0, width=width_px, height=24)
+        return holder, label
 
     def _sync_channel_scroll(self, _event: Any = None) -> None:
         self.channel_canvas.configure(scrollregion=self.channel_canvas.bbox("all"))
@@ -190,14 +206,13 @@ class BossTrackerApp:
         for row in rows:
             line = ttk.Frame(self.channel_frame, padding=(4, 5))
             line.pack(fill="x")
-            ttk.Label(line, text=row["name"], width=6).grid(
-                row=0, column=0, sticky="w"
-            )
+            name_holder, _name_label = self._fixed_label(line, row["name"])
+            name_holder.grid(row=0, column=0, sticky="w")
             progress = ttk.Progressbar(
                 line,
                 maximum=row["interval"],
                 value=row["remaining"],
-                length=55,
+                length=110,
             )
             progress.grid(row=0, column=1, padx=3)
             remaining = ttk.Label(
