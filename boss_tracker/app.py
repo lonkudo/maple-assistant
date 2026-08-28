@@ -55,34 +55,34 @@ class BossTrackerApp:
 
         settings = ttk.LabelFrame(outer, text="通用设置", padding=7)
         settings.pack(fill="x")
-        ttk.Label(settings, text="统一时间间隔（小时）").grid(
-            row=0, column=0, sticky="w"
-        )
+        interval_row = ttk.Frame(settings)
+        interval_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(interval_row, text="统一时间间隔（小时）").pack(side="left")
         hours = self.model.snapshot()["universal_interval_hours"]
         self.interval_var = tk.StringVar(value=f"{hours:g}")
-        ttk.Entry(settings, textvariable=self.interval_var, width=6).grid(
-            row=0, column=1, padx=5
+        _interval_holder, interval_entry = self._fixed_entry(
+            interval_row, self.interval_var
         )
-        ttk.Button(settings, text="应用并重置全部", command=self._apply_interval).grid(
-            row=0, column=2, sticky="w"
-        )
+        _interval_holder.pack(side="left", padx=4)
+        ttk.Button(
+            interval_row, text="应用并重置全部", command=self._apply_interval
+        ).pack(side="left")
 
-        ttk.Label(settings, text="频道名称").grid(
-            row=1, column=0, sticky="w", pady=(10, 0)
-        )
+        channel_row = ttk.Frame(settings)
+        channel_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(channel_row, text="频道名称").pack(side="left")
         self.channel_name_var = tk.StringVar()
-        channel_entry = ttk.Entry(
-            settings, textvariable=self.channel_name_var, width=11
+        channel_holder, channel_entry = self._fixed_entry(
+            channel_row, self.channel_name_var
         )
-        channel_entry.grid(row=1, column=1, padx=5, pady=(8, 0), sticky="ew")
+        channel_holder.pack(side="left", padx=4)
         channel_entry.bind("<Return>", lambda _event: self._add_channel())
-        ttk.Button(settings, text="添加频道", command=self._add_channel).grid(
-            row=1, column=2, pady=(8, 0), sticky="w"
-        )
+        ttk.Button(
+            channel_row, text="添加频道", command=self._add_channel
+        ).pack(side="left")
         ttk.Button(
             settings, text="清空全部数据", command=self._clear_all_data
-        ).grid(row=2, column=0, columnspan=3, pady=(8, 0), sticky="e")
-        settings.columnconfigure(1, weight=1)
+        ).grid(row=2, column=0, pady=(8, 0), sticky="w")
 
         channel_box = ttk.LabelFrame(outer, text="各频道 BOSS 倒计时", padding=8)
         channel_box.pack(fill="both", expand=True, pady=(10, 0))
@@ -114,6 +114,21 @@ class BossTrackerApp:
         ttk.Label(outer, textvariable=self.status_var).pack(
             fill="x", pady=(8, 0)
         )
+
+    @staticmethod
+    def _fixed_entry(
+        parent: tk.Misc,
+        variable: tk.StringVar,
+        width_px: int = 20,
+    ) -> tuple[ttk.Frame, ttk.Entry]:
+        """Return an editable field constrained to an exact pixel width."""
+
+        holder = ttk.Frame(parent, width=width_px, height=24)
+        holder.pack_propagate(False)
+        holder.grid_propagate(False)
+        entry = ttk.Entry(holder, textvariable=variable)
+        entry.place(x=0, y=0, width=width_px, height=24)
+        return holder, entry
 
     def _sync_channel_scroll(self, _event: Any = None) -> None:
         self.channel_canvas.configure(scrollregion=self.channel_canvas.bbox("all"))
@@ -175,31 +190,32 @@ class BossTrackerApp:
         for row in rows:
             line = ttk.Frame(self.channel_frame, padding=(4, 5))
             line.pack(fill="x")
-            ttk.Label(line, text=row["name"], width=8).grid(
+            ttk.Label(line, text=row["name"], width=6).grid(
                 row=0, column=0, sticky="w"
             )
-            remaining = ttk.Label(
-                line, text=format_seconds(row["remaining"]), width=10
+            progress = ttk.Progressbar(
+                line,
+                maximum=row["interval"],
+                value=row["remaining"],
+                length=55,
             )
-            remaining.grid(row=0, column=1, padx=(4, 0))
+            progress.grid(row=0, column=1, padx=3)
+            remaining = ttk.Label(
+                line, text=format_seconds(row["remaining"]), width=8
+            )
+            remaining.grid(row=0, column=2)
             ttk.Button(
                 line,
                 text="重置",
-                width=5,
+                width=4,
                 command=lambda channel_id=row["id"]: self._reset_channel(channel_id),
-            ).grid(row=0, column=2, padx=(5, 2))
+            ).grid(row=0, column=3, padx=(3, 2))
             ttk.Button(
                 line,
                 text="删除",
-                width=5,
+                width=4,
                 command=lambda channel_id=row["id"]: self._delete_channel(channel_id),
-            ).grid(row=0, column=3)
-            progress = ttk.Progressbar(
-                line, maximum=row["interval"], value=row["remaining"]
-            )
-            progress.grid(
-                row=1, column=0, columnspan=4, pady=(5, 0), sticky="ew"
-            )
+            ).grid(row=0, column=4)
             line.columnconfigure(0, weight=1)
             self.channel_widgets[row["id"]] = {
                 "progress": progress,
@@ -254,8 +270,8 @@ class BossTrackerApp:
 
         for row_index, item in enumerate(data["custom"], start=1):
             variable = tk.StringVar(value=item["name"])
-            entry = ttk.Entry(self.stats_frame, textvariable=variable, width=12)
-            entry.grid(row=row_index, column=0, sticky="ew", pady=3)
+            entry_holder, entry = self._fixed_entry(self.stats_frame, variable)
+            entry_holder.grid(row=row_index, column=0, sticky="w", pady=3)
             entry.bind(
                 "<FocusOut>",
                 lambda _event, item_id=item["id"], var=variable:
