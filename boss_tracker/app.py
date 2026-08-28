@@ -71,7 +71,7 @@ class BossTrackerApp:
         _interval_holder.pack(side="left", padx=4)
         ttk.Button(
             interval_controls,
-            text="应用并重置全部",
+            text="重置间隔",
             command=self._apply_interval,
         ).pack(side="left")
 

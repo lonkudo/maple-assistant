@@ -29,12 +29,16 @@ try {
         "BossTracker\app.py", "BossTracker\audio.py",
         "BossTracker\model.py", "BossTracker\sound\beep.mp3",
         "BossTracker\requirements.txt",
+        "BossTracker\install_boss_tracker.ps1",
         "BossTracker\vendor\comtypes\__init__.py"
     )) {
         if ($required -notin $names) { throw "zip missing $required" }
     }
     if (-not ($names | Where-Object { $_ -like "BossTracker\*.bat" })) {
         throw "zip missing launcher bat"
+    }
+    if (@($names | Where-Object { $_ -like "BossTracker\*.bat" }).Count -lt 2) {
+        throw "zip missing installer bat"
     }
     if ($names | Where-Object { $_ -like "*config.json" }) {
         throw "zip contains user config.json"

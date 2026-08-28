@@ -2,23 +2,16 @@
 setlocal
 cd /d "%~dp0"
 
-py -3.10 -c "import sys" >nul 2>&1
-if not errorlevel 1 (
-    py -3.10 "%~dp0app.py"
-    if errorlevel 1 goto failed
-    goto done
-)
-
-python -c "import sys" >nul 2>&1
-if not errorlevel 1 (
-    python "%~dp0app.py"
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" "%~dp0app.py"
     if errorlevel 1 goto failed
     goto done
 )
 
 :failed
 echo.
-echo BOSS Tracker could not start. Install Python 3.10 or review the error above.
+echo BOSS Tracker is not installed yet, or could not start.
+echo Double-click the installer first, then try again.
 pause
 
 :done
