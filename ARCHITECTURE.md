@@ -386,8 +386,8 @@ git -c core.quotepath=false ls-files
 |---|---|
 | `boss_tracker/app.py` | Standalone Tk UI, channel progress bars, and alarm polling |
 | `boss_tracker/model.py` | Atomic configuration, independent deadlines, and statistics |
-| `boss_tracker/audio.py` | Non-blocking Windows MP3 alarm playback |
-| `boss_tracker/test_model.py` | Countdown, persistence, and statistics tests |
+| `boss_tracker/audio.py` | Non-blocking MP3 alarm and female Chinese channel announcement |
+| `boss_tracker/test_model.py`, `test_audio.py` | Countdown, persistence, statistics, and speech-text tests |
 | `boss_tracker/启动BOSS追踪.bat` | Standalone launcher |
 | `boss_tracker/build_release.ps1` | Minimal separate package builder |
 | `boss_tracker/release_now.ps1` | Tests, builds, and verifies the separate ZIP |

@@ -5,7 +5,7 @@ $root = Split-Path -Parent $source
 Write-Host "== 1/3 BOSS Tracker tests ==" -ForegroundColor Cyan
 Push-Location $source
 try {
-    & py -3.10 -m unittest -v test_model
+    & py -3.10 -m unittest -v test_model test_audio
     if ($LASTEXITCODE -ne 0) { throw "BOSS Tracker tests failed" }
 } finally {
     Pop-Location

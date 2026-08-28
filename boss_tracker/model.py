@@ -170,10 +170,20 @@ class BossTrackerModel:
 
     def add_channel(self, name: str) -> str:
         with self._lock:
+            raw_name = str(name).strip()
+            if (
+                not raw_name.isdigit()
+                or raw_name.startswith("0")
+                or not 1 <= int(raw_name) <= 60
+            ):
+                raise ValueError("channel number must be an integer from 1 to 60")
+            clean_name = str(int(raw_name))
+            if any(
+                channel["name"] == clean_name
+                for channel in self._data["channels"]
+            ):
+                raise ValueError("channel number already exists")
             channel_id = uuid4().hex
-            clean_name = str(name).strip()
-            if not clean_name:
-                clean_name = f"频道 {len(self._data['channels']) + 1}"
             self._data["channels"].append({
                 "id": channel_id,
                 "name": clean_name,

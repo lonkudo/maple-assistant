@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any
 
-from audio import play_mp3_async
+from audio import announce_channels_async
 from model import BossTrackerModel
 
 
@@ -71,12 +71,19 @@ class BossTrackerApp:
 
         channel_row = ttk.Frame(settings)
         channel_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(channel_row, text="频道名称").pack(side="left")
+        ttk.Label(channel_row, text="频道号").pack(side="left")
         self.channel_name_var = tk.StringVar()
         channel_holder, channel_entry = self._fixed_entry(
             channel_row, self.channel_name_var
         )
         channel_holder.pack(side="left", padx=4)
+        channel_entry.configure(
+            validate="key",
+            validatecommand=(
+                self.root.register(self._valid_channel_number_input),
+                "%P",
+            ),
+        )
         channel_entry.bind("<Return>", lambda _event: self._add_channel())
         ttk.Button(
             channel_row, text="添加频道", command=self._add_channel
@@ -147,6 +154,17 @@ class BossTrackerApp:
             position = f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
         self.root.geometry(f"{width}x{height}{position}")
 
+    @staticmethod
+    def _valid_channel_number_input(value: str) -> bool:
+        if value == "":
+            return True
+        return (
+            value.isdigit()
+            and not value.startswith("0")
+            and len(value) <= 2
+            and int(value) <= 60
+        )
+
     def _apply_interval(self) -> None:
         try:
             hours = float(self.interval_var.get())
@@ -161,7 +179,14 @@ class BossTrackerApp:
         self._refresh_channels()
 
     def _add_channel(self) -> None:
-        self.model.add_channel(self.channel_name_var.get())
+        try:
+            self.model.add_channel(self.channel_name_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "频道号无效",
+                "请输入 1 到 60 之间尚未添加的整数频道号。",
+            )
+            return
         self.channel_name_var.set("")
         self._rebuild_channels()
 
@@ -391,7 +416,7 @@ class BossTrackerApp:
             return
         expired = self.model.advance_expired()
         if expired:
-            play_mp3_async(APP_DIR / "sound" / "beep.mp3")
+            announce_channels_async(APP_DIR / "sound" / "beep.mp3", expired)
             self.status_var.set("BOSS 刷新提醒：" + "、".join(expired))
         self._refresh_channels()
         self.root.after(self.POLL_MS, self._poll)

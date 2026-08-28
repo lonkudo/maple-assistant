@@ -22,27 +22,27 @@ class BossTrackerModelTests(unittest.TestCase):
         self.model = BossTrackerModel(self.path, clock=self.clock)
 
     def test_channels_have_independent_deadlines(self) -> None:
-        first = self.model.add_channel("1线")
+        first = self.model.add_channel("1")
         self.clock.value += 600
-        second = self.model.add_channel("2线")
+        second = self.model.add_channel("2")
         rows = {row["id"]: row for row in self.model.channel_status()}
         self.assertAlmostEqual(rows[first]["remaining"], 3000)
         self.assertAlmostEqual(rows[second]["remaining"], 3600)
 
     def test_expired_channel_resets_and_reports_once(self) -> None:
         self.model.set_interval_hours(0.01)
-        self.model.add_channel("3线")
+        self.model.add_channel("3")
         self.clock.value += 36
-        self.assertEqual(self.model.advance_expired(), ["3线"])
+        self.assertEqual(self.model.advance_expired(), ["3"])
         self.assertAlmostEqual(
             self.model.channel_status()[0]["remaining"], 36
         )
         self.assertEqual(self.model.advance_expired(), [])
 
     def test_interval_change_resets_all_channels(self) -> None:
-        self.model.add_channel("1线")
+        self.model.add_channel("1")
         self.clock.value += 100
-        self.model.add_channel("2线")
+        self.model.add_channel("2")
         self.model.set_interval_hours(2)
         self.assertEqual(
             [row["remaining"] for row in self.model.channel_status()],
@@ -50,8 +50,8 @@ class BossTrackerModelTests(unittest.TestCase):
         )
 
     def test_channel_reset_and_delete_are_scoped(self) -> None:
-        first = self.model.add_channel("1线")
-        second = self.model.add_channel("2线")
+        first = self.model.add_channel("1")
+        second = self.model.add_channel("2")
         self.clock.value += 100
         self.assertTrue(self.model.reset_channel(first))
         rows = {row["id"]: row for row in self.model.channel_status()}
@@ -61,8 +61,8 @@ class BossTrackerModelTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in self.model.channel_status()], [second])
 
     def test_channel_remaining_can_be_dragged_independently(self) -> None:
-        first = self.model.add_channel("1线")
-        second = self.model.add_channel("2线")
+        first = self.model.add_channel("1")
+        second = self.model.add_channel("2")
         self.assertTrue(self.model.set_channel_remaining(first, 900))
         rows = {row["id"]: row for row in self.model.channel_status()}
         self.assertAlmostEqual(rows[first]["remaining"], 900)
@@ -71,6 +71,13 @@ class BossTrackerModelTests(unittest.TestCase):
         self.assertAlmostEqual(
             self.model.channel_status()[0]["remaining"], 3600
         )
+
+    def test_channel_number_must_be_unique_integer_from_1_to_60(self) -> None:
+        self.model.add_channel("60")
+        for invalid in ("", "0", "01", "61", "1.5", "abc", "60"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    self.model.add_channel(invalid)
 
     def test_statistics_persist_and_never_go_negative(self) -> None:
         self.assertEqual(self.model.change_boss_kills(1), 1)
@@ -87,7 +94,7 @@ class BossTrackerModelTests(unittest.TestCase):
 
     def test_clear_all_data_keeps_universal_settings(self) -> None:
         self.model.set_interval_hours(2.5)
-        self.model.add_channel("1线")
+        self.model.add_channel("1")
         self.model.change_boss_kills(4)
         self.model.add_custom_stat("核心")
         self.model.clear_all_data()
@@ -102,8 +109,8 @@ class BossTrackerModelTests(unittest.TestCase):
     def test_malformed_configuration_recovers(self) -> None:
         self.path.write_text("not json", encoding="utf-8")
         recovered = BossTrackerModel(self.path, clock=self.clock)
-        recovered.add_channel("")
-        self.assertEqual(recovered.snapshot()["channels"][0]["name"], "频道 1")
+        recovered.add_channel("1")
+        self.assertEqual(recovered.snapshot()["channels"][0]["name"], "1")
         self.assertIn("channels", self.path.read_text(encoding="utf-8"))
 
 
