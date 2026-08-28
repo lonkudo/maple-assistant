@@ -59,24 +59,30 @@ class BossTrackerApp:
         settings = ttk.LabelFrame(outer, text="通用设置", padding=7)
         settings.pack(fill="x")
         interval_row = ttk.Frame(settings)
-        interval_row.grid(row=0, column=0, sticky="w")
-        ttk.Label(interval_row, text="统一时间间隔（小时）").pack(side="left")
+        interval_row.grid(row=0, column=0, sticky="ew")
+        ttk.Label(interval_row, text="时间间隔(h)").pack(side="left")
         hours = self.model.snapshot()["universal_interval_hours"]
         self.interval_var = tk.StringVar(value=f"{hours:g}")
+        interval_controls = ttk.Frame(interval_row)
+        interval_controls.pack(side="right")
         _interval_holder, interval_entry = self._fixed_entry(
-            interval_row, self.interval_var
+            interval_controls, self.interval_var
         )
         _interval_holder.pack(side="left", padx=4)
         ttk.Button(
-            interval_row, text="应用并重置全部", command=self._apply_interval
+            interval_controls,
+            text="应用并重置全部",
+            command=self._apply_interval,
         ).pack(side="left")
 
         channel_row = ttk.Frame(settings)
-        channel_row.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        channel_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Label(channel_row, text="频道号").pack(side="left")
         self.channel_name_var = tk.StringVar()
+        channel_controls = ttk.Frame(channel_row)
+        channel_controls.pack(side="right")
         channel_holder, channel_entry = self._fixed_entry(
-            channel_row, self.channel_name_var
+            channel_controls, self.channel_name_var
         )
         channel_holder.pack(side="left", padx=4)
         channel_entry.configure(
@@ -88,8 +94,9 @@ class BossTrackerApp:
         )
         channel_entry.bind("<Return>", lambda _event: self._add_channel())
         ttk.Button(
-            channel_row, text="添加频道", command=self._add_channel
+            channel_controls, text="添加频道", command=self._add_channel
         ).pack(side="left")
+        settings.columnconfigure(0, weight=1)
         channel_box = ttk.LabelFrame(outer, text="各频道 BOSS 倒计时", padding=8)
         channel_box.pack(fill="x", pady=(10, 0))
         self.channel_frame = ttk.Frame(channel_box)

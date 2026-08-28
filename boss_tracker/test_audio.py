@@ -1,6 +1,18 @@
 import unittest
 
-from audio import channel_announcement, number_to_chinese
+from audio import (
+    channel_announcement,
+    number_to_chinese,
+    select_female_chinese_voice,
+)
+
+
+class FakeVoice:
+    def __init__(self, language: str, gender: str) -> None:
+        self.values = {"Language": language, "Gender": gender}
+
+    def GetAttribute(self, name: str) -> str:
+        return self.values[name]
 
 
 class BossTrackerAudioTests(unittest.TestCase):
@@ -22,6 +34,17 @@ class BossTrackerAudioTests(unittest.TestCase):
         self.assertEqual(
             channel_announcement(["1", "12"]),
             "频道一，频道一，频道十二，频道十二",
+        )
+
+    def test_female_chinese_voice_is_preferred(self) -> None:
+        english_female = FakeVoice("409", "Female")
+        chinese_male = FakeVoice("804", "Male")
+        chinese_female = FakeVoice("804", "Female")
+        self.assertIs(
+            select_female_chinese_voice(
+                [english_female, chinese_male, chinese_female]
+            ),
+            chinese_female,
         )
 
 

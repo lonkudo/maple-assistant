@@ -27,7 +27,9 @@ try {
     $names = @($archive.Entries | ForEach-Object { $_.FullName })
     foreach ($required in @(
         "BossTracker\app.py", "BossTracker\audio.py",
-        "BossTracker\model.py", "BossTracker\sound\beep.mp3"
+        "BossTracker\model.py", "BossTracker\sound\beep.mp3",
+        "BossTracker\requirements.txt",
+        "BossTracker\vendor\comtypes\__init__.py"
     )) {
         if ($required -notin $names) { throw "zip missing $required" }
     }

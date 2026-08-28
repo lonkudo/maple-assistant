@@ -4,35 +4,15 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
-import subprocess
+import sys
 import threading
 import time
-from typing import Iterable
+from typing import Any, Iterable
 
 
-POWERSHELL_TTS = r"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Speech
-$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$voices = @($speaker.GetInstalledVoices() | Where-Object Enabled |
-    ForEach-Object { $_.VoiceInfo })
-$voice = $voices | Where-Object {
-    $_.Culture.Name -like 'zh-*' -and $_.Gender -eq 'Female'
-} | Select-Object -First 1
-if ($null -eq $voice) {
-    $voice = $voices | Where-Object { $_.Culture.Name -like 'zh-*' } |
-        Select-Object -First 1
-}
-if ($null -eq $voice) {
-    $voice = $voices | Where-Object { $_.Gender -eq 'Female' } |
-        Select-Object -First 1
-}
-if ($null -ne $voice) { $speaker.SelectVoice($voice.Name) }
-$speaker.Rate = -1
-$speaker.Volume = 100
-$speaker.Speak($args[0])
-$speaker.Dispose()
-"""
+VENDOR_DIR = Path(__file__).resolve().with_name("vendor")
+if VENDOR_DIR.is_dir() and str(VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(VENDOR_DIR))
 
 
 def play_mp3(path: Path) -> None:
@@ -93,29 +73,56 @@ def channel_announcement(channel_names: Iterable[str]) -> str:
     return "，".join(phrases)
 
 
-def speak_chinese(text: str) -> None:
-    """Speak through the best installed female Chinese Windows voice."""
+def select_female_chinese_voice(voices: Iterable[Any]) -> Any | None:
+    """Prefer female zh-CN, then any Chinese, then any female voice."""
+
+    tokens = list(voices)
+
+    def attribute(token: Any, name: str) -> str:
+        try:
+            return str(token.GetAttribute(name)).lower()
+        except Exception:
+            return ""
+
+    for token in tokens:
+        language = attribute(token, "Language").lstrip("0")
+        if language == "804" and attribute(token, "Gender") == "female":
+            return token
+    for token in tokens:
+        if attribute(token, "Language").lstrip("0") == "804":
+            return token
+    for token in tokens:
+        if attribute(token, "Gender") == "female":
+            return token
+    return tokens[0] if tokens else None
+
+
+def speak_chinese(text: str) -> bool:
+    """Speak directly through SAPI using the bundled lightweight comtypes."""
 
     if not text:
-        return
+        return False
     try:
-        subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                POWERSHELL_TTS,
-                text,
-            ],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except OSError:
-        return
+        import comtypes
+        from comtypes.client import CreateObject
+    except (ImportError, OSError):
+        return False
+    comtypes.CoInitialize()
+    try:
+        speaker = CreateObject("SAPI.SpVoice")
+        collection = speaker.GetVoices()
+        voices = [collection.Item(index) for index in range(collection.Count)]
+        voice = select_female_chinese_voice(voices)
+        if voice is not None:
+            speaker.Voice = voice
+        speaker.Rate = -1
+        speaker.Volume = 100
+        speaker.Speak(text)
+        return True
+    except Exception:
+        return False
+    finally:
+        comtypes.CoUninitialize()
 
 
 def announce_channels_async(path: Path, channel_names: Iterable[str]) -> None:
@@ -142,4 +149,5 @@ __all__ = [
     "channel_announcement",
     "number_to_chinese",
     "play_mp3_async",
+    "select_female_chinese_voice",
 ]
