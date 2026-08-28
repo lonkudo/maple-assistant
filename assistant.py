@@ -121,8 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-title", default="冒险岛怀旧服")
     parser.add_argument("--interval", type=float, default=0.25,
                         help="seconds between minimap captures (default: 0.25)")
-    parser.add_argument("--status-interval", type=float, default=1.0,
-                        help="seconds between HP/MP captures (default: 1.0)")
+    parser.add_argument("--status-interval", type=float, default=0.25,
+                        help="seconds between HP/MP captures (default: 0.25)")
     parser.add_argument("--attack-interval", type=float, default=2.0,
                         help="seconds between Ctrl attacks (default: 2)")
     parser.add_argument("--enable-attack", action="store_true",

@@ -699,9 +699,11 @@ class StatusWorker(threading.Thread):
         detector: Optional[BarStatusDetector] = None,
         automation_active_event: Optional[threading.Event] = None,
         potion_cooldown: float = 5.0,
-        low_frames_required: int = 2,
+        low_frames_required: int = 1,
         potion_retry_attempts: int = 3,
         potion_retry_delay_seconds: float = 0.05,
+        potion_verify_seconds: float = 1.25,
+        potion_verify_retries: int = 1,
         status_state_path: Optional[str] = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
@@ -719,12 +721,20 @@ class StatusWorker(threading.Thread):
         self.potion_retry_delay_seconds = max(
             0.0, float(potion_retry_delay_seconds)
         )
+        # A successful SendInput call only proves the key was sent, not that
+        # the game consumed the potion.  Check the actual coloured fill soon
+        # afterwards and permit one priority retry if it did not rise.
+        self.potion_verify_seconds = max(0.25, float(potion_verify_seconds))
+        self.potion_verify_retries = max(0, int(potion_verify_retries))
         # Optional shared state file: latest HP/MP ratios, read by the
         # movement worker so the channel-switch safety net can gate its
         # potion on the current health.
         self.status_state_path = status_state_path
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
+        self._potion_verification: dict[str, Optional[dict[str, float | int]]] = {
+            "hp": None, "mp": None,
+        }
         # Monotonic timestamps of the last periodic buff tap (per buff row).
         # 增益为"定时触发"，不从开局立即触发：起始时间戳设为当前时刻，
         # 第一个增益会在 interval 秒后才按（用户会先手动触发第一次增益）。
@@ -759,8 +769,56 @@ class StatusWorker(threading.Thread):
             if self._tap_potion(key):
                 self._last_potion[name] = now
                 self._low_count[name] = 0
+                self._potion_verification[name] = {
+                    "before_ratio": ratio,
+                    "deadline": now + self.potion_verify_seconds,
+                    "retries": 0,
+                }
                 LOG.warning("%s=%.0f%% below %.0f%%: used %s", name.upper(),
                             ratio * 100, threshold_ratio * 100, key)
+
+    def _verify_potion_effect(
+        self,
+        name: str,
+        ratio: Optional[float],
+        threshold_ratio: float,
+        key: str,
+        now: float,
+    ) -> bool:
+        """Confirm a sent potion raised its own progress bar.
+
+        Returns true while verification owns this resource, preventing the
+        ordinary cooldown path from delaying or duplicating its retry.
+        """
+
+        pending = self._potion_verification[name]
+        if pending is None:
+            return False
+        if ratio is not None and ratio >= float(pending["before_ratio"]) + 0.02:
+            LOG.info("%s potion verified: bar rose to %.0f%%", name.upper(),
+                     ratio * 100)
+            self._potion_verification[name] = None
+            return False
+        if now < float(pending["deadline"]):
+            return True
+        retries = int(pending["retries"])
+        if (ratio is not None and ratio < threshold_ratio
+                and retries < self.potion_verify_retries
+                and self._tap_potion(key)):
+            self._last_potion[name] = now
+            self._potion_verification[name] = {
+                "before_ratio": ratio,
+                "deadline": now + self.potion_verify_seconds,
+                "retries": retries + 1,
+            }
+            LOG.warning(
+                "%s potion was not reflected by its bar; priority retry %s",
+                name.upper(), key,
+            )
+            return True
+        LOG.warning("%s potion effect could not be verified", name.upper())
+        self._potion_verification[name] = None
+        return False
 
     def _check_buffs(self, now: float) -> None:
         """Tap the periodic buff keys when their timer elapses.
@@ -829,19 +887,29 @@ class StatusWorker(threading.Thread):
             self._write_status_state(reading)
         now = time.monotonic()
         if config.hp_enabled:
-            self._check_resource(
+            if not self._verify_potion_effect(
                 "hp", reading.hp_ratio, config.hp_ratio_threshold,
                 config.hp_key, now,
-            )
+            ):
+                self._check_resource(
+                    "hp", reading.hp_ratio, config.hp_ratio_threshold,
+                    config.hp_key, now,
+                )
         else:
             self._low_count["hp"] = 0
+            self._potion_verification["hp"] = None
         if config.mp_enabled:
-            self._check_resource(
+            if not self._verify_potion_effect(
                 "mp", reading.mp_ratio, config.mp_ratio_threshold,
                 config.mp_key, now,
-            )
+            ):
+                self._check_resource(
+                    "mp", reading.mp_ratio, config.mp_ratio_threshold,
+                    config.mp_key, now,
+                )
         else:
             self._low_count["mp"] = 0
+            self._potion_verification["mp"] = None
 
     def _write_status_state(self, reading: "StatusReading") -> None:
         """Publish the latest HP/MP ratios for other workers (JSON file)."""

@@ -216,6 +216,27 @@ class StatusTests(unittest.TestCase):
         worker._process_frame(status_image(0.4, 0.1))
         self.assertEqual(sender.keys, ["delete", "end"])
 
+    def test_potion_effect_is_verified_and_retried_once_when_bar_stays_low(self) -> None:
+        sender = FakeSender()
+        worker = StatusWorker(
+            queue.Queue(), sender, threading.Event(),
+            potion_cooldown=60, low_frames_required=1,
+            potion_verify_seconds=0.25, potion_verify_retries=1,
+        )
+        low = status_image(0.2, 1.0)
+        worker._process_frame(low)
+        self.assertEqual(sender.keys, ["delete"])
+
+        # The displayed HP did not rise after the first accepted key press,
+        # so the verifier bypasses the normal five-second cooldown once.
+        worker._potion_verification["hp"]["deadline"] = time.monotonic() - 0.01
+        worker._process_frame(low)
+        self.assertEqual(sender.keys, ["delete", "delete"])
+
+        # A real rise confirms the retry and clears the pending verifier.
+        worker._process_frame(status_image(0.7, 1.0))
+        self.assertIsNone(worker._potion_verification["hp"])
+
     def test_apply_drug_settings_maps_percent_to_ratio_and_validates_keys(self) -> None:
         config = StatusConfig()
         updated = apply_drug_settings(config, {
