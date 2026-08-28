@@ -29,7 +29,7 @@ try {
         "BossTracker\app.py", "BossTracker\audio.py",
         "BossTracker\model.py", "BossTracker\sound\beep.mp3",
         "BossTracker\requirements.txt",
-        "BossTracker\install_boss_tracker.ps1",
+        "BossTracker\install_boss_tracker.ps1", "BossTracker\launch_boss_tracker.vbs",
         "BossTracker\vendor\comtypes\__init__.py"
     )) {
         if ($required -notin $names) { throw "zip missing $required" }

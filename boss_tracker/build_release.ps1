@@ -9,7 +9,7 @@ $out = Join-Path $releaseRoot "BossTracker"
 if (Test-Path $out) { Remove-Item -LiteralPath $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 
-@("app.py", "audio.py", "model.py", "README.md", "requirements.txt", "install_boss_tracker.ps1") |
+@("app.py", "audio.py", "model.py", "README.md", "requirements.txt", "install_boss_tracker.ps1", "launch_boss_tracker.vbs") |
     ForEach-Object { Copy-Item -LiteralPath (Join-Path $source $_) -Destination $out }
 Get-ChildItem -LiteralPath $source -Filter "*.bat" |
     ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $out }
