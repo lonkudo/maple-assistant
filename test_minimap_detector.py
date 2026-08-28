@@ -204,6 +204,25 @@ class MinimapDetectorTests(unittest.TestCase):
         jumped = detector._stabilize_boxes(*resize)
         self.assertEqual(jumped[0], resize[0])
 
+    def test_box_smoothing_rejects_transient_minimap_height_collapse(self) -> None:
+        """A clipped contour must not crop the player marker out of the map."""
+
+        detector = MinimapDetector()
+        stable = ((0, 0, 239, 184), (0, 58, 239, 184), (2, 78, 237, 178))
+        collapsed = ((0, 0, 239, 69), (0, 22, 239, 69), (2, 31, 237, 65))
+        detector._stabilize_boxes(*stable)
+
+        # The failure seen in the live log was a one/two-frame crop from 184
+        # to 69 pixels high.  Retain the known-good geometry during it.
+        self.assertEqual(detector._stabilize_boxes(*collapsed), stable)
+        self.assertEqual(detector._stabilize_boxes(*collapsed), stable)
+        self.assertEqual(detector._stabilize_boxes(*stable), stable)
+
+        # A deliberate, persistent minimap resize is still adopted.
+        detector._stabilize_boxes(*collapsed)
+        detector._stabilize_boxes(*collapsed)
+        self.assertEqual(detector._stabilize_boxes(*collapsed), collapsed)
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

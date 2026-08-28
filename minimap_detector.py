@@ -120,6 +120,13 @@ class MinimapDetector:
         self._box_history: deque[tuple[Box, Box, Box]] = deque(
             maxlen=self.box_history_len
         )
+        # A partially detected outer border can make the minimap look much
+        # shorter for one or two frames.  That crop excludes the lower map
+        # canvas (and therefore the yellow marker), which must not be treated
+        # as a disconnect.  Keep a candidate here until the shrink is proven
+        # consistent across several frames.
+        self._pending_shrunken_boxes: Optional[tuple[Box, Box, Box]] = None
+        self._pending_shrunken_count = 0
         self._last_good: Optional[MinimapDetection] = None
         self._last_good_image_size: Optional[tuple[int, int]] = None
         self._last_good_at = float("-inf")
@@ -203,6 +210,44 @@ class MinimapDetector:
         with self._state_lock:
             if self._box_history:
                 median = self._coordinate_median(self._box_history, 0)
+                median_width = max(1, median[2] - median[0])
+                median_height = max(1, median[3] - median[1])
+                window_width = max(1, window[2] - window[0])
+                window_height = max(1, window[3] - window[1])
+                # A sudden height/width collapse is normally a contour that
+                # captured the title panel or only the upper part of the
+                # minimap.  Do not let a one-frame crop remove the marker
+                # from both movement and disconnect monitoring.  A real user
+                # resize still takes effect after three matching detections.
+                severely_shrunken = (
+                    window_width < median_width * 0.65
+                    or window_height < median_height * 0.65
+                )
+                if severely_shrunken:
+                    pending = self._pending_shrunken_boxes
+                    same_pending = pending is not None and max(
+                        abs(window[0] - pending[0][0]),
+                        abs(window[1] - pending[0][1]),
+                        abs(window[2] - pending[0][2]),
+                        abs(window[3] - pending[0][3]),
+                    ) <= 6
+                    if same_pending:
+                        self._pending_shrunken_count += 1
+                    else:
+                        self._pending_shrunken_boxes = (window, analysis, canvas)
+                        self._pending_shrunken_count = 1
+                    if self._pending_shrunken_count < 3:
+                        return (
+                            self._coordinate_median(self._box_history, 0),
+                            self._coordinate_median(self._box_history, 1),
+                            self._coordinate_median(self._box_history, 2),
+                        )
+                    self._box_history.clear()
+                    self._pending_shrunken_boxes = None
+                    self._pending_shrunken_count = 0
+                else:
+                    self._pending_shrunken_boxes = None
+                    self._pending_shrunken_count = 0
                 deviation = max(
                     abs(window[0] - median[0]),
                     abs(window[1] - median[1]),
