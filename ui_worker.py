@@ -2605,8 +2605,7 @@ class UiWorker(threading.Thread):
         if self.on_patrol_start is not None:
             try:
                 self.on_patrol_start()
-            except Exception as exc:
-                LOG.exception("Start Patrol window selection failed")
+            except OSError as exc:
                 self._control_status.configure(
                     text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
