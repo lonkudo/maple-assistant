@@ -1,5 +1,9 @@
 # Maple Assistant
 
+> The repository also contains the separately launched and separately packaged
+> [BOSS 追踪](boss_tracker/README.md) companion application. It does not share
+> Maple Assistant runtime state or automation workers.
+
 Maple Assistant is a Windows desktop automation tool for a MapleStory client.
 It captures the game window, reads the minimap and HP/MP bars, follows a
 recorded multi-layer patrol route, climbs ropes, recovers from falls, collects

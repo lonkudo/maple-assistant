@@ -7,6 +7,12 @@ workers, state ownership, or release steps change.
 
 ## 1. System boundary
 
+The repository also contains `boss_tracker/`, a separate Tk application with
+its own process, persistent `boss_tracker/config.json`, tests, launcher, and
+release workflow. It does not import Maple Assistant workers or participate in
+game capture/input. Its channels use independent wall-clock deadlines under a
+single universal interval, while its statistics are persisted atomically.
+
 The project has one primary process and one optional subprocess:
 
 ```text
@@ -373,6 +379,19 @@ git -c core.quotepath=false ls-files
 | `INSTALL.md` | Installation guide |
 | `COMMIT_MSG.txt` | Historical/local commit-message material; excluded from release |
 | `.gitignore` | Generated/runtime exclusion rules |
+
+### Separate `boss_tracker/` application
+
+| File | Responsibility |
+|---|---|
+| `boss_tracker/app.py` | Standalone Tk UI, channel progress bars, and alarm polling |
+| `boss_tracker/model.py` | Atomic configuration, independent deadlines, and statistics |
+| `boss_tracker/audio.py` | Non-blocking Windows MP3 alarm playback |
+| `boss_tracker/test_model.py` | Countdown, persistence, and statistics tests |
+| `boss_tracker/启动BOSS追踪.bat` | Standalone launcher |
+| `boss_tracker/build_release.ps1` | Minimal separate package builder |
+| `boss_tracker/release_now.ps1` | Tests, builds, and verifies the separate ZIP |
+| `boss_tracker/README.md` | BOSS Tracker operating and release guide |
 
 ### Root tests
 

@@ -9,6 +9,7 @@ outputs/
 recording-assets/
 release/
 config.json
+boss_tracker/config.json
 
 # local virtual environments
 .venv/
