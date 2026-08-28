@@ -26,6 +26,7 @@ def format_seconds(seconds: float) -> str:
 class BossTrackerApp:
     POLL_MS = 200
     DEFAULT_HEIGHT = 600
+    CHANNELS_PER_COLUMN = 10
 
     def __init__(self, root: tk.Tk, model: BossTrackerModel) -> None:
         self.root = root
@@ -33,26 +34,20 @@ class BossTrackerApp:
         self.channel_widgets: dict[str, dict[str, Any]] = {}
         self.custom_widgets: dict[str, dict[str, Any]] = {}
         self._closing = False
+        self._building = True
 
         root.title("BOSS 追踪")
-        root.minsize(1, 500)
+        root.minsize(350, 300)
         root.protocol("WM_DELETE_WINDOW", self.close)
         geometry = model.snapshot().get("window_geometry", "")
-        match = re.match(r"^\d+x(\d+)([+-]\d+[+-]\d+)?$", geometry)
-        height = max(500, int(match.group(1))) if match else self.DEFAULT_HEIGHT
-        position = match.group(2) if match and match.group(2) else ""
+        match = re.match(r"^\d+x\d+([+-]\d+[+-]\d+)?$", geometry)
+        self._saved_position = match.group(1) if match and match.group(1) else ""
 
         self._build_ui()
         self._rebuild_channels()
         self._rebuild_statistics()
-        root.update_idletasks()
-        natural_width = max(
-            350,
-            root.winfo_reqwidth(),
-            self.channel_frame.winfo_reqwidth() + 55,
-        )
-        root.geometry(f"{natural_width}x{height}{position}")
-        root.minsize(natural_width, 500)
+        self._building = False
+        self._fit_to_content(use_saved_position=True)
         self._poll()
 
     def _build_ui(self) -> None:
@@ -87,22 +82,9 @@ class BossTrackerApp:
             channel_row, text="添加频道", command=self._add_channel
         ).pack(side="left")
         channel_box = ttk.LabelFrame(outer, text="各频道 BOSS 倒计时", padding=8)
-        channel_box.pack(fill="both", expand=True, pady=(10, 0))
-        self.channel_canvas = tk.Canvas(
-            channel_box, width=1, height=210, highlightthickness=0
-        )
-        channel_scroll = ttk.Scrollbar(
-            channel_box, orient="vertical", command=self.channel_canvas.yview
-        )
-        self.channel_frame = ttk.Frame(self.channel_canvas)
-        self.channel_window = self.channel_canvas.create_window(
-            (0, 0), window=self.channel_frame, anchor="nw"
-        )
-        self.channel_canvas.configure(yscrollcommand=channel_scroll.set)
-        self.channel_canvas.pack(side="left", fill="both", expand=True)
-        channel_scroll.pack(side="right", fill="y")
-        self.channel_frame.bind("<Configure>", self._sync_channel_scroll)
-        self.channel_canvas.bind("<Configure>", self._sync_channel_width)
+        channel_box.pack(fill="x", pady=(10, 0))
+        self.channel_frame = ttk.Frame(channel_box)
+        self.channel_frame.pack(fill="x")
 
         stats = ttk.LabelFrame(outer, text="统计分析", padding=8)
         stats.pack(fill="x", pady=(10, 0))
@@ -151,11 +133,19 @@ class BossTrackerApp:
         label.place(x=0, y=0, width=width_px, height=24)
         return holder, label
 
-    def _sync_channel_scroll(self, _event: Any = None) -> None:
-        self.channel_canvas.configure(scrollregion=self.channel_canvas.bbox("all"))
+    def _fit_to_content(self, *, use_saved_position: bool = False) -> None:
+        """Resize the window around all channel columns and statistic rows."""
 
-    def _sync_channel_width(self, event: Any) -> None:
-        self.channel_canvas.itemconfigure(self.channel_window, width=event.width)
+        if self._building or self._closing:
+            return
+        self.root.update_idletasks()
+        width = max(350, self.root.winfo_reqwidth())
+        height = max(300, self.root.winfo_reqheight())
+        if use_saved_position:
+            position = self._saved_position
+        else:
+            position = f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
+        self.root.geometry(f"{width}x{height}{position}")
 
     def _apply_interval(self) -> None:
         try:
@@ -206,20 +196,43 @@ class BossTrackerApp:
             ttk.Label(
                 self.channel_frame,
                 text="尚未添加频道。",
-            ).pack(anchor="w", padx=4, pady=8)
+            ).grid(row=0, column=0, sticky="w", padx=4, pady=8)
+            self._fit_to_content()
             return
-        for row in rows:
+        column_count = (len(rows) - 1) // self.CHANNELS_PER_COLUMN + 1
+        for index, row in enumerate(rows):
+            grid_column = index // self.CHANNELS_PER_COLUMN
+            grid_row = index % self.CHANNELS_PER_COLUMN
             line = ttk.Frame(self.channel_frame, padding=(4, 5))
-            line.pack(fill="x")
+            line.grid(
+                row=grid_row,
+                column=grid_column,
+                padx=(0, 8 if grid_column < column_count - 1 else 0),
+                sticky="ew",
+            )
             name_holder, _name_label = self._fixed_label(line, row["name"])
             name_holder.grid(row=0, column=0, sticky="w")
-            progress = ttk.Progressbar(
+            remaining_var = tk.DoubleVar(value=row["remaining"])
+            progress = ttk.Scale(
                 line,
-                maximum=row["interval"],
-                value=row["remaining"],
+                from_=0.0,
+                to=row["interval"],
+                variable=remaining_var,
                 length=110,
+                command=lambda value, channel_id=row["id"]:
+                self._channel_dragged(channel_id, value),
             )
             progress.grid(row=0, column=1, padx=3)
+            progress.bind(
+                "<ButtonPress-1>",
+                lambda _event, channel_id=row["id"]:
+                self._channel_drag_start(channel_id),
+            )
+            progress.bind(
+                "<ButtonRelease-1>",
+                lambda _event, channel_id=row["id"]:
+                self._channel_drag_end(channel_id),
+            )
             remaining = ttk.Label(
                 line, text=format_seconds(row["remaining"]), width=8
             )
@@ -240,7 +253,12 @@ class BossTrackerApp:
             self.channel_widgets[row["id"]] = {
                 "progress": progress,
                 "remaining": remaining,
+                "remaining_var": remaining_var,
+                "dragging": False,
             }
+        for column in range(column_count):
+            self.channel_frame.columnconfigure(column, weight=1)
+        self._fit_to_content()
 
     def _refresh_channels(self) -> None:
         rows = self.model.channel_status()
@@ -249,10 +267,31 @@ class BossTrackerApp:
             return
         for row in rows:
             widgets = self.channel_widgets[row["id"]]
-            widgets["progress"].configure(
-                maximum=row["interval"], value=row["remaining"]
-            )
-            widgets["remaining"].configure(text=format_seconds(row["remaining"]))
+            widgets["progress"].configure(to=row["interval"])
+            if not widgets["dragging"]:
+                widgets["remaining_var"].set(row["remaining"])
+                widgets["remaining"].configure(
+                    text=format_seconds(row["remaining"])
+                )
+
+    def _channel_drag_start(self, channel_id: str) -> None:
+        widgets = self.channel_widgets.get(channel_id)
+        if widgets is not None:
+            widgets["dragging"] = True
+
+    def _channel_dragged(self, channel_id: str, value: str) -> None:
+        widgets = self.channel_widgets.get(channel_id)
+        if widgets is not None:
+            widgets["remaining"].configure(text=format_seconds(float(value)))
+
+    def _channel_drag_end(self, channel_id: str) -> None:
+        widgets = self.channel_widgets.get(channel_id)
+        if widgets is None:
+            return
+        remaining = float(widgets["remaining_var"].get())
+        self.model.set_channel_remaining(channel_id, remaining)
+        widgets["dragging"] = False
+        self.status_var.set("该频道剩余时间已调整。")
 
     def _change_boss(self, delta: int) -> None:
         value = self.model.change_boss_kills(delta)
@@ -326,6 +365,7 @@ class BossTrackerApp:
                 "name": variable,
             }
         self.stats_frame.columnconfigure(0, weight=1)
+        self._fit_to_content()
 
     def _build_stat_row(
         self,

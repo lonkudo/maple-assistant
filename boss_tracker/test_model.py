@@ -60,6 +60,18 @@ class BossTrackerModelTests(unittest.TestCase):
         self.assertTrue(self.model.delete_channel(first))
         self.assertEqual([row["id"] for row in self.model.channel_status()], [second])
 
+    def test_channel_remaining_can_be_dragged_independently(self) -> None:
+        first = self.model.add_channel("1线")
+        second = self.model.add_channel("2线")
+        self.assertTrue(self.model.set_channel_remaining(first, 900))
+        rows = {row["id"]: row for row in self.model.channel_status()}
+        self.assertAlmostEqual(rows[first]["remaining"], 900)
+        self.assertAlmostEqual(rows[second]["remaining"], 3600)
+        self.assertTrue(self.model.set_channel_remaining(first, 99999))
+        self.assertAlmostEqual(
+            self.model.channel_status()[0]["remaining"], 3600
+        )
+
     def test_statistics_persist_and_never_go_negative(self) -> None:
         self.assertEqual(self.model.change_boss_kills(1), 1)
         self.assertEqual(self.model.change_boss_kills(-5), 0)

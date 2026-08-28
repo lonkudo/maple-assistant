@@ -203,6 +203,18 @@ class BossTrackerModel:
                     return True
             return False
 
+    def set_channel_remaining(self, channel_id: str, seconds: float) -> bool:
+        """Move one channel deadline within the universal interval."""
+
+        with self._lock:
+            remaining = max(0.0, min(float(seconds), self.interval_seconds))
+            for channel in self._data["channels"]:
+                if channel["id"] == channel_id:
+                    channel["deadline"] = self._clock() + remaining
+                    self._save_locked()
+                    return True
+            return False
+
     def channel_status(self) -> list[dict[str, Any]]:
         """Return display rows without mutating expired deadlines."""
 
