@@ -1,4 +1,5 @@
 import queue
+import sys
 import threading
 import time
 import unittest
@@ -35,6 +36,24 @@ class FakeSender:
 
 
 class StatusTests(unittest.TestCase):
+    def test_exact_window_title_lookup_avoids_fallback_enumeration(self) -> None:
+        class FakeWin32Gui:
+            @staticmethod
+            def FindWindow(_class, title):
+                return 42 if title == "MapleStory" else 0
+
+            @staticmethod
+            def IsWindowVisible(hwnd):
+                return hwnd == 42
+
+            @staticmethod
+            def EnumWindows(_callback, _extra):
+                raise AssertionError("fallback enumeration should not run")
+
+        sender = WindowKeySender("MapleStory", dry_run=True)
+        with patch.dict(sys.modules, {"win32gui": FakeWin32Gui}):
+            self.assertEqual(sender._find_target_window(), 42)
+
     def test_bar_ratios_are_converted_to_values(self) -> None:
         reading = BarStatusDetector().detect(status_image(0.5, 0.2))
         self.assertAlmostEqual(reading.hp, 328, delta=5)

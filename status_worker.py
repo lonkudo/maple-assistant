@@ -153,20 +153,60 @@ class WindowKeySender:
         return self._input_enabled.is_set()
 
     def _find_target_window(self) -> int:
-        """Find exactly one visible top-level window containing the title."""
+        """Find the configured game window without blocking the UI forever."""
 
         import win32gui
 
+        # The configured MapleStory title is normally exact. FindWindowW reads
+        # it from Windows directly and avoids enumerating every top-level
+        # window, which can stall when a third-party/protected window is busy.
+        try:
+            exact = win32gui.FindWindow(None, self.window_title)
+            if exact and win32gui.IsWindowVisible(exact):
+                self.hwnd = exact
+                LOG.info("WINDOW SELECT: found exact-title hwnd=%s", exact)
+                return exact
+        except Exception:
+            LOG.debug("WINDOW SELECT: exact-title lookup failed", exc_info=True)
+
+        # Keep substring matching for users whose client adds text to the
+        # title, but never allow that fallback enumeration to freeze Tk's
+        # Start Patrol callback. If a foreign window blocks enumeration, the
+        # temporary daemon may finish later but it cannot hold this selection.
         matches: list[int] = []
+        scan_error: list[BaseException] = []
+        scan_done = threading.Event()
 
         def collect(hwnd: int, _extra: object) -> None:
-            if not win32gui.IsWindowVisible(hwnd):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                title = win32gui.GetWindowText(hwnd)
+            except Exception:
+                LOG.debug("WINDOW SELECT: skipped unreadable hwnd=%s", hwnd,
+                          exc_info=True)
                 return
-            title = win32gui.GetWindowText(hwnd)
             if self.window_title.casefold() in title.casefold():
                 matches.append(hwnd)
 
-        win32gui.EnumWindows(collect, None)
+        def scan() -> None:
+            try:
+                win32gui.EnumWindows(collect, None)
+            except BaseException as exc:
+                scan_error.append(exc)
+            finally:
+                scan_done.set()
+
+        threading.Thread(target=scan, name="window-title-scan", daemon=True).start()
+        if not scan_done.wait(1.5):
+            raise OSError(
+                "game-window title scan timed out; close blocking overlays or "
+                "configure the exact game window title"
+            )
+        if scan_error:
+            raise OSError("could not enumerate visible Windows windows") from scan_error[0]
+        LOG.info("WINDOW SELECT: fallback title scan found %d matching window(s)",
+                 len(matches))
         if len(matches) != 1:
             raise OSError(
                 f"expected exactly one visible game window containing "

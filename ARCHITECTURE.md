@@ -84,6 +84,8 @@ background `sound/beep.mp3`; a later valid marker re-arms the next alert.
 implementation. It:
 
 - finds one matching game window and stores its HWND;
+- uses a direct exact-title lookup first; its slower substring fallback is
+  time-bounded so a foreign window cannot freeze the Start Patrol UI;
 - tracks per-key owners and physical down/up state;
 - refuses live input while disarmed or unsafe;
 - serializes sensitive input sequences;
