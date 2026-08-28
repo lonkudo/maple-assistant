@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any
@@ -24,6 +25,8 @@ def format_seconds(seconds: float) -> str:
 
 class BossTrackerApp:
     POLL_MS = 200
+    COMPACT_WIDTH = 350
+    DEFAULT_HEIGHT = 600
 
     def __init__(self, root: tk.Tk, model: BossTrackerModel) -> None:
         self.root = root
@@ -33,14 +36,13 @@ class BossTrackerApp:
         self._closing = False
 
         root.title("BOSS 追踪")
-        root.minsize(620, 520)
+        root.minsize(330, 500)
         root.protocol("WM_DELETE_WINDOW", self.close)
         geometry = model.snapshot().get("window_geometry", "")
-        if geometry:
-            try:
-                root.geometry(geometry)
-            except tk.TclError:
-                pass
+        match = re.match(r"^\d+x(\d+)([+-]\d+[+-]\d+)?$", geometry)
+        height = max(500, int(match.group(1))) if match else self.DEFAULT_HEIGHT
+        position = match.group(2) if match and match.group(2) else ""
+        root.geometry(f"{self.COMPACT_WIDTH}x{height}{position}")
 
         self._build_ui()
         self._rebuild_channels()
@@ -48,18 +50,18 @@ class BossTrackerApp:
         self._poll()
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=12)
+        outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill="both", expand=True)
 
-        settings = ttk.LabelFrame(outer, text="通用设置", padding=10)
+        settings = ttk.LabelFrame(outer, text="通用设置", padding=7)
         settings.pack(fill="x")
         ttk.Label(settings, text="统一时间间隔（小时）").grid(
             row=0, column=0, sticky="w"
         )
         hours = self.model.snapshot()["universal_interval_hours"]
         self.interval_var = tk.StringVar(value=f"{hours:g}")
-        ttk.Entry(settings, textvariable=self.interval_var, width=10).grid(
-            row=0, column=1, padx=8
+        ttk.Entry(settings, textvariable=self.interval_var, width=6).grid(
+            row=0, column=1, padx=5
         )
         ttk.Button(settings, text="应用并重置全部", command=self._apply_interval).grid(
             row=0, column=2, sticky="w"
@@ -70,19 +72,22 @@ class BossTrackerApp:
         )
         self.channel_name_var = tk.StringVar()
         channel_entry = ttk.Entry(
-            settings, textvariable=self.channel_name_var, width=22
+            settings, textvariable=self.channel_name_var, width=11
         )
-        channel_entry.grid(row=1, column=1, padx=8, pady=(10, 0), sticky="ew")
+        channel_entry.grid(row=1, column=1, padx=5, pady=(8, 0), sticky="ew")
         channel_entry.bind("<Return>", lambda _event: self._add_channel())
         ttk.Button(settings, text="添加频道", command=self._add_channel).grid(
-            row=1, column=2, pady=(10, 0), sticky="w"
+            row=1, column=2, pady=(8, 0), sticky="w"
         )
+        ttk.Button(
+            settings, text="清空全部数据", command=self._clear_all_data
+        ).grid(row=2, column=0, columnspan=3, pady=(8, 0), sticky="e")
         settings.columnconfigure(1, weight=1)
 
         channel_box = ttk.LabelFrame(outer, text="各频道 BOSS 倒计时", padding=8)
         channel_box.pack(fill="both", expand=True, pady=(10, 0))
         self.channel_canvas = tk.Canvas(
-            channel_box, height=210, highlightthickness=0
+            channel_box, width=1, height=210, highlightthickness=0
         )
         channel_scroll = ttk.Scrollbar(
             channel_box, orient="vertical", command=self.channel_canvas.yview
@@ -144,6 +149,18 @@ class BossTrackerApp:
         self.status_var.set("该频道倒计时已重置。")
         self._refresh_channels()
 
+    def _clear_all_data(self) -> None:
+        if not messagebox.askyesno(
+            "清空全部数据",
+            "确定删除全部频道、BOSS 讨伐数量和自定义统计吗？\n"
+            "统一时间间隔会保留。",
+        ):
+            return
+        self.model.clear_all_data()
+        self._rebuild_channels()
+        self._rebuild_statistics()
+        self.status_var.set("频道数据和统计分析数据已全部清空。")
+
     def _rebuild_channels(self) -> None:
         for child in self.channel_frame.winfo_children():
             child.destroy()
@@ -158,30 +175,32 @@ class BossTrackerApp:
         for row in rows:
             line = ttk.Frame(self.channel_frame, padding=(4, 5))
             line.pack(fill="x")
-            ttk.Label(line, text=row["name"], width=16).grid(
+            ttk.Label(line, text=row["name"], width=8).grid(
                 row=0, column=0, sticky="w"
             )
-            progress = ttk.Progressbar(
-                line, maximum=row["interval"], value=row["remaining"]
-            )
-            progress.grid(row=0, column=1, padx=8, sticky="ew")
             remaining = ttk.Label(
                 line, text=format_seconds(row["remaining"]), width=10
             )
-            remaining.grid(row=0, column=2)
+            remaining.grid(row=0, column=1, padx=(4, 0))
             ttk.Button(
                 line,
                 text="重置",
-                width=6,
+                width=5,
                 command=lambda channel_id=row["id"]: self._reset_channel(channel_id),
-            ).grid(row=0, column=3, padx=(8, 4))
+            ).grid(row=0, column=2, padx=(5, 2))
             ttk.Button(
                 line,
                 text="删除",
-                width=6,
+                width=5,
                 command=lambda channel_id=row["id"]: self._delete_channel(channel_id),
-            ).grid(row=0, column=4)
-            line.columnconfigure(1, weight=1)
+            ).grid(row=0, column=3)
+            progress = ttk.Progressbar(
+                line, maximum=row["interval"], value=row["remaining"]
+            )
+            progress.grid(
+                row=1, column=0, columnspan=4, pady=(5, 0), sticky="ew"
+            )
+            line.columnconfigure(0, weight=1)
             self.channel_widgets[row["id"]] = {
                 "progress": progress,
                 "remaining": remaining,
@@ -235,7 +254,7 @@ class BossTrackerApp:
 
         for row_index, item in enumerate(data["custom"], start=1):
             variable = tk.StringVar(value=item["name"])
-            entry = ttk.Entry(self.stats_frame, textvariable=variable, width=24)
+            entry = ttk.Entry(self.stats_frame, textvariable=variable, width=12)
             entry.grid(row=row_index, column=0, sticky="ew", pady=3)
             entry.bind(
                 "<FocusOut>",
@@ -243,27 +262,27 @@ class BossTrackerApp:
                 self._rename_custom(item_id, var),
             )
             count = ttk.Label(
-                self.stats_frame, text=str(item["count"]), width=7, anchor="center"
+                self.stats_frame, text=str(item["count"]), width=5, anchor="center"
             )
             count.grid(row=row_index, column=1, padx=6)
             ttk.Button(
                 self.stats_frame,
                 text="−1",
-                width=5,
+                width=4,
                 command=lambda item_id=item["id"]:
                 self._change_custom(item_id, -1),
             ).grid(row=row_index, column=2, padx=2)
             ttk.Button(
                 self.stats_frame,
                 text="+1",
-                width=5,
+                width=4,
                 command=lambda item_id=item["id"]:
                 self._change_custom(item_id, 1),
             ).grid(row=row_index, column=3, padx=2)
             ttk.Button(
                 self.stats_frame,
                 text="删除",
-                width=6,
+                width=5,
                 command=lambda item_id=item["id"]: self._delete_custom(item_id),
             ).grid(row=row_index, column=4, padx=(6, 0))
             self.custom_widgets[item["id"]] = {
@@ -282,13 +301,13 @@ class BossTrackerApp:
     ) -> None:
         ttk.Label(self.stats_frame, text=name).grid(row=row, column=0, sticky="w")
         ttk.Label(
-            self.stats_frame, text=str(count), width=7, anchor="center"
+            self.stats_frame, text=str(count), width=5, anchor="center"
         ).grid(row=row, column=1, padx=6)
         ttk.Button(
-            self.stats_frame, text="−1", width=5, command=minus_command
+            self.stats_frame, text="−1", width=4, command=minus_command
         ).grid(row=row, column=2, padx=2)
         ttk.Button(
-            self.stats_frame, text="+1", width=5, command=plus_command
+            self.stats_frame, text="+1", width=4, command=plus_command
         ).grid(row=row, column=3, padx=2)
 
     def _poll(self) -> None:

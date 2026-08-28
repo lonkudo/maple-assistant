@@ -73,6 +73,20 @@ class BossTrackerModelTests(unittest.TestCase):
         self.assertEqual(stats["custom"][0]["name"], "核心")
         self.assertEqual(stats["custom"][0]["count"], 3)
 
+    def test_clear_all_data_keeps_universal_settings(self) -> None:
+        self.model.set_interval_hours(2.5)
+        self.model.add_channel("1线")
+        self.model.change_boss_kills(4)
+        self.model.add_custom_stat("核心")
+        self.model.clear_all_data()
+
+        data = self.model.snapshot()
+        self.assertEqual(data["universal_interval_hours"], 2.5)
+        self.assertEqual(data["channels"], [])
+        self.assertEqual(
+            data["statistics"], {"boss_kills": 0, "custom": []}
+        )
+
     def test_malformed_configuration_recovers(self) -> None:
         self.path.write_text("not json", encoding="utf-8")
         recovered = BossTrackerModel(self.path, clock=self.clock)

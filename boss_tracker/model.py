@@ -289,6 +289,14 @@ class BossTrackerModel:
                 self._save_locked()
             return changed
 
+    def clear_all_data(self) -> None:
+        """Clear every channel and statistic while retaining app settings."""
+
+        with self._lock:
+            self._data["channels"] = []
+            self._data["statistics"] = {"boss_kills": 0, "custom": []}
+            self._save_locked()
+
     def set_window_geometry(self, geometry: str) -> None:
         with self._lock:
             self._data["window_geometry"] = str(geometry)
