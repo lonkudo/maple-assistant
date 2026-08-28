@@ -53,7 +53,7 @@ function Install-Python310 {
     return $installed
 }
 
-Write-Host "" 
+Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  BOSS Tracker setup" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
@@ -77,7 +77,7 @@ if ($LASTEXITCODE -ne 0) { throw "Could not update pip." }
 & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $root "requirements.txt") -i $mirror
 if ($LASTEXITCODE -ne 0) { throw "Could not install required packages." }
 
-Write-Host "" 
+Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host "Next time, double-click 启动BOSS追踪.bat." -ForegroundColor Green
 if (-not $NoLaunch) {
