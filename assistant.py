@@ -32,7 +32,11 @@ def _compact_log_formatter() -> logging.Formatter:
 
 
 OPENCV_ANALYSIS_SIZE = (200, 200)
-MINIMAP_FALLBACK_REGION = (0, 0, 0.2, 0.24)
+# Keep a small margin around the top-left minimap.  At 20% x 24% the crop can
+# end exactly on the minimap border, making a transient clipped contour more
+# likely.  OpenCV rescales this crop to its fixed analysis size, so the modest
+# 22% x 27% expansion does not increase per-frame detector work.
+MINIMAP_FALLBACK_REGION = (0, 0, 0.22, 0.27)
 STATUS_CAPTURE_REGION = (0.36, 0.96, 0.53, 1)
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
 # Status-bar fractions are calibrated to the CLIENT WIDTH so they hold at any

@@ -1013,7 +1013,7 @@ def climb(
 # Only the map drawing inside the top-left minimap panel.  The old broad crop
 # included yellow monsters/items in the game world and could mistake those for
 # the player diamond.
-DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
+DEFAULT_MINIMAP_REGION = (0.0, 0.0, 0.22, 0.27)
 
 # 卡住判定阈值：标记 X 变化 < 0.012（最小地图单位）即视为"没在动"。
 # 按帧判定（连续 3 帧 ≈ 0.75s）触发跳跃。

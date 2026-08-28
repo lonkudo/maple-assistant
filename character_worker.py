@@ -29,7 +29,7 @@ LOG = logging.getLogger(__name__)
 
 # Fallback minimap region when the movement worker has not produced its
 # stabilised box yet (normalised left/top/right/bottom).
-DEFAULT_MINIMAP_REGION = (0.0, 0.075, 0.12, 0.24)
+DEFAULT_MINIMAP_REGION = (0.0, 0.0, 0.22, 0.27)
 
 
 class CharacterPosition:

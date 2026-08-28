@@ -92,7 +92,7 @@ class MinimapDetector:
 
     def __init__(
         self,
-        fallback_region: NormalizedBox = (0.0, 0.075, 0.12, 0.24),
+        fallback_region: NormalizedBox = (0.0, 0.0, 0.22, 0.27),
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
