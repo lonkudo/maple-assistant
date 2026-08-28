@@ -60,9 +60,9 @@ class BossTrackerApp:
         settings.pack(fill="x")
         interval_row = ttk.Frame(settings)
         interval_row.grid(row=0, column=0, sticky="ew")
-        ttk.Label(interval_row, text="时间间隔(h)").pack(side="left")
-        hours = self.model.snapshot()["universal_interval_hours"]
-        self.interval_var = tk.StringVar(value=f"{hours:g}")
+        ttk.Label(interval_row, text="时间间隔(min)").pack(side="left")
+        minutes = self.model.snapshot()["universal_interval_minutes"]
+        self.interval_var = tk.StringVar(value=f"{minutes:g}")
         interval_controls = ttk.Frame(interval_row)
         interval_controls.pack(side="right")
         _interval_holder, interval_entry = self._fixed_entry(
@@ -176,14 +176,14 @@ class BossTrackerApp:
 
     def _apply_interval(self) -> None:
         try:
-            hours = float(self.interval_var.get())
-            if hours <= 0:
+            minutes = float(self.interval_var.get())
+            if minutes <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("无效时间", "请输入大于 0 的小时数。")
+            messagebox.showerror("无效时间", "请输入大于 0 的分钟数。")
             return
-        hours = self.model.set_interval_hours(hours)
-        self.interval_var.set(f"{hours:g}")
+        minutes = self.model.set_interval_minutes(minutes)
+        self.interval_var.set(f"{minutes:g}")
         self.status_var.set("统一时间间隔已保存，全部频道已重置。")
         self._refresh_channels()
 

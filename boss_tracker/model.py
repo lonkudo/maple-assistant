@@ -13,9 +13,9 @@ from typing import Any, Callable
 from uuid import uuid4
 
 
-DEFAULT_INTERVAL_HOURS = 1.0
-MIN_INTERVAL_HOURS = 0.01
-MAX_INTERVAL_HOURS = 168.0
+DEFAULT_INTERVAL_MINUTES = 60.0
+MIN_INTERVAL_MINUTES = 0.1
+MAX_INTERVAL_MINUTES = 10080.0
 
 
 def _clean_count(value: Any) -> int:
@@ -25,14 +25,14 @@ def _clean_count(value: Any) -> int:
         return 0
 
 
-def _clean_hours(value: Any) -> float:
+def _clean_minutes(value: Any) -> float:
     try:
-        hours = float(value)
+        minutes = float(value)
     except (TypeError, ValueError):
-        return DEFAULT_INTERVAL_HOURS
-    if not math.isfinite(hours):
-        return DEFAULT_INTERVAL_HOURS
-    return min(MAX_INTERVAL_HOURS, max(MIN_INTERVAL_HOURS, hours))
+        return DEFAULT_INTERVAL_MINUTES
+    if not math.isfinite(minutes):
+        return DEFAULT_INTERVAL_MINUTES
+    return min(MAX_INTERVAL_MINUTES, max(MIN_INTERVAL_MINUTES, minutes))
 
 
 class BossTrackerModel:
@@ -51,31 +51,40 @@ class BossTrackerModel:
 
     def _default_data(self) -> dict[str, Any]:
         return {
-            "version": 1,
-            "universal_interval_hours": DEFAULT_INTERVAL_HOURS,
+            "version": 2,
+            "universal_interval_minutes": DEFAULT_INTERVAL_MINUTES,
             "channels": [],
             "statistics": {"boss_kills": 0, "custom": []},
             "window_geometry": "",
         }
 
     def _load(self) -> dict[str, Any]:
-        data = self._default_data()
+        data: dict[str, Any] | None = None
         try:
             loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
-                data.update(loaded)
+                data = loaded
         except FileNotFoundError:
             pass
         except (OSError, json.JSONDecodeError):
             # Keep the application usable; the next successful edit repairs
             # the malformed file with normalized data.
             pass
-        return self._normalize(data)
+        return self._normalize(data if data is not None else self._default_data())
 
     def _normalize(self, data: dict[str, Any]) -> dict[str, Any]:
         now = self._clock()
-        interval_hours = _clean_hours(data.get("universal_interval_hours"))
-        interval_seconds = interval_hours * 3600.0
+        if "universal_interval_minutes" in data:
+            interval_minutes = _clean_minutes(data["universal_interval_minutes"])
+        else:
+            # Preserve values written by every pre-minute release.
+            try:
+                interval_minutes = _clean_minutes(
+                    float(data.get("universal_interval_hours", 1.0)) * 60.0
+                )
+            except (TypeError, ValueError):
+                interval_minutes = DEFAULT_INTERVAL_MINUTES
+        interval_seconds = interval_minutes * 60.0
 
         channels: list[dict[str, Any]] = []
         raw_channels = data.get("channels", [])
@@ -113,8 +122,8 @@ class BossTrackerModel:
                 })
 
         return {
-            "version": 1,
-            "universal_interval_hours": interval_hours,
+            "version": 2,
+            "universal_interval_minutes": interval_minutes,
             "channels": channels,
             "statistics": {
                 "boss_kills": _clean_count(statistics.get("boss_kills")),
@@ -154,19 +163,19 @@ class BossTrackerModel:
     @property
     def interval_seconds(self) -> float:
         with self._lock:
-            return float(self._data["universal_interval_hours"]) * 3600.0
+            return float(self._data["universal_interval_minutes"]) * 60.0
 
-    def set_interval_hours(self, hours: float) -> float:
+    def set_interval_minutes(self, minutes: float) -> float:
         """Change the shared gap and reset every channel to the full gap."""
 
-        hours = _clean_hours(hours)
-        deadline = self._clock() + hours * 3600.0
+        minutes = _clean_minutes(minutes)
+        deadline = self._clock() + minutes * 60.0
         with self._lock:
-            self._data["universal_interval_hours"] = hours
+            self._data["universal_interval_minutes"] = minutes
             for channel in self._data["channels"]:
                 channel["deadline"] = deadline
             self._save_locked()
-        return hours
+        return minutes
 
     def add_channel(self, name: str) -> str:
         with self._lock:

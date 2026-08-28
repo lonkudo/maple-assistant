@@ -30,7 +30,7 @@ class BossTrackerModelTests(unittest.TestCase):
         self.assertAlmostEqual(rows[second]["remaining"], 3600)
 
     def test_expired_channel_resets_and_reports_once(self) -> None:
-        self.model.set_interval_hours(0.01)
+        self.model.set_interval_minutes(0.6)
         self.model.add_channel("3")
         self.clock.value += 36
         self.assertEqual(self.model.advance_expired(), ["3"])
@@ -43,7 +43,7 @@ class BossTrackerModelTests(unittest.TestCase):
         self.model.add_channel("1")
         self.clock.value += 100
         self.model.add_channel("2")
-        self.model.set_interval_hours(2)
+        self.model.set_interval_minutes(120)
         self.assertEqual(
             [row["remaining"] for row in self.model.channel_status()],
             [7200, 7200],
@@ -93,14 +93,14 @@ class BossTrackerModelTests(unittest.TestCase):
         self.assertEqual(stats["custom"][0]["count"], 3)
 
     def test_clear_all_data_keeps_universal_settings(self) -> None:
-        self.model.set_interval_hours(2.5)
+        self.model.set_interval_minutes(150)
         self.model.add_channel("1")
         self.model.change_boss_kills(4)
         self.model.add_custom_stat("核心")
         self.model.clear_all_data()
 
         data = self.model.snapshot()
-        self.assertEqual(data["universal_interval_hours"], 2.5)
+        self.assertEqual(data["universal_interval_minutes"], 150)
         self.assertEqual(data["channels"], [])
         self.assertEqual(
             data["statistics"], {"boss_kills": 0, "custom": []}
@@ -112,6 +112,17 @@ class BossTrackerModelTests(unittest.TestCase):
         recovered.add_channel("1")
         self.assertEqual(recovered.snapshot()["channels"][0]["name"], "1")
         self.assertIn("channels", self.path.read_text(encoding="utf-8"))
+
+    def test_legacy_hour_configuration_migrates_to_minutes(self) -> None:
+        self.path.write_text(
+            '{"universal_interval_hours": 1.5, "channels": []}',
+            encoding="utf-8",
+        )
+        migrated = BossTrackerModel(self.path, clock=self.clock)
+        self.assertEqual(
+            migrated.snapshot()["universal_interval_minutes"], 90
+        )
+        self.assertEqual(migrated.interval_seconds, 5400)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,9 @@ The repository also contains `boss_tracker/`, a separate Tk application with
 its own process, persistent `boss_tracker/config.json`, tests, launcher, and
 release workflow. It does not import Maple Assistant workers or participate in
 game capture/input. Its channels use independent wall-clock deadlines under a
-single universal interval, while its statistics are persisted atomically.
+single universal interval measured in minutes; legacy hour-based settings are
+migrated without changing the real countdown duration, while statistics are
+persisted atomically.
 
 The project has one primary process and one optional subprocess:
 
