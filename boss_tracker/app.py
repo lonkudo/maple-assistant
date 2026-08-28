@@ -33,6 +33,7 @@ class BossTrackerApp:
         self.model = model
         self.channel_widgets: dict[str, dict[str, Any]] = {}
         self.custom_widgets: dict[str, dict[str, Any]] = {}
+        self._editing_custom_id: str | None = None
         self._closing = False
         self._building = True
 
@@ -323,11 +324,36 @@ class BossTrackerApp:
         self.boss_count_label.configure(text=str(value))
 
     def _add_custom(self) -> None:
-        self.model.add_custom_stat()
+        self._editing_custom_id = self.model.add_custom_stat()
         self._rebuild_statistics()
+        self.root.after_idle(
+            lambda item_id=self._editing_custom_id:
+            self._start_custom_edit(item_id)
+        )
 
-    def _rename_custom(self, item_id: str, variable: tk.StringVar) -> None:
-        self.model.rename_custom_stat(item_id, variable.get())
+    def _start_custom_edit(self, item_id: str | None) -> None:
+        if item_id is None:
+            return
+        widgets = self.custom_widgets.get(item_id)
+        if widgets is None:
+            return
+        self._editing_custom_id = item_id
+        widgets["label"].place_forget()
+        widgets["entry"].place(x=0, y=0, width=80, height=24)
+        widgets["entry"].focus_set()
+        widgets["entry"].selection_range(0, "end")
+
+    def _finish_custom_edit(self, item_id: str) -> None:
+        widgets = self.custom_widgets.get(item_id)
+        if widgets is None:
+            return
+        name = widgets["name"].get().strip() or "未命名项目"
+        widgets["name"].set(name)
+        self.model.rename_custom_stat(item_id, name)
+        widgets["entry"].place_forget()
+        widgets["label"].place(x=0, y=0, width=80, height=24)
+        if self._editing_custom_id == item_id:
+            self._editing_custom_id = None
 
     def _change_custom(self, item_id: str, delta: int) -> None:
         value = self.model.change_custom_stat(item_id, delta)
@@ -356,10 +382,28 @@ class BossTrackerApp:
             variable = tk.StringVar(value=item["name"])
             entry_holder, entry = self._fixed_entry(self.stats_frame, variable)
             entry_holder.grid(row=row_index, column=0, sticky="w", pady=3)
+            label = ttk.Label(
+                entry_holder,
+                textvariable=variable,
+                anchor="w",
+                cursor="hand2",
+            )
+            label.place(x=0, y=0, width=80, height=24)
+            entry.place_forget()
+            label.bind(
+                "<Button-1>",
+                lambda _event, item_id=item["id"]:
+                self._start_custom_edit(item_id),
+            )
             entry.bind(
                 "<FocusOut>",
-                lambda _event, item_id=item["id"], var=variable:
-                self._rename_custom(item_id, var),
+                lambda _event, item_id=item["id"]:
+                self._finish_custom_edit(item_id),
+            )
+            entry.bind(
+                "<Return>",
+                lambda _event, item_id=item["id"]:
+                self._finish_custom_edit(item_id),
             )
             count = ttk.Label(
                 self.stats_frame, text=str(item["count"]), width=5, anchor="center"
@@ -388,6 +432,8 @@ class BossTrackerApp:
             self.custom_widgets[item["id"]] = {
                 "count": count,
                 "name": variable,
+                "entry": entry,
+                "label": label,
             }
         self.stats_frame.columnconfigure(0, weight=1)
         self._fit_to_content()
