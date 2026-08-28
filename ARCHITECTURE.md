@@ -262,7 +262,9 @@ once until a later scan confirms the square has disappeared.
 `ScreenBlinker` is a separate, request-driven worker. When **闪烁提醒** is
 selected, every existing beep trigger queues two short blue full-screen flashes
 (countdown, disconnect alarm, and lie detector). It owns no capture or game
-input and therefore cannot delay the workers that produced the alert.
+input and therefore cannot delay the workers that produced the alert. It uses
+a native no-activation, topmost Win32 overlay to cover the game's virtual
+desktop rather than a background Tk window, and the UI exposes a test button.
 
 ## 7. Cross-process coordination
 

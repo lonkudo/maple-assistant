@@ -1177,6 +1177,9 @@ class UiWorker(threading.Thread):
                 variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
+            ttk.Button(
+                blink_row, text="测试闪烁", command=self._test_screen_blink
+            ).pack(side="left", padx=(8, 0))
             self._shutdown_load_settings()
 
             # Minimap / map-name preview widgets: built but hidden by default
@@ -1930,6 +1933,16 @@ class UiWorker(threading.Thread):
         self._shutdown_save_settings(data)
         self._shutdown_apply_to_worker(data)
         self._shutdown_refresh_grey()
+
+    def _test_screen_blink(self) -> None:
+        """Let the user verify the blue overlay without waiting for an alarm."""
+
+        blinker = getattr(self, "screen_blinker", None)
+        request = getattr(blinker, "request_blink", None)
+        if request is None:
+            LOG.warning("screen blink test ignored: notifier is unavailable")
+            return
+        request()
 
     def _shutdown_save_settings(self, data: dict) -> None:
         """Persist the Additional Functions values to the local JSON file."""

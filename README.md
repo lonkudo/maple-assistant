@@ -238,4 +238,5 @@ image files remain to delete.
 
 Selecting **闪烁提醒** makes the primary screen flash blue twice whenever one
 of the existing beep alarms fires: the repeating countdown, 掉线警报, or 测谎报警.
-It is a separate notification worker and does not create another capture loop.
+Use **测试闪烁** beside the checkbox to confirm it immediately. It is a separate
+notification worker and does not create another capture loop.
