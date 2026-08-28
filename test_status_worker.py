@@ -1,4 +1,5 @@
 import queue
+import sys
 import threading
 import time
 import unittest
@@ -35,6 +36,27 @@ class FakeSender:
 
 
 class StatusTests(unittest.TestCase):
+    def test_window_scan_skips_unreadable_unrelated_windows(self) -> None:
+        class FakeWin32Gui:
+            @staticmethod
+            def IsWindowVisible(_hwnd):
+                return True
+
+            @staticmethod
+            def GetWindowText(hwnd):
+                if hwnd == 1:
+                    raise RuntimeError("protected transient window")
+                return "MapleStory"
+
+            @staticmethod
+            def EnumWindows(callback, extra):
+                callback(1, extra)
+                callback(2, extra)
+
+        sender = WindowKeySender("maple", dry_run=True)
+        with patch.dict(sys.modules, {"win32gui": FakeWin32Gui}):
+            self.assertEqual(sender._find_target_window(), 2)
+
     def test_bar_ratios_are_converted_to_values(self) -> None:
         reading = BarStatusDetector().detect(status_image(0.5, 0.2))
         self.assertAlmostEqual(reading.hp, 328, delta=5)

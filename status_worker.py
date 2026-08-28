@@ -160,13 +160,26 @@ class WindowKeySender:
         matches: list[int] = []
 
         def collect(hwnd: int, _extra: object) -> None:
-            if not win32gui.IsWindowVisible(hwnd):
+            # A protected or transient top-level window can reject a title
+            # read while Windows is enumerating. One unrelated window must
+            # not abort Start Patrol before the actual game HWND is reached.
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return
+                title = win32gui.GetWindowText(hwnd)
+            except Exception:
+                LOG.debug("WINDOW SELECT: skipped unreadable hwnd=%s", hwnd,
+                          exc_info=True)
                 return
-            title = win32gui.GetWindowText(hwnd)
             if self.window_title.casefold() in title.casefold():
                 matches.append(hwnd)
 
-        win32gui.EnumWindows(collect, None)
+        try:
+            win32gui.EnumWindows(collect, None)
+        except Exception as exc:
+            raise OSError("could not enumerate visible Windows windows") from exc
+        LOG.info("WINDOW SELECT: title scan found %d matching window(s)",
+                 len(matches))
         if len(matches) != 1:
             raise OSError(
                 f"expected exactly one visible game window containing "

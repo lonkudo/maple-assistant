@@ -84,6 +84,8 @@ background `sound/beep.mp3`; a later valid marker re-arms the next alert.
 implementation. It:
 
 - finds one matching game window and stores its HWND;
+- skips unrelated top-level windows that reject title reads during the scan,
+  so one protected transient window cannot block patrol startup;
 - tracks per-key owners and physical down/up state;
 - refuses live input while disarmed or unsafe;
 - serializes sensitive input sequences;
