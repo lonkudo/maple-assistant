@@ -25,8 +25,8 @@ class ScreenBlinker(threading.Thread):
         *,
         enabled: bool = False,
         flashes_per_alert: int = 2,
-        flash_seconds: float = 0.16,
-        gap_seconds: float = 0.12,
+        flash_seconds: float = 0.5,
+        gap_seconds: float = 0.3,
     ) -> None:
         super().__init__(name="screen-blinker", daemon=True)
         self.stop_event = stop_event
@@ -155,7 +155,7 @@ class ScreenBlinker(threading.Thread):
             LOG.warning("screen blink alert is unavailable", exc_info=True)
             return
         try:
-            for _ in range(self.flashes_per_alert):
+            for flash_index in range(self.flashes_per_alert):
                 if self.stop_event.is_set() or not self.enabled:
                     return
                 user32.SetWindowPos(
@@ -166,6 +166,8 @@ class ScreenBlinker(threading.Thread):
                 user32.UpdateWindow(hwnd)
                 if self._wait(self.flash_seconds):
                     return
+                if flash_index + 1 >= self.flashes_per_alert:
+                    break
                 user32.ShowWindow(hwnd, 0)  # SW_HIDE
                 if self._wait(self.gap_seconds):
                     return
