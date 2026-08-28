@@ -3777,6 +3777,29 @@ class StairJumpTests(unittest.TestCase):
         self.assertTrue(worker._stair_state["gave_up"])
         self.assertEqual(worker._route_phase, "left")
 
+    def test_forced_reversal_requires_real_movement_before_it_can_advance(self):
+        """A blocked Right cannot skip the forced Left on the next frame."""
+        worker = self._worker()
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        worker._force_advance_phase(.5)
+
+        self.assertEqual(worker._route_phase, "left")
+        # The unchanged marker is not evidence that Left was reached.
+        self.assertFalse(worker._advance_route_endpoint(
+            MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1)), .2
+        ))
+        self.assertEqual(worker._route_phase, "left")
+        # After it has actually backed away, ordinary endpoint handling can
+        # resume on a later frame.
+        self.assertFalse(worker._advance_route_endpoint(
+            MinimapObservation(Point(.48, .7), None, .9, (0, 0, 1, 1)), .2
+        ))
+        self.assertTrue(worker._advance_route_endpoint(
+            MinimapObservation(Point(.19, .7), None, .9, (0, 0, 1, 1)), .2
+        ))
+        self.assertEqual(worker._route_phase, "right")
+
     def test_phase_change_resets_stair_state(self):
         worker = self._worker()
         worker._route_layer_index = 0

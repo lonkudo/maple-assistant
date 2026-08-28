@@ -1980,6 +1980,10 @@ class MovementWorker(threading.Thread):
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
         self._route_patrol_cycle = 1
+        # A failed stair approach can force the route to reverse direction.
+        # Do not immediately count that new endpoint as reached while the
+        # marker is still standing at the blocked position.
+        self._forced_phase_entry: Optional[tuple[int, str, float]] = None
         self.patrol_enabled = patrol_enabled
         self.climbing_enabled = climbing_enabled
         self.final_layer_action = final_layer_action
@@ -2345,7 +2349,7 @@ class MovementWorker(threading.Thread):
                 state["gave_up"] = True
                 # 边界不可达（墙角/越界目标）：角色已在实际可到达的边界处，
                 # 强制完成当前相位进入下一相位，而不是无限按方向键+Z。
-                self._force_advance_phase()
+                self._force_advance_phase(px)
             return None
         state["attempts"] += 1
         state["stall_frames"] = 0
@@ -3648,6 +3652,31 @@ class MovementWorker(threading.Thread):
             return False
         name = self._route_layers[self._route_layer_index]
         is_final = self._route_layer_index == len(self._route_layers) - 1
+        forced_entry = self._forced_phase_entry
+        if (forced_entry is not None
+                and forced_entry[:2] == (
+                    self._route_layer_index, self._route_phase
+                )):
+            entry_x = forced_entry[2]
+            moved_away = (
+                observation.player.x < entry_x - self._current_horizontal_tolerance
+                if self._route_phase == "left" else
+                observation.player.x > entry_x + self._current_horizontal_tolerance
+            )
+            if not moved_away:
+                # The previous endpoint was unreachable. The forced reverse
+                # must visibly start before its endpoint can advance; without
+                # this, an old position can skip Left and retry blocked Right.
+                return False
+            self._forced_phase_entry = None
+            # Let the next fresh frame evaluate the endpoint. This avoids one
+            # marker sample both proving departure and completing the new phase.
+            return False
+        if (forced_entry is not None
+                and forced_entry[:2] != (
+                    self._route_layer_index, self._route_phase
+                )):
+            self._forced_phase_entry = None
         if self._route_phase == "left":
             # Passing the line counts. We intentionally do not turn this into
             # an exact-position problem at the minimap's coarse resolution.
@@ -3757,6 +3786,7 @@ class MovementWorker(threading.Thread):
         self._route_layer_index = self._route_layers.index(self.first_layer)
         self._route_phase = "left"
         self._route_patrol_cycle = 1
+        self._forced_phase_entry = None
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
         self._descending_to_first = False
@@ -3768,7 +3798,7 @@ class MovementWorker(threading.Thread):
             self.dropping_active_event.clear()
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
 
-    def _force_advance_phase(self) -> None:
+    def _force_advance_phase(self, player_x: Optional[float] = None) -> None:
         """Boundary unreachable (walk blocked / out-of-bounds target): the
         character is AT the reachable boundary - complete the current phase
         and move to the next recorded one, breaking the loop of chasing an
@@ -3779,7 +3809,17 @@ class MovementWorker(threading.Thread):
         name = self._route_layers[self._route_layer_index]
         phases = self._layer_phases(name)
         current = self._route_phase
+
+        def arm_reversal_guard() -> None:
+            if self._route_phase in ("left", "right") and player_x is not None:
+                self._forced_phase_entry = (
+                    self._route_layer_index, self._route_phase, float(player_x)
+                )
+            else:
+                self._forced_phase_entry = None
+
         if self._repeat_patrol_cycle_if_needed(name, phases, current):
+            arm_reversal_guard()
             LOG.warning(
                 "boundary %s unreachable on %s; starting patrol cycle %d/%d",
                 current,
@@ -3792,11 +3832,13 @@ class MovementWorker(threading.Thread):
             index = phases.index(current)
             if index + 1 < len(phases):
                 self._route_phase = phases[index + 1]
+                arm_reversal_guard()
                 LOG.warning("boundary %s unreachable on %s; forcing next "
                             "phase %s", current, name, phases[index + 1])
                 return
         if phases:
             self._route_phase = phases[0]
+            arm_reversal_guard()
             LOG.warning("boundary %s unreachable on %s; looping %s",
                         current, name, phases[0])
 
@@ -4414,10 +4456,19 @@ class MovementWorker(threading.Thread):
                     # Stairs that block the walk: when the marker stalls at a
                     # recorded jump-trigger X, replace the plain walk hold with
                     # a walk-and-jump (direction held, Alt tapped mid-hold).
+                    phase_before_stair_check = self._route_phase
                     stair_decision = self._stair_jump_decision(
                         observation, route_label, position_plan, time.monotonic()
                     )
-                    if stair_decision is not None:
+                    # Exhausting the stair budget can reroute this phase. The
+                    # plan above belongs to the old direction, so do not send
+                    # it after that reroute.
+                    if self._route_phase != phase_before_stair_check:
+                        decision = MovementDecision(
+                            None, "boundary unreachable; waiting for rerouted patrol phase"
+                        )
+                        active_target_x = None
+                    elif stair_decision is not None:
                         decision = stair_decision
                     active_target_x = route_target_x
                 # Other-player safety net: a per-frame scan (no cooldown)

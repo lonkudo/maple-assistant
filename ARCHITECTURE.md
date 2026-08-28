@@ -187,7 +187,9 @@ Left/Right walking holds Z simultaneously for pickup. Hold management is
 non-blocking so frame analysis and coordination continue during long movement.
 Stair-jump recovery watches progress toward a horizontal endpoint. After a
 configured stationary run it holds the travel direction and taps Alt, with
-grace and attempt limits.
+grace and attempt limits. If that budget is exhausted, the route reverses, but
+the new direction must first show real minimap movement away from the blocked
+position; a stale marker cannot skip the reversal and retry the same endpoint.
 
 ### 5.4 Rope approach and climb
 
