@@ -33,7 +33,7 @@ if (-not $SkipTests) {
     & $python -u -m unittest `
         test_movement_worker test_ui_worker test_status_worker `
         test_character_worker test_config_store test_countdown_worker `
-        test_lie_detector_worker `
+        test_lie_detector_worker test_screen_blinker `
         test_minimap_detector test_assistant test_single_instance `
         test_capture_worker test_map_identity test_map_structure_tracker `
         *> $tempLog 2>&1

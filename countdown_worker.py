@@ -65,12 +65,14 @@ class CountdownWorker(threading.Thread):
         interval_hours: float = 1.0,
         poll_interval: float = 0.2,
         play_sound: Optional[Callable[[Path], None]] = None,
+        flash_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(name="countdown-worker", daemon=True)
         self.stop_event = stop_event
         self.sound_path = Path(sound_path)
         self.poll_interval = max(0.02, float(poll_interval))
         self._play_sound = play_sound or play_mp3
+        self._flash_callback = flash_callback
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
         self._enabled = bool(enabled)
@@ -146,6 +148,11 @@ class CountdownWorker(threading.Thread):
             self._deadline = now + self._interval_seconds
         LOG.info("COUNTDOWN reached zero: playing %s and resetting timer",
                  self.sound_path)
+        if self._flash_callback is not None:
+            try:
+                self._flash_callback()
+            except Exception:
+                LOG.warning("COUNTDOWN screen blink callback failed", exc_info=True)
         try:
             self._play_sound(self.sound_path)
         except Exception:

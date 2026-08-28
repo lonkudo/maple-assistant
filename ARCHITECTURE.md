@@ -30,6 +30,7 @@ assistant.py (primary process)
     ShutdownWorker     optional timed shutdown
     CountdownWorker    independent repeating MP3 reminder
     LieDetectorWorker  1-second full-client pure-white-square alarm
+    ScreenBlinker       optional two-flash blue visual alarm
     supervisor-worker  stops the process if a core worker dies
 
 yolo-detection/live_view.py (optional subprocess launched by UiWorker)
@@ -258,6 +259,11 @@ Every second it scales the reference `40×40` signature from a
 over the exact-white pixel mask to find an all-white rectangle. A match beeps
 once until a later scan confirms the square has disappeared.
 
+`ScreenBlinker` is a separate, request-driven worker. When **闪烁提醒** is
+selected, every existing beep trigger queues two short blue full-screen flashes
+(countdown, disconnect alarm, and lie detector). It owns no capture or game
+input and therefore cannot delay the workers that produced the alert.
+
 ## 7. Cross-process coordination
 
 The primary and YOLO processes coordinate through atomically replaced,
@@ -353,6 +359,7 @@ git -c core.quotepath=false ls-files
 | `shutdown_worker.py` | Optional timed shutdown |
 | `countdown_worker.py` | Independent repeating countdown and MP3 playback |
 | `lie_detector_worker.py` | Resolution-scaled in-memory lie-event detection |
+| `screen_blinker.py` | Optional queued two-flash blue full-screen notifier |
 | `pickup_worker.py` | Legacy standalone pickup worker; not wired by assistant.py |
 | `channel_switch.py` | Channel-switch/drop recovery procedure |
 | `combat_coordination.py` | Attack, patrol, and rope state-file adapters |
@@ -412,6 +419,7 @@ test_character_worker.py
 test_config_store.py
 test_countdown_worker.py
 test_lie_detector_worker.py
+test_screen_blinker.py
 test_focus_worker.py
 test_map_identity.py
 test_map_structure_tracker.py

@@ -71,6 +71,8 @@ The application starts with live input disarmed. Input is enabled only after
   result and plays the same beep after three consecutive missing frames.
 - The optional **测谎报警** samples the shared full-client capture every one
   seconds and alarms when it finds a resolution-scaled pure-white square.
+- The optional **闪烁提醒** adds two brief blue full-screen flashes to every
+  countdown, disconnect, and lie-detector beep without affecting capture.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
@@ -233,3 +235,7 @@ Its reference signature is a `40×40` block of entirely pure-white pixels in a
 client resolution. A visible match plays one beep; after the square disappears,
 a later match can alert again. The detector never saves screenshots, so no used
 image files remain to delete.
+
+Selecting **闪烁提醒** makes the primary screen flash blue twice whenever one
+of the existing beep alarms fires: the repeating countdown, 掉线警报, or 测谎报警.
+It is a separate notification worker and does not create another capture loop.

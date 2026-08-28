@@ -65,6 +65,16 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             threading.Event().wait(.01)
         self.assertEqual(played, [Path("sound/beep.mp3")])
 
+    def test_disconnect_alert_requests_visual_alert_with_the_beep(self):
+        flashed = threading.Event()
+        worker = CharacterWorker(
+            queue.Queue(), queue.Queue(), threading.Event(),
+            disconnect_alert_enabled=True, disconnect_alert_misses=1,
+            play_alert_sound=lambda _path: None, flash_callback=flashed.set,
+        )
+        worker._update_disconnect_alert(False)
+        self.assertTrue(flashed.wait(.5))
+
     def test_run_reuses_the_single_marker_detection_for_alert(self):
         frames = queue.Queue()
         positions = queue.Queue()

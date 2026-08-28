@@ -69,7 +69,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "shutdown_enabled": False, "shutdown_hours": 3.0,
         "player_check_enabled": False, "disconnect_alert_enabled": False,
         "countdown_enabled": False, "countdown_interval_hours": 1.0,
-        "lie_alert_enabled": False,
+        "lie_alert_enabled": False, "screen_blink_enabled": False,
     },
     "yolo_detection": {
         "threshold": .4, "attack_range": 30, "min_mob_size": 2,

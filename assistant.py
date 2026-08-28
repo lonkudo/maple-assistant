@@ -187,6 +187,7 @@ def main() -> int:
     from shutdown_worker import ShutdownWorker
     from countdown_worker import CountdownWorker
     from lie_detector_worker import LieDetectorWorker
+    from screen_blinker import ScreenBlinker
     from config_store import get_config_store
     from focus_worker import FocusWorker
     from minimap_detector import MinimapDetector
@@ -412,11 +413,13 @@ def main() -> int:
         enabled=False,
         hours=3.0,
     )
+    screen_blinker = ScreenBlinker(stop_event, enabled=False)
     countdown_worker = CountdownWorker(
         stop_event,
         sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
         enabled=False,
         interval_hours=1.0,
+        flash_callback=screen_blinker.request_blink,
     )
     lie_detector_worker = LieDetectorWorker(
         lie_detector_frames,
@@ -424,6 +427,7 @@ def main() -> int:
         enabled=False,
         scan_interval=1.0,
         sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
+        flash_callback=screen_blinker.request_blink,
     )
     # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。
     status_worker = StatusWorker(
@@ -609,6 +613,7 @@ def main() -> int:
         alert_sound_path=(
             Path(__file__).resolve().parent / "sound" / "beep.mp3"
         ),
+        flash_callback=screen_blinker.request_blink,
     )
     core_workers = [
         capture_worker,
@@ -617,6 +622,7 @@ def main() -> int:
         status_worker,
         *attack_workers,
         shutdown_worker,
+        screen_blinker,
         countdown_worker,
         lie_detector_worker,
         FocusWorker(
@@ -645,6 +651,7 @@ def main() -> int:
             shutdown_worker=shutdown_worker,
             countdown_worker=countdown_worker,
             lie_detector_worker=lie_detector_worker,
+            screen_blinker=screen_blinker,
             on_patrol_start=lambda: _start_live_input(
                 key_sender, automation_active, prepare_map_session
             ),

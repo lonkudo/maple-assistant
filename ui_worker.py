@@ -463,6 +463,7 @@ class UiWorker(threading.Thread):
         shutdown_worker: Any = None,
         countdown_worker: Any = None,
         lie_detector_worker: Any = None,
+        screen_blinker: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -501,6 +502,8 @@ class UiWorker(threading.Thread):
         # Five-second white-square detector fed by the existing full-client
         # capture bus. It never creates screenshot files.
         self.lie_detector_worker = lie_detector_worker
+        # Shared visual counterpart to every optional beep alert.
+        self.screen_blinker = screen_blinker
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -1162,6 +1165,16 @@ class UiWorker(threading.Thread):
                 lie_alert_row,
                 text="测谎报警",
                 variable=self._lie_alert_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left")
+
+            blink_row = ttk.Frame(extra_panel)
+            blink_row.pack(fill="x", pady=(4, 0))
+            self._screen_blink_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                blink_row,
+                text="闪烁提醒（蓝色闪烁两次）",
+                variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
             self._shutdown_load_settings()
@@ -1895,6 +1908,8 @@ class UiWorker(threading.Thread):
             )
         if hasattr(self, "_lie_alert_var"):
             data["lie_alert_enabled"] = bool(self._lie_alert_var.get())
+        if hasattr(self, "_screen_blink_var"):
+            data["screen_blink_enabled"] = bool(self._screen_blink_var.get())
         if hasattr(self, "_countdown_enabled_var"):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
@@ -1954,6 +1969,11 @@ class UiWorker(threading.Thread):
             setter = getattr(lie_detector, "set_enabled", None)
             if setter is not None:
                 setter(bool(data.get("lie_alert_enabled", False)))
+        blinker = getattr(self, "screen_blinker", None)
+        if blinker is not None:
+            setter = getattr(blinker, "set_enabled", None)
+            if setter is not None:
+                setter(bool(data.get("screen_blink_enabled", False)))
         if worker.enabled:
             self._shutdown_status.configure(
                 text=f"定时关闭已启动: 游戏将在 "
@@ -2144,6 +2164,10 @@ class UiWorker(threading.Thread):
                 self, "_lie_alert_var"
             ):
                 self._lie_alert_var.set(bool(data["lie_alert_enabled"]))
+            if "screen_blink_enabled" in data and hasattr(
+                    self, "_screen_blink_var"
+            ):
+                self._screen_blink_var.set(bool(data["screen_blink_enabled"]))
             if hasattr(self, "_countdown_enabled_var"):
                 # Like scheduled shutdown, do not silently start a timer on
                 # application launch. Preserve only its configured time gap.

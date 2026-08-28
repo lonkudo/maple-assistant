@@ -84,6 +84,7 @@ class LieDetectorWorker(threading.Thread):
         scan_interval: float = 1.0,
         sound_path: Optional[Path] = None,
         play_alert_sound: Optional[Callable[[Path], None]] = None,
+        flash_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(name="lie-detector-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -95,6 +96,7 @@ class LieDetectorWorker(threading.Thread):
             else Path(__file__).resolve().parent / "sound" / "beep.mp3"
         )
         self._play_alert_sound = play_alert_sound or play_mp3
+        self._flash_callback = flash_callback
         self._lock = threading.Lock()
         self._enabled = bool(enabled)
         self._next_scan_at = (
@@ -132,6 +134,11 @@ class LieDetectorWorker(threading.Thread):
             return True
 
     def _play_alert(self) -> None:
+        if self._flash_callback is not None:
+            try:
+                self._flash_callback()
+            except Exception:
+                LOG.warning("lie detector screen blink failed", exc_info=True)
         try:
             self._play_alert_sound(self.sound_path)
         except Exception:

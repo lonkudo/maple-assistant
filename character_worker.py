@@ -83,6 +83,7 @@ class CharacterWorker(Thread):
         disconnect_alert_misses: int = 3,
         alert_sound_path: Optional[Path] = None,
         play_alert_sound: Optional[Callable[[Path], None]] = None,
+        flash_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(name="character-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -102,6 +103,7 @@ class CharacterWorker(Thread):
             else Path(__file__).resolve().parent / "sound" / "beep.mp3"
         )
         self._play_alert_sound = play_alert_sound or play_mp3
+        self._flash_callback = flash_callback
 
     def set_disconnect_alert(self, enabled: bool) -> None:
         """Enable/disable the missing-yellow-marker alarm live from the UI."""
@@ -118,6 +120,11 @@ class CharacterWorker(Thread):
             return self._disconnect_alert_enabled
 
     def _play_disconnect_alert(self) -> None:
+        if self._flash_callback is not None:
+            try:
+                self._flash_callback()
+            except Exception:
+                LOG.warning("disconnect alert screen blink failed", exc_info=True)
         try:
             self._play_alert_sound(self._alert_sound_path)
         except Exception:

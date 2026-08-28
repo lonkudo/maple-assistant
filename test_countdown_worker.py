@@ -75,6 +75,15 @@ class CountdownWorkerTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(remaining, interval)
 
+    def test_expiry_requests_visual_alert_with_the_beep(self) -> None:
+        flashes = []
+        worker = CountdownWorker(
+            threading.Event(), sound_path=Path("sound/beep.mp3"), enabled=True,
+            play_sound=lambda _path: None, flash_callback=lambda: flashes.append(True),
+        )
+        worker._fire_and_reset()
+        self.assertEqual(flashes, [True])
+
 
 if __name__ == "__main__":
     unittest.main()
