@@ -6,6 +6,7 @@ import ctypes
 from ctypes import wintypes
 import logging
 import threading
+from typing import Iterable, Sequence
 
 
 LOG = logging.getLogger(__name__)
@@ -59,6 +60,144 @@ class ScreenBlinker(threading.Thread):
                 return
             self._pending += 1
         self._wake_event.set()
+
+    def show_detection_regions(
+        self,
+        window_rect: tuple[int, int, int, int],
+        image_size: tuple[int, int],
+        regions: Iterable[tuple[str, tuple[int, int, int, int], int]],
+    ) -> None:
+        """Briefly outline capture regions over the selected game client.
+
+        This is an always-on start-of-patrol visual check, separate from the
+        optional red alert setting.  Boxes use pixels in the full client
+        capture and are converted to screen pixels with the captured client
+        rectangle, so the outlines remain correct at every game resolution.
+        """
+
+        image_width, image_height = image_size
+        left, top, right, bottom = window_rect
+        client_width = right - left
+        client_height = bottom - top
+        if image_width <= 0 or image_height <= 0 or client_width <= 0 or client_height <= 0:
+            return
+        screen_regions: list[tuple[str, tuple[int, int, int, int], int]] = []
+        for name, box, color in regions:
+            box_left, box_top, box_right, box_bottom = box
+            x1 = left + round(box_left * client_width / image_width)
+            y1 = top + round(box_top * client_height / image_height)
+            x2 = left + round(box_right * client_width / image_width)
+            y2 = top + round(box_bottom * client_height / image_height)
+            if x2 > x1 and y2 > y1:
+                screen_regions.append((name, (x1, y1, x2, y2), int(color)))
+        if not screen_regions:
+            return
+        threading.Thread(
+            target=self._flash_detection_regions,
+            args=(tuple(screen_regions),),
+            name="detection-region-overlay",
+            daemon=True,
+        ).start()
+
+    def _flash_detection_regions(
+        self,
+        regions: Sequence[tuple[str, tuple[int, int, int, int], int]],
+    ) -> None:
+        """Draw two no-activation border flashes without covering the game."""
+
+        if not hasattr(ctypes, "windll"):
+            LOG.warning("detection-region overlay requires Windows")
+            return
+        windows: list[tuple[int, int]] = []
+        try:
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            kernel32 = ctypes.windll.kernel32
+            user32.CreateWindowExW.argtypes = (
+                wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                wintypes.HINSTANCE, wintypes.LPVOID,
+            )
+            user32.CreateWindowExW.restype = wintypes.HWND
+            user32.SetWindowPos.argtypes = (
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT,
+            )
+            user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+            user32.DestroyWindow.argtypes = (wintypes.HWND,)
+            user32.GetDC.argtypes = (wintypes.HWND,)
+            user32.GetDC.restype = wintypes.HDC
+            user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+            user32.GetClientRect.argtypes = (
+                wintypes.HWND, ctypes.POINTER(wintypes.RECT),
+            )
+            user32.FillRect.argtypes = (
+                wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH,
+            )
+            gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
+            gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+            instance = kernel32.GetModuleHandleW(None)
+            border = 3
+            for _name, (left, top, right, bottom), color in regions:
+                brush = gdi32.CreateSolidBrush(color)
+                if not brush:
+                    continue
+                # Four small built-in STATIC windows form a transparent-style
+                # outline without a custom Win32 message callback.
+                for x, y, width, height in (
+                    (left, top, right - left, border),
+                    (left, bottom - border, right - left, border),
+                    (left, top, border, bottom - top),
+                    (right - border, top, border, bottom - top),
+                ):
+                    hwnd = user32.CreateWindowExW(
+                        0x00000008 | 0x00000080 | 0x08000000,
+                        "STATIC", None, 0x80000000,
+                        x, y, max(1, width), max(1, height),
+                        None, None, instance, None,
+                    )
+                    if hwnd:
+                        windows.append((hwnd, brush))
+            if not windows:
+                return
+            for flash_index in range(2):
+                for hwnd, brush in windows:
+                    user32.SetWindowPos(
+                        hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0,
+                        0x0001 | 0x0002 | 0x0010 | 0x0040,
+                    )
+                    user32.ShowWindow(hwnd, 4)
+                    rect = wintypes.RECT()
+                    hdc = user32.GetDC(hwnd)
+                    if hdc:
+                        try:
+                            user32.GetClientRect(hwnd, ctypes.byref(rect))
+                            user32.FillRect(hdc, ctypes.byref(rect), brush)
+                        finally:
+                            user32.ReleaseDC(hwnd, hdc)
+                if self._wait(0.45):
+                    return
+                if flash_index == 0:
+                    for hwnd, _brush in windows:
+                        user32.ShowWindow(hwnd, 0)
+                    if self._wait(0.20):
+                        return
+        except Exception:
+            LOG.warning("detection-region overlay failed", exc_info=True)
+        finally:
+            brushes: set[int] = set()
+            for hwnd, brush in windows:
+                try:
+                    user32.DestroyWindow(hwnd)
+                except Exception:
+                    pass
+                brushes.add(int(brush))
+            for brush in brushes:
+                try:
+                    gdi32.DeleteObject(brush)
+                except Exception:
+                    pass
 
     def _wait(self, seconds: float) -> bool:
         return self.stop_event.wait(seconds)

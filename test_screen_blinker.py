@@ -29,6 +29,27 @@ class ScreenBlinkerTests(unittest.TestCase):
         blinker.set_enabled(False)
         self.assertEqual(blinker._pending, 0)
 
+    def test_detection_overlay_converts_client_pixels_and_starts_once(self):
+        blinker = ScreenBlinker(threading.Event())
+        rendered = threading.Event()
+        received = []
+
+        def render(regions):
+            received.extend(regions)
+            rendered.set()
+
+        blinker._flash_detection_regions = render
+        blinker.show_detection_regions(
+            (100, 200, 1100, 700), (500, 250),
+            (("minimap", (0, 0, 100, 50), 0x0000FF00),),
+        )
+
+        self.assertTrue(rendered.wait(.5))
+        self.assertEqual(
+            received,
+            [("minimap", (100, 200, 300, 300), 0x0000FF00)],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -341,6 +341,30 @@ def main() -> int:
                 configured_name,
             )
 
+        image_width, image_height = fresh_frame.image.size
+        status_box = (
+            round(STATUS_CAPTURE_REGION[0] * image_width),
+            round(STATUS_CAPTURE_REGION[1] * image_height),
+            round(STATUS_CAPTURE_REGION[2] * image_width),
+            round(STATUS_CAPTURE_REGION[3] * image_height),
+        )
+        # The colours make the startup check easy to read: green is the
+        # detected minimap frame, yellow is the marker/patrol analysis area,
+        # and blue is the HP/MP status capture area.
+        screen_blinker.show_detection_regions(
+            fresh_frame.window_rect,
+            fresh_frame.image.size,
+            (
+                ("minimap", detection.window_box, 0x0000FF00),
+                ("marker/patrol", detection.analysis_box, 0x0000FFFF),
+                ("hp/mp", status_box, 0x00FF0000),
+            ),
+        )
+        logging.info(
+            "DETECTION OVERLAY: flashing minimap (green), marker/patrol "
+            "(yellow), and HP/MP (blue) regions"
+        )
+
         # Detect the floor on the fresh frame BEFORE setting the transient
         # world-Y origin. Anchoring unconditionally to the configured patrol
         # start made a character standing on layer1 look confidently like
