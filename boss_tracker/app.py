@@ -46,7 +46,11 @@ class BossTrackerApp:
         self._rebuild_channels()
         self._rebuild_statistics()
         root.update_idletasks()
-        natural_width = root.winfo_reqwidth()
+        natural_width = max(
+            350,
+            root.winfo_reqwidth(),
+            self.channel_frame.winfo_reqwidth() + 55,
+        )
         root.geometry(f"{natural_width}x{height}{position}")
         root.minsize(natural_width, 500)
         self._poll()
@@ -82,10 +86,6 @@ class BossTrackerApp:
         ttk.Button(
             channel_row, text="添加频道", command=self._add_channel
         ).pack(side="left")
-        ttk.Button(
-            settings, text="清空全部数据", command=self._clear_all_data
-        ).grid(row=2, column=0, pady=(8, 0), sticky="w")
-
         channel_box = ttk.LabelFrame(outer, text="各频道 BOSS 倒计时", padding=8)
         channel_box.pack(fill="both", expand=True, pady=(10, 0))
         self.channel_canvas = tk.Canvas(
@@ -108,9 +108,14 @@ class BossTrackerApp:
         stats.pack(fill="x", pady=(10, 0))
         self.stats_frame = ttk.Frame(stats)
         self.stats_frame.pack(fill="x")
-        ttk.Button(stats, text="添加自定义统计", command=self._add_custom).pack(
-            anchor="w", pady=(8, 0)
-        )
+        stats_buttons = ttk.Frame(stats)
+        stats_buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(
+            stats_buttons, text="添加自定义统计", command=self._add_custom
+        ).pack(side="left")
+        ttk.Button(
+            stats_buttons, text="清空全部数据", command=self._clear_all_data
+        ).pack(side="left", padx=(6, 0))
 
         self.status_var = tk.StringVar(value="所有数据会自动保存。")
         ttk.Label(outer, textvariable=self.status_var).pack(
@@ -121,7 +126,7 @@ class BossTrackerApp:
     def _fixed_entry(
         parent: tk.Misc,
         variable: tk.StringVar,
-        width_px: int = 150,
+        width_px: int = 80,
     ) -> tuple[ttk.Frame, ttk.Entry]:
         """Return an editable field constrained to an exact pixel width."""
 
@@ -136,7 +141,7 @@ class BossTrackerApp:
     def _fixed_label(
         parent: tk.Misc,
         text: str,
-        width_px: int = 60,
+        width_px: int = 30,
     ) -> tuple[ttk.Frame, ttk.Label]:
         """Return a left-aligned label constrained to an exact pixel width."""
 
@@ -200,7 +205,7 @@ class BossTrackerApp:
         if not rows:
             ttk.Label(
                 self.channel_frame,
-                text="尚未添加频道。请在上方输入名称并点击“添加频道”。",
+                text="尚未添加频道。",
             ).pack(anchor="w", padx=4, pady=8)
             return
         for row in rows:
