@@ -40,6 +40,7 @@ class BossTrackerApp:
         root.title("BOSS 追踪")
         root.minsize(350, 300)
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Button-1>", self._custom_editor_root_click, add="+")
         geometry = model.snapshot().get("window_geometry", "")
         match = re.match(r"^\d+x\d+([+-]\d+[+-]\d+)?$", geometry)
         self._saved_position = match.group(1) if match and match.group(1) else ""
@@ -334,6 +335,8 @@ class BossTrackerApp:
     def _start_custom_edit(self, item_id: str | None) -> None:
         if item_id is None:
             return
+        if self._editing_custom_id not in (None, item_id):
+            self._finish_custom_edit(self._editing_custom_id)
         widgets = self.custom_widgets.get(item_id)
         if widgets is None:
             return
@@ -354,6 +357,39 @@ class BossTrackerApp:
         widgets["label"].place(x=0, y=0, width=80, height=24)
         if self._editing_custom_id == item_id:
             self._editing_custom_id = None
+
+    def _custom_editor_focus_out(self, item_id: str) -> None:
+        """Ignore whole-window blur; in-window clicks handle field blur."""
+
+        def inspect_focus() -> None:
+            widgets = self.custom_widgets.get(item_id)
+            if widgets is None or self._editing_custom_id != item_id:
+                return
+            focused = self.root.focus_get()
+            if focused is None:
+                # The application itself lost focus. Keep the editor open.
+                return
+            if focused is not widgets["entry"]:
+                self._finish_custom_edit(item_id)
+
+        self.root.after_idle(inspect_focus)
+
+    def _custom_editor_root_click(self, event: Any) -> None:
+        """Turn the active editor into text when its field is clicked away."""
+
+        item_id = self._editing_custom_id
+        if item_id is None:
+            return
+        widgets = self.custom_widgets.get(item_id)
+        if widgets is None:
+            return
+        if event.widget in (widgets["entry"], widgets["label"]):
+            return
+        self.root.after_idle(
+            lambda active_id=item_id:
+            self._finish_custom_edit(active_id)
+            if self._editing_custom_id == active_id else None
+        )
 
     def _change_custom(self, item_id: str, delta: int) -> None:
         value = self.model.change_custom_stat(item_id, delta)
@@ -398,7 +434,7 @@ class BossTrackerApp:
             entry.bind(
                 "<FocusOut>",
                 lambda _event, item_id=item["id"]:
-                self._finish_custom_edit(item_id),
+                self._custom_editor_focus_out(item_id),
             )
             entry.bind(
                 "<Return>",
