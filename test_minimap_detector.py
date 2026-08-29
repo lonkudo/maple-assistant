@@ -226,6 +226,11 @@ class MinimapDetectorTests(unittest.TestCase):
         detector._stabilize_boxes(*collapsed)
         self.assertEqual(detector._stabilize_boxes(*collapsed), stable)
 
+        # Starting patrol on another map deliberately resets the geometry;
+        # its differently sized minimap then becomes the new valid baseline.
+        detector.reset_geometry()
+        self.assertEqual(detector._stabilize_boxes(*collapsed), collapsed)
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

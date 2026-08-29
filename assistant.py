@@ -322,6 +322,11 @@ def main() -> int:
         # Read the live profile, not the startup snapshot: a reset or map
         # re-identification updates the shared file while the app runs.
         configured_name = patrol_controller.map_name()
+        # A new map can have a different minimap/HUD size.  Reset only at the
+        # explicit Start Patrol boundary: once patrol is running, the detector
+        # keeps this fresh geometry stable against false cropped contours.
+        minimap_detector.reset_geometry()
+        logging.info("MINIMAP geometry reset for new patrol/map session")
         fresh_frame = capture_worker.capture_now()
         detection = minimap_detector.detect(fresh_frame.image)
         title_image = fresh_frame.image.crop(detection.map_name_box)

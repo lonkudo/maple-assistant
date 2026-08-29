@@ -132,6 +132,23 @@ class MinimapDetector:
         self._last_good_at = float("-inf")
         self._state_lock = threading.Lock()
 
+    def reset_geometry(self) -> None:
+        """Forget the previous map's minimap frame before a patrol starts.
+
+        Minimap size is map/HUD-specific, so a newly selected map must be
+        allowed to establish a fresh coordinate frame.  During an already
+        running patrol, ``_stabilize_boxes`` still protects that frame from a
+        false cropped contour.
+        """
+
+        with self._state_lock:
+            self._box_history.clear()
+            self._pending_shrunken_boxes = None
+            self._pending_shrunken_count = 0
+            self._last_good = None
+            self._last_good_image_size = None
+            self._last_good_at = float("-inf")
+
     def _held_or_fallback(self, image: Image.Image) -> MinimapDetection:
         now = time.monotonic()
         with self._state_lock:
