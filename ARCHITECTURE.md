@@ -419,7 +419,7 @@ git -c core.quotepath=false ls-files
 | `boss_tracker/build_release.ps1` | Minimal separate package builder |
 | `boss_tracker/release_now.ps1` | Tests, builds, and verifies the separate ZIP |
 | `boss_tracker/requirements.txt` | Small pure-Python comtypes dependency bundled into the release |
-| `boss_tracker/install_boss_tracker.ps1`, `安装.bat` | Beginner one-click Python 3.10, virtualenv, and Tsinghua-mirror setup |
+| `boss_tracker/install_boss_tracker.ps1`, `安装.bat` | Beginner one-click Python 3.10, virtualenv, Alibaba Cloud mirror, and official-PyPI fallback setup |
 | `boss_tracker/启动BOSS追踪.bat`, `launch_boss_tracker.vbs` | Starts the local virtual environment via hidden pythonw window |
 | `boss_tracker/README.md` | BOSS Tracker operating and release guide |
 

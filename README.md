@@ -22,8 +22,9 @@ For a packaged release on a new Windows machine:
 
 1. Extract the complete ZIP.
 2. Double-click `安装.bat`. It finds or installs Python 3.10, creates `.venv`,
-   installs the core dependencies and creates the launchers. The large YOLO
-   dependencies are temporarily skipped.
+   installs the core dependencies through the Alibaba Cloud PyPI mirror and
+   creates the launchers. If that mirror is unavailable, installation retries
+   against official PyPI. The large YOLO dependencies are temporarily skipped.
 3. Double-click `启动助手.bat`.
 4. Bring the configured game window to the foreground.
 5. Record or verify the patrol route in the UI, then click **Start Patrol**.

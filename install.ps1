@@ -8,7 +8,7 @@
          找不到时自动下载并安装 Python 3.10（先尝试 winget，失败则从
          python.org 静默安装）。
       2. 创建本地虚拟环境 (.venv)（使用 Python 3.10 解释器启动助手）。
-      3. 安装基础依赖库（pip 使用清华镜像加速）。
+      3. 安装基础依赖库（优先阿里云镜像，失败自动回退官方 PyPI）。
       4. 暂不安装 YOLO 怪物检测依赖（模型重新训练后可按 README 恢复）。
       5. 生成启动器（start_assistant.bat / 启动助手.bat）。
 
@@ -133,12 +133,25 @@ if (-not (Test-Path $venvPy)) {
 Write-Host "虚拟环境已就绪。"
 
 # ---- 3. 安装依赖 -------------------------------------------------------------
-# 全部 pip 安装使用国内镜像（清华 TUNA），加速下载。
-$pipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# 国内优先使用阿里云 PyPI 镜像；若镜像临时不可用，自动回退官方 PyPI。
+$pipMirror = "https://mirrors.aliyun.com/pypi/simple/"
 Write-Host "正在安装依赖 (numpy, Pillow, OpenCV, pywin32) ..." -ForegroundColor Yellow
-& $venvPy -m pip install --upgrade pip -i $pipMirror
-& $venvPy -m pip install -r requirements.txt -i $pipMirror
-if ($LASTEXITCODE -ne 0) { throw "pip 安装失败" }
+& $venvPy -m pip install --disable-pip-version-check --upgrade pip `
+    -i $pipMirror --timeout 30 --retries 2
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "阿里云镜像不可用，正在改用官方 PyPI 更新 pip ..." -ForegroundColor Yellow
+    & $venvPy -m pip install --disable-pip-version-check --upgrade pip `
+        --index-url https://pypi.org/simple --timeout 45 --retries 2
+    if ($LASTEXITCODE -ne 0) { throw "pip 更新失败" }
+}
+& $venvPy -m pip install --disable-pip-version-check -r requirements.txt `
+    -i $pipMirror --timeout 30 --retries 2
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "阿里云镜像不可用，正在改用官方 PyPI 安装依赖 ..." -ForegroundColor Yellow
+    & $venvPy -m pip install --disable-pip-version-check -r requirements.txt `
+        --index-url https://pypi.org/simple --timeout 45 --retries 2
+    if ($LASTEXITCODE -ne 0) { throw "pip 依赖安装失败" }
+}
 
 # ---- 4. 生成启动器 ------------------------------------------------------------
 # 启动器内容必须为纯 ASCII：cmd 会用系统代码页解码 .bat，中文会乱码并破坏语法。
@@ -171,10 +184,10 @@ Write-Host "正在安装 YOLO 怪物检测依赖到主环境 .venv ..." -Foregro
 Write-Host "（先安装 CPU 版 PyTorch，下载约 200MB；CUDA 版约 2.5GB）" -ForegroundColor Yellow
 & $venvPy -m pip install --upgrade pip -i $pipMirror
 # CPU 版 torch/torchvision：检测用 CPU 推理足够（device: auto 会自动选）。
-# torch 走官方 CPU 源（清华镜像不提供 torch 的 CPU wheel）。
+# torch 走官方 CPU 源（普通 PyPI 镜像不提供指定的 CPU wheel 仓库）。
 & $venvPy -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 if ($LASTEXITCODE -ne 0) { throw "torch 安装失败" }
-# 其余依赖（走清华镜像）：跳过 torch/torchvision 行（已装 CPU 版，
+# 其余依赖（走阿里云镜像）：跳过 torch/torchvision 行（已装 CPU 版，
 # 避免被覆盖成 CUDA 版）。保留 opencv-python（显示检测画面需要 GUI 版）。
 $reqs = Get-Content "yolo-detection\requirements.txt" | Where-Object {
     $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*(torch|torchvision)\b'

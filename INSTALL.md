@@ -14,7 +14,8 @@
      python.org 静默安装）。
    - 创建本地 `.venv` 并安装全部依赖：基础库（numpy、Pillow、OpenCV、
      pywin32）+ **YOLO 怪物检测依赖**（CPU 版 PyTorch、mss、ultralytics 等，
-     装进同一个主环境，无需单独的 venv313）。**pip 全部走清华镜像**，
+     装进同一个主环境，无需单独的 venv313）。**pip 优先走阿里云镜像，
+     镜像失败时自动回退官方 PyPI**，
      国内下载更快。
    - 自动生成两个启动器：**`start_assistant.bat`** 和 **`启动助手.bat`**
      （使用 Python 3.10 解释器启动助手）。

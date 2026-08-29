@@ -22,8 +22,15 @@ Copy-Item -LiteralPath (Join-Path $root "sound\beep.mp3") -Destination $soundOut
 # requiring the recipient to install a package or run PowerShell TTS.
 $vendorOut = Join-Path $out "vendor"
 & py -3.10 -m pip install --disable-pip-version-check --no-compile `
-    --target $vendorOut -r (Join-Path $source "requirements.txt")
-if ($LASTEXITCODE -ne 0) { throw "could not bundle BOSS Tracker dependencies" }
+    --target $vendorOut -r (Join-Path $source "requirements.txt") `
+    -i "https://mirrors.aliyun.com/pypi/simple/" --timeout 30 --retries 2
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Alibaba Cloud mirror failed; using official PyPI..." -ForegroundColor Yellow
+    & py -3.10 -m pip install --disable-pip-version-check --no-compile `
+        --target $vendorOut -r (Join-Path $source "requirements.txt") `
+        --index-url "https://pypi.org/simple" --timeout 45 --retries 2
+    if ($LASTEXITCODE -ne 0) { throw "could not bundle BOSS Tracker dependencies" }
+}
 
 if ($Zip) {
     Get-ChildItem -LiteralPath $releaseRoot -Filter "BossTracker-*.zip" |

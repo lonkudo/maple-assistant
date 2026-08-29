@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
-$mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+$mirror = "https://mirrors.aliyun.com/pypi/simple/"
 
 function Find-Python310 {
     function Test-Python310([string]$candidate) {
@@ -109,19 +109,19 @@ if (-not (Test-Path $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw "Could not create .venv." }
 }
 
-Write-Host "Installing required packages from the Tsinghua mirror..." -ForegroundColor Yellow
+Write-Host "Installing required packages from the Alibaba Cloud mirror..." -ForegroundColor Yellow
 & $venvPython -m ensurepip --upgrade
 if ($LASTEXITCODE -ne 0) { throw "Could not prepare pip." }
 & $venvPython -m pip install --disable-pip-version-check --upgrade pip -i $mirror --timeout 30 --retries 2
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Tsinghua mirror failed; retrying pip from the official source..." -ForegroundColor Yellow
-    & $venvPython -m pip install --disable-pip-version-check --upgrade pip
+    Write-Host "Alibaba Cloud mirror failed; retrying pip from the official source..." -ForegroundColor Yellow
+    & $venvPython -m pip install --disable-pip-version-check --upgrade pip --index-url https://pypi.org/simple --timeout 45 --retries 2
     if ($LASTEXITCODE -ne 0) { throw "Could not update pip." }
 }
 & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $root "requirements.txt") -i $mirror --timeout 30 --retries 2
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "Tsinghua mirror failed; retrying required packages from the official source..." -ForegroundColor Yellow
-    & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $root "requirements.txt")
+    Write-Host "Alibaba Cloud mirror failed; retrying required packages from the official source..." -ForegroundColor Yellow
+    & $venvPython -m pip install --disable-pip-version-check -r (Join-Path $root "requirements.txt") --index-url https://pypi.org/simple --timeout 45 --retries 2
     if ($LASTEXITCODE -ne 0) { throw "Could not install required packages." }
 }
 
