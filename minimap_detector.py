@@ -171,6 +171,17 @@ class MinimapDetector:
             self._last_good_image_size = image_size
             self._last_good_at = time.monotonic()
 
+    def retained_geometry(
+        self, image_size: tuple[int, int]
+    ) -> Optional[MinimapDetection]:
+        """Return the verified border retained for this client size."""
+
+        with self._state_lock:
+            if (self._last_good is None
+                    or self._last_good_image_size != image_size):
+                return None
+            return replace(self._last_good, source="opencv-held")
+
     def _held_or_fallback(self, image: Image.Image) -> MinimapDetection:
         now = time.monotonic()
         with self._state_lock:

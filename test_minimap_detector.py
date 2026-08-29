@@ -179,6 +179,18 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertEqual(held.analysis_box, detected.analysis_box)
         self.assertEqual(held.canvas_box, detected.canvas_box)
 
+    def test_verified_geometry_can_be_retained_for_same_size_restart(self) -> None:
+        detector = MinimapDetector()
+        detection = detector.detect(synthetic_game_frame())
+        detector.seed_geometry(detection, (800, 600))
+
+        retained = detector.retained_geometry((800, 600))
+
+        self.assertIsNotNone(retained)
+        self.assertEqual(retained.source, "opencv-held")
+        self.assertEqual(retained.window_box, detection.window_box)
+        self.assertIsNone(detector.retained_geometry((1024, 768)))
+
     def test_box_smoothing_stabilizes_frame_repeats_and_rejects_resizes(self) -> None:
         # Live logs show the minimap frame flipping between near-identical
         # contour boxes every frame; each flip shifts the player marker AND

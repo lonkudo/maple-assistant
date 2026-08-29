@@ -322,31 +322,72 @@ def main() -> int:
         # Read the live profile, not the startup snapshot: a reset or map
         # re-identification updates the shared file while the app runs.
         configured_name = patrol_controller.map_name()
-        # A new map can have a different minimap/HUD size.  Reset only at the
-        # explicit Start Patrol boundary: once patrol is running, the detector
-        # keeps this fresh geometry stable against false cropped contours.
-        minimap_detector.reset_geometry()
-        logging.info("MINIMAP geometry reset for new patrol/map session")
+        # A new map can have a different minimap/HUD size. Probe a replacement
+        # without first deleting the current verified border: Stop -> Start on
+        # the same map must remain restartable even if one contour pass misses.
+        logging.info("MINIMAP calibrating border for patrol/map session")
         # The top-left region only bounds OpenCV work; it is not minimap
         # geometry.  Probe independent fresh frames so one false contour
         # cannot seed that search crop as the coordinate frame.
+        fresh_frame = capture_worker.capture_now()
+        previous_geometry = minimap_detector.retained_geometry(
+            fresh_frame.image.size
+        )
+        probe_frames = [fresh_frame]
+        after_sequence = fresh_frame.sequence
+        # One forced request is enough. Normal capture publications provide
+        # the remaining samples and avoid the request-event race that made a
+        # restart wait on five consecutive capture_now() timeouts.
+        for _sample in range(4):
+            candidate_frame = bus.wait_for_new(after_sequence, 0.40)
+            if candidate_frame is None:
+                break
+            probe_frames.append(candidate_frame)
+            after_sequence = candidate_frame.sequence
         probes = []
-        for _sample in range(5):
-            fresh_frame = capture_worker.capture_now()
+        for candidate_frame in probe_frames:
             probe = MinimapDetector(
                 fallback_region=minimap_region,
                 dedicated_crop=True,
                 opencv_size=OPENCV_ANALYSIS_SIZE,
             )
-            probes.append((fresh_frame, probe.detect(fresh_frame.image)))
-        chosen_index = choose_stable_minimap_index(
-            [candidate for _frame, candidate in probes]
-        )
-        fresh_frame, detection = probes[chosen_index]
-        minimap_detector.seed_geometry(detection, fresh_frame.image.size)
+            probes.append(
+                (candidate_frame, probe.detect(candidate_frame.image))
+            )
+        try:
+            chosen_index = choose_stable_minimap_index(
+                [candidate for _frame, candidate in probes],
+                minimum_repeats=2 if len(probes) >= 2 else 1,
+            )
+            fresh_frame, detection = probes[chosen_index]
+            minimap_detector.seed_geometry(detection, fresh_frame.image.size)
+            calibration_source = "fresh"
+        except OSError:
+            if previous_geometry is not None:
+                # The retained boxes came from an actual OpenCV border, not
+                # the top-left search region. Reuse them for a same-size
+                # client when restart samples are temporarily inconsistent.
+                detection = previous_geometry
+                calibration_source = "retained"
+            else:
+                # On the very first start the focus worker may not yet have
+                # enabled normal publications, leaving only the forced frame.
+                # Accept one actual OpenCV border; fallback/search boxes are
+                # still rejected by choose_stable_minimap_index.
+                chosen_index = choose_stable_minimap_index(
+                    [candidate for _frame, candidate in probes],
+                    minimum_repeats=1,
+                )
+                fresh_frame, detection = probes[chosen_index]
+                minimap_detector.seed_geometry(
+                    detection, fresh_frame.image.size
+                )
+                calibration_source = "fresh-single"
         logging.info(
-            "MINIMAP startup border verified from 5 captures | box=%s | "
-            "size=%dx%d | confidence=%.3f",
+            "MINIMAP startup border verified source=%s captures=%d | box=%s "
+            "| size=%dx%d | confidence=%.3f",
+            calibration_source,
+            len(probes),
             detection.window_box,
             detection.window_size[0],
             detection.window_size[1],
