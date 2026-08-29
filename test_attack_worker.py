@@ -115,6 +115,16 @@ class AttackWorkerTests(unittest.TestCase):
         gap.assert_called_once_with(0.0, .1)
         self.assertEqual(value, 3.1)
 
+    def test_random_gap_ceiling_is_runtime_configurable(self):
+        worker = AttackWorker(
+            FakeSender(), threading.Event(), 2.5,
+            attack_jitter_seconds=.7,
+        )
+        with mock.patch("attack_worker.random.uniform", return_value=.45) as gap:
+            value = worker.next_delay()
+        gap.assert_called_once_with(0.0, .7)
+        self.assertEqual(value, 2.95)
+
 
 if __name__ == "__main__":
     unittest.main()

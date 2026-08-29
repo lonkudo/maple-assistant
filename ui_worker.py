@@ -447,6 +447,8 @@ class UiWorker(threading.Thread):
     # Keep the implementation below intact so it can be restored quickly;
     # README.md documents the matching installer change.
     _YOLO_MONSTER_DETECTION_ENABLED = False
+    _FIXED_RANDOM_GAP_STEP = 0.1
+    _FIXED_RANDOM_GAP_MAX = 5.0
 
     def __init__(
         self,
@@ -874,19 +876,39 @@ class UiWorker(threading.Thread):
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
             fixed_interval_slider = ttk.Scale(
                 fixed_key_row, from_=0.5, to=10.0, orient="horizontal",
+                length=105,
                 variable=self._fixed_interval_var,
                 command=self._fixed_on_change,
             )
-            fixed_interval_slider.pack(side="left", fill="x",
-                                       expand=True, padx=(0, 8))
+            fixed_interval_slider.pack(side="left", padx=(0, 6))
             self._fixed_interval_label = ttk.Label(
-                fixed_key_row, text="3.0s", width=6
+                fixed_key_row, text="3.0s", width=5
             )
-            self._fixed_interval_label.pack(side="left")
+            self._fixed_interval_label.pack(side="left", padx=(0, 6))
+            ttk.Label(fixed_key_row, text="随机间差:").pack(side="left")
+            self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
+            ttk.Button(
+                fixed_key_row, text="−", width=2,
+                command=lambda: self._fixed_adjust_random_gap(-0.1),
+            ).pack(side="left", padx=(3, 2))
+            self._fixed_random_gap_label = ttk.Label(
+                fixed_key_row, text="0.1s", width=5, anchor="center"
+            )
+            self._fixed_random_gap_label.pack(side="left")
+            ttk.Button(
+                fixed_key_row, text="+", width=2,
+                command=lambda: self._fixed_adjust_random_gap(0.1),
+            ).pack(side="left", padx=(2, 0))
+            self._fixed_range_label = ttk.Label(
+                fixed_panel,
+                text="随机攻击间隔: (3.0s, 3.1s)  基础=3.0s + 随机=0.0~0.1s",
+                justify="left",
+            )
+            self._fixed_range_label.pack(anchor="w", pady=(6, 0))
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left"
             )
-            self._fixed_status.pack(anchor="w", pady=(6, 0))
+            self._fixed_status.pack(anchor="w", pady=(3, 0))
             self._fixed_load_settings()
 
             # Drug (HP/MP potion) panel: key binds + percent trigger sliders.
@@ -1576,8 +1598,31 @@ class UiWorker(threading.Thread):
             "interval_seconds": round(
                 float(self._fixed_interval_var.get()), 1
             ),
+            "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
         }
+
+    def _fixed_random_gap_seconds(self) -> float:
+        """Return the clamped, one-decimal random-gap setting."""
+
+        var = getattr(self, "_fixed_random_gap_var", None)
+        raw = 0.1 if var is None else float(var.get())
+        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+
+    def _fixed_adjust_random_gap(self, delta: float) -> None:
+        """Adjust the random delay ceiling using fixed 0.1-second steps."""
+
+        current = self._fixed_random_gap_seconds()
+        value = round(
+            max(0.0, min(
+                self._FIXED_RANDOM_GAP_MAX,
+                current + (self._FIXED_RANDOM_GAP_STEP if delta > 0
+                           else -self._FIXED_RANDOM_GAP_STEP),
+            )),
+            1,
+        )
+        self._fixed_random_gap_var.set(value)
+        self._fixed_on_change()
 
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
@@ -1588,7 +1633,18 @@ class UiWorker(threading.Thread):
                 and self._attack_mode_var.get() != "fixed"):
             self._attack_mode_var.set("fixed")
         interval = float(self._fixed_interval_var.get())
+        random_gap = self._fixed_random_gap_seconds()
+        if hasattr(self, "_fixed_random_gap_var"):
+            self._fixed_random_gap_var.set(random_gap)
         self._fixed_interval_label.configure(text=f"{interval:.1f}s")
+        if hasattr(self, "_fixed_random_gap_label"):
+            self._fixed_random_gap_label.configure(text=f"{random_gap:.1f}s")
+        if hasattr(self, "_fixed_range_label"):
+            self._fixed_range_label.configure(
+                text=(f"随机攻击间隔: ({interval:.1f}s, "
+                      f"{interval + random_gap:.1f}s)  "
+                      f"基础={interval:.1f}s + 随机=0.0~{random_gap:.1f}s")
+            )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
@@ -1629,6 +1685,9 @@ class UiWorker(threading.Thread):
         worker.attack_interval = max(
             0.25, float(data.get("interval_seconds", 3.0))
         )
+        worker.attack_jitter_seconds = max(
+            0.0, float(data.get("random_gap_seconds", 0.1))
+        )
         key = str(data.get("attack_key", "ctrl")).strip()
         if not worker.set_key(key):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
@@ -1660,10 +1719,14 @@ class UiWorker(threading.Thread):
             self._set_panel_state(panel, fixed_mode)
         if hasattr(self, "_fixed_status"):
             if fixed_mode:
+                interval = float(self._fixed_interval_var.get())
+                random_gap = self._fixed_random_gap_seconds()
                 self._fixed_status.configure(
-                    text=(f"固定攻击已启用 - 每 "
-                          f"{float(self._fixed_interval_var.get()):.1f}秒 "
-                          f"按下 {self._fixed_attack_key_var.get()}。"
+                    text=(f"固定攻击已启用 - 按键 "
+                          f"{self._fixed_attack_key_var.get()}；"
+                          f"基础 {interval:.1f}s；随机间差 {random_gap:.1f}s；"
+                          f"范围 ({interval:.1f}s, "
+                          f"{interval + random_gap:.1f}s)。"
                           "YOLO 怪物检测暂时停用。")
                 )
             else:
@@ -1718,6 +1781,11 @@ class UiWorker(threading.Thread):
             if "interval_seconds" in data:
                 self._fixed_interval_var.set(
                     float(data["interval_seconds"])
+                )
+            if ("random_gap_seconds" in data
+                    and hasattr(self, "_fixed_random_gap_var")):
+                self._fixed_random_gap_var.set(
+                    float(data["random_gap_seconds"])
                 )
             if "attack_key" in data:
                 key = str(data["attack_key"]).strip()

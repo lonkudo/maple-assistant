@@ -605,6 +605,7 @@ class UiLogHandlerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.enabled = False
                 self.attack_interval = 3.0
+                self.attack_jitter_seconds = .1
                 self.attack_key = "ctrl"
 
             def set_key(self, key):
@@ -626,6 +627,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker.movement_worker = FakeMover()
         worker._attack_mode_var = Var("yolo")
         worker._fixed_interval_var = Var(3.0)
+        worker._fixed_random_gap_var = Var(.1)
         worker._fixed_attack_key_var = Var("ctrl")
         worker._fixed_interval_label = Label()
         worker._fixed_key_button = Button()
@@ -635,6 +637,7 @@ class UiLogHandlerTests(unittest.TestCase):
 
         worker._fixed_attack_key_var.set("shift")
         worker._fixed_interval_var.set(2.5)
+        worker._fixed_random_gap_var.set(.4)
         worker._attack_mode_var.set("fixed")
 
         def fake_path(self):
@@ -646,12 +649,14 @@ class UiLogHandlerTests(unittest.TestCase):
             # Fixed mode applied to the worker live.
             self.assertTrue(worker.attack_worker.enabled)
             self.assertEqual(worker.attack_worker.attack_interval, 2.5)
+            self.assertEqual(worker.attack_worker.attack_jitter_seconds, .4)
             self.assertEqual(worker.attack_worker.attack_key, "shift")
             # YOLO panel greyed out; status line reflects the mode.
             for child in worker._yolo_panel.children:
                 self.assertIn(["disabled"], child.states)
             self.assertIn("固定攻击已启用", worker._fixed_status.text)
-            self.assertIn("每 2.5秒", worker._fixed_status.text)
+            self.assertIn("基础 2.5s", worker._fixed_status.text)
+            self.assertIn("范围 (2.5s, 2.9s)", worker._fixed_status.text)
             # The jump-rope logic switched to minimap (YOLO inactive).
             self.assertEqual(worker.movement_worker.calls, [False])
 
@@ -706,6 +711,7 @@ class UiLogHandlerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.enabled = False
                 self.attack_interval = 3.0
+                self.attack_jitter_seconds = .1
                 self.attack_key = "ctrl"
 
             def set_key(self, key):
@@ -717,6 +723,7 @@ class UiLogHandlerTests(unittest.TestCase):
             w.attack_worker = FakeAttackWorker()
             w._attack_mode_var = Var("yolo")
             w._fixed_interval_var = Var(3.0)
+            w._fixed_random_gap_var = Var(.1)
             w._fixed_attack_key_var = Var("ctrl")
             w._fixed_interval_label = Label()
             w._fixed_key_button = Button()
@@ -729,6 +736,7 @@ class UiLogHandlerTests(unittest.TestCase):
             worker = make_worker()
             worker._attack_mode_var.set("fixed")
             worker._fixed_interval_var.set(4.5)
+            worker._fixed_random_gap_var.set(.6)
             worker._fixed_attack_key_var.set("delete")
 
             def fake_path(self):
@@ -741,6 +749,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 data = json.loads(saved.read_text(encoding="utf-8"))
                 self.assertEqual(data["attack_mode"], "fixed")
                 self.assertEqual(data["interval_seconds"], 4.5)
+                self.assertEqual(data["random_gap_seconds"], .6)
                 self.assertEqual(data["attack_key"], "delete")
 
                 loader = make_worker()
@@ -749,9 +758,11 @@ class UiLogHandlerTests(unittest.TestCase):
 
                 self.assertEqual(loader._attack_mode_var.get(), "fixed")
                 self.assertEqual(loader._fixed_interval_var.get(), 4.5)
+                self.assertEqual(loader._fixed_random_gap_var.get(), .6)
                 self.assertEqual(loader._fixed_attack_key_var.get(), "delete")
                 self.assertTrue(loader.attack_worker.enabled)
                 self.assertEqual(loader.attack_worker.attack_interval, 4.5)
+                self.assertEqual(loader.attack_worker.attack_jitter_seconds, .6)
                 self.assertEqual(loader.attack_worker.attack_key, "delete")
 
     def test_disabled_yolo_setting_is_coerced_to_fixed_attack(self) -> None:
@@ -787,6 +798,25 @@ class UiLogHandlerTests(unittest.TestCase):
 
         self.assertEqual(worker._attack_mode_var.get(), "fixed")
         self.assertTrue(worker.attack_worker.enabled)
+
+    def test_random_gap_buttons_adjust_in_point_one_second_steps(self) -> None:
+        class Var:
+            def __init__(self, value): self.value = value
+            def get(self): return self.value
+            def set(self, value): self.value = value
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._fixed_random_gap_var = Var(.1)
+        changes = []
+        worker._fixed_on_change = lambda: changes.append(
+            worker._fixed_random_gap_var.get()
+        )
+
+        worker._fixed_adjust_random_gap(.1)
+        worker._fixed_adjust_random_gap(-.1)
+        worker._fixed_adjust_random_gap(-.1)
+
+        self.assertEqual(changes, [.2, .1, 0.0])
 
     def test_shutdown_panel_roundtrip_and_worker_apply(self) -> None:
         import json

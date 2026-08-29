@@ -64,6 +64,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "fixed_attack": {
         "attack_mode": "fixed", "interval_seconds": 3.0,
+        "random_gap_seconds": .1,
         "attack_key": "ctrl",
     },
     "additional_functions": {

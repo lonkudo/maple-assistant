@@ -45,7 +45,7 @@ class AttackWorker(threading.Thread):
         self.key_sender = key_sender
         self.stop_event = stop_event
         self.attack_interval = max(0.25, attack_interval)
-        # 下一次攻击 = configured interval + random gap (0..0.1s).
+        # 下一次攻击 = configured interval + UI-configurable random gap.
         self.attack_jitter_seconds = max(0.0, float(attack_jitter_seconds))
         self.attack_key = str(attack_key).casefold()
         scan_map = getattr(key_sender, "_SCAN", None)
@@ -94,7 +94,7 @@ class AttackWorker(threading.Thread):
         return False
 
     def next_delay(self) -> float:
-        """Configured attack interval plus a random gap of at most 0.1s."""
+        """Configured attack interval plus the configured random gap."""
 
         random_gap = random.uniform(0.0, self.attack_jitter_seconds)
         return max(0.05, self.attack_interval + random_gap)

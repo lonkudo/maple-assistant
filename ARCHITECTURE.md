@@ -239,7 +239,10 @@ valid upper-layer patrol from transient adaptive layer-band misses.
 
 The fixed attack thread always exists but begins disabled unless requested or
 enabled through the UI. It periodically presses the selected attack key and
-honors climb/return suppression.
+honors climb/return suppression. Its next delay is uniformly selected from the
+UI-configured `(base interval, base interval + random gap)` range. The random
+gap ceiling is persisted in 0.1-second increments and applied to the live
+worker without restart.
 
 The YOLO monster subprocess is temporarily feature-disabled while its model is
 retrained. The UI forces fixed attack, disables the YOLO panel, and does not

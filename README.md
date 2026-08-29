@@ -127,8 +127,10 @@ re-recorded when the UI labels them as a legacy layout.
   remains held through a short rope-top compensation window.
 - Attack suppression ends immediately after confirmed climb arrival; the
   separate arrival grace period only prevents an unsafe stair jump.
-- Fixed attack timing is `attack interval + random gap`; the additive random
-  gap is uniformly selected from `0.0` through `0.1` seconds.
+- Fixed attack timing is `base interval + random gap`. The shorter base slider
+  sets the lower bound; adjacent −/+ buttons change the random-gap ceiling in
+  0.1-second steps. The UI displays the complete effective range
+  `(base, base + random gap)`, and both values persist in `config.json`.
 - Losing focus releases every key. After refocus, movement reconciles its
   internal hold state with the sender and re-presses externally released keys.
 - A secondary character-marker reading can override movement only when it
