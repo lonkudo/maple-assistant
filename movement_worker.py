@@ -2057,6 +2057,14 @@ class MovementWorker(threading.Thread):
         # after a monster knock-down the character would stop at every move).
         self.attack_block_max_seconds = max(0.5, float(attack_block_max_seconds))
         self._attack_active_since: Optional[float] = None        # YOLO rope state: gates the inner-gap jump on the real screen gap.
+        # State-independent floor verifier. Normal reconciliation runs every
+        # frame, but an obsolete climb/drop phase can deliberately reject a
+        # lower-floor marker. Recheck the already-computed marker at a modest
+        # fixed cadence; this performs no capture and no second image scan.
+        self._floor_verify_interval_seconds = 0.75
+        self._last_floor_verify_at = float("-inf")
+        self._floor_verify_candidate: Optional[str] = None
+        self._floor_verify_frames = 0
         # rope_jump_px = max |screen gap| that still counts as "at the rope".
         self._rope_state = (
             RopeStateFile(rope_state_path)
@@ -3265,6 +3273,71 @@ class MovementWorker(threading.Thread):
             )
         return None
 
+    def _verify_out_of_range_floor(
+        self,
+        observation: MinimapObservation,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Periodically confirm a marker-only out-of-range landing.
+
+        This verifier intentionally ignores world Y and vertical state. A
+        monster can knock the character from an upper floor while the climb
+        or planned-drop state still describes the old floor; those guards are
+        useful during animation but must not suppress two stable readings on
+        a recorded floor outside the patrol range.
+        """
+
+        checked_at = time.monotonic() if now is None else float(now)
+        if (checked_at - self._last_floor_verify_at
+                < self._floor_verify_interval_seconds):
+            return False
+        self._last_floor_verify_at = checked_at
+        if observation.player is None:
+            self._floor_verify_candidate = None
+            self._floor_verify_frames = 0
+            return False
+        marker_layers = {
+            name: layer for name, layer in self.important_positions.items()
+            if isinstance(layer, dict) and "layer_y" in layer
+        }
+        floor = detect_layer_by_y(observation.player.y, marker_layers)
+        if floor is None or floor in self._route_layers:
+            self._floor_verify_candidate = None
+            self._floor_verify_frames = 0
+            return False
+        if floor == self._floor_verify_candidate:
+            self._floor_verify_frames += 1
+        else:
+            self._floor_verify_candidate = floor
+            self._floor_verify_frames = 1
+        if self._floor_verify_frames < 2:
+            return False
+        self._floor_verify_candidate = None
+        self._floor_verify_frames = 0
+        if self._return_mode is not None:
+            return False
+
+        LOG.warning(
+            "POSITION VERIFIER: confirmed %s outside patrol range from "
+            "two marker readings; clearing stale vertical state",
+            floor,
+        )
+        self._descending_to_first = False
+        self._release_climb_up()
+        self._climb_state = ClimbState()
+        self._fall_pending = False
+        self._fall_frames = 0
+        self._fall_last_y = None
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
+        if self.near_rope_event is not None:
+            self.near_rope_event.clear()
+        self._maybe_begin_return_if_out_of_range(observation)
+        return self._return_mode is not None
+
     def _finish_return(self, floor: str) -> None:
         """After a return climb/drop reaches ``floor``: in range or not?  An
         in-range floor restarts patrol there; an out-of-range floor keeps the
@@ -4196,6 +4269,10 @@ class MovementWorker(threading.Thread):
                     # 连续 3 帧即判定卡住并跳。
                     self._current_stair_jump_stall = 0.012
                 self._sync_patrol_controller(coordinate_layout)
+                # Cheap periodic sanity check over the marker already found
+                # above. It can recover from a monster knock-down even when a
+                # stale climb/drop phase would reject normal reconciliation.
+                self._verify_out_of_range_floor(observation)
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.

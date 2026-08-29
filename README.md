@@ -132,6 +132,10 @@ re-recorded when the UI labels them as a legacy layout.
 - Patrol startup detects the character's actual recorded layer from the fresh
   adaptive minimap before anchoring world Y; it does not assume the character
   is already on the configured first patrol layer.
+- A marker-only position verifier runs every 0.75 seconds using the existing
+  movement observation. Two matching out-of-range readings clear stale
+  climb/drop state and start return-to-route without another capture or image
+  analysis pass.
 - Self-rescue requires a genuinely stationary run. Off-layer readings use a
   separate consecutive counter, so adaptive minimap drift or visible patrol
   progress cannot cause a premature Alt+Down drop.

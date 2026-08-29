@@ -219,6 +219,10 @@ only suppresses unsafe stair jumps during settling.
 - Landing inside the patrol range restarts or continues that floor.
 - Landing below the range starts climb-to-route using each current floor's
   rope; landing above starts drop-to-route.
+- Every 0.75 seconds, a state-independent verifier reuses the already detected
+  yellow marker. Two matching readings on a recorded out-of-range floor clear
+  obsolete climb/drop state and enter the same return path; it adds no capture
+  or duplicate image scan.
 - Final-layer descent owns the route until the first active layer is reached.
 - Return-to-route blocks attacks for the entire recovery.
 

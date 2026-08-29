@@ -894,6 +894,50 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(label, "return.climb")
         self.assertAlmostEqual(target, 0.5)  # layer1 rope_pos.x
 
+    def test_periodic_position_verifier_clears_stale_climb_after_knock_down(self):
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        worker._route_layer_index = 1  # stale layer3 route state
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=False)
+        worker._descending_to_first = True
+        on_layer1 = MinimapObservation(
+            Point(.4, .8), None, .9, (0, 0, 1, 1),
+            # Deliberately stale upper-floor world reading. The verifier is
+            # marker-only and therefore does not inherit this bad anchor.
+            world_y_diamonds=-99.0, structure_confidence=.95,
+        )
+
+        self.assertFalse(
+            worker._verify_out_of_range_floor(on_layer1, now=1.0)
+        )
+        # Calls inside the 0.75-second interval cost nothing and cannot count
+        # as another confirmation.
+        self.assertFalse(
+            worker._verify_out_of_range_floor(on_layer1, now=1.5)
+        )
+        self.assertTrue(
+            worker._verify_out_of_range_floor(on_layer1, now=1.8)
+        )
+        self.assertEqual(worker._return_mode, "climb-to-route")
+        self.assertEqual(worker._return_from_floor, "layer1")
+        self.assertEqual(worker._climb_state.phase, "idle")
+        self.assertFalse(worker._descending_to_first)
+
+    def test_periodic_position_verifier_rejects_one_frame_floor_flicker(self):
+        worker = self._range_worker(4, "layer2", "layer3")
+        worker.patrol_enabled = True
+        on_layer1 = MinimapObservation(
+            Point(.4, .8), None, .9, (0, 0, 1, 1)
+        )
+        on_layer2 = MinimapObservation(
+            Point(.4, .7), None, .9, (0, 0, 1, 1)
+        )
+
+        worker._verify_out_of_range_floor(on_layer1, now=1.0)
+        worker._verify_out_of_range_floor(on_layer2, now=1.8)
+
+        self.assertIsNone(worker._return_mode)
+
     def test_return_climb_keeps_from_floor_rope_when_marker_off_band(self) -> None:
         # After a failed return-climb grab the marker settles between recorded
         # bands: the return must KEEP targeting the from-floor rope (retry the
