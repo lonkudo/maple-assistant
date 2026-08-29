@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 import threading
 import time
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -113,8 +113,9 @@ class MinimapDetector:
         # shifts the coordinate frame (marker AND projected targets), which
         # stalls the rope approach / boundary turns even though the character
         # is moving.  Mirroring ``DiamondSizeTracker``: small jitter is
-        # median-smoothed over ``box_history`` frames; a large jump (genuine
-        # minimap resize/move) clears the history and is adopted immediately.
+        # median-smoothed over ``box_history`` frames. Large jumps are held
+        # for the active map session; reset_geometry permits a different map
+        # to establish its own border at the next explicit patrol start.
         self.box_history_len = max(2, int(box_history))
         self.box_jump_ratio = max(0.05, min(0.8, float(box_jump_ratio)))
         self._box_history: deque[tuple[Box, Box, Box]] = deque(
@@ -149,15 +150,40 @@ class MinimapDetector:
             self._last_good_image_size = None
             self._last_good_at = float("-inf")
 
+    def seed_geometry(
+        self, detection: MinimapDetection, image_size: tuple[int, int]
+    ) -> None:
+        """Lock a verified minimap border as this map session's baseline."""
+
+        if detection.source != "opencv":
+            raise ValueError("minimap geometry must come from an OpenCV border")
+        boxes = (
+            detection.window_box,
+            detection.analysis_box,
+            detection.canvas_box,
+        )
+        with self._state_lock:
+            self._box_history.clear()
+            self._box_history.append(boxes)
+            self._pending_shrunken_boxes = None
+            self._pending_shrunken_count = 0
+            self._last_good = detection
+            self._last_good_image_size = image_size
+            self._last_good_at = time.monotonic()
+
     def _held_or_fallback(self, image: Image.Image) -> MinimapDetection:
         now = time.monotonic()
         with self._state_lock:
             if (self._last_good is not None
-                    and self._last_good_image_size == image.size
-                    and now - self._last_good_at <= self.transient_hold_seconds):
+                    and self._last_good_image_size == image.size):
+                age = max(0.0, now - self._last_good_at)
                 return replace(
                     self._last_good,
-                    confidence=max(0.0, self._last_good.confidence * 0.85),
+                    confidence=max(
+                        0.25,
+                        self._last_good.confidence
+                        * (0.85 if age <= self.transient_hold_seconds else 0.60),
+                    ),
                     source="opencv-held",
                 )
         return self._fallback_detection(image)
@@ -219,9 +245,9 @@ class MinimapDetector:
         frame: the player marker AND the projected patrol/rope targets both
         jump, so the rope approach gap never closes and the character stalls
         ("MOVE TO ROPE right" forever).  Mirroring ``DiamondSizeTracker``:
-        small frame-to-frame jitter is median-smoothed; a large jump (a
-        genuine minimap resize/reposition) clears the history and is adopted
-        immediately.
+        small frame-to-frame jitter is median-smoothed; a large jump is held
+        because it is usually a contour of the bounded search region rather
+        than a real minimap resize. A new map calls reset_geometry first.
         """
 
         with self._state_lock:
@@ -233,14 +259,15 @@ class MinimapDetector:
                 window_height = max(1, window[3] - window[1])
                 # A sudden height/width collapse is normally a contour that
                 # captured the title panel or only the upper part of the
-                # minimap.  Do not let a one-frame crop remove the marker
-                # from both movement and disconnect monitoring.  A real user
-                # resize still takes effect after three matching detections.
-                severely_shrunken = (
+                # minimap. Do not let a false crop or enclosing search-region
+                # contour remove or shift the marker coordinate system.
+                severely_changed = (
                     window_width < median_width * 0.65
                     or window_height < median_height * 0.65
+                    or window_width > median_width * 1.55
+                    or window_height > median_height * 1.55
                 )
-                if severely_shrunken:
+                if severely_changed:
                     pending = self._pending_shrunken_boxes
                     same_pending = pending is not None and max(
                         abs(window[0] - pending[0][0]),
@@ -253,12 +280,12 @@ class MinimapDetector:
                     else:
                         self._pending_shrunken_boxes = (window, analysis, canvas)
                         self._pending_shrunken_count = 1
-                    # A running client does not legitimately shrink only the
+                    # A running client does not legitimately resize only the
                     # minimap frame by 35%+ while the game window itself is
-                    # unchanged.  Adopting that candidate after three frames
-                    # used to reproject the saved patrol layers onto a false
-                    # 95x130 minimap (from a correct ~239x184 frame), making
-                    # layer2 look like layer1 and repeatedly jump at a rope.
+                    # unchanged.  In particular, the much larger candidate
+                    # can be the whole top-left SEARCH CROP, which is only a
+                    # performance boundary and must never become coordinate
+                    # geometry.  Keep the detected minimap border instead.
                     # Keep the known-good geometry until a fresh assistant
                     # session starts; a user who intentionally changes HUD
                     # scale can simply restart before recording/patrolling.
@@ -332,32 +359,11 @@ class MinimapDetector:
             candidate_box = (x, y, x + candidate_width, y + candidate_height)
             rectangles.append((candidate_box, rectangularity))
             if (self.dedicated_crop
-                    and x <= width * 0.10
-                    and height * 0.18 <= y <= height * 0.42
-                    and candidate_width >= width * 0.35
-                    and candidate_height >= height * 0.30):
-                # In the tight top-left capture, the outer minimap border can
-                # merge with the crop edge and no longer form a closed contour.
-                # Its large rectangular map canvas remains reliable; reconstruct
-                # the outer frame from that canvas and the known top anchoring.
-                inferred_box = _clamp_box(
-                    (
-                        x - 4,
-                        0,
-                        x + candidate_width + 4,
-                        y + candidate_height + 16,
-                    ),
-                    width,
-                    height,
-                )
-                inferred_area = (
-                    (inferred_box[2] - inferred_box[0])
-                    * (inferred_box[3] - inferred_box[1])
-                )
-                inferred_score = 0.60 + min(
-                    inferred_area / float(width * height), 0.30
-                )
-                candidates.append((inferred_score, inferred_box, rectangularity))
+                    and candidate_width >= width * 0.90
+                    and candidate_height >= height * 0.85):
+                # This is the search crop (or an edge clipped by that crop),
+                # not a measured minimap border.  Inferring the border from
+                # the crop made search-region size alter marker/world Y.
                 continue
             max_left_ratio = 0.20 if self.dedicated_crop else 0.06
             max_top_ratio = 0.20 if self.dedicated_crop else 0.08
@@ -496,6 +502,45 @@ class MinimapDetector:
         )
 
 
+def choose_stable_minimap_index(
+    detections: Sequence[MinimapDetection],
+    *,
+    minimum_repeats: int = 2,
+) -> int:
+    """Choose a repeated OpenCV border without using search-crop geometry."""
+
+    clusters: list[list[int]] = []
+    for index, detection in enumerate(detections):
+        if detection.source != "opencv" or detection.confidence < 0.80:
+            continue
+        width, height = detection.window_size
+        for cluster in clusters:
+            exemplar = detections[cluster[0]]
+            exemplar_width, exemplar_height = exemplar.window_size
+            if (abs(width - exemplar_width) <= max(6, exemplar_width * 0.08)
+                    and abs(height - exemplar_height)
+                    <= max(6, exemplar_height * 0.08)):
+                cluster.append(index)
+                break
+        else:
+            clusters.append([index])
+    repeated = [cluster for cluster in clusters if len(cluster) >= minimum_repeats]
+    if not repeated:
+        raise OSError("could not establish a stable detected minimap border")
+    # Most repeats wins.  If both the true border and a larger enclosing
+    # rectangle repeat equally, the smaller measured border is the minimap;
+    # the larger one is commonly the bounded top-left search area.
+    chosen = min(
+        repeated,
+        key=lambda cluster: (
+            -len(cluster),
+            detections[cluster[len(cluster) // 2]].window_size[0]
+            * detections[cluster[len(cluster) // 2]].window_size[1],
+        ),
+    )
+    return chosen[len(chosen) // 2]
+
+
 __all__ = [
     "Box",
     "MapNameReader",
@@ -503,4 +548,5 @@ __all__ = [
     "MinimapDetector",
     "NormalizedBox",
     "box_to_normalized",
+    "choose_stable_minimap_index",
 ]

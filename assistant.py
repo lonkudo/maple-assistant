@@ -196,7 +196,7 @@ def main() -> int:
     from screen_blinker import ScreenBlinker
     from config_store import get_config_store
     from focus_worker import FocusWorker
-    from minimap_detector import MinimapDetector
+    from minimap_detector import MinimapDetector, choose_stable_minimap_index
     from marker_detector import DiamondSizeTracker, detect_yellow_diamond
     from map_identity import MapIdentityStore
     from map_structure_tracker import MapStructureTracker
@@ -327,8 +327,31 @@ def main() -> int:
         # keeps this fresh geometry stable against false cropped contours.
         minimap_detector.reset_geometry()
         logging.info("MINIMAP geometry reset for new patrol/map session")
-        fresh_frame = capture_worker.capture_now()
-        detection = minimap_detector.detect(fresh_frame.image)
+        # The top-left region only bounds OpenCV work; it is not minimap
+        # geometry.  Probe independent fresh frames so one false contour
+        # cannot seed that search crop as the coordinate frame.
+        probes = []
+        for _sample in range(5):
+            fresh_frame = capture_worker.capture_now()
+            probe = MinimapDetector(
+                fallback_region=minimap_region,
+                dedicated_crop=True,
+                opencv_size=OPENCV_ANALYSIS_SIZE,
+            )
+            probes.append((fresh_frame, probe.detect(fresh_frame.image)))
+        chosen_index = choose_stable_minimap_index(
+            [candidate for _frame, candidate in probes]
+        )
+        fresh_frame, detection = probes[chosen_index]
+        minimap_detector.seed_geometry(detection, fresh_frame.image.size)
+        logging.info(
+            "MINIMAP startup border verified from 5 captures | box=%s | "
+            "size=%dx%d | confidence=%.3f",
+            detection.window_box,
+            detection.window_size[0],
+            detection.window_size[1],
+            detection.confidence,
+        )
         title_image = fresh_frame.image.crop(detection.map_name_box)
         if configured_name and map_identity_store.has_reference(configured_name):
             matched, score = map_identity_store.matches(configured_name, title_image)

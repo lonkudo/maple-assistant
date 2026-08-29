@@ -8,7 +8,11 @@ from PIL import Image, ImageDraw
 
 from capture_worker import CapturedFrame
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
-from minimap_detector import MinimapDetector
+from minimap_detector import (
+    MinimapDetection,
+    MinimapDetector,
+    choose_stable_minimap_index,
+)
 from ui_worker import build_debug_snapshot
 
 
@@ -120,7 +124,7 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(detection.window_size[0], 370)
         self.assertGreater(detection.canvas_box[2] - detection.canvas_box[0], 360)
 
-    def test_dedicated_crop_reconstructs_outer_frame_from_map_canvas(self) -> None:
+    def test_dedicated_crop_does_not_infer_border_from_search_crop(self) -> None:
         image = Image.new("RGB", (320, 320), "black")
         draw = ImageDraw.Draw(image)
         # The real outer border touches the crop edge and may not be a closed
@@ -130,17 +134,14 @@ class MinimapDetectorTests(unittest.TestCase):
             outline=(190, 190, 190), width=2,
         )
         detection = MinimapDetector(dedicated_crop=True).detect(image)
-        self.assertEqual(detection.source, "opencv")
-        self.assertAlmostEqual(detection.window_box[0], 2, delta=3)
-        self.assertEqual(detection.window_box[1], 0)
-        self.assertAlmostEqual(detection.window_box[2], 160, delta=5)
-        self.assertAlmostEqual(detection.window_box[3], 257, delta=5)
+        self.assertEqual(detection.source, "fallback")
 
     def test_opencv_working_image_is_180_square_and_boxes_scale_back(self) -> None:
         image = Image.new("RGB", (320, 320), "black")
         draw = ImageDraw.Draw(image)
+        draw.rectangle((2, 2, 162, 172), outline=(230, 230, 230), width=3)
         draw.rectangle(
-            (6, 90, 155, 240), fill=(35, 45, 55),
+            (6, 60, 155, 160), fill=(35, 45, 55),
             outline=(190, 190, 190), width=3,
         )
         detector = MinimapDetector(
@@ -152,7 +153,7 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertEqual(detector.opencv_size, (180, 180))
         self.assertEqual(detection.source, "opencv")
         self.assertGreater(detection.window_box[2], 140)
-        self.assertGreater(detection.window_box[3], 220)
+        self.assertGreater(detection.window_box[3], 150)
 
     def test_transient_contour_miss_keeps_last_good_minimap_geometry(self) -> None:
         detector = MinimapDetector(
@@ -162,8 +163,9 @@ class MinimapDetectorTests(unittest.TestCase):
         )
         good = Image.new("RGB", (320, 320), "black")
         draw = ImageDraw.Draw(good)
+        draw.rectangle((2, 2, 162, 172), outline=(230, 230, 230), width=3)
         draw.rectangle(
-            (6, 90, 155, 240), fill=(35, 45, 55),
+            (6, 60, 155, 160), fill=(35, 45, 55),
             outline=(190, 190, 190), width=3,
         )
         blank = Image.new("RGB", good.size, "black")
@@ -177,7 +179,7 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertEqual(held.analysis_box, detected.analysis_box)
         self.assertEqual(held.canvas_box, detected.canvas_box)
 
-    def test_box_smoothing_stabilizes_frame_repeats_but_adopts_resizes(self) -> None:
+    def test_box_smoothing_stabilizes_frame_repeats_and_rejects_resizes(self) -> None:
         # Live logs show the minimap frame flipping between near-identical
         # contour boxes every frame; each flip shifts the player marker AND
         # the projected targets, stalling the rope approach.  The median
@@ -198,11 +200,35 @@ class MinimapDetectorTests(unittest.TestCase):
             height = box[0][3] - box[0][1]
             self.assertLessEqual(abs(width - 90), 6)   # 90..96
             self.assertLessEqual(abs(height - 137), 4)  # 135..140
-        # A genuine minimap resize/reposition clears the history and is
-        # adopted on the very next frame.
+        # A large change during the session is rejected; a new map/session
+        # uses reset_geometry before establishing its own border.
         resize = ((50, 10, 300, 260), (50, 30, 300, 260), (55, 50, 295, 250))
         jumped = detector._stabilize_boxes(*resize)
-        self.assertEqual(jumped[0], resize[0])
+        self.assertNotEqual(jumped[0], resize[0])
+        detector.reset_geometry()
+        self.assertEqual(detector._stabilize_boxes(*resize)[0], resize[0])
+
+    def test_startup_prefers_repeated_smaller_minimap_border(self) -> None:
+        def found(width: int, height: int) -> MinimapDetection:
+            box = (0, 0, width, height)
+            return MinimapDetection(
+                box, box, box, box, .98, "opencv"
+            )
+
+        detections = [
+            found(238, 207), found(96, 135), found(238, 207),
+            found(95, 134), found(97, 135),
+        ]
+        chosen = detections[choose_stable_minimap_index(detections)]
+        self.assertLess(chosen.window_size[0], 100)
+
+    def test_startup_rejects_unstable_or_fallback_only_geometry(self) -> None:
+        fallback = MinimapDetection(
+            (0, 0, 238, 207), (0, 0, 238, 207), (0, 0, 238, 207),
+            (0, 0, 10, 10), 0.0, "fallback",
+        )
+        with self.assertRaises(OSError):
+            choose_stable_minimap_index([fallback, fallback, fallback])
 
     def test_box_smoothing_rejects_transient_minimap_height_collapse(self) -> None:
         """A clipped contour must not crop the player marker out of the map."""

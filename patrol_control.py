@@ -660,11 +660,50 @@ class PatrolController:
             if not isinstance(layer, dict):
                 continue
             projected_y: list[float] = []
+            adaptive_points = 0
+            incompatible_layout = False
             for point_name in REQUIRED_LAYER_POINTS:
                 point = layer.get(point_name)
                 coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
                 if not isinstance(coordinate, dict):
                     continue
+                adaptive_points += 1
+                recorded_layout = coordinate.get("recorded_layout")
+                if isinstance(recorded_layout, dict):
+                    try:
+                        width_ratio = (
+                            float(recorded_layout["analysis_width"])
+                            / max(1.0, layout.analysis_width)
+                        )
+                        height_ratio = (
+                            float(recorded_layout["analysis_height"])
+                            / max(1.0, layout.analysis_height)
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        width_ratio = height_ratio = 1.0
+                    try:
+                        recorded_width = float(recorded_layout["analysis_width"])
+                        recorded_height = float(recorded_layout["analysis_height"])
+                        fills_analysis = (
+                            abs(float(recorded_layout["canvas_left"])) <= 1.0
+                            and abs(float(recorded_layout["canvas_top"])) <= 1.0
+                            and float(recorded_layout["canvas_width"])
+                            >= recorded_width * 0.98
+                            and float(recorded_layout["canvas_height"])
+                            >= recorded_height * 0.98
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        fills_analysis = False
+                    if fills_analysis and (
+                            not 0.65 <= width_ratio <= 1.55
+                            or not 0.65 <= height_ratio <= 1.55
+                    ):
+                        # Older recordings could accidentally store the
+                        # top-left SEARCH REGION as recorded_layout.  It is
+                        # not the minimap border, so projecting through it
+                        # corrupts layer Y.  Preserve the recorded raw point.
+                        incompatible_layout = True
+                        continue
                 try:
                     x, y = layout.project(
                         float(coordinate["x_diamond"]),
@@ -678,7 +717,8 @@ class PatrolController:
                 point["x"] = round(max(0.02, min(0.98, x)), 6)
                 point["y"] = round(max(0.02, min(0.98, y)), 6)
                 projected_y.append(y)
-            if projected_y:
+            if projected_y and not incompatible_layout \
+                    and len(projected_y) == adaptive_points:
                 # Same average rule as the recorded layer_y: the projected
                 # layer level is the mean of the projected points so the
                 # arrival band centers on the platform, not one edge.

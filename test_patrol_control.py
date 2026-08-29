@@ -278,6 +278,34 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertTrue(controller.layer_is_adaptive("layer1"))
             self.assertTrue(controller.can_start())
 
+    def test_search_crop_layout_is_not_used_to_reproject_layer_y(self) -> None:
+        recorded_layout = CoordinateLayout(
+            analysis_width=238, analysis_height=207,
+            canvas_left=0, canvas_top=0, canvas_width=238, canvas_height=207,
+            diamond_width=8, diamond_height=8,
+        )
+        actual_minimap_layout = CoordinateLayout(
+            analysis_width=95, analysis_height=130,
+            canvas_left=0, canvas_top=20, canvas_width=95, canvas_height=110,
+            diamond_width=8, diamond_height=8,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.json"
+            data = profile()
+            data["layers"].pop("layer2")
+            data["layers"]["layer1"]["layer_y"] = .437198
+            controller = PatrolController(path, data)
+            controller.record_endpoint(
+                "left_most_pos", .20, .437198, recorded_layout
+            )
+            controller.record_endpoint(
+                "right_most_pos", .70, .437198, recorded_layout
+            )
+
+            mapped = controller.snapshot(actual_minimap_layout).layers["layer1"]
+            self.assertEqual(mapped["layer_y"], .437198)
+            self.assertEqual(mapped["left_most_pos"]["y"], .437198)
+
     def test_legacy_ratio_only_layer_starts_but_is_not_adaptive(self) -> None:
         # Left/Rope/Right start patrol once recorded; a legacy ratio-only
         # layer starts too but is flagged non-adaptive (re-record for zoom).
