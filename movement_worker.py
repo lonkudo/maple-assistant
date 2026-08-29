@@ -684,7 +684,15 @@ def climb(
             return send_all()
 
     if state.phase == "idle":
-        direction = (
+        aligned_with_rope = bool(
+            rope_x is not None
+            and abs(rope_x - player.x) <= rope_x_tolerance
+        )
+        # Once X is already inside the attachment tolerance, a sideways
+        # jump is more likely to throw the character off the platform than
+        # improve alignment. Start straight up; a single live-gap lateral
+        # retry remains available if that first grab fails.
+        direction = "up" if aligned_with_rope else (
             preferred_direction
             if preferred_direction in ("left", "right", "up") else "left"
         )
@@ -937,7 +945,18 @@ def climb(
         # jump retries toward the rope SIDE the character is actually on
         # (the live minimap gap) instead of a blind "right" that shoves the
         # character past the rope.
-        if preferred_direction in ("left", "right"):
+        aligned_with_rope = bool(
+            rope_x is not None
+            and abs(rope_x - player.x) <= rope_x_tolerance
+        )
+        if (aligned_with_rope
+                and (state.phase != "check-primary-up"
+                     or state.failed_shift_used)):
+            # Do not repeat the same lateral chord while X is not changing.
+            # After the one allowed side retry/correction, recovery stays
+            # vertical instead of walking the character off the platform.
+            retry_direction = "up"
+        elif preferred_direction in ("left", "right"):
             retry_direction = preferred_direction
         elif player is not None and rope_x is not None:
             retry_direction = "right" if rope_x - player.x > 0 else "left"
@@ -971,8 +990,9 @@ def climb(
             return f"{retry_direction}-retry-toward-rope"
         return "input-blocked"
 
-    # Both directional attempts failed. Shift slightly right before restarting
-    # the search on a later fresh screenshot.
+    # Both attempts failed. Shift slightly TOWARD the live rope before
+    # restarting on a later screenshot; the old hard-coded Right correction
+    # moved away from ropes positioned to the left.
     if state.failed_shift_used:
         state.phase = "idle"
         state.baseline_y = None
@@ -981,12 +1001,17 @@ def climb(
         state.progress_check_frames = 0
         state.last_world_y = None
         state.stalled_frames = 0
-        LOG.warning("CLIMB failed again; right correction already used for this approach")
+        LOG.warning("CLIMB failed again; rope correction already used for this approach")
         return "failed-cycle-no-more-shift"
+    correction_direction = (
+        "right"
+        if rope_x is None or rope_x - player.x >= 0
+        else "left"
+    )
     shifted = perform([
         MovementDecision(
-            "right",
-            "one-time right correction after failed left/right climb cycle",
+            correction_direction,
+            "one-time correction toward rope after failed climb cycle",
             failed_cycle_right_seconds,
         )
     ])
@@ -1000,11 +1025,11 @@ def climb(
     if shifted:
         state.failed_shift_used = True
         LOG.warning(
-            "CLIMB not verified after both directions; shifted right %.3fs",
-            failed_cycle_right_seconds,
+            "CLIMB not verified; shifted %s toward rope %.3fs",
+            correction_direction, failed_cycle_right_seconds,
         )
         return "failed-cycle-shifted-right"
-    LOG.warning("CLIMB not verified and right correction was blocked")
+    LOG.warning("CLIMB not verified and rope correction was blocked")
     return "input-blocked"
 
 
@@ -1016,7 +1041,7 @@ def climb(
 DEFAULT_MINIMAP_REGION = (0.0, 0.0, 0.22, 0.27)
 
 # 卡住判定阈值：标记 X 变化 < 0.012（最小地图单位）即视为"没在动"。
-# 按帧判定（连续 3 帧 ≈ 0.75s）触发跳跃。
+# 按帧判定（连续 6 帧 ≈ 1.5s）触发跳跃，避免把攻击动作的短暂停顿误判为台阶。
 STAIR_JUMP_STALL_FALLBACK = 0.012
 
 
@@ -1851,7 +1876,7 @@ class MovementWorker(threading.Thread):
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
         stair_jump_stall_diamonds: float = 0.25,
-        stair_jump_stall_frames: int = 3,
+        stair_jump_stall_frames: int = 6,
         patrol_start_grace_seconds: float = 3.0,
         stair_jump_attempts_max: int = 3,
         # 台阶/坑边尝试间隔 0.8s（原 2.5s）：地图坑多时角色卡在边缘会等

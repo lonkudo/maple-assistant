@@ -40,6 +40,13 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_default_stair_jump_waits_six_frames_through_attack_animation(self):
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), important_positions={}
+        )
+
+        self.assertEqual(worker.stair_jump_stall_frames, 6)
+
     def test_dispatched_marker_must_match_current_frame_and_minimap_region(self):
         class Reading:
             x = .42
@@ -3627,6 +3634,62 @@ class MovementTests(unittest.TestCase):
         direction_downs = [key for event, key in sender.events
                            if event == "down" and key in ("left", "right")]
         self.assertEqual(direction_downs, ["right", "right"])
+
+    def test_aligned_lateral_plan_starts_straight_up_to_avoid_falling(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def press(self, key, duration=0):
+                self.events.append(("press", key)); return True
+            def key_down(self, key):
+                self.events.append(("down", key)); return True
+            def key_up(self, key):
+                self.events.append(("up", key)); return True
+
+        # The live log had x=.575 and a nearby rope. Even if the outer plan
+        # says Left, being within the attach tolerance must use Alt+Up first.
+        sender, state = Sender(), ClimbState()
+        aligned = MinimapObservation(
+            Point(.575, .716667), None, .9, (0, 0, 1, 1)
+        )
+        with patch("movement_worker.time.sleep"):
+            result = climb(
+                sender, aligned, state, preferred_direction="left",
+                persistent_up=True, rope_x=.590,
+            )
+        self.assertEqual(result, "up-toward-rope")
+        lateral_downs = [
+            key for event, key in sender.events
+            if event == "down" and key in ("left", "right")
+        ]
+        self.assertEqual(lateral_downs, [])
+
+    def test_failed_cycle_correction_moves_toward_left_side_rope(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def press(self, key, duration=0):
+                self.events.append(("press", key, duration)); return True
+            def key_down(self, key):
+                self.events.append(("down", key)); return True
+            def key_up(self, key):
+                self.events.append(("up", key)); return True
+
+        sender, state = Sender(), ClimbState()
+        right_of_rope = MinimapObservation(
+            Point(.60, .70), None, .9, (0, 0, 1, 1)
+        )
+        with patch("movement_worker.time.sleep"):
+            climb(sender, right_of_rope, state,
+                  preferred_direction="left", rope_x=.55)
+            climb(sender, right_of_rope, state,
+                  preferred_direction="left", rope_x=.55)
+            result = climb(
+                sender, right_of_rope, state, rope_x=.55,
+                failed_cycle_right_seconds=.1,
+            )
+        self.assertEqual(result, "failed-cycle-shifted-right")
+        self.assertIn(("press", "left", .1), sender.events)
 
     def test_failed_directional_round_shifts_right_point_zero_one_seconds(self):
         class Sender:

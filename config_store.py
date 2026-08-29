@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "climb_world_y_change_required": .75,
         "climb_world_y_stall_change_required": .15,
         "climb_world_y_stall_frames": 2, "patrol_cycles_per_layer": 2,
+        "stair_jump_stall_frames": 6,
         "movement_hold_seconds": 2.0, "minimum_final_hold_seconds": .08,
         "minimum_movement_hold_seconds": .3,
         "estimated_minimap_speed": .11, "final_calculation_distance": .035,
