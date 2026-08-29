@@ -218,10 +218,13 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertEqual(detector._stabilize_boxes(*collapsed), stable)
         self.assertEqual(detector._stabilize_boxes(*stable), stable)
 
-        # A deliberate, persistent minimap resize is still adopted.
+        # The current session must not adopt a persistent cropped contour:
+        # it would remap recorded adaptive layer coordinates and make a
+        # correctly recorded layer look like another floor.  A deliberate HUD
+        # resize is picked up cleanly after restarting the assistant.
         detector._stabilize_boxes(*collapsed)
         detector._stabilize_boxes(*collapsed)
-        self.assertEqual(detector._stabilize_boxes(*collapsed), collapsed)
+        self.assertEqual(detector._stabilize_boxes(*collapsed), stable)
 
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(

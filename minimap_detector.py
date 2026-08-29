@@ -236,15 +236,20 @@ class MinimapDetector:
                     else:
                         self._pending_shrunken_boxes = (window, analysis, canvas)
                         self._pending_shrunken_count = 1
-                    if self._pending_shrunken_count < 3:
-                        return (
-                            self._coordinate_median(self._box_history, 0),
-                            self._coordinate_median(self._box_history, 1),
-                            self._coordinate_median(self._box_history, 2),
-                        )
-                    self._box_history.clear()
-                    self._pending_shrunken_boxes = None
-                    self._pending_shrunken_count = 0
+                    # A running client does not legitimately shrink only the
+                    # minimap frame by 35%+ while the game window itself is
+                    # unchanged.  Adopting that candidate after three frames
+                    # used to reproject the saved patrol layers onto a false
+                    # 95x130 minimap (from a correct ~239x184 frame), making
+                    # layer2 look like layer1 and repeatedly jump at a rope.
+                    # Keep the known-good geometry until a fresh assistant
+                    # session starts; a user who intentionally changes HUD
+                    # scale can simply restart before recording/patrolling.
+                    return (
+                        self._coordinate_median(self._box_history, 0),
+                        self._coordinate_median(self._box_history, 1),
+                        self._coordinate_median(self._box_history, 2),
+                    )
                 else:
                     self._pending_shrunken_boxes = None
                     self._pending_shrunken_count = 0
