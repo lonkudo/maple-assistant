@@ -72,7 +72,17 @@ class AttackWorker(threading.Thread):
         return True
 
     def attack_once(self) -> bool:
-        """Send exactly the attack key down/up; never move the character."""
+        """Send a game-recognizable short attack press; never move.
+
+        A zero-duration down/up pair is visible in the debug log but can be
+        ignored by MapleStory between input polls.  Prefer the key sender's
+        normal ``tap`` method, which holds the scan code for 25 ms just like
+        the reliable potion input path.
+        """
+
+        tap = getattr(self.key_sender, "tap", None)
+        if callable(tap):
+            return tap(self.attack_key) is not False
 
         key_down = getattr(self.key_sender, "key_down", None)
         key_up = getattr(self.key_sender, "key_up", None)
@@ -81,7 +91,7 @@ class AttackWorker(threading.Thread):
             if not claimed:
                 return False
             return key_up(self.attack_key) is not False
-        return self.key_sender.tap(self.attack_key) is not False
+        return False
 
     def next_delay(self) -> float:
         """Configured attack interval plus a random gap of at most 0.1s."""

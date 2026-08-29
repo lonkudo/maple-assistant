@@ -19,6 +19,12 @@ class FakeSender:
         return True
 
 
+class TapSender(FakeSender):
+    def tap(self, key):
+        self.events.append(("tap", key))
+        return True
+
+
 class AttackWorkerTests(unittest.TestCase):
     def test_attack_once_is_only_ctrl_down_up(self):
         sender = FakeSender()
@@ -31,6 +37,12 @@ class AttackWorkerTests(unittest.TestCase):
         worker = AttackWorker(sender, threading.Event(), attack_key="shift")
         self.assertTrue(worker.attack_once())
         self.assertEqual(sender.events, [("down", "shift"), ("up", "shift")])
+
+    def test_attack_prefers_short_tap_over_zero_length_transition(self):
+        sender = TapSender()
+        worker = AttackWorker(sender, threading.Event())
+        self.assertTrue(worker.attack_once())
+        self.assertEqual(sender.events, [("tap", "ctrl")])
 
     def test_set_key_validates_against_sender_scan_map(self):
         class ScannedSender(FakeSender):
