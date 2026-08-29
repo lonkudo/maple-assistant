@@ -235,6 +235,7 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.state = state
 
         worker = UiWorker.__new__(UiWorker)
+        worker._YOLO_MONSTER_DETECTION_ENABLED = True
         worker._yolo_process = None
         worker._yolo_threshold_var = type(
             "Var", (), {"get": lambda self: "0.33", "set": lambda self, v: None}
@@ -299,6 +300,7 @@ class UiLogHandlerTests(unittest.TestCase):
                     self.state = state
 
         worker = UiWorker.__new__(UiWorker)
+        worker._YOLO_MONSTER_DETECTION_ENABLED = True
         worker._yolo_process = None
         worker._yolo_threshold_var = type(
             "Var", (), {"get": lambda self: "0.4", "set": lambda self, v: None}
@@ -617,6 +619,9 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.calls.append(active)
 
         worker = UiWorker.__new__(UiWorker)
+        # Exercise the preserved recovery path; production temporarily leaves
+        # this flag False until a better-trained monster model is available.
+        worker._YOLO_MONSTER_DETECTION_ENABLED = True
         worker.attack_worker = FakeAttackWorker()
         worker.movement_worker = FakeMover()
         worker._attack_mode_var = Var("yolo")
@@ -748,6 +753,40 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertTrue(loader.attack_worker.enabled)
                 self.assertEqual(loader.attack_worker.attack_interval, 4.5)
                 self.assertEqual(loader.attack_worker.attack_key, "delete")
+
+    def test_disabled_yolo_setting_is_coerced_to_fixed_attack(self) -> None:
+        class Var:
+            def __init__(self, value): self.value = value
+            def get(self): return self.value
+            def set(self, value): self.value = value
+
+        class Label:
+            def configure(self, **_kwargs): pass
+
+        class AttackWorker:
+            enabled = False
+            attack_interval = 3.0
+            attack_key = "ctrl"
+            def set_key(self, key):
+                self.attack_key = key
+                return True
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._attack_mode_var = Var("yolo")
+        worker._fixed_interval_var = Var(3.0)
+        worker._fixed_attack_key_var = Var("ctrl")
+        worker._fixed_interval_label = Label()
+        worker._fixed_status = Label()
+        worker._yolo_status = Label()
+        worker._yolo_panel = None
+        worker.attack_worker = AttackWorker()
+        worker.movement_worker = None
+        worker._fixed_save_settings = lambda _data: None
+
+        worker._fixed_on_change()
+
+        self.assertEqual(worker._attack_mode_var.get(), "fixed")
+        self.assertTrue(worker.attack_worker.enabled)
 
     def test_shutdown_panel_roundtrip_and_worker_apply(self) -> None:
         import json

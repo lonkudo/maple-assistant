@@ -7,7 +7,8 @@
 Maple Assistant is a Windows desktop automation tool for a MapleStory client.
 It captures the game window, reads the minimap and HP/MP bars, follows a
 recorded multi-layer patrol route, climbs ropes, recovers from falls, collects
-items, and supports either fixed-interval or YOLO-driven attacks.
+items. Fixed-interval attack remains available; YOLO-driven monster attack is
+temporarily disabled until its model has been trained more reliably.
 
 The runtime is resolution-adaptive: minimap geometry and the yellow player
 diamond are detected dynamically, while normalized fallback regions keep the
@@ -21,7 +22,8 @@ For a packaged release on a new Windows machine:
 
 1. Extract the complete ZIP.
 2. Double-click `安装.bat`. It finds or installs Python 3.10, creates `.venv`,
-   installs the core and YOLO dependencies, and creates the launchers.
+   installs the core dependencies and creates the launchers. The large YOLO
+   dependencies are temporarily skipped.
 3. Double-click `启动助手.bat`.
 4. Bring the configured game window to the foreground.
 5. Record or verify the patrol route in the UI, then click **Start Patrol**.
@@ -158,6 +160,35 @@ engine's developer-oriented `yolo-detection/config.yaml` remains separate.
 
 Runtime state and logs are written under ignored directories such as `work/`,
 `outputs/`, and `recording-assets/`. Do not assume these files are saved by Git.
+
+## Temporarily disabled YOLO monster detection
+
+YOLO monster detection is temporarily disabled because the current
+`weights/best.pt` is not trained reliably enough. The implementation and model
+files have deliberately not been deleted. While disabled:
+
+- the UI forces **Fixed Attack**, greys the YOLO controls, and cannot launch
+  the YOLO subprocess when patrol starts;
+- fresh configuration defaults to `fixed` attack mode; and
+- `install.ps1` skips the large PyTorch/Ultralytics dependency download. The
+  preserved commands are inside the
+  `YOLO_DEPENDENCIES_TEMPORARILY_DISABLED` block comment.
+
+To recover YOLO quickly after replacing `yolo-detection/weights/best.pt` with a
+better-trained model:
+
+1. In `ui_worker.py`, change
+   `_YOLO_MONSTER_DETECTION_ENABLED = False` to `True`.
+2. In `install.ps1`, remove the opening
+   `<# YOLO_DEPENDENCIES_TEMPORARILY_DISABLED` line and its matching closing
+   `#>` line, then run `安装.bat` once to install the preserved dependencies.
+3. Optionally change `config_store.py`'s default `fixed_attack.attack_mode`
+   from `fixed` to `yolo`; otherwise select YOLO in the restored UI.
+4. Update the temporary wording in `安装.bat`, `build_release.ps1`, this section,
+   and `ARCHITECTURE.md`, then run the normal release workflow below.
+
+The minimap-based patrol, layer, rope, fixed attack, potion, and alert workers
+do not require these YOLO dependencies and continue to operate normally.
 
 ## Publishing a release
 

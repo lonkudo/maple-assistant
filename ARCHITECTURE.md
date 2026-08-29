@@ -241,7 +241,12 @@ The fixed attack thread always exists but begins disabled unless requested or
 enabled through the UI. It periodically presses the selected attack key and
 honors climb/return suppression.
 
-The UI can launch `yolo-detection/live_view.py`. That loop captures with MSS,
+The YOLO monster subprocess is temporarily feature-disabled while its model is
+retrained. The UI forces fixed attack, disables the YOLO panel, and does not
+auto-launch or install its inference dependencies. The preserved recovery flag
+and installer block are documented in `README.md`.
+
+When re-enabled, the UI can launch `yolo-detection/live_view.py`. That loop captures with MSS,
 runs the model in `weights/best.pt`, filters detections to the configured zone
 and mob size, chooses an in-range target, optionally invokes
 `AttackExecutor`, publishes attack state, and publishes the nearest useful

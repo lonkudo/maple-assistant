@@ -5,7 +5,7 @@
 .DESCRIPTION
     只复制运行所需的文件（不含虚拟环境、日志、测试、work 数据、git 元数据）。
     打包结果可压缩后交给其他用户，对方解压后双击 安装.bat 即可自动安装
-    Python 与全部依赖（含 YOLO）。
+    Python 与当前启用的依赖（YOLO 怪物检测暂时停用）。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File build_release.ps1
@@ -81,7 +81,7 @@ Write-Host "已复制 $($files.Count) 个文件 ($totalMB MB)。" -ForegroundCol
 Write-Host ""
 Write-Host "发布方法:"
 Write-Host "  1. 将 $OutDir 文件夹压缩为 zip"
-Write-Host "  2. 接收方解压后双击 安装.bat 即可自动安装（含 YOLO 依赖）"
+Write-Host "  2. 接收方解压后双击 安装.bat 即可自动安装（YOLO 暂停）"
 Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundColor Cyan
 Write-Host ""
 

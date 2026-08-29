@@ -63,7 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "buff1_enabled": False, "buff2_enabled": False,
     },
     "fixed_attack": {
-        "attack_mode": "yolo", "interval_seconds": 3.0,
+        "attack_mode": "fixed", "interval_seconds": 3.0,
         "attack_key": "ctrl",
     },
     "additional_functions": {

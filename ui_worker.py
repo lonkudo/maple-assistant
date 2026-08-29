@@ -443,6 +443,10 @@ class UiWorker(threading.Thread):
     # Set True to show the "Detection" info panel (frame stats) again; it is
     # hidden by default, the rendering code is kept for future use.
     _SHOW_DETECTION_INFO = False
+    # TEMPORARY: the current monster model is not trained reliably enough.
+    # Keep the implementation below intact so it can be restored quickly;
+    # README.md documents the matching installer change.
+    _YOLO_MONSTER_DETECTION_ENABLED = False
 
     def __init__(
         self,
@@ -829,12 +833,18 @@ class UiWorker(threading.Thread):
             ttk.Label(mode_row, text="攻击模式:").pack(
                 side="left", padx=(0, 8)
             )
-            self._attack_mode_var = tk.StringVar(value="yolo")
-            ttk.Radiobutton(
+            self._attack_mode_var = tk.StringVar(
+                value=("yolo" if self._YOLO_MONSTER_DETECTION_ENABLED
+                       else "fixed")
+            )
+            yolo_mode_button = ttk.Radiobutton(
                 mode_row, text="YOLO 检测", value="yolo",
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
-            ).pack(side="left", padx=(0, 12))
+            )
+            yolo_mode_button.pack(side="left", padx=(0, 12))
+            if not self._YOLO_MONSTER_DETECTION_ENABLED:
+                yolo_mode_button.configure(state="disabled")
             ttk.Radiobutton(
                 mode_row, text="固定攻击", value="fixed",
                 variable=self._attack_mode_var,
@@ -1574,6 +1584,9 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_fixed_interval_label"):
             return
+        if (not self._YOLO_MONSTER_DETECTION_ENABLED
+                and self._attack_mode_var.get() != "fixed"):
+            self._attack_mode_var.set("fixed")
         interval = float(self._fixed_interval_var.get())
         self._fixed_interval_label.configure(text=f"{interval:.1f}s")
         if hasattr(self, "_fixed_key_button"):
@@ -1609,7 +1622,9 @@ class UiWorker(threading.Thread):
                 text="固定攻击: 工作线程未接入 (无界面模式)。"
             )
             return
-        mode = str(data.get("attack_mode", "yolo"))
+        mode = str(data.get("attack_mode", "fixed"))
+        if not self._YOLO_MONSTER_DETECTION_ENABLED:
+            mode = "fixed"
         worker.enabled = bool(mode == "fixed")
         worker.attack_interval = max(
             0.25, float(data.get("interval_seconds", 3.0))
@@ -1622,7 +1637,10 @@ class UiWorker(threading.Thread):
     def _fixed_refresh_grey(self) -> None:
         """Grey the YOLO panel + update status lines for the active mode."""
 
-        fixed_mode = str(self._attack_mode_var.get()) == "fixed"
+        fixed_mode = (
+            not self._YOLO_MONSTER_DETECTION_ENABLED
+            or str(self._attack_mode_var.get()) == "fixed"
+        )
         if fixed_mode:
             # Only one attack engine at a time: selecting Fixed Attack stops
             # a running YOLO detection subprocess.
@@ -1646,7 +1664,7 @@ class UiWorker(threading.Thread):
                     text=(f"固定攻击已启用 - 每 "
                           f"{float(self._fixed_interval_var.get()):.1f}秒 "
                           f"按下 {self._fixed_attack_key_var.get()}。"
-                          "YOLO 检测已禁用。")
+                          "YOLO 怪物检测暂时停用。")
                 )
             else:
                 self._fixed_status.configure(
@@ -1655,7 +1673,8 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_yolo_status"):
             if fixed_mode:
                 self._yolo_status.configure(
-                    text="已禁用 - 当前选择固定攻击模式。"
+                    text=("暂时停用 - 当前模型识别率不足；"
+                          "恢复方法见 README.md。")
                 )
             else:
                 self._yolo_status.configure(text="YOLO 检测已停止。")
@@ -1674,6 +1693,11 @@ class UiWorker(threading.Thread):
                     )
                 except Exception:
                     pass
+            # Most YOLO controls are nested inside row frames. Disabling only
+            # the immediate frames does not disable their buttons on Tk, so
+            # recurse to make the temporary feature switch effective.
+            if callable(getattr(child, "winfo_children", None)):
+                self._set_panel_state(child, disabled)
 
     def _fixed_load_settings(self) -> None:
         """Restore saved Fixed Attack panel values and apply them live."""
@@ -1689,6 +1713,8 @@ class UiWorker(threading.Thread):
                 mode = str(data["attack_mode"])
                 if mode in ("yolo", "fixed"):
                     self._attack_mode_var.set(mode)
+            if not self._YOLO_MONSTER_DETECTION_ENABLED:
+                self._attack_mode_var.set("fixed")
             if "interval_seconds" in data:
                 self._fixed_interval_var.set(
                     float(data["interval_seconds"])
@@ -2264,6 +2290,13 @@ class UiWorker(threading.Thread):
     def _yolo_start(self) -> None:
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
 
+        if not self._YOLO_MONSTER_DETECTION_ENABLED:
+            self._yolo_status.configure(
+                text="YOLO 怪物检测暂时停用；恢复方法见 README.md。"
+            )
+            LOG.info("yolo detection launch ignored: feature temporarily disabled")
+            return
+
         if self._yolo_process is not None and self._yolo_process.poll() is None:
             self._yolo_status.configure(text="YOLO 检测已在运行中。")
             return
@@ -2344,7 +2377,8 @@ class UiWorker(threading.Thread):
         attack_key = "ctrl"
         if hasattr(self, "_fixed_attack_key_var"):
             attack_key = (self._fixed_attack_key_var.get().strip() or "ctrl")
-        if (getattr(self, "_attack_mode_var", None) is not None
+        if (self._YOLO_MONSTER_DETECTION_ENABLED
+                and getattr(self, "_attack_mode_var", None) is not None
                 and self._attack_mode_var.get() == "yolo"):
             cmd.append("--attack")
             cmd.extend(["--attack-key", attack_key])

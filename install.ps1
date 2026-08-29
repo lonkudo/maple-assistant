@@ -9,8 +9,7 @@
          python.org 静默安装）。
       2. 创建本地虚拟环境 (.venv)（使用 Python 3.10 解释器启动助手）。
       3. 安装基础依赖库（pip 使用清华镜像加速）。
-      4. 安装 YOLO 怪物检测依赖（CPU 版 PyTorch + mss/ultralytics 等，
-         直接装进主环境 .venv，无需单独的 venv313）。
+      4. 暂不安装 YOLO 怪物检测依赖（模型重新训练后可按 README 恢复）。
       5. 生成启动器（start_assistant.bat / 启动助手.bat）。
 
 .EXAMPLE
@@ -165,7 +164,8 @@ Set-Content -Path "start_assistant.bat" -Value $bat -Encoding ASCII
 Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding ASCII
 Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -ForegroundColor Green
 
-# ---- 5. YOLO 怪物检测依赖（始终安装，无需额外参数） ---------------------------
+# ---- 5. YOLO 怪物检测依赖（暂时停用；恢复步骤见 README.md） ------------------
+<# YOLO_DEPENDENCIES_TEMPORARILY_DISABLED
 Write-Host ""
 Write-Host "正在安装 YOLO 怪物检测依赖到主环境 .venv ..." -ForegroundColor Yellow
 Write-Host "（先安装 CPU 版 PyTorch，下载约 200MB；CUDA 版约 2.5GB）" -ForegroundColor Yellow
@@ -186,6 +186,8 @@ if ($LASTEXITCODE -ne 0) { throw "YOLO 依赖安装失败" }
 Remove-Item $filtered -ErrorAction SilentlyContinue
 Write-Host "YOLO 环境已就绪（主环境 .venv，无需单独的 venv313）。" -ForegroundColor Green
 Write-Host "请将训练好的模型放到 yolo-detection\weights\best.pt" -ForegroundColor Yellow
+#>
+Write-Host "已跳过 YOLO 怪物检测依赖（当前模型识别率不足）。" -ForegroundColor DarkYellow
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
