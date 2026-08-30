@@ -209,6 +209,10 @@ class HoverTooltip:
             borderwidth=1,
             padx=7,
             pady=4,
+            # Wrap instead of growing the tooltip to the full text length
+            # (the bindable-hotkeys hint is long and would otherwise extend
+            # off-screen / over the UI).
+            wraplength=360,
         )
         label.pack()
         window.update_idletasks()
@@ -702,9 +706,13 @@ class UiWorker(threading.Thread):
             self._control_status = ttk.Label(
                 controls,
                 text="先录制 最左、绳索、最右，然后添加上方图层。",
+                justify="left",
+                wraplength=440,
             )
             self._control_status.pack(anchor="w", pady=(8, 0))
-            self._automation_status_label = ttk.Label(controls)
+            self._automation_status_label = ttk.Label(
+                controls, justify="left", wraplength=440
+            )
             self._automation_status_label.pack(anchor="w", pady=(5, 0))
             self._refresh_patrol_controls()
 
@@ -880,7 +888,8 @@ class UiWorker(threading.Thread):
             self._yolo_zone_shift_y_label.pack(side="left")
             # 显示检测画面（可选，默认不显示）；YOLO 依赖由 安装.bat 自动安装。
             self._yolo_status = ttk.Label(
-                yolo_panel, text="YOLO 检测已停止。", justify="left"
+                yolo_panel, text="YOLO 检测已停止。", justify="left",
+                wraplength=440,
             )
             self._yolo_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved YOLO panel settings (threshold, ranges).
@@ -973,7 +982,8 @@ class UiWorker(threading.Thread):
             )
             self._fixed_range_label.pack(anchor="w", pady=(6, 0))
             self._fixed_status = ttk.Label(
-                fixed_panel, text="固定攻击未启用。", justify="left"
+                fixed_panel, text="固定攻击未启用。", justify="left",
+                wraplength=440,
             )
             self._fixed_load_settings()
 
@@ -1132,7 +1142,8 @@ class UiWorker(threading.Thread):
             )
             self._buff2_interval_label.pack(side="left")
             self._drug_status = ttk.Label(
-                drug_panel, text="药品面板就绪。", justify="left"
+                drug_panel, text="药品面板就绪。", justify="left",
+                wraplength=440,
             )
             self._drug_status.pack(anchor="w", pady=(6, 0))
             # Restore previously saved drug settings and apply them live.
@@ -1150,7 +1161,8 @@ class UiWorker(threading.Thread):
                 command=self._quick_message_add,
             ).pack(side="left")
             self._quick_message_status = ttk.Label(
-                quick_header, text="单击复制；双击发送；长按 1 秒修改/删除。"
+                quick_header, text="单击复制；双击发送；长按 1 秒修改/删除。",
+                justify="left", wraplength=300,
             )
             self._quick_message_status.pack(side="left", padx=(8, 0))
             self._quick_messages_frame = ttk.Frame(quick_panel)
@@ -1197,6 +1209,7 @@ class UiWorker(threading.Thread):
                 extra_panel,
                 text="定时关闭: 未启用 - 游戏继续运行。",
                 justify="left",
+                wraplength=440,
             )
             self._shutdown_status.pack(anchor="w", pady=(6, 0))
 
@@ -1275,6 +1288,7 @@ class UiWorker(threading.Thread):
                 extra_panel,
                 text="循环警报: 未启用。",
                 justify="left",
+                wraplength=440,
             )
 
             reminder_row = ttk.Frame(extra_panel)
@@ -1327,7 +1341,7 @@ class UiWorker(threading.Thread):
                 extra_panel,
                 text="消息提醒: 未启用；BOT token 仅保存在本机用户配置。",
                 justify="left",
-                wraplength=620,
+                wraplength=440,
             )
             self._telegram_status.pack(anchor="w", pady=(4, 0))
 
