@@ -1012,10 +1012,14 @@ class UiWorker(threading.Thread):
             self._attach_bind_hint(hp_key_button)
             ttk.Label(hp_row, text="HP 低于以下时喝药:").pack(side="left")
             self._hp_threshold_var = tk.IntVar(value=50)
+            # Fixed 500px column: the slider is shortened (length=60) so the
+            # row's total width stays inside the 500px column instead of
+            # pushing it wider.
             hp_threshold_slider = ttk.Scale(
                 hp_row, from_=5, to=95, orient="horizontal",
                 variable=self._hp_threshold_var,
                 command=self._drug_on_change,
+                length=60,
             )
             hp_threshold_slider.pack(side="left", fill="x",
                                      expand=True, padx=(8, 8))
@@ -1048,6 +1052,7 @@ class UiWorker(threading.Thread):
                 mp_row, from_=5, to=95, orient="horizontal",
                 variable=self._mp_threshold_var,
                 command=self._drug_on_change,
+                length=60,
             )
             mp_threshold_slider.pack(side="left", fill="x",
                                      expand=True, padx=(8, 8))
@@ -1087,6 +1092,7 @@ class UiWorker(threading.Thread):
                 buff1_row, from_=0.5, to=30.0, orient="horizontal",
                 variable=self._buff1_interval_var,
                 command=self._drug_on_change,
+                length=60,
             )
             buff1_interval_slider.pack(side="left", fill="x",
                                        expand=True, padx=(8, 8))
@@ -1122,6 +1128,7 @@ class UiWorker(threading.Thread):
                 buff2_row, from_=0.5, to=30.0, orient="horizontal",
                 variable=self._buff2_interval_var,
                 command=self._drug_on_change,
+                length=60,
             )
             buff2_interval_slider.pack(side="left", fill="x",
                                        expand=True, padx=(8, 8))
