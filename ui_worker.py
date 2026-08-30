@@ -34,8 +34,11 @@ from versioning import version_label
 
 LOG = logging.getLogger(__name__)
 
-_INITIAL_WINDOW_WIDTH = 1200
-_INITIAL_WINDOW_HEIGHT = 900
+# The debug UI uses two fixed 500px columns (controls + debug/YOLO), so
+# the initial width fits both plus the container padding; the initial
+# height is 750px but stays user-resizable (only the minimum is enforced).
+_INITIAL_WINDOW_WIDTH = 500 + 500 + 24  # 2 columns + 12px container padding x2
+_INITIAL_WINDOW_HEIGHT = 750
 
 
 def tooltip_cursor_top_right_position(
@@ -612,9 +615,11 @@ class UiWorker(threading.Thread):
             )
             root.geometry(_clamp_window_geometry(
                 restored, screen_width, screen_height,
-                max_height=_INITIAL_WINDOW_HEIGHT,
             ))
-            root.minsize(980, 560)
+            # The two columns are fixed at 500px each (plus padding), so the
+            # window must never shrink below that; the height stays
+            # user-resizable from the 750px initial value.
+            root.minsize(_INITIAL_WINDOW_WIDTH + 12, 560)
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
 
@@ -629,12 +634,13 @@ class UiWorker(threading.Thread):
 
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
-            # The controls column used to receive half the window even though
-            # its content needs less room. A 2:3 grid makes it 40% of the
-            # available width (20% narrower than the former 50% share) and
-            # gives the debug/YOLO column the recovered space.
-            columns.columnconfigure(0, weight=2)
-            columns.columnconfigure(1, weight=3)
+            # Both columns are FIXED at 500px wide: the layout no longer
+            # scales with the window width (weight=0, so a wider window
+            # leaves the columns at their fixed width and the height is the
+            # resizable dimension).  Initial window height 750px; the user
+            # can still drag the height (only the minimum is enforced).
+            columns.columnconfigure(0, weight=0, minsize=500)
+            columns.columnconfigure(1, weight=0, minsize=500)
             columns.rowconfigure(0, weight=1)
             col1 = ttk.Frame(columns)
             col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
