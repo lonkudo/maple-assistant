@@ -108,6 +108,22 @@ class ConfigStoreTests(unittest.TestCase):
                     "rope_calibration", {"stair_jump_stall_frames": 3}
                 )
 
+    def test_recording_can_replace_user_minimap_calibration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = self._store(root)
+            original_recording = store.read_section("recording")
+
+            calibration = {"schema": 1, "window_box": [0, 0, .1, .2]}
+            store.write_section("minimap_calibration", calibration)
+
+            self.assertEqual(
+                store.read_section("minimap_calibration"), calibration
+            )
+            self.assertEqual(
+                store.read_section("recording"), original_recording
+            )
+
     def test_tracked_system_file_matches_code_fallback(self):
         tracked = json.loads(
             Path(__file__).with_name("system_config.json").read_text(

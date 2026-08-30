@@ -508,6 +508,7 @@ class UiWorker(threading.Thread):
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
+        on_recording_verified: Optional[Callable[[DebugSnapshot], None]] = None,
         log_queue: Optional["queue.Queue[str]"] = None,
         automation_active_event: Optional[threading.Event] = None,
     ) -> None:
@@ -564,6 +565,7 @@ class UiWorker(threading.Thread):
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
+        self.on_recording_verified = on_recording_verified
         self.log_queue = log_queue
         self.automation_active_event = automation_active_event
         self._yolo_process: Any = None
@@ -1625,7 +1627,16 @@ class UiWorker(threading.Thread):
                 text="无法录制: 最新画面中未检测到黄色菱形标记。"
             )
             return
+        if snapshot.detection.source != "opencv":
+            self._control_status.configure(
+                text="无法录制: 未检测到可保存的小地图边框。"
+            )
+            return
         try:
+            # Border calibration is an independent recording output. Save it
+            # before route coordinates so patrol never depends on UI timing.
+            if self.on_recording_verified is not None:
+                self.on_recording_verified(snapshot)
             if self.map_identity_store is not None and self.configured_map_name:
                 self.map_identity_store.record(
                     self.configured_map_name, snapshot.map_name_preview

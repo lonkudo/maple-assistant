@@ -97,26 +97,22 @@ releases keys.
 
 The start transition has an explicit capture-only phase. After
 `WindowKeySender.select_window()` and foreground verification,
-`patrol_preparing` opens the capture gate so `prepare_map_session()` receives
-several fresh game frames for minimap calibration. A repeated OpenCV border wins
-the vote. If repetition is unavailable, one OpenCV border may be accepted only
-when yellow-diamond detection independently verifies its analysis region. A
-fallback search crop is never accepted as the minimap border. Input remains
-disabled during this phase. On success input is armed; on any calibration error
-the temporary gate clears in `finally`. This prevents pre-focus/UI-overlaid
-frames from contaminating calibration while preserving idle behavior before
-Start Patrol.
+`patrol_preparing` opens the capture gate so `prepare_map_session()` receives a
+current game frame. Patrol loads the recording-owned normalized minimap boxes
+from `user_config.json`, projects them to the current client resolution, and
+seeds `MinimapDetector`; no repeated-contour vote is required. Legacy profiles
+without this section use marker-verified OpenCV discovery, never the fallback
+search crop. Input remains disabled during preparation. On success input is
+armed; on any error the temporary gate clears in `finally`.
 
 Manual recording has a parallel one-off path and does not depend on that
 patrol capture gate. Every recording click first foregrounds the game, waits
 briefly for compositor settlement, then samples up to three forced frames. It
 accepts only a frame containing both an OpenCV minimap border and yellow marker;
-resetting a recording also clears retained minimap geometry.
-The verified recording frame remains a startup input: when it is at most 30
-seconds old, Start Patrol uses it immediately. For an older session, if a slow
-capture backend cannot deliver the first patrol-calibration frame within five
-seconds, Start Patrol reuses the last verified frame and measured border rather
-than aborting.
+resetting a recording also clears retained in-memory geometry. Each successful
+record writes normalized window, analysis, canvas, and map-name boxes to the
+independent `minimap_calibration` user section. A different map/minimap recording
+replaces those values; client-resolution changes are handled during projection.
 
 `FocusWorker` is completely idle while patrol input is disarmed. Once patrol
 starts, it checks whether the selected game is foreground. During a focus
@@ -370,13 +366,14 @@ recovery behavior.
 
 ## 8. Configuration ownership
 
-`config_store.py` routes each section by ownership. UI-visible settings and
-recordings are atomically written to `user_config.json`; internal movement and
-detection calibration is read from the shipped, runtime-read-only
-`system_config.json`.
+`config_store.py` routes each section by ownership. UI-visible settings,
+recordings, and the recording-owned minimap border are atomically written to
+`user_config.json`; update-owned internal movement tuning is read from the
+shipped, runtime-read-only `system_config.json`.
 
 | Section | File ownership | Main owner/consumer |
 |---|---|---|
+| `minimap_calibration` | user | UiWorker recording / patrol startup |
 | `recording` | user | PatrolController, MovementWorker, UiWorker |
 | `rope_calibration` | system/update | assistant.py -> MovementWorker tuning |
 | `drug` | user | UiWorker, StatusWorker, MovementWorker |

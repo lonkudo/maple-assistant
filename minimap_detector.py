@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 import threading
 import time
-from typing import Optional, Protocol, Sequence
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -79,6 +79,71 @@ class MinimapDetection:
 
     def normalized_analysis_box(self, image_size: tuple[int, int]) -> NormalizedBox:
         return box_to_normalized(self.analysis_box, image_size)
+
+
+def minimap_calibration_to_dict(
+    detection: MinimapDetection,
+    image_size: tuple[int, int],
+) -> dict[str, Any]:
+    """Serialize a recording-verified border independently of resolution."""
+
+    if not detection.source.startswith("opencv"):
+        raise ValueError("only an OpenCV minimap border can be calibrated")
+    return {
+        "schema": 1,
+        "recorded_client_size": [int(image_size[0]), int(image_size[1])],
+        "window_box": list(box_to_normalized(detection.window_box, image_size)),
+        "analysis_box": list(box_to_normalized(detection.analysis_box, image_size)),
+        "canvas_box": list(box_to_normalized(detection.canvas_box, image_size)),
+        "map_name_box": list(box_to_normalized(detection.map_name_box, image_size)),
+        "confidence": float(detection.confidence),
+    }
+
+
+def minimap_calibration_from_dict(
+    value: Mapping[str, Any],
+    image_size: tuple[int, int],
+) -> Optional[MinimapDetection]:
+    """Scale a saved normalized border to the current game-client size."""
+
+    if value.get("schema") != 1:
+        return None
+    width, height = image_size
+    if width < 1 or height < 1:
+        return None
+
+    def load_box(name: str) -> Box:
+        raw = value.get(name)
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            raise ValueError(name)
+        numbers = tuple(float(item) for item in raw)
+        if (not all(np.isfinite(item) for item in numbers)
+                or not all(-0.01 <= item <= 1.01 for item in numbers)
+                or numbers[2] <= numbers[0]
+                or numbers[3] <= numbers[1]):
+            raise ValueError(name)
+        return _clamp_box(
+            (
+                round(numbers[0] * width), round(numbers[1] * height),
+                round(numbers[2] * width), round(numbers[3] * height),
+            ),
+            width,
+            height,
+        )
+
+    try:
+        detection = MinimapDetection(
+            window_box=load_box("window_box"),
+            analysis_box=load_box("analysis_box"),
+            canvas_box=load_box("canvas_box"),
+            map_name_box=load_box("map_name_box"),
+            confidence=float(value.get("confidence", 1.0)),
+            source="opencv-recording",
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    window_width, window_height = detection.window_size
+    return detection if window_width >= 20 and window_height >= 20 else None
 
 
 class MapNameReader(Protocol):
@@ -155,7 +220,7 @@ class MinimapDetector:
     ) -> None:
         """Lock a verified minimap border as this map session's baseline."""
 
-        if detection.source != "opencv":
+        if not detection.source.startswith("opencv"):
             raise ValueError("minimap geometry must come from an OpenCV border")
         boxes = (
             detection.window_box,
@@ -576,4 +641,6 @@ __all__ = [
     "NormalizedBox",
     "box_to_normalized",
     "choose_stable_minimap_index",
+    "minimap_calibration_from_dict",
+    "minimap_calibration_to_dict",
 ]

@@ -239,7 +239,12 @@ def main() -> int:
     from telegram_notifier import TelegramNotifier
     from config_store import get_config_store
     from focus_worker import FocusWorker
-    from minimap_detector import MinimapDetector, choose_stable_minimap_index
+    from minimap_detector import (
+        MinimapDetector,
+        choose_stable_minimap_index,
+        minimap_calibration_from_dict,
+        minimap_calibration_to_dict,
+    )
     from marker_detector import DiamondSizeTracker, detect_yellow_diamond
     from map_identity import MapIdentityStore
     from map_structure_tracker import MapStructureTracker
@@ -373,79 +378,62 @@ def main() -> int:
         # The top-left region only bounds OpenCV work; it is not minimap
         # geometry.  Probe independent fresh frames so one false contour
         # cannot seed that search crop as the coordinate frame.
-        latest_recording_frame = bus.latest
-        retained_recording_geometry = (
-            minimap_detector.retained_geometry(
-                latest_recording_frame.image.size
-            )
-            if latest_recording_frame is not None else None
-        )
-        recording_frame_is_recent = bool(
-            latest_recording_frame is not None
-            and retained_recording_geometry is not None
-            and time.monotonic() - latest_recording_frame.captured_monotonic
-                <= 30.0
-        )
-        if recording_frame_is_recent:
-            # Starting directly after recording is the common reset workflow.
-            # That frame was focused and verified already, so do not enter the
-            # slow backend's failing wake-up path a second time.
-            fresh_frame = latest_recording_frame
-            logging.info(
-                "MINIMAP startup using recent verified recording frame "
-                "sequence=%d",
+        latest_frame = bus.latest
+        try:
+            # Get a current game image for map/layer verification. Geometry no
+            # longer depends on this capture producing repeatable contours.
+            fresh_frame = capture_worker.capture_now(timeout=5.0)
+        except TimeoutError:
+            if latest_frame is None:
+                raise
+            fresh_frame = latest_frame
+            logging.warning(
+                "MINIMAP startup capture timed out; using latest frame "
+                "sequence=%d with saved recording border",
                 fresh_frame.sequence,
             )
+
+        saved_detection = minimap_calibration_from_dict(
+            config_store.read_section("minimap_calibration"),
+            fresh_frame.image.size,
+        )
+        probes = [(fresh_frame, saved_detection)] if saved_detection else []
+        if saved_detection is not None:
+            # Recording owns border discovery. Patrol only consumes the saved,
+            # normalized result, so start is independent of contour stability.
+            detection = saved_detection
+            minimap_detector.seed_geometry(detection, fresh_frame.image.size)
+            calibration_source = "recording-saved"
         else:
-            try:
-                # Some machines need longer than the generic two-second
-                # one-off timeout while calibration capture is just waking.
-                fresh_frame = capture_worker.capture_now(timeout=5.0)
-            except TimeoutError:
-                if (latest_recording_frame is None
-                        or retained_recording_geometry is None):
-                    raise
-                # An older verified frame is still safer than failing Start
-                # Patrol solely because a slow capture backend timed out.
-                fresh_frame = latest_recording_frame
-                logging.warning(
-                    "MINIMAP startup capture timed out; reusing verified "
-                    "recording frame sequence=%d",
-                    fresh_frame.sequence,
+            # Compatibility for profiles recorded by older releases. Discover
+            # once, but require an actual OpenCV border containing the marker;
+            # the next recording persists it and bypasses this path thereafter.
+            probe_frames = [fresh_frame]
+            after_sequence = fresh_frame.sequence
+            for _sample in range(4):
+                candidate_frame = bus.wait_for_new(after_sequence, 0.40)
+                if candidate_frame is None:
+                    break
+                probe_frames.append(candidate_frame)
+                after_sequence = candidate_frame.sequence
+            probes = []
+            marker_verified_indices = []
+            for candidate_frame in probe_frames:
+                probe = MinimapDetector(
+                    fallback_region=minimap_region,
+                    dedicated_crop=True,
+                    opencv_size=OPENCV_ANALYSIS_SIZE,
                 )
-        previous_geometry = minimap_detector.retained_geometry(
-            fresh_frame.image.size
-        ) or retained_recording_geometry
-        probe_frames = [fresh_frame]
-        after_sequence = fresh_frame.sequence
-        # One forced request is enough. Normal capture publications provide
-        # the remaining samples and avoid the request-event race that made a
-        # restart wait on five consecutive capture_now() timeouts.
-        for _sample in range(4):
-            candidate_frame = bus.wait_for_new(after_sequence, 0.40)
-            if candidate_frame is None:
-                break
-            probe_frames.append(candidate_frame)
-            after_sequence = candidate_frame.sequence
-        probes = []
-        marker_verified_indices = []
-        for candidate_frame in probe_frames:
-            probe = MinimapDetector(
-                fallback_region=minimap_region,
-                dedicated_crop=True,
-                opencv_size=OPENCV_ANALYSIS_SIZE,
-            )
-            candidate_detection = probe.detect(candidate_frame.image)
-            probes.append((candidate_frame, candidate_detection))
-            if candidate_detection.source == "opencv":
-                marker_rgb = np.asarray(
-                    candidate_frame.image.crop(
-                        candidate_detection.analysis_box
-                    ).convert("RGB")
-                )
-                if detect_yellow_diamond(marker_rgb) is not None:
-                    marker_verified_indices.append(len(probes) - 1)
-        try:
+                candidate_detection = probe.detect(candidate_frame.image)
+                probes.append((candidate_frame, candidate_detection))
+                if candidate_detection.source == "opencv":
+                    marker_rgb = np.asarray(
+                        candidate_frame.image.crop(
+                            candidate_detection.analysis_box
+                        ).convert("RGB")
+                    )
+                    if detect_yellow_diamond(marker_rgb) is not None:
+                        marker_verified_indices.append(len(probes) - 1)
             chosen_index = choose_stable_minimap_index(
                 [candidate for _frame, candidate in probes],
                 minimum_repeats=2 if len(probes) >= 2 else 1,
@@ -453,29 +441,7 @@ def main() -> int:
             )
             fresh_frame, detection = probes[chosen_index]
             minimap_detector.seed_geometry(detection, fresh_frame.image.size)
-            calibration_source = "fresh"
-        except OSError:
-            if previous_geometry is not None:
-                # The retained boxes came from an actual OpenCV border, not
-                # the top-left search region. Reuse them for a same-size
-                # client when restart samples are temporarily inconsistent.
-                detection = previous_geometry
-                calibration_source = "retained"
-            else:
-                # On the very first start the focus worker may not yet have
-                # enabled normal publications, leaving only the forced frame.
-                # Accept one actual OpenCV border; fallback/search boxes are
-                # still rejected by choose_stable_minimap_index.
-                chosen_index = choose_stable_minimap_index(
-                    [candidate for _frame, candidate in probes],
-                    minimum_repeats=1,
-                    marker_verified_indices=marker_verified_indices,
-                )
-                fresh_frame, detection = probes[chosen_index]
-                minimap_detector.seed_geometry(
-                    detection, fresh_frame.image.size
-                )
-                calibration_source = "fresh-single"
+            calibration_source = "legacy-detected"
         logging.info(
             "MINIMAP startup border verified source=%s captures=%d | box=%s "
             "| size=%dx%d | confidence=%.3f",
@@ -605,6 +571,19 @@ def main() -> int:
         enabled=False,
         hours=3.0,
     )
+
+    def save_recording_minimap_calibration(snapshot: object) -> None:
+        """Publish recording's verified border for independent patrol use."""
+
+        detection = getattr(snapshot, "detection")
+        client_size = getattr(snapshot, "client_size")
+        value = minimap_calibration_to_dict(detection, client_size)
+        config_store.write_section("minimap_calibration", value)
+        minimap_detector.seed_geometry(detection, client_size)
+        logging.info(
+            "MINIMAP recording border saved | box=%s | client=%dx%d",
+            detection.window_box, client_size[0], client_size[1],
+        )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
     telegram_notifier = TelegramNotifier(stop_event)
     countdown_worker = CountdownWorker(
@@ -860,6 +839,7 @@ def main() -> int:
             on_capture_now=lambda: _capture_focused_game_frame(
                 key_sender, capture_worker.capture_now
             ),
+            on_recording_verified=save_recording_minimap_calibration,
             log_queue=ui_log_handler.messages if ui_log_handler is not None else None,
             automation_active_event=automation_active,
         )

@@ -14,6 +14,7 @@ SYSTEM_CONFIG_NAME = "system_config.json"
 LEGACY_UNIFIED_NAME = "config.json"
 
 SECTION_FILES = {
+    "minimap_calibration": "minimap_calibration.json",
     "recording": "recording-configuration.json",
     "rope_calibration": "rope_calibration.json",
     "drug": "drug_settings.json",
@@ -24,6 +25,8 @@ SECTION_FILES = {
 }
 
 DEFAULT_USER_CONFIG: dict[str, Any] = {
+    # Recording-owned, normalized border consumed independently by patrol.
+    "minimap_calibration": {},
     "recording": {
         "configuration_id": "patrol_recording", "map_name": "",
         "patrol_enabled": False, "climbing_enabled": True,
@@ -212,7 +215,6 @@ class ConfigStore:
             data = _read_json(self.user_path)
             data[section] = deepcopy(value)
             _write_json(self.user_path, data)
-
 
 class ConfigSectionFile:
     """Small read_text/write_text adapter for existing JSON UI helpers."""

@@ -12,6 +12,8 @@ from minimap_detector import (
     MinimapDetection,
     MinimapDetector,
     choose_stable_minimap_index,
+    minimap_calibration_from_dict,
+    minimap_calibration_to_dict,
 )
 from ui_worker import build_debug_snapshot
 
@@ -35,6 +37,28 @@ class FakeMapNameReader:
 
 
 class MinimapDetectorTests(unittest.TestCase):
+    def test_recorded_calibration_scales_to_current_client_size(self):
+        detection = MinimapDetection(
+            (2, 3, 102, 153), (2, 50, 108, 153),
+            (8, 55, 98, 148), (16, 12, 96, 45),
+            .94, "opencv",
+        )
+        saved = minimap_calibration_to_dict(detection, (800, 600))
+
+        restored = minimap_calibration_from_dict(saved, (1600, 1200))
+
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.window_box, (4, 6, 204, 306))
+        self.assertEqual(restored.analysis_box, (4, 100, 216, 306))
+        self.assertEqual(restored.source, "opencv-recording")
+
+    def test_invalid_recorded_calibration_is_rejected(self):
+        self.assertIsNone(minimap_calibration_from_dict({}, (800, 600)))
+        self.assertIsNone(minimap_calibration_from_dict({
+            "schema": 1,
+            "window_box": [0, 0, 1, 1],
+        }, (800, 600)))
+
     def test_opencv_detects_resizable_outer_minimap_frame(self) -> None:
         detection = MinimapDetector().detect(synthetic_game_frame())
         self.assertEqual(detection.source, "opencv")

@@ -61,14 +61,14 @@ py -3.10 assistant.py --help
 The application starts with live input disarmed. Input is enabled only after
 **Start Patrol** is clicked.
 
-Start Patrol first selects and verifies the game in the foreground, then opens
-a temporary capture-only phase to collect minimap samples. A border repeated
-across samples is preferred. If only one OpenCV border is available, it is
-accepted when the same region independently contains the yellow character
+Start Patrol first selects and verifies the game in the foreground, then loads
+the normalized minimap border saved by recording and scales it to the current
+client resolution. It does not require the border contour to repeat at startup.
+For a legacy route without saved calibration, startup can discover an OpenCV
+border only when its region independently contains the yellow character
 diamond; the broad fallback search region is never used as map geometry.
-Keyboard input is armed only after calibration succeeds. UI-overlaid pre-focus
-frames therefore cannot enter the vote, and window checking remains idle before
-Start Patrol.
+Keyboard input is armed only after preparation succeeds, and window checking
+remains idle before Start Patrol.
 
 ## What the assistant does
 
@@ -136,6 +136,9 @@ record-button click focuses the game, resets stale minimap geometry, and takes
 up to three fresh one-off samples. A point is accepted only after an OpenCV
 minimap border and yellow character diamond are both detected, which avoids
 machine-specific failures caused by an overlapping UI or a transition frame.
+Every successful recording also replaces the normalized `minimap_calibration`
+in `user_config.json`. Patrol consumes that saved border independently, so its
+startup does not depend on a recent recording frame or stable contour voting.
 
 ## Movement and safety rules
 
@@ -187,8 +190,9 @@ machine-specific failures caused by an overlapping UI or a transition frame.
 
 Configuration is intentionally split by ownership:
 
-- `user_config.json` contains only UI-managed values and route recordings:
-  `recording`, `drug`, `fixed_attack`, `additional_functions`,
+- `user_config.json` contains UI-managed values, route recordings, and the
+  recording-owned minimap border: `minimap_calibration`, `recording`, `drug`,
+  `fixed_attack`, `additional_functions`,
   `yolo_detection`, and `ui_window`. It is ignored and excluded from releases,
   so copying an update over an installation preserves every user choice.
 - `system_config.json` contains update-owned internal behavior, currently
