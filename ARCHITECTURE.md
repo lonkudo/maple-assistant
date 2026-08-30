@@ -342,9 +342,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
 1. Run the exact release-gate suite defined in `release_now.ps1`; save output
    to `work/release_gate.log`; abort on nonzero exit.
 2. Ensure `build_release.ps1` has its required UTF-8 BOM.
-3. Run `build_release.ps1 -Zip`, which recreates
+3. The release script advances the four-digit `VERSION` counter (`0000` to
+   `9999`) and runs `build_release.ps1 -Version NNNN -Zip`, which recreates
    `release/MapleAssistant`, copies runtime files/assets/model weights, removes
-   old ZIPs, and creates `release/MapleAssistant-{dd-HH-mm}.zip`.
+   old ZIPs, and creates `release/MapleAssistant-vNNNN.zip`. Failed build or
+   verification restores the prior counter; `9999` never wraps.
 4. Run the local verifier `work/verify_zip.py` against the newest ZIP; abort
    if verification fails.
 5. Inspect `git diff --check` and `git status`, stage only intended source,
@@ -494,7 +496,8 @@ These exist locally but are not guaranteed in a clone or commit:
 |---|---|
 | `.venv/`, `yolo-detection/venv313/` | Local Python environments; never commit |
 | `work/` | Logs, state JSON, debug captures, ad-hoc diagnostics, release gate log, and required local `verify_zip.py` |
-| `release/` | Rebuilt distributable directory and timestamped ZIP |
+| `VERSION`, `versioning.py` | Four-digit release counter and UI version label |
+| `release/` | Rebuilt distributable directory and `MapleAssistant-vNNNN.zip` |
 | `recording-assets/` | Map-name index/reference images and map-structure reference; packaged when present |
 | `outputs/` | Generated detection outputs |
 | `map_profiles/` | Currently local/empty profile directory |

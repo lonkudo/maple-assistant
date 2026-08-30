@@ -13,11 +13,22 @@
 #>
 param(
     [string]$OutDir = "release\MapleAssistant",
+    [string]$Version = "",
     [switch]$Zip
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$versionFile = Join-Path $root "VERSION"
+if (-not $Version) {
+    if (-not (Test-Path -LiteralPath $versionFile)) {
+        throw "VERSION 文件不存在；请通过 release_now.ps1 发布"
+    }
+    $Version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+}
+if ($Version -notmatch '^\d{4}$') {
+    throw "版本号必须是 0000 到 9999 的四位数字: $Version"
+}
 $out = Join-Path $root $OutDir
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out -Force | Out-Null
@@ -42,6 +53,7 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
                    "yolo_detection_settings.json")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
+Copy-Item -LiteralPath $versionFile -Destination (Join-Path $out "VERSION")
 
 # --- countdown reminder sound -----------------------------------------------
 $soundIn = Join-Path $root "sound"
@@ -86,10 +98,7 @@ Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundCo
 Write-Host ""
 
 if ($Zip) {
-    # 时间戳：每次重建生成不同文件名，方便区分版本（如 MapleAssistant-29-21-05.zip）。
-    # Windows 文件名不允许冒号，故用 dd-HH-mm（日-时-分）代替 {dd:HH:mm}。
-    $stamp = Get-Date -Format "dd-HH-mm"
-    $zipPath = Join-Path $root "release\MapleAssistant-$stamp.zip"
+    $zipPath = Join-Path $root "release\MapleAssistant-v$Version.zip"
     # 先删除旧的压缩包（带重试，防止旧包被资源管理器/杀软短暂锁定），
     # 重建后不会残留旧包。
     Get-ChildItem (Join-Path $root "release") -Filter "MapleAssistant*.zip" |

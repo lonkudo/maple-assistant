@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     One-command release: run the release-gate tests, rebuild the distributable
-    folder + timestamped zip, and verify the zip.  Everything the README
+    folder + four-digit versioned zip, and verify the zip. Everything the README
     "Releasing a new build" section does, in one step.
 
 .EXAMPLE
@@ -36,6 +36,7 @@ if (-not $SkipTests) {
         test_lie_detector_worker test_screen_blinker `
         test_minimap_detector test_assistant test_single_instance `
         test_capture_worker test_map_identity test_map_structure_tracker `
+        test_versioning `
         *> $tempLog 2>&1
     $testExit = $LASTEXITCODE
     Pop-Location
@@ -47,6 +48,35 @@ if (-not $SkipTests) {
 }
 
 Write-Host "== 2/3 build + zip ==" -ForegroundColor Cyan
+$versionPath = Join-Path $root "VERSION"
+$hadVersion = Test-Path -LiteralPath $versionPath
+$previousVersion = if ($hadVersion) {
+    Get-Content -LiteralPath $versionPath -Raw
+} else { $null }
+$versionOutput = @(& $python -u (Join-Path $root "versioning.py") `
+    next $versionPath 2>&1)
+if ($LASTEXITCODE -ne 0 -or $versionOutput.Count -eq 0) {
+    $versionOutput | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+    exit 1
+}
+$version = $versionOutput[-1].ToString().Trim()
+if ($version -notmatch '^\d{4}$') {
+    Write-Host "invalid next release version: $version" -ForegroundColor Red
+    exit 1
+}
+[System.IO.File]::WriteAllText(
+    $versionPath, "$version`n", [System.Text.Encoding]::ASCII
+)
+function Restore-VersionFile {
+    if ($hadVersion) {
+        [System.IO.File]::WriteAllText(
+            $versionPath, $previousVersion, [System.Text.Encoding]::ASCII
+        )
+    } elseif (Test-Path -LiteralPath $versionPath) {
+        Remove-Item -LiteralPath $versionPath -Force
+    }
+}
+Write-Host "release version: v$version" -ForegroundColor Green
 # build_release.ps1 must stay UTF-8 WITH BOM - Windows PowerShell 5.1 cannot
 # parse its Chinese script text without it, and some editors strip the BOM.
 # Repair automatically so the one-command flow always works.
@@ -60,15 +90,18 @@ if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes
     Write-Host "build_release.ps1 BOM re-added (UTF-8 with BOM)" -ForegroundColor Yellow
 }
 & powershell -NoProfile -ExecutionPolicy Bypass `
-    -File $buildScript -Zip 2>&1
+    -File $buildScript -Version $version -Zip 2>&1
 if ($LASTEXITCODE -ne 0) {
+    Restore-VersionFile
     Write-Host "build_release.ps1 FAILED" -ForegroundColor Red
     exit 1
 }
 
-$zip = Get-ChildItem (Join-Path $root "release") -Filter "*-*.zip" |
-    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+$zip = Get-Item -LiteralPath (
+    Join-Path $root "release\MapleAssistant-v$version.zip"
+) -ErrorAction SilentlyContinue
 if ($null -eq $zip) {
+    Restore-VersionFile
     Write-Host "no zip was produced under release\" -ForegroundColor Red
     exit 1
 }
@@ -76,6 +109,8 @@ if ($null -eq $zip) {
 Write-Host "== 3/3 verify ==" -ForegroundColor Cyan
 & $python -u (Join-Path $root "work\verify_zip.py") $zip.FullName 2>&1
 if ($LASTEXITCODE -ne 0) {
+    Restore-VersionFile
+    Remove-Item -LiteralPath $zip.FullName -Force -ErrorAction SilentlyContinue
     Write-Host "zip verification FAILED - do not ship" -ForegroundColor Red
     exit 1
 }

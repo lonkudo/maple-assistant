@@ -24,6 +24,7 @@ from minimap_detector import Box, MinimapDetection, MinimapDetector
 from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
+from versioning import version_label
 
 
 LOG = logging.getLogger(__name__)
@@ -542,7 +543,8 @@ class UiWorker(threading.Thread):
 
             root = tk.Tk()
             self._root = root
-            root.title("Maple 助手 调试界面")
+            app_version = version_label()
+            root.title(f"Maple 助手 ({app_version}) 调试界面")
             screen_width = root.winfo_screenwidth()
             screen_height = root.winfo_screenheight()
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
@@ -559,7 +561,10 @@ class UiWorker(threading.Thread):
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
-            title = ttk.Label(container, text="Maple 助手", font=("Segoe UI", 16, "bold"))
+            title = ttk.Label(
+                container, text=f"Maple 助手 ({app_version})",
+                font=("Segoe UI", 16, "bold"),
+            )
             title.pack(anchor="w")
             ttk.Label(container, text="OpenCV 小地图检测 · 巡逻控制").pack(anchor="w")
 

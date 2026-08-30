@@ -212,10 +212,14 @@ The script performs three gated stages:
    `yolo-detection\venv313\Scripts\python.exe` when present, otherwise
    `python`. Output is saved to `work\release_gate.log`; any failing test stops
    the release.
-2. **Build and ZIP** via `build_release.ps1 -Zip`. The destination
+2. **Advance version, build, and ZIP.** `VERSION` is a four-digit counter from
+   `0000` through `9999`. A missing file starts at `0000`; every later
+   successful `release_now.ps1` run advances it once. The value is restored if
+   build or verification fails. `build_release.ps1` receives that version. The destination
    `release\MapleAssistant\` is rebuilt from scratch, runtime files and model
    weights are copied, ignored development/test artifacts are excluded, old
-   ZIPs are removed, and a new `MapleAssistant-{dd-HH-mm}.zip` is created.
+   ZIPs are removed, and `MapleAssistant-v{0000..9999}.zip` is created. The
+   packaged `VERSION` file drives the visible `Maple 助手 (vNNNN)` UI label.
 3. **ZIP verification** via `work\verify_zip.py`. A verification failure means
    the ZIP must not be shipped.
 
@@ -225,6 +229,8 @@ Important publishing details:
   `release_now.ps1` repairs the BOM automatically when needed.
 - `work\verify_zip.py` is currently a required local helper inside a
   Git-ignored directory. Confirm it exists before publishing on a fresh clone.
+- Version `9999` is terminal: publishing stops with an error instead of
+  wrapping back to `0000`.
 - `release\` is Git-ignored. The ZIP is a delivery artifact, not part of the
   commit.
 - `config.json` is user-owned and excluded from releases; never replace it
