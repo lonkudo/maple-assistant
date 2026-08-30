@@ -42,11 +42,12 @@ MINIMAP_ANALYSIS_SIZE = (400, 400)
 # window resolution, so HUD regions must be absolute pixels, not normalized
 # fractions of the client.  Measured on the real client: the top-left region
 # holds the MAP NAME (a ~64px-high strip) and BELOW it the real minimap
-# (~380px wide).  The search region therefore starts at y=64 so the map-name
-# strip can never be mistaken for the minimap border; the minimap itself
-# varies a little between maps.
-MINIMAP_MAP_NAME_HEIGHT = 64
-MINIMAP_FALLBACK_REGION = (0, MINIMAP_MAP_NAME_HEIGHT, 400, 320)
+# (~380px wide).  The search region starts at y=60 (4px of tolerance below
+# the 64px strip) so the map-name strip can never be mistaken for the
+# minimap border while small measurement errors still fit; the minimap
+# itself varies a little between maps.
+MINIMAP_REGION_TOP = 60
+MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
 # HP/MP bars: measured ~228x35 px at the BOTTOM of the window, slightly LEFT
 # of the horizontal center (the info bar they sit in is exactly
 # bottom-centered).  The box is anchored to the window bottom and to a point

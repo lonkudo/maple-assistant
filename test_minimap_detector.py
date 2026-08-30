@@ -584,10 +584,10 @@ class MinimapDetectorTests(unittest.TestCase):
         The live client log showed detection=opencv window=(5,22,45,62) - a
         40x40 contour inside the 64px map-name strip - whose analysis box
         excluded the yellow marker, failing every record click.  The search
-        region starts BELOW the map-name strip (y=64), so such tiny contours
-        are never candidates; when no real border closes, the marker-verified
-        fixed region (source=fixed-region) is the geometry and the map-name
-        crop reads the strip above the minimap.
+        region starts BELOW the map-name strip (y=60, 4px tolerance), so
+        such tiny contours are never candidates; when no real border closes,
+        the marker-verified fixed region (source=fixed-region) is the
+        geometry and the map-name crop reads the strip above the minimap.
         """
 
         import numpy as np
@@ -610,7 +610,7 @@ class MinimapDetectorTests(unittest.TestCase):
                     image.putpixel((190 + x, 220 + y), color)
 
         detector = MinimapDetector(
-            fallback_region=(0, 64, 400, 320),
+            fallback_region=(0, 60, 400, 320),
             dedicated_crop=True, opencv_size=(400, 400),
         )
         detection = detector.detect(image)
@@ -618,13 +618,13 @@ class MinimapDetectorTests(unittest.TestCase):
         # The 40x40 box is rejected; geometry is the fixed region below the
         # map-name strip and the marker is inside the analysis box.
         self.assertEqual(detection.source, "fallback")
-        self.assertGreaterEqual(detection.window_box[1], 64)
+        self.assertGreaterEqual(detection.window_box[1], 60)
         marker = detect_yellow_diamond(np.asarray(
             image.crop(detection.analysis_box).convert("RGB")
         ))
         self.assertIsNotNone(marker)
         # The map-name crop is the strip ABOVE the minimap, not inside it.
-        self.assertLessEqual(detection.map_name_box[3], 64)
+        self.assertLessEqual(detection.map_name_box[3], 60)
 
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(

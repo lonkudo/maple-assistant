@@ -189,7 +189,10 @@ class MinimapDetector:
 
     def __init__(
         self,
-        fallback_region: NormalizedBox = (0, 64, 400, 320),
+        # default measured on the real client: the map-name strip occupies
+        # the top ~64px and the minimap starts below it; the search region
+        # starts at y=60 for 4px of tolerance.
+        fallback_region: NormalizedBox = (0, 60, 400, 320),
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
@@ -613,21 +616,6 @@ class MinimapDetector:
             max(inner_candidates, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]))
             if inner_candidates else analysis_box
         )
-        # The MAP NAME is a fixed strip ABOVE the minimap (measured ~64px
-        # tall): its crop must read that strip, not a region inside the map
-        # canvas.  The minimap border starts below it, so the name crop is
-        # the band between the search-region top and the detected border's
-        # top, widened to the border's horizontal span.
-        map_name_box = _clamp_box(
-            (
-                left,
-                self.fallback_region[1],
-                right,
-                max(top, self.fallback_region[1] + 1),
-            ),
-            width,
-            height,
-        )
         working_size = (width, height)
 
         def to_original(box: Box) -> Box:
@@ -654,7 +642,29 @@ class MinimapDetector:
         window_box, analysis_box, canvas_box = self._stabilize_boxes(
             window_box, analysis_box, canvas_box
         )
-        map_name_box = to_original(map_name_box)
+        # The MAP NAME is a fixed strip ABOVE the minimap (measured ~64px
+        # tall): its crop must read that strip from the ORIGINAL image, not
+        # the search crop (which starts below it at y=60).  The name crop is
+        # the band between the image top and the detected border's top,
+        # widened to the border's horizontal span.
+        map_name_box = _clamp_box(
+            (window_box[0], 0, window_box[2], max(1, window_box[1])),
+            original_size[0],
+            original_size[1],
+        )
+        if map_name_box[3] - map_name_box[1] < 4:
+            # The minimap touches the window top (no map-name strip above);
+            # fall back to the top band of the minimap itself.
+            band_top = window_box[1]
+            band_bottom = min(
+                original_size[1],
+                band_top + max(4, (window_box[3] - window_box[1]) // 4),
+            )
+            map_name_box = _clamp_box(
+                (window_box[0], band_top, window_box[2], band_bottom),
+                original_size[0],
+                original_size[1],
+            )
         map_name = self._read_map_name(image, map_name_box)
         confidence = float(np.clip(0.55 + rectangularity * 0.45, 0.0, 1.0))
         return self._remember_good(MinimapDetection(
@@ -682,10 +692,11 @@ class MinimapDetector:
             height,
         )
         # The fallback region starts BELOW the map-name strip (the search
-        # region top is the map name bottom).  The map-name title sits in the
-        # strip ABOVE the minimap (y=0..analysis_top); keep the identity crop
-        # to that static strip so recorded signatures never include the
-        # scrolling map canvas below it.
+        # region top is the map-name bottom, with 4px tolerance).  The
+        # map-name title sits in the strip ABOVE the minimap
+        # (y=0..analysis_top); keep the identity crop to that static strip
+        # so recorded signatures never include the scrolling map canvas
+        # below it.
         map_name_box = _clamp_box(
             (
                 analysis_box[0],
