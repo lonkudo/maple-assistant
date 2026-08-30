@@ -1290,6 +1290,15 @@ class WindowGeometryHelperTests(unittest.TestCase):
         self.assertGreaterEqual(width, 980)
         self.assertGreaterEqual(height, 560)
 
+    def test_clamp_window_geometry_caps_initial_height(self) -> None:
+        width, height, _, _ = _parse_window_geometry(
+            _clamp_window_geometry(
+                "1200x1800+40+40", 2560, 1440, max_height=1250
+            )
+        )
+        self.assertEqual(width, 1200)
+        self.assertEqual(height, 1250)
+
     def test_clamp_window_geometry_falls_back_for_corrupt_input(self) -> None:
         self.assertEqual(
             _clamp_window_geometry("garbage", 1920, 1080),

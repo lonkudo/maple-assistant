@@ -29,6 +29,9 @@ from versioning import version_label
 
 LOG = logging.getLogger(__name__)
 
+_INITIAL_WINDOW_WIDTH = 1200
+_INITIAL_WINDOW_HEIGHT = 1250
+
 
 def tooltip_cursor_top_right_position(
     pointer_x: int,
@@ -75,6 +78,7 @@ def _clamp_window_geometry(
     screen_height: int = 1080,
     min_width: int = 980,
     min_height: int = 560,
+    max_height: Optional[int] = None,
 ) -> str:
     """Keep a restored window fully on-screen and at least the minimum size.
 
@@ -87,7 +91,10 @@ def _clamp_window_geometry(
         return f"{min_width}x{min_height}+40+40"
     width, height, x, y = parsed
     width = max(min_width, min(width, max(min_width, screen_width)))
-    height = max(min_height, min(height, max(min_height, screen_height)))
+    height_limit = max(min_height, screen_height)
+    if max_height is not None:
+        height_limit = min(height_limit, max(min_height, int(max_height)))
+    height = max(min_height, min(height, height_limit))
     x = max(0, min(x, max(0, screen_width - width - 8)))
     y = max(0, min(y, max(0, screen_height - height - 40)))
     return f"{width}x{height}+{x}+{y}"
@@ -591,10 +598,12 @@ class UiWorker(threading.Thread):
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
             # 不会因调试窗口抢到前台而松开按键、角色跳离绳索。窗口位置与大小
             # 按上次保存的几何恢复（可移动、可调整），默认不再固定左上角。
-            window_height = 1000
-            restored = _load_window_geometry(f"1200x{window_height}+40+40")
+            restored = _load_window_geometry(
+                f"{_INITIAL_WINDOW_WIDTH}x{_INITIAL_WINDOW_HEIGHT}+40+40"
+            )
             root.geometry(_clamp_window_geometry(
                 restored, screen_width, screen_height,
+                max_height=_INITIAL_WINDOW_HEIGHT,
             ))
             root.minsize(980, 560)
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
