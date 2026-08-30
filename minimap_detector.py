@@ -85,17 +85,23 @@ def minimap_calibration_to_dict(
     detection: MinimapDetection,
     image_size: tuple[int, int],
 ) -> dict[str, Any]:
-    """Serialize a recording-verified border independently of resolution."""
+    """Serialize a recording-verified border in ABSOLUTE pixels.
+
+    The game HUD is fixed pixel: only the playfield viewport scales with the
+    window, so the minimap border occupies the same pixels at any resolution.
+    Storing absolute boxes (instead of client-normalized fractions) makes the
+    saved calibration valid regardless of the current window size.
+    """
 
     if not detection.source.startswith("opencv"):
         raise ValueError("only an OpenCV minimap border can be calibrated")
     return {
-        "schema": 1,
+        "schema": 2,
         "recorded_client_size": [int(image_size[0]), int(image_size[1])],
-        "window_box": list(box_to_normalized(detection.window_box, image_size)),
-        "analysis_box": list(box_to_normalized(detection.analysis_box, image_size)),
-        "canvas_box": list(box_to_normalized(detection.canvas_box, image_size)),
-        "map_name_box": list(box_to_normalized(detection.map_name_box, image_size)),
+        "window_box": list(detection.window_box),
+        "analysis_box": list(detection.analysis_box),
+        "canvas_box": list(detection.canvas_box),
+        "map_name_box": list(detection.map_name_box),
         "confidence": float(detection.confidence),
     }
 
@@ -104,28 +110,42 @@ def minimap_calibration_from_dict(
     value: Mapping[str, Any],
     image_size: tuple[int, int],
 ) -> Optional[MinimapDetection]:
-    """Scale a saved normalized border to the current game-client size."""
+    """Return a saved border in ABSOLUTE pixels, clamped to the client.
 
-    if value.get("schema") != 1:
-        return None
+    Schema 2 stores absolute pixel boxes (see ``minimap_calibration_to_dict``)
+    and is applied unchanged because the minimap is fixed pixel.  Schema 1
+    stored client-normalized fractions from an older release and is rescaled
+    for compatibility; a fresh recording overwrites it with schema 2.
+    """
+
     width, height = image_size
     if width < 1 or height < 1:
         return None
+    schema = value.get("schema")
+    if schema not in (1, 2):
+        return None
+    normalized = schema == 1
 
     def load_box(name: str) -> Box:
         raw = value.get(name)
         if not isinstance(raw, (list, tuple)) or len(raw) != 4:
             raise ValueError(name)
         numbers = tuple(float(item) for item in raw)
-        if (not all(np.isfinite(item) for item in numbers)
-                or not all(-0.01 <= item <= 1.01 for item in numbers)
-                or numbers[2] <= numbers[0]
-                or numbers[3] <= numbers[1]):
+        if not all(np.isfinite(item) for item in numbers):
+            raise ValueError(name)
+        if normalized:
+            if not all(-0.01 <= item <= 1.01 for item in numbers):
+                raise ValueError(name)
+            numbers = (
+                numbers[0] * width, numbers[1] * height,
+                numbers[2] * width, numbers[3] * height,
+            )
+        if numbers[2] <= numbers[0] or numbers[3] <= numbers[1]:
             raise ValueError(name)
         return _clamp_box(
             (
-                round(numbers[0] * width), round(numbers[1] * height),
-                round(numbers[2] * width), round(numbers[3] * height),
+                round(numbers[0]), round(numbers[1]),
+                round(numbers[2]), round(numbers[3]),
             ),
             width,
             height,
@@ -157,7 +177,7 @@ class MinimapDetector:
 
     def __init__(
         self,
-        fallback_region: NormalizedBox = (0.0, 0.0, 0.22, 0.27),
+        fallback_region: NormalizedBox = (0, 0, 400, 400),
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
@@ -165,6 +185,10 @@ class MinimapDetector:
         box_history: int = 5,
         box_jump_ratio: float = 0.25,
     ) -> None:
+        # The game HUD is fixed pixel: the minimap occupies the same absolute
+        # pixels at any window resolution.  ``fallback_region`` is therefore
+        # expressed in ABSOLUTE client pixels (calibrated at the 2560x1600
+        # reference), not as a fraction of the current client.
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
         self.dedicated_crop = bool(dedicated_crop)
@@ -293,8 +317,7 @@ class MinimapDetector:
         width, height = image.size
         left, top, right, bottom = self.fallback_region
         crop_box = _clamp_box(
-            (round(left * width), round(top * height),
-             round(right * width), round(bottom * height)),
+            (round(left), round(top), round(right), round(bottom)),
             width,
             height,
         )
@@ -628,8 +651,7 @@ class MinimapDetector:
         width, height = image.size
         left, top, right, bottom = self.fallback_region
         analysis_box = _clamp_box(
-            (round(left * width), round(top * height),
-             round(right * width), round(bottom * height)),
+            (round(left), round(top), round(right), round(bottom)),
             width,
             height,
         )

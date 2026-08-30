@@ -1597,7 +1597,7 @@ class UiWorker(threading.Thread):
             # then seeds the shared detector via on_recording_verified.
             probe = MinimapDetector(
                 fallback_region=getattr(
-                    self.detector, "fallback_region", (0.0, 0.0, 0.22, 0.27)
+                    self.detector, "fallback_region", (0, 0, 400, 400)
                 ),
                 dedicated_crop=getattr(self.detector, "dedicated_crop", True),
                 opencv_size=getattr(self.detector, "opencv_size", (400, 400)),

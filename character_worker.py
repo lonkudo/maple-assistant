@@ -27,9 +27,10 @@ from countdown_worker import play_mp3
 
 LOG = logging.getLogger(__name__)
 
-# Fallback minimap region when the movement worker has not produced its
-# stabilised box yet (normalised left/top/right/bottom).
-DEFAULT_MINIMAP_REGION = (0.0, 0.0, 0.22, 0.27)
+# Fallback minimap region in ABSOLUTE client pixels (the HUD is fixed
+# pixel; only the viewport scales).  The movement worker overrides this with
+# its per-frame normalized analysis box as soon as it publishes.
+DEFAULT_MINIMAP_REGION = (0, 0, 400, 400)
 
 
 class CharacterPosition:
@@ -59,12 +60,23 @@ class CharacterPosition:
 
 def _crop_minimap(image: Any, region: tuple[float, float, float, float]) -> np.ndarray:
     width, height = image.size
-    box = (
-        max(0, min(width, int(region[0] * width))),
-        max(0, min(height, int(region[1] * height))),
-        max(0, min(width, int(region[2] * width))),
-        max(0, min(height, int(region[3] * height))),
-    )
+    # Movement publishes a per-frame NORMALIZED analysis box (all values in
+    # 0..1); the fallback default is ABSOLUTE pixels (values > 1).  Handle
+    # both so the fixed-pixel HUD works at any window size.
+    if all(-0.01 <= value <= 1.01 for value in region):
+        box = (
+            max(0, min(width, int(region[0] * width))),
+            max(0, min(height, int(region[1] * height))),
+            max(0, min(width, int(region[2] * width))),
+            max(0, min(height, int(region[3] * height))),
+        )
+    else:
+        box = (
+            max(0, min(width, int(region[0]))),
+            max(0, min(height, int(region[1]))),
+            max(0, min(width, int(region[2]))),
+            max(0, min(height, int(region[3]))),
+        )
     if box[2] <= box[0] or box[3] <= box[1]:
         return np.zeros((1, 1, 3), dtype=np.uint8)
     return np.asarray(image.crop(box).convert("RGB"), dtype=np.uint8)

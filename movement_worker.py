@@ -1038,12 +1038,11 @@ def climb(
     return "input-blocked"
 
 
-# Broad top-left crop.  Keeping it normalized makes initial calibration work
-# across common 16:9/16:10 client resolutions.
-# Only the map drawing inside the top-left minimap panel.  The old broad crop
-# included yellow monsters/items in the game world and could mistake those for
-# the player diamond.
-DEFAULT_MINIMAP_REGION = (0.0, 0.0, 0.22, 0.27)
+# Broad top-left crop in ABSOLUTE client pixels (the HUD is fixed pixel;
+# only the viewport scales).  Only the map drawing inside the top-left
+# minimap panel.  The old broad crop included yellow monsters/items in the
+# game world and could mistake those for the player diamond.
+DEFAULT_MINIMAP_REGION = (0, 0, 400, 400)
 
 # 卡住判定阈值：标记 X 变化 < 0.012（最小地图单位）即视为"没在动"。
 # 按帧判定（连续 10 帧 ≈ 2.5s）触发跳跃，避免把攻击动作的短暂停顿误判为台阶。
@@ -1076,7 +1075,14 @@ def _image_from_frame(frame: Any) -> Image.Image:
 def _crop(image: Image.Image, region: tuple[float, float, float, float]) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     width, height = image.size
     x0, y0, x1, y1 = region
-    box = (int(x0 * width), int(y0 * height), int(x1 * width), int(y1 * height))
+    # Movement normally receives the detector's per-frame NORMALIZED analysis
+    # box (all values in 0..1); the static DEFAULT_MINIMAP_REGION fallback is
+    # ABSOLUTE pixels (values > 1) because the HUD is fixed pixel.  Handle
+    # both so the fixed-pixel minimap works at any window size.
+    if all(-0.01 <= value <= 1.01 for value in region):
+        box = (int(x0 * width), int(y0 * height), int(x1 * width), int(y1 * height))
+    else:
+        box = (int(x0), int(y0), int(x1), int(y1))
     return np.asarray(image.crop(box), dtype=np.uint8), box
 
 

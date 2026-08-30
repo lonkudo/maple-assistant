@@ -37,7 +37,9 @@ class FakeMapNameReader:
 
 
 class MinimapDetectorTests(unittest.TestCase):
-    def test_recorded_calibration_scales_to_current_client_size(self):
+    def test_recorded_calibration_is_absolute_pixels(self):
+        """The HUD is fixed pixel; calibration must not rescale by client."""
+
         detection = MinimapDetection(
             (2, 3, 102, 153), (2, 50, 108, 153),
             (8, 55, 98, 148), (16, 12, 96, 45),
@@ -45,12 +47,31 @@ class MinimapDetectorTests(unittest.TestCase):
         )
         saved = minimap_calibration_to_dict(detection, (800, 600))
 
+        # Applying at a completely different client size keeps the same
+        # absolute pixels because the minimap does not scale with the window.
         restored = minimap_calibration_from_dict(saved, (1600, 1200))
 
         self.assertIsNotNone(restored)
-        self.assertEqual(restored.window_box, (4, 6, 204, 306))
-        self.assertEqual(restored.analysis_box, (4, 100, 216, 306))
+        self.assertEqual(restored.window_box, (2, 3, 102, 153))
+        self.assertEqual(restored.analysis_box, (2, 50, 108, 153))
         self.assertEqual(restored.source, "opencv-recording")
+        # The recorded reference client size is preserved for diagnostics.
+        self.assertEqual(saved["recorded_client_size"], [800, 600])
+
+    def test_legacy_normalized_calibration_still_loads(self):
+        """Schema 1 (normalized fractions) loads by rescaling to the client."""
+
+        legacy = {
+            "schema": 1,
+            "window_box": [2 / 800, 3 / 600, 102 / 800, 153 / 600],
+            "analysis_box": [2 / 800, 50 / 600, 108 / 800, 153 / 600],
+            "canvas_box": [8 / 800, 55 / 600, 98 / 800, 148 / 600],
+            "map_name_box": [16 / 800, 12 / 600, 96 / 800, 45 / 600],
+            "confidence": .94,
+        }
+        restored = minimap_calibration_from_dict(legacy, (1600, 1200))
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.window_box, (4, 6, 204, 306))
 
     def test_invalid_recorded_calibration_is_rejected(self):
         self.assertIsNone(minimap_calibration_from_dict({}, (800, 600)))
@@ -168,11 +189,18 @@ class MinimapDetectorTests(unittest.TestCase):
         # A real size jump clears old history instead of slowly averaging it.
         self.assertEqual(tracker.stabilize((15, 15)), (15, 15))
 
-    def test_blank_frame_uses_normalized_fallback(self) -> None:
-        detection = MinimapDetector((0, .1, .2, .3)).detect(
+    def test_blank_frame_uses_absolute_pixel_fallback(self) -> None:
+        """Fallback regions are ABSOLUTE client pixels (fixed-pixel HUD)."""
+
+        detection = MinimapDetector((0, 50, 200, 150)).detect(
             Image.new("RGB", (1000, 500), "black")
         )
         self.assertEqual(detection.source, "fallback")
+        self.assertEqual(detection.analysis_box, (0, 50, 200, 150))
+        # The same absolute box is returned at any client size.
+        detection = MinimapDetector((0, 50, 200, 150)).detect(
+            Image.new("RGB", (1920, 1080), "black")
+        )
         self.assertEqual(detection.analysis_box, (0, 50, 200, 150))
 
     def test_opencv_accepts_expanded_wide_minimap(self) -> None:

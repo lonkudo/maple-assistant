@@ -65,16 +65,20 @@ game client
 ```
 
 `MinimapDetector` uses OpenCV to locate the resizable minimap, inner canvas,
-map-name crop, and analysis box. It analyzes a dedicated top-left crop and
-fits it inside its analysis box preserving the aspect ratio (an exact-square
-squash thinned the minimap border on large clients until detection fell
-back). Candidates are scored so the larger outer frame beats a same-corner
-title-panel strip, and a same-width height collapse (the title strip at any
-zoom) is never adopted as geometry. A genuinely resized border (width AND
-height change together) is adopted once it repeats for a full history
-window, and recording verifies with fresh detector probes so a poisoned
-shared history cannot reject a good frame. `marker_detector.py` locates
-yellow player and
+map-name crop, and analysis box. The game HUD is FIXED pixel: only the
+playfield viewport scales with the window, so the detector's search region,
+the recorded minimap calibration, and the HP/MP capture region are all
+ABSOLUTE client pixels (calibrated at the original 2560x1600 reference) and
+stay valid at any window size. The detector analyzes a dedicated top-left
+crop and fits it inside its analysis box preserving the aspect ratio (an
+exact-square squash thinned the minimap border on large clients until
+detection fell back). Candidates are scored so the larger outer frame beats
+a same-corner title-panel strip, and a same-width height collapse (the title
+strip at any zoom) is never adopted as geometry. A genuinely resized border
+(width AND height change together) is adopted once it repeats for a full
+history window, and recording verifies with fresh detector probes so a
+poisoned shared history cannot reject a good frame. `marker_detector.py`
+locates yellow player and
 red other-player diamonds; its size limits are generous enough for a zoomed
 diamond inside a fixed minimap panel while aspect/compactness checks still
 reject long platform decorations. `DiamondSizeTracker` stabilizes small

@@ -38,20 +38,23 @@ OPENCV_ANALYSIS_SIZE = (200, 200)
 # detector now fits the crop inside this box preserving aspect ratio, and the
 # larger box keeps the border resolvable on large clients.
 MINIMAP_ANALYSIS_SIZE = (400, 400)
-# Keep a small margin around the top-left minimap.  At 20% x 24% the crop can
-# end exactly on the minimap border, making a transient clipped contour more
-# likely.  OpenCV rescales this crop to its fixed analysis size, so the modest
-# 22% x 27% expansion does not increase per-frame detector work.
-MINIMAP_FALLBACK_REGION = (0, 0, 0.22, 0.27)
-STATUS_CAPTURE_REGION = (0.36, 0.96, 0.53, 1)
+# The game HUD is FIXED PIXEL: only the playfield viewport scales with the
+# window resolution, so HUD regions must be absolute pixels, not normalized
+# fractions of the client.  The minimap is anchored top-left; the largest
+# observed border is ~240x250, so a 400x400 absolute search region contains
+# it at any supported window size while keeping the OpenCV working scale at
+# ~1.0 (a huge crop would be downscaled and thin the border).
+MINIMAP_FALLBACK_REGION = (0, 0, 400, 400)
+# HP/MP bars sit at the BOTTOM of the window: x is fixed from the left edge,
+# y is measured from the BOTTOM edge (0.36/0.96/0.53/1 of 2560x1600 gives a
+# 435x64 box whose top is 64px above the bottom).  Negative y = from bottom.
+STATUS_CAPTURE_REGION = (922, -64, 1357, 0)
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
-# Status-bar fractions are calibrated to the CLIENT WIDTH so they hold at any
-# resolution.  The game's HUD may retain a larger fixed-pixel scale on a
-# smaller client; 0.075 is deliberately conservative so potion thresholds
-# trigger a little early rather than dangerously late before a full bar has
-# been observed and calibrated.
-FULL_BAR_CLIENT_FRACTION = 0.075
-MIN_BAR_CLIENT_FRACTION = 0.0020
+# Status-bar widths are FIXED PIXEL values calibrated at the same 2560x1600
+# reference (full bar ~192px = 0.075 of 2560; min ~5px = 0.002 of 2560).
+# They no longer scale with the client width.
+FULL_BAR_CLIENT_FRACTION = 192.0
+MIN_BAR_CLIENT_FRACTION = 5.0
 
 
 class _AnyEvent:
@@ -330,11 +333,12 @@ def main() -> int:
     minimap_region = MINIMAP_FALLBACK_REGION
     status_defaults = StatusConfig()
     status_capture_width = STATUS_CAPTURE_REGION[2] - STATUS_CAPTURE_REGION[0]
+    # The HUD is fixed pixel: the status capture is bottom-anchored and the
+    # detector's expected bar lengths are FIXED PIXEL values (calibrated at
+    # the 2560x1600 reference), not fractions of the current client width.
     status_detector = BarStatusDetector(replace(
         status_defaults,
         status_roi=(0.0, 0.0, 1.0, 1.0),
-        # Client-width-relative fractions: the detector's expected bar length
-        # becomes fraction * client_width, valid at any resolution.
         full_bar_width_fraction=(
             FULL_BAR_CLIENT_FRACTION / status_capture_width
         ),
@@ -359,9 +363,11 @@ def main() -> int:
         bus,
         stop_event,
         args.debug_dir,
-        # Capture the FULL client window (no fixed-size top-left crop) so all
-        # normalized analysis regions map to the client at any resolution.
-        status_capture_region=STATUS_CAPTURE_REGION,
+        # Capture the FULL client window.  The status capture region is an
+        # ABSOLUTE pixel box anchored to the bottom of the window (the HUD is
+        # fixed pixel, only the viewport scales), so it stays correct at any
+        # window size.
+        status_capture_pixel_region=STATUS_CAPTURE_REGION,
         status_capture_interval=args.status_interval,
         capture_enabled_event=_AnyEvent(game_focused, patrol_preparing),
         fast_capture_event=dropping_active,
@@ -478,11 +484,16 @@ def main() -> int:
             )
 
         image_width, image_height = fresh_frame.image.size
+        # The status region is absolute bottom-anchored pixels (HUD is fixed
+        # pixel), so resolve the negative-from-bottom y against this frame.
+        status_left, status_top, status_right, status_bottom = STATUS_CAPTURE_REGION
+        if status_top < 0:
+            status_top = image_height + status_top
+        if status_bottom <= 0:
+            status_bottom = image_height + status_bottom
         status_box = (
-            round(STATUS_CAPTURE_REGION[0] * image_width),
-            round(STATUS_CAPTURE_REGION[1] * image_height),
-            round(STATUS_CAPTURE_REGION[2] * image_width),
-            round(STATUS_CAPTURE_REGION[3] * image_height),
+            round(status_left), round(status_top),
+            round(status_right), round(status_bottom),
         )
         # The colours make the startup check easy to read: green is the
         # detected minimap frame, yellow is the marker/patrol analysis area,

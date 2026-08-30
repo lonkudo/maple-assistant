@@ -121,8 +121,16 @@ def capture_window(
     window_title: str,
     crop_region: NormalizedBox = (0.0, 0.0, 1.0, 1.0),
     crop_pixel_size: Optional[tuple[int, int]] = None,
+    pixel_region: Optional[Box] = None,
 ) -> tuple[Image.Image, WindowRect]:
-    """Capture the visible client area of a Windows window as an RGB image."""
+    """Capture the visible client area of a Windows window as an RGB image.
+
+    ``crop_region`` is a normalized fraction of the client (legacy).
+    ``pixel_region`` (left, top, right, bottom) is in ABSOLUTE client pixels;
+    negative/zero y values are measured from the BOTTOM edge (the HUD is
+    fixed pixel, so the HP/MP bars stay anchored to the bottom of the window
+    when it is resized).  ``pixel_region`` wins when both are provided.
+    """
 
     if not window_title.strip():
         raise ValueError("window_title must not be empty")
@@ -152,7 +160,17 @@ def capture_window(
     if client_width <= 0 or client_height <= 0:
         raise WindowCaptureError(f"window has an empty client area: {window_title!r}")
 
-    if crop_pixel_size is not None:
+    if pixel_region is not None:
+        source_x, source_top, source_right, source_bottom = pixel_region
+        if source_top < 0:
+            source_top = client_height + source_top
+        if source_bottom <= 0:
+            source_bottom = client_height + source_bottom
+        source_x = max(0, min(client_width, int(source_x)))
+        source_right = max(source_x + 1, min(client_width, int(source_right)))
+        source_top = max(0, min(client_height, int(source_top)))
+        source_bottom = max(source_top + 1, min(client_height, int(source_bottom)))
+    elif crop_pixel_size is not None:
         pixel_width, pixel_height = map(int, crop_pixel_size)
         if pixel_width <= 0 or pixel_height <= 0:
             raise ValueError("pixel capture crop must have positive dimensions")
@@ -222,6 +240,7 @@ class CaptureWorker(threading.Thread):
         capture_region: NormalizedBox = (0.0, 0.0, 1.0, 1.0),
         capture_pixel_size: Optional[tuple[int, int]] = None,
         status_capture_region: Optional[NormalizedBox] = None,
+        status_capture_pixel_region: Optional[Box] = None,
         status_capture_interval: Optional[float] = None,
         capture_enabled_event: Optional[threading.Event] = None,
         fast_capture_event: Optional[threading.Event] = None,
@@ -242,6 +261,7 @@ class CaptureWorker(threading.Thread):
         self.capture_region = capture_region
         self.capture_pixel_size = capture_pixel_size
         self.status_capture_region = status_capture_region
+        self.status_capture_pixel_region = status_capture_pixel_region
         self.status_capture_interval = (
             max(0.05, float(status_capture_interval))
             if status_capture_interval is not None else None
@@ -337,11 +357,16 @@ class CaptureWorker(threading.Thread):
                         self.capture_pixel_size,
                     )
                     status_image = None
-                    if (self.status_capture_region is not None
+                    if ((self.status_capture_region is not None
+                         or self.status_capture_pixel_region is not None)
                             and (self.status_capture_interval is None
                                  or captured_monotonic >= next_status_capture)):
                         status_image, _status_rect = capture_window(
-                            self.window_title, self.status_capture_region
+                            self.window_title,
+                            self.status_capture_region
+                            if self.status_capture_pixel_region is None
+                            else (0.0, 0.0, 1.0, 1.0),
+                            pixel_region=self.status_capture_pixel_region,
                         )
                         if self.status_capture_interval is not None:
                             next_status_capture = (
