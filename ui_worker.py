@@ -38,7 +38,7 @@ LOG = logging.getLogger(__name__)
 # the initial width fits both plus the container padding; the initial
 # height is 750px but stays user-resizable (only the minimum is enforced).
 _INITIAL_WINDOW_WIDTH = 500 + 500 + 24  # 2 columns + 12px container padding x2
-_INITIAL_WINDOW_HEIGHT = 750
+_INITIAL_WINDOW_HEIGHT = 650
 
 
 def tooltip_cursor_top_right_position(
@@ -604,7 +604,7 @@ class UiWorker(threading.Thread):
             root = tk.Tk()
             self._root = root
             app_version = version_label()
-            root.title(f"Maple 助手 ({app_version}) 调试界面")
+            root.title(f"Maple 助手 ({app_version})")
             screen_width = root.winfo_screenwidth()
             screen_height = root.winfo_screenheight()
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
@@ -618,26 +618,20 @@ class UiWorker(threading.Thread):
             ))
             # The two columns are fixed at 500px each (plus padding), so the
             # window must never shrink below that; the height stays
-            # user-resizable from the 750px initial value.
+            # user-resizable from the 650px initial value.
             root.minsize(_INITIAL_WINDOW_WIDTH + 12, 560)
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
-            title = ttk.Label(
-                container, text=f"Maple 助手 ({app_version})",
-                font=("Segoe UI", 16, "bold"),
-            )
-            title.pack(anchor="w")
-            ttk.Label(container, text="OpenCV 小地图检测 · 巡逻控制").pack(anchor="w")
 
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
             # Both columns are FIXED at 500px wide: the layout no longer
             # scales with the window width (weight=0, so a wider window
             # leaves the columns at their fixed width and the height is the
-            # resizable dimension).  Initial window height 750px; the user
+            # resizable dimension).  Initial window height 650px; the user
             # can still drag the height (only the minimum is enforced).
             columns.columnconfigure(0, weight=0, minsize=500)
             columns.columnconfigure(1, weight=0, minsize=500)
