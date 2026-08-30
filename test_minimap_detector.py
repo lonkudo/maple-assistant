@@ -111,6 +111,36 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(large.pixel_size[0], small.pixel_size[0])
         self.assertGreater(large.pixel_size[1], small.pixel_size[1])
 
+    def test_diamond_detector_accepts_pure_and_bright_yellow(self) -> None:
+        """The live client renders the diamond as pure/bright yellow.
+
+        The debug snapshot's diamond was golden (255,255,136), so the old
+        mask (blue ~136 +- 30) matched there but rejected the live game's
+        pure yellow (255,255,0..255,240,80), failing recording with "failed
+        to detect yellow diamond".  All saturated yellow shades must be found
+        while orange/brown platform decorations stay excluded.
+        """
+
+        import numpy as np
+
+        def marker(color: tuple[int, int, int], radius: int = 3):
+            image = np.zeros((171, 167, 3), dtype=np.uint8)
+            center_y, center_x = 85, 83
+            for y in range(-radius, radius + 1):
+                for x in range(-radius, radius + 1):
+                    if abs(x) + abs(y) <= radius:
+                        image[center_y + y, center_x + x] = color
+            return detect_yellow_diamond(image)
+
+        for color in [(255, 255, 136), (255, 255, 0), (255, 240, 80),
+                      (240, 220, 100)]:
+            self.assertIsNotNone(marker(color), color)
+
+        # Orange/brown platform decorations are not the player marker.
+        image = np.zeros((171, 167, 3), dtype=np.uint8)
+        image[80, 10:150] = (255, 220, 60)
+        self.assertIsNone(detect_yellow_diamond(image))
+
     def test_diamond_detector_accepts_heavy_minimap_zoom(self) -> None:
         """A zoomed diamond inside a fixed panel must still be found.
 

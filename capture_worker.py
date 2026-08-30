@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw
 
 
 WindowRect = Tuple[int, int, int, int]
+Box = Tuple[int, int, int, int]
 NormalizedBox = Tuple[float, float, float, float]
 CaptureFunction = Callable[[str], tuple[Image.Image, WindowRect]]
 
@@ -241,6 +242,7 @@ class CaptureWorker(threading.Thread):
         capture_pixel_size: Optional[tuple[int, int]] = None,
         status_capture_region: Optional[NormalizedBox] = None,
         status_capture_pixel_region: Optional[Box] = None,
+        status_capture_box_provider: Optional[Callable[[tuple[int, int]], Box]] = None,
         status_capture_interval: Optional[float] = None,
         capture_enabled_event: Optional[threading.Event] = None,
         fast_capture_event: Optional[threading.Event] = None,
@@ -262,6 +264,7 @@ class CaptureWorker(threading.Thread):
         self.capture_pixel_size = capture_pixel_size
         self.status_capture_region = status_capture_region
         self.status_capture_pixel_region = status_capture_pixel_region
+        self.status_capture_box_provider = status_capture_box_provider
         self.status_capture_interval = (
             max(0.05, float(status_capture_interval))
             if status_capture_interval is not None else None
@@ -358,15 +361,25 @@ class CaptureWorker(threading.Thread):
                     )
                     status_image = None
                     if ((self.status_capture_region is not None
-                         or self.status_capture_pixel_region is not None)
+                         or self.status_capture_pixel_region is not None
+                         or self.status_capture_box_provider is not None)
                             and (self.status_capture_interval is None
                                  or captured_monotonic >= next_status_capture)):
+                        # A box provider computes the status box from the
+                        # CURRENT client size (bottom-anchored fixed-pixel
+                        # HUD); otherwise use the static pixel/normalized
+                        # region.
+                        pixel_box = self.status_capture_pixel_region
+                        if (self.status_capture_box_provider is not None
+                                and image is not None):
+                            pixel_box = self.status_capture_box_provider(
+                                image.size
+                            )
                         status_image, _status_rect = capture_window(
                             self.window_title,
                             self.status_capture_region
-                            if self.status_capture_pixel_region is None
-                            else (0.0, 0.0, 1.0, 1.0),
-                            pixel_region=self.status_capture_pixel_region,
+                            if pixel_box is None else (0.0, 0.0, 1.0, 1.0),
+                            pixel_region=pixel_box,
                         )
                         if self.status_capture_interval is not None:
                             next_status_capture = (
@@ -397,6 +410,16 @@ class CaptureWorker(threading.Thread):
                             (int(sr_x1 * w), int(sr_y1 * h), int(sr_x2 * w), int(sr_y2 * h)),
                             outline=(0, 120, 255), width=2
                         )
+                    elif (self.status_capture_pixel_region is not None
+                          or self.status_capture_box_provider is not None):
+                        pixel_box = self.status_capture_pixel_region
+                        if (self.status_capture_box_provider is not None
+                                and image is not None):
+                            pixel_box = self.status_capture_box_provider(
+                                image.size
+                            )
+                        if pixel_box is not None:
+                            draw.rectangle(pixel_box, outline=(0, 120, 255), width=2)
                     # Green: static fallback search ROI
                     if self.debug_minimap_fallback is not None:
                         x1, y1, x2, y2 = self.debug_minimap_fallback

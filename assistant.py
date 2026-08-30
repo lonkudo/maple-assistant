@@ -40,21 +40,33 @@ OPENCV_ANALYSIS_SIZE = (200, 200)
 MINIMAP_ANALYSIS_SIZE = (400, 400)
 # The game HUD is FIXED PIXEL: only the playfield viewport scales with the
 # window resolution, so HUD regions must be absolute pixels, not normalized
-# fractions of the client.  The minimap is anchored top-left; the largest
-# observed border is ~240x250, so a 400x400 absolute search region contains
-# it at any supported window size while keeping the OpenCV working scale at
-# ~1.0 (a huge crop would be downscaled and thin the border).
-MINIMAP_FALLBACK_REGION = (0, 0, 400, 400)
-# HP/MP bars sit at the BOTTOM of the window: x is fixed from the left edge,
-# y is measured from the BOTTOM edge (0.36/0.96/0.53/1 of 2560x1600 gives a
-# 435x64 box whose top is 64px above the bottom).  Negative y = from bottom.
-STATUS_CAPTURE_REGION = (922, -64, 1357, 0)
+# fractions of the client.  Measured on the real client: the minimap border
+# is ~380x250 at the top-left of the game window (it varies a little between
+# maps), so a 400x280 absolute search region contains it at any supported
+# window size while keeping the OpenCV working scale near 1.0.
+MINIMAP_FALLBACK_REGION = (0, 0, 400, 280)
+# HP/MP bars: measured ~228x35 px at the BOTTOM of the window, slightly LEFT
+# of the horizontal center (the info bar they sit in is exactly
+# bottom-centered).  The box is anchored to the window bottom and to a point
+# a little left of the horizontal center, so it follows the window size.
+STATUS_CAPTURE_WIDTH = 228
+STATUS_CAPTURE_HEIGHT = 35
+STATUS_CAPTURE_CENTER_SHIFT = 40  # px left of the window center
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
-# Status-bar widths are FIXED PIXEL values calibrated at the same 2560x1600
-# reference (full bar ~192px = 0.075 of 2560; min ~5px = 0.002 of 2560).
-# They no longer scale with the client width.
-FULL_BAR_CLIENT_FRACTION = 192.0
+# Status-bar widths are FIXED PIXEL values measured on the real client
+# (full bar ~228px wide, minimum meaningful run ~5px).
+FULL_BAR_CLIENT_FRACTION = 228.0
 MIN_BAR_CLIENT_FRACTION = 5.0
+
+
+def status_capture_pixel_box(client_size: tuple[int, int]) -> Box:
+    """Return the bottom-anchored, slightly-left-of-center status box."""
+
+    width, height = client_size
+    center = width // 2 - STATUS_CAPTURE_CENTER_SHIFT
+    left = max(0, center - STATUS_CAPTURE_WIDTH // 2)
+    top = max(0, height - STATUS_CAPTURE_HEIGHT)
+    return (left, top, left + STATUS_CAPTURE_WIDTH, top + STATUS_CAPTURE_HEIGHT)
 
 
 class _AnyEvent:
@@ -332,10 +344,10 @@ def main() -> int:
     rope_profile = map_profile["rope"]
     minimap_region = MINIMAP_FALLBACK_REGION
     status_defaults = StatusConfig()
-    status_capture_width = STATUS_CAPTURE_REGION[2] - STATUS_CAPTURE_REGION[0]
     # The HUD is fixed pixel: the status capture is bottom-anchored and the
-    # detector's expected bar lengths are FIXED PIXEL values (calibrated at
-    # the 2560x1600 reference), not fractions of the current client width.
+    # detector's expected bar lengths are FIXED PIXEL values (measured on the
+    # real client), not fractions of the current client width.
+    status_capture_width = STATUS_CAPTURE_WIDTH
     status_detector = BarStatusDetector(replace(
         status_defaults,
         status_roi=(0.0, 0.0, 1.0, 1.0),
@@ -363,11 +375,11 @@ def main() -> int:
         bus,
         stop_event,
         args.debug_dir,
-        # Capture the FULL client window.  The status capture region is an
-        # ABSOLUTE pixel box anchored to the bottom of the window (the HUD is
-        # fixed pixel, only the viewport scales), so it stays correct at any
-        # window size.
-        status_capture_pixel_region=STATUS_CAPTURE_REGION,
+        # Capture the FULL client window.  The status capture box is computed
+        # per capture from the current client size: bottom-anchored, slightly
+        # left of the horizontal center (the HUD is fixed pixel, only the
+        # viewport scales).
+        status_capture_box_provider=status_capture_pixel_box,
         status_capture_interval=args.status_interval,
         capture_enabled_event=_AnyEvent(game_focused, patrol_preparing),
         fast_capture_event=dropping_active,
@@ -484,17 +496,9 @@ def main() -> int:
             )
 
         image_width, image_height = fresh_frame.image.size
-        # The status region is absolute bottom-anchored pixels (HUD is fixed
-        # pixel), so resolve the negative-from-bottom y against this frame.
-        status_left, status_top, status_right, status_bottom = STATUS_CAPTURE_REGION
-        if status_top < 0:
-            status_top = image_height + status_top
-        if status_bottom <= 0:
-            status_bottom = image_height + status_bottom
-        status_box = (
-            round(status_left), round(status_top),
-            round(status_right), round(status_bottom),
-        )
+        # The status region is bottom-anchored, slightly left of center (HUD
+        # is fixed pixel), computed from this frame's client size.
+        status_box = status_capture_pixel_box(fresh_frame.image.size)
         # The colours make the startup check easy to read: green is the
         # detected minimap frame, yellow is the marker/patrol analysis area,
         # and blue is the HP/MP status capture area.

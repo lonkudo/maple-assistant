@@ -79,12 +79,20 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
 
     rgb = minimap_rgb.astype(np.int16)
     red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    # Accept both the golden snapshot color (255,255,136) and the pure/bright
+    # yellow the live client renders (255,255,0 .. 255,240,80): the marker is
+    # a small saturated yellow diamond, whatever its exact shade.  Long
+    # orange/brown platform decorations stay excluded by requiring a strong
+    # green channel (not orange) and a weak blue channel (not white), plus
+    # the shape/compactness checks below.
     yellow = (
-        (np.abs(red - 255) <= 22)
-        & (np.abs(green - 255) <= 22)
-        & (np.abs(blue - 136) <= 30)
+        (red >= 200)
+        & (green >= 185)
+        & (blue <= 180)
+        & (red >= green * 0.92)
+        & (green >= blue * 1.4)
     )
-    yellow_body = (red >= 200) & (green >= 190) & (blue <= 175)
+    yellow_body = (red >= 200) & (green >= 185) & (blue <= 180)
     height, width = yellow.shape
     candidates: list[tuple[float, MarkerDetection]] = []
     # The player diamond is SMALL: ~6-7 px at normal zoom on a 130-170 px
