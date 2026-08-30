@@ -1353,7 +1353,14 @@ class UiWorker(threading.Thread):
                 self._map_name_label.pack(anchor="w", pady=(4, 0))
 
             debug_frame = ttk.LabelFrame(col2, text="调试日志", padding=6)
-            debug_frame.pack(fill="both", expand=True, pady=(10, 0))
+            # The log panel is FIXED at 280px tall: it must not stretch with
+            # the window (that inflated the actual window height beyond the
+            # configured 750px initial value).  Only the log text inside
+            # scrolls; the window itself resizes vertically without the log
+            # panel growing.
+            debug_frame.configure(height=280)
+            debug_frame.pack_propagate(False)
+            debug_frame.pack(fill="x", pady=(10, 0))
             self._log_text = tk.Text(
                 debug_frame,
                 height=10,
