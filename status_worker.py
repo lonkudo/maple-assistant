@@ -476,11 +476,13 @@ class WindowKeySender:
             for key in held_keys:
                 transition(key, True)
             direct_tap("enter")
-            time.sleep(0.05)
+            # Older/slower clients need time to open chat before Ctrl+V and
+            # to consume the clipboard paste before the final Enter.
+            time.sleep(0.15)
             transition("ctrl", False)
             direct_tap("v")
             transition("ctrl", True)
-            time.sleep(0.05)
+            time.sleep(0.15)
             direct_tap("enter")
         LOG.info("quick message pasted and sent to game window")
         return True

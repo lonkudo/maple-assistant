@@ -373,10 +373,49 @@ def main() -> int:
         # The top-left region only bounds OpenCV work; it is not minimap
         # geometry.  Probe independent fresh frames so one false contour
         # cannot seed that search crop as the coordinate frame.
-        fresh_frame = capture_worker.capture_now()
+        latest_recording_frame = bus.latest
+        retained_recording_geometry = (
+            minimap_detector.retained_geometry(
+                latest_recording_frame.image.size
+            )
+            if latest_recording_frame is not None else None
+        )
+        recording_frame_is_recent = bool(
+            latest_recording_frame is not None
+            and retained_recording_geometry is not None
+            and time.monotonic() - latest_recording_frame.captured_monotonic
+                <= 30.0
+        )
+        if recording_frame_is_recent:
+            # Starting directly after recording is the common reset workflow.
+            # That frame was focused and verified already, so do not enter the
+            # slow backend's failing wake-up path a second time.
+            fresh_frame = latest_recording_frame
+            logging.info(
+                "MINIMAP startup using recent verified recording frame "
+                "sequence=%d",
+                fresh_frame.sequence,
+            )
+        else:
+            try:
+                # Some machines need longer than the generic two-second
+                # one-off timeout while calibration capture is just waking.
+                fresh_frame = capture_worker.capture_now(timeout=5.0)
+            except TimeoutError:
+                if (latest_recording_frame is None
+                        or retained_recording_geometry is None):
+                    raise
+                # An older verified frame is still safer than failing Start
+                # Patrol solely because a slow capture backend timed out.
+                fresh_frame = latest_recording_frame
+                logging.warning(
+                    "MINIMAP startup capture timed out; reusing verified "
+                    "recording frame sequence=%d",
+                    fresh_frame.sequence,
+                )
         previous_geometry = minimap_detector.retained_geometry(
             fresh_frame.image.size
-        )
+        ) or retained_recording_geometry
         probe_frames = [fresh_frame]
         after_sequence = fresh_frame.sequence
         # One forced request is enough. Normal capture publications provide

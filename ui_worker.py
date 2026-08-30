@@ -556,7 +556,8 @@ class UiWorker(threading.Thread):
         self._quick_messages: list[str] = []
         self._quick_message_press_job: Any = None
         self._quick_message_hold_fired = False
-        self._quick_message_double_fired = False
+        self._quick_message_last_click_at = float("-inf")
+        self._quick_message_last_click_index: Optional[int] = None
         self._quick_delete_press_job: Any = None
         self._quick_delete_hold_fired = False
         self._quick_edit_entry: Any = None
@@ -2359,10 +2360,6 @@ class UiWorker(threading.Thread):
                     "<ButtonRelease-1>",
                     lambda event, i=index: self._quick_message_release(i),
                 )
-                button.bind(
-                    "<Double-Button-1>",
-                    lambda event, i=index: self._quick_message_double_click(i),
-                )
             delete_button = self._ttk.Button(row, text="×", width=3)
             delete_button.pack(side="left")
             delete_button.bind(
@@ -2400,14 +2397,23 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
         self._quick_message_press_job = None
-        if getattr(self, "_quick_message_double_fired", False):
-            self._quick_message_double_fired = False
-            return
         if self._quick_message_hold_fired:
             self._quick_message_hold_fired = False
             return
         if not (0 <= index < len(self._quick_messages)):
             return
+        now = time.monotonic()
+        last_at = getattr(
+            self, "_quick_message_last_click_at", float("-inf")
+        )
+        last_index = getattr(self, "_quick_message_last_click_index", None)
+        if last_index == index and now - last_at <= 0.60:
+            self._quick_message_last_click_at = float("-inf")
+            self._quick_message_last_click_index = None
+            self._quick_message_double_click(index)
+            return
+        self._quick_message_last_click_at = now
+        self._quick_message_last_click_index = index
         self._copy_quick_message(index)
 
     def _copy_quick_message(self, index: int) -> bool:
@@ -2433,7 +2439,6 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
         self._quick_message_press_job = None
-        self._quick_message_double_fired = True
         if not self._copy_quick_message(index):
             return "break"
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
@@ -2454,6 +2459,8 @@ class UiWorker(threading.Thread):
     def _quick_message_begin_edit(self, index: int) -> None:
         self._quick_message_press_job = None
         self._quick_message_hold_fired = True
+        self._quick_message_last_click_at = float("-inf")
+        self._quick_message_last_click_index = None
         if 0 <= index < len(self._quick_messages):
             self._render_quick_messages(index)
 

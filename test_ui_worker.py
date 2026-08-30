@@ -82,19 +82,19 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._quick_messages = ["组队吗？"]
         worker._quick_message_press_job = object()
         worker._quick_message_hold_fired = False
-        worker._quick_message_double_fired = False
+        worker._quick_message_last_click_at = float("-inf")
+        worker._quick_message_last_click_index = None
         worker._quick_message_status = Label()
         sender = Sender()
         worker.status_worker = type("Status", (), {"key_sender": sender})()
 
-        self.assertEqual(worker._quick_message_double_click(0), "break")
+        with mock.patch("ui_worker.time.monotonic", side_effect=[10.0, 10.3]):
+            worker._quick_message_release(0)
+            worker._quick_message_release(0)
         self.assertEqual(worker._root.copied, "组队吗？")
         self.assertEqual(sender.calls, 1)
         self.assertIn("已发送", worker._quick_message_status.text)
-        # The release belonging to the second click must not run the normal
-        # single-click action again.
-        worker._quick_message_release(0)
-        self.assertFalse(worker._quick_message_double_fired)
+        self.assertIsNone(worker._quick_message_last_click_index)
 
     def test_quick_delete_requires_hold_callback(self) -> None:
         class Label:

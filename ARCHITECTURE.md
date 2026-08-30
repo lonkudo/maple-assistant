@@ -109,6 +109,11 @@ patrol capture gate. Every recording click first foregrounds the game, waits
 briefly for compositor settlement, then samples up to three forced frames. It
 accepts only a frame containing both an OpenCV minimap border and yellow marker;
 resetting a recording also clears retained minimap geometry.
+The verified recording frame remains a startup input: when it is at most 30
+seconds old, Start Patrol uses it immediately. For an older session, if a slow
+capture backend cannot deliver the first patrol-calibration frame within five
+seconds, Start Patrol reuses the last verified frame and measured border rather
+than aborting.
 
 `FocusWorker` is completely idle while patrol input is disarmed. Once patrol
 starts, it checks whether the selected game is foreground. During a focus
@@ -295,8 +300,9 @@ optional periodic buffs.
 The potion panel is placed in column 2 where the hidden YOLO panel previously
 appeared. The adjacent Quick Messages panel persists up to 20 strings in the
 user-owned `additional_functions` section. Its buttons use the shared 1-second
-gesture convention: short-click copies, double-click explicitly focuses the
-game and sends Enter, Ctrl+V, Enter, long-press edits, and long-pressing the
+gesture convention: short-click copies, two releases within 0.6 seconds
+reliably implement double-click across Windows themes and explicitly focus the
+game and send Enter, Ctrl+V, Enter, long-press edits, and long-pressing the
 adjacent delete icon removes that row. The Telegram machine marker uses the
 same long-press-to-entry, focus-out-to-button interaction.
 
