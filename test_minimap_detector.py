@@ -346,6 +346,85 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertLess(abs(detection.window_size[0] - 158), 12)
         self.assertLess(abs(detection.window_size[1] - 248), 12)
 
+    def test_partial_title_strip_never_becomes_baseline(self) -> None:
+        """A strip sharing the top-left corner must not win over the border.
+
+        The live log flickered between box=(0,0,239,68) (the title strip) and
+        box=(0,0,239,184) (the full border).  A strip that becomes the median
+        excludes the yellow marker from its analysis box, so recording fails
+        with "failed to detect yellow diamond" even though the full border is
+        visible.  When both contours appear in the same frame the outer frame
+        must win; a persistent strip must never replace a full baseline.
+        """
+
+        image = Image.new("RGB", (1707, 1067), "black")
+        draw = ImageDraw.Draw(image)
+        # Solid bright minimap panel (outer contour closes), dark canvas
+        # hollowing the lower part, and a bright title strip with its own
+        # closed contour: the detector sees both a 229x62-ish strip and the
+        # full 235x180 frame, exactly like the live flicker frames.
+        draw.rectangle((0, 0, 239, 184), fill=(150, 160, 175),
+                       outline=(235, 235, 235), width=3)
+        draw.rectangle((6, 84, 233, 178), fill=(35, 45, 55),
+                       outline=(200, 200, 200), width=2)
+        draw.rectangle((6, 6, 233, 66), fill=(145, 180, 195),
+                       outline=(235, 235, 235), width=2)
+
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detection = detector.detect(image)
+
+        self.assertEqual(detection.source, "opencv")
+        # The full border (tall) wins, not the 68-px strip.
+        self.assertGreater(detection.window_size[1], 120)
+
+    def test_strip_poisoned_baseline_recovers_to_full_border(self) -> None:
+        """A first-frame strip must not block recovery for the session.
+
+        Regression: after reset_geometry (recording reset / refocus), the very
+        first frame can detect the partial title strip.  The old stabilizer
+        returned the median forever and never appended the severely-changed
+        full border, so the marker stayed outside the analysis box and every
+        record click failed.  The grow direction must be adopted once the
+        same larger box repeats for a full history window.
+        """
+
+        strip = ((0, 0, 239, 68), (0, 21, 239, 68), (2, 25, 237, 64))
+        full = ((0, 0, 239, 184), (0, 57, 239, 184), (2, 78, 237, 178))
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detector.reset_geometry()
+        self.assertEqual(
+            detector._stabilize_boxes(*strip)[0][3] - 0, 68
+        )
+
+        recovered = None
+        for _frame in range(detector.box_history_len + 3):
+            recovered = detector._stabilize_boxes(*full)
+        self.assertEqual(recovered[0], (0, 0, 239, 184))
+        # And the marker (y=107) is inside the recovered analysis box.
+        self.assertLessEqual(recovered[1][1], 107)
+        self.assertGreaterEqual(recovered[1][3], 107)
+
+    def test_persistent_strip_cannot_shrink_established_full_baseline(self) -> None:
+        """A repeated strip must never shrink a good full-border baseline."""
+
+        strip = ((0, 0, 239, 68), (0, 21, 239, 68), (2, 25, 237, 64))
+        full = ((0, 0, 239, 184), (0, 57, 239, 184), (2, 78, 237, 178))
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detector.reset_geometry()
+        detector._stabilize_boxes(*full)
+        detector._stabilize_boxes(*full)
+        detector._stabilize_boxes(*full)
+
+        for _frame in range(detector.box_history_len + 3):
+            kept = detector._stabilize_boxes(*strip)
+        self.assertEqual(kept[0], (0, 0, 239, 184))
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

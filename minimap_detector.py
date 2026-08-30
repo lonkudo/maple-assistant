@@ -349,6 +349,26 @@ class MinimapDetector:
                     or window_height > median_height * 1.55
                 )
                 if severely_changed:
+                    # Direction matters.  A SHRINK is a partial contour (the
+                    # title-panel strip, e.g. 239x68 vs the full 239x184): it
+                    # must never become the session baseline, no matter how
+                    # many frames repeat it, because its analysis box excludes
+                    # the yellow marker and remaps recorded layer coordinates.
+                    # A GROW is the real border recovering from a first-frame
+                    # strip that poisoned the baseline (or a genuine HUD
+                    # change); adopt it once it repeats consistently.
+                    shrinking = (
+                        window_width < median_width * 0.65
+                        or window_height < median_height * 0.65
+                    )
+                    if shrinking:
+                        self._pending_shrunken_boxes = None
+                        self._pending_shrunken_count = 0
+                        return (
+                            self._coordinate_median(self._box_history, 0),
+                            self._coordinate_median(self._box_history, 1),
+                            self._coordinate_median(self._box_history, 2),
+                        )
                     pending = self._pending_shrunken_boxes
                     same_pending = pending is not None and max(
                         abs(window[0] - pending[0][0]),
@@ -361,15 +381,20 @@ class MinimapDetector:
                     else:
                         self._pending_shrunken_boxes = (window, analysis, canvas)
                         self._pending_shrunken_count = 1
-                    # A running client does not legitimately resize only the
-                    # minimap frame by 35%+ while the game window itself is
-                    # unchanged.  In particular, the much larger candidate
-                    # can be the whole top-left SEARCH CROP, which is only a
-                    # performance boundary and must never become coordinate
-                    # geometry.  Keep the detected minimap border instead.
-                    # Keep the known-good geometry until a fresh assistant
-                    # session starts; a user who intentionally changes HUD
-                    # scale can simply restart before recording/patrolling.
+                    if self._pending_shrunken_count >= self.box_history_len:
+                        # The same larger box has now repeated for a full
+                        # history window: normal detection, not a one-off
+                        # contour flicker.  Adopt it as the session baseline
+                        # so a strip-poisoned first frame cannot block
+                        # recording/patrol for the whole session.
+                        adopted = self._pending_shrunken_boxes
+                        self._box_history.clear()
+                        self._box_history.append(adopted)
+                        self._pending_shrunken_boxes = None
+                        self._pending_shrunken_count = 0
+                        return adopted
+                    # Transient grow: keep the known-good geometry while the
+                    # candidate is still unconfirmed.
                     return (
                         self._coordinate_median(self._box_history, 0),
                         self._coordinate_median(self._box_history, 1),
@@ -469,13 +494,41 @@ class MinimapDetector:
             if x > width * max_left_ratio or y > height * max_top_ratio:
                 continue
             # Prefer the outer, highly rectangular minimap frame over its map
-            # canvas and title-panel child rectangles.
+            # canvas and title-panel child rectangles.  The area cap must not
+            # saturate for both the full border and its title strip (e.g.
+            # 0.41 vs 0.15 of the crop): a saturated tie was broken by
+            # contour order, making detection flicker between the strip and
+            # the full border every frame.  The larger outer frame is the
+            # minimap geometry and must win deterministically.
             area_ratio = rectangle_area / float(width * height)
-            score = rectangularity * 0.65 + min(area_ratio / 0.03, 1.0) * 0.35
+            score = rectangularity * 0.65 + min(area_ratio / 0.20, 1.0) * 0.35
             candidates.append((score, candidate_box, rectangularity))
 
         if not candidates:
             return self._held_or_fallback(image)
+
+        # A partially detected outer border shares the real frame's top-left
+        # corner but is strictly shorter (the title-panel strip, e.g. 239x68
+        # vs the full 239x184).  When both appear in the same frame the strip
+        # must never become the minimap geometry: its analysis box excludes
+        # the yellow player marker, so recording/patrol would fail even
+        # though the full border was visible.  Drop any candidate strictly
+        # contained in another candidate anchored at the same corner.
+        outer: list[tuple[float, Box, float]] = []
+        for score, box, rectangularity in candidates:
+            left, top, right, bottom = box
+            contained = any(
+                abs(other[1][0] - left) <= 1
+                and abs(other[1][1] - top) <= 1
+                and other[1][2] >= right - 1
+                and other[1][3] > bottom + 1
+                for other in candidates
+            )
+            if not contained:
+                outer.append((score, box, rectangularity))
+        if not outer:
+            return self._held_or_fallback(image)
+        candidates = outer
 
         _score, window_box, rectangularity = max(candidates, key=lambda item: item[0])
         left, top, right, bottom = window_box

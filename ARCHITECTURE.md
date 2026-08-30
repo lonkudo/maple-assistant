@@ -68,7 +68,11 @@ game client
 map-name crop, and analysis box. It analyzes a dedicated top-left crop and
 fits it inside its analysis box preserving the aspect ratio (an exact-square
 squash thinned the minimap border on large clients until detection fell
-back). `marker_detector.py` locates yellow player and
+back). Candidates are scored so the larger outer frame beats a same-corner
+title-panel strip, and the box stabilizer rejects transient shrinks (partial
+strips) forever while adopting a persistently repeated larger border so a
+strip-poisoned first frame cannot block recording/patrol for a whole session.
+`marker_detector.py` locates yellow player and
 red other-player diamonds. `DiamondSizeTracker` stabilizes small marker-size
 changes but accepts large zoom changes immediately. `MapStructureTracker`
 estimates scroll-compensated world Y and can re-anchor at a recorded floor.
