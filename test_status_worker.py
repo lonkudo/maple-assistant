@@ -15,18 +15,18 @@ from status_worker import (
 )
 
 
-# Measured on the real client (357x57 bottom-middle capture): HP red
-# x 0-84, MP blue x 89-223, EXP yellow x 230-356, all in the same
+# Measured on the real client (370x57 bottom-middle capture): HP red
+# x 7-91, MP blue x 96-230, EXP yellow x 237-363, all in the same
 # vertical band (rows ~33-53).  Full fills: HP 85px, MP 135px, EXP 127px.
-HP_BAR = (0, 85)
-MP_BAR = (89, 224)
-EXP_BAR = (230, 357)
+HP_BAR = (7, 92)
+MP_BAR = (96, 231)
+EXP_BAR = (237, 364)
 BAND_TOP, BAND_BOTTOM = 33, 53
 
 
 def status_image(hp_ratio: float, mp_ratio: float,
                  exp_ratio: float = 1.0) -> Image.Image:
-    image = Image.new("RGB", (357, 57), "black")
+    image = Image.new("RGB", (370, 57), "black")
     draw = ImageDraw.Draw(image)
     # Gray tracks behind the three bars.
     for left, right in (HP_BAR, MP_BAR, EXP_BAR):
@@ -81,15 +81,15 @@ class StatusTests(unittest.TestCase):
 
     def test_adaptive_full_bar_reference_handles_fixed_pixel_hud(self) -> None:
         # Fixed-pixel HUD: the bars are fixed pixels (HP 85, MP 135, EXP
-        # 127) inside the 357px-wide capture while a stale estimate says
+        # 127) inside the 370px-wide capture while a stale estimate says
         # otherwise.  Once the full bar is observed the reference adapts and
         # ratios are correct - previously every ratio clipped to 1.0 and
         # potions never fired on such machines.
         def frame(hp_px: int, mp_px: int) -> Image.Image:
-            image = Image.new("RGB", (357, 57), "black")
+            image = Image.new("RGB", (370, 57), "black")
             draw = ImageDraw.Draw(image)
-            draw.rectangle((0, 33, hp_px - 1, 53), fill=(220, 20, 20))
-            draw.rectangle((89, 33, 89 + mp_px - 1, 53), fill=(20, 40, 220))
+            draw.rectangle((7, 33, 7 + hp_px - 1, 53), fill=(220, 20, 20))
+            draw.rectangle((96, 33, 96 + mp_px - 1, 53), fill=(20, 40, 220))
             return image
 
         detector = BarStatusDetector()
@@ -103,12 +103,12 @@ class StatusTests(unittest.TestCase):
     def test_partial_bar_never_becomes_the_full_reference(self) -> None:
         # A 60px MP fill is only 75% of the conservative 80px reference.  It
         # must remain 75%, not be learned as "full" and reported as 100%.
-        image = Image.new("RGB", (357, 57), "black")
-        ImageDraw.Draw(image).rectangle((89, 33, 148, 53), fill=(20, 40, 220))
+        image = Image.new("RGB", (370, 57), "black")
+        ImageDraw.Draw(image).rectangle((96, 33, 155, 53), fill=(20, 40, 220))
         detector = BarStatusDetector(replace(
             StatusConfig(status_roi=(0.0, 0.0, 1.0, 1.0)),
             full_bar_width_fractions={
-                "hp": 0.224, "mp": 80.0 / 357.0, "exp": 0.224,
+                "hp": 0.224, "mp": 80.0 / 370.0, "exp": 0.224,
             },
         ))
 
@@ -121,13 +121,13 @@ class StatusTests(unittest.TestCase):
         # A wide blue element (HUD frame / bar-track glow) inside the ROI
         # must NOT be measured as the MP bar - it would lock the ratio at
         # 1.0 and MP potions would never fire.  The real fill is used.
-        image = Image.new("RGB", (357, 57), "black")
+        image = Image.new("RGB", (370, 57), "black")
         draw = ImageDraw.Draw(image)
         # Wide blue artifact, passes the MP mask, sits in its own row band
         # (above the bars) and spans beyond the MP zone.
-        draw.rectangle((0, 10, 356, 14), fill=(60, 120, 220))
+        draw.rectangle((0, 10, 369, 14), fill=(60, 120, 220))
         # Real MP fill at roughly half length (~68px of the 135px estimate).
-        draw.rectangle((89, 33, 156, 53), fill=(20, 40, 220))
+        draw.rectangle((96, 33, 163, 53), fill=(20, 40, 220))
         reading = BarStatusDetector().detect(image)
         self.assertIsNotNone(reading.mp_ratio)
         self.assertLess(reading.mp_ratio, 0.7)
@@ -138,7 +138,7 @@ class StatusTests(unittest.TestCase):
         # EXP yellow fill must never be measured as HP red, and a saturated
         # yellow-green EXP never as MP blue - each bar is measured only in
         # its own horizontal zone.
-        image = Image.new("RGB", (357, 57), "black")
+        image = Image.new("RGB", (370, 57), "black")
         draw = ImageDraw.Draw(image)
         # Only EXP is filled (full yellow); HP/MP zones stay empty.
         draw.rectangle((EXP_BAR[0], BAND_TOP, EXP_BAR[1], BAND_BOTTOM),
@@ -149,7 +149,7 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.exp_ratio, 1.0, delta=0.05)
 
         # Only HP is filled (full red); EXP/MP zones stay empty.
-        image = Image.new("RGB", (357, 57), "black")
+        image = Image.new("RGB", (370, 57), "black")
         draw = ImageDraw.Draw(image)
         draw.rectangle((HP_BAR[0], BAND_TOP, HP_BAR[1], BAND_BOTTOM),
                        fill=(220, 20, 20))
@@ -159,7 +159,7 @@ class StatusTests(unittest.TestCase):
         self.assertIsNone(reading.exp_ratio)
 
         # Only MP is filled (full blue); HP/EXP zones stay empty.
-        image = Image.new("RGB", (357, 57), "black")
+        image = Image.new("RGB", (370, 57), "black")
         draw = ImageDraw.Draw(image)
         draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[1], BAND_BOTTOM),
                        fill=(20, 40, 220))
@@ -169,11 +169,11 @@ class StatusTests(unittest.TestCase):
         self.assertIsNone(reading.exp_ratio)
 
     def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
-        # The status-only capture (357x57 bottom-middle crop) is the image
+        # The status-only capture (370x57 bottom-middle crop) is the image
         # the detector receives; the full bar fractions are fixed-pixel
         # values measured inside that crop.
         full = status_image(0.5, 0.2, 0.75)
-        cropped = full.crop((0, 0, 357, 57))
+        cropped = full.crop((0, 0, 370, 57))
         defaults = StatusConfig()
         config = replace(
             defaults,
@@ -185,11 +185,11 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.exp, 75, delta=3)
 
     def test_bar_calibration_uses_status_only_capture(self) -> None:
-        # The status-only capture (357x57 bottom-middle crop) is the image
+        # The status-only capture (370x57 bottom-middle crop) is the image
         # the detector receives; the full bar fractions are fixed-pixel
         # values measured inside that crop.
         full = status_image(0.5, 0.2, 0.75)
-        cropped = full.crop((0, 0, 357, 57))
+        cropped = full.crop((0, 0, 370, 57))
         defaults = StatusConfig()
         config = replace(
             defaults,

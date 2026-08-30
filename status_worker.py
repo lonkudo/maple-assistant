@@ -569,7 +569,7 @@ class StatusConfig:
     """Calibration values for the classic bottom-centre HP/MP/EXP bars.
 
     ``status_roi`` is (left, top, right, bottom) in normalized frame units.
-    The capture region is the FIXED-PIXEL 357x57 bottom-middle info bar;
+    The capture region is the FIXED-PIXEL 370x57 bottom-middle info bar;
     inside it three bars sit SIDE BY SIDE in the same vertical band - HP
     (red) left, MP (blue) middle, EXP (yellow) right.  Each bar is measured
     ONLY inside its own horizontal zone (``bar_zones``, fractions of the ROI
@@ -600,14 +600,14 @@ class StatusConfig:
     buff2_interval: float = 600.0
     buff1_enabled: bool = False
     buff2_enabled: bool = False
-    # Three side-by-side bars in the fixed-pixel 357x57 info bar (measured
-    # on the real client: HP red x 0-84, MP blue x 89-223, EXP yellow
-    # x 230-356, all in the same vertical band).  Zones are (name, left,
+    # Three side-by-side bars in the fixed-pixel 370x57 info bar (measured
+    # on the real client: HP red x ~7-91, MP blue x ~96-230, EXP yellow
+    # x ~237-363, all in the same vertical band).  Zones are (name, left,
     # right) fractions of the ROI width so the bars can never be mixed.
     bar_zones: tuple[tuple[str, float, float], ...] = (
-        ("hp", 0.00, 0.25),
-        ("mp", 0.25, 0.63),
-        ("exp", 0.63, 1.00),
+        ("hp", 0.02, 0.25),
+        ("mp", 0.26, 0.63),
+        ("exp", 0.64, 1.00),
     )
     # Vertical band (top, bottom) as fractions of the ROI height: the bars
     # occupy rows ~33-53 of the 57px capture; the band excludes the blue
@@ -615,15 +615,15 @@ class StatusConfig:
     bar_band: tuple[float, float] = (0.50, 0.96)
     # Full bar length per bar as a fraction of the ROI width (FIXED PIXEL
     # HUD - measured on the real client: HP ~85px, MP ~135px, EXP ~127px
-    # inside the 357px-wide capture).  Accepted candidates may vary.
+    # inside the 370px-wide capture).  Accepted candidates may vary.
     full_bar_width_fractions: dict[str, float] = field(
         default_factory=lambda: {
-            "hp": 85.0 / 357.0,
-            "mp": 135.0 / 357.0,
-            "exp": 127.0 / 357.0,
+            "hp": 85.0 / 370.0,
+            "mp": 135.0 / 370.0,
+            "exp": 127.0 / 370.0,
         }
     )
-    min_bar_width_fraction: float = 5.0 / 357.0
+    min_bar_width_fraction: float = 5.0 / 370.0
     minimum_action_confidence: float = 0.55
 
 

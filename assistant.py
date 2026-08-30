@@ -48,18 +48,18 @@ MINIMAP_ANALYSIS_SIZE = (400, 400)
 # itself varies a little between maps.
 MINIMAP_REGION_TOP = 60
 MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
-# HP/MP/EXP bars: measured 357x57 px at the BOTTOM MIDDLE of the window
+# HP/MP/EXP bars: measured 370x57 px at the BOTTOM MIDDLE of the window
 # (the info bar is exactly bottom-centered).  Inside the capture the three
 # bars sit SIDE BY SIDE in one vertical band: HP red left, MP blue middle,
 # EXP yellow right.  The box is anchored to the window bottom and centered
 # horizontally, so it follows the window size (the HUD itself is fixed
 # pixel - the bars never change size or position within the region).
-STATUS_CAPTURE_WIDTH = 357
+STATUS_CAPTURE_WIDTH = 370
 STATUS_CAPTURE_HEIGHT = 57
 STATUS_CAPTURE_CENTER_SHIFT = 0  # exactly bottom-centered
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
 # Status-bar widths are FIXED PIXEL values measured on the real client
-# inside the 357px-wide capture: full HP bar ~85px, MP ~135px, EXP ~127px;
+# inside the 370px-wide capture: full HP bar ~85px, MP ~135px, EXP ~127px;
 # minimum meaningful run ~5px.
 FULL_BAR_CLIENT_FRACTIONS = {"hp": 85.0, "mp": 135.0, "exp": 127.0}
 MIN_BAR_CLIENT_FRACTION = 5.0
