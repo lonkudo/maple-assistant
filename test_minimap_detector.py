@@ -314,6 +314,38 @@ class MinimapDetectorTests(unittest.TestCase):
         detector.reset_geometry()
         self.assertEqual(detector._stabilize_boxes(*collapsed), collapsed)
 
+    def test_large_client_border_detects_with_aspect_preserving_fit(self) -> None:
+        """A big client must not fall back because the crop is squashed.
+
+        The debug snapshot is 1707x1067: the 22% x 27% search crop is
+        375x288.  The old exact-square resize to a fixed 200x200 working
+        image distorted that crop and thinned the minimap border until Canny
+        could no longer close its rectangle, so every frame fell back and
+        patrol/recording could never verify a border.  The detector now fits
+        the crop inside its analysis box preserving aspect ratio.
+        """
+
+        image = Image.new("RGB", (1707, 1067), "black")
+        draw = ImageDraw.Draw(image)
+        # Same geometry as the real snapshot: outer border at the top-left
+        # corner, inner map canvas, and a lighter title strip.
+        draw.rectangle((0, 0, 158, 248), outline=(230, 230, 230), width=3)
+        draw.rectangle(
+            (4, 84, 154, 238), fill=(35, 45, 55),
+            outline=(190, 190, 190), width=2,
+        )
+        draw.rectangle((22, 26, 152, 70), fill=(145, 180, 195))
+
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detection = detector.detect(image)
+
+        self.assertEqual(detection.source, "opencv")
+        self.assertGreater(detection.confidence, 0.8)
+        self.assertLess(abs(detection.window_size[0] - 158), 12)
+        self.assertLess(abs(detection.window_size[1] - 248), 12)
+
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
             map_name_reader=FakeMapNameReader()

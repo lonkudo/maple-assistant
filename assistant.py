@@ -32,6 +32,12 @@ def _compact_log_formatter() -> logging.Formatter:
 
 
 OPENCV_ANALYSIS_SIZE = (200, 200)
+# The minimap border needs enough working pixels for Canny to close its
+# rectangle.  A fixed 200x200 square squash of a large-client crop (375x288
+# at 1707x1067) thinned the border until detection always fell back.  The
+# detector now fits the crop inside this box preserving aspect ratio, and the
+# larger box keeps the border resolvable on large clients.
+MINIMAP_ANALYSIS_SIZE = (400, 400)
 # Keep a small margin around the top-left minimap.  At 20% x 24% the crop can
 # end exactly on the minimap border, making a transient clipped contour more
 # likely.  OpenCV rescales this crop to its fixed analysis size, so the modest
@@ -339,7 +345,7 @@ def main() -> int:
     minimap_detector = MinimapDetector(
         fallback_region=minimap_region,
         dedicated_crop=True,
-        opencv_size=OPENCV_ANALYSIS_SIZE,
+        opencv_size=MINIMAP_ANALYSIS_SIZE,
     )
     movement_diamond_tracker = DiamondSizeTracker()
     ui_diamond_tracker = DiamondSizeTracker()
@@ -422,7 +428,7 @@ def main() -> int:
                 probe = MinimapDetector(
                     fallback_region=minimap_region,
                     dedicated_crop=True,
-                    opencv_size=OPENCV_ANALYSIS_SIZE,
+                    opencv_size=MINIMAP_ANALYSIS_SIZE,
                 )
                 candidate_detection = probe.detect(candidate_frame.image)
                 probes.append((candidate_frame, candidate_detection))

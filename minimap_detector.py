@@ -172,6 +172,11 @@ class MinimapDetector:
             (max(96, int(opencv_size[0])), max(96, int(opencv_size[1])))
             if opencv_size is not None else None
         )
+        # Full-client captures are far larger than the minimap; images at or
+        # below this size are treated as already-cropped minimap captures and
+        # searched whole.  Kept independent of ``opencv_size`` so raising the
+        # analysis resolution never reclassifies a normal client frame.
+        self._tight_crop_size = (480, 480)
         self.transient_hold_seconds = max(0.0, float(transient_hold_seconds))
         # Median-smoothing of the detected minimap boxes.  A minimap frame can
         # flip between near-identical contour boxes every frame; each flip
@@ -293,8 +298,8 @@ class MinimapDetector:
             width,
             height,
         )
-        if image.size[0] <= self.opencv_size[0] * 2 \
-                and image.size[1] <= self.opencv_size[1] * 2:
+        if image.size[0] <= self._tight_crop_size[0] \
+                and image.size[1] <= self._tight_crop_size[1]:
             # The capture is already a tight minimap crop; search it whole.
             return image, None
         return image.crop(crop_box), crop_box
@@ -395,7 +400,25 @@ class MinimapDetector:
         original_size = image.size
         cv_image, crop_box = self._analysis_crop(image)
         if self.opencv_size is not None and cv_image.size != self.opencv_size:
-            cv_image = cv_image.resize(self.opencv_size, Image.Resampling.BILINEAR)
+            # Fit inside the analysis box preserving aspect ratio.  The old
+            # exact-square squash distorted a non-square crop (e.g. 375x288 ->
+            # 200x200) and thinned the minimap border until Canny could no
+            # longer close its rectangle, so large clients always fell back.
+            # Never upscale: a crop smaller than the box is already fine.
+            working_width, working_height = cv_image.size
+            target_width, target_height = self.opencv_size
+            scale = min(
+                1.0,
+                target_width / working_width,
+                target_height / working_height,
+            )
+            cv_image = cv_image.resize(
+                (
+                    max(1, round(working_width * scale)),
+                    max(1, round(working_height * scale)),
+                ),
+                Image.Resampling.BILINEAR,
+            )
         rgb = np.asarray(cv_image.convert("RGB"))
         height, width = rgb.shape[:2]
         search_width = (
