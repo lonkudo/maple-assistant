@@ -21,6 +21,19 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn("--disable-interactivity", lowered)
         self.assertLess(lowered.index("python.org/ftp"), lowered.index("winget install"))
 
+    def test_assistant_launcher_cannot_relaunch_batch_recursively(self):
+        for name in ("start_assistant.bat", "启动助手.bat"):
+            text = (ROOT / name).read_text(encoding="utf-8-sig").lower()
+            self.assertIn("wscript.exe", text)
+            self.assertNotIn("net session", text)
+            self.assertNotIn("start-process", text)
+        vbs = (ROOT / "launch_assistant.vbs").read_text(
+            encoding="utf-8-sig"
+        ).lower()
+        self.assertIn("shellapp.shellexecute", vbs)
+        self.assertIn('"runas", 0', vbs)
+        self.assertIn("pythonw.exe", vbs)
+
 
 if __name__ == "__main__":
     unittest.main()

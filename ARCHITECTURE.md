@@ -95,7 +95,8 @@ The UI starts with input disarmed. **Start Patrol** prepares the map session,
 selects the game window, and arms input. **Stop Patrol** disables input and
 releases keys.
 
-`FocusWorker` checks whether the selected game is foreground. During a focus
+`FocusWorker` is completely idle while patrol input is disarmed. Once patrol
+starts, it checks whether the selected game is foreground. During a focus
 dip it clears automation events and releases all keys. It attempts a rate-
 limited asynchronous refocus. A short dip resumes automatically; a sustained
 loss disables input and marks patrol stopped while leaving the UI open.
@@ -410,7 +411,7 @@ git -c core.quotepath=false ls-files
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
 | `install.ps1`, `安装.bat` | Request UAC up front, silently bootstrap Python 3.10 in a hidden installer process, then create `.venv`, dependencies, and launchers |
-| `start_assistant.bat`, `启动助手.bat` | Elevated/normal application launch wrappers |
+| `start_assistant.bat`, `启动助手.bat`, `launch_assistant.vbs` | Portable launcher chain; VBS requests UAC and starts `pythonw` hidden without recursive BAT elevation |
 | `launch_assistant_elevated.vbs` | Development elevation helper; excluded from release |
 | `restart_assistant.ps1` | Development restart helper; excluded from release |
 | `build_release.ps1` | Minimal distributable folder and ZIP builder |

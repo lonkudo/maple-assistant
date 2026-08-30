@@ -31,6 +31,11 @@ For a packaged release on a new Windows machine:
 4. Bring the configured game window to the foreground.
 5. Record or verify the patrol route in the UI, then click **Start Patrol**.
 
+The launcher uses a hidden `wscript`/`pythonw` path: after the single UAC
+confirmation it does not leave a command window behind. Game-window lookup,
+foreground monitoring, and periodic game capture remain idle until **Start
+Patrol** is clicked (manual recording can still request a one-off capture).
+
 See [INSTALL.md](INSTALL.md) for installation and troubleshooting details.
 
 For development from the repository:

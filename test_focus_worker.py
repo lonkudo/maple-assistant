@@ -13,11 +13,13 @@ class FakeSender:
         self.release_calls = 0
         self.disable_calls = 0
         self.select_calls = 0
+        self.focus_calls = 0
 
     def input_is_enabled(self) -> bool:
         return self.enabled
 
     def is_game_foreground(self) -> bool:
+        self.focus_calls += 1
         return self.focused
 
     def select_window(self) -> bool:
@@ -33,6 +35,33 @@ class FakeSender:
 
 
 class FocusWorkerTests(unittest.TestCase):
+    def test_stopped_patrol_does_not_check_or_select_window(self) -> None:
+        sender = FakeSender()
+        sender.enabled = False
+        stop = threading.Event()
+        active = threading.Event()
+        game_focused = threading.Event()
+        worker = FocusWorker(
+            sender, stop, active, game_focused, poll_interval=0.01,
+        )
+        worker.start()
+        try:
+            time.sleep(0.08)
+            self.assertEqual(sender.focus_calls, 0)
+            self.assertEqual(sender.select_calls, 0)
+            self.assertFalse(active.is_set())
+            self.assertFalse(game_focused.is_set())
+
+            sender.enabled = True
+            deadline = time.monotonic() + 0.5
+            while sender.focus_calls < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(sender.focus_calls, 1)
+            self.assertTrue(active.wait(0.5))
+        finally:
+            stop.set()
+            worker.join(0.5)
+
     def test_transient_focus_dip_resumes_without_stopping(self) -> None:
         sender = FakeSender()
         stop = threading.Event()

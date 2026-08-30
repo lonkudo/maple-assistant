@@ -166,27 +166,43 @@ if ($LASTEXITCODE -ne 0) {
 
 # ---- 4. 生成启动器 ------------------------------------------------------------
 # 启动器内容必须为纯 ASCII：cmd 会用系统代码页解码 .bat，中文会乱码并破坏语法。
-# 启动器会先通过 UAC 请求管理员权限（与游戏同权限注入按键才能生效），
-# 然后使用 pythonw 启动助手：不显示命令行窗口，只显示图形界面。
+# BAT 只调用隐藏的 Windows Script Host。VBS 直接用 runas 启动 pythonw，
+# 避免用 net session 判断权限失败后递归重启 BAT、造成命令行窗口反复闪烁。
 $bat = @"
 @echo off
-rem Request administrator rights (UAC) so injected keys reach the game.
-net session >nul 2>&1
-if errorlevel 1 (
-    powershell -NoProfile -Command "Start-Process -FilePath '%~dp0start_assistant.bat' -Verb RunAs"
-    exit /b
-)
 cd /d "%~dp0"
 if not exist ".venv\Scripts\pythonw.exe" (
     echo Virtual environment missing. Run the setup first.
     pause
     exit /b 1
 )
-start "" ".venv\Scripts\pythonw.exe" assistant.py %*
+wscript.exe //nologo "%~dp0launch_assistant.vbs" %*
 "@
+$vbs = @'
+Option Explicit
+
+Dim shellApp, files, root, pythonwPath, assistantPath, arguments, item
+Set files = CreateObject("Scripting.FileSystemObject")
+root = files.GetParentFolderName(WScript.ScriptFullName)
+pythonwPath = root & "\.venv\Scripts\pythonw.exe"
+assistantPath = root & "\assistant.py"
+arguments = QuoteArgument(assistantPath)
+For Each item In WScript.Arguments
+    arguments = arguments & " " & QuoteArgument(CStr(item))
+Next
+
+Set shellApp = CreateObject("Shell.Application")
+' runas shows one UAC prompt; window style 0 keeps the Python console hidden.
+shellApp.ShellExecute pythonwPath, arguments, root, "runas", 0
+
+Function QuoteArgument(value)
+    QuoteArgument = Chr(34) & Replace(value, Chr(34), Chr(34) & Chr(34)) & Chr(34)
+End Function
+'@
 Set-Content -Path "start_assistant.bat" -Value $bat -Encoding ASCII
 Set-Content -Path (Join-Path $root "启动助手.bat") -Value $bat -Encoding ASCII
-Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat" -ForegroundColor Green
+Set-Content -Path (Join-Path $root "launch_assistant.vbs") -Value $vbs -Encoding ASCII
+Write-Host "启动器已生成: start_assistant.bat / 启动助手.bat（隐藏命令行）" -ForegroundColor Green
 
 # ---- 5. YOLO 怪物检测依赖（暂时停用；恢复步骤见 README.md） ------------------
 <# YOLO_DEPENDENCIES_TEMPORARILY_DISABLED

@@ -100,7 +100,13 @@ class FocusWorker(threading.Thread):
         try:
             while not self.stop_event.is_set():
                 input_enabled = bool(self.key_sender.input_is_enabled())
-                game_focused = bool(self.key_sender.is_game_foreground())
+                # Stay completely idle while patrol is stopped.  The old
+                # unconditional probe searched for the game every 0.2s and
+                # also kept the capture pipeline running before Start Patrol.
+                game_focused = (
+                    bool(self.key_sender.is_game_foreground())
+                    if input_enabled else False
+                )
                 if game_focused:
                     self.game_focused_event.set()
                 else:
