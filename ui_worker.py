@@ -34,11 +34,12 @@ from versioning import version_label
 
 LOG = logging.getLogger(__name__)
 
-# The debug UI uses two fixed 500px columns (controls + debug/YOLO), so
-# the initial width fits both plus the container padding; the initial
-# height is 750px but stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 500 + 500 + 24  # 2 columns + 12px container padding x2
-_INITIAL_WINDOW_HEIGHT = 650
+# The debug UI uses two fixed 500px columns (controls + debug/YOLO); the
+# initial size is 1036x672 (two 500px columns + 24px container padding +
+# 12px column gap; header removed, so the height can be compact).  The
+# height stays user-resizable (only the minimum is enforced).
+_INITIAL_WINDOW_WIDTH = 1036
+_INITIAL_WINDOW_HEIGHT = 672
 
 
 def tooltip_cursor_top_right_position(
@@ -616,10 +617,10 @@ class UiWorker(threading.Thread):
             root.geometry(_clamp_window_geometry(
                 restored, screen_width, screen_height,
             ))
-            # The two columns are fixed at 500px each (plus padding), so the
-            # window must never shrink below that; the height stays
-            # user-resizable from the 650px initial value.
-            root.minsize(_INITIAL_WINDOW_WIDTH + 12, 560)
+            # The two columns are fixed at 500px each (plus padding/gap, so
+            # 1036px total), and the window must never shrink below that;
+            # the height stays user-resizable from the 672px initial value.
+            root.minsize(_INITIAL_WINDOW_WIDTH, 560)
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
 
@@ -1354,12 +1355,14 @@ class UiWorker(threading.Thread):
                 self._map_name_label.pack(anchor="w", pady=(4, 0))
 
             debug_frame = ttk.LabelFrame(col2, text="调试日志", padding=6)
-            # The log panel is FIXED at 280px tall: it must not stretch with
-            # the window (that inflated the actual window height beyond the
-            # configured 750px initial value).  Only the log text inside
+            # The log panel is FIXED so it must not stretch with the window
+            # (that inflated the actual window height beyond the configured
+            # initial value).  The LabelFrame's own label + border take ~33px
+            # off the inner area, so the frame is 313px to make the visible
+            # log text area exactly 280px.  Only the log text inside
             # scrolls; the window itself resizes vertically without the log
             # panel growing.
-            debug_frame.configure(height=280)
+            debug_frame.configure(height=313)
             debug_frame.pack_propagate(False)
             debug_frame.pack(fill="x", pady=(10, 0))
             self._log_text = tk.Text(
