@@ -86,34 +86,45 @@ function Find-Python {
 
 function Install-Python {
     <#
-    为当前用户安装 Python 3.10（固定用 3.10，不用最新版）。先尝试 winget，
-    再回退到 python.org 静默安装程序。返回安装后的 python.exe 路径。
+    为当前用户安装 Python 3.10（固定用 3.10，不用最新版）。优先直接运行
+    python.org 官方静默安装程序；失败时再回退到 winget。返回 python.exe 路径。
+    安装.bat 已在最开始取得管理员权限，所以此处不会再次弹出 UAC 或安装向导。
     #>
+    $url = "https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe"
+    $installer = Join-Path $env:TEMP "python-3.10.11-amd64.exe"
+    try {
+        Write-Host "未找到 Python - 正在后台下载并安装 Python 3.10..." -ForegroundColor Yellow
+        Invoke-WebRequest -Uri $url -OutFile $installer
+        $quietArgs = "/quiet InstallAllUsers=0 PrependPath=0 Include_test=0 " +
+            "Include_pip=1 Include_tcltk=1 Include_launcher=1 AssociateFiles=0 " +
+            "Shortcuts=0 SimpleInstall=1"
+        $process = Start-Process -FilePath $installer -ArgumentList $quietArgs `
+            -WindowStyle Hidden -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "Python 安装程序退出码为 $($process.ExitCode)"
+        }
+        $exe = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
+        if (Test-Path $exe) { return $exe }
+        throw "Python 安装结束后找不到 python.exe"
+    } catch {
+        Write-Warning "Python 官方静默安装失败：$($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+    }
+
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
-        Write-Host "未找到 Python - 正在通过 winget 安装 Python 3.10..." -ForegroundColor Yellow
-        & winget install --id Python.Python.3.10 -e --silent `
+        Write-Host "正在通过 winget 后台重试 Python 3.10..." -ForegroundColor Yellow
+        & winget install --id Python.Python.3.10 -e --silent --disable-interactivity `
             --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0) {
             $exe = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
             if (Test-Path $exe) { return $exe }
+            $exe = Find-Python
+            if ($exe) { return $exe }
         }
     }
-    Write-Host "正在从 python.org 下载 Python 3.10..." -ForegroundColor Yellow
-    $url = "https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe"
-    $installer = Join-Path $env:TEMP "python-3.10.11-amd64.exe"
-    Invoke-WebRequest -Uri $url -OutFile $installer
-    $quietArgs = "/quiet InstallAllUsers=0 PrependPath=0 Include_test=0 " +
-        "Include_launcher=1 AssociateFiles=0 Shortcuts=0 SimpleInstall=1"
-    $process = Start-Process -FilePath $installer -ArgumentList $quietArgs -Wait -PassThru
-    if ($process.ExitCode -ne 0) {
-        throw "Python 安装程序退出码为 $($process.ExitCode)"
-    }
-    $exe = "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
-    if (-not (Test-Path $exe)) {
-        throw "Python 已安装但找不到 python.exe；请手动安装 Python 3.10 后重试"
-    }
-    return $exe
+    throw "无法自动安装 Python 3.10；请检查网络后重新双击安装.bat"
 }
 
 # ---- 1. Python -------------------------------------------------------------

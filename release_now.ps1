@@ -36,7 +36,7 @@ if (-not $SkipTests) {
         test_lie_detector_worker test_screen_blinker `
         test_minimap_detector test_assistant test_single_instance `
         test_capture_worker test_map_identity test_map_structure_tracker `
-        test_versioning `
+        test_versioning test_installer_scripts `
         *> $tempLog 2>&1
     $testExit = $LASTEXITCODE
     Pop-Location

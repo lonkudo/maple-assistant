@@ -409,7 +409,7 @@ git -c core.quotepath=false ls-files
 | `sound/beep.mp3` | Countdown reminder sound shipped in releases |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
-| `install.ps1`, `安装.bat` | Bootstrap Python, `.venv`, dependencies, launchers |
+| `install.ps1`, `安装.bat` | Request UAC up front, silently bootstrap Python 3.10 in a hidden installer process, then create `.venv`, dependencies, and launchers |
 | `start_assistant.bat`, `启动助手.bat` | Elevated/normal application launch wrappers |
 | `launch_assistant_elevated.vbs` | Development elevation helper; excluded from release |
 | `restart_assistant.ps1` | Development restart helper; excluded from release |

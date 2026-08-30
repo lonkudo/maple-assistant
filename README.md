@@ -21,7 +21,9 @@ assistant usable when detection confidence is low.
 For a packaged release on a new Windows machine:
 
 1. Extract the complete ZIP.
-2. Double-click `安装.bat`. It finds or installs Python 3.10, creates `.venv`,
+2. Double-click `安装.bat` and approve the single UAC prompt shown immediately.
+   It finds or silently installs Python 3.10 without opening the Python setup
+   wizard, creates `.venv`,
    installs the core dependencies through the Alibaba Cloud PyPI mirror and
    creates the launchers. If that mirror is unavailable, installation retries
    against official PyPI. The large YOLO dependencies are temporarily skipped.

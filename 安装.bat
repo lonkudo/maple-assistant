@@ -1,4 +1,17 @@
 @echo off
+rem Ask for administrator permission before doing any installation work.
+rem The elevated copy receives --elevated so it does not request UAC again.
+if /I "%~1"=="--elevated" goto elevated
+net session >nul 2>&1
+if not errorlevel 1 goto elevated
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '--elevated' -Verb RunAs"
+if errorlevel 1 (
+    echo Administrator permission was not granted. Installation cancelled.
+    pause
+)
+exit /b
+
+:elevated
 title Maple Assistant Installer
 cd /d "%~dp0"
 
