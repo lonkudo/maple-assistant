@@ -433,6 +433,29 @@ def recorded_coordinate_text(x: float, y: float) -> str:
     return f"x={float(x):.4f} y={float(y):.4f}"
 
 
+def machine_name_button_text(name: str) -> str:
+    """Display the saved marker, or the edit hint when it is empty."""
+
+    return str(name).strip() or "修改名称"
+
+
+def normalize_quick_messages(value: Any, limit: int = 20) -> list[str]:
+    """Keep only bounded, non-empty quick-message strings."""
+
+    if not isinstance(value, list):
+        return []
+    messages = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = str(item).strip()
+        if text:
+            messages.append(text[:500])
+        if len(messages) >= max(1, int(limit)):
+            break
+    return messages
+
+
 class UiWorker(threading.Thread):
     """Own the independent UI loop; Tk requires ``run`` on Python's main thread."""
 
@@ -444,6 +467,9 @@ class UiWorker(threading.Thread):
     # Set True to show the "Detection" info panel (frame stats) again; it is
     # hidden by default, the rendering code is kept for future use.
     _SHOW_DETECTION_INFO = False
+    # TEMPORARY: keep every YOLO widget and handler intact but do not pack the
+    # panel/radio into the UI. README.md documents the one-flag restoration.
+    _SHOW_YOLO_PANEL = False
     # TEMPORARY: the current monster model is not trained reliably enough.
     # Keep the implementation below intact so it can be restored quickly;
     # README.md documents the matching installer change.
@@ -517,6 +543,15 @@ class UiWorker(threading.Thread):
         self.telegram_notifier = telegram_notifier
         self._telegram_bot_token = ""
         self._telegram_chat_id = ""
+        self._machine_name_press_job: Any = None
+        self._machine_name_hold_fired = False
+        self._machine_name_entry: Any = None
+        self._quick_messages: list[str] = []
+        self._quick_message_press_job: Any = None
+        self._quick_message_hold_fired = False
+        self._quick_delete_press_job: Any = None
+        self._quick_delete_hold_fired = False
+        self._quick_edit_entry: Any = None
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -664,7 +699,8 @@ class UiWorker(threading.Thread):
                 self._info_label.pack(anchor="w")
 
             yolo_panel = ttk.LabelFrame(col2, text="YOLO 怪物检测", padding=10)
-            yolo_panel.pack(fill="x", pady=(0, 8))
+            if self._SHOW_YOLO_PANEL:
+                yolo_panel.pack(fill="x", pady=(0, 8))
             # Reference kept so the Fixed Attack panel can grey this whole
             # panel out when the fixed-rate mode is selected.
             self._yolo_panel = yolo_panel
@@ -855,7 +891,8 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             )
-            yolo_mode_button.pack(side="left", padx=(0, 12))
+            if self._SHOW_YOLO_PANEL:
+                yolo_mode_button.pack(side="left", padx=(0, 12))
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
                 yolo_mode_button.configure(state="disabled")
             ttk.Radiobutton(
@@ -926,7 +963,7 @@ class UiWorker(threading.Thread):
             # The StatusWorker taps the bound key when the bar ratio drops
             # below the chosen percent (debounced by frames + cooldown).
             drug_panel = ttk.LabelFrame(
-                col1, text="药品 (HP/MP 药水)", padding=10
+                col2, text="药品 (HP/MP 药水)", padding=10
             )
             drug_panel.pack(fill="x", pady=(0, 8))
             hp_row = ttk.Frame(drug_panel)
@@ -1076,6 +1113,24 @@ class UiWorker(threading.Thread):
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
+            # Persistent clipboard shortcuts. Short click copies; long press
+            # edits. The adjacent delete icon also requires a 1s long press.
+            quick_panel = ttk.LabelFrame(col2, text="快捷消息", padding=10)
+            quick_panel.pack(fill="x", pady=(0, 8))
+            quick_header = ttk.Frame(quick_panel)
+            quick_header.pack(fill="x")
+            ttk.Button(
+                quick_header, text="添加快捷消息",
+                command=self._quick_message_add,
+            ).pack(side="left")
+            self._quick_message_status = ttk.Label(
+                quick_header, text="短按复制；长按 1 秒修改/删除。"
+            )
+            self._quick_message_status.pack(side="left", padx=(8, 0))
+            self._quick_messages_frame = ttk.Frame(quick_panel)
+            self._quick_messages_frame.pack(fill="x", pady=(6, 0))
+            self._render_quick_messages()
+
             # Additional Functions panel: optional extras, each gated by its
             # own checkbox.  First one: scheduled shutdown - after X hours
             # the game gets Alt+F4, the worker verifies the window is gone,
@@ -1123,7 +1178,7 @@ class UiWorker(threading.Thread):
             countdown_row.pack(fill="x", pady=(8, 0))
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
-                countdown_row, text="循环声音提醒",
+                countdown_row, text="循环提醒",
                 variable=self._countdown_enabled_var,
                 command=self._countdown_on_change,
             )
@@ -1132,31 +1187,31 @@ class UiWorker(threading.Thread):
             self._countdown_interval_var = tk.DoubleVar(value=1.0)
             self._countdown_interval_slider = ttk.Scale(
                 countdown_row, from_=0.1, to=12.0, orient="horizontal",
+                length=70,
                 variable=self._countdown_interval_var,
                 command=self._countdown_on_change,
             )
             self._countdown_interval_slider.pack(
-                side="left", fill="x", expand=True, padx=(6, 8)
+                side="left", padx=(4, 4)
             )
             self._countdown_interval_label = ttk.Label(
                 countdown_row, text="1.0h", width=6
             )
             self._countdown_interval_label.pack(side="left")
 
-            remaining_row = ttk.Frame(extra_panel)
-            remaining_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(remaining_row, text="剩余时间").pack(
-                side="left", padx=(22, 8)
+            ttk.Label(countdown_row, text="剩余").pack(
+                side="left", padx=(6, 0)
             )
             self._countdown_remaining_var = tk.DoubleVar(value=3600.0)
             self._countdown_remaining_slider = ttk.Scale(
-                remaining_row, from_=0.0, to=3600.0,
+                countdown_row, from_=0.0, to=3600.0,
                 orient="horizontal",
+                length=70,
                 variable=self._countdown_remaining_var,
                 command=self._countdown_remaining_on_drag,
             )
             self._countdown_remaining_slider.pack(
-                side="left", fill="x", expand=True, padx=(0, 8)
+                side="left", padx=(4, 4)
             )
             self._countdown_dragging = False
             self._countdown_remaining_slider.bind(
@@ -1166,7 +1221,7 @@ class UiWorker(threading.Thread):
                 "<ButtonRelease-1>", self._countdown_drag_end
             )
             self._countdown_remaining_label = ttk.Label(
-                remaining_row, text="1h 00m", width=9
+                countdown_row, text="1h 00m", width=9
             )
             self._countdown_remaining_label.pack(side="left")
             self._countdown_status = ttk.Label(
@@ -1216,32 +1271,39 @@ class UiWorker(threading.Thread):
             self._screen_blink_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 blink_row,
-                text="闪烁提醒（红色闪烁两次）",
+                text="闪烁提醒",
                 variable=self._screen_blink_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left", padx=(0, 12))
+
+            self._telegram_enabled_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                blink_row,
+                text="消息提醒",
+                variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
 
             telegram_row = ttk.Frame(extra_panel)
             telegram_row.pack(fill="x", pady=(4, 0))
-            self._telegram_enabled_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                telegram_row,
-                text="消息提醒（Telegram）",
-                variable=self._telegram_enabled_var,
-                command=self._shutdown_on_change,
-            ).pack(side="left", padx=(0, 8))
+            self._telegram_machine_row = telegram_row
             ttk.Label(telegram_row, text="设备名称").pack(side="left")
             self._telegram_machine_var = tk.StringVar(value="")
-            machine_entry = ttk.Entry(
-                telegram_row, textvariable=self._telegram_machine_var, width=14
+            self._telegram_machine_button = ttk.Button(
+                telegram_row, text="修改名称", width=14
             )
-            machine_entry.pack(side="left", padx=(4, 8))
-            machine_entry.bind("<FocusOut>", self._telegram_machine_changed)
-            machine_entry.bind("<Return>", self._telegram_machine_changed)
-            ttk.Button(
+            self._telegram_machine_button.pack(side="left", padx=(4, 8))
+            self._telegram_machine_button.bind(
+                "<ButtonPress-1>", self._machine_name_press
+            )
+            self._telegram_machine_button.bind(
+                "<ButtonRelease-1>", self._machine_name_release
+            )
+            self._telegram_token_button = ttk.Button(
                 telegram_row, text="修改BOT token",
                 command=self._telegram_change_token,
-            ).pack(side="left")
+            )
+            self._telegram_token_button.pack(side="left")
             self._telegram_status = ttk.Label(
                 extra_panel,
                 text="消息提醒: 未启用；BOT token 仅保存在本机用户配置。",
@@ -2050,6 +2112,8 @@ class UiWorker(threading.Thread):
             data["telegram_bot_token"] = self._telegram_bot_token
             data["telegram_chat_id"] = self._telegram_chat_id
             data["telegram_machine_name"] = self._telegram_machine_var.get().strip()
+        if hasattr(self, "_quick_messages"):
+            data["quick_messages"] = list(self._quick_messages)
         if hasattr(self, "_countdown_enabled_var"):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
@@ -2149,8 +2213,200 @@ class UiWorker(threading.Thread):
                 except Exception:
                     pass
 
-    def _telegram_machine_changed(self, _event: Any = None) -> None:
+    def _machine_name_press(self, _event: Any = None) -> None:
+        """Arm the 1s edit gesture; a short click intentionally does nothing."""
+
+        self._machine_name_hold_fired = False
+        if self._root is not None:
+            self._machine_name_press_job = self._root.after(
+                1000, self._machine_name_begin_edit
+            )
+
+    def _machine_name_release(self, _event: Any = None) -> None:
+        if self._root is not None and self._machine_name_press_job is not None:
+            try:
+                self._root.after_cancel(self._machine_name_press_job)
+            except Exception:
+                pass
+        self._machine_name_press_job = None
+        self._machine_name_hold_fired = False
+
+    def _machine_name_begin_edit(self) -> None:
+        self._machine_name_press_job = None
+        self._machine_name_hold_fired = True
+        if self._machine_name_entry is not None:
+            return
+        button = getattr(self, "_telegram_machine_button", None)
+        row = getattr(self, "_telegram_machine_row", None)
+        token_button = getattr(self, "_telegram_token_button", None)
+        if button is None or row is None:
+            return
+        button.pack_forget()
+        entry = self._ttk.Entry(
+            row, textvariable=self._telegram_machine_var, width=14
+        )
+        self._machine_name_entry = entry
+        entry.pack(side="left", padx=(4, 8), before=token_button)
+        entry.bind("<FocusOut>", self._machine_name_finish_edit)
+        entry.bind("<Return>", self._machine_name_finish_edit)
+        entry.focus_set()
+        entry.selection_range(0, "end")
+
+    def _machine_name_finish_edit(self, _event: Any = None) -> None:
+        entry = self._machine_name_entry
+        if entry is None:
+            return
+        self._machine_name_entry = None
+        try:
+            entry.destroy()
+        except Exception:
+            pass
+        name = self._telegram_machine_var.get().strip()
+        self._telegram_machine_var.set(name)
+        self._telegram_machine_button.configure(
+            text=machine_name_button_text(name)
+        )
+        self._telegram_machine_button.pack(
+            side="left", padx=(4, 8), before=self._telegram_token_button
+        )
         self._shutdown_on_change()
+
+    def _render_quick_messages(self, edit_index: Optional[int] = None) -> None:
+        frame = getattr(self, "_quick_messages_frame", None)
+        if frame is None:
+            return
+        # Clear the active-entry identity before destroying widgets so a
+        # destruction-induced FocusOut cannot recursively save/render.
+        self._quick_edit_entry = None
+        for child in frame.winfo_children():
+            child.destroy()
+        for index, message in enumerate(self._quick_messages):
+            row = self._ttk.Frame(frame)
+            row.pack(fill="x", pady=2)
+            if edit_index == index:
+                entry = self._ttk.Entry(row, width=42)
+                entry.insert(0, message)
+                entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+                self._quick_edit_entry = entry
+                entry.bind(
+                    "<FocusOut>",
+                    lambda event, i=index, field=entry: (
+                        self._quick_message_finish_edit(i, field)
+                    ),
+                )
+                entry.bind(
+                    "<Return>",
+                    lambda event, i=index, field=entry: (
+                        self._quick_message_finish_edit(i, field)
+                    ),
+                )
+                entry.focus_set()
+                entry.selection_range(0, "end")
+            else:
+                button = self._ttk.Button(row, text=message)
+                button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+                button.bind(
+                    "<ButtonPress-1>",
+                    lambda event, i=index: self._quick_message_press(i),
+                )
+                button.bind(
+                    "<ButtonRelease-1>",
+                    lambda event, i=index: self._quick_message_release(i),
+                )
+            delete_button = self._ttk.Button(row, text="×", width=3)
+            delete_button.pack(side="left")
+            delete_button.bind(
+                "<ButtonPress-1>",
+                lambda event, i=index: self._quick_delete_press(i),
+            )
+            delete_button.bind(
+                "<ButtonRelease-1>",
+                lambda event, i=index: self._quick_delete_release(i),
+            )
+
+    def _quick_messages_save(self) -> None:
+        self._shutdown_save_settings(self._shutdown_collect_data())
+
+    def _quick_message_add(self) -> None:
+        if len(self._quick_messages) >= 20:
+            self._quick_message_status.configure(text="快捷消息最多 20 条。")
+            return
+        self._quick_messages.append("新快捷消息")
+        index = len(self._quick_messages) - 1
+        self._quick_messages_save()
+        self._render_quick_messages(index)
+
+    def _quick_message_press(self, index: int) -> None:
+        self._quick_message_hold_fired = False
+        if self._root is not None:
+            self._quick_message_press_job = self._root.after(
+                1000, lambda: self._quick_message_begin_edit(index)
+            )
+
+    def _quick_message_release(self, index: int) -> None:
+        if self._root is not None and self._quick_message_press_job is not None:
+            try:
+                self._root.after_cancel(self._quick_message_press_job)
+            except Exception:
+                pass
+        self._quick_message_press_job = None
+        if self._quick_message_hold_fired:
+            self._quick_message_hold_fired = False
+            return
+        if not (0 <= index < len(self._quick_messages)):
+            return
+        message = self._quick_messages[index]
+        try:
+            self._root.clipboard_clear()
+            self._root.clipboard_append(message)
+            self._root.update_idletasks()
+            self._quick_message_status.configure(text=f"已复制：{message}")
+        except Exception as exc:
+            self._quick_message_status.configure(text=f"复制失败：{exc}")
+
+    def _quick_message_begin_edit(self, index: int) -> None:
+        self._quick_message_press_job = None
+        self._quick_message_hold_fired = True
+        if 0 <= index < len(self._quick_messages):
+            self._render_quick_messages(index)
+
+    def _quick_message_finish_edit(self, index: int, entry: Any) -> None:
+        if entry is not self._quick_edit_entry:
+            return
+        self._quick_edit_entry = None
+        try:
+            text = entry.get().strip()
+        except Exception:
+            text = ""
+        if 0 <= index < len(self._quick_messages) and text:
+            self._quick_messages[index] = text[:500]
+            self._quick_messages_save()
+        self._render_quick_messages()
+
+    def _quick_delete_press(self, index: int) -> None:
+        self._quick_delete_hold_fired = False
+        if self._root is not None:
+            self._quick_delete_press_job = self._root.after(
+                1000, lambda: self._quick_delete(index)
+            )
+
+    def _quick_delete_release(self, _index: int) -> None:
+        if self._root is not None and self._quick_delete_press_job is not None:
+            try:
+                self._root.after_cancel(self._quick_delete_press_job)
+            except Exception:
+                pass
+        self._quick_delete_press_job = None
+        self._quick_delete_hold_fired = False
+
+    def _quick_delete(self, index: int) -> None:
+        self._quick_delete_press_job = None
+        self._quick_delete_hold_fired = True
+        if 0 <= index < len(self._quick_messages):
+            deleted = self._quick_messages.pop(index)
+            self._quick_messages_save()
+            self._render_quick_messages()
+            self._quick_message_status.configure(text=f"已删除：{deleted}")
 
     def _telegram_change_token(self) -> None:
         """Ask for a token, then let the notifier validate it asynchronously."""
@@ -2379,6 +2635,16 @@ class UiWorker(threading.Thread):
                 self._telegram_machine_var.set(str(
                     data.get("telegram_machine_name", "")
                 ))
+                self._telegram_machine_button.configure(
+                    text=machine_name_button_text(
+                        self._telegram_machine_var.get()
+                    )
+                )
+            if hasattr(self, "_quick_messages"):
+                self._quick_messages = normalize_quick_messages(
+                    data.get("quick_messages", [])
+                )
+                self._render_quick_messages()
             if hasattr(self, "_countdown_enabled_var"):
                 # Like scheduled shutdown, do not silently start a timer on
                 # application launch. Preserve only its configured time gap.

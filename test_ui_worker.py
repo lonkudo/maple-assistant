@@ -10,6 +10,8 @@ from ui_worker import (
     patrol_button_states,
     record_button_is_locked,
     recorded_coordinate_text,
+    machine_name_button_text,
+    normalize_quick_messages,
     rope_unavailable_hint,
     tooltip_cursor_top_right_position,
     _clamp_window_geometry,
@@ -20,6 +22,57 @@ from ui_worker import (
 
 
 class UiLogHandlerTests(unittest.TestCase):
+    def test_yolo_panel_is_temporarily_hidden_behind_restore_flag(self) -> None:
+        self.assertFalse(UiWorker._SHOW_YOLO_PANEL)
+
+    def test_machine_name_button_uses_edit_hint_only_when_empty(self) -> None:
+        self.assertEqual(machine_name_button_text(""), "修改名称")
+        self.assertEqual(machine_name_button_text("  电脑A  "), "电脑A")
+
+    def test_quick_messages_are_normalized_and_bounded(self) -> None:
+        self.assertEqual(
+            normalize_quick_messages(["  hello ", "", None, "world"]),
+            ["hello", "world"],
+        )
+        self.assertEqual(normalize_quick_messages(["a", "b"], 1), ["a"])
+
+    def test_quick_message_short_click_copies_to_clipboard(self) -> None:
+        class Root:
+            copied = ""
+            def clipboard_clear(self): self.copied = ""
+            def clipboard_append(self, value): self.copied += value
+            def update_idletasks(self): pass
+
+        class Label:
+            text = ""
+            def configure(self, **kwargs): self.text = kwargs.get("text", "")
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._root = Root()
+        worker._quick_messages = ["回城补给"]
+        worker._quick_message_press_job = None
+        worker._quick_message_hold_fired = False
+        worker._quick_message_status = Label()
+        worker._quick_message_release(0)
+        self.assertEqual(worker._root.copied, "回城补给")
+        self.assertIn("已复制", worker._quick_message_status.text)
+
+    def test_quick_delete_requires_hold_callback(self) -> None:
+        class Label:
+            text = ""
+            def configure(self, **kwargs): self.text = kwargs.get("text", "")
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._quick_messages = ["A", "B"]
+        worker._quick_delete_press_job = object()
+        worker._quick_delete_hold_fired = False
+        worker._quick_message_status = Label()
+        worker._quick_messages_save = lambda: None
+        worker._render_quick_messages = lambda *args: None
+        worker._quick_delete(0)
+        self.assertEqual(worker._quick_messages, ["B"])
+        self.assertTrue(worker._quick_delete_hold_fired)
+
     def test_higher_layers_are_displayed_above_lower_layers(self) -> None:
         self.assertEqual(
             layer_display_order(["layer1", "layer2", "layer3"]),

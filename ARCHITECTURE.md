@@ -263,7 +263,8 @@ gap ceiling is persisted in 0.1-second increments and applied to the live
 worker without restart.
 
 The YOLO monster subprocess is temporarily feature-disabled while its model is
-retrained. The UI forces fixed attack, disables the YOLO panel, and does not
+retrained. The UI forces fixed attack, hides the preserved YOLO panel/mode via
+`_SHOW_YOLO_PANEL = False`, and does not
 auto-launch or install its inference dependencies. The preserved recovery flag
 and installer block are documented in `README.md`.
 
@@ -278,6 +279,13 @@ environment.
 `StatusWorker` analyzes the status capture independently. Potion use requires
 confirmed low readings and retries blocked sends. Its configuration also owns
 optional periodic buffs.
+
+The potion panel is placed in column 2 where the hidden YOLO panel previously
+appeared. The adjacent Quick Messages panel persists up to 20 strings in the
+user-owned `additional_functions` section. Its buttons use the shared 1-second
+gesture convention: short-click copies, long-press edits, and long-pressing the
+adjacent delete icon removes that row. The Telegram machine marker uses the
+same long-press-to-entry, focus-out-to-button interaction.
 
 `CountdownWorker` has no gameplay dependencies: it owns only a monotonic
 deadline, configured interval, wake event, and `sound/beep.mp3`. At expiry it

@@ -198,8 +198,8 @@ YOLO monster detection is temporarily disabled because the current
 `weights/best.pt` is not trained reliably enough. The implementation and model
 files have deliberately not been deleted. While disabled:
 
-- the UI forces **Fixed Attack**, greys the YOLO controls, and cannot launch
-  the YOLO subprocess when patrol starts;
+- the UI forces **Fixed Attack**, completely hides the YOLO panel and YOLO
+  mode selector, and cannot launch the subprocess when patrol starts;
 - fresh configuration defaults to `fixed` attack mode; and
 - `install.ps1` skips the large PyTorch/Ultralytics dependency download. The
   preserved commands are inside the
@@ -208,14 +208,16 @@ files have deliberately not been deleted. While disabled:
 To recover YOLO quickly after replacing `yolo-detection/weights/best.pt` with a
 better-trained model:
 
-1. In `ui_worker.py`, change
+1. In `ui_worker.py`, change `_SHOW_YOLO_PANEL = False` to `True` so the
+   preserved panel and YOLO attack-mode selector are packed into the UI again.
+2. In `ui_worker.py`, change
    `_YOLO_MONSTER_DETECTION_ENABLED = False` to `True`.
-2. In `install.ps1`, remove the opening
+3. In `install.ps1`, remove the opening
    `<# YOLO_DEPENDENCIES_TEMPORARILY_DISABLED` line and its matching closing
    `#>` line, then run `安装.bat` once to install the preserved dependencies.
-3. Optionally change `config_store.py`'s default `fixed_attack.attack_mode`
+4. Optionally change `config_store.py`'s default `fixed_attack.attack_mode`
    from `fixed` to `yolo`; otherwise select YOLO in the restored UI.
-4. Update the temporary wording in `安装.bat`, `build_release.ps1`, this section,
+5. Update the temporary wording in `安装.bat`, `build_release.ps1`, this section,
    and `ARCHITECTURE.md`, then run the normal release workflow below.
 
 The minimap-based patrol, layer, rope, fixed attack, potion, and alert workers
@@ -317,7 +319,9 @@ of the existing beep alarms fires: the repeating countdown, 掉线警报, or 测
 It is a separate notification worker and does not create another capture loop.
 
 Selecting **消息提醒（Telegram）** sends those same three alert events through
-the configured BOT. Enter a distinct **设备名称** on every computer, first send
+the configured BOT. Long-press the machine-name button for one second to turn
+it into an input field; leaving that field saves it and restores the named
+button. Enter a distinct **设备名称** on every computer, first send
 any message (for example `/start`) to the BOT in Telegram, then click
 **修改BOT token** and paste the token. The assistant verifies the BOT and learns
 the latest chat automatically. The UI reports whether it is enabled, correctly
@@ -325,3 +329,9 @@ configured, awaiting a chat, or failed. Messages use
 `设备名称 事件类型 时间 YYYY-MM-DD HH:MM:SS`. Token, learned chat ID, machine
 name, and enabled state live only in ignored `user_config.json`, so updates do
 not overwrite them. Telegram failures never stop other assistant workers.
+
+The **快捷消息** panel lives beside the potion controls in column 2. Add any
+number of reusable messages (maximum 20). Short-click a message to copy it to
+the Windows clipboard, long-press it for one second to edit it, and long-press
+its adjacent `×` button for one second to delete it. Quick messages are stored
+in the ignored `user_config.json` and survive application updates.
