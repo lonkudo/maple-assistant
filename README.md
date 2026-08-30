@@ -10,9 +10,12 @@ recorded multi-layer patrol route, climbs ropes, recovers from falls, collects
 items. Fixed-interval attack remains available; YOLO-driven monster attack is
 temporarily disabled until its model has been trained more reliably.
 
-The runtime is resolution-adaptive: minimap geometry and the yellow player
-diamond are detected dynamically, while normalized fallback regions keep the
-assistant usable when detection confidence is low.
+The runtime uses a FIXED-PIXEL HUD model: the game's minimap, map-name
+strip, and HP/MP/EXP bars never change size or position with window
+resolution - only the playfield viewport scales.  All HUD regions are
+therefore absolute client pixels, never normalized fractions.  The yellow
+player diamond is detected dynamically; a measured fallback region is used
+as verified map geometry when OpenCV cannot close a border contour.
 
 > Automation may violate a game or server's rules. Use it only where permitted.
 
@@ -77,7 +80,7 @@ remains idle before Start Patrol.
   minimap, yellow/red diamonds, and scroll-compensated map position.
 - `MovementWorker` owns patrol movement, endpoint sequencing, stair jumps,
   rope approach/climbing, fall recovery, route return, and self-rescue.
-- `StatusWorker` reads HP/MP and sends configured potion or buff keys.
+- `StatusWorker` reads HP/MP/EXP and sends configured potion or buff keys.
 - `AttackWorker` performs the optional fixed-rate attack mode.
 - The UI can launch `yolo-detection/live_view.py` as a second process for
   target-aware attacks and main-screen rope sensing.
@@ -240,6 +243,61 @@ better-trained model:
 
 The minimap-based patrol, layer, rope, fixed attack, potion, and alert workers
 do not require these YOLO dependencies and continue to operate normally.
+
+## Current work handoff (agents taking over)
+
+Branch: `feature/continue-development`. Latest release: see `VERSION` and the
+latest commit message. Push before handing off; keep user-owned JSON files
+(`drug_settings.json`, `additional_functions_settings.json`,
+`fixed_attack_settings.json`, `recording-configuration.json`,
+`ui_window_settings.json`) UNCOMMITTED - they are runtime-modified on the live
+machine.
+
+### HUD geometry (measured on the real client, 1366x768)
+
+All HUD regions are ABSOLUTE client pixels (the HUD never scales with window
+resolution). Key constants live in `assistant.py`:
+
+- Minimap: `MINIMAP_REGION_TOP = 60`, `MINIMAP_FALLBACK_REGION = (0, 60, 400, 320)`.
+  The map-name strip is ~64px tall ABOVE the minimap; the search region starts
+  at y=60 (4px tolerance). Candidates below 25% of the region's min side are
+  rejected so a ~40px UI box inside the map-name strip can never become the
+  minimap border (`window=(5,22,45,62)` was the live failure).
+- `MINIMAP_ANALYSIS_SIZE = (400, 400)`, aspect-preserving fit, never upscale.
+- When OpenCV cannot close a border contour, the marker-verified fixed region
+  is promoted to `source="fixed-region"` (accepted by recording, startup
+  probes, and calibration). `is_verified_border()` in `minimap_detector.py`
+  returns True for opencv or fixed-region sources.
+- Status bars: `STATUS_CAPTURE_WIDTH = 370`, `STATUS_CAPTURE_HEIGHT = 57`,
+  bottom-centered (`STATUS_CAPTURE_CENTER_SHIFT = 0`). Inside the capture the
+  three bars sit SIDE BY SIDE in one vertical band (rows ~33-53): HP red
+  x ~7-91, MP blue x ~96-230, EXP yellow x ~237-363. `BarStatusDetector`
+  (`status_worker.py`) measures each bar ONLY inside its own horizontal zone
+  (`bar_zones`) with per-bar full widths (85/135/127px) - the three can never
+  be mixed, and blue UI text above the band is excluded by `bar_band`.
+  `StatusReading`/`work/status_state.json` carry `exp`/`exp_ratio` too.
+- The live snapshot `work/debug/snapshot.png` (1707x1067) verifies: hp=38%,
+  mp=84%, exp=69%.
+
+### UI layout (`ui_worker.py`)
+
+- Two FIXED 500px columns (controls | debug/YOLO); initial window 1036x672;
+  height user-resizable, width min 1036.
+- Debug log panel: frame height 313px so the visible log text area is exactly
+  280px (`pack_propagate(False)`; LabelFrame label+border eat ~33px). The log
+  auto-scrolls to bottom (`_log_text.see("end")` in `_drain_logs`).
+- Drug-panel sliders use `length=60` so column 2 stays within 500px.
+- No in-window header; window title is `Maple 助手 (vNNNN)`.
+
+### Workflow
+
+- Tests: `.venv\Scripts\python.exe -m unittest <modules>`; full gate =
+  `release_now.ps1` (uses `yolo-detection\venv313` when present).
+- Release + commit every change: `powershell -NoProfile -ExecutionPolicy Bypass
+  -File .\release_now.ps1`, then `git add` the changed source/tests/docs +
+  `VERSION`, commit on `feature/continue-development`, push to origin.
+- PowerShell uses `;` not `&&`; avoid `(Get-Content -Raw)` re-writes of UTF-8
+  files (encoding corruption history: use the edit tool instead).
 
 ## Publishing a release
 
