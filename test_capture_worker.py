@@ -6,6 +6,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -206,6 +207,114 @@ class CaptureWorkerTests(unittest.TestCase):
                 stop.set()
                 worker.join(timeout=.5)
             self.assertEqual(list(debug_dir.glob("frame-*.png")), [])
+
+    def test_capture_window_pixel_region_resolves_bottom_anchor(self) -> None:
+        """Bottom-anchored pixel regions must not crash capture_window.
+
+        Regression: the v0022 status capture used ``pixel_region`` with a
+        negative (from-bottom) y, but that branch never assigned
+        ``source_y``, so ``height = source_bottom - source_y`` raised
+        UnboundLocalError on the live machine and every record click timed
+        out with "could not capture game window".
+        """
+
+        import sys
+        from unittest import mock
+
+        from capture_worker import capture_window
+
+        captured: dict[str, object] = {}
+
+        class FakeGui:
+            @staticmethod
+            def FindWindow(_class: object, _title: str) -> int:
+                return 1
+
+            @staticmethod
+            def IsIconic(_hwnd: int) -> bool:
+                return False
+
+            @staticmethod
+            def GetClientRect(_hwnd: int) -> tuple[int, int, int, int]:
+                return 0, 0, 1400, 800
+
+            @staticmethod
+            def ClientToScreen(_hwnd: int, point: tuple[int, int]) -> tuple[int, int]:
+                return point
+
+            @staticmethod
+            def GetDC(_hwnd: int) -> int:
+                return 5
+
+            @staticmethod
+            def ReleaseDC(_hwnd: int, _dc: int) -> int:
+                return 0
+
+            @staticmethod
+            def DeleteObject(_handle: int) -> int:
+                return 0
+
+        class FakeDc:
+            def __init__(self) -> None:
+                captured["dc"] = self
+
+            def CreateCompatibleDC(self) -> "FakeDc":
+                return FakeDc()
+
+            def SelectObject(self, _bitmap: object) -> int:
+                return 0
+
+            def BitBlt(
+                self, _dest: tuple[int, int], size: tuple[int, int],
+                _source: object, origin: tuple[int, int], _rop: int,
+            ) -> None:
+                captured["size"] = size
+                captured["origin"] = origin
+
+            def DeleteDC(self) -> int:
+                return 0
+
+        class FakeBitmap:
+            def __init__(self) -> None:
+                captured["bitmap"] = self
+                self._size = (0, 0)
+
+            def CreateCompatibleBitmap(self, _dc: object, width: int, height: int) -> int:
+                self._size = (width, height)
+                return 0
+
+            def GetBitmapBits(self, _flags: bool) -> bytes:
+                width, height = self._size
+                return b"\x00" * (width * height * 4)
+
+            def GetHandle(self) -> int:
+                return 7
+
+        class FakeUi:
+            @staticmethod
+            def CreateDCFromHandle(_dc: int) -> FakeDc:
+                return FakeDc()
+
+            @staticmethod
+            def CreateBitmap() -> FakeBitmap:
+                return FakeBitmap()
+
+        fake_modules = {
+            "win32gui": FakeGui,
+            "win32ui": FakeUi,
+            "win32con": mock.MagicMock(SRCCOPY=0x00CC0020),
+        }
+        with mock.patch.dict(sys.modules, fake_modules):
+            image, rect = capture_window(
+                "game", pixel_region=(922, -64, 1357, 0)
+            )
+
+        # Bottom-anchored: top = 800 - 64 = 736, bottom = 800.
+        self.assertEqual(image.size, (435, 64))
+        self.assertEqual(rect[1], 736)
+        self.assertEqual(rect[3], 800)
+        self.assertEqual(captured["size"], (435, 64))
+        self.assertEqual(captured["origin"], (922, 736))
 
 
 if __name__ == "__main__":

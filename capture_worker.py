@@ -171,6 +171,8 @@ def capture_window(
         source_right = max(source_x + 1, min(client_width, int(source_right)))
         source_top = max(0, min(client_height, int(source_top)))
         source_bottom = max(source_top + 1, min(client_height, int(source_bottom)))
+        # ``height`` below reads ``source_y``; keep both names in sync.
+        source_y = source_top
     elif crop_pixel_size is not None:
         pixel_width, pixel_height = map(int, crop_pixel_size)
         if pixel_width <= 0 or pixel_height <= 0:
