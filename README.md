@@ -121,8 +121,10 @@ re-recorded when the UI labels them as a legacy layout.
 - Rope-stall recovery is armed only after repeated no-progress frames within
   the rope alignment range. While the rope is farther away, movement keeps
   walking across the platform and cannot start a recovery jump.
-- Stair adaptation requires six consecutive no-progress frames (about 1.5
-  seconds), so a normal fixed-attack animation does not trigger a stair jump.
+- Stair adaptation requires ten consecutive no-progress frames (about 2.5
+  seconds). Progress is measured cumulatively from a stable anchor, so several
+  small but real movements reset the counter and attack animations do not
+  trigger false stair jumps.
 - Climb arrival requires the expected next layer and stable confirmation. Up
   remains held through a short rope-top compensation window.
 - Attack suppression ends immediately after confirmed climb arrival; the

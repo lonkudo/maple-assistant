@@ -49,6 +49,38 @@ class ConfigStoreTests(unittest.TestCase):
                 store.read_section("fixed_attack")["interval_seconds"], 1.7
             )
 
+    def test_old_stair_frame_default_is_migrated_to_ten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({
+                "rope_calibration": {"stair_jump_stall_frames": 6},
+            }), encoding="utf-8")
+
+            store = ConfigStore(path)
+
+            self.assertEqual(
+                store.read_section("rope_calibration")[
+                    "stair_jump_stall_frames"
+                ],
+                10,
+            )
+
+    def test_custom_stair_frame_setting_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({
+                "rope_calibration": {"stair_jump_stall_frames": 14},
+            }), encoding="utf-8")
+
+            store = ConfigStore(path)
+
+            self.assertEqual(
+                store.read_section("rope_calibration")[
+                    "stair_jump_stall_frames"
+                ],
+                14,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

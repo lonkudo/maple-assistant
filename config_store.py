@@ -42,7 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "climb_world_y_change_required": .75,
         "climb_world_y_stall_change_required": .15,
         "climb_world_y_stall_frames": 2, "patrol_cycles_per_layer": 2,
-        "stair_jump_stall_frames": 6,
+        "stair_jump_stall_frames": 10,
         "movement_hold_seconds": 2.0, "minimum_final_hold_seconds": .08,
         "minimum_movement_hold_seconds": .3,
         "estimated_minimap_speed": .11, "final_calculation_distance": .035,
@@ -121,6 +121,16 @@ class ConfigStore:
                     value = deepcopy(DEFAULT_CONFIG[section])
                 if isinstance(value, dict):
                     data[section] = value
+                    changed = True
+            # Migrate the two previously shipped stair-stall defaults. There
+            # is no UI control for this calibration, so values 3/6 identify
+            # old defaults rather than a deliberate user choice. Missing
+            # values also receive the safer ten-frame default.
+            rope = data.get("rope_calibration")
+            if isinstance(rope, dict):
+                old_frames = rope.get("stair_jump_stall_frames")
+                if old_frames is None or old_frames in (3, 6):
+                    rope["stair_jump_stall_frames"] = 10
                     changed = True
             if changed:
                 self._write_document(data)

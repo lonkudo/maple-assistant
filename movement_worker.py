@@ -1041,7 +1041,7 @@ def climb(
 DEFAULT_MINIMAP_REGION = (0.0, 0.0, 0.22, 0.27)
 
 # 卡住判定阈值：标记 X 变化 < 0.012（最小地图单位）即视为"没在动"。
-# 按帧判定（连续 6 帧 ≈ 1.5s）触发跳跃，避免把攻击动作的短暂停顿误判为台阶。
+# 按帧判定（连续 10 帧 ≈ 2.5s）触发跳跃，避免把攻击动作的短暂停顿误判为台阶。
 STAIR_JUMP_STALL_FALLBACK = 0.012
 
 
@@ -1722,7 +1722,7 @@ class MovementWorker(threading.Thread):
 
         The main loop is NOT blocked - it keeps processing minimap frames,
         so the stair/pit stall detection runs at the minimap frame rate
-        (3 frames ~= 0.75s) instead of being delayed by the hold.  Movement
+        (10 frames ~= 2.5s) instead of being delayed by the hold.  Movement
         and the jump (Alt tap) can overlap: the jump is a short chord on
         top of the held direction.
 
@@ -1876,7 +1876,7 @@ class MovementWorker(threading.Thread):
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
         stair_jump_stall_diamonds: float = 0.25,
-        stair_jump_stall_frames: int = 6,
+        stair_jump_stall_frames: int = 10,
         patrol_start_grace_seconds: float = 3.0,
         stair_jump_attempts_max: int = 3,
         # 台阶/坑边尝试间隔 0.8s（原 2.5s）：地图坑多时角色卡在边缘会等
@@ -2039,7 +2039,7 @@ class MovementWorker(threading.Thread):
         self._pickup_count = 0
         # 非阻塞行走 hold：主循环不再被方向键 hold 阻塞，方向键的按住/
         # 松开交给独立的 hold 管理线程（_hold_manager）。这样主循环按
-        # 最小地图帧率跑，卡住检测（3 帧 ≈ 0.75s）不会被 2 秒 hold 拖延。
+        # 最小地图帧率跑，卡住检测（10 帧 ≈ 2.5s）不会被 2 秒 hold 拖延。
         self._hold_lock = threading.RLock()
         self._walk_hold_key: Optional[str] = None
         self._walk_hold_z = False
@@ -2259,7 +2259,10 @@ class MovementWorker(threading.Thread):
         self._stair_state = {
             "phase_label": None,   # e.g. "layer1.right-most"; reset on change
             "stall_frames": 0,     # consecutive no-progress frames near a stair
-            "last_x": None,        # marker X from the previous processed frame
+            # Anchor for cumulative progress. Comparing only adjacent frames
+            # misclassified normal ~0.008/frame walking as frozen because the
+            # old threshold was 0.012/frame.
+            "last_x": None,
             "attempts": 0,         # jumps issued at the current blockage
             "grace_until": 0.0,    # stall detection suspended until this time
             "gave_up": False,      # attempts exhausted; stop jumping this phase
@@ -2357,16 +2360,22 @@ class MovementWorker(threading.Thread):
             state = self._stair_state
             state["phase_label"] = route_label
         px = observation.player.x
-        last_x = state["last_x"]
-        moved = last_x is not None and abs(px - last_x) >= self._current_stair_jump_stall
-        state["last_x"] = px
+        anchor_x = state["last_x"]
+        moved = (
+            anchor_x is not None
+            and abs(px - anchor_x) >= self._current_stair_jump_stall
+        )
         if moved:
-            # Still walking: keep going, no jump.  A marker that moved again
-            # after a blockage clears the jump budget for the next stair.
+            # Cumulative progress across several small frame-to-frame steps is
+            # still real walking. Re-anchor only after enough total movement;
+            # otherwise a steady sub-threshold walk eventually looks frozen.
+            state["last_x"] = px
             state["stall_frames"] = 0
             state["attempts"] = 0
             state["gave_up"] = False
             return None
+        if anchor_x is None:
+            state["last_x"] = px
         if now < state["grace_until"] or state["gave_up"]:
             return None
         state["stall_frames"] += 1

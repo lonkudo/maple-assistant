@@ -189,12 +189,14 @@ it, avoiding an exact-pixel problem.
 Left/Right walking holds Z simultaneously for pickup. Hold management is
 non-blocking so frame analysis and coordination continue during long movement.
 Stair-jump recovery watches progress toward a horizontal endpoint. After a
-configured stationary run (six frames, about 1.5 seconds, by default) it holds
-the travel direction and taps Alt. This filters the shorter stationary period
-caused by an attack animation. Grace and attempt limits still apply. If that
-budget is exhausted, the route reverses, but the new direction must first show
-real minimap movement away from the blocked position; a stale marker cannot
-skip the reversal and retry the same endpoint.
+configured stationary run (ten frames, about 2.5 seconds, by default) it holds
+the travel direction and taps Alt. Progress is cumulative from a stable X
+anchor instead of requiring one large adjacent-frame step; this distinguishes
+slow valid movement from a real blockage and filters attack animation pauses.
+Grace and attempt limits still apply. If that budget is exhausted, the route
+reverses, but the new direction must first show real minimap movement away from
+the blocked position; a stale marker cannot skip the reversal and retry the
+same endpoint.
 
 ### 5.4 Rope approach and climb
 

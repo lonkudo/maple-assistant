@@ -40,12 +40,12 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
-    def test_default_stair_jump_waits_six_frames_through_attack_animation(self):
+    def test_default_stair_jump_waits_ten_frames_through_attack_animation(self):
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(), important_positions={}
         )
 
-        self.assertEqual(worker.stair_jump_stall_frames, 6)
+        self.assertEqual(worker.stair_jump_stall_frames, 10)
 
     def test_dispatched_marker_must_match_current_frame_and_minimap_region(self):
         class Reading:
@@ -3847,6 +3847,22 @@ class StairJumpTests(unittest.TestCase):
                 moving, "layer1.right-most", self._plan(px, "right"),
                 now + index))
         self.assertEqual(worker._stair_state["stall_frames"], 0)
+
+    def test_small_per_frame_progress_is_measured_cumulatively(self):
+        # Production logs showed normal movement of ~0.008 per frame while
+        # the analysis threshold was 0.012. Adjacent-frame comparison called
+        # every frame frozen; cumulative comparison recognizes real progress.
+        worker = self._worker(stair_jump_stall_frames=3)
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        for index, px in enumerate((.500, .508, .516, .524, .532)):
+            moving = MinimapObservation(Point(px, .7), None, .9, (0, 0, 1, 1))
+            self.assertIsNone(worker._stair_jump_decision(
+                moving, "layer1.right-most", self._plan(px, "right"),
+                100.0 + index,
+            ))
+        self.assertEqual(worker._stair_state["attempts"], 0)
+        self.assertLess(worker._stair_state["stall_frames"], 3)
 
     def test_stuck_jumps_only_in_left_right_phases(self):
         # The stair jump belongs to move-to-left-most / move-to-right-most
