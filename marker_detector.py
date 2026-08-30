@@ -87,14 +87,17 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
     yellow_body = (red >= 200) & (green >= 190) & (blue <= 175)
     height, width = yellow.shape
     candidates: list[tuple[float, MarkerDetection]] = []
-    # Limits are relative enough for resized/zoomed diamonds while still
-    # rejecting long yellow platform decorations.  The minimap ZOOM can
-    # change while the panel stays the same size, so the diamond can grow
-    # to a large fraction of the analysis box; the aspect and compactness
-    # checks below reject decorations, so the size bound only needs to
-    # exclude huge solid yellow regions, not modest zoom levels.
-    max_span = max(24, int(round(min(width, height) * 0.35)))
-    max_pixels = max(400, max_span * max_span)
+    # The player diamond is SMALL: ~6-7 px at normal zoom on a 130-170 px
+    # analysis box (~4-5% of the box's min dimension).  The minimap ZOOM can
+    # change while the panel stays fixed, so the diamond may grow, but only
+    # within a bounded range - a 48 px blob is never the marker.  The cap is
+    # a generous ~18% of the min dimension (roughly 3-4x the normal diamond)
+    # and the score below prefers candidates near the expected size, so the
+    # right-size diamond wins while oversized yellow regions are rejected.
+    min_dimension = min(width, height)
+    expected_span = max(4, int(round(min_dimension * 0.05)))
+    max_span = max(20, int(round(min_dimension * 0.18)))
+    max_pixels = max(320, max_span * max_span)
     body_components = _components(yellow_body, min_pixels=3)
     for component in _components(yellow, min_pixels=3):
         ys, xs = component[:, 0], component[:, 1]
@@ -108,8 +111,13 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
         compact = count / max(1, span_x * span_y)
         if 0.45 <= aspect <= 2.2 and compact >= 0.20 and span_x >= 2 and span_y >= 2:
             shape_score = max(0.0, 1.0 - abs(aspect - 1.0) / 2.0)
-            # Do not prefer one fixed pixel size; the marker changes with zoom.
-            score = 0.62 * compact + 0.38 * shape_score
+            # Prefer the size near the expected marker span; tolerate zoom
+            # changes up to roughly 3-4x before the candidate scores zero.
+            span = max(span_x, span_y)
+            size_score = max(
+                0.0, 1.0 - abs(span - expected_span) / max(1.0, expected_span * 3)
+            )
+            score = 0.50 * compact + 0.30 * shape_score + 0.20 * size_score
             measured_box = (strict_left, strict_top, strict_right, strict_bottom)
             for body in body_components:
                 body_ys, body_xs = body[:, 0], body[:, 1]
@@ -159,8 +167,10 @@ def detect_red_diamonds(minimap_rgb: np.ndarray) -> list[MarkerDetection]:
     )
     red_body = (red >= 190) & (green <= 70) & (blue <= 70)
     height, width = red_center.shape
-    max_span = max(24, int(round(min(width, height) * 0.35)))
-    max_pixels = max(400, max_span * max_span)
+    min_dimension = min(width, height)
+    expected_span = max(4, int(round(min_dimension * 0.05)))
+    max_span = max(20, int(round(min_dimension * 0.18)))
+    max_pixels = max(320, max_span * max_span)
     body_components = _components(red_body, min_pixels=3)
     detections: list[MarkerDetection] = []
     for component in _components(red_center, min_pixels=3):
@@ -175,7 +185,11 @@ def detect_red_diamonds(minimap_rgb: np.ndarray) -> list[MarkerDetection]:
         compact = count / max(1, span_x * span_y)
         if 0.45 <= aspect <= 2.2 and compact >= 0.20 and span_x >= 2 and span_y >= 2:
             shape_score = max(0.0, 1.0 - abs(aspect - 1.0) / 2.0)
-            score = 0.62 * compact + 0.38 * shape_score
+            span = max(span_x, span_y)
+            size_score = max(
+                0.0, 1.0 - abs(span - expected_span) / max(1.0, expected_span * 3)
+            )
+            score = 0.50 * compact + 0.30 * shape_score + 0.20 * size_score
             measured_box = (strict_left, strict_top, strict_right, strict_bottom)
             for body in body_components:
                 body_ys, body_xs = body[:, 0], body[:, 1]

@@ -94,12 +94,10 @@ class MinimapDetectorTests(unittest.TestCase):
         """A zoomed diamond inside a fixed panel must still be found.
 
         The minimap ZOOM can change while the panel size stays the same, so
-        the yellow player diamond grows to a large fraction of the analysis
-        box.  The old 14%-of-min-dimension span cap rejected diamonds of
-        ~26px in a 167x171 panel, which made recording fail with "failed to
-        detect yellow diamond" after a zoom change.  The span cap is now a
-        generous fraction of the box; the aspect/compactness checks still
-        reject long platform decorations.
+        the yellow player diamond grows within the analysis box.  The real
+        marker is small (~6-7 px at normal zoom on a 130-170 px box); the
+        detector must accept a bounded zoom range (roughly 3-4x) but reject
+        oversized yellow blobs that are never the marker.
         """
 
         import numpy as np
@@ -114,11 +112,17 @@ class MinimapDetectorTests(unittest.TestCase):
                         image[center_y + y, center_x + x] = (255, 255, 136)
             return detect_yellow_diamond(image)
 
-        # 167x171 panel: the old cap allowed ~23px spans; a zoomed diamond
-        # of radius 24 (49px) must now be detected.
-        zoomed = marker(24)
+        # Normal marker (~7px, radius 3) and a zoomed one (radius 12 -> 25px
+        # span, well inside the ~30px cap for a 167px box).
+        normal = marker(3)
+        zoomed = marker(12)
+        self.assertIsNotNone(normal)
         self.assertIsNotNone(zoomed)
-        self.assertGreaterEqual(zoomed.pixel_size[0], 40)
+        self.assertGreater(zoomed.pixel_size[0], normal.pixel_size[0])
+
+        # A 49px blob (radius 24) is far beyond the marker's zoom range and
+        # must be rejected, not mistaken for the player diamond.
+        self.assertIsNone(marker(24))
 
         # A long yellow platform decoration must still be rejected.
         height, width = 171, 167
