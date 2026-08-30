@@ -349,19 +349,27 @@ class MinimapDetector:
                     or window_height > median_height * 1.55
                 )
                 if severely_changed:
-                    # Direction matters.  A SHRINK is a partial contour (the
-                    # title-panel strip, e.g. 239x68 vs the full 239x184): it
-                    # must never become the session baseline, no matter how
-                    # many frames repeat it, because its analysis box excludes
-                    # the yellow marker and remaps recorded layer coordinates.
-                    # A GROW is the real border recovering from a first-frame
-                    # strip that poisoned the baseline (or a genuine HUD
-                    # change); adopt it once it repeats consistently.
-                    shrinking = (
-                        window_width < median_width * 0.65
-                        or window_height < median_height * 0.65
+                    # A severe one-frame change is usually a contour artifact.
+                    # Hold the known-good geometry while a candidate is
+                    # unconfirmed.  But the minimap can also legitimately
+                    # resize mid-session (window resize, HUD scale, map
+                    # switch): once the SAME new box repeats for a full
+                    # history window it is normal detection and must be
+                    # adopted.
+                    #
+                    # The one exception is a PARTIAL TITLE STRIP: it keeps the
+                    # full border's width (e.g. 239x68 vs the full 239x184)
+                    # and only collapses in height, whatever the current zoom
+                    # or minimap size.  A genuine resize changes width AND
+                    # height together, so a same-width height collapse is
+                    # always a strip and is never adopted, no matter how many
+                    # frames repeat it (its analysis box excludes the yellow
+                    # marker and remaps recorded layer coordinates).
+                    same_width = abs(window_width - median_width) <= max(
+                        3, round(median_width * 0.05)
                     )
-                    if shrinking:
+                    height_collapsed = window_height < median_height * 0.65
+                    if same_width and height_collapsed:
                         self._pending_shrunken_boxes = None
                         self._pending_shrunken_count = 0
                         return (
@@ -382,19 +390,17 @@ class MinimapDetector:
                         self._pending_shrunken_boxes = (window, analysis, canvas)
                         self._pending_shrunken_count = 1
                     if self._pending_shrunken_count >= self.box_history_len:
-                        # The same larger box has now repeated for a full
-                        # history window: normal detection, not a one-off
-                        # contour flicker.  Adopt it as the session baseline
-                        # so a strip-poisoned first frame cannot block
-                        # recording/patrol for the whole session.
+                        # Same box repeated for a full history window: a real
+                        # resize or recovery from a poisoned first frame, not
+                        # a one-off contour flicker.  Adopt it as the new
+                        # session baseline.
                         adopted = self._pending_shrunken_boxes
                         self._box_history.clear()
                         self._box_history.append(adopted)
                         self._pending_shrunken_boxes = None
                         self._pending_shrunken_count = 0
                         return adopted
-                    # Transient grow: keep the known-good geometry while the
-                    # candidate is still unconfirmed.
+                    # Transient severe change: keep the known-good geometry.
                     return (
                         self._coordinate_median(self._box_history, 0),
                         self._coordinate_median(self._box_history, 1),

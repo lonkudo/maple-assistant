@@ -1588,6 +1588,20 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="正在捕获当前位置…")
             if self._root is not None:
                 self._root.update_idletasks()
+            # Use a FRESH detector probe per recording click, exactly like
+            # patrol startup does.  The shared detector's box history can be
+            # poisoned by one bad frame (a partial title strip), which would
+            # make every one of these samples return the strip and reject the
+            # recording even though the full border is visible.  A fresh
+            # probe measures this frame independently; a successful record
+            # then seeds the shared detector via on_recording_verified.
+            probe = MinimapDetector(
+                fallback_region=getattr(
+                    self.detector, "fallback_region", (0.0, 0.0, 0.22, 0.27)
+                ),
+                dedicated_crop=getattr(self.detector, "dedicated_crop", True),
+                opencv_size=getattr(self.detector, "opencv_size", (400, 400)),
+            )
             try:
                 # Patrol capture is deliberately idle while recording. Take a
                 # few explicit post-focus samples so a reset does not depend
@@ -1596,7 +1610,7 @@ class UiWorker(threading.Thread):
                     fresh_frame = self.on_capture_now()
                     candidate = build_debug_snapshot(
                         fresh_frame,
-                        self.detector,
+                        probe,
                         self.configured_map_name,
                         self.diamond_size_tracker,
                         self.structure_tracker,
@@ -1623,11 +1637,25 @@ class UiWorker(threading.Thread):
             return
         snapshot = self._capture_snapshot_for_recording()
         if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            LOG.warning(
+                "RECORD REJECTED: no yellow marker | detection=%s "
+                "window=%s analysis=%s client=%s",
+                snapshot.detection.source if snapshot is not None else None,
+                snapshot.detection.window_box if snapshot is not None else None,
+                snapshot.detection.analysis_box if snapshot is not None else None,
+                snapshot.client_size if snapshot is not None else None,
+            )
             self._control_status.configure(
                 text="无法录制: 最新画面中未检测到黄色菱形标记。"
             )
             return
         if snapshot.detection.source != "opencv":
+            LOG.warning(
+                "RECORD REJECTED: border source=%s window=%s client=%s",
+                snapshot.detection.source,
+                snapshot.detection.window_box,
+                snapshot.client_size,
+            )
             self._control_status.configure(
                 text="无法录制: 未检测到可保存的小地图边框。"
             )

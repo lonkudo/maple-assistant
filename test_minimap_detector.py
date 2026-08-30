@@ -90,6 +90,42 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(large.pixel_size[0], small.pixel_size[0])
         self.assertGreater(large.pixel_size[1], small.pixel_size[1])
 
+    def test_diamond_detector_accepts_heavy_minimap_zoom(self) -> None:
+        """A zoomed diamond inside a fixed panel must still be found.
+
+        The minimap ZOOM can change while the panel size stays the same, so
+        the yellow player diamond grows to a large fraction of the analysis
+        box.  The old 14%-of-min-dimension span cap rejected diamonds of
+        ~26px in a 167x171 panel, which made recording fail with "failed to
+        detect yellow diamond" after a zoom change.  The span cap is now a
+        generous fraction of the box; the aspect/compactness checks still
+        reject long platform decorations.
+        """
+
+        import numpy as np
+
+        def marker(radius: int, box: tuple[int, int] = (171, 167)):
+            height, width = box
+            image = np.zeros((height, width, 3), dtype=np.uint8)
+            center_y, center_x = height // 2, width // 2
+            for y in range(-radius, radius + 1):
+                for x in range(-radius, radius + 1):
+                    if abs(x) + abs(y) <= radius:
+                        image[center_y + y, center_x + x] = (255, 255, 136)
+            return detect_yellow_diamond(image)
+
+        # 167x171 panel: the old cap allowed ~23px spans; a zoomed diamond
+        # of radius 24 (49px) must now be detected.
+        zoomed = marker(24)
+        self.assertIsNotNone(zoomed)
+        self.assertGreaterEqual(zoomed.pixel_size[0], 40)
+
+        # A long yellow platform decoration must still be rejected.
+        height, width = 171, 167
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        image[80, 10:150] = (255, 255, 136)
+        self.assertIsNone(detect_yellow_diamond(image))
+
     def test_red_diamond_detector_counts_other_players(self) -> None:
         import numpy as np
         from marker_detector import detect_red_diamonds
@@ -409,7 +445,7 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreaterEqual(recovered[1][3], 107)
 
     def test_persistent_strip_cannot_shrink_established_full_baseline(self) -> None:
-        """A repeated strip must never shrink a good full-border baseline."""
+        """A repeated same-width strip must never shrink a full baseline."""
 
         strip = ((0, 0, 239, 68), (0, 21, 239, 68), (2, 25, 237, 64))
         full = ((0, 0, 239, 184), (0, 57, 239, 184), (2, 78, 237, 178))
@@ -424,6 +460,40 @@ class MinimapDetectorTests(unittest.TestCase):
         for _frame in range(detector.box_history_len + 3):
             kept = detector._stabilize_boxes(*strip)
         self.assertEqual(kept[0], (0, 0, 239, 184))
+
+    def test_legitimate_resize_is_adopted_after_consistent_window(self) -> None:
+        """A real minimap size change (both dimensions) is adopted.
+
+        The strip rejection must not freeze a session when the minimap
+        legitimately changes size (window resize, HUD scale, map switch):
+        once the SAME new box repeats for a full history window it becomes
+        the new baseline, in either direction.
+        """
+
+        full = ((0, 0, 239, 184), (0, 57, 239, 184), (2, 78, 237, 178))
+        shrunk = ((0, 0, 130, 100), (0, 31, 130, 100), (2, 42, 128, 96))
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detector.reset_geometry()
+        for _frame in range(3):
+            detector._stabilize_boxes(*full)
+
+        adopted = None
+        for _frame in range(detector.box_history_len + 3):
+            adopted = detector._stabilize_boxes(*shrunk)
+        self.assertEqual(adopted[0], (0, 0, 130, 100))
+
+        # And the reverse: a grow back to the larger border is adopted too.
+        detector2 = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detector2.reset_geometry()
+        for _frame in range(3):
+            detector2._stabilize_boxes(*shrunk)
+        for _frame in range(detector2.box_history_len + 3):
+            adopted = detector2._stabilize_boxes(*full)
+        self.assertEqual(adopted[0], (0, 0, 239, 184))
 
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(

@@ -69,11 +69,16 @@ map-name crop, and analysis box. It analyzes a dedicated top-left crop and
 fits it inside its analysis box preserving the aspect ratio (an exact-square
 squash thinned the minimap border on large clients until detection fell
 back). Candidates are scored so the larger outer frame beats a same-corner
-title-panel strip, and the box stabilizer rejects transient shrinks (partial
-strips) forever while adopting a persistently repeated larger border so a
-strip-poisoned first frame cannot block recording/patrol for a whole session.
-`marker_detector.py` locates yellow player and
-red other-player diamonds. `DiamondSizeTracker` stabilizes small marker-size
+title-panel strip, and a same-width height collapse (the title strip at any
+zoom) is never adopted as geometry. A genuinely resized border (width AND
+height change together) is adopted once it repeats for a full history
+window, and recording verifies with fresh detector probes so a poisoned
+shared history cannot reject a good frame. `marker_detector.py` locates
+yellow player and
+red other-player diamonds; its size limits are generous enough for a zoomed
+diamond inside a fixed minimap panel while aspect/compactness checks still
+reject long platform decorations. `DiamondSizeTracker` stabilizes small
+marker-size
 changes but accepts large zoom changes immediately. `MapStructureTracker`
 estimates scroll-compensated world Y and can re-anchor at a recorded floor.
 

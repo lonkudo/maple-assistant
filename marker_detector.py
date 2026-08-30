@@ -88,9 +88,13 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
     height, width = yellow.shape
     candidates: list[tuple[float, MarkerDetection]] = []
     # Limits are relative enough for resized/zoomed diamonds while still
-    # rejecting long yellow platform decorations.
-    max_span = max(18, int(round(min(width, height) * 0.14)))
-    max_pixels = max(180, max_span * max_span)
+    # rejecting long yellow platform decorations.  The minimap ZOOM can
+    # change while the panel stays the same size, so the diamond can grow
+    # to a large fraction of the analysis box; the aspect and compactness
+    # checks below reject decorations, so the size bound only needs to
+    # exclude huge solid yellow regions, not modest zoom levels.
+    max_span = max(24, int(round(min(width, height) * 0.35)))
+    max_pixels = max(400, max_span * max_span)
     body_components = _components(yellow_body, min_pixels=3)
     for component in _components(yellow, min_pixels=3):
         ys, xs = component[:, 0], component[:, 1]
@@ -155,8 +159,8 @@ def detect_red_diamonds(minimap_rgb: np.ndarray) -> list[MarkerDetection]:
     )
     red_body = (red >= 190) & (green <= 70) & (blue <= 70)
     height, width = red_center.shape
-    max_span = max(18, int(round(min(width, height) * 0.14)))
-    max_pixels = max(180, max_span * max_span)
+    max_span = max(24, int(round(min(width, height) * 0.35)))
+    max_pixels = max(400, max_span * max_span)
     body_components = _components(red_body, min_pixels=3)
     detections: list[MarkerDetection] = []
     for component in _components(red_center, min_pixels=3):
