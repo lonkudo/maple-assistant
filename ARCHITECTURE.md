@@ -209,6 +209,12 @@ no-progress samples within the rope alignment threshold. Recovery also checks
 that threshold itself, so a distant rope target always remains an ordinary
 walk and cannot enter the jump-climb state machine.
 
+The straight-up center zone and attachment verification are intentionally
+separate. Only `under_rope_tolerance` may turn a planned directional jump into
+Alt+Up. The wider attachment X tolerance is used only after a jump to confirm
+that rising motion has grabbed the rope; it cannot overwrite Left/Right at a
+nearby platform edge.
+
 The climb state machine performs the jump chord, holds Up persistently, tracks
 screen/world-Y progress, retries failed grabs, releases a stalled climb, and
 confirms arrival at the expected next floor. Walking decisions are deferred

@@ -136,6 +136,9 @@ re-recorded when the UI labels them as a legacy layout.
   trigger false stair jumps.
 - Climb arrival requires the expected next layer and stable confirmation. Up
   remains held through a short rope-top compensation window.
+- Rope jumping keeps two separate horizontal tolerances: only the narrow
+  center zone jumps Alt+Up; positions outside it jump Left/Right toward the
+  rope even when the wider attachment-verification band accepts their X.
 - Attack suppression ends immediately after confirmed climb arrival; the
   separate arrival grace period only prevents an unsafe stair jump.
 - Fixed attack timing is `base interval + random gap`. The shorter base slider

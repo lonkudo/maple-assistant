@@ -643,6 +643,7 @@ def climb(
     persistent_up: bool = False,
     rope_x: Optional[float] = None,
     rope_x_tolerance: float = 0.025,
+    straight_up_tolerance: float = 0.008,
     climb_attach_frames: int = 2,
     arrival_y: Optional[float] = None,
     arrival_tolerance: float = 0.02,
@@ -667,6 +668,11 @@ def climb(
     the marker settles within that band the character reached the platform
     (not a failed grab), so the fell-back release is suppressed and the
     layer arrival (handled by the route resync) completes the climb.
+
+    ``straight_up_tolerance`` is deliberately narrower than the attachment
+    tolerance. Only that center zone may replace a planned left/right jump
+    with Alt+Up; attachment verification can remain wider without destroying
+    the directional rope approach.
     """
 
     player = observation.player
@@ -684,15 +690,14 @@ def climb(
             return send_all()
 
     if state.phase == "idle":
-        aligned_with_rope = bool(
+        inside_straight_up_zone = bool(
             rope_x is not None
-            and abs(rope_x - player.x) <= rope_x_tolerance
+            and abs(rope_x - player.x) <= straight_up_tolerance
         )
-        # Once X is already inside the attachment tolerance, a sideways
-        # jump is more likely to throw the character off the platform than
-        # improve alignment. Start straight up; a single live-gap lateral
-        # retry remains available if that first grab fails.
-        direction = "up" if aligned_with_rope else (
+        # Only the narrow center zone jumps vertically. The wider attachment
+        # tolerance must not override a left/right jump chosen by the rope
+        # planner (observed gap +0.020 incorrectly becoming Alt+Up).
+        direction = "up" if inside_straight_up_zone else (
             preferred_direction
             if preferred_direction in ("left", "right", "up") else "left"
         )
@@ -945,11 +950,11 @@ def climb(
         # jump retries toward the rope SIDE the character is actually on
         # (the live minimap gap) instead of a blind "right" that shoves the
         # character past the rope.
-        aligned_with_rope = bool(
+        inside_straight_up_zone = bool(
             rope_x is not None
-            and abs(rope_x - player.x) <= rope_x_tolerance
+            and abs(rope_x - player.x) <= straight_up_tolerance
         )
-        if (aligned_with_rope
+        if (inside_straight_up_zone
                 and (state.phase != "check-primary-up"
                      or state.failed_shift_used)):
             # Do not repeat the same lateral chord while X is not changing.
@@ -1367,6 +1372,7 @@ class MovementWorker(threading.Thread):
             failed_cycle_right_seconds=self.climb_failed_shift_right_seconds,
             persistent_up=True,
             rope_x=route_target_x,
+            straight_up_tolerance=self.under_rope_tolerance,
             arrival_y=arrival_y,
             arrival_tolerance=arrival_tolerance,
             arrival_in_progress=arrival_in_progress,

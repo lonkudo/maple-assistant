@@ -3635,7 +3635,7 @@ class MovementTests(unittest.TestCase):
                            if event == "down" and key in ("left", "right")]
         self.assertEqual(direction_downs, ["right", "right"])
 
-    def test_aligned_lateral_plan_starts_straight_up_to_avoid_falling(self):
+    def test_attachment_band_does_not_override_directional_jump(self):
         class Sender:
             dry_run = True
             def __init__(self): self.events = []
@@ -3646,8 +3646,8 @@ class MovementTests(unittest.TestCase):
             def key_up(self, key):
                 self.events.append(("up", key)); return True
 
-        # The live log had x=.575 and a nearby rope. Even if the outer plan
-        # says Left, being within the attach tolerance must use Alt+Up first.
+        # Attachment may use a wider X tolerance, but a position outside the
+        # narrow center zone must preserve the planner's Left/Right jump.
         sender, state = Sender(), ClimbState()
         aligned = MinimapObservation(
             Point(.575, .716667), None, .9, (0, 0, 1, 1)
@@ -3657,12 +3657,66 @@ class MovementTests(unittest.TestCase):
                 sender, aligned, state, preferred_direction="left",
                 persistent_up=True, rope_x=.590,
             )
-        self.assertEqual(result, "up-toward-rope")
+        self.assertEqual(result, "left-toward-rope")
         lateral_downs = [
             key for event, key in sender.events
             if event == "down" and key in ("left", "right")
         ]
-        self.assertEqual(lateral_downs, [])
+        self.assertEqual(lateral_downs, ["left"])
+
+    def test_logged_point_zero_two_gap_jumps_right_not_up(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def press(self, key, duration=0):
+                self.events.append(("press", key, duration)); return True
+            def key_down(self, key):
+                self.events.append(("down", key)); return True
+            def key_up(self, key):
+                self.events.append(("up", key)); return True
+
+        sender, state = Sender(), ClimbState()
+        observation = MinimapObservation(
+            Point(.675, .527778), None, .9, (0, 0, 1, 1)
+        )
+        with patch("movement_worker.time.sleep"):
+            result = climb(
+                sender, observation, state,
+                preferred_direction="right", persistent_up=True,
+                rope_x=.695, rope_x_tolerance=.025,
+                straight_up_tolerance=.008,
+            )
+        self.assertEqual(result, "right-toward-rope")
+        downs = [key for event, key in sender.events if event == "down"]
+        self.assertIn("right", downs)
+        self.assertNotIn("left", downs)
+
+    def test_worker_passes_center_zone_separately_from_attach_zone(self):
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def press(self, key, duration=0):
+                self.events.append(("press", key, duration)); return True
+            def key_down(self, key):
+                self.events.append(("down", key)); return True
+            def key_up(self, key):
+                self.events.append(("up", key)); return True
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            fixed_target_x=.695, under_rope_tolerance=.008,
+            important_positions={},
+        )
+        observation = MinimapObservation(
+            Point(.675, .527778), None, .9, (0, 0, 1, 1)
+        )
+        with patch("movement_worker.time.sleep"):
+            result = worker._run_climb_step(observation, .695, "right")
+        self.assertEqual(result, "right-toward-rope")
+        downs = [key for event, key in sender.events if event == "down"]
+        self.assertIn("right", downs)
+        self.assertNotIn("left", downs)
 
     def test_failed_cycle_correction_moves_toward_left_side_rope(self):
         class Sender:
