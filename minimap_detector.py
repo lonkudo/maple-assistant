@@ -587,18 +587,13 @@ class MinimapDetector:
         left, top, right, bottom = window_box
         minimap_width, minimap_height = right - left, bottom - top
 
-        # Preserve the old calibrated analysis geometry relative to the detected
-        # minimap frame: at 195x256 this produces approximately (0,80,205,256).
-        analysis_box = _clamp_box(
-            (
-                left,
-                top + round(minimap_height * 0.3125),
-                left + round(minimap_width * 1.0513),
-                bottom,
-            ),
-            width,
-            height,
-        )
+        # The analysis area is the whole detected minimap frame.  The old
+        # 0.3125 top offset (and 1.0513 right extension) came from a layout
+        # where the map-name strip sat INSIDE the minimap's top; now the
+        # map name is a separate strip ABOVE the minimap, so the marker /
+        # patrol analysis box must match the window box exactly (the green
+        # and yellow rectangles in the startup overlay must coincide).
+        analysis_box = window_box
         inner_candidates: list[Box] = []
         for candidate_box, _candidate_rectangularity in rectangles:
             inner_left, inner_top, inner_right, inner_bottom = candidate_box
