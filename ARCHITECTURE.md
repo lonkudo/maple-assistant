@@ -124,7 +124,7 @@ Control ownership rules:
 ## 4. Patrol data model
 
 `PatrolController` is the thread-safe owner of the `recording` section in
-`config.json`. It provides immutable snapshots to the UI and
+`user_config.json`. It provides immutable snapshots to the UI and
 movement worker and persists updates atomically through a temporary file.
 
 Each layer may contain any subset of:
@@ -309,22 +309,27 @@ recovery behavior.
 
 ## 8. Configuration ownership
 
-`config_store.py` atomically owns the single user file `config.json`.
+`config_store.py` routes each section by ownership. UI-visible settings and
+recordings are atomically written to `user_config.json`; internal movement and
+detection calibration is read from the shipped, runtime-read-only
+`system_config.json`.
 
-| Section | Main owner/consumer |
-|---|---|
-| `recording` | PatrolController, MovementWorker, UiWorker |
-| `rope_calibration` | assistant.py -> MovementWorker tuning |
-| `drug` | UiWorker, StatusWorker, MovementWorker |
-| `fixed_attack` | UiWorker and AttackWorker |
-| `additional_functions` | UiWorker and optional-function workers |
-| `yolo_detection` | UiWorker and YOLO launch settings |
-| `ui_window` | Tk window geometry helpers |
+| Section | File ownership | Main owner/consumer |
+|---|---|---|
+| `recording` | user | PatrolController, MovementWorker, UiWorker |
+| `rope_calibration` | system/update | assistant.py -> MovementWorker tuning |
+| `drug` | user | UiWorker, StatusWorker, MovementWorker |
+| `fixed_attack` | user | UiWorker and AttackWorker |
+| `additional_functions` | user | UiWorker and optional-function workers |
+| `yolo_detection` | user | UiWorker and YOLO launch settings |
+| `ui_window` | user | Tk window geometry helpers |
 
-Missing sections migrate once from the former split JSON files. `config.json`
-is ignored and excluded from releases, so updates cannot replace user settings
-or route recordings. `yolo-detection/config.yaml` remains the model
-subproject's lower-level developer configuration.
+User sections migrate once from the old unified `config.json` or former split
+JSON files. System sections never migrate from those files: the release-owned
+`system_config.json` wins, fixing stale internal defaults after an update.
+`user_config.json` is ignored/excluded while `system_config.json` is tracked and
+packaged. `yolo-detection/config.yaml` remains the model subproject's lower-level
+developer configuration.
 
 Persistent user recordings and generated assets may be modified at runtime.
 Avoid overwriting them during unrelated code changes.
@@ -372,7 +377,7 @@ git -c core.quotepath=false ls-files
 | File | Responsibility |
 |---|---|
 | `assistant.py` | Primary entry point, dependency wiring, lifecycle, single-instance guard |
-| `config_store.py` | Atomic unified settings store and split-file migration |
+| `config_store.py` | User/system section router and legacy user migration |
 | `capture_worker.py` | Client capture, frame bus, region mapping |
 | `movement_worker.py` | Patrol and movement state machines |
 | `character_worker.py` | Minimap character-position stream and shared-result disconnect alert |
@@ -397,7 +402,9 @@ git -c core.quotepath=false ls-files
 
 | File | Responsibility |
 |---|---|
-| `config.json` | Ignored user-owned unified settings, generated/migrated at runtime |
+| `user_config.json` | Ignored UI settings and recordings, generated/migrated at runtime |
+| `system_config.json` | Tracked internal calibration, replaced by application updates |
+| `config.json` | Legacy unified backup/migration source; no longer written |
 | Former split settings JSONs | Legacy migration sources only; excluded from releases |
 | `sound/beep.mp3` | Countdown reminder sound shipped in releases |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |

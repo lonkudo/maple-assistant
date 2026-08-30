@@ -44,9 +44,12 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
     $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs",
                    "build_release.ps1", "ui_window_settings.json",
                    "COMMIT_MSG.txt", "release_now.ps1", "发布.bat",
-                   # User configuration is generated/migrated as config.json
-                   # and must never be overwritten by an application update.
-                   "config.json", "recording-configuration.json",
+                   # User configuration is generated/migrated as
+                   # user_config.json and must never be overwritten by an
+                   # application update. system_config.json is intentionally
+                   # included so internal calibration follows each version.
+                   "config.json", "user_config.json",
+                   "recording-configuration.json",
                    "rope_calibration.json", "drug_settings.json",
                    "fixed_attack_settings.json",
                    "additional_functions_settings.json",

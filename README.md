@@ -83,7 +83,7 @@ inventory.
 
 ## Recording and patrol behavior
 
-The shared route is stored in the `recording` section of `config.json`. In the UI, select
+The shared route is stored in the `recording` section of `user_config.json`. In the UI, select
 a layer and record any desired combination of:
 
 - **Left-most**
@@ -102,7 +102,7 @@ Layers are executed in numeric bottom-to-top order. The selected patrol range
 is contiguous. A character that lands below it climbs back; one above it drops
 back. Return-to-route input suppresses attacks until the route is reached.
 
-`patrol_cycles_per_layer` in `config.json` -> `rope_calibration` defaults to `2`. Every
+`patrol_cycles_per_layer` in `system_config.json` -> `rope_calibration` defaults to `2`. Every
 layer completes two full horizontal Left/Right cycles before it climbs or,
 for the top layer of the active route, drops back to the first route layer.
 The final layer's rope is intentionally not used because no patrolled layer is
@@ -132,7 +132,7 @@ re-recorded when the UI labels them as a legacy layout.
 - Fixed attack timing is `base interval + random gap`. The shorter base slider
   sets the lower bound; adjacent −/+ buttons change the random-gap ceiling in
   0.1-second steps. The UI displays the complete effective range
-  `(base, base + random gap)`, and both values persist in `config.json`.
+  `(base, base + random gap)`, and both values persist in `user_config.json`.
 - Losing focus releases every key. After refocus, movement reconciles its
   internal hold state with the sender and re-presses externally released keys.
 - A secondary character-marker reading can override movement only when it
@@ -153,15 +153,23 @@ re-recorded when the UI labels them as a legacy layout.
 
 ## Configuration
 
-All application settings now live in one ignored, persistent `config.json`.
-Its sections are `recording`, `rope_calibration`, `drug`, `fixed_attack`,
-`additional_functions`, `yolo_detection`, and `ui_window`.
+Configuration is intentionally split by ownership:
 
-On the first updated launch, `config_store.py` imports values from the old split
-JSON files. After that, `config.json` is authoritative. Release ZIPs exclude
-both `config.json` and the old split files, so extracting a new version over an
-installation cannot overwrite the user's configuration. The lower-level YOLO
-engine's developer-oriented `yolo-detection/config.yaml` remains separate.
+- `user_config.json` contains only UI-managed values and route recordings:
+  `recording`, `drug`, `fixed_attack`, `additional_functions`,
+  `yolo_detection`, and `ui_window`. It is ignored and excluded from releases,
+  so copying an update over an installation preserves every user choice.
+- `system_config.json` contains update-owned internal behavior, currently
+  `rope_calibration`. It is tracked and included in every release, so fixes such
+  as `stair_jump_stall_frames: 10` replace obsolete system values during an
+  update.
+
+On the first split-config launch, `config_store.py` migrates user-owned sections
+from the former unified `config.json` (or older split JSON files) into
+`user_config.json`. It deliberately does not migrate `rope_calibration`; the
+shipped `system_config.json` is authoritative. The old `config.json` remains as
+a backup but is no longer written. The lower-level YOLO engine's developer
+`yolo-detection/config.yaml` remains separate.
 
 Runtime state and logs are written under ignored directories such as `work/`,
 `outputs/`, and `recording-assets/`. Do not assume these files are saved by Git.
@@ -233,8 +241,9 @@ Important publishing details:
   wrapping back to `0000`.
 - `release\` is Git-ignored. The ZIP is a delivery artifact, not part of the
   commit.
-- `config.json` is user-owned and excluded from releases; never replace it
-  during an update.
+- `user_config.json` is user-owned and excluded from releases; never replace it
+  during an update. `system_config.json` must be included and replaced so
+  internal fixes follow the application version.
 - A successful command prints `release ready: <absolute zip path>`.
 
 After a successful release, save the source change:

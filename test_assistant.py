@@ -43,6 +43,10 @@ class StartLiveInputTests(unittest.TestCase):
         with patch("sys.argv", ["assistant.py"]):
             self.assertEqual(parse_args().status_interval, 0.25)
 
+    def test_default_config_path_is_user_owned_file(self) -> None:
+        with patch("sys.argv", ["assistant.py"]):
+            self.assertEqual(parse_args().config.name, "user_config.json")
+
     def test_start_selects_and_verifies_game_before_enabling_input(self) -> None:
         sender = FakeSender()
         active = threading.Event()
