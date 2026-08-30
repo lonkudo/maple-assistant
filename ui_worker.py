@@ -20,7 +20,12 @@ from PIL import Image, ImageTk
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from map_identity import MapIdentityStore
 from map_structure_tracker import MapStructureTracker
-from minimap_detector import Box, MinimapDetection, MinimapDetector
+from minimap_detector import (
+    Box,
+    MinimapDetection,
+    MinimapDetector,
+    is_verified_border,
+)
 from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
@@ -1616,7 +1621,7 @@ class UiWorker(threading.Thread):
                         self.structure_tracker,
                     )
                     snapshot = candidate
-                    if (candidate.detection.source == "opencv"
+                    if (is_verified_border(candidate.detection)
                             and candidate.player_x is not None
                             and candidate.player_y is not None):
                         break
@@ -1649,7 +1654,7 @@ class UiWorker(threading.Thread):
                 text="无法录制: 最新画面中未检测到黄色菱形标记。"
             )
             return
-        if snapshot.detection.source != "opencv":
+        if not is_verified_border(snapshot.detection):
             LOG.warning(
                 "RECORD REJECTED: border source=%s window=%s client=%s",
                 snapshot.detection.source,

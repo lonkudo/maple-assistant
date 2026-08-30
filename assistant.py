@@ -40,11 +40,13 @@ OPENCV_ANALYSIS_SIZE = (200, 200)
 MINIMAP_ANALYSIS_SIZE = (400, 400)
 # The game HUD is FIXED PIXEL: only the playfield viewport scales with the
 # window resolution, so HUD regions must be absolute pixels, not normalized
-# fractions of the client.  Measured on the real client: the minimap border
-# is ~380x250 at the top-left of the game window (it varies a little between
-# maps), so a 400x280 absolute search region contains it at any supported
-# window size while keeping the OpenCV working scale near 1.0.
-MINIMAP_FALLBACK_REGION = (0, 0, 400, 280)
+# fractions of the client.  Measured on the real client: the top-left region
+# holds the MAP NAME (a ~64px-high strip) and BELOW it the real minimap
+# (~380px wide).  The search region therefore starts at y=64 so the map-name
+# strip can never be mistaken for the minimap border; the minimap itself
+# varies a little between maps.
+MINIMAP_MAP_NAME_HEIGHT = 64
+MINIMAP_FALLBACK_REGION = (0, MINIMAP_MAP_NAME_HEIGHT, 400, 320)
 # HP/MP bars: measured ~228x35 px at the BOTTOM of the window, slightly LEFT
 # of the horizontal center (the info bar they sit in is exactly
 # bottom-centered).  The box is anchored to the window bottom and to a point
@@ -450,14 +452,23 @@ def main() -> int:
                 )
                 candidate_detection = probe.detect(candidate_frame.image)
                 probes.append((candidate_frame, candidate_detection))
-                if candidate_detection.source == "opencv":
-                    marker_rgb = np.asarray(
-                        candidate_frame.image.crop(
-                            candidate_detection.analysis_box
-                        ).convert("RGB")
-                    )
-                    if detect_yellow_diamond(marker_rgb) is not None:
-                        marker_verified_indices.append(len(probes) - 1)
+                # Accept an OpenCV contour OR the fixed HUD region when the
+                # yellow marker is found inside the analysis box; the fixed
+                # region is marker-verified geometry on the fixed-pixel HUD.
+                marker_rgb = np.asarray(
+                    candidate_frame.image.crop(
+                        candidate_detection.analysis_box
+                    ).convert("RGB")
+                )
+                if detect_yellow_diamond(marker_rgb) is not None:
+                    if candidate_detection.source == "fallback":
+                        candidate_detection = replace(
+                            candidate_detection,
+                            source="fixed-region",
+                            confidence=1.0,
+                        )
+                        probes[-1] = (candidate_frame, candidate_detection)
+                    marker_verified_indices.append(len(probes) - 1)
             chosen_index = choose_stable_minimap_index(
                 [candidate for _frame, candidate in probes],
                 minimum_repeats=2 if len(probes) >= 2 else 1,
@@ -597,13 +608,22 @@ def main() -> int:
         """Publish recording's verified border for independent patrol use."""
 
         detection = getattr(snapshot, "detection")
+        # When OpenCV could not close a border contour, the marker-verified
+        # fixed HUD region (map-name strip above the measured minimap area)
+        # is the calibration: the marker was found inside it, so its
+        # absolute-pixel geometry is correct for the fixed-pixel HUD.
+        if detection.source == "fallback":
+            detection = replace(
+                detection, source="fixed-region", confidence=1.0
+            )
         client_size = getattr(snapshot, "client_size")
         value = minimap_calibration_to_dict(detection, client_size)
         config_store.write_section("minimap_calibration", value)
         minimap_detector.seed_geometry(detection, client_size)
         logging.info(
-            "MINIMAP recording border saved | box=%s | client=%dx%d",
-            detection.window_box, client_size[0], client_size[1],
+            "MINIMAP recording border saved source=%s | box=%s | client=%dx%d",
+            detection.source, detection.window_box,
+            client_size[0], client_size[1],
         )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
     telegram_notifier = TelegramNotifier(stop_event)

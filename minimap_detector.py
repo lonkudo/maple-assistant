@@ -81,6 +81,18 @@ class MinimapDetection:
         return box_to_normalized(self.analysis_box, image_size)
 
 
+def is_verified_border(detection: MinimapDetection) -> bool:
+    """True when a detection can seed/calibrate minimap geometry.
+
+    An OpenCV contour is verified by construction.  The fixed fallback region
+    (the measured HUD minimap area) is also acceptable: it carries the same
+    absolute-pixel boxes and is only used when the yellow marker was found
+    inside it (the caller checks the marker before promoting it).
+    """
+
+    return detection.source.startswith("opencv") or detection.source == "fixed-region"
+
+
 def minimap_calibration_to_dict(
     detection: MinimapDetection,
     image_size: tuple[int, int],
@@ -93,8 +105,8 @@ def minimap_calibration_to_dict(
     saved calibration valid regardless of the current window size.
     """
 
-    if not detection.source.startswith("opencv"):
-        raise ValueError("only an OpenCV minimap border can be calibrated")
+    if not is_verified_border(detection):
+        raise ValueError("only a verified minimap border can be calibrated")
     return {
         "schema": 2,
         "recorded_client_size": [int(image_size[0]), int(image_size[1])],
@@ -177,7 +189,7 @@ class MinimapDetector:
 
     def __init__(
         self,
-        fallback_region: NormalizedBox = (0, 0, 400, 400),
+        fallback_region: NormalizedBox = (0, 64, 400, 320),
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
@@ -249,8 +261,8 @@ class MinimapDetector:
     ) -> None:
         """Lock a verified minimap border as this map session's baseline."""
 
-        if not detection.source.startswith("opencv"):
-            raise ValueError("minimap geometry must come from an OpenCV border")
+        if not is_verified_border(detection):
+            raise ValueError("minimap geometry must come from a verified border")
         boxes = (
             detection.window_box,
             detection.analysis_box,
@@ -489,9 +501,18 @@ class MinimapDetector:
 
         candidates: list[tuple[float, Box, float]] = []
         rectangles: list[tuple[Box, float]] = []
+        # The minimap is a large fraction of the search region (measured
+        # ~380x250 in a 400x280 box).  Tiny contours - a UI button, the map
+        # name strip, a minimap child rectangle - are NOT the minimap border:
+        # the live client produced a 40x40 box whose analysis area excluded
+        # the yellow marker, failing every recording.  Require a meaningful
+        # minimum side relative to the search region.
+        region_min = max(1, min(width, height))
+        minimum_side = (
+            max(40, round(region_min * 0.25)) if self.dedicated_crop else 90
+        )
         for contour in contours:
             x, y, candidate_width, candidate_height = cv2.boundingRect(contour)
-            minimum_side = 40 if self.dedicated_crop else 90
             if candidate_width < max(minimum_side, int(width * 0.055)):
                 continue
             if candidate_height < max(minimum_side, int(height * 0.075)):
@@ -592,12 +613,17 @@ class MinimapDetector:
             max(inner_candidates, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]))
             if inner_candidates else analysis_box
         )
+        # The MAP NAME is a fixed strip ABOVE the minimap (measured ~64px
+        # tall): its crop must read that strip, not a region inside the map
+        # canvas.  The minimap border starts below it, so the name crop is
+        # the band between the search-region top and the detected border's
+        # top, widened to the border's horizontal span.
         map_name_box = _clamp_box(
             (
-                left + round(minimap_width * 0.14),
-                top + round(minimap_height * 0.105),
-                left + round(minimap_width * 0.98),
-                top + round(minimap_height * 0.32),
+                left,
+                self.fallback_region[1],
+                right,
+                max(top, self.fallback_region[1] + 1),
             ),
             width,
             height,
@@ -655,23 +681,35 @@ class MinimapDetector:
             width,
             height,
         )
-        # The fallback region is the historical analysis crop, not the entire
-        # minimap frame. It remains safe for movement if OpenCV cannot localize.
-        # The map-name title sits in a strip at the top of the minimap; keep
-        # the identity crop to that static strip instead of the whole region so
-        # recorded signatures never include the scrolling map canvas below it.
-        region_width = analysis_box[2] - analysis_box[0]
-        region_height = analysis_box[3] - analysis_box[1]
+        # The fallback region starts BELOW the map-name strip (the search
+        # region top is the map name bottom).  The map-name title sits in the
+        # strip ABOVE the minimap (y=0..analysis_top); keep the identity crop
+        # to that static strip so recorded signatures never include the
+        # scrolling map canvas below it.
         map_name_box = _clamp_box(
             (
-                analysis_box[0] + round(region_width * 0.14),
-                analysis_box[1] + round(region_height * 0.105),
-                analysis_box[0] + round(region_width * 0.98),
-                analysis_box[1] + round(region_height * 0.32),
+                analysis_box[0],
+                0,
+                analysis_box[2],
+                analysis_box[1],
             ),
             width,
             height,
         )
+        if map_name_box[3] - map_name_box[1] < 4:
+            # The minimap touches the window top (no map-name strip above);
+            # fall back to the top band of the region itself.
+            region_height = analysis_box[3] - analysis_box[1]
+            map_name_box = _clamp_box(
+                (
+                    analysis_box[0],
+                    analysis_box[1],
+                    analysis_box[2],
+                    min(height, analysis_box[1] + max(4, region_height // 4)),
+                ),
+                width,
+                height,
+            )
         return MinimapDetection(
             window_box=analysis_box,
             analysis_box=analysis_box,
@@ -688,11 +726,14 @@ def choose_stable_minimap_index(
     minimum_repeats: int = 2,
     marker_verified_indices: Sequence[int] = (),
 ) -> int:
-    """Choose a repeated or marker-verified OpenCV minimap border.
+    """Choose a repeated or marker-verified minimap border.
 
-    Repetition remains preferred. A single real OpenCV border is also safe
-    when its analysis region independently contains the yellow character
-    diamond. Raw fallback/search-region geometry is never accepted.
+    Repetition remains preferred. A single verified border is also safe when
+    its analysis region independently contains the yellow character diamond:
+    either a real OpenCV contour, or the fixed HUD region (map-name strip
+    above the measured minimap area) that the caller confirmed contains the
+    marker.  Raw unverified fallback/search-region geometry is never
+    accepted.
     """
 
     clusters: list[list[int]] = []
@@ -715,7 +756,7 @@ def choose_stable_minimap_index(
         verified = [
             index for index in marker_verified_indices
             if (0 <= index < len(detections)
-                and detections[index].source == "opencv")
+                and is_verified_border(detections[index]))
         ]
         if verified:
             return max(

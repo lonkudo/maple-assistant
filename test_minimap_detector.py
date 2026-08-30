@@ -435,24 +435,25 @@ class MinimapDetectorTests(unittest.TestCase):
     def test_large_client_border_detects_with_aspect_preserving_fit(self) -> None:
         """A big client must not fall back because the crop is squashed.
 
-        The debug snapshot is 1707x1067: the 22% x 27% search crop is
-        375x288.  The old exact-square resize to a fixed 200x200 working
-        image distorted that crop and thinned the minimap border until Canny
-        could no longer close its rectangle, so every frame fell back and
-        patrol/recording could never verify a border.  The detector now fits
-        the crop inside its analysis box preserving aspect ratio.
+        The real HUD layout has the map-name strip (~64px) ABOVE the minimap,
+        so the border sits below it (y>=64).  The old exact-square resize to a
+        fixed 200x200 working image distorted that crop and thinned the
+        minimap border until Canny could no longer close its rectangle, so
+        every frame fell back and patrol/recording could never verify a
+        border.  The detector now fits the crop inside its analysis box
+        preserving aspect ratio.
         """
 
         image = Image.new("RGB", (1707, 1067), "black")
         draw = ImageDraw.Draw(image)
-        # Same geometry as the real snapshot: outer border at the top-left
-        # corner, inner map canvas, and a lighter title strip.
-        draw.rectangle((0, 0, 158, 248), outline=(230, 230, 230), width=3)
+        # Real layout: map-name strip on top, minimap border below it.
+        draw.rectangle((0, 0, 400, 64), fill=(145, 180, 195))
+        draw.rectangle((0, 64, 158, 312), outline=(230, 230, 230), width=3)
         draw.rectangle(
-            (4, 84, 154, 238), fill=(35, 45, 55),
+            (4, 148, 154, 302), fill=(35, 45, 55),
             outline=(190, 190, 190), width=2,
         )
-        draw.rectangle((22, 26, 152, 70), fill=(145, 180, 195))
+        draw.rectangle((22, 90, 152, 134), fill=(200, 200, 200))
 
         detector = MinimapDetector(
             dedicated_crop=True, opencv_size=(400, 400)
@@ -477,15 +478,15 @@ class MinimapDetectorTests(unittest.TestCase):
 
         image = Image.new("RGB", (1707, 1067), "black")
         draw = ImageDraw.Draw(image)
-        # Solid bright minimap panel (outer contour closes), dark canvas
-        # hollowing the lower part, and a bright title strip with its own
-        # closed contour: the detector sees both a 229x62-ish strip and the
-        # full 235x180 frame, exactly like the live flicker frames.
-        draw.rectangle((0, 0, 239, 184), fill=(150, 160, 175),
+        # Real layout: map-name strip on top (y=0..64), then the minimap
+        # panel below with a bright outer border and a separated title strip,
+        # so the detector sees both a strip contour and the full frame.
+        draw.rectangle((0, 0, 400, 64), fill=(145, 180, 195))
+        draw.rectangle((0, 64, 239, 248), fill=(150, 160, 175),
                        outline=(235, 235, 235), width=3)
-        draw.rectangle((6, 84, 233, 178), fill=(35, 45, 55),
+        draw.rectangle((6, 148, 233, 242), fill=(35, 45, 55),
                        outline=(200, 200, 200), width=2)
-        draw.rectangle((6, 6, 233, 66), fill=(145, 180, 195),
+        draw.rectangle((6, 70, 233, 130), fill=(145, 180, 195),
                        outline=(235, 235, 235), width=2)
 
         detector = MinimapDetector(
@@ -576,6 +577,54 @@ class MinimapDetectorTests(unittest.TestCase):
         for _frame in range(detector2.box_history_len + 3):
             adopted = detector2._stabilize_boxes(*full)
         self.assertEqual(adopted[0], (0, 0, 239, 184))
+
+    def test_map_name_strip_is_not_chosen_as_minimap_border(self) -> None:
+        """A tiny UI box inside the map-name strip must not win.
+
+        The live client log showed detection=opencv window=(5,22,45,62) - a
+        40x40 contour inside the 64px map-name strip - whose analysis box
+        excluded the yellow marker, failing every record click.  The search
+        region starts BELOW the map-name strip (y=64), so such tiny contours
+        are never candidates; when no real border closes, the marker-verified
+        fixed region (source=fixed-region) is the geometry and the map-name
+        crop reads the strip above the minimap.
+        """
+
+        import numpy as np
+
+        image = Image.new("RGB", (1366, 768), (20, 20, 20))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 400, 64), fill=(145, 180, 195))  # map name
+        draw.rectangle((5, 22, 45, 62), outline=(255, 255, 255), width=2)
+        draw.rectangle((0, 64, 380, 314), outline=(235, 235, 235), width=3)
+        draw.rectangle((6, 148, 374, 308), fill=(35, 45, 55),
+                       outline=(200, 200, 200), width=2)
+        # Yellow diamond inside the minimap (reported color range).
+        for y in range(-3, 4):
+            for x in range(-3, 4):
+                distance = abs(x) + abs(y)
+                if distance <= 3:
+                    color = ((255, 255, 136) if distance <= 1
+                             else ((240, 225, 60) if distance == 2
+                                   else (214, 200, 0)))
+                    image.putpixel((190 + x, 220 + y), color)
+
+        detector = MinimapDetector(
+            fallback_region=(0, 64, 400, 320),
+            dedicated_crop=True, opencv_size=(400, 400),
+        )
+        detection = detector.detect(image)
+
+        # The 40x40 box is rejected; geometry is the fixed region below the
+        # map-name strip and the marker is inside the analysis box.
+        self.assertEqual(detection.source, "fallback")
+        self.assertGreaterEqual(detection.window_box[1], 64)
+        marker = detect_yellow_diamond(np.asarray(
+            image.crop(detection.analysis_box).convert("RGB")
+        ))
+        self.assertIsNotNone(marker)
+        # The map-name crop is the strip ABOVE the minimap, not inside it.
+        self.assertLessEqual(detection.map_name_box[3], 64)
 
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(
