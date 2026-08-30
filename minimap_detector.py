@@ -517,8 +517,14 @@ def choose_stable_minimap_index(
     detections: Sequence[MinimapDetection],
     *,
     minimum_repeats: int = 2,
+    marker_verified_indices: Sequence[int] = (),
 ) -> int:
-    """Choose a repeated OpenCV border without using search-crop geometry."""
+    """Choose a repeated or marker-verified OpenCV minimap border.
+
+    Repetition remains preferred. A single real OpenCV border is also safe
+    when its analysis region independently contains the yellow character
+    diamond. Raw fallback/search-region geometry is never accepted.
+    """
 
     clusters: list[list[int]] = []
     for index, detection in enumerate(detections):
@@ -537,6 +543,16 @@ def choose_stable_minimap_index(
             clusters.append([index])
     repeated = [cluster for cluster in clusters if len(cluster) >= minimum_repeats]
     if not repeated:
+        verified = [
+            index for index in marker_verified_indices
+            if (0 <= index < len(detections)
+                and detections[index].source == "opencv")
+        ]
+        if verified:
+            return max(
+                verified,
+                key=lambda index: detections[index].confidence,
+            )
         raise OSError("could not establish a stable detected minimap border")
     # Most repeats wins.  If both the true border and a larger enclosing
     # rectangle repeat equally, the smaller measured border is the minimap;

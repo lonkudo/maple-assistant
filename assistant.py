@@ -428,19 +428,28 @@ def main() -> int:
             probe_frames.append(candidate_frame)
             after_sequence = candidate_frame.sequence
         probes = []
+        marker_verified_indices = []
         for candidate_frame in probe_frames:
             probe = MinimapDetector(
                 fallback_region=minimap_region,
                 dedicated_crop=True,
                 opencv_size=OPENCV_ANALYSIS_SIZE,
             )
-            probes.append(
-                (candidate_frame, probe.detect(candidate_frame.image))
-            )
+            candidate_detection = probe.detect(candidate_frame.image)
+            probes.append((candidate_frame, candidate_detection))
+            if candidate_detection.source == "opencv":
+                marker_rgb = np.asarray(
+                    candidate_frame.image.crop(
+                        candidate_detection.analysis_box
+                    ).convert("RGB")
+                )
+                if detect_yellow_diamond(marker_rgb) is not None:
+                    marker_verified_indices.append(len(probes) - 1)
         try:
             chosen_index = choose_stable_minimap_index(
                 [candidate for _frame, candidate in probes],
                 minimum_repeats=2 if len(probes) >= 2 else 1,
+                marker_verified_indices=marker_verified_indices,
             )
             fresh_frame, detection = probes[chosen_index]
             minimap_detector.seed_geometry(detection, fresh_frame.image.size)
@@ -460,6 +469,7 @@ def main() -> int:
                 chosen_index = choose_stable_minimap_index(
                     [candidate for _frame, candidate in probes],
                     minimum_repeats=1,
+                    marker_verified_indices=marker_verified_indices,
                 )
                 fresh_frame, detection = probes[chosen_index]
                 minimap_detector.seed_geometry(

@@ -98,11 +98,14 @@ releases keys.
 The start transition has an explicit capture-only phase. After
 `WindowKeySender.select_window()` and foreground verification,
 `patrol_preparing` opens the capture gate so `prepare_map_session()` receives
-several fresh game frames for minimap stability voting. Input remains disabled
-during this phase. On success input is armed; on any calibration error the
-temporary gate clears in `finally`. This prevents pre-focus/UI-overlaid frames
-from contaminating the stable minimap sequence while preserving idle behavior
-before Start Patrol.
+several fresh game frames for minimap calibration. A repeated OpenCV border wins
+the vote. If repetition is unavailable, one OpenCV border may be accepted only
+when yellow-diamond detection independently verifies its analysis region. A
+fallback search crop is never accepted as the minimap border. Input remains
+disabled during this phase. On success input is armed; on any calibration error
+the temporary gate clears in `finally`. This prevents pre-focus/UI-overlaid
+frames from contaminating calibration while preserving idle behavior before
+Start Patrol.
 
 Manual recording has a parallel one-off path and does not depend on that
 patrol capture gate. Every recording click first foregrounds the game, waits

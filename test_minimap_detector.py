@@ -242,6 +242,27 @@ class MinimapDetectorTests(unittest.TestCase):
         with self.assertRaises(OSError):
             choose_stable_minimap_index([fallback, fallback, fallback])
 
+    def test_startup_accepts_single_opencv_border_verified_by_marker(self):
+        fallback = MinimapDetection(
+            (0, 0, 238, 207), (0, 0, 238, 207), (0, 0, 238, 207),
+            (0, 0, 10, 10), 0.0, "fallback",
+        )
+        measured = MinimapDetection(
+            (0, 0, 96, 135), (0, 40, 101, 135), (2, 45, 94, 132),
+            (10, 8, 90, 42), .55, "opencv",
+        )
+        self.assertEqual(
+            choose_stable_minimap_index(
+                [fallback, measured, fallback],
+                marker_verified_indices=[1],
+            ),
+            1,
+        )
+        with self.assertRaises(OSError):
+            choose_stable_minimap_index(
+                [fallback, fallback], marker_verified_indices=[0]
+            )
+
     def test_box_smoothing_rejects_transient_minimap_height_collapse(self) -> None:
         """A clipped contour must not crop the player marker out of the map."""
 

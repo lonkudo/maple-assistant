@@ -967,7 +967,6 @@ class UiWorker(threading.Thread):
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left"
             )
-            self._fixed_status.pack(anchor="w", pady=(3, 0))
             self._fixed_load_settings()
 
             # Drug (HP/MP potion) panel: key binds + percent trigger sliders.
@@ -1262,7 +1261,6 @@ class UiWorker(threading.Thread):
                 text="循环警报: 未启用。",
                 justify="left",
             )
-            self._countdown_status.pack(anchor="w", pady=(4, 0))
 
             reminder_row = ttk.Frame(extra_panel)
             reminder_row.pack(fill="x", pady=(4, 0))
@@ -1290,14 +1288,6 @@ class UiWorker(threading.Thread):
                 variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
-            ttk.Label(
-                extra_panel,
-                text=("提醒: 声音播放 beep.mp3；闪烁为红屏两次；"
-                      "消息通过 Telegram BOT 发送。"),
-                justify="left",
-                wraplength=620,
-            ).pack(anchor="w", pady=(2, 0))
-
             telegram_row = ttk.Frame(extra_panel)
             telegram_row.pack(fill="x", pady=(4, 0))
             self._telegram_machine_row = telegram_row
