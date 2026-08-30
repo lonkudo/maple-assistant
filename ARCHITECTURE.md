@@ -95,6 +95,15 @@ The UI starts with input disarmed. **Start Patrol** prepares the map session,
 selects the game window, and arms input. **Stop Patrol** disables input and
 releases keys.
 
+The start transition has an explicit capture-only phase. After
+`WindowKeySender.select_window()` and foreground verification,
+`patrol_preparing` opens the capture gate so `prepare_map_session()` receives
+several fresh game frames for minimap stability voting. Input remains disabled
+during this phase. On success input is armed; on any calibration error the
+temporary gate clears in `finally`. This prevents pre-focus/UI-overlaid frames
+from contaminating the stable minimap sequence while preserving idle behavior
+before Start Patrol.
+
 `FocusWorker` is completely idle while patrol input is disarmed. Once patrol
 starts, it checks whether the selected game is foreground. During a focus
 dip it clears automation events and releases all keys. It attempts a rate-

@@ -61,6 +61,12 @@ py -3.10 assistant.py --help
 The application starts with live input disarmed. Input is enabled only after
 **Start Patrol** is clicked.
 
+Start Patrol first selects and verifies the game in the foreground, then opens
+a temporary capture-only phase to collect stable minimap samples. Keyboard
+input is armed only after that calibration succeeds. UI-overlaid pre-focus
+frames therefore cannot enter the stability vote, and window checking remains
+idle before Start Patrol.
+
 ## What the assistant does
 
 - `CaptureWorker` captures the client and publishes latest-only frames.

@@ -3,7 +3,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from assistant import _compact_log_formatter, _start_live_input, parse_args
+from assistant import _AnyEvent, _compact_log_formatter, _start_live_input, parse_args
 
 
 class FakeSender:
@@ -66,6 +66,49 @@ class StartLiveInputTests(unittest.TestCase):
             sender.calls, ["select", "verify", "prepare-map", "enable"]
         )
         self.assertTrue(active.is_set())
+
+    def test_capture_calibration_starts_only_after_foreground_verification(self) -> None:
+        sender = FakeSender()
+        active = threading.Event()
+        preparing = threading.Event()
+
+        def prepare() -> None:
+            self.assertTrue(preparing.is_set())
+            sender.calls.append("stable-minimap")
+
+        _start_live_input(sender, active, prepare, preparing)
+        self.assertEqual(
+            sender.calls,
+            ["select", "verify", "stable-minimap", "enable"],
+        )
+        self.assertFalse(preparing.is_set())
+        self.assertTrue(active.is_set())
+
+    def test_capture_calibration_gate_clears_when_detection_fails(self) -> None:
+        sender = FakeSender()
+        active = threading.Event()
+        preparing = threading.Event()
+
+        with self.assertRaisesRegex(OSError, "unstable minimap"):
+            _start_live_input(
+                sender, active,
+                lambda: (_ for _ in ()).throw(OSError("unstable minimap")),
+                preparing,
+            )
+        self.assertFalse(preparing.is_set())
+        self.assertFalse(active.is_set())
+        self.assertEqual(sender.calls, ["select", "verify"])
+
+    def test_combined_capture_gate_accepts_focus_or_preparation(self) -> None:
+        focused = threading.Event()
+        preparing = threading.Event()
+        gate = _AnyEvent(focused, preparing)
+        self.assertFalse(gate.is_set())
+        preparing.set()
+        self.assertTrue(gate.is_set())
+        preparing.clear()
+        focused.set()
+        self.assertTrue(gate.is_set())
 
     def test_failed_map_match_does_not_enable_input(self) -> None:
         sender = FakeSender()

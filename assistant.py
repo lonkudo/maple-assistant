@@ -48,6 +48,16 @@ FULL_BAR_CLIENT_FRACTION = 0.075
 MIN_BAR_CLIENT_FRACTION = 0.0020
 
 
+class _AnyEvent:
+    """Read-only event view that is set when any source event is set."""
+
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+
 def _acquire_single_instance_mutex(
     mutex_name: str = SINGLE_INSTANCE_MUTEX_NAME,
 ) -> int | None:
@@ -94,8 +104,9 @@ def _start_live_input(
     key_sender: object,
     automation_active_event: threading.Event,
     before_enable: Optional[Callable[[], None]] = None,
+    capture_preparing_event: Optional[threading.Event] = None,
 ) -> None:
-    """Select the game first, then arm all keyboard-producing workers."""
+    """Focus game, capture/calibrate, then arm keyboard-producing workers."""
 
     logging.info("START PATROL: selecting game window")
     if key_sender.select_window() is False:
@@ -103,10 +114,20 @@ def _start_live_input(
     if not key_sender.is_game_foreground():
         raise OSError("game window did not become foreground")
     logging.info("START PATROL: game window verified foreground")
-    if before_enable is not None:
-        before_enable()
-    key_sender.enable_input()
-    automation_active_event.set()
+    if capture_preparing_event is not None:
+        # Stable minimap samples must begin only after foreground verification,
+        # but before keyboard input is armed. This temporary capture-only gate
+        # prevents UI-overlaid pre-focus frames from entering calibration.
+        capture_preparing_event.set()
+        logging.info("START PATROL: capture-only calibration enabled")
+    try:
+        if before_enable is not None:
+            before_enable()
+        key_sender.enable_input()
+        automation_active_event.set()
+    finally:
+        if capture_preparing_event is not None:
+            capture_preparing_event.clear()
     logging.info("START PATROL: automation input armed")
 
 
@@ -212,6 +233,7 @@ def main() -> int:
     pickup_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
+    patrol_preparing = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -309,7 +331,7 @@ def main() -> int:
         # normalized analysis regions map to the client at any resolution.
         status_capture_region=STATUS_CAPTURE_REGION,
         status_capture_interval=args.status_interval,
-        capture_enabled_event=game_focused,
+        capture_enabled_event=_AnyEvent(game_focused, patrol_preparing),
         fast_capture_event=dropping_active,
         fast_interval=0.10,
         # ==== ADDED pass debug flag into capture worker ====
@@ -759,7 +781,8 @@ def main() -> int:
             screen_blinker=screen_blinker,
             telegram_notifier=telegram_notifier,
             on_patrol_start=lambda: _start_live_input(
-                key_sender, automation_active, prepare_map_session
+                key_sender, automation_active, prepare_map_session,
+                patrol_preparing,
             ),
             on_patrol_stop=lambda: _stop_live_input(
                 key_sender, automation_active
