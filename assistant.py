@@ -48,22 +48,25 @@ MINIMAP_ANALYSIS_SIZE = (400, 400)
 # itself varies a little between maps.
 MINIMAP_REGION_TOP = 60
 MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
-# HP/MP bars: measured ~228x35 px at the BOTTOM of the window, slightly LEFT
-# of the horizontal center (the info bar they sit in is exactly
-# bottom-centered).  The box is anchored to the window bottom and to a point
-# a little left of the horizontal center, so it follows the window size.
-STATUS_CAPTURE_WIDTH = 228
-STATUS_CAPTURE_HEIGHT = 35
-STATUS_CAPTURE_CENTER_SHIFT = 40  # px left of the window center
+# HP/MP/EXP bars: measured 357x57 px at the BOTTOM MIDDLE of the window
+# (the info bar is exactly bottom-centered).  Inside the capture the three
+# bars sit SIDE BY SIDE in one vertical band: HP red left, MP blue middle,
+# EXP yellow right.  The box is anchored to the window bottom and centered
+# horizontally, so it follows the window size (the HUD itself is fixed
+# pixel - the bars never change size or position within the region).
+STATUS_CAPTURE_WIDTH = 357
+STATUS_CAPTURE_HEIGHT = 57
+STATUS_CAPTURE_CENTER_SHIFT = 0  # exactly bottom-centered
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
 # Status-bar widths are FIXED PIXEL values measured on the real client
-# (full bar ~228px wide, minimum meaningful run ~5px).
-FULL_BAR_CLIENT_FRACTION = 228.0
+# inside the 357px-wide capture: full HP bar ~85px, MP ~135px, EXP ~127px;
+# minimum meaningful run ~5px.
+FULL_BAR_CLIENT_FRACTIONS = {"hp": 85.0, "mp": 135.0, "exp": 127.0}
 MIN_BAR_CLIENT_FRACTION = 5.0
 
 
 def status_capture_pixel_box(client_size: tuple[int, int]) -> Box:
-    """Return the bottom-anchored, slightly-left-of-center status box."""
+    """Return the bottom-anchored, horizontally centered status box."""
 
     width, height = client_size
     center = width // 2 - STATUS_CAPTURE_CENTER_SHIFT
@@ -349,14 +352,16 @@ def main() -> int:
     status_defaults = StatusConfig()
     # The HUD is fixed pixel: the status capture is bottom-anchored and the
     # detector's expected bar lengths are FIXED PIXEL values (measured on the
-    # real client), not fractions of the current client width.
+    # real client inside the 357px-wide capture), not fractions of the
+    # current client width.
     status_capture_width = STATUS_CAPTURE_WIDTH
     status_detector = BarStatusDetector(replace(
         status_defaults,
         status_roi=(0.0, 0.0, 1.0, 1.0),
-        full_bar_width_fraction=(
-            FULL_BAR_CLIENT_FRACTION / status_capture_width
-        ),
+        full_bar_width_fractions={
+            name: width / status_capture_width
+            for name, width in FULL_BAR_CLIENT_FRACTIONS.items()
+        },
         min_bar_width_fraction=(
             MIN_BAR_CLIENT_FRACTION / status_capture_width
         ),

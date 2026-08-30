@@ -308,9 +308,14 @@ rope/character geometry. The UI prefers a local
 `yolo-detection/venv313`, then falls back to the assistant's current Python
 environment.
 
-`StatusWorker` analyzes the status capture independently. Potion use requires
-confirmed low readings and retries blocked sends. Its configuration also owns
-optional periodic buffs.
+`StatusWorker` analyzes the status capture independently.  The capture region
+is the FIXED-PIXEL 357x57 bottom-middle info bar; inside it three bars sit
+SIDE BY SIDE in one vertical band - HP (red) left, MP (blue) middle, EXP
+(yellow) right.  Each bar is measured only inside its own horizontal zone
+(`bar_zones`) with its own full-width reference, so the three can never be
+mixed (blue UI decoration above the bars is excluded by the vertical
+`bar_band`).  Potion use requires confirmed low readings and retries blocked
+sends.  Its configuration also owns optional periodic buffs.
 
 The potion panel is placed in column 2 where the hidden YOLO panel previously
 appeared. The adjacent Quick Messages panel persists up to 20 strings in the

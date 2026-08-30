@@ -13,7 +13,7 @@ import json
 import queue
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Protocol, Sequence
 
@@ -560,18 +560,23 @@ class StatusReading:
     hp_ratio: Optional[float]
     mp_ratio: Optional[float]
     confidence: float
+    exp: Optional[int] = None
+    exp_ratio: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class StatusConfig:
-    """Calibration values for the classic bottom-centre HP/MP bars.
+    """Calibration values for the classic bottom-centre HP/MP/EXP bars.
 
     ``status_roi`` is (left, top, right, bottom) in normalized frame units.
-    The default maximums match the currently observed character and should be
-    changed after equipment/stat changes.
+    The capture region is the FIXED-PIXEL 357x57 bottom-middle info bar;
+    inside it three bars sit SIDE BY SIDE in the same vertical band - HP
+    (red) left, MP (blue) middle, EXP (yellow) right.  Each bar is measured
+    ONLY inside its own horizontal zone (``bar_zones``, fractions of the ROI
+    width) so the three can never be mixed up.
     """
 
-    status_roi: tuple[float, float, float, float] = (0.34, 0.96, 0.56, 1.0)
+    status_roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     max_hp: int = 656
     max_mp: int = 371
     hp_threshold: int = 300
@@ -595,12 +600,30 @@ class StatusConfig:
     buff2_interval: float = 600.0
     buff1_enabled: bool = False
     buff2_enabled: bool = False
-    # Approximate full bar length as a fraction of the CLIENT width; the game
-    # HUD scales with the client, so this value is resolution-independent.
-    # Measured at a 2560-wide client: a full fill is about 131px
-    # (131/2560 ~= 0.0512).  Accepted candidates may vary substantially.
-    full_bar_width_fraction: float = 0.0512
-    min_bar_width_fraction: float = 0.0020
+    # Three side-by-side bars in the fixed-pixel 357x57 info bar (measured
+    # on the real client: HP red x 0-84, MP blue x 89-223, EXP yellow
+    # x 230-356, all in the same vertical band).  Zones are (name, left,
+    # right) fractions of the ROI width so the bars can never be mixed.
+    bar_zones: tuple[tuple[str, float, float], ...] = (
+        ("hp", 0.00, 0.25),
+        ("mp", 0.25, 0.63),
+        ("exp", 0.63, 1.00),
+    )
+    # Vertical band (top, bottom) as fractions of the ROI height: the bars
+    # occupy rows ~33-53 of the 57px capture; the band excludes the blue
+    # UI text/decoration above them (rows 7-9).
+    bar_band: tuple[float, float] = (0.50, 0.96)
+    # Full bar length per bar as a fraction of the ROI width (FIXED PIXEL
+    # HUD - measured on the real client: HP ~85px, MP ~135px, EXP ~127px
+    # inside the 357px-wide capture).  Accepted candidates may vary.
+    full_bar_width_fractions: dict[str, float] = field(
+        default_factory=lambda: {
+            "hp": 85.0 / 357.0,
+            "mp": 135.0 / 357.0,
+            "exp": 127.0 / 357.0,
+        }
+    )
+    min_bar_width_fraction: float = 5.0 / 357.0
     minimum_action_confidence: float = 0.55
 
 
@@ -624,7 +647,9 @@ class BarStatusDetector:
         # partially filled bar must never be adopted as "full": doing so
         # inflates every later percentage and causes a 30% potion threshold
         # to fire dangerously late.
-        self._full_run: dict[str, Optional[int]] = {"hp": None, "mp": None}
+        self._full_run: dict[str, Optional[int]] = {
+            "hp": None, "mp": None, "exp": None,
+        }
         self._ref_width: int = 0
 
     @staticmethod
@@ -646,7 +671,12 @@ class BarStatusDetector:
     def _ratio(self, mask: np.ndarray, frame_width: int,
                name: str) -> tuple[Optional[float], float]:
         minimum = frame_width * self.config.min_bar_width_fraction
-        expected = max(1.0, frame_width * self.config.full_bar_width_fraction)
+        expected = max(
+            1.0,
+            frame_width * self.config.full_bar_width_fractions.get(
+                name, self.config.full_bar_width_fractions["hp"]
+            ),
+        )
         # Only bar-plausible runs count: the fill is at most ~1x the fraction
         # estimate when full.  A WIDER red/blue element in the ROI (HUD
         # frame, bar-track glow, character effect) would otherwise be
@@ -706,6 +736,25 @@ class BarStatusDetector:
         confidence = min(1.0, run / minimum) * (0.75 if ratio >= 0.995 else 1.0)
         return ratio, confidence
 
+    @staticmethod
+    def _bar_mask(name: str, red: np.ndarray, green: np.ndarray,
+                  blue: np.ndarray) -> np.ndarray:
+        """Color mask for one bar: HP red, MP blue, EXP yellow.
+
+        Each mask accepts the measured fill range (bright core to dark
+        edge) and excludes the gray track, white separators and the OTHER
+        two bars' colors, so the three bars can never be mixed up.
+        """
+
+        if name == "hp":
+            return (red >= 60) & (red >= green * 1.6) & (red >= blue * 1.5)
+        if name == "mp":
+            return (blue >= 60) & (blue >= red * 1.5) & (blue >= green * 1.3)
+        # EXP: yellow-green fill (bright 238,255,0 -> dark 88,102,0), low
+        # blue; the gray/white track and separators have blue > 130.
+        return ((green >= 60) & (blue <= 130) & (red >= green * 0.7)
+                & (green >= blue * 1.2))
+
     def detect(self, image: Image.Image) -> StatusReading:
         width, height = image.size
         left, top, right, bottom = self.config.status_roi
@@ -723,16 +772,36 @@ class BarStatusDetector:
         if crop.size == 0:
             return StatusReading(None, None, None, None, 0.0)
 
+        # The three bars share one vertical band but sit SIDE BY SIDE:
+        # restrict to the band first (excludes blue UI text/decoration above
+        # the bars), then measure each bar only inside its own horizontal
+        # zone so HP/MP/EXP can never be mixed.
+        crop_height, crop_width = crop.shape[0], crop.shape[1]
+        band_top = int(round(self.config.bar_band[0] * crop_height))
+        band_bottom = int(round(self.config.bar_band[1] * crop_height))
+        band = slice(max(0, band_top), min(crop_height, band_bottom))
         red, green, blue = crop[..., 0], crop[..., 1], crop[..., 2]
-        # Saturated red/blue fills, allowing bright highlights and dark shading.
-        hp_mask = (red >= 90) & (red >= green * 1.35) & (red >= blue * 1.25)
-        mp_mask = (blue >= 90) & (blue >= red * 1.25) & (blue >= green * 1.10)
-        hp_ratio, hp_conf = self._ratio(hp_mask, width, "hp")
-        mp_ratio, mp_conf = self._ratio(mp_mask, width, "mp")
+        readings: dict[str, tuple[Optional[float], float]] = {}
+        for name, zone_left, zone_right in self.config.bar_zones:
+            zone = slice(
+                int(round(zone_left * crop_width)),
+                int(round(zone_right * crop_width)),
+            )
+            mask = self._bar_mask(
+                name, red[band, zone], green[band, zone], blue[band, zone]
+            )
+            readings[name] = self._ratio(mask, width, name)
+        hp_ratio, hp_conf = readings["hp"]
+        mp_ratio, mp_conf = readings["mp"]
+        exp_ratio, exp_conf = readings["exp"]
         hp = round(hp_ratio * self.config.max_hp) if hp_ratio is not None else None
         mp = round(mp_ratio * self.config.max_mp) if mp_ratio is not None else None
+        exp = round(exp_ratio * 100) if exp_ratio is not None else None
         confidence = min(hp_conf, mp_conf) if hp is not None and mp is not None else 0.0
-        return StatusReading(hp, mp, hp_ratio, mp_ratio, confidence)
+        return StatusReading(
+            hp, mp, hp_ratio, mp_ratio, confidence,
+            exp=exp, exp_ratio=exp_ratio,
+        )
 
 
 class StatusWorker(threading.Thread):
@@ -906,8 +975,8 @@ class StatusWorker(threading.Thread):
             LOG.warning("ignored frame without PIL image")
             return
         reading = self.detector.detect(image)
-        LOG.info("status hp=%s mp=%s confidence=%.2f", reading.hp, reading.mp,
-                 reading.confidence)
+        LOG.info("status hp=%s mp=%s exp=%s confidence=%.2f",
+                 reading.hp, reading.mp, reading.exp, reading.confidence)
         config = self.detector.config
         if reading.confidence < config.minimum_action_confidence:
             # Potions are the highest priority: a low-confidence read must NOT
@@ -966,8 +1035,10 @@ class StatusWorker(threading.Thread):
             data = {
                 "hp_ratio": reading.hp_ratio,
                 "mp_ratio": reading.mp_ratio,
+                "exp_ratio": reading.exp_ratio,
                 "hp": reading.hp,
                 "mp": reading.mp,
+                "exp": reading.exp,
                 "updated_at": time.time(),
             }
             Path(self.status_state_path).write_text(

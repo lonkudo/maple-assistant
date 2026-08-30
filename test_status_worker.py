@@ -15,14 +15,33 @@ from status_worker import (
 )
 
 
-def status_image(hp_ratio: float, mp_ratio: float) -> Image.Image:
-    image = Image.new("RGB", (1000, 1000), "black")
+# Measured on the real client (357x57 bottom-middle capture): HP red
+# x 0-84, MP blue x 89-223, EXP yellow x 230-356, all in the same
+# vertical band (rows ~33-53).  Full fills: HP 85px, MP 135px, EXP 127px.
+HP_BAR = (0, 85)
+MP_BAR = (89, 224)
+EXP_BAR = (230, 357)
+BAND_TOP, BAND_BOTTOM = 33, 53
+
+
+def status_image(hp_ratio: float, mp_ratio: float,
+                 exp_ratio: float = 1.0) -> Image.Image:
+    image = Image.new("RGB", (357, 57), "black")
     draw = ImageDraw.Draw(image)
-    # Detector expects a 51 px full bar at this resolution (0.0512 of width).
-    draw.rectangle((400, 970, 400 + round(51 * hp_ratio) - 1, 974),
+    # Gray tracks behind the three bars.
+    for left, right in (HP_BAR, MP_BAR, EXP_BAR):
+        draw.rectangle((left, BAND_TOP, right, BAND_BOTTOM),
+                       fill=(204, 204, 204))
+    # Fills: HP red, MP blue, EXP yellow.
+    hp_width = round(85 * hp_ratio)
+    draw.rectangle((HP_BAR[0], BAND_TOP, HP_BAR[0] + hp_width, BAND_BOTTOM),
                    fill=(220, 20, 20))
-    draw.rectangle((400, 985, 400 + round(51 * mp_ratio) - 1, 989),
+    mp_width = round(135 * mp_ratio)
+    draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[0] + mp_width, BAND_BOTTOM),
                    fill=(20, 40, 220))
+    exp_width = round(127 * exp_ratio)
+    draw.rectangle((EXP_BAR[0], BAND_TOP, EXP_BAR[0] + exp_width, BAND_BOTTOM),
+                   fill=(238, 255, 0))
     return image
 
 
@@ -55,40 +74,42 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(sender._find_target_window(), 42)
 
     def test_bar_ratios_are_converted_to_values(self) -> None:
-        reading = BarStatusDetector().detect(status_image(0.5, 0.2))
+        reading = BarStatusDetector().detect(status_image(0.5, 0.2, 0.75))
         self.assertAlmostEqual(reading.hp, 328, delta=5)
         self.assertAlmostEqual(reading.mp, 74, delta=5)
+        self.assertAlmostEqual(reading.exp, 75, delta=3)
 
     def test_adaptive_full_bar_reference_handles_fixed_pixel_hud(self) -> None:
-        # Fixed-pixel HUD: the bars are 100px wide on a 1000px frame while the
-        # client-fraction estimate says 51px.  Once the full bar is observed
-        # the reference adapts and ratios are correct - previously every ratio
-        # clipped to 1.0 and potions never fired on such machines.
+        # Fixed-pixel HUD: the bars are fixed pixels (HP 85, MP 135, EXP
+        # 127) inside the 357px-wide capture while a stale estimate says
+        # otherwise.  Once the full bar is observed the reference adapts and
+        # ratios are correct - previously every ratio clipped to 1.0 and
+        # potions never fired on such machines.
         def frame(hp_px: int, mp_px: int) -> Image.Image:
-            image = Image.new("RGB", (1000, 1000), "black")
+            image = Image.new("RGB", (357, 57), "black")
             draw = ImageDraw.Draw(image)
-            draw.rectangle((400, 970, 400 + hp_px - 1, 974),
-                           fill=(220, 20, 20))
-            draw.rectangle((400, 985, 400 + mp_px - 1, 989),
-                           fill=(20, 40, 220))
+            draw.rectangle((0, 33, hp_px - 1, 53), fill=(220, 20, 20))
+            draw.rectangle((89, 33, 89 + mp_px - 1, 53), fill=(20, 40, 220))
             return image
 
         detector = BarStatusDetector()
-        first = detector.detect(frame(100, 100))  # both full: adapts refs
+        first = detector.detect(frame(85, 135))  # both full: adapts refs
         self.assertAlmostEqual(first.hp, 656, delta=5)
         self.assertAlmostEqual(first.mp, 371, delta=5)
-        half = detector.detect(frame(50, 100))    # HP at 50% of the real bar
+        half = detector.detect(frame(42, 135))   # HP at ~50% of the real bar
         self.assertAlmostEqual(half.hp, 328, delta=10)
         self.assertAlmostEqual(half.mp, 371, delta=5)
 
     def test_partial_bar_never_becomes_the_full_reference(self) -> None:
         # A 60px MP fill is only 75% of the conservative 80px reference.  It
         # must remain 75%, not be learned as "full" and reported as 100%.
-        image = Image.new("RGB", (1000, 100), "black")
-        ImageDraw.Draw(image).rectangle((100, 40, 159, 44), fill=(20, 40, 220))
+        image = Image.new("RGB", (357, 57), "black")
+        ImageDraw.Draw(image).rectangle((89, 33, 148, 53), fill=(20, 40, 220))
         detector = BarStatusDetector(replace(
             StatusConfig(status_roi=(0.0, 0.0, 1.0, 1.0)),
-            full_bar_width_fraction=0.08,
+            full_bar_width_fractions={
+                "hp": 0.224, "mp": 80.0 / 357.0, "exp": 0.224,
+            },
         ))
 
         reading = detector.detect(image)
@@ -100,46 +121,84 @@ class StatusTests(unittest.TestCase):
         # A wide blue element (HUD frame / bar-track glow) inside the ROI
         # must NOT be measured as the MP bar - it would lock the ratio at
         # 1.0 and MP potions would never fire.  The real fill is used.
-        image = Image.new("RGB", (1000, 1000), "black")
+        image = Image.new("RGB", (357, 57), "black")
         draw = ImageDraw.Draw(image)
-        # Wide blue artifact, passes the MP mask, sits in its own row band.
-        draw.rectangle((340, 975, 639, 979), fill=(60, 120, 220))
-        # Real MP fill at roughly half length (25px of the 51px estimate).
-        draw.rectangle((400, 985, 424, 989), fill=(20, 40, 220))
+        # Wide blue artifact, passes the MP mask, sits in its own row band
+        # (above the bars) and spans beyond the MP zone.
+        draw.rectangle((0, 10, 356, 14), fill=(60, 120, 220))
+        # Real MP fill at roughly half length (~68px of the 135px estimate).
+        draw.rectangle((89, 33, 156, 53), fill=(20, 40, 220))
         reading = BarStatusDetector().detect(image)
         self.assertIsNotNone(reading.mp_ratio)
         self.assertLess(reading.mp_ratio, 0.7)
         self.assertGreater(reading.mp_ratio, 0.3)
 
-    def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
-        full = status_image(0.5, 0.2)
-        cropped = full.crop((0, 0, 600, 1000))
-        defaults = StatusConfig()
-        config = replace(
-            defaults,
-            status_roi=remap_normalized_box(
-                defaults.status_roi, (0.0, 0.0, 0.60, 1.0)
-            ),
-            full_bar_width_fraction=defaults.full_bar_width_fraction / 0.60,
-            min_bar_width_fraction=defaults.min_bar_width_fraction / 0.60,
-        )
-        reading = BarStatusDetector(config).detect(cropped)
-        self.assertAlmostEqual(reading.hp, 328, delta=5)
-        self.assertAlmostEqual(reading.mp, 74, delta=5)
+    def test_three_bars_never_mix_each_measured_in_own_zone(self) -> None:
+        # The three bars sit side by side in the same vertical band.  The
+        # EXP yellow fill must never be measured as HP red, and a saturated
+        # yellow-green EXP never as MP blue - each bar is measured only in
+        # its own horizontal zone.
+        image = Image.new("RGB", (357, 57), "black")
+        draw = ImageDraw.Draw(image)
+        # Only EXP is filled (full yellow); HP/MP zones stay empty.
+        draw.rectangle((EXP_BAR[0], BAND_TOP, EXP_BAR[1], BAND_BOTTOM),
+                       fill=(238, 255, 0))
+        reading = BarStatusDetector().detect(image)
+        self.assertIsNone(reading.hp_ratio)
+        self.assertIsNone(reading.mp_ratio)
+        self.assertAlmostEqual(reading.exp_ratio, 1.0, delta=0.05)
 
-    def test_bar_calibration_uses_status_only_capture(self) -> None:
-        full = status_image(0.5, 0.2)
-        cropped = full.crop((340, 960, 560, 1000))
+        # Only HP is filled (full red); EXP/MP zones stay empty.
+        image = Image.new("RGB", (357, 57), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((HP_BAR[0], BAND_TOP, HP_BAR[1], BAND_BOTTOM),
+                       fill=(220, 20, 20))
+        reading = BarStatusDetector().detect(image)
+        self.assertAlmostEqual(reading.hp_ratio, 1.0, delta=0.05)
+        self.assertIsNone(reading.mp_ratio)
+        self.assertIsNone(reading.exp_ratio)
+
+        # Only MP is filled (full blue); HP/EXP zones stay empty.
+        image = Image.new("RGB", (357, 57), "black")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[1], BAND_BOTTOM),
+                       fill=(20, 40, 220))
+        reading = BarStatusDetector().detect(image)
+        self.assertIsNone(reading.hp_ratio)
+        self.assertAlmostEqual(reading.mp_ratio, 1.0, delta=0.05)
+        self.assertIsNone(reading.exp_ratio)
+
+    def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
+        # The status-only capture (357x57 bottom-middle crop) is the image
+        # the detector receives; the full bar fractions are fixed-pixel
+        # values measured inside that crop.
+        full = status_image(0.5, 0.2, 0.75)
+        cropped = full.crop((0, 0, 357, 57))
         defaults = StatusConfig()
         config = replace(
             defaults,
             status_roi=(0.0, 0.0, 1.0, 1.0),
-            full_bar_width_fraction=defaults.full_bar_width_fraction / 0.22,
-            min_bar_width_fraction=defaults.min_bar_width_fraction / 0.22,
         )
         reading = BarStatusDetector(config).detect(cropped)
         self.assertAlmostEqual(reading.hp, 328, delta=5)
         self.assertAlmostEqual(reading.mp, 74, delta=5)
+        self.assertAlmostEqual(reading.exp, 75, delta=3)
+
+    def test_bar_calibration_uses_status_only_capture(self) -> None:
+        # The status-only capture (357x57 bottom-middle crop) is the image
+        # the detector receives; the full bar fractions are fixed-pixel
+        # values measured inside that crop.
+        full = status_image(0.5, 0.2, 0.75)
+        cropped = full.crop((0, 0, 357, 57))
+        defaults = StatusConfig()
+        config = replace(
+            defaults,
+            status_roi=(0.0, 0.0, 1.0, 1.0),
+        )
+        reading = BarStatusDetector(config).detect(cropped)
+        self.assertAlmostEqual(reading.hp, 328, delta=5)
+        self.assertAlmostEqual(reading.mp, 74, delta=5)
+        self.assertAlmostEqual(reading.exp, 75, delta=3)
 
     def test_two_low_frames_trigger_once_and_cooldown_debounces(self) -> None:
         sender = FakeSender()
