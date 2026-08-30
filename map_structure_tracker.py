@@ -13,6 +13,34 @@ import numpy as np
 from PIL import Image
 
 from marker_detector import MarkerDetection
+
+
+def _write_image_unicode_safe(path: Path, image: np.ndarray) -> None:
+    """Save an image through Python's Unicode-safe file I/O.
+
+    ``cv2.imwrite`` uses the C file API, which fails silently (returns False)
+    on Windows when the path contains non-ASCII characters (for example an
+    installation folder with Chinese characters like ``D:\u86c7\u592bG``).
+    Encoding with ``cv2.imencode`` and writing the bytes with
+    ``Path.write_bytes`` keeps the path in Python's Unicode-aware layer.
+    """
+
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise OSError(f"could not encode image for {path}")
+    path.write_bytes(encoded.tobytes())
+
+
+def _read_image_unicode_safe(path: Path, flags: int) -> Optional[np.ndarray]:
+    """Load an image through Python's Unicode-safe file I/O (see above)."""
+
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
 from minimap_detector import MinimapDetection
 
 
@@ -62,7 +90,9 @@ class MapStructureTracker:
     def _load_reference(self) -> None:
         if self.reference_path is None or not self.reference_path.is_file():
             return
-        image = cv2.imread(str(self.reference_path), cv2.IMREAD_GRAYSCALE)
+        image = _read_image_unicode_safe(
+            self.reference_path, cv2.IMREAD_GRAYSCALE
+        )
         if image is None:
             LOG.warning("could not load minimap structure reference %s", self.reference_path)
             return
@@ -273,8 +303,7 @@ class MapStructureTracker:
                 return
             self.reference_path.parent.mkdir(parents=True, exist_ok=True)
             image = np.clip((self._reference + 0.5) * 255.0, 0, 255).astype(np.uint8)
-            if not cv2.imwrite(str(self.reference_path), image):
-                raise OSError(f"could not save minimap reference {self.reference_path}")
+            _write_image_unicode_safe(self.reference_path, image)
 
     def reset(self, *, delete_reference: bool = False) -> None:
         with self._lock:

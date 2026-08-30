@@ -6,10 +6,39 @@ import hashlib
 import json
 from pathlib import Path
 import threading
+from typing import Optional
 
 import cv2
 import numpy as np
 from PIL import Image
+
+
+def _write_image_unicode_safe(path: Path, image: np.ndarray) -> None:
+    """Save an image through Python's Unicode-safe file I/O.
+
+    ``cv2.imwrite`` uses the C file API, which fails silently (returns False)
+    on Windows when the path contains non-ASCII characters (for example an
+    installation folder with Chinese characters like ``D:\u86c7\u592bG``).
+    Encoding with ``cv2.imencode`` and writing the bytes with
+    ``Path.write_bytes`` keeps the path in Python's Unicode-aware layer.
+    """
+
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise OSError(f"could not encode image for {path}")
+    path.write_bytes(encoded.tobytes())
+
+
+def _read_image_unicode_safe(path: Path, flags: int) -> Optional[np.ndarray]:
+    """Load an image through Python's Unicode-safe file I/O (see above)."""
+
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
 
 
 class MapIdentityStore:
@@ -49,8 +78,7 @@ class MapIdentityStore:
         with self._lock:
             self.root.mkdir(parents=True, exist_ok=True)
             path = self.signature_path(name)
-            if not cv2.imwrite(str(path), signature):
-                raise OSError(f"could not save map-name signature: {path}")
+            _write_image_unicode_safe(path, signature)
             index = {}
             if self.index_path.is_file():
                 try:
@@ -68,7 +96,7 @@ class MapIdentityStore:
 
     def similarity(self, map_name: str, image: Image.Image) -> float:
         path = self.signature_path(map_name)
-        reference = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        reference = _read_image_unicode_safe(path, cv2.IMREAD_GRAYSCALE)
         if reference is None:
             return 0.0
         current = self._normalize(image)

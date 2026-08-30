@@ -67,6 +67,33 @@ class MapStructureTrackerTests(unittest.TestCase):
             self.assertEqual(result.mode, "reference")
             self.assertAlmostEqual(result.scroll_y_diamonds, 0.0, places=2)
 
+    def test_reference_saves_and_loads_through_non_ascii_folder(self):
+        """Recording must work when the install folder has non-ASCII chars.
+
+        Regression: cv2.imwrite/cv2.imread use the C file API and fail
+        silently (False / None) on Windows paths containing non-ASCII
+        characters - the user's install is D:\u86c7\u592bG\MapleAssistant, so
+        recording raised "could not save minimap reference".  The tracker now
+        encodes/decodes through Python's Unicode-safe I/O.
+        """
+
+        rng = np.random.default_rng(12)
+        canvas = rng.integers(0, 140, (160, 160, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            base = (
+                __import__("pathlib").Path(directory)
+                / "\u86c7\u592bG" / "MapleAssistant" / "recording-assets"
+            )
+            path = base / "map-structure-reference.png"
+            tracker = MapStructureTracker(path, tracking_size=128, minimum_response=.05)
+            tracker.analyze(self.frame(0, canvas), self.detection(), self.marker())
+            tracker.save_reference()  # must not raise
+            self.assertTrue(path.is_file())
+            restored = MapStructureTracker(path, tracking_size=128, minimum_response=.05)
+            result = restored.analyze(self.frame(1, canvas), self.detection(), self.marker())
+            self.assertEqual(result.mode, "reference")
+            self.assertAlmostEqual(result.scroll_y_diamonds, 0.0, places=2)
+
     def test_new_session_reanchors_without_rerecording_positions(self):
         rng = np.random.default_rng(14)
         canvas = rng.integers(0, 140, (160, 160, 3), dtype=np.uint8)
