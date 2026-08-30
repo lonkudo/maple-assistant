@@ -264,6 +264,12 @@ resolution). Key constants live in `assistant.py`:
   rejected so a ~40px UI box inside the map-name strip can never become the
   minimap border (`window=(5,22,45,62)` was the live failure).
 - `MINIMAP_ANALYSIS_SIZE = (400, 400)`, aspect-preserving fit, never upscale.
+- **v0033: `analysis_box` now EQUALS `window_box`.** The yellow marker/patrol
+  overlay rectangle must coincide with the green minimap rectangle. The legacy
+  0.3125 top offset + 1.0513 right extension belonged to a layout with the map
+  name INSIDE the minimap top; it made the yellow box shorter and wider than
+  the green one. ROUTES RECORDED BEFORE v0033 were calibrated against the old
+  offset box - re-record on the live machine after deploying v0033.
 - When OpenCV cannot close a border contour, the marker-verified fixed region
   is promoted to `source="fixed-region"` (accepted by recording, startup
   probes, and calibration). `is_verified_border()` in `minimap_detector.py`
@@ -277,7 +283,21 @@ resolution). Key constants live in `assistant.py`:
   be mixed, and blue UI text above the band is excluded by `bar_band`.
   `StatusReading`/`work/status_state.json` carry `exp`/`exp_ratio` too.
 - The live snapshot `work/debug/snapshot.png` (1707x1067) verifies: hp=38%,
-  mp=84%, exp=69%.
+  mp=84%, exp=69%; minimap window==analysis==(6,89,152,231) with the 6x6
+  marker found inside.
+
+### Pending / open items
+
+- **Patrol turns left before reaching the recorded right-most point** (user
+  report 2026-08-30): log shows `pos=(0.334, 0.717) target=0.231 action=left`
+  while the recorded right-most is 0.4611 - the character reversed at x=0.334
+  before reaching 0.4611. Suspects: `_force_advance_phase` (stair-jump give-up
+  at line ~2406) firing early, or `_advance_route_endpoint` tolerance
+  (`_current_horizontal_tolerance`) being too wide. NOT YET DIAGNOSED - check
+  `movement_worker.py` `_stair_jump_decision` / `_force_advance_phase` call
+  sites and the phase advance against the recorded `right_most_pos.x`.
+- Re-record patrol points on the live machine after v0033 (analysis box
+  change).
 
 ### UI layout (`ui_worker.py`)
 
