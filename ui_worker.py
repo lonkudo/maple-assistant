@@ -30,7 +30,7 @@ from versioning import version_label
 LOG = logging.getLogger(__name__)
 
 _INITIAL_WINDOW_WIDTH = 1200
-_INITIAL_WINDOW_HEIGHT = 1250
+_INITIAL_WINDOW_HEIGHT = 900
 
 
 def tooltip_cursor_top_right_position(

@@ -369,8 +369,8 @@ detection calibration is read from the shipped, runtime-read-only
 | `yolo_detection` | user | UiWorker and YOLO launch settings |
 | `ui_window` | user | Tk window geometry helpers |
 
-The debug UI starts at 1200x1250 px. Restored window geometry is capped to
-1250 px high during startup (and to the available screen height on smaller
+The debug UI starts at 1200x900 px. Restored window geometry is capped to
+900 px high during startup (and to the available screen height on smaller
 displays), while the user can still resize and persist a smaller window.
 
 User sections migrate once from the old unified `config.json` or former split
