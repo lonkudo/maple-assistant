@@ -112,13 +112,16 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(large.pixel_size[1], small.pixel_size[1])
 
     def test_diamond_detector_accepts_pure_and_bright_yellow(self) -> None:
-        """The live client renders the diamond as pure/bright yellow.
+        """The live marker is a RANGE of yellows, not one exact color.
 
-        The debug snapshot's diamond was golden (255,255,136), so the old
-        mask (blue ~136 +- 30) matched there but rejected the live game's
-        pure yellow (255,255,0..255,240,80), failing recording with "failed
-        to detect yellow diamond".  All saturated yellow shades must be found
-        while orange/brown platform decorations stay excluded.
+        The user measured the actual player diamond on the live client: its
+        bright core is ~(255,255,136) and its dark edge is ~(214,200,0),
+        with anti-aliased shades in between.  The old mask required
+        blue ~136 +-30 (the debug snapshot's golden color), so the live
+        diamond's darker/edge pixels were rejected and recording failed with
+        "failed to detect yellow diamond".  Every saturated yellow shade in
+        the reported range must be found; orange/brown platform decorations
+        stay excluded.
         """
 
         import numpy as np
@@ -132,9 +135,26 @@ class MinimapDetectorTests(unittest.TestCase):
                         image[center_y + y, center_x + x] = color
             return detect_yellow_diamond(image)
 
-        for color in [(255, 255, 136), (255, 255, 0), (255, 240, 80),
-                      (240, 220, 100)]:
+        # Both endpoints of the user-measured range, plus intermediates.
+        for color in [(255, 255, 136), (214, 200, 0), (250, 240, 100),
+                      (235, 220, 50), (245, 235, 90)]:
             self.assertIsNotNone(marker(color), color)
+
+        # The real marker is a gradient: bright core, dark edge, anti-aliased
+        # shades in between - a 6x6 90-degree-rotated square.
+        image = np.zeros((171, 167, 3), dtype=np.uint8)
+        for y in range(-3, 4):
+            for x in range(-3, 4):
+                distance = abs(x) + abs(y)
+                if distance <= 3:
+                    if distance <= 1:
+                        color = (255, 255, 136)
+                    elif distance == 2:
+                        color = (240, 225, 60)
+                    else:
+                        color = (214, 200, 0)
+                    image[85 + y, 83 + x] = color
+        self.assertIsNotNone(detect_yellow_diamond(image))
 
         # Orange/brown platform decorations are not the player marker.
         image = np.zeros((171, 167, 3), dtype=np.uint8)
