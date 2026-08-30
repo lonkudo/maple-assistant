@@ -471,6 +471,7 @@ class UiWorker(threading.Thread):
         countdown_worker: Any = None,
         lie_detector_worker: Any = None,
         screen_blinker: Any = None,
+        telegram_notifier: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
@@ -511,6 +512,11 @@ class UiWorker(threading.Thread):
         self.lie_detector_worker = lie_detector_worker
         # Shared visual counterpart to every optional beep alert.
         self.screen_blinker = screen_blinker
+        # Optional Telegram delivery runs in its own worker; UI calls only
+        # non-blocking configuration/queue methods.
+        self.telegram_notifier = telegram_notifier
+        self._telegram_bot_token = ""
+        self._telegram_chat_id = ""
         self.on_patrol_start = on_patrol_start
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
@@ -1214,6 +1220,35 @@ class UiWorker(threading.Thread):
                 variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
+
+            telegram_row = ttk.Frame(extra_panel)
+            telegram_row.pack(fill="x", pady=(4, 0))
+            self._telegram_enabled_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                telegram_row,
+                text="消息提醒（Telegram）",
+                variable=self._telegram_enabled_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left", padx=(0, 8))
+            ttk.Label(telegram_row, text="设备名称").pack(side="left")
+            self._telegram_machine_var = tk.StringVar(value="")
+            machine_entry = ttk.Entry(
+                telegram_row, textvariable=self._telegram_machine_var, width=14
+            )
+            machine_entry.pack(side="left", padx=(4, 8))
+            machine_entry.bind("<FocusOut>", self._telegram_machine_changed)
+            machine_entry.bind("<Return>", self._telegram_machine_changed)
+            ttk.Button(
+                telegram_row, text="修改BOT token",
+                command=self._telegram_change_token,
+            ).pack(side="left")
+            self._telegram_status = ttk.Label(
+                extra_panel,
+                text="消息提醒: 未启用；BOT token 仅保存在本机用户配置。",
+                justify="left",
+                wraplength=620,
+            )
+            self._telegram_status.pack(anchor="w", pady=(4, 0))
             self._shutdown_load_settings()
 
             # Minimap / map-name preview widgets: built but hidden by default
@@ -1320,6 +1355,7 @@ class UiWorker(threading.Thread):
         self._refresh_automation_status()
         self._refresh_shutdown_status()
         self._refresh_countdown_status()
+        self._refresh_telegram_status()
         self._poll_yolo_exit()
         root.after(self.refresh_ms, self._poll)
 
@@ -2009,6 +2045,11 @@ class UiWorker(threading.Thread):
             data["lie_alert_enabled"] = bool(self._lie_alert_var.get())
         if hasattr(self, "_screen_blink_var"):
             data["screen_blink_enabled"] = bool(self._screen_blink_var.get())
+        if hasattr(self, "_telegram_enabled_var"):
+            data["telegram_enabled"] = bool(self._telegram_enabled_var.get())
+            data["telegram_bot_token"] = self._telegram_bot_token
+            data["telegram_chat_id"] = self._telegram_chat_id
+            data["telegram_machine_name"] = self._telegram_machine_var.get().strip()
         if hasattr(self, "_countdown_enabled_var"):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
@@ -2073,6 +2114,14 @@ class UiWorker(threading.Thread):
             setter = getattr(blinker, "set_enabled", None)
             if setter is not None:
                 setter(bool(data.get("screen_blink_enabled", False)))
+        notifier = getattr(self, "telegram_notifier", None)
+        if notifier is not None:
+            notifier.configure(
+                str(data.get("telegram_bot_token", "")),
+                str(data.get("telegram_chat_id", "")),
+                str(data.get("telegram_machine_name", "")),
+            )
+            notifier.set_enabled(bool(data.get("telegram_enabled", False)))
         if worker.enabled:
             self._shutdown_status.configure(
                 text=f"定时关闭已启动: 游戏将在 "
@@ -2099,6 +2148,56 @@ class UiWorker(threading.Thread):
                     )
                 except Exception:
                     pass
+
+    def _telegram_machine_changed(self, _event: Any = None) -> None:
+        self._shutdown_on_change()
+
+    def _telegram_change_token(self) -> None:
+        """Ask for a token, then let the notifier validate it asynchronously."""
+
+        try:
+            from tkinter import simpledialog
+
+            token = simpledialog.askstring(
+                "修改BOT token",
+                "粘贴 Telegram BOT token。\n"
+                "请先在 Telegram 给这个 BOT 发送一条消息，系统会自动识别聊天。",
+                parent=self._root,
+                show="*",
+            )
+        except Exception as exc:
+            self._telegram_status.configure(
+                text=f"消息提醒: 无法打开 token 输入框 - {exc}"
+            )
+            return
+        if token is None:
+            return
+        self._telegram_bot_token = token.strip()
+        self._telegram_chat_id = ""
+        self._telegram_status.configure(text="消息提醒: 正在验证 BOT 配置...")
+        self._shutdown_on_change()
+
+    def _refresh_telegram_status(self) -> None:
+        """Show notifier health and persist an auto-discovered chat ID."""
+
+        if not hasattr(self, "_telegram_status"):
+            return
+        notifier = getattr(self, "telegram_notifier", None)
+        if notifier is None:
+            self._telegram_status.configure(text="消息提醒: 工作线程未接入。")
+            return
+        try:
+            snapshot = notifier.snapshot()
+            self._telegram_status.configure(text=str(snapshot["status"]))
+            discovered = str(snapshot.get("chat_id", "")).strip()
+            if discovered and discovered != self._telegram_chat_id:
+                self._telegram_chat_id = discovered
+                self._shutdown_save_settings(self._shutdown_collect_data())
+        except Exception as exc:
+            # Status display itself must be non-fatal too.
+            self._telegram_status.configure(
+                text=f"消息提醒: 状态读取失败 - {exc}"
+            )
 
     def _refresh_shutdown_status(self) -> None:
         """Live countdown in the status line (called every UI poll tick)."""
@@ -2267,6 +2366,19 @@ class UiWorker(threading.Thread):
                     self, "_screen_blink_var"
             ):
                 self._screen_blink_var.set(bool(data["screen_blink_enabled"]))
+            if hasattr(self, "_telegram_enabled_var"):
+                self._telegram_enabled_var.set(bool(
+                    data.get("telegram_enabled", False)
+                ))
+                self._telegram_bot_token = str(
+                    data.get("telegram_bot_token", "")
+                ).strip()
+                self._telegram_chat_id = str(
+                    data.get("telegram_chat_id", "")
+                ).strip()
+                self._telegram_machine_var.set(str(
+                    data.get("telegram_machine_name", "")
+                ))
             if hasattr(self, "_countdown_enabled_var"):
                 # Like scheduled shutdown, do not silently start a timer on
                 # application launch. Preserve only its configured time gap.

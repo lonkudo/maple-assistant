@@ -81,8 +81,10 @@ The application starts with live input disarmed. Input is enabled only after
   result and plays the same beep after three consecutive missing frames.
 - The optional **测谎报警** samples the shared full-client capture every one
   seconds and alarms when it finds a resolution-scaled pure-white square.
-- The optional **闪烁提醒** adds two brief blue full-screen flashes to every
+- The optional **闪烁提醒** adds two brief red full-screen flashes to every
   countdown, disconnect, and lie-detector beep without affecting capture.
+- The optional **消息提醒** queues those same events to a separate Telegram
+  worker with a machine marker, event type, and local timestamp.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
@@ -304,3 +306,13 @@ Selecting **闪烁提醒** makes the primary screen flash red for 0.5 seconds,
 turn off for 0.3 seconds, then flash red for another 0.5 seconds whenever one
 of the existing beep alarms fires: the repeating countdown, 掉线警报, or 测谎报警.
 It is a separate notification worker and does not create another capture loop.
+
+Selecting **消息提醒（Telegram）** sends those same three alert events through
+the configured BOT. Enter a distinct **设备名称** on every computer, first send
+any message (for example `/start`) to the BOT in Telegram, then click
+**修改BOT token** and paste the token. The assistant verifies the BOT and learns
+the latest chat automatically. The UI reports whether it is enabled, correctly
+configured, awaiting a chat, or failed. Messages use
+`设备名称 事件类型 时间 YYYY-MM-DD HH:MM:SS`. Token, learned chat ID, machine
+name, and enabled state live only in ignored `user_config.json`, so updates do
+not overwrite them. Telegram failures never stop other assistant workers.

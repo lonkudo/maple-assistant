@@ -89,6 +89,22 @@ class LieDetectorWorkerTests(unittest.TestCase):
         worker._update_alert((10, 20, 40, 40))
         self.assertTrue(flashed.wait(.5))
 
+    def test_lie_alert_requests_message_alert_with_the_beep(self):
+        alerted = threading.Event()
+        events = []
+
+        def notify(event_type):
+            events.append(event_type)
+            alerted.set()
+
+        worker = LieDetectorWorker(
+            queue.Queue(), threading.Event(), enabled=True,
+            play_alert_sound=lambda _path: None, alert_callback=notify,
+        )
+        worker._update_alert((10, 20, 40, 40))
+        self.assertTrue(alerted.wait(.5))
+        self.assertEqual(events, ["测谎报警"])
+
     def test_worker_analyzes_shared_frame_without_writing_a_file(self):
         frames = queue.Queue()
         stop = threading.Event()

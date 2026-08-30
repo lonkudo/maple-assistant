@@ -286,6 +286,16 @@ input and therefore cannot delay the workers that produced the alert. It uses
 a native no-activation, topmost Win32 overlay to cover the game's virtual
 desktop rather than a background Tk window.
 
+`TelegramNotifier` is another independent queued worker fed by the exact same
+countdown, disconnect, and lie-detector trigger points. UI/game threads never
+perform network I/O. It validates the token with `getMe`, learns the most
+recent chat with `getUpdates`, and sends
+`machine event_type 时间 YYYY-MM-DD HH:MM:SS` via `sendMessage`. Bounded
+timeouts and per-task exception handling convert invalid tokens, missing chats,
+and network failures into UI status text and warnings; they cannot terminate
+the notifier or assistant. Credentials, learned chat ID, and the per-machine
+marker belong to ignored `user_config.json`.
+
 ## 7. Cross-process coordination
 
 The primary and YOLO processes coordinate through atomically replaced,
@@ -388,7 +398,8 @@ git -c core.quotepath=false ls-files
 | `shutdown_worker.py` | Optional timed shutdown |
 | `countdown_worker.py` | Independent repeating countdown and MP3 playback |
 | `lie_detector_worker.py` | Resolution-scaled in-memory lie-event detection |
-| `screen_blinker.py` | Optional queued two-flash blue full-screen notifier |
+| `screen_blinker.py` | Optional queued two-flash red full-screen notifier |
+| `telegram_notifier.py` | Optional non-blocking Telegram BOT verification and alert delivery |
 | `pickup_worker.py` | Legacy standalone pickup worker; not wired by assistant.py |
 | `channel_switch.py` | Channel-switch/drop recovery procedure |
 | `combat_coordination.py` | Attack, patrol, and rope state-file adapters |

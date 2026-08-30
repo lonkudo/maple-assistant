@@ -52,6 +52,8 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "player_check_enabled": False, "disconnect_alert_enabled": False,
         "countdown_enabled": False, "countdown_interval_hours": 1.0,
         "lie_alert_enabled": False, "screen_blink_enabled": False,
+        "telegram_enabled": False, "telegram_bot_token": "",
+        "telegram_chat_id": "", "telegram_machine_name": "",
     },
     "yolo_detection": {
         "threshold": .4, "attack_range": 30, "min_mob_size": 2,

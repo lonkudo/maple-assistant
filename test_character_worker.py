@@ -75,6 +75,23 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
         worker._update_disconnect_alert(False)
         self.assertTrue(flashed.wait(.5))
 
+    def test_disconnect_alert_requests_message_alert_with_the_beep(self):
+        alerted = threading.Event()
+        events = []
+
+        def notify(event_type):
+            events.append(event_type)
+            alerted.set()
+
+        worker = CharacterWorker(
+            queue.Queue(), queue.Queue(), threading.Event(),
+            disconnect_alert_enabled=True, disconnect_alert_misses=1,
+            play_alert_sound=lambda _path: None, alert_callback=notify,
+        )
+        worker._update_disconnect_alert(False)
+        self.assertTrue(alerted.wait(.5))
+        self.assertEqual(events, ["掉线警报"])
+
     def test_run_reuses_the_single_marker_detection_for_alert(self):
         frames = queue.Queue()
         positions = queue.Queue()
