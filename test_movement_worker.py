@@ -1397,6 +1397,51 @@ class MovementTests(unittest.TestCase):
         )
         self.assertFalse(worker._on_first_layer(upper))
 
+    def test_on_first_layer_uses_world_y_when_scrolling_marker_bands_overlap(self):
+        # On a vertically scrolling minimap both floors can record the same
+        # marker Y. Entering the final-layer drop phase must not immediately
+        # reset the route to layer2 before a drop input has even been sent.
+        positions = {
+            "layer2": {
+                "layer_y": .561111, "y_tolerance": .02,
+                "layer_world_y": -.080187, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .375, "y": .561111,
+                                  "world_y": -.080187},
+                "right_most_pos": {"x": .635, "y": .561111,
+                                   "world_y": -.080187},
+            },
+            "layer3": {
+                "layer_y": .561111, "y_tolerance": .02,
+                "layer_world_y": -1.162375, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .465, "y": .561111,
+                                  "world_y": -1.162375},
+                "right_most_pos": {"x": .645, "y": .561111,
+                                   "world_y": -1.162375},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(), fixed_target_x=.5,
+            important_positions=positions, route_order=["layer2", "layer3"],
+            final_layer_action="drop_to_first_layer", first_layer="layer2",
+        )
+        worker._route_layer_index = 1
+        worker._route_phase = "drop"
+
+        still_on_layer3 = MinimapObservation(
+            Point(.635, .561111), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-1.162375, structure_confidence=.9,
+        )
+        self.assertFalse(worker._on_first_layer(still_on_layer3))
+        self.assertEqual(
+            worker._route_target(still_on_layer3),
+            (None, False, "layer3.drop-to-first"),
+        )
+
+        landed_on_layer2 = replace(
+            still_on_layer3, world_y_diamonds=-.080187
+        )
+        self.assertTrue(worker._on_first_layer(landed_on_layer2))
+
     def test_final_layer_drops_instead_of_targeting_rope_then_resets(self):
         positions = {
             "layer1": {"layer_y": .70, "y_tolerance": .02,

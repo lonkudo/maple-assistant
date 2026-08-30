@@ -166,6 +166,10 @@ re-recorded when the UI labels them as a legacy layout.
 - Self-rescue requires a genuinely stationary run. Off-layer readings use a
   separate consecutive counter, so adaptive minimap drift or visible patrol
   progress cannot cause a premature Alt+Down drop.
+- On scrolling minimaps where several floors share the same marker Y, final
+  drop arrival uses the scroll-compensated world Y to distinguish the route's
+  first floor. This prevents a layer3 drop from resetting immediately to
+  layer2 before any drop input is sent.
 - Missing or stale cross-process state files mean “not busy,” preventing a dead
   process from permanently blocking patrol or attack.
 

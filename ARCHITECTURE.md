@@ -168,6 +168,12 @@ For each active layer, `_layer_phases()` returns its available actions in
 Left/Right/Rope order. Horizontal actions repeat
 `patrol_cycles_per_layer` times (default 2) before rope or final drop.
 
+Final-drop arrival normally accepts marker Y, including a landing slightly
+below the recorded first-floor band. If an upper floor shares that marker band
+because the minimap scrolls, marker Y is ambiguous and the state machine waits
+for scroll-compensated world Y to identify the first route floor before it
+resets the loop.
+
 ```text
 left -> right -> left -> right -> rope/climb
                                \-> final-layer drop

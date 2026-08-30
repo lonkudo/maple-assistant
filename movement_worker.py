@@ -3882,9 +3882,24 @@ class MovementWorker(threading.Thread):
         marker_arrived = bool(
             band is not None and observation.player.y >= band[0] - 1e-9
         )
-        if marker_arrived:
+        # A scrolling minimap can keep the yellow marker at exactly the same
+        # screen Y on several floors. In that layout the old broad
+        # "at-or-below first layer" check was already true on the final
+        # layer, so the drop phase ended before its first Alt+Down chord and
+        # the route was reset to the lower floor forever. Marker Y remains
+        # preferred when it identifies the first floor alone (which also
+        # handles a stale world tracker), but an overlapping upper-floor band
+        # must be disambiguated by scroll-compensated world Y.
+        marker_matches_upper_floor = any(
+            name != self.first_layer
+            and isinstance(other_layer, dict)
+            and self._layer_band_contains(name, observation.player.y)
+            for name, other_layer in self.important_positions.items()
+        )
+        if marker_arrived and not marker_matches_upper_floor:
             return True
-        # Fall back to the world-Y signal when it is tracked and confident.
+        # Fall back to the world-Y signal when marker Y is ambiguous and the
+        # structure tracker is available and confident.
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):
