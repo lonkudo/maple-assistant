@@ -139,6 +139,27 @@ def _stop_live_input(
     key_sender.disable_input()
 
 
+def _capture_focused_game_frame(
+    key_sender: object,
+    capture_now: Callable[[], object],
+) -> object:
+    """Focus the game before a one-off recording capture.
+
+    Recording is available while patrol capture is idle. Focusing first keeps
+    the Tk window and its controls out of the game image on machines whose
+    capture backend includes overlapping desktop windows.
+    """
+
+    logging.info("RECORD POSITION: selecting game window before capture")
+    if key_sender.select_window() is False:
+        raise OSError("game window selection returned failure")
+    if not key_sender.is_game_foreground():
+        raise OSError("game window did not become foreground")
+    # Allow DWM/compositor state to settle after the foreground transition.
+    time.sleep(0.08)
+    return capture_now()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Modular MapleStory screen assistant")
     parser.add_argument("--window-title", default="冒险岛怀旧服")
@@ -787,7 +808,9 @@ def main() -> int:
             on_patrol_stop=lambda: _stop_live_input(
                 key_sender, automation_active
             ),
-            on_capture_now=capture_worker.capture_now,
+            on_capture_now=lambda: _capture_focused_game_frame(
+                key_sender, capture_worker.capture_now
+            ),
             log_queue=ui_log_handler.messages if ui_log_handler is not None else None,
             automation_active_event=automation_active,
         )

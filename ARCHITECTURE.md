@@ -104,6 +104,12 @@ temporary gate clears in `finally`. This prevents pre-focus/UI-overlaid frames
 from contaminating the stable minimap sequence while preserving idle behavior
 before Start Patrol.
 
+Manual recording has a parallel one-off path and does not depend on that
+patrol capture gate. Every recording click first foregrounds the game, waits
+briefly for compositor settlement, then samples up to three forced frames. It
+accepts only a frame containing both an OpenCV minimap border and yellow marker;
+resetting a recording also clears retained minimap geometry.
+
 `FocusWorker` is completely idle while patrol input is disarmed. Once patrol
 starts, it checks whether the selected game is foreground. During a focus
 dip it clears automation events and releases all keys. It attempts a rate-
@@ -289,7 +295,8 @@ optional periodic buffs.
 The potion panel is placed in column 2 where the hidden YOLO panel previously
 appeared. The adjacent Quick Messages panel persists up to 20 strings in the
 user-owned `additional_functions` section. Its buttons use the shared 1-second
-gesture convention: short-click copies, long-press edits, and long-pressing the
+gesture convention: short-click copies, double-click explicitly focuses the
+game and sends Enter, Ctrl+V, Enter, long-press edits, and long-pressing the
 adjacent delete icon removes that row. The Telegram machine marker uses the
 same long-press-to-entry, focus-out-to-button interaction.
 

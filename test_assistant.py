@@ -3,7 +3,13 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from assistant import _AnyEvent, _compact_log_formatter, _start_live_input, parse_args
+from assistant import (
+    _AnyEvent,
+    _capture_focused_game_frame,
+    _compact_log_formatter,
+    _start_live_input,
+    parse_args,
+)
 
 
 class FakeSender:
@@ -129,6 +135,20 @@ class StartLiveInputTests(unittest.TestCase):
             _start_live_input(sender, active)
         self.assertEqual(sender.calls, ["select", "verify"])
         self.assertFalse(active.is_set())
+
+    def test_recording_capture_focuses_and_settles_before_capture(self) -> None:
+        sender = FakeSender()
+        calls = []
+
+        with patch("assistant.time.sleep") as sleep:
+            frame = _capture_focused_game_frame(
+                sender, lambda: calls.append("capture") or "frame"
+            )
+
+        self.assertEqual(frame, "frame")
+        self.assertEqual(sender.calls, ["select", "verify"])
+        sleep.assert_called_once_with(0.08)
+        self.assertEqual(calls, ["capture"])
 
 
 if __name__ == "__main__":

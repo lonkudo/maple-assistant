@@ -443,6 +443,48 @@ class WindowKeySender:
     def tap(self, key: str) -> bool:
         return self.press(key, duration=0.025)
 
+    def send_clipboard_message(self) -> bool:
+        """Explicit UI action: focus game and send Enter, Ctrl+V, Enter.
+
+        This deliberately works while patrol input is disarmed. It never
+        types arbitrary text itself—the UI has already placed the chosen
+        quick message on the Windows clipboard. Holding the key-state lock
+        prevents movement/attack injection from interleaving with the chat
+        chord when patrol happens to be active.
+        """
+
+        if self.select_window() is False or not self.is_game_foreground():
+            return False
+        if self.dry_run:
+            LOG.info("DRY-RUN quick message: enter, ctrl+v, enter")
+            return True
+
+        def transition(key: str, key_up: bool) -> None:
+            scan_code, extended = self._SCAN[key]
+            self._send_scan_code(scan_code, key_up=key_up, extended=extended)
+
+        def direct_tap(key: str) -> None:
+            transition(key, False)
+            time.sleep(0.025)
+            transition(key, True)
+
+        with self._key_state_lock:
+            # Release any gameplay hold before opening chat, and forget the
+            # matching ownership so no later worker releases a stale claim.
+            held_keys = tuple(self._key_owners)
+            self._key_owners.clear()
+            for key in held_keys:
+                transition(key, True)
+            direct_tap("enter")
+            time.sleep(0.05)
+            transition("ctrl", False)
+            direct_tap("v")
+            transition("ctrl", True)
+            time.sleep(0.05)
+            direct_tap("enter")
+        LOG.info("quick message pasted and sent to game window")
+        return True
+
     @staticmethod
     def _send_scan_code(scan_code: int, *, key_up: bool, extended: bool) -> None:
         """Inject one hardware-like keyboard transition with Win32 SendInput."""

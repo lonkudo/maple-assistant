@@ -1,5 +1,7 @@
 import logging
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from ui_worker import (
     UiLogHandler,
@@ -56,6 +58,43 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._quick_message_release(0)
         self.assertEqual(worker._root.copied, "回城补给")
         self.assertIn("已复制", worker._quick_message_status.text)
+
+    def test_quick_message_double_click_copies_and_sends_to_game(self) -> None:
+        class Root:
+            copied = ""
+            def clipboard_clear(self): self.copied = ""
+            def clipboard_append(self, value): self.copied += value
+            def update_idletasks(self): pass
+            def after_cancel(self, _job): pass
+
+        class Label:
+            text = ""
+            def configure(self, **kwargs): self.text = kwargs.get("text", "")
+
+        class Sender:
+            def __init__(self): self.calls = 0
+            def send_clipboard_message(self):
+                self.calls += 1
+                return True
+
+        worker = UiWorker.__new__(UiWorker)
+        worker._root = Root()
+        worker._quick_messages = ["组队吗？"]
+        worker._quick_message_press_job = object()
+        worker._quick_message_hold_fired = False
+        worker._quick_message_double_fired = False
+        worker._quick_message_status = Label()
+        sender = Sender()
+        worker.status_worker = type("Status", (), {"key_sender": sender})()
+
+        self.assertEqual(worker._quick_message_double_click(0), "break")
+        self.assertEqual(worker._root.copied, "组队吗？")
+        self.assertEqual(sender.calls, 1)
+        self.assertIn("已发送", worker._quick_message_status.text)
+        # The release belonging to the second click must not run the normal
+        # single-click action again.
+        worker._quick_message_release(0)
+        self.assertFalse(worker._quick_message_double_fired)
 
     def test_quick_delete_requires_hold_callback(self) -> None:
         class Label:
@@ -595,6 +634,10 @@ class UiLogHandlerTests(unittest.TestCase):
             def configure(self, **_kwargs):
                 pass
 
+        class Detector:
+            def reset_geometry(self):
+                calls.append(("reset_geometry",))
+
         worker = UiWorker.__new__(UiWorker)
         worker.patrol_controller = Controller()
         worker.on_patrol_stop = lambda: calls.append(("stop_input",))
@@ -602,6 +645,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._layer_row_names = ("layer1",)
         worker._refresh_patrol_controls = lambda: calls.append(("refresh",))
         worker._control_status = Label()
+        worker.detector = Detector()
 
         worker._reset_recording()
 
@@ -609,6 +653,46 @@ class UiLogHandlerTests(unittest.TestCase):
             ("enabled", False), ("stop_input",), ("reset",)
         ])
         self.assertEqual(worker._unlocked_points, set())
+        self.assertIn(("reset_geometry",), calls)
+
+    def test_recording_retries_until_opencv_minimap_and_marker_are_ready(self):
+        class Root:
+            def update_idletasks(self): pass
+
+        class Label:
+            def configure(self, **_kwargs): pass
+
+        frames = [object(), object()]
+        candidates = [
+            SimpleNamespace(
+                detection=SimpleNamespace(source="fallback"),
+                player_x=None, player_y=None,
+            ),
+            SimpleNamespace(
+                detection=SimpleNamespace(source="opencv"),
+                player_x=.4, player_y=.6,
+            ),
+        ]
+        worker = UiWorker.__new__(UiWorker)
+        worker._root = Root()
+        worker._control_status = Label()
+        worker.last_snapshot = None
+        worker.on_capture_now = lambda: frames.pop(0)
+        worker.detector = object()
+        worker.configured_map_name = ""
+        worker.diamond_size_tracker = None
+        worker.structure_tracker = None
+        rendered = []
+        worker._render = rendered.append
+
+        with mock.patch(
+            "ui_worker.build_debug_snapshot", side_effect=candidates
+        ), mock.patch("ui_worker.time.sleep") as sleep:
+            snapshot = worker._capture_snapshot_for_recording()
+
+        self.assertIs(snapshot, candidates[1])
+        self.assertEqual(rendered, [candidates[1]])
+        sleep.assert_called_once_with(.05)
 
     def test_fixed_attack_mode_greys_yolo_panel_and_applies_worker(self) -> None:
         import tempfile

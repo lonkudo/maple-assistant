@@ -128,6 +128,12 @@ Adaptive recordings include `coordinate_v2` metadata based on minimap canvas
 and diamond dimensions. Legacy ratio-only points still run, but should be
 re-recorded when the UI labels them as a legacy layout.
 
+Recording does not require patrol to be active. After **重置录制**, the next
+record-button click focuses the game, resets stale minimap geometry, and takes
+up to three fresh one-off samples. A point is accepted only after an OpenCV
+minimap border and yellow character diamond are both detected, which avoids
+machine-specific failures caused by an overlapping UI or a transition frame.
+
 ## Movement and safety rules
 
 - Only the movement worker owns directional movement and its paired pickup
@@ -338,6 +344,7 @@ not overwrite them. Telegram failures never stop other assistant workers.
 
 The **快捷消息** panel lives beside the potion controls in column 2. Add any
 number of reusable messages (maximum 20). Short-click a message to copy it to
-the Windows clipboard, long-press it for one second to edit it, and long-press
-its adjacent `×` button for one second to delete it. Quick messages are stored
+the Windows clipboard; double-click it to focus the game, open chat with Enter,
+paste with Ctrl+V, and send with Enter; long-press it for one second to edit it;
+and long-press its adjacent `×` button for one second to delete it. Quick messages are stored
 in the ignored `user_config.json` and survive application updates.

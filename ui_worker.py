@@ -556,6 +556,7 @@ class UiWorker(threading.Thread):
         self._quick_messages: list[str] = []
         self._quick_message_press_job: Any = None
         self._quick_message_hold_fired = False
+        self._quick_message_double_fired = False
         self._quick_delete_press_job: Any = None
         self._quick_delete_hold_fired = False
         self._quick_edit_entry: Any = None
@@ -1122,8 +1123,9 @@ class UiWorker(threading.Thread):
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
-            # Persistent clipboard shortcuts. Short click copies; long press
-            # edits. The adjacent delete icon also requires a 1s long press.
+            # Persistent clipboard shortcuts. Short click copies, double-click
+            # sends to game chat, and long press edits. The adjacent delete
+            # icon also requires a 1s long press.
             quick_panel = ttk.LabelFrame(col2, text="快捷消息", padding=10)
             quick_panel.pack(fill="x", pady=(0, 8))
             quick_header = ttk.Frame(quick_panel)
@@ -1133,7 +1135,7 @@ class UiWorker(threading.Thread):
                 command=self._quick_message_add,
             ).pack(side="left")
             self._quick_message_status = ttk.Label(
-                quick_header, text="短按复制；长按 1 秒修改/删除。"
+                quick_header, text="单击复制；双击发送；长按 1 秒修改/删除。"
             )
             self._quick_message_status.pack(side="left", padx=(8, 0))
             self._quick_messages_frame = ttk.Frame(quick_panel)
@@ -1594,14 +1596,24 @@ class UiWorker(threading.Thread):
             if self._root is not None:
                 self._root.update_idletasks()
             try:
-                fresh_frame = self.on_capture_now()
-                snapshot = build_debug_snapshot(
-                    fresh_frame,
-                    self.detector,
-                    self.configured_map_name,
-                    self.diamond_size_tracker,
-                    self.structure_tracker,
-                )
+                # Patrol capture is deliberately idle while recording. Take a
+                # few explicit post-focus samples so a reset does not depend
+                # on one transition frame or an unstabilized minimap border.
+                for _attempt in range(3):
+                    fresh_frame = self.on_capture_now()
+                    candidate = build_debug_snapshot(
+                        fresh_frame,
+                        self.detector,
+                        self.configured_map_name,
+                        self.diamond_size_tracker,
+                        self.structure_tracker,
+                    )
+                    snapshot = candidate
+                    if (candidate.detection.source == "opencv"
+                            and candidate.player_x is not None
+                            and candidate.player_y is not None):
+                        break
+                    time.sleep(0.05)
                 self.last_snapshot = snapshot
                 self._render(snapshot)
             except Exception as exc:
@@ -2347,6 +2359,10 @@ class UiWorker(threading.Thread):
                     "<ButtonRelease-1>",
                     lambda event, i=index: self._quick_message_release(i),
                 )
+                button.bind(
+                    "<Double-Button-1>",
+                    lambda event, i=index: self._quick_message_double_click(i),
+                )
             delete_button = self._ttk.Button(row, text="×", width=3)
             delete_button.pack(side="left")
             delete_button.bind(
@@ -2384,19 +2400,56 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
         self._quick_message_press_job = None
+        if getattr(self, "_quick_message_double_fired", False):
+            self._quick_message_double_fired = False
+            return
         if self._quick_message_hold_fired:
             self._quick_message_hold_fired = False
             return
         if not (0 <= index < len(self._quick_messages)):
             return
+        self._copy_quick_message(index)
+
+    def _copy_quick_message(self, index: int) -> bool:
+        if not (0 <= index < len(self._quick_messages)):
+            return False
         message = self._quick_messages[index]
         try:
             self._root.clipboard_clear()
             self._root.clipboard_append(message)
             self._root.update_idletasks()
             self._quick_message_status.configure(text=f"已复制：{message}")
+            return True
         except Exception as exc:
             self._quick_message_status.configure(text=f"复制失败：{exc}")
+            return False
+
+    def _quick_message_double_click(self, index: int) -> str:
+        """Copy and explicitly send the selected message to game chat."""
+
+        if self._root is not None and self._quick_message_press_job is not None:
+            try:
+                self._root.after_cancel(self._quick_message_press_job)
+            except Exception:
+                pass
+        self._quick_message_press_job = None
+        self._quick_message_double_fired = True
+        if not self._copy_quick_message(index):
+            return "break"
+        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        send = getattr(sender, "send_clipboard_message", None)
+        if send is None:
+            self._quick_message_status.configure(text="发送失败：游戏输入未接入。")
+            return "break"
+        try:
+            if send() is False:
+                raise OSError("无法聚焦游戏窗口")
+            self._quick_message_status.configure(
+                text=f"已发送：{self._quick_messages[index]}"
+            )
+        except Exception as exc:
+            self._quick_message_status.configure(text=f"发送失败：{exc}")
+        return "break"
 
     def _quick_message_begin_edit(self, index: int) -> None:
         self._quick_message_press_job = None
@@ -3188,6 +3241,11 @@ class UiWorker(threading.Thread):
             self.configured_map_name = self.patrol_controller.map_name()
             if getattr(self, "structure_tracker", None) is not None:
                 self.structure_tracker.reset(delete_reference=True)
+            reset_geometry = getattr(
+                getattr(self, "detector", None), "reset_geometry", None
+            )
+            if callable(reset_geometry):
+                reset_geometry()
             if getattr(self, "map_identity_store", None) is not None:
                 self.map_identity_store.remove(self.configured_map_name)
         except OSError as exc:

@@ -359,6 +359,30 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(sender.tap("ctrl"))
         self.assertEqual(events, [False, True])
 
+    def test_explicit_quick_message_works_while_patrol_input_is_disabled(self):
+        sender = WindowKeySender("game", dry_run=False, input_enabled=False)
+        sender.select_window = lambda: True
+        sender.is_game_foreground = lambda: True
+        events = []
+        sender._send_scan_code = lambda code, key_up, extended: events.append(
+            (code, key_up, extended)
+        )
+
+        with patch("status_worker.time.sleep"):
+            self.assertTrue(sender.send_clipboard_message())
+
+        enter = sender._SCAN["enter"][0]
+        ctrl = sender._SCAN["ctrl"][0]
+        v_key = sender._SCAN["v"][0]
+        self.assertEqual(
+            [(code, up) for code, up, _extended in events],
+            [
+                (enter, False), (enter, True),
+                (ctrl, False), (v_key, False), (v_key, True),
+                (ctrl, True), (enter, False), (enter, True),
+            ],
+        )
+
     def test_focus_loss_blocks_keys_without_reselecting_window(self) -> None:
         sender = WindowKeySender("game", dry_run=False)
         selections = []
