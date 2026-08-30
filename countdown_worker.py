@@ -1,8 +1,9 @@
-"""Independent repeating countdown that plays a local MP3 when it expires.
+"""Independent repeating countdown that dispatches selected reminders.
 
 The worker consumes no screenshots, sends no input, and does not inspect any
-other automation state.  Its interval and remaining time can be changed live
-by the UI.  At zero it re-arms the full interval before playing the sound.
+other automation state. Its interval and remaining time can be changed live
+by the UI. At zero it re-arms the full interval before notifying each enabled
+output (sound, screen flash, and Telegram message).
 """
 
 from __future__ import annotations
@@ -78,6 +79,7 @@ class CountdownWorker(threading.Thread):
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
         self._enabled = bool(enabled)
+        self._sound_enabled = True
         self._interval_seconds = max(
             0.01, float(interval_hours) * SECONDS_PER_HOUR
         )
@@ -105,6 +107,12 @@ class CountdownWorker(threading.Thread):
                 self._deadline = None
             self._enabled = enabled
         self._wake_event.set()
+
+    def set_sound_enabled(self, enabled: bool) -> None:
+        """Enable/disable only audio; visual/message callbacks still fire."""
+
+        with self._lock:
+            self._sound_enabled = bool(enabled)
 
     def set_interval_hours(self, hours: float) -> None:
         """Set the time gap and restart an enabled timer from the full gap."""
@@ -148,8 +156,8 @@ class CountdownWorker(threading.Thread):
             if not self._enabled:
                 return
             self._deadline = now + self._interval_seconds
-        LOG.info("COUNTDOWN reached zero: playing %s and resetting timer",
-                 self.sound_path)
+            sound_enabled = self._sound_enabled
+        LOG.info("COUNTDOWN reached zero: triggering reminders and resetting")
         if self._flash_callback is not None:
             try:
                 self._flash_callback()
@@ -157,13 +165,14 @@ class CountdownWorker(threading.Thread):
                 LOG.warning("COUNTDOWN screen blink callback failed", exc_info=True)
         if self._alert_callback is not None:
             try:
-                self._alert_callback("倒计时提醒")
+                self._alert_callback("循环警报")
             except Exception:
                 LOG.warning("COUNTDOWN message callback failed", exc_info=True)
-        try:
-            self._play_sound(self.sound_path)
-        except Exception:
-            LOG.warning("COUNTDOWN sound callback failed", exc_info=True)
+        if sound_enabled:
+            try:
+                self._play_sound(self.sound_path)
+            except Exception:
+                LOG.warning("COUNTDOWN sound callback failed", exc_info=True)
 
     def run(self) -> None:
         LOG.info("countdown worker started")

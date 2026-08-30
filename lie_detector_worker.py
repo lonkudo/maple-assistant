@@ -101,6 +101,7 @@ class LieDetectorWorker(threading.Thread):
         self._alert_callback = alert_callback
         self._lock = threading.Lock()
         self._enabled = bool(enabled)
+        self._sound_enabled = True
         self._next_scan_at = (
             time.monotonic() + self.scan_interval if enabled else None
         )
@@ -123,6 +124,12 @@ class LieDetectorWorker(threading.Thread):
             self._alerted_for_current_event = False
         LOG.info("lie detector alert %s", "enabled" if enabled else "disabled")
 
+    def set_sound_enabled(self, enabled: bool) -> None:
+        """Enable/disable only audio; visual/message callbacks still fire."""
+
+        with self._lock:
+            self._sound_enabled = bool(enabled)
+
     def _take_due_scan(self, now: float) -> bool:
         with self._lock:
             if not self._enabled:
@@ -143,13 +150,16 @@ class LieDetectorWorker(threading.Thread):
                 LOG.warning("lie detector screen blink failed", exc_info=True)
         if self._alert_callback is not None:
             try:
-                self._alert_callback("测谎报警")
+                self._alert_callback("测谎警报")
             except Exception:
                 LOG.warning("lie detector message callback failed", exc_info=True)
-        try:
-            self._play_alert_sound(self.sound_path)
-        except Exception:
-            LOG.warning("lie detector alert sound failed", exc_info=True)
+        with self._lock:
+            sound_enabled = self._sound_enabled
+        if sound_enabled:
+            try:
+                self._play_alert_sound(self.sound_path)
+            except Exception:
+                LOG.warning("lie detector alert sound failed", exc_info=True)
 
     def _update_alert(self, match: Optional[tuple[int, int, int, int]]) -> None:
         should_alert = False
@@ -164,7 +174,7 @@ class LieDetectorWorker(threading.Thread):
         if should_alert:
             LOG.warning(
                 "LIE DETECTOR ALERT: pure-white block detected at "
-                "x=%d y=%d size=%dx%d; playing beep",
+                "x=%d y=%d size=%dx%d; triggering reminders",
                 *match,
             )
             threading.Thread(

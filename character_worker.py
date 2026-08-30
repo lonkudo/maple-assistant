@@ -95,6 +95,7 @@ class CharacterWorker(Thread):
         self._last_frame: Any = None
         self._disconnect_alert_lock = threading.Lock()
         self._disconnect_alert_enabled = bool(disconnect_alert_enabled)
+        self._sound_enabled = True
         self._disconnect_alert_misses = max(1, int(disconnect_alert_misses))
         self._disconnect_missing_frames = 0
         self._disconnect_alerted = False
@@ -116,6 +117,12 @@ class CharacterWorker(Thread):
             self._disconnect_alerted = False
         LOG.info("disconnect alert %s", "enabled" if enabled else "disabled")
 
+    def set_sound_enabled(self, enabled: bool) -> None:
+        """Enable/disable only audio; visual/message callbacks still fire."""
+
+        with self._disconnect_alert_lock:
+            self._sound_enabled = bool(enabled)
+
     @property
     def disconnect_alert_enabled(self) -> bool:
         with self._disconnect_alert_lock:
@@ -132,10 +139,13 @@ class CharacterWorker(Thread):
                 self._alert_callback("掉线警报")
             except Exception:
                 LOG.warning("disconnect alert message callback failed", exc_info=True)
-        try:
-            self._play_alert_sound(self._alert_sound_path)
-        except Exception:
-            LOG.warning("disconnect alert sound failed", exc_info=True)
+        with self._disconnect_alert_lock:
+            sound_enabled = self._sound_enabled
+        if sound_enabled:
+            try:
+                self._play_alert_sound(self._alert_sound_path)
+            except Exception:
+                LOG.warning("disconnect alert sound failed", exc_info=True)
 
     def _update_disconnect_alert(self, detected: bool) -> None:
         """Consume the existing marker result; never runs another detector."""
@@ -158,7 +168,7 @@ class CharacterWorker(Thread):
         if should_alert:
             LOG.warning(
                 "DISCONNECT ALERT: yellow character marker missing for %d "
-                "consecutive frames; playing beep",
+                "consecutive frames; triggering reminders",
                 self._disconnect_missing_frames,
             )
             # MCI playback waits until the MP3 ends. Keep marker detection at

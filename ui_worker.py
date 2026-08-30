@@ -1183,15 +1183,36 @@ class UiWorker(threading.Thread):
             )
             self._shutdown_status.pack(anchor="w", pady=(6, 0))
 
-            countdown_row = ttk.Frame(extra_panel)
-            countdown_row.pack(fill="x", pady=(8, 0))
+            alarm_row = ttk.Frame(extra_panel)
+            alarm_row.pack(fill="x", pady=(8, 0))
+            ttk.Label(alarm_row, text="警报:").pack(side="left")
+
+            self._disconnect_alert_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                alarm_row,
+                text="掉线警报",
+                variable=self._disconnect_alert_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left", padx=(4, 8))
+
+            self._lie_alert_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                alarm_row,
+                text="测谎警报",
+                variable=self._lie_alert_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left", padx=(0, 8))
+
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
-                countdown_row, text="循环提醒",
+                alarm_row, text="循环警报",
                 variable=self._countdown_enabled_var,
                 command=self._countdown_on_change,
             )
-            self._countdown_check.pack(side="left", padx=(0, 8))
+            self._countdown_check.pack(side="left")
+
+            countdown_row = ttk.Frame(extra_panel)
+            countdown_row.pack(fill="x", pady=(4, 0))
             ttk.Label(countdown_row, text="间隔").pack(side="left")
             self._countdown_interval_var = tk.DoubleVar(value=1.0)
             self._countdown_interval_slider = ttk.Scale(
@@ -1235,63 +1256,44 @@ class UiWorker(threading.Thread):
             self._countdown_remaining_label.pack(side="left")
             self._countdown_status = ttk.Label(
                 extra_panel,
-                text="循环提醒: 未启用。",
+                text="循环警报: 未启用。",
                 justify="left",
             )
             self._countdown_status.pack(anchor="w", pady=(4, 0))
 
-            # Other-player safety net: when red diamonds (other players) show
-            # on the minimap at a move-to-left event finished, auto switch
-            # channel (progressive HP drug first).  Switched live to the
-            # movement worker.  This is a SELECTION (enable/disable), not a
-            # manual trigger button.
-            player_row = ttk.Frame(extra_panel)
-            player_row.pack(fill="x", pady=(4, 0))
-            self._player_check_var = tk.BooleanVar(value=False)
+            reminder_row = ttk.Frame(extra_panel)
+            reminder_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(reminder_row, text="提醒:").pack(side="left")
+            self._sound_alert_var = tk.BooleanVar(value=True)
             ttk.Checkbutton(
-                player_row,
-                text="检测到其他玩家时自动切换频道",
-                variable=self._player_check_var,
+                reminder_row,
+                text="声音提醒",
+                variable=self._sound_alert_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left")
+            ).pack(side="left", padx=(4, 8))
 
-            disconnect_row = ttk.Frame(extra_panel)
-            disconnect_row.pack(fill="x", pady=(4, 0))
-            self._disconnect_alert_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                disconnect_row,
-                text="掉线警报",
-                variable=self._disconnect_alert_var,
-                command=self._shutdown_on_change,
-            ).pack(side="left")
-
-            lie_alert_row = ttk.Frame(extra_panel)
-            lie_alert_row.pack(fill="x", pady=(4, 0))
-            self._lie_alert_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                lie_alert_row,
-                text="测谎报警",
-                variable=self._lie_alert_var,
-                command=self._shutdown_on_change,
-            ).pack(side="left")
-
-            blink_row = ttk.Frame(extra_panel)
-            blink_row.pack(fill="x", pady=(4, 0))
             self._screen_blink_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                blink_row,
+                reminder_row,
                 text="闪烁提醒",
                 variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left", padx=(0, 12))
+            ).pack(side="left", padx=(0, 8))
 
             self._telegram_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                blink_row,
+                reminder_row,
                 text="消息提醒",
                 variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
+            ttk.Label(
+                extra_panel,
+                text=("提醒: 声音播放 beep.mp3；闪烁为红屏两次；"
+                      "消息通过 Telegram BOT 发送。"),
+                justify="left",
+                wraplength=620,
+            ).pack(anchor="w", pady=(2, 0))
 
             telegram_row = ttk.Frame(extra_panel)
             telegram_row.pack(fill="x", pady=(4, 0))
@@ -1320,6 +1322,18 @@ class UiWorker(threading.Thread):
                 wraplength=620,
             )
             self._telegram_status.pack(anchor="w", pady=(4, 0))
+
+            # Other-player safety net is intentionally the final row. It is
+            # a selection (enable/disable), not a manual trigger button.
+            player_row = ttk.Frame(extra_panel)
+            player_row.pack(fill="x", pady=(4, 0))
+            self._player_check_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                player_row,
+                text="检测到其他玩家自动切换频道",
+                variable=self._player_check_var,
+                command=self._shutdown_on_change,
+            ).pack(side="left")
             self._shutdown_load_settings()
 
             # Minimap / map-name preview widgets: built but hidden by default
@@ -2114,6 +2128,8 @@ class UiWorker(threading.Thread):
             )
         if hasattr(self, "_lie_alert_var"):
             data["lie_alert_enabled"] = bool(self._lie_alert_var.get())
+        if hasattr(self, "_sound_alert_var"):
+            data["sound_alert_enabled"] = bool(self._sound_alert_var.get())
         if hasattr(self, "_screen_blink_var"):
             data["screen_blink_enabled"] = bool(self._screen_blink_var.get())
         if hasattr(self, "_telegram_enabled_var"):
@@ -2182,6 +2198,15 @@ class UiWorker(threading.Thread):
             setter = getattr(lie_detector, "set_enabled", None)
             if setter is not None:
                 setter(bool(data.get("lie_alert_enabled", False)))
+        sound_enabled = bool(data.get("sound_alert_enabled", True))
+        for alert_worker in (
+            getattr(self, "countdown_worker", None),
+            character,
+            lie_detector,
+        ):
+            setter = getattr(alert_worker, "set_sound_enabled", None)
+            if setter is not None:
+                setter(sound_enabled)
         blinker = getattr(self, "screen_blinker", None)
         if blinker is not None:
             setter = getattr(blinker, "set_enabled", None)
@@ -2516,7 +2541,7 @@ class UiWorker(threading.Thread):
         worker = getattr(self, "countdown_worker", None)
         if worker is None:
             self._countdown_status.configure(
-                text="循环提醒: 工作线程未接入 (无界面模式)。"
+                text="循环警报: 工作线程未接入 (无界面模式)。"
             )
             return
         hours = float(data.get("countdown_interval_hours", 1.0))
@@ -2524,10 +2549,10 @@ class UiWorker(threading.Thread):
         worker.set_enabled(bool(data.get("countdown_enabled", False)))
         if worker.enabled:
             self._countdown_status.configure(
-                text=f"循环提醒已启动: 每 {hours:.1f} 小时播放 beep.mp3。"
+                text=f"循环警报已启动: 每 {hours:.1f} 小时触发已选提醒。"
             )
         else:
-            self._countdown_status.configure(text="循环提醒: 未启用。")
+            self._countdown_status.configure(text="循环警报: 未启用。")
 
     def _countdown_refresh_grey(self) -> None:
         enabled = bool(self._countdown_enabled_var.get())
@@ -2588,9 +2613,9 @@ class UiWorker(threading.Thread):
                 text=self._format_countdown_seconds(remaining)
             )
         self._countdown_status.configure(
-            text=("循环提醒: 剩余 "
+            text=("循环警报: 剩余 "
                   f"{self._format_countdown_seconds(remaining)} / "
-                  f"间隔 {interval / 3600.0:.1f}h；到时播放并自动重置。")
+                  f"间隔 {interval / 3600.0:.1f}h；到时提醒并自动重置。")
         )
 
     def _shutdown_load_settings(self) -> None:
@@ -2627,6 +2652,10 @@ class UiWorker(threading.Thread):
                 self, "_lie_alert_var"
             ):
                 self._lie_alert_var.set(bool(data["lie_alert_enabled"]))
+            if hasattr(self, "_sound_alert_var"):
+                self._sound_alert_var.set(bool(
+                    data.get("sound_alert_enabled", True)
+                ))
             if "screen_blink_enabled" in data and hasattr(
                     self, "_screen_blink_var"
             ):

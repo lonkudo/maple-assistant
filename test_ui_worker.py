@@ -1187,16 +1187,24 @@ class UiLogHandlerTests(unittest.TestCase):
         class FakeCharacter:
             def __init__(self) -> None:
                 self.calls = []
+                self.sound_calls = []
 
             def set_disconnect_alert(self, enabled) -> None:
                 self.calls.append(enabled)
 
+            def set_sound_enabled(self, enabled) -> None:
+                self.sound_calls.append(enabled)
+
         class FakeLieDetector:
             def __init__(self) -> None:
                 self.calls = []
+                self.sound_calls = []
 
             def set_enabled(self, enabled) -> None:
                 self.calls.append(enabled)
+
+            def set_sound_enabled(self, enabled) -> None:
+                self.sound_calls.append(enabled)
 
         worker = UiWorker.__new__(UiWorker)
         worker.shutdown_worker = FakeShutdownWorker()
@@ -1211,6 +1219,7 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._player_check_var = Var(True)
         worker._disconnect_alert_var = Var(True)
         worker._lie_alert_var = Var(True)
+        worker._sound_alert_var = Var(False)
 
         def fake_path(self):
             return Path(tempfile.gettempdir()) / "test_player_check_settings.json"
@@ -1225,9 +1234,12 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertTrue(data["player_check_enabled"])
             self.assertTrue(data["disconnect_alert_enabled"])
             self.assertTrue(data["lie_alert_enabled"])
+            self.assertFalse(data["sound_alert_enabled"])
             self.assertEqual(worker.movement_worker.calls, [True])
             self.assertEqual(worker.character_worker.calls, [True])
             self.assertEqual(worker.lie_detector_worker.calls, [True])
+            self.assertEqual(worker.character_worker.sound_calls, [False])
+            self.assertEqual(worker.lie_detector_worker.sound_calls, [False])
 
             loader = UiWorker.__new__(UiWorker)
             loader.shutdown_worker = FakeShutdownWorker()
@@ -1242,6 +1254,7 @@ class UiLogHandlerTests(unittest.TestCase):
             loader._player_check_var = Var(False)
             loader._disconnect_alert_var = Var(False)
             loader._lie_alert_var = Var(False)
+            loader._sound_alert_var = Var(True)
             with mock.patch.object(UiWorker, "_shutdown_settings_path", fake_path):
                 loader._shutdown_load_settings()
             self.assertTrue(loader._player_check_var.get())
@@ -1250,6 +1263,9 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertEqual(loader.character_worker.calls, [True])
             self.assertTrue(loader._lie_alert_var.get())
             self.assertEqual(loader.lie_detector_worker.calls, [True])
+            self.assertFalse(loader._sound_alert_var.get())
+            self.assertEqual(loader.character_worker.sound_calls, [False])
+            self.assertEqual(loader.lie_detector_worker.sound_calls, [False])
 
 
 class WindowGeometryHelperTests(unittest.TestCase):

@@ -84,11 +84,12 @@ idle before Start Patrol.
 - `CountdownWorker` independently repeats an adjustable countdown, plays
   `sound/beep.mp3` at zero, and immediately resets for the next interval.
 - The optional **掉线警报** consumes `CharacterWorker`'s existing yellow-marker
-  result and plays the same beep after three consecutive missing frames.
-- The optional **测谎报警** samples the shared full-client capture every one
+  result and raises an alert after three consecutive missing frames.
+- The optional **测谎警报** samples the shared full-client capture every one
   seconds and alarms when it finds a resolution-scaled pure-white square.
-- The optional **闪烁提醒** adds two brief red full-screen flashes to every
-  countdown, disconnect, and lie-detector beep without affecting capture.
+- The independent **声音提醒**, **闪烁提醒**, and **消息提醒** choices deliver
+  every countdown, disconnect, and lie-detector event through beep audio, two
+  red full-screen flashes, and Telegram respectively.
 - The optional **消息提醒** queues those same events to a separate Telegram
   worker with a machine marker, event type, and local timestamp.
 
@@ -298,31 +299,32 @@ shipping even when focused tests already passed.
 Stop a console run with `Ctrl+C`. Keep the game visible during calibration and
 use `--dry-run` whenever input injection is not intended.
 
-The **Additional Functions** panel includes an independent repeating sound
-reminder. Set its interval in hours, enable it, and use the remaining-time bar
+The **Additional Functions** panel includes an independent **循环警报**. Set its
+interval in hours, enable it, and use the remaining-time bar
 to move the current deadline anywhere from zero to the full interval. For
 example, with a `1.0h` interval, dragging the bar to `20m 00s` makes the next
-beep occur in 20 minutes. At zero, `sound/beep.mp3` plays and the bar resets to
-the full interval. The timer does not depend on patrol or attack being active.
+event occur in 20 minutes. At zero, the selected reminder outputs run and the
+bar resets to the full interval. The timer does not depend on patrol or attack
+being active.
 
 Selecting **掉线警报** reuses the normal per-frame yellow-character-diamond
-detection. Three consecutive missing frames confirm the loss and play one
-beep; the alarm re-arms after the marker is detected again. Audio runs in the
-background, so it does not slow the character detector or add another capture.
+detection. Three consecutive missing frames confirm the loss and raise one
+event; the alarm re-arms after the marker is detected again.
 
-Selecting **测谎报警** checks one in-memory full-game frame every second.
+Selecting **测谎警报** checks one in-memory full-game frame every second.
 Its reference signature is a `40×40` block of entirely pure-white pixels in a
 `1075×768` client. Both target dimensions scale independently with the current
-client resolution. A visible match plays one beep; after the square disappears,
-a later match can alert again. The detector never saves screenshots, so no used
-image files remain to delete.
+client resolution. A visible match raises one event; after the square
+disappears, a later match can alert again. The detector never saves
+screenshots, so no used image files remain to delete.
 
-Selecting **闪烁提醒** makes the primary screen flash red for 0.5 seconds,
-turn off for 0.3 seconds, then flash red for another 0.5 seconds whenever one
-of the existing beep alarms fires: the repeating countdown, 掉线警报, or 测谎报警.
-It is a separate notification worker and does not create another capture loop.
+The reminder row controls event delivery independently: **声音提醒** plays
+`sound/beep.mp3`; **闪烁提醒** makes the primary screen flash red for 0.5
+seconds, turn off for 0.3 seconds, then flash red for another 0.5 seconds; and
+**消息提醒** sends Telegram messages. Disabling sound does not disable either
+of the other outputs.
 
-Selecting **消息提醒（Telegram）** sends those same three alert events through
+Selecting **消息提醒** sends those same three alert events through
 the configured BOT. Long-press the machine-name button for one second to turn
 it into an input field; leaving that field saves it and restores the named
 button. Enter a distinct **设备名称** on every computer, first send

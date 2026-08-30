@@ -92,6 +92,26 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
         self.assertTrue(alerted.wait(.5))
         self.assertEqual(events, ["掉线警报"])
 
+    def test_sound_can_be_disabled_without_suppressing_message_alert(self):
+        played = []
+        events = []
+        alerted = threading.Event()
+
+        def notify(event_type):
+            events.append(event_type)
+            alerted.set()
+
+        worker = CharacterWorker(
+            queue.Queue(), queue.Queue(), threading.Event(),
+            disconnect_alert_enabled=True, disconnect_alert_misses=1,
+            play_alert_sound=played.append, alert_callback=notify,
+        )
+        worker.set_sound_enabled(False)
+        worker._update_disconnect_alert(False)
+        self.assertTrue(alerted.wait(.5))
+        self.assertEqual(played, [])
+        self.assertEqual(events, ["掉线警报"])
+
     def test_run_reuses_the_single_marker_detection_for_alert(self):
         frames = queue.Queue()
         positions = queue.Queue()

@@ -294,21 +294,26 @@ adjacent delete icon removes that row. The Telegram machine marker uses the
 same long-press-to-entry, focus-out-to-button interaction.
 
 `CountdownWorker` has no gameplay dependencies: it owns only a monotonic
-deadline, configured interval, wake event, and `sound/beep.mp3`. At expiry it
-re-arms the full interval before playing the MP3 through the Windows MCI API.
+deadline, configured interval, wake event, and alert callbacks. At expiry it
+re-arms the full interval before dispatching the selected reminder outputs.
 The UI reads a locked snapshot for its live progress scale. Dragging that scale
 sets a new remaining duration within `0..interval`; UI refresh pauses while the
 pointer owns the scale so it does not fight the drag.
+
+The UI separates alert sources (`掉线警报`, `测谎警报`, `循环警报`) from reminder
+outputs (`声音提醒`, `闪烁提醒`, `消息提醒`). Each source always emits its event;
+the three output switches independently gate MP3 playback, red-screen flashing,
+and Telegram delivery.
 
 `LieDetectorWorker` receives its own latest-only subscription to the existing
 full-client `FrameBus`. It does not capture again and never writes a screenshot.
 Every second it scales the reference `40×40` signature from a
 `1075×768` client to the current width and height, then uses an OpenCV erosion
-over the exact-white pixel mask to find an all-white rectangle. A match beeps
+over the exact-white pixel mask to find an all-white rectangle. A match alerts
 once until a later scan confirms the square has disappeared.
 
 `ScreenBlinker` is a separate, request-driven worker. When **闪烁提醒** is
-selected, every existing beep trigger queues a 0.5s red full-screen flash,
+selected, every alert event queues a 0.5s red full-screen flash,
 a 0.3s gap, and a final 0.5s red flash
 (countdown, disconnect alarm, and lie detector). It owns no capture or game
 input and therefore cannot delay the workers that produced the alert. It uses

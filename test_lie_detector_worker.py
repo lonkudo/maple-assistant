@@ -103,7 +103,19 @@ class LieDetectorWorkerTests(unittest.TestCase):
         )
         worker._update_alert((10, 20, 40, 40))
         self.assertTrue(alerted.wait(.5))
-        self.assertEqual(events, ["测谎报警"])
+        self.assertEqual(events, ["测谎警报"])
+
+    def test_sound_can_be_disabled_without_suppressing_visual_alert(self):
+        played = []
+        flashed = threading.Event()
+        worker = LieDetectorWorker(
+            queue.Queue(), threading.Event(), enabled=True,
+            play_alert_sound=played.append, flash_callback=flashed.set,
+        )
+        worker.set_sound_enabled(False)
+        worker._update_alert((10, 20, 40, 40))
+        self.assertTrue(flashed.wait(.5))
+        self.assertEqual(played, [])
 
     def test_worker_analyzes_shared_frame_without_writing_a_file(self):
         frames = queue.Queue()

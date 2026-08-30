@@ -91,7 +91,23 @@ class CountdownWorkerTests(unittest.TestCase):
             play_sound=lambda _path: None, alert_callback=alerts.append,
         )
         worker._fire_and_reset()
-        self.assertEqual(alerts, ["倒计时提醒"])
+        self.assertEqual(alerts, ["循环警报"])
+
+    def test_sound_can_be_disabled_without_suppressing_other_reminders(self):
+        played = []
+        flashes = []
+        alerts = []
+        worker = CountdownWorker(
+            threading.Event(), sound_path=Path("sound/beep.mp3"), enabled=True,
+            play_sound=played.append,
+            flash_callback=lambda: flashes.append(True),
+            alert_callback=alerts.append,
+        )
+        worker.set_sound_enabled(False)
+        worker._fire_and_reset()
+        self.assertEqual(played, [])
+        self.assertEqual(flashes, [True])
+        self.assertEqual(alerts, ["循环警报"])
 
 
 if __name__ == "__main__":

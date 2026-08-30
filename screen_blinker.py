@@ -1,4 +1,4 @@
-"""Optional full-screen red visual alert shared by all beep triggers."""
+"""Optional full-screen red visual reminder shared by all alert events."""
 
 from __future__ import annotations
 
