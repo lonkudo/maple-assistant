@@ -162,6 +162,21 @@ startup does not depend on a recent recording frame or stable contour voting.
   seconds). Progress is measured cumulatively from a stable anchor, so several
   small but real movements reset the counter and attack animations do not
   trigger false stair jumps.
+- The minimap coordinate frame must stay stable for those no-progress
+  counters to mean anything. `_stabilize_boxes` in `minimap_detector.py` holds
+  one established box while the raw contour alternates between two
+  near-identical boxes (border vs canvas edge - the live client flipped
+  87x70/80x70 every few frames). Without the hysteresis anchor the normalized
+  position swings +/-0.05 while the character stands still, which resets the
+  stall counters and a stuck character presses Left forever without ever
+  triggering edge recovery. A different box is adopted only after the SAME
+  box repeats for a full history window (a genuine resize, HUD scale change,
+  or map switch).
+- When a walk key cannot be sent because the game window is not foreground or
+  live input is disabled, `_send_walk_hold` logs at INFO
+  (`walk key <dir> send blocked (window not foreground or input disabled)`)
+  so a frozen character is diagnosable directly in the log instead of a
+  silent no-op.
 - Climb arrival requires the expected next layer and stable confirmation. Up
   remains held through a short rope-top compensation window.
 - Rope jumping keeps two separate horizontal tolerances: only the narrow
@@ -271,6 +286,15 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
   rejected so a ~40px UI box inside the map-name strip can never become the
   minimap border (`window=(5,22,45,62)` was the live failure).
 - `MINIMAP_ANALYSIS_SIZE = (400, 400)`, aspect-preserving fit, never upscale.
+- **v0043: `_stabilize_boxes` hysteresis anchor.** The live client flipped the
+  minimap detection between 87x70 and 80x70 every few frames; the
+  per-coordinate median flipped with the alternation, swinging the normalized
+  position +/-0.05 while the character stood still, which defeated the
+  stall/edge-recovery counters (stuck character pressed Left forever). The
+  stabilizer now holds the first established box and adopts a different one
+  only after the SAME box repeats for a full history window.
+  `movement_worker._send_walk_hold` also logs at INFO when a walk key send is
+  blocked (window not foreground / input disabled).
 - **v0033: `analysis_box` now EQUALS `window_box`.** The yellow marker/patrol
   overlay rectangle must coincide with the green minimap rectangle. The legacy
   0.3125 top offset + 1.0513 right extension belonged to a layout with the map
