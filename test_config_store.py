@@ -40,7 +40,7 @@ class ConfigStoreTests(unittest.TestCase):
                 store.read_section("rope_calibration")[
                     "stair_jump_stall_frames"
                 ],
-                6,
+                10,
             )
 
     def test_unified_config_migrates_only_user_sections(self):

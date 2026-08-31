@@ -158,9 +158,8 @@ startup does not depend on a recent recording frame or stable contour voting.
 - Rope-stall recovery is armed only after repeated no-progress frames within
   the rope alignment range. While the rope is farther away, movement keeps
   walking across the platform and cannot start a recovery jump.
-- Stair adaptation requires six consecutive no-progress frames (about 1.5
-  seconds; tuned down from ten once the minimap frame became stable).
-  Progress is measured cumulatively from a stable anchor, so several
+- Stair adaptation requires ten consecutive no-progress frames (about 2.5
+  seconds). Progress is measured cumulatively from a stable anchor, so several
   small but real movements reset the counter and attack animations do not
   trigger false stair jumps.
 - The minimap coordinate frame must stay stable for those no-progress
