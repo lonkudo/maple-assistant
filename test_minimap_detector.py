@@ -596,6 +596,31 @@ class MinimapDetectorTests(unittest.TestCase):
             adopted = detector2._stabilize_boxes(*full)
         self.assertEqual(adopted[0], (0, 0, 239, 184))
 
+    def test_alternating_border_and_canvas_edge_holds_stable_box(self) -> None:
+        """An A/B/A/B contour alternation must not flip the frame.
+
+        Live client log: the minimap detection flipped 87x70 / 80x70 every
+        few frames, and the per-coordinate median flipped with it, swinging
+        the normalized player position +-0.05 while the character stood
+        still - so stall/edge recovery never fired and the character was
+        stuck forever.  The hysteresis anchor must hold one box.
+        """
+
+        box_a = ((4, 56, 91, 126), (4, 56, 91, 126), (4, 56, 91, 126))
+        box_b = ((7, 56, 87, 126), (7, 56, 87, 126), (7, 56, 87, 126))
+        detector = MinimapDetector(
+            dedicated_crop=True, opencv_size=(400, 400)
+        )
+        detector.reset_geometry()
+        first = None
+        for _frame in range(3):
+            first = detector._stabilize_boxes(*box_a)
+        for _frame in range(20):
+            kept = detector._stabilize_boxes(*box_b)
+            self.assertEqual(kept[0], first[0], "frame flipped to box B")
+            kept = detector._stabilize_boxes(*box_a)
+            self.assertEqual(kept[0], first[0], "frame flipped back to box A")
+
     def test_map_name_strip_is_not_chosen_as_minimap_border(self) -> None:
         """A tiny UI box inside the map-name strip must not win.
 

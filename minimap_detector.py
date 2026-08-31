@@ -246,6 +246,13 @@ class MinimapDetector:
         self._box_history: deque[tuple[Box, Box, Box]] = deque(
             maxlen=self.box_history_len
         )
+        # Hysteresis anchor: the returned geometry holds the first
+        # established box while the raw contour alternates between two
+        # near-identical boxes (border vs canvas edge).  A different box is
+        # adopted only after the SAME box repeats for a full history window.
+        self._stable_boxes: Optional[tuple[Box, Box, Box]] = None
+        self._stable_candidate: Optional[tuple[Box, Box, Box]] = None
+        self._stable_candidate_count = 0
         # A partially detected outer border can make the minimap look much
         # shorter for one or two frames.  That crop excludes the lower map
         # canvas (and therefore the yellow marker), which must not be treated
@@ -278,6 +285,9 @@ class MinimapDetector:
             self._box_history.clear()
             self._pending_shrunken_boxes = None
             self._pending_shrunken_count = 0
+            self._stable_boxes = None
+            self._stable_candidate = None
+            self._stable_candidate_count = 0
             self._last_good = None
             self._last_good_image_size = None
             self._last_good_at = float("-inf")
@@ -460,6 +470,9 @@ class MinimapDetector:
                         self._box_history.append(adopted)
                         self._pending_shrunken_boxes = None
                         self._pending_shrunken_count = 0
+                        self._stable_boxes = adopted
+                        self._stable_candidate = None
+                        self._stable_candidate_count = 0
                         return adopted
                     # Transient severe change: keep the known-good geometry.
                     return (
@@ -482,11 +495,65 @@ class MinimapDetector:
             self._box_history.append((window, analysis, canvas))
             if len(self._box_history) < 2:
                 return window, analysis, canvas
-            return (
+            median_boxes = (
                 self._coordinate_median(self._box_history, 0),
                 self._coordinate_median(self._box_history, 1),
                 self._coordinate_median(self._box_history, 2),
             )
+            return self._hold_stable_boxes(
+                window, analysis, canvas, median_boxes
+            )
+
+    @staticmethod
+    def _boxes_close(first: Box, second: Box, tolerance: int = 6) -> bool:
+        """True when two window boxes differ by at most ``tolerance`` px."""
+
+        return max(
+            abs(first[0] - second[0]), abs(first[1] - second[1]),
+            abs(first[2] - second[2]), abs(first[3] - second[3]),
+        ) <= tolerance
+
+    def _hold_stable_boxes(
+        self,
+        window: Box,
+        analysis: Box,
+        canvas: Box,
+        median_boxes: tuple[Box, Box, Box],
+    ) -> tuple[Box, Box, Box]:
+        """Hold one box while the raw contour alternates between two
+        near-identical boxes (e.g. the border vs the canvas edge - the live
+        client flips 87x70 / 80x70 every frame).
+
+        The per-coordinate median cannot smooth an A/B/A/B alternation: the
+        median itself flips with the history window, shifting the whole
+        normalized coordinate frame (marker AND projected targets) every few
+        frames, which makes the character look like it is moving (stall
+        recovery never fires) while it is actually stuck.  A different box is
+        adopted only after the SAME box repeats for a full history window -
+        a genuine resize, HUD scale change, or map switch.
+        """
+
+        if self._stable_boxes is None:
+            self._stable_boxes = median_boxes
+            return median_boxes
+        stable = self._stable_boxes
+        if self._boxes_close(window, stable[0]):
+            # Same geometry as the anchor (or its frame-to-frame jitter):
+            # hold it and forget any in-progress candidate.
+            self._stable_candidate = None
+            self._stable_candidate_count = 0
+            return stable
+        candidate = self._stable_candidate
+        if candidate is not None and self._boxes_close(window, candidate[0]):
+            self._stable_candidate_count += 1
+        else:
+            self._stable_candidate = (window, analysis, canvas)
+            self._stable_candidate_count = 1
+        if self._stable_candidate_count >= self.box_history_len:
+            self._stable_boxes = self._stable_candidate
+            self._stable_candidate = None
+            self._stable_candidate_count = 0
+        return self._stable_boxes
 
     def detect(self, image: Image.Image) -> MinimapDetection:
         original_size = image.size

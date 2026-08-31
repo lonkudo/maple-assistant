@@ -1777,6 +1777,11 @@ class MovementWorker(threading.Thread):
                 self._release_walk_hold()
                 claimed = key_down(decision.key) is not False
                 if not claimed:
+                    LOG.info(
+                        "walk key %s send blocked (window not foreground "
+                        "or input disabled) - character will not move",
+                        decision.key,
+                    )
                     return False
                 self._walk_hold_key = decision.key
             if not self._walk_hold_z:
