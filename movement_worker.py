@@ -1893,7 +1893,7 @@ class MovementWorker(threading.Thread):
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
         stair_jump_stall_diamonds: float = 0.25,
-        stair_jump_stall_frames: int = 10,
+        stair_jump_stall_frames: int = 6,
         patrol_start_grace_seconds: float = 3.0,
         stair_jump_attempts_max: int = 3,
         # 台阶/坑边尝试间隔 0.8s（原 2.5s）：地图坑多时角色卡在边缘会等

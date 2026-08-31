@@ -811,7 +811,7 @@ def main() -> int:
                 calibration.get("stair_jump_stall_diamonds", 0.25)
             ),
             stair_jump_stall_frames=int(
-                calibration.get("stair_jump_stall_frames", 10)
+                calibration.get("stair_jump_stall_frames", 6)
             ),
             patrol_start_grace_seconds=float(
                 calibration.get("patrol_start_grace_seconds", 3.0)

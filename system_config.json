@@ -16,7 +16,7 @@
     "patrol_cycles_per_layer": 2,
     "potion_retry_attempts": 3,
     "potion_retry_delay_seconds": 0.05,
-    "stair_jump_stall_frames": 10,
+    "stair_jump_stall_frames": 6,
     "movement_hold_seconds": 2.0,
     "minimum_final_hold_seconds": 0.08,
     "minimum_movement_hold_seconds": 0.3,

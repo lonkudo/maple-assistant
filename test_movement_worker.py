@@ -40,12 +40,12 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
-    def test_default_stair_jump_waits_ten_frames_through_attack_animation(self):
+    def test_default_stair_jump_waits_six_frames_through_attack_animation(self):
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(), important_positions={}
         )
 
-        self.assertEqual(worker.stair_jump_stall_frames, 10)
+        self.assertEqual(worker.stair_jump_stall_frames, 6)
 
     def test_dispatched_marker_must_match_current_frame_and_minimap_region(self):
         class Reading:
