@@ -1,10 +1,11 @@
 """One-second, full-client lie-event detector using in-memory frames only.
 
-At the 1075x768 reference resolution a lie event contains a 40x40 block whose
-pixels are all exactly white.  The target width and height scale independently
-with the current captured client dimensions.  Frames are consumed from the
-existing full-window FrameBus; this worker never captures or writes an image,
-so there are no used screenshot files to clean up.
+A lie event is a HUD square of the exact color #c9ced0 (201, 206, 208), so
+it follows the HUD scale factor: measured 60x60 at a 1075px-wide client;
+at/above the 1366px HUD reference width (1920x1080, 1366x768) it is
+60 * 1366/1075 ~= 76x76.  Frames are consumed from the existing
+full-window FrameBus; this worker never captures or writes an image, so
+there are no used screenshot files to clean up.
 """
 
 from __future__ import annotations
@@ -20,45 +21,67 @@ import cv2
 import numpy as np
 
 from countdown_worker import play_mp3
+from minimap_detector import hud_scale_for
 
 
 LOG = logging.getLogger(__name__)
-REFERENCE_WINDOW_SIZE = (1075, 768)
-REFERENCE_WHITE_SQUARE_SIZE = (40, 40)
+# The lie square is a HUD element: color #c9ced0, measured 60x60 at a
+# 1075px-wide client, so the HUD-reference (>=1366px) size is
+# round(60 * 1366/1075) = 76x76.
+LIE_SQUARE_COLOR = (201, 206, 208)  # #c9ced0
+# Small per-channel tolerance (0-255) so rendering/antialiasing shifts of
+# the exact color still match.
+LIE_COLOR_TOLERANCE = 10
+REFERENCE_LIE_SQUARE_SIZE = (76, 76)
 
 
-def scaled_white_square_size(width: int, height: int) -> tuple[int, int]:
-    """Scale the 40x40 reference target to the current client dimensions."""
+def scaled_lie_square_size(width: int, height: int) -> tuple[int, int]:
+    """Scale the 76x76 HUD reference target to the current client.
 
-    reference_width, reference_height = REFERENCE_WINDOW_SIZE
-    square_width, square_height = REFERENCE_WHITE_SQUARE_SIZE
+    The lie square is a HUD element: fixed pixel at/above the 1366px
+    reference width and scaled down with the HUD below it (60x60 at a
+    1075px-wide client).  ``height`` is kept in the signature for call-site
+    compatibility; the HUD scale is driven by the client width.
+    """
+
+    scale = hud_scale_for(width)
+    square_width, square_height = REFERENCE_LIE_SQUARE_SIZE
     return (
-        max(1, int(round(square_width * width / reference_width))),
-        max(1, int(round(square_height * height / reference_height))),
+        max(1, int(round(square_width * scale))),
+        max(1, int(round(square_height * scale))),
     )
 
 
-def detect_pure_white_square(
+def detect_lie_square(
     image: Any,
 ) -> Optional[tuple[int, int, int, int]]:
-    """Return one scaled all-white rectangle as ``x, y, width, height``.
+    """Return one scaled #c9ced0 rectangle as ``x, y, width, height``.
 
-    OpenCV erosion asks whether the full scaled kernel fits inside the exact
-    white-pixel mask. It searches the full client in one native operation and
-    avoids a slow Python sliding-window loop.
+    OpenCV erosion asks whether the full scaled kernel fits inside the
+    #c9ced0 mask (each channel within ``LIE_COLOR_TOLERANCE``). It searches
+    the full client in one native operation and avoids a slow Python
+    sliding-window loop.
     """
 
     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         return None
     height, width = rgb.shape[:2]
-    target_width, target_height = scaled_white_square_size(width, height)
+    target_width, target_height = scaled_lie_square_size(width, height)
     if target_width > width or target_height > height:
         return None
-    white = np.all(rgb[:, :, :3] == 255, axis=2).astype(np.uint8) * 255
+    color = np.asarray(LIE_SQUARE_COLOR, dtype=np.uint8)
+    tolerance = int(LIE_COLOR_TOLERANCE)
+    lower = np.asarray(
+        [max(0, int(channel) - tolerance) for channel in color], dtype=np.uint8
+    )
+    upper = np.asarray(
+        [min(255, int(channel) + tolerance) for channel in color], dtype=np.uint8
+    )
+    mask = cv2.inRange(rgb[:, :, :3], lower, upper)
     kernel = np.ones((target_height, target_width), dtype=np.uint8)
     matches = cv2.erode(
-        white,
+        mask,
         kernel,
         borderType=cv2.BORDER_CONSTANT,
         borderValue=0,
@@ -173,7 +196,7 @@ class LieDetectorWorker(threading.Thread):
                 should_alert = True
         if should_alert:
             LOG.warning(
-                "LIE DETECTOR ALERT: pure-white block detected at "
+                "LIE DETECTOR ALERT: #c9ced0 block detected at "
                 "x=%d y=%d size=%dx%d; triggering reminders",
                 *match,
             )
@@ -197,7 +220,7 @@ class LieDetectorWorker(threading.Thread):
                     continue
                 # Work directly on the shared in-memory full-client image.
                 # No screenshot file is created, retained, or deleted.
-                match = detect_pure_white_square(frame.image)
+                match = detect_lie_square(frame.image)
                 self._update_alert(match)
             except Exception:
                 LOG.exception("lie detector failed on a frame")
@@ -206,6 +229,6 @@ class LieDetectorWorker(threading.Thread):
 
 __all__ = [
     "LieDetectorWorker",
-    "detect_pure_white_square",
-    "scaled_white_square_size",
+    "detect_lie_square",
+    "scaled_lie_square_size",
 ]

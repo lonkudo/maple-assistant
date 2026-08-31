@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from minimap_detector import hud_scale_for
+
 
 class CompactThreadFormatter(logging.Formatter):
     """Display worker thread names without the redundant ``-worker``."""
@@ -38,41 +40,55 @@ OPENCV_ANALYSIS_SIZE = (200, 200)
 # detector now fits the crop inside this box preserving aspect ratio, and the
 # larger box keeps the border resolvable on large clients.
 MINIMAP_ANALYSIS_SIZE = (400, 400)
-# The game HUD is FIXED PIXEL: only the playfield viewport scales with the
-# window resolution, so HUD regions must be absolute pixels, not normalized
-# fractions of the client.  Measured on the real client: the top-left region
-# holds the MAP NAME (a ~64px-high strip) and BELOW it the real minimap
-# (~380px wide).  The search region starts at y=60 (4px of tolerance below
-# the 64px strip) so the map-name strip can never be mistaken for the
-# minimap border while small measurement errors still fit; the minimap
-# itself varies a little between maps.
-MINIMAP_REGION_TOP = 60
+# The game HUD is FIXED PIXEL above a ~1366px client width: only the
+# playfield viewport scales with the window resolution, so HUD regions must
+# be absolute pixels, not normalized fractions of the client.  Measured on
+# the real client: the top-left region holds the MAP NAME (a ~64px-high
+# strip) and BELOW it the real minimap (~380px wide).  The search region
+# starts at y=50 (14px of tolerance below the 64px strip) so the map-name
+# strip can never be mistaken for the minimap border while small measurement
+# errors still fit; the minimap itself varies a little between maps.
+#
+# BELOW 1366px the game scales the whole HUD down (at 1024x768 everything
+# measures ~0.75x: minimap 250x127 -> 187x95, status 370x57 -> 276x33), so
+# every fixed-pixel region is scaled per frame by ``hud_scale_for``.
+MINIMAP_REGION_TOP = 50
 MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
 # HP/MP/EXP bars: measured 370x57 px at the BOTTOM MIDDLE of the window
 # (the info bar is exactly bottom-centered).  Inside the capture the three
 # bars sit SIDE BY SIDE in one vertical band: HP red left, MP blue middle,
 # EXP yellow right.  The box is anchored to the window bottom and centered
-# horizontally, so it follows the window size (the HUD itself is fixed
-# pixel - the bars never change size or position within the region).
+# horizontally, so it follows the window size; the HUD itself is fixed
+# pixel above 1366px and scales down below it (see hud_scale_for).
 STATUS_CAPTURE_WIDTH = 370
 STATUS_CAPTURE_HEIGHT = 57
 STATUS_CAPTURE_CENTER_SHIFT = 0  # exactly bottom-centered
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
 # Status-bar widths are FIXED PIXEL values measured on the real client
 # inside the 370px-wide capture: full HP bar ~85px, MP ~135px, EXP ~127px;
-# minimum meaningful run ~5px.
+# minimum meaningful run ~5px.  The fractions stay relative to the 370px
+# reference capture: the capture box is scaled by ``hud_scale_for`` and the
+# bars scale by the same factor, so the ratios hold at any resolution.
 FULL_BAR_CLIENT_FRACTIONS = {"hp": 85.0, "mp": 135.0, "exp": 127.0}
 MIN_BAR_CLIENT_FRACTION = 5.0
 
 
 def status_capture_pixel_box(client_size: tuple[int, int]) -> Box:
-    """Return the bottom-anchored, horizontally centered status box."""
+    """Return the bottom-anchored, horizontally centered status box.
+
+    The box is the reference 370x57 HUD capture scaled by
+    ``hud_scale_for`` (fixed pixel above 1366px client width; the game
+    shrinks the whole HUD below that, e.g. ~0.75x at 1024x768).
+    """
 
     width, height = client_size
+    scale = hud_scale_for(width)
+    box_width = max(1, round(STATUS_CAPTURE_WIDTH * scale))
+    box_height = max(1, round(STATUS_CAPTURE_HEIGHT * scale))
     center = width // 2 - STATUS_CAPTURE_CENTER_SHIFT
-    left = max(0, center - STATUS_CAPTURE_WIDTH // 2)
-    top = max(0, height - STATUS_CAPTURE_HEIGHT)
-    return (left, top, left + STATUS_CAPTURE_WIDTH, top + STATUS_CAPTURE_HEIGHT)
+    left = max(0, center - box_width // 2)
+    top = max(0, height - box_height)
+    return (left, top, left + box_width, top + box_height)
 
 
 class _AnyEvent:
@@ -269,6 +285,7 @@ def main() -> int:
     from minimap_detector import (
         MinimapDetector,
         choose_stable_minimap_index,
+        hud_scale_for,
         minimap_calibration_from_dict,
         minimap_calibration_to_dict,
     )

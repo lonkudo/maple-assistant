@@ -9,6 +9,7 @@ from assistant import (
     _compact_log_formatter,
     _start_live_input,
     parse_args,
+    status_capture_pixel_box,
 )
 
 
@@ -48,6 +49,29 @@ class StartLiveInputTests(unittest.TestCase):
     def test_status_capture_is_fast_for_potion_priority(self) -> None:
         with patch("sys.argv", ["assistant.py"]):
             self.assertEqual(parse_args().status_interval, 0.25)
+
+    def test_status_box_is_fixed_pixel_at_or_above_reference_width(self) -> None:
+        # 1366px is the HUD reference width; 1920px is above it.  The capture
+        # stays 370x57, bottom-anchored and horizontally centered.
+        self.assertEqual(
+            status_capture_pixel_box((1366, 768)),
+            (1366 // 2 - 185, 768 - 57, 1366 // 2 + 185, 768),
+        )
+        self.assertEqual(
+            status_capture_pixel_box((1920, 1080)),
+            (1920 // 2 - 185, 1080 - 57, 1920 // 2 + 185, 1080),
+        )
+
+    def test_status_box_scales_below_reference_width(self) -> None:
+        # 1024x768: the whole HUD measures ~0.75x (user-measured status
+        # region 276x33).  The capture scales to round(370*.75)=277 wide and
+        # round(57*.75)=43 tall, still bottom-anchored and centered.
+        box = status_capture_pixel_box((1024, 768))
+        self.assertEqual(box[2] - box[0], 277)
+        self.assertEqual(box[3] - box[1], 43)
+        self.assertEqual(box[1], 768 - 43)
+        self.assertEqual(box[3], 768)
+        self.assertAlmostEqual((box[0] + box[2]) / 2.0, 1024 / 2.0, delta=1)
 
     def test_default_config_path_is_user_owned_file(self) -> None:
         with patch("sys.argv", ["assistant.py"]):

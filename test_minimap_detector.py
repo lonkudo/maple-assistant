@@ -12,6 +12,7 @@ from minimap_detector import (
     MinimapDetection,
     MinimapDetector,
     choose_stable_minimap_index,
+    hud_scale_for,
     minimap_calibration_from_dict,
     minimap_calibration_to_dict,
 )
@@ -240,18 +241,35 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertEqual(tracker.stabilize((15, 15)), (15, 15))
 
     def test_blank_frame_uses_absolute_pixel_fallback(self) -> None:
-        """Fallback regions are ABSOLUTE client pixels (fixed-pixel HUD)."""
+        """Fallback regions are ABSOLUTE client pixels at the HUD reference.
 
-        detection = MinimapDetector((0, 50, 200, 150)).detect(
-            Image.new("RGB", (1000, 500), "black")
-        )
+        Above ~1366px client width the HUD is fixed pixel, so the box is
+        returned unchanged; below that the game scales the whole HUD down
+        (at 1024x768 everything measures ~0.75x), so the fallback box
+        scales with it.
+        """
+
+        detector = MinimapDetector((0, 50, 200, 150))
+        detection = detector.detect(Image.new("RGB", (1920, 1080), "black"))
         self.assertEqual(detection.source, "fallback")
         self.assertEqual(detection.analysis_box, (0, 50, 200, 150))
-        # The same absolute box is returned at any client size.
-        detection = MinimapDetector((0, 50, 200, 150)).detect(
-            Image.new("RGB", (1920, 1080), "black")
-        )
+        # 1366px is the HUD reference width: unchanged.
+        detection = detector.detect(Image.new("RGB", (1366, 768), "black"))
         self.assertEqual(detection.analysis_box, (0, 50, 200, 150))
+        # 1024x768 is below the reference: ~0.75x (round(50*.75)=37, etc.).
+        detection = detector.detect(Image.new("RGB", (1024, 768), "black"))
+        self.assertEqual(detection.analysis_box, (0, 37, 150, 112))
+        # Any width below the reference scales proportionally (1000/1366).
+        detection = detector.detect(Image.new("RGB", (1000, 500), "black"))
+        self.assertEqual(detection.analysis_box, (0, 37, 146, 110))
+
+    def test_hud_scale_is_one_at_or_above_reference_width(self) -> None:
+        self.assertEqual(hud_scale_for(1920), 1.0)
+        self.assertEqual(hud_scale_for(1366), 1.0)
+
+    def test_hud_scale_shrinks_below_reference_width(self) -> None:
+        self.assertAlmostEqual(hud_scale_for(1024), 1024.0 / 1366.0)
+        self.assertAlmostEqual(hud_scale_for(800), 800.0 / 1366.0)
 
     def test_opencv_accepts_expanded_wide_minimap(self) -> None:
         image = Image.new("RGB", (1000, 700), "black")
@@ -584,7 +602,7 @@ class MinimapDetectorTests(unittest.TestCase):
         The live client log showed detection=opencv window=(5,22,45,62) - a
         40x40 contour inside the 64px map-name strip - whose analysis box
         excluded the yellow marker, failing every record click.  The search
-        region starts BELOW the map-name strip (y=60, 4px tolerance), so
+        region starts BELOW the map-name strip (y=50, 14px tolerance), so
         such tiny contours are never candidates; when no real border closes,
         the marker-verified fixed region (source=fixed-region) is the
         geometry and the map-name crop reads the strip above the minimap.
@@ -610,7 +628,7 @@ class MinimapDetectorTests(unittest.TestCase):
                     image.putpixel((190 + x, 220 + y), color)
 
         detector = MinimapDetector(
-            fallback_region=(0, 60, 400, 320),
+            fallback_region=(0, 50, 400, 320),
             dedicated_crop=True, opencv_size=(400, 400),
         )
         detection = detector.detect(image)
@@ -618,13 +636,13 @@ class MinimapDetectorTests(unittest.TestCase):
         # The 40x40 box is rejected; geometry is the fixed region below the
         # map-name strip and the marker is inside the analysis box.
         self.assertEqual(detection.source, "fallback")
-        self.assertGreaterEqual(detection.window_box[1], 60)
+        self.assertGreaterEqual(detection.window_box[1], 50)
         marker = detect_yellow_diamond(np.asarray(
             image.crop(detection.analysis_box).convert("RGB")
         ))
         self.assertIsNotNone(marker)
         # The map-name crop is the strip ABOVE the minimap, not inside it.
-        self.assertLessEqual(detection.map_name_box[3], 60)
+        self.assertLessEqual(detection.map_name_box[3], 50)
 
     def test_map_name_reader_is_replaceable_adapter(self) -> None:
         detection = MinimapDetector(

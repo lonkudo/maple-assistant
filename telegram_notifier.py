@@ -6,13 +6,125 @@ from datetime import datetime
 import json
 import logging
 import queue
+import socket
 import threading
 from typing import Any, Callable, Optional
-from urllib import parse, request
+from urllib import error as url_error, parse, request
 
 
 LOG = logging.getLogger(__name__)
 ApiRequest = Callable[[str, dict[str, str]], dict[str, Any]]
+
+# Local HTTP proxy ports used by common proxy tools (Clash 7890, Clash
+# Verge 7891, Clash Verge Rev / mihomo 7897, V2Ray 10808/10809, Shadowsocks
+# 1080, ...).  The Windows system proxy (registry) can point at a STALE port
+# after the proxy app restarts or switches profiles, which makes urllib fail
+# with cryptic errors (e.g. "urlopen error [Errno 2]").  When the configured
+# proxy stops working the notifier probes these ports and caches the first
+# one that actually forwards to Telegram.
+LOCAL_PROXY_PORTS = (7890, 7891, 7897, 7899, 1080, 10808, 10809, 8888, 8889)
+
+_proxy_state: dict[str, Any] = {"url": None, "verified": False}
+_proxy_lock = threading.Lock()
+
+
+def _system_proxy_urls() -> list[str]:
+    """System proxy URLs (Windows registry / env), https then http."""
+
+    proxies = request.getproxies()
+    urls: list[str] = []
+    for key in ("https", "http"):
+        value = str(proxies.get(key) or "").strip()
+        if value and value not in urls:
+            urls.append(value)
+    return urls
+
+
+def _listening_proxy_ports(timeout: float = 0.25) -> set[int]:
+    """Return LOCAL_PROXY_PORTS accepting a TCP connect on 127.0.0.1."""
+
+    listening: set[int] = set()
+    for port in LOCAL_PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                listening.add(port)
+        except OSError:
+            continue
+    return listening
+
+
+def _proxy_forwarded(proxy: Optional[str], timeout: float = 3.0) -> bool:
+    """True when a getMe probe through ``proxy`` reaches Telegram.
+
+    Any HTTP response (401/404 included) means the proxy forwarded; only
+    connection/transport failures count as unusable.  ``None`` probes a
+    DIRECT connection (bypassing the system proxy).
+    """
+
+    url = f"https://api.telegram.org/bot{'0' * 9}:PROBE/getMe"
+    probe = request.Request(url, data=b"", method="POST")
+    try:
+        with _open(probe, proxy, timeout=timeout):
+            return True
+    except url_error.HTTPError:
+        return True
+    except (OSError, url_error.URLError):
+        return False
+
+
+def _open(req: request.Request, proxy: Optional[str], timeout: float):
+    """Open ``req`` through ``proxy``, or direct when ``proxy`` is None."""
+
+    if proxy:
+        handler = request.ProxyHandler({"http": proxy, "https": proxy})
+    else:
+        handler = request.ProxyHandler({})  # empty = bypass system proxy
+    return request.build_opener(handler).open(req, timeout=timeout)
+
+
+def _detect_working_proxy() -> Optional[str]:
+    """Return the first proxy URL that forwards to Telegram, or None=direct."""
+
+    system = _system_proxy_urls()
+    # Fast path: the configured system proxy is usually correct.
+    for proxy in system:
+        if _proxy_forwarded(proxy):
+            LOG.info("telegram proxy: using system proxy %s", proxy)
+            return proxy
+    # Fallback: scan the common local proxy ports.
+    listening = _listening_proxy_ports()
+    for port in LOCAL_PROXY_PORTS:
+        if port in listening:
+            url = f"http://127.0.0.1:{port}"
+            if url not in system and _proxy_forwarded(url):
+                LOG.info(
+                    "telegram proxy: system proxy stale; using %s", url
+                )
+                return url
+    # Last resort: a direct connection may work without any proxy.
+    if _proxy_forwarded(None):
+        LOG.info("telegram proxy: no proxy needed (direct)")
+        return None
+    LOG.warning("telegram proxy: no working proxy found")
+    return system[0] if system else None
+
+
+def _cached_proxy() -> Optional[str]:
+    """Detect once and cache the working proxy until invalidated."""
+
+    global _proxy_state
+    with _proxy_lock:
+        if not _proxy_state["verified"]:
+            _proxy_state = {"url": _detect_working_proxy(), "verified": True}
+        return _proxy_state["url"]
+
+
+def _invalidate_proxy_cache() -> None:
+    """Force the next call to re-detect the proxy."""
+
+    global _proxy_state
+    with _proxy_lock:
+        _proxy_state["verified"] = False
 
 
 def format_alert_message(
@@ -28,13 +140,36 @@ def format_alert_message(
 def _telegram_api_request(
     token: str, method: str, params: dict[str, str]
 ) -> dict[str, Any]:
-    """Call one Telegram Bot API method with a bounded network timeout."""
+    """Call one Telegram Bot API method with a bounded network timeout.
+
+    Uses the cached working proxy (auto-detected).  A network-layer failure
+    invalidates the cache and retries ONCE with a fresh proxy so a proxy app
+    that just restarted on a different port does not lose the alert.
+    """
 
     url = f"https://api.telegram.org/bot{token}/{method}"
     payload = parse.urlencode(params).encode("utf-8")
     http_request = request.Request(url, data=payload, method="POST")
-    with request.urlopen(http_request, timeout=8.0) as response:
-        result = json.loads(response.read().decode("utf-8"))
+
+    def attempt() -> dict[str, Any]:
+        proxy = _cached_proxy()
+        try:
+            with _open(http_request, proxy, timeout=8.0) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except url_error.HTTPError:
+            raise  # proxy worked; Telegram itself rejected the request
+        except (OSError, url_error.URLError) as exc:
+            _invalidate_proxy_cache()
+            message = (
+                "网络代理不可用（Errno 2），已尝试重新检测代理端口。"
+                if isinstance(exc, FileNotFoundError) else str(exc)
+            )
+            raise _NetworkFailure(message) from exc
+
+    try:
+        result = attempt()
+    except _NetworkFailure:
+        result = attempt()  # one retry with a freshly detected proxy
     if not isinstance(result, dict) or not result.get("ok"):
         description = (
             result.get("description", "Telegram API returned an error")
@@ -42,6 +177,10 @@ def _telegram_api_request(
         )
         raise OSError(str(description))
     return result
+
+
+class _NetworkFailure(OSError):
+    """Transport-level failure; safe to retry with a fresh proxy."""
 
 
 class TelegramNotifier(threading.Thread):

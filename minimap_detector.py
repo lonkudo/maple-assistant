@@ -20,6 +20,20 @@ from PIL import Image
 Box = tuple[int, int, int, int]
 NormalizedBox = tuple[float, float, float, float]
 
+# The game HUD is FIXED PIXEL above a ~1366px client width: measured on the
+# real client the minimap and the status bars keep the same absolute size at
+# 1920x1080 and 1366x768.  BELOW that width the game scales the whole HUD
+# down (at 1024x768 everything measures ~0.75x: minimap 250x127 -> 187x95,
+# status 370x57 -> 276x33).  All fixed-pixel HUD regions must be scaled by
+# this factor before use.
+HUD_REFERENCE_WIDTH = 1366
+
+
+def hud_scale_for(client_width: int) -> float:
+    """Return the HUD scale factor for a client of ``client_width`` px."""
+
+    return min(1.0, float(client_width) / HUD_REFERENCE_WIDTH)
+
 
 def _clamp_box(box: Box, width: int, height: int) -> Box:
     left, top, right, bottom = box
@@ -191,8 +205,8 @@ class MinimapDetector:
         self,
         # default measured on the real client: the map-name strip occupies
         # the top ~64px and the minimap starts below it; the search region
-        # starts at y=60 for 4px of tolerance.
-        fallback_region: NormalizedBox = (0, 60, 400, 320),
+        # starts at y=50 for 14px of tolerance.
+        fallback_region: NormalizedBox = (0, 50, 400, 320),
         map_name_reader: Optional[MapNameReader] = None,
         dedicated_crop: bool = False,
         opencv_size: Optional[tuple[int, int]] = None,
@@ -200,10 +214,12 @@ class MinimapDetector:
         box_history: int = 5,
         box_jump_ratio: float = 0.25,
     ) -> None:
-        # The game HUD is fixed pixel: the minimap occupies the same absolute
-        # pixels at any window resolution.  ``fallback_region`` is therefore
-        # expressed in ABSOLUTE client pixels (calibrated at the 2560x1600
-        # reference), not as a fraction of the current client.
+        # The game HUD is fixed pixel above ~1366px client width: the minimap
+        # occupies the same absolute pixels at any window resolution in that
+        # range.  ``fallback_region`` is therefore expressed in ABSOLUTE
+        # client pixels at the HUD reference size; below 1366px the game
+        # scales the whole HUD down, so every use of the region scales it by
+        # ``hud_scale_for`` of the CURRENT frame's client width.
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
         self.dedicated_crop = bool(dedicated_crop)
@@ -241,6 +257,13 @@ class MinimapDetector:
         self._last_good_image_size: Optional[tuple[int, int]] = None
         self._last_good_at = float("-inf")
         self._state_lock = threading.Lock()
+
+    def _scaled_fallback_region(self, client_width: int) -> tuple[float, float, float, float]:
+        """Scale the reference fallback region to the current client width."""
+
+        scale = hud_scale_for(client_width)
+        left, top, right, bottom = self.fallback_region
+        return (left * scale, top * scale, right * scale, bottom * scale)
 
     def reset_geometry(self) -> None:
         """Forget the previous map's minimap frame before a patrol starts.
@@ -330,7 +353,7 @@ class MinimapDetector:
         if not self.dedicated_crop or self.opencv_size is None:
             return image, None
         width, height = image.size
-        left, top, right, bottom = self.fallback_region
+        left, top, right, bottom = self._scaled_fallback_region(width)
         crop_box = _clamp_box(
             (round(left), round(top), round(right), round(bottom)),
             width,
@@ -639,7 +662,7 @@ class MinimapDetector:
         )
         # The MAP NAME is a fixed strip ABOVE the minimap (measured ~64px
         # tall): its crop must read that strip from the ORIGINAL image, not
-        # the search crop (which starts below it at y=60).  The name crop is
+        # the search crop (which starts below it at y=50).  The name crop is
         # the band between the image top and the detected border's top,
         # widened to the border's horizontal span.
         map_name_box = _clamp_box(
@@ -680,7 +703,7 @@ class MinimapDetector:
 
     def _fallback_detection(self, image: Image.Image) -> MinimapDetection:
         width, height = image.size
-        left, top, right, bottom = self.fallback_region
+        left, top, right, bottom = self._scaled_fallback_region(width)
         analysis_box = _clamp_box(
             (round(left), round(top), round(right), round(bottom)),
             width,

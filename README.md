@@ -10,10 +10,13 @@ recorded multi-layer patrol route, climbs ropes, recovers from falls, collects
 items. Fixed-interval attack remains available; YOLO-driven monster attack is
 temporarily disabled until its model has been trained more reliably.
 
-The runtime uses a FIXED-PIXEL HUD model: the game's minimap, map-name
-strip, and HP/MP/EXP bars never change size or position with window
-resolution - only the playfield viewport scales.  All HUD regions are
-therefore absolute client pixels, never normalized fractions.  The yellow
+The runtime uses a FIXED-PIXEL HUD model above ~1366px client width: the
+game's minimap, map-name strip, and HP/MP/EXP bars keep the same absolute
+pixel size at any window resolution in that range (1920x1080 and 1366x768
+measure identically) - only the playfield viewport scales.  BELOW 1366px the
+game shrinks the whole HUD (at 1024x768 everything measures ~0.75x).  All
+HUD regions are therefore absolute client pixels at the HUD reference size,
+scaled per frame by `hud_scale_for` in `minimap_detector.py`.  The yellow
 player diamond is detected dynamically; a measured fallback region is used
 as verified map geometry when OpenCV cannot close a border contour.
 
@@ -92,12 +95,15 @@ remains idle before Start Patrol.
 - The optional **掉线警报** consumes `CharacterWorker`'s existing yellow-marker
   result and raises an alert after three consecutive missing frames.
 - The optional **测谎警报** samples the shared full-client capture every one
-  seconds and alarms when it finds a resolution-scaled pure-white square.
+  second and alarms when it finds a HUD-scaled `#c9ced0` square.
 - The independent **声音提醒**, **闪烁提醒**, and **消息提醒** choices deliver
   every countdown, disconnect, and lie-detector event through beep audio, two
   red full-screen flashes, and Telegram respectively.
 - The optional **消息提醒** queues those same events to a separate Telegram
-  worker with a machine marker, event type, and local timestamp.
+  worker with a machine marker, event type, and local timestamp. The worker
+  auto-detects the local HTTP proxy (system proxy first, then common ports:
+  Clash 7890, Clash Verge 7891, mihomo 7897, V2Ray 10808/10809, ...), caches
+  the working one, and retries once with a fresh proxy on transport failure.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
@@ -253,14 +259,15 @@ latest commit message. Push before handing off; keep user-owned JSON files
 `ui_window_settings.json`) UNCOMMITTED - they are runtime-modified on the live
 machine.
 
-### HUD geometry (measured on the real client, 1366x768)
+### HUD geometry (measured on the real client, 1366x768 reference)
 
-All HUD regions are ABSOLUTE client pixels (the HUD never scales with window
-resolution). Key constants live in `assistant.py`:
+HUD regions are ABSOLUTE client pixels at the HUD reference size (client
+width >= 1366px); below that `hud_scale_for(client_width)` scales every
+region (0.75x at 1024x768). Key constants live in `assistant.py`:
 
-- Minimap: `MINIMAP_REGION_TOP = 60`, `MINIMAP_FALLBACK_REGION = (0, 60, 400, 320)`.
+- Minimap: `MINIMAP_REGION_TOP = 50`, `MINIMAP_FALLBACK_REGION = (0, 50, 400, 320)`.
   The map-name strip is ~64px tall ABOVE the minimap; the search region starts
-  at y=60 (4px tolerance). Candidates below 25% of the region's min side are
+  at y=50 (14px tolerance). Candidates below 25% of the region's min side are
   rejected so a ~40px UI box inside the map-name strip can never become the
   minimap border (`window=(5,22,45,62)` was the live failure).
 - `MINIMAP_ANALYSIS_SIZE = (400, 400)`, aspect-preserving fit, never upscale.
@@ -403,10 +410,11 @@ detection. Three consecutive missing frames confirm the loss and raise one
 event; the alarm re-arms after the marker is detected again.
 
 Selecting **测谎警报** checks one in-memory full-game frame every second.
-Its reference signature is a `40×40` block of entirely pure-white pixels in a
-`1075×768` client. Both target dimensions scale independently with the current
-client resolution. A visible match raises one event; after the square
-disappears, a later match can alert again. The detector never saves
+Its signature is a block of the exact color `#c9ced0` (201, 206, 208) with a
+±10 per-channel tolerance: 60x60 at a 1075px-wide client, scaled by the HUD
+factor to 76x76 at 1366px and above (60 * 1366/1075; see
+`lie_detector_worker.py`). A visible match raises one event; after the
+square disappears, a later match can alert again. The detector never saves
 screenshots, so no used image files remain to delete.
 
 The reminder row controls event delivery independently: **声音提醒** plays

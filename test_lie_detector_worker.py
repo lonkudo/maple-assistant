@@ -9,38 +9,59 @@ from PIL import Image
 
 from lie_detector_worker import (
     LieDetectorWorker,
-    detect_pure_white_square,
-    scaled_white_square_size,
+    detect_lie_square,
+    scaled_lie_square_size,
 )
 
 
+LIE_COLOR = (201, 206, 208)  # #c9ced0
+
+
 class LieDetectorImageTests(unittest.TestCase):
-    def test_reference_resolution_detects_exact_40_pixel_white_square(self):
-        image = Image.new("RGB", (1075, 768), "black")
-        for y in range(200, 240):
-            for x in range(300, 340):
-                image.putpixel((x, y), (255, 255, 255))
-        match = detect_pure_white_square(image)
+    def test_reference_width_detects_exact_76_pixel_lie_square(self):
+        # At/above the 1366px HUD reference width the lie square is
+        # 60 * 1366/1075 ~= 76x76.
+        image = Image.new("RGB", (1366, 768), "black")
+        for y in range(200, 276):
+            for x in range(300, 376):
+                image.putpixel((x, y), LIE_COLOR)
+        match = detect_lie_square(image)
         self.assertIsNotNone(match)
-        self.assertEqual(match[2:], (40, 40))
+        self.assertEqual(match[2:], (76, 76))
 
-    def test_target_scales_independently_with_window_resolution(self):
-        self.assertEqual(scaled_white_square_size(1075, 768), (40, 40))
-        self.assertEqual(scaled_white_square_size(2150, 1536), (80, 80))
-        self.assertEqual(scaled_white_square_size(537, 384), (20, 20))
-        image = Image.new("RGB", (537, 384), "black")
-        for y in range(50, 70):
-            for x in range(80, 100):
-                image.putpixel((x, y), (255, 255, 255))
-        self.assertIsNotNone(detect_pure_white_square(image))
-
-    def test_nonwhite_pixel_breaks_an_exact_size_match(self):
+    def test_target_scales_with_hud_reference_width(self):
+        # Fixed pixel at/above 1366px; 60x60 at the measured 1075px client.
+        self.assertEqual(scaled_lie_square_size(1920, 1080), (76, 76))
+        self.assertEqual(scaled_lie_square_size(1366, 768), (76, 76))
+        self.assertEqual(scaled_lie_square_size(1075, 768), (60, 60))
+        self.assertEqual(scaled_lie_square_size(1024, 768), (57, 57))
         image = Image.new("RGB", (1075, 768), "black")
-        for y in range(200, 240):
-            for x in range(300, 340):
-                image.putpixel((x, y), (255, 255, 255))
-        image.putpixel((320, 220), (254, 255, 255))
-        self.assertIsNone(detect_pure_white_square(image))
+        for y in range(50, 110):
+            for x in range(80, 140):
+                image.putpixel((x, y), LIE_COLOR)
+        match = detect_lie_square(image)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[2:], (60, 60))
+
+    def test_color_shifted_within_tolerance_still_matches(self):
+        # +5 per channel on every pixel (within LIE_COLOR_TOLERANCE=10).
+        shifted = tuple(channel + 5 for channel in LIE_COLOR)
+        image = Image.new("RGB", (1075, 768), "black")
+        for y in range(200, 260):
+            for x in range(300, 360):
+                image.putpixel((x, y), shifted)
+        match = detect_lie_square(image)
+        self.assertIsNotNone(match)
+        self.assertEqual(match[2:], (60, 60))
+
+    def test_color_outside_tolerance_breaks_match(self):
+        image = Image.new("RGB", (1075, 768), "black")
+        for y in range(200, 260):
+            for x in range(300, 360):
+                image.putpixel((x, y), LIE_COLOR)
+        # 51 below the red channel: far outside the +-10 tolerance.
+        image.putpixel((320, 220), (150, 206, 208))
+        self.assertIsNone(detect_lie_square(image))
 
 
 class LieDetectorWorkerTests(unittest.TestCase):
@@ -122,9 +143,9 @@ class LieDetectorWorkerTests(unittest.TestCase):
         stop = threading.Event()
         alerted = threading.Event()
         image = Image.new("RGB", (1075, 768), "black")
-        for y in range(100, 140):
-            for x in range(100, 140):
-                image.putpixel((x, y), (255, 255, 255))
+        for y in range(100, 160):
+            for x in range(100, 160):
+                image.putpixel((x, y), LIE_COLOR)
         worker = LieDetectorWorker(
             frames, stop, enabled=True, scan_interval=.05,
             sound_path=Path("sound/beep.mp3"),

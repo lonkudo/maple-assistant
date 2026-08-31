@@ -17,6 +17,8 @@ from typing import Callable, Iterable, Optional, Tuple
 
 from PIL import Image, ImageDraw
 
+from minimap_detector import hud_scale_for
+
 
 WindowRect = Tuple[int, int, int, int]
 Box = Tuple[int, int, int, int]
@@ -251,7 +253,9 @@ class CaptureWorker(threading.Thread):
         fast_interval: float = 0.10,
         # === ADDED DEBUG FLAG ===
         debug_draw_regions: bool = False,
-        debug_minimap_fallback: Optional[NormalizedBox] = None,
+        # Reference-size ABSOLUTE client pixels of the minimap search ROI
+        # (scaled per frame by ``hud_scale_for``; NOT normalized).
+        debug_minimap_fallback: Optional[Box] = None,
     ) -> None:
         if interval <= 0:
             raise ValueError("interval must be greater than zero")
@@ -422,11 +426,14 @@ class CaptureWorker(threading.Thread):
                             )
                         if pixel_box is not None:
                             draw.rectangle(pixel_box, outline=(0, 120, 255), width=2)
-                    # Green: static fallback search ROI
+                    # Green: minimap fallback search ROI (reference-size
+                    # absolute client pixels, scaled by the HUD scale factor)
                     if self.debug_minimap_fallback is not None:
                         x1, y1, x2, y2 = self.debug_minimap_fallback
+                        hud_scale = hud_scale_for(w)
                         draw.rectangle(
-                            (int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)),
+                            (int(x1 * hud_scale), int(y1 * hud_scale),
+                             int(x2 * hud_scale), int(y2 * hud_scale)),
                             outline=(0, 255, 0),
                             width=2
                         )
