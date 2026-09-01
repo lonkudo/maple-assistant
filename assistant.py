@@ -267,7 +267,7 @@ def main() -> int:
     import numpy as np
     from capture_worker import CaptureWorker, FrameBus
     from character_worker import CharacterWorker
-    from movement_worker import MovementWorker, detect_layer_by_y
+    from movement_worker import MovementWorker, _layer_y_band, detect_layer_by_y
     from status_worker import (
         BarStatusDetector,
         StatusConfig,
@@ -585,6 +585,36 @@ def main() -> int:
                 "MAP SESSION no patrol route recorded; standing still + attack"
             )
             return
+        layer_bands = []
+        for layer_name in snapshot.route_order:
+            layer = snapshot.layers.get(layer_name, {})
+            if not isinstance(layer, dict):
+                continue
+            band = _layer_y_band(
+                layer, float(layer.get("y_tolerance", 0.020000))
+            )
+            if band is not None:
+                layer_bands.append((layer_name, band))
+                logging.info(
+                    "LAYER BAND: %s y=(%.6f, %.6f)",
+                    layer_name, band[0], band[1],
+                )
+        screen_blinker.show_layer_bands(
+            fresh_frame.window_rect,
+            fresh_frame.image.size,
+            detection.analysis_box,
+            layer_bands,
+            wait_until_hidden=True,
+        )
+        # The overlay is deliberately gone before input is armed. Publish one
+        # clean post-overlay frame for screen-capture-based machines so the
+        # movement worker cannot consume a colour-tinted minimap.
+        try:
+            capture_worker.capture_now(timeout=2.0)
+        except TimeoutError:
+            logging.warning(
+                "LAYER BAND OVERLAY: clean post-overlay capture timed out"
+            )
         detected_name = (
             detect_layer_by_y(marker.y, snapshot.layers)
             if marker is not None else None

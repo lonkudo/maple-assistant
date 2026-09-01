@@ -50,6 +50,50 @@ class ScreenBlinkerTests(unittest.TestCase):
             [("minimap", (100, 200, 300, 300), 0x0000FF00)],
         )
 
+    def test_layer_band_overlay_maps_normalized_y_into_minimap(self):
+        blinker = ScreenBlinker(threading.Event())
+        rendered = threading.Event()
+        received = []
+
+        def render(bands):
+            received.extend(bands)
+            rendered.set()
+
+        blinker._show_layer_band_regions = render
+        blinker.show_layer_bands(
+            (100, 200, 1100, 700),
+            (500, 250),
+            (10, 20, 110, 120),
+            (
+                ("layer2", (.30, .50)),
+                ("layer3", (.20, .32)),
+            ),
+        )
+
+        self.assertTrue(rendered.wait(.5))
+        self.assertEqual(received[0][0], "layer2")
+        self.assertEqual(received[0][1], (120, 300, 320, 340))
+        self.assertEqual(received[1][0], "layer3")
+        self.assertEqual(received[1][1], (120, 280, 320, 304))
+        # Each layer gets a real vertical gradient, not one flat colour.
+        self.assertNotEqual(received[0][2], received[0][3])
+
+    def test_layer_band_overlay_can_wait_until_hidden(self):
+        blinker = ScreenBlinker(threading.Event())
+        rendered = []
+        blinker._show_layer_band_regions = rendered.append
+
+        blinker.show_layer_bands(
+            (0, 0, 500, 250),
+            (500, 250),
+            (10, 20, 110, 120),
+            (("layer1", (.4, .6)),),
+            wait_until_hidden=True,
+        )
+
+        self.assertEqual(len(rendered), 1)
+        self.assertEqual(rendered[0][0][0], "layer1")
+
 
 if __name__ == "__main__":
     unittest.main()

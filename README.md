@@ -70,6 +70,11 @@ The application starts with live input disarmed. Input is enabled only after
 Start Patrol first selects and verifies the game in the foreground, then loads
 the normalized minimap border saved by recording and scales it to the current
 client resolution. It does not require the border contour to repeat at startup.
+Before input is armed, every recorded marker-Y band is drawn directly over the
+live minimap as a distinct translucent vertical colour-gradient rectangle.
+Overlapping areas visibly mix/darken, and the log prints each layer's exact Y
+bounds. The overlay closes before a clean frame is published and patrol keys
+are enabled, so it cannot alter runtime marker detection.
 The focused startup capture must detect the yellow marker inside a recorded
 layer before input is armed. That detected floor is handed directly to the
 movement worker: an in-range floor starts from its first recorded patrol action
@@ -243,6 +248,11 @@ startup does not depend on a recent recording frame or stable contour voting.
   drop arrival uses the scroll-compensated world Y to distinguish the route's
   first floor. This prevents a layer3 drop from resetting immediately to
   layer2 before any drop input is sent.
+- Final-layer descent cannot complete until at least one Alt+Down chord has
+  actually been sent. If a lower layer's stair/bench band overlaps the final
+  layer, the marker's nearest recorded base wins; world Y is used only for a
+  genuinely tied/aliased marker coordinate. This prevents a stale lower-floor
+  world anchor from resetting the route while the character remains upstairs.
 - Missing or stale cross-process state files mean “not busy,” preventing a dead
   process from permanently blocking patrol or attack.
 

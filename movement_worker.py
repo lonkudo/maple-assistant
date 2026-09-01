@@ -4047,15 +4047,11 @@ class MovementWorker(threading.Thread):
     def _on_first_layer(self, observation: MinimapObservation) -> bool:
         """True when the marker has reached the first (bottom) layer.
 
-        The first layer is the bottom of the route, so arrival means the
-        marker's Y is AT or BELOW the recorded band (dropping further is
-        impossible - the character is standing on it).  Both signals are
-        OR-ed: the marker-Y check (reliable - the character is visibly on
-        the platform) and the world-Y check (can drift when the structure
-        tracker lags).  A strict symmetric tolerance or a single world-Y
-        path failed when the drop landed a few pixels below the recorded
-        ``layer_y`` / the world-Y estimate was stale, leaving the bot
-        pressing Alt+Down forever.
+        A clear nearest marker base wins. Genuinely tied/aliased marker bands
+        use scroll-compensated world Y. A marker slightly below every band is
+        accepted as the bottom floor because dropping farther is impossible.
+        This keeps stale world tracking from overriding a visible upper floor
+        while preserving the older below-band landing tolerance.
         """
 
         if observation.player is None or self.first_layer is None:
@@ -4076,25 +4072,50 @@ class MovementWorker(threading.Thread):
         # preferred when it identifies the first floor alone (which also
         # handles a stale world tracker), but an overlapping upper-floor band
         # must be disambiguated by scroll-compensated world Y.
-        marker_matches_upper_floor = any(
-            name != self.first_layer
-            and isinstance(other_layer, dict)
-            and self._layer_band_contains(name, observation.player.y)
-            for name, other_layer in self.important_positions.items()
+        marker_candidates = _layer_y_candidates(
+            observation.player.y, self.important_positions
         )
-        if marker_arrived and not marker_matches_upper_floor:
+        if marker_candidates:
+            distances = []
+            for name in marker_candidates:
+                candidate = self.important_positions.get(name, {})
+                reference = float(candidate.get("layer_y", observation.player.y))
+                distances.append((abs(observation.player.y - reference), name))
+            nearest_distance = min(distance for distance, _name in distances)
+            nearest = [
+                name for distance, name in distances
+                if abs(distance - nearest_distance) <= 1e-6
+            ]
+            if len(nearest) == 1:
+                # The field failure had layer2's bench band overlapping the
+                # exact layer3 base. The closest recorded base is layer3, so
+                # stale world Y must not end the drop before Alt+Down is sent.
+                return nearest[0] == self.first_layer
+        elif marker_arrived:
+            # The bottom floor may render a few pixels below its recorded
+            # band. With no recorded upper-floor candidate there, accept it.
             return True
-        # Fall back to the world-Y signal when marker Y is ambiguous and the
-        # structure tracker is available and confident.
+        # Fall back to the world-Y signal only when marker bases are genuinely
+        # tied/aliased and the structure tracker is available and confident.
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):
-            world_tol = float(layer.get("world_y_tolerance", 0.75))
-            world_band = _layer_world_y_band(layer, world_tol)
-            if world_band is None:
-                return False
-            return observation.world_y_diamonds >= world_band[0] - 1e-9
+            world_layers = {
+                name: candidate
+                for name, candidate in self.important_positions.items()
+                if isinstance(candidate, dict) and "layer_world_y" in candidate
+            }
+            return detect_layer_by_world_y(
+                observation.world_y_diamonds, world_layers
+            ) == self.first_layer
         return False
+
+    def _final_drop_arrived(self, observation: MinimapObservation) -> bool:
+        """Require at least one real drop chord before accepting arrival."""
+
+        if self._last_drop_attempt == float("-inf"):
+            return False
+        return self._on_first_layer(observation)
 
     def _reset_route_loop(self) -> None:
         self._route_layer_index = self._route_layers.index(self.first_layer)
@@ -4582,7 +4603,7 @@ class MovementWorker(threading.Thread):
                         LOG.info("final layer patrol done; descending to %s",
                                  self.first_layer)
                         self._descending_to_first = True
-                    if self._on_first_layer(observation):
+                    if self._final_drop_arrived(observation):
                         self._reset_route_loop()
                         self._reanchor_tracker_to_current_layer(observation)
                         route_target_x, route_is_rope, route_label = self._route_target(observation)
@@ -4963,20 +4984,26 @@ class MovementWorker(threading.Thread):
                     if decision.key == "drop":
                         if now - self._last_drop_attempt < self.drop_retry_seconds:
                             continue
-                        self._last_drop_attempt = now
                         if self.climbing_active_event is not None:
                             self.climbing_active_event.set()
                         if self.dropping_active_event is not None:
                             self.dropping_active_event.set()
                         if self.climb_attack_lock is None:
-                            _drop_through_platform(
+                            drop_sent = _drop_through_platform(
                                 self.key_sender, self.drop_chord_hold_seconds
                             )
                         else:
                             with self.climb_attack_lock:
-                                _drop_through_platform(
+                                drop_sent = _drop_through_platform(
                                     self.key_sender, self.drop_chord_hold_seconds
                                 )
+                        if not drop_sent:
+                            if self.climbing_active_event is not None:
+                                self.climbing_active_event.clear()
+                            if self.dropping_active_event is not None:
+                                self.dropping_active_event.clear()
+                            continue
+                        self._last_drop_attempt = now
                     elif decision.key in (
                         "climb", "jump_climb_left", "jump_climb_right",
                         "jump_climb_up",

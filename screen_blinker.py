@@ -11,6 +11,26 @@ from typing import Iterable, Sequence
 
 LOG = logging.getLogger(__name__)
 
+_LAYER_COLORS_RGB = (
+    (255, 70, 70),
+    (255, 180, 45),
+    (70, 220, 110),
+    (55, 190, 255),
+    (185, 90, 255),
+    (255, 85, 190),
+)
+
+
+def _colorref(rgb: tuple[int, int, int]) -> int:
+    """Convert RGB to Win32 COLORREF (0x00bbggrr)."""
+
+    red, green, blue = rgb
+    return int(red) | (int(green) << 8) | (int(blue) << 16)
+
+
+def _shade(rgb: tuple[int, int, int], amount: int) -> tuple[int, int, int]:
+    return tuple(max(0, min(255, channel + amount)) for channel in rgb)
+
 
 class ScreenBlinker(threading.Thread):
     """Show a short red full-screen overlay twice for each queued alert.
@@ -98,6 +118,181 @@ class ScreenBlinker(threading.Thread):
             name="detection-region-overlay",
             daemon=True,
         ).start()
+
+    def show_layer_bands(
+        self,
+        window_rect: tuple[int, int, int, int],
+        image_size: tuple[int, int],
+        analysis_box: tuple[int, int, int, int],
+        bands: Iterable[tuple[str, tuple[float, float]]],
+        *,
+        wait_until_hidden: bool = False,
+    ) -> None:
+        """Overlay every normalized marker-Y band on the live minimap.
+
+        Each layer receives a distinct translucent vertical colour gradient.
+        Overlap becomes visibly darker/mixed while the no-activate native
+        windows leave keyboard focus on the game.
+        """
+
+        image_width, image_height = image_size
+        client_left, client_top, client_right, client_bottom = window_rect
+        client_width = client_right - client_left
+        client_height = client_bottom - client_top
+        analysis_left, analysis_top, analysis_right, analysis_bottom = analysis_box
+        analysis_width = analysis_right - analysis_left
+        analysis_height = analysis_bottom - analysis_top
+        if (image_width <= 0 or image_height <= 0
+                or client_width <= 0 or client_height <= 0
+                or analysis_width <= 0 or analysis_height <= 0):
+            return
+        screen_bands = []
+        for index, (name, (upper_y, lower_y)) in enumerate(bands):
+            upper = max(0.0, min(1.0, float(upper_y)))
+            lower = max(upper, min(1.0, float(lower_y)))
+            pixel_box = (
+                analysis_left,
+                analysis_top + round(upper * analysis_height),
+                analysis_right,
+                analysis_top + round(lower * analysis_height),
+            )
+            x1 = client_left + round(pixel_box[0] * client_width / image_width)
+            y1 = client_top + round(pixel_box[1] * client_height / image_height)
+            x2 = client_left + round(pixel_box[2] * client_width / image_width)
+            y2 = client_top + round(pixel_box[3] * client_height / image_height)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            base = _LAYER_COLORS_RGB[index % len(_LAYER_COLORS_RGB)]
+            screen_bands.append((
+                name,
+                (x1, y1, x2, y2),
+                _colorref(_shade(base, 35)),
+                _colorref(_shade(base, -35)),
+            ))
+        if not screen_bands:
+            return
+        if wait_until_hidden:
+            self._show_layer_band_regions(tuple(screen_bands))
+        else:
+            threading.Thread(
+                target=self._show_layer_band_regions,
+                args=(tuple(screen_bands),),
+                name="layer-band-overlay",
+                daemon=True,
+            ).start()
+
+    def _show_layer_band_regions(
+        self,
+        bands: Sequence[
+            tuple[str, tuple[int, int, int, int], int, int]
+        ],
+    ) -> None:
+        """Render translucent gradient strips for about two seconds."""
+
+        if not hasattr(ctypes, "windll"):
+            LOG.warning("layer-band overlay requires Windows")
+            return
+        windows: list[tuple[int, int]] = []
+        user32 = None
+        gdi32 = None
+        try:
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            kernel32 = ctypes.windll.kernel32
+            user32.CreateWindowExW.argtypes = (
+                wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                wintypes.HINSTANCE, wintypes.LPVOID,
+            )
+            user32.CreateWindowExW.restype = wintypes.HWND
+            user32.SetLayeredWindowAttributes.argtypes = (
+                wintypes.HWND, wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD,
+            )
+            user32.SetWindowPos.argtypes = (
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT,
+            )
+            user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+            user32.DestroyWindow.argtypes = (wintypes.HWND,)
+            user32.GetDC.argtypes = (wintypes.HWND,)
+            user32.GetDC.restype = wintypes.HDC
+            user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+            user32.GetClientRect.argtypes = (
+                wintypes.HWND, ctypes.POINTER(wintypes.RECT),
+            )
+            user32.FillRect.argtypes = (
+                wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH,
+            )
+            gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
+            gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+            instance = kernel32.GetModuleHandleW(None)
+            stripe_count = 8
+            for name, (left, top, right, bottom), top_color, bottom_color in bands:
+                height = max(1, bottom - top)
+                LOG.info(
+                    "LAYER BAND OVERLAY: %s screen=(%d,%d,%d,%d)",
+                    name, left, top, right, bottom,
+                )
+                for stripe_index in range(stripe_count):
+                    stripe_top = top + round(height * stripe_index / stripe_count)
+                    stripe_bottom = top + round(
+                        height * (stripe_index + 1) / stripe_count
+                    )
+                    if stripe_bottom <= stripe_top:
+                        continue
+                    ratio = stripe_index / max(1, stripe_count - 1)
+                    color = 0
+                    for shift in (0, 8, 16):
+                        start = (top_color >> shift) & 0xFF
+                        end = (bottom_color >> shift) & 0xFF
+                        channel = round(start + (end - start) * ratio)
+                        color |= channel << shift
+                    brush = gdi32.CreateSolidBrush(color)
+                    if not brush:
+                        continue
+                    hwnd = user32.CreateWindowExW(
+                        # topmost, tool, no-activate, layered
+                        0x00000008 | 0x00000080 | 0x08000000 | 0x00080000,
+                        "STATIC", None, 0x80000000,
+                        left, stripe_top, max(1, right - left),
+                        max(1, stripe_bottom - stripe_top),
+                        None, None, instance, None,
+                    )
+                    if hwnd:
+                        windows.append((hwnd, brush))
+                    else:
+                        gdi32.DeleteObject(brush)
+            for hwnd, brush in windows:
+                user32.SetLayeredWindowAttributes(hwnd, 0, 78, 0x00000002)
+                user32.SetWindowPos(
+                    hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0,
+                    0x0001 | 0x0002 | 0x0010 | 0x0040,
+                )
+                user32.ShowWindow(hwnd, 4)
+                rect = wintypes.RECT()
+                hdc = user32.GetDC(hwnd)
+                if hdc:
+                    try:
+                        user32.GetClientRect(hwnd, ctypes.byref(rect))
+                        user32.FillRect(hdc, ctypes.byref(rect), brush)
+                    finally:
+                        user32.ReleaseDC(hwnd, hdc)
+            self._wait(2.2)
+        except Exception:
+            LOG.warning("layer-band overlay failed", exc_info=True)
+        finally:
+            for hwnd, brush in windows:
+                try:
+                    if user32 is not None:
+                        user32.DestroyWindow(hwnd)
+                except Exception:
+                    pass
+                try:
+                    if gdi32 is not None:
+                        gdi32.DeleteObject(brush)
+                except Exception:
+                    pass
 
     def _flash_detection_regions(
         self,

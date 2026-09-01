@@ -231,6 +231,15 @@ same-layer jump never changes the tracker origin; a rope attempt uses the live
 marker X to select/interpolate the rope/bench point anchor, and a fall or return
 re-anchors only after its landing floor has passed confirmation.
 
+At Start Patrol, `assistant.py` converts every recorded marker-Y band through
+the current analysis box and client rectangle. `ScreenBlinker` displays the
+results as distinct translucent native Win32 gradient rectangles without
+activating a window. The overlay runs while input is disarmed, is removed after
+2.2 seconds, and a clean capture is published before automation is enabled.
+Final-drop completion separately requires one dispatched drop chord and rejects
+an overlapping lower-floor bench band when the marker is closer to the final
+layer's recorded base.
+
 The two signals have explicit priority. A marker Y that matches exactly one
 recorded layer is direct visible-floor evidence and wins over world Y. World Y
 is used to disambiguate overlapping marker bands and is accepted only inside a

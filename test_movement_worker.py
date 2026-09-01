@@ -1738,6 +1738,78 @@ class MovementTests(unittest.TestCase):
         )
         self.assertTrue(worker._on_first_layer(landed_on_layer2))
 
+    def test_final_drop_does_not_finish_on_overlapping_bench_band(self):
+        positions = {
+            "layer2": {
+                "layer_y": .40, "y_tolerance": .02,
+                "layer_world_y": -.168814, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .37, "y": .489474},
+                "rope_pos": {"x": .76, "y": .310526},
+            },
+            "layer3": {
+                "layer_y": .310526, "y_tolerance": .02,
+                "layer_world_y": -3.00091, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .45, "y": .310526},
+                "right_most_pos": {"x": .68, "y": .310526},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer2", "layer3"],
+            first_layer="layer2",
+            final_layer_action="drop_to_first_layer",
+        )
+        worker._route_layer_index = 1
+        worker._route_phase = "drop"
+        still_on_layer3 = MinimapObservation(
+            Point(.679825, .310526), None, .9, (0, 0, 1, 1),
+            # Reproduce the stale layer2 world signal from the field log.
+            world_y_diamonds=-.169012, structure_confidence=.961,
+        )
+
+        self.assertFalse(worker._on_first_layer(still_on_layer3))
+        self.assertFalse(worker._final_drop_arrived(still_on_layer3))
+        worker._last_drop_attempt = 1.0
+        self.assertFalse(worker._final_drop_arrived(still_on_layer3))
+
+        landed_on_layer2 = replace(
+            still_on_layer3,
+            player=Point(.60, .489474),
+            world_y_diamonds=-.168814,
+        )
+        self.assertTrue(worker._final_drop_arrived(landed_on_layer2))
+
+    def test_final_drop_requires_one_drop_attempt_before_reset(self):
+        positions = {
+            "layer1": {
+                "layer_y": .70, "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .70},
+                "right_most_pos": {"x": .8, "y": .70},
+            },
+            "layer2": {
+                "layer_y": .56, "y_tolerance": .02,
+                "left_most_pos": {"x": .3, "y": .56},
+                "right_most_pos": {"x": .7, "y": .56},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer1", "layer2"],
+            first_layer="layer1",
+            final_layer_action="drop_to_first_layer",
+        )
+        worker._route_layer_index = 1
+        worker._route_phase = "drop"
+        on_first = MinimapObservation(
+            Point(.5, .70), None, .9, (0, 0, 1, 1)
+        )
+
+        self.assertFalse(worker._final_drop_arrived(on_first))
+        worker._last_drop_attempt = 1.0
+        self.assertTrue(worker._final_drop_arrived(on_first))
+
     def test_final_layer_drops_instead_of_targeting_rope_then_resets(self):
         positions = {
             "layer1": {"layer_y": .70, "y_tolerance": .02,
