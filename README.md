@@ -224,6 +224,13 @@ startup does not depend on a recent recording frame or stable contour voting.
   agree with adaptive diamond-space Y. This creates a real world-Y interval
   for paths such as left-high/middle/right-low. Confirmed landings interpolate
   the re-anchor from character X; airborne frames are never used as anchors.
+- A bench or stair jump inside the current logical layer is treated as a
+  same-layer bounce and never re-anchors world Y. When a rope climb actually
+  begins, the live character X selects the recorded point-specific world Y;
+  therefore a rope recorded while standing on a bench uses that bench anchor
+  instead of the layer's flat fallback. Return/fall recovery re-anchors only
+  after the landing layer is confirmed, then restarts patrol or returns from
+  an out-of-range floor such as layer1.
 - A marker-only position verifier runs every 0.75 seconds using the existing
   movement observation. Two matching out-of-range readings clear stale
   climb/drop state and start return-to-route without another capture or image

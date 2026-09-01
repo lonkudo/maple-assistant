@@ -2676,6 +2676,77 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(pinned.world_y_diamonds, -.4)
         self.assertEqual(tracker.anchors, [-.4])
 
+    def test_rope_bench_reanchor_uses_recorded_point_world_y(self):
+        class Tracker:
+            def __init__(self): self.anchors = []
+            def reanchor_world_y(self, world_y): self.anchors.append(world_y)
+
+        positions = {
+            "layer2": {
+                "layer_y": .49,
+                "layer_world_y": 0.0,
+                "left_most_pos": {
+                    "x": .2, "y": .49, "observed_world_y": 0.0,
+                    "tracking_confidence": .9,
+                    "coordinate_v2": {"y_diamond": 0.0},
+                },
+                # The rope is reached from a bench one diamond above the
+                # layer's floor. Both local marker Y and world Y record it.
+                "rope_pos": {
+                    "x": .8, "y": .31, "observed_world_y": -1.0,
+                    "tracking_confidence": .9,
+                    "coordinate_v2": {"y_diamond": -1.0},
+                },
+            },
+        }
+        tracker = Tracker()
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer2"],
+            structure_tracker=tracker,
+        )
+        worker._route_layer_index = 0
+
+        on_rope_bench = MinimapObservation(
+            Point(.8, .31), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=.2, structure_confidence=.9,
+        )
+        worker._reanchor_tracker_to_current_layer(on_rope_bench)
+
+        self.assertEqual(tracker.anchors, [-1.0])
+
+    def test_same_layer_bench_landing_does_not_reanchor(self):
+        class Tracker:
+            def __init__(self): self.anchors = []
+            def reanchor_world_y(self, world_y): self.anchors.append(world_y)
+
+        positions = {
+            "layer2": {
+                "layer_y": .40, "y_tolerance": .02,
+                "layer_world_y": 0.0,
+                "left_most_pos": {"x": .2, "y": .49},
+                "rope_pos": {"x": .8, "y": .31},
+            },
+        }
+        tracker = Tracker()
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer2"],
+            structure_tracker=tracker,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        bench_landing = MinimapObservation(
+            Point(.8, .31), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-1.0, structure_confidence=.9,
+        )
+
+        self.assertTrue(worker._resolve_fall(bench_landing))
+        self.assertEqual(worker._route_phase, "rope")
+        self.assertEqual(tracker.anchors, [])
+
     def test_same_layer_does_not_restart_patrol_phase(self):
         positions = {
             "layer1": {"layer_y": .70, "y_tolerance": .02,

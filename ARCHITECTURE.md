@@ -224,6 +224,11 @@ the topmost point: `(min(recorded Y) - y_tolerance / 2, max(recorded Y))`.
 No margin is added below the bottommost point. This narrows adjacent-floor
 overlap without removing the recorded vertical span of a stair-shaped layer.
 World-space detection uses the corresponding scroll-compensated world-Y band.
+The recorder retains both the canonical layer world Y and each point's raw
+`observed_world_y`. Coherent point readings describe stairs or benches. A
+same-layer jump never changes the tracker origin; a rope attempt uses the live
+marker X to select/interpolate the rope/bench point anchor, and a fall or return
+re-anchors only after its landing floor has passed confirmation.
 
 The two signals have explicit priority. A marker Y that matches exactly one
 recorded layer is direct visible-floor evidence and wins over world Y. World Y

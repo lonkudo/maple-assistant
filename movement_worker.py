@@ -3541,7 +3541,11 @@ class MovementWorker(threading.Thread):
         self._maybe_begin_return_if_out_of_range(observation)
         return self._return_mode is not None
 
-    def _finish_return(self, floor: str) -> None:
+    def _finish_return(
+        self,
+        floor: str,
+        observation: Optional[MinimapObservation] = None,
+    ) -> None:
         """After a return climb/drop reaches ``floor``: in range or not?  An
         in-range floor restarts patrol there; an out-of-range floor keeps the
         return mode pointed at the next step."""
@@ -3562,7 +3566,9 @@ class MovementWorker(threading.Thread):
             self._patrol_busy_until = 0.0
             self._return_mode = None
             self._return_arrival_floor = None
-            self._start_patrol_on(floor)
+            # Keep the confirmed landing position: stair/bench layers can
+            # have a different recorded world-Y at each action point.
+            self._start_patrol_on(floor, observation)
             LOG.warning("RETURN TO ROUTE: reached %s; restarting patrol", floor)
         else:
             number = _layer_number(floor)
@@ -3642,20 +3648,27 @@ class MovementWorker(threading.Thread):
         self._fall_last_y = None
         self._fall_frames = 0
         if self._return_mode is not None:
-            # Re-anchor only after the fall stopped and a floor was confirmed.
-            # On stairs, X chooses/interpolates the matching recorded world-Y.
-            self._reanchor_tracker_to_layer(floor, observation)
             if (self._return_mode == "climb-to-route"
                     and floor in self._route_layers
                     and not self._return_climb_arrival_ready(floor)):
+                # Do not re-anchor from the first apparent arrival frame. A
+                # bench jump can briefly enter an upper marker band while it
+                # is still part of the current logical layer.
                 return False
             confirmed_floor = self._return_arrival_floor or floor
-            self._finish_return(confirmed_floor)
+            # Re-anchor only after the landing floor has been confirmed. X
+            # selects/interpolates the recorded per-point world-Y on a stair
+            # or bench layer.
+            if confirmed_floor not in self._route_layers:
+                self._reanchor_tracker_to_layer(confirmed_floor, observation)
+            self._finish_return(confirmed_floor, observation)
             return True
         if floor in self._route_layers:
             if self._current_route_floor() == floor:
-                self._reanchor_tracker_to_layer(floor, observation)
-                return True  # same-floor bounce: keep patrolling
+                # A stair/bench jump is a same-layer bounce, not a floor
+                # transition. Re-anchoring here used to turn the bench into a
+                # new world origin and made the following rope arrival miss.
+                return True
             self._start_patrol_on(floor, observation)
             LOG.warning("FALL RECOVERY: landed on %s; restarting patrol", floor)
         else:
@@ -3780,7 +3793,7 @@ class MovementWorker(threading.Thread):
                     "RETURN TO ROUTE: climb settled on %s; restarting patrol",
                     floor,
                 )
-                self._finish_return(floor)
+                self._finish_return(floor, observation)
                 return self._route_target(observation)
             floor = detected_floor
             if floor is None or floor in self._route_layers:
@@ -4556,7 +4569,7 @@ class MovementWorker(threading.Thread):
                     if self._return_mode == "drop-to-route":
                         floor = self._detect_floor_all(observation)
                         if floor is not None and self._in_patrol_range(floor):
-                            self._finish_return(floor)
+                            self._finish_return(floor, observation)
                             route_target_x, route_is_rope, route_label = (
                                 self._route_target(observation)
                             )
@@ -4971,7 +4984,11 @@ class MovementWorker(threading.Thread):
                                 continue
                             self._last_climb_attempt = now
                         if self._climb_state.phase == "idle":
-                            self._reanchor_tracker_to_current_layer()
+                            # The rope can be recorded on a bench within the
+                            # same logical layer. Pass the live marker X so
+                            # the point-specific observed world-Y is used
+                            # instead of the layer's flat fallback anchor.
+                            self._reanchor_tracker_to_current_layer(observation)
                         # Direction comes from character X versus Rope X. At
                         # an exactly quantized X, retain the last observed side
                         # of approach instead of using a fixed right-first rule.
