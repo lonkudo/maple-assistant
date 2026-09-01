@@ -255,6 +255,12 @@ phase/cycle or enters return-to-route from the detected out-of-range layer.
 Missing/off-band startup markers are fatal to that start attempt, but leave the
 UI and process running with live input disarmed.
 
+No layer count is special-cased. Numeric suffix ordering and the configured
+inclusive range drive the route. A map recorded as layer1..layer4 with active
+range layer3..layer4 therefore treats layer3 as the loop's first floor and
+layer4 as its final floor; lower-floor startup returns upward one recorded
+floor at a time, and final-layer completion drops back to layer3.
+
 ### 5.3 Walking and endpoints
 
 Far movement uses a bounded continuous hold; final correction duration is

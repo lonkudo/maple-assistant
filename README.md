@@ -75,8 +75,11 @@ layer before input is armed. That detected floor is handed directly to the
 movement worker: an in-range floor starts from its first recorded patrol action
 at cycle 1, while an out-of-range floor immediately starts return-to-route.
 Every Start Patrol clears stale climb, drop, fall, stair, and return state left
-by an earlier Stop Patrol, so starting on layer3 cannot inherit a layer1/layer2
-rope recovery.
+by an earlier Stop Patrol, so starting on any upper floor cannot inherit a
+lower-floor rope recovery. Layer count is not fixed: for example, a four-floor
+map with patrol range layer3 through layer4 starts either in-range floor
+directly, climbs through layer1/layer2 when starting below the range, and drops
+from layer4 back to layer3 after the final patrol cycles.
 For a legacy route without saved calibration, startup can discover an OpenCV
 border only when its region independently contains the yellow character
 diamond; the broad fallback search region is never used as map geometry.
@@ -211,7 +214,7 @@ startup does not depend on a recent recording frame or stable contour voting.
   world Y resolves only overlapping/aliased marker bands and must itself fall
   inside a recorded world band. A confirmed rope arrival immediately
   re-anchors world Y to the new layer, so a stale lower-floor reading cannot
-  turn a valid layer3 patrol back into layer2 before the final drop.
+  turn a valid final-layer patrol back into the preceding layer before drop.
 - Stair-shaped layers retain the recorder's canonical anti-alias anchor, but
   also use the saved per-point `observed_world_y` values when their changes
   agree with adaptive diamond-space Y. This creates a real world-Y interval

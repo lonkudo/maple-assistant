@@ -925,6 +925,55 @@ class MovementTests(unittest.TestCase):
         self.assertFalse(is_rope)
         self.assertEqual(label, "layer3.drop-to-first")
 
+    def test_four_layer_map_patrol_range_layer3_to_layer4(self) -> None:
+        """Layer count and active range are data-driven, never fixed at 3."""
+
+        worker = self._range_worker(4, "layer3", "layer4")
+        worker.patrol_cycles_per_layer = 2
+        worker.patrol_enabled = True
+        self.assertEqual(worker._route_layers, ["layer3", "layer4"])
+        self.assertEqual(worker.first_layer, "layer3")
+
+        # Starting directly on the top recorded floor begins layer4 from its
+        # first patrol action, then two cycles lead to a drop back to layer3.
+        on_layer4 = MinimapObservation(
+            Point(.5, .5), None, .9, (0, 0, 1, 1)
+        )
+        worker.prepare_patrol_start("layer4")
+        self.assertTrue(worker._apply_pending_patrol_start(on_layer4))
+        self.assertEqual(worker._current_route_floor(), "layer4")
+        self.assertEqual(worker._route_phase, "left")
+        for _ in range(2):
+            left = replace(on_layer4, player=Point(.29, .5))
+            right = replace(on_layer4, player=Point(.71, .5))
+            target, _, _ = worker._route_target(left)
+            self.assertTrue(worker._advance_route_endpoint(left, target))
+            target, _, _ = worker._route_target(right)
+            self.assertTrue(worker._advance_route_endpoint(right, target))
+        self.assertEqual(worker._route_phase, "drop")
+        self.assertEqual(
+            worker._route_target(on_layer4)[2], "layer4.drop-to-first"
+        )
+
+        # Starting two floors below the range climbs layer1 -> layer2 ->
+        # layer3. Reaching layer2 must continue returning, not patrol it.
+        on_layer1 = replace(on_layer4, player=Point(.4, .8))
+        worker.prepare_patrol_start("layer1")
+        self.assertTrue(worker._apply_pending_patrol_start(on_layer1))
+        self.assertEqual(worker._return_mode, "climb-to-route")
+        self.assertEqual(worker._return_from_floor, "layer1")
+        self.assertEqual(worker._route_target(on_layer1)[2], "return.climb")
+
+        worker._finish_return("layer2")
+        self.assertEqual(worker._return_mode, "climb-to-route")
+        self.assertEqual(worker._return_from_floor, "layer2")
+        self.assertEqual(worker._route_target(on_layer1)[2], "return.climb")
+
+        worker._finish_return("layer3")
+        self.assertIsNone(worker._return_mode)
+        self.assertEqual(worker._current_route_floor(), "layer3")
+        self.assertEqual(worker._route_phase, "left")
+
     def test_range_top_repeats_when_range_not_configured(self) -> None:
         # No range configured: the map-top final layer keeps the legacy
         # end action (profile default repeats the layer's own patrol) -
