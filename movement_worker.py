@@ -170,21 +170,100 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     return min(values) - tolerance, max(values)
 
 
+def _coherent_observed_world_points(
+    layer: Any,
+) -> list[tuple[float, float]]:
+    """Return ``(x, observed_world_y)`` points that describe a real slope.
+
+    Recording deliberately keeps a canonical ``world_y`` on every point so
+    one horizontally repeating platform cannot create several fake floors.
+    It also stores the raw ``observed_world_y`` and adaptive diamond-space Y.
+    When those two measurements move together, the change is real geometry
+    (for example a left-high/right-low stair layer), not a phase-correlation
+    alias. Such coherent readings may safely form a world-Y interval.
+    """
+
+    points: list[tuple[float, float, float]] = []
+    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+        point = layer.get(point_name) if isinstance(layer, dict) else None
+        coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
+        if (not isinstance(point, dict)
+                or not isinstance(coordinate, dict)
+                or "x" not in point
+                or "observed_world_y" not in point
+                or "y_diamond" not in coordinate
+                or float(point.get("tracking_confidence", 0.0)) < 0.12):
+            continue
+        points.append((
+            float(point["x"]),
+            float(point["observed_world_y"]),
+            float(coordinate["y_diamond"]),
+        ))
+    if len(points) < 2:
+        return []
+    offsets = [world_y - diamond_y for _, world_y, diamond_y in points]
+    # A genuine slope changes local diamond Y and world Y by the same amount.
+    # Allow sub-diamond capture noise, but reject a repeated-platform alias.
+    if max(offsets) - min(offsets) > 0.35:
+        return []
+    return [(x, world_y) for x, world_y, _ in points]
+
+
 def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     """World-Y band from recorded point world-Ys (same rule as Y:
 
     tolerance applies only above the topmost point, not below the
     lowermost point, so adjacent floors' bands overlap less."""
-    values = []
-    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
-        point = layer.get(point_name)
-        if isinstance(point, dict) and "world_y" in point:
-            values.append(float(point["world_y"]))
+    coherent_points = _coherent_observed_world_points(layer)
+    values = [world_y for _, world_y in coherent_points]
+    if not coherent_points:
+        for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+            point = layer.get(point_name)
+            if isinstance(point, dict) and "world_y" in point:
+                values.append(float(point["world_y"]))
     if not values and isinstance(layer, dict) and "layer_world_y" in layer:
         values = [float(layer["layer_world_y"])]
     if not values:
         return None
     return min(values) - tolerance, max(values)
+
+
+def _layer_world_anchor_at_x(layer: Any, player_x: Optional[float]) -> Optional[float]:
+    """Return the recorded world-Y expected at X on a flat or stair layer."""
+
+    points = sorted(_coherent_observed_world_points(layer))
+    if player_x is not None and points:
+        x = float(player_x)
+        if x <= points[0][0]:
+            return points[0][1]
+        if x >= points[-1][0]:
+            return points[-1][1]
+        for (left_x, left_y), (right_x, right_y) in zip(points, points[1:]):
+            if left_x <= x <= right_x:
+                span = right_x - left_x
+                if span <= 1e-9:
+                    return (left_y + right_y) / 2.0
+                ratio = (x - left_x) / span
+                return left_y + (right_y - left_y) * ratio
+    if isinstance(layer, dict) and "layer_world_y" in layer:
+        return float(layer["layer_world_y"])
+    return None
+
+
+def _layer_y_candidates(player_y: float, layers: dict[str, Any]) -> list[str]:
+    """All marker-Y matches ordered from nearest recorded layer center."""
+
+    candidates: list[tuple[float, str]] = []
+    for name, layer in layers.items():
+        if not isinstance(layer, dict) or "layer_y" not in layer:
+            continue
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        if band is None or not band[0] - 1e-9 <= player_y <= band[1] + 1e-9:
+            continue
+        reference_y = float(layer.get("layer_y", (band[0] + band[1]) / 2.0))
+        candidates.append((abs(player_y - reference_y), name))
+    return [name for _, name in sorted(candidates)]
 
 
 def detect_layer_by_y(
@@ -193,24 +272,8 @@ def detect_layer_by_y(
 ) -> Optional[str]:
     """Return the nearest layer whose recorded-point band contains Y."""
 
-    candidates = []
-    for name, layer in layers.items():
-        if not isinstance(layer, dict) or "layer_y" not in layer:
-            continue
-        tolerance = float(layer.get("y_tolerance", 0.020000))
-        band = _layer_y_band(layer, tolerance)
-        if band is None:
-            continue
-        band_min, band_max = band
-        if band_min - 1e-9 <= player_y <= band_max + 1e-9:
-            # Overlapping bands are common after minimap scrolling. The old
-            # constant score silently selected the alphabetically first layer,
-            # regardless of which recorded platform was actually closest.
-            reference_y = float(layer.get(
-                "layer_y", (band_min + band_max) / 2.0
-            ))
-            candidates.append((abs(player_y - reference_y), name))
-    return min(candidates)[1] if candidates else None
+    candidates = _layer_y_candidates(player_y, layers)
+    return candidates[0] if candidates else None
 
 
 def detect_layer_by_world_y(
@@ -2838,6 +2901,15 @@ class MovementWorker(threading.Thread):
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
+        marker_candidates = (
+            _layer_y_candidates(observation.player.y, layers)
+            if observation.player is not None else []
+        )
+        # A unique marker band is direct evidence of the visible floor. It
+        # must beat scroll tracking: OpenCV can briefly phase-lock to a
+        # repeated platform and report the previous floor after a good climb.
+        if len(marker_candidates) == 1:
+            return marker_candidates[0]
         has_world_calibration = any(
             isinstance(layer, dict) and "layer_world_y" in layer
             for layer in layers.values()
@@ -2923,8 +2995,7 @@ class MovementWorker(threading.Thread):
         )
 
     def _nearest_world_layer_all(self, world_y: float) -> Optional[str]:
-        """Nearest world-anchored floor over EVERY recorded layer (patrol
-        range or not).
+        """World-band floor over EVERY recorded layer (patrol range or not).
 
         The world-Y tracker re-anchors per floor, so after any move (climb,
         fall/DROP even to a floor outside the patrol range, e.g. layer1) the
@@ -2932,31 +3003,13 @@ class MovementWorker(threading.Thread):
         Y aliases inside the current band.  Runs every frame: this is what
         \"detect the layer each frame\" means for tracking the actual floor.
         """
-        best_name: Optional[str] = None
-        best_gap: Optional[float] = None
-        for name, layer in self.important_positions.items():
-            if not isinstance(layer, dict) or "layer_world_y" not in layer:
-                continue
-            gap = abs(world_y - float(layer["layer_world_y"]))
-            if best_gap is None or gap < best_gap:
-                best_name, best_gap = name, gap
-        return best_name
-        """Nearest world-anchored layer over EVERY recorded floor.
-
-        The world tracker re-anchors per floor, so after a fall (even to a
-        floor OUTSIDE the patrol range, e.g. layer1) the reading points at
-        the new floor's own anchor even when the marker Y aliases inside the
-        current band.  Used per frame; never gated by the band guard.
-        """
-        best_name: Optional[str] = None
-        best_gap: Optional[float] = None
-        for name, layer in self.important_positions.items():
-            if not isinstance(layer, dict) or "layer_world_y" not in layer:
-                continue
-            gap = abs(world_y - float(layer["layer_world_y"]))
-            if best_gap is None or gap < best_gap:
-                best_name, best_gap = name, gap
-        return best_name
+        layers = {
+            name: layer for name, layer in self.important_positions.items()
+            if isinstance(layer, dict) and "layer_world_y" in layer
+        }
+        # Do not snap an arbitrary reading to whichever anchor is least far
+        # away. The reading must lie in that layer's calibrated world band.
+        return detect_layer_by_world_y(world_y, layers)
 
     def _resync_route_layer(self, observation: MinimapObservation) -> Optional[str]:
         """Switch patrol state when the marker is detected on another layer.
@@ -3091,6 +3144,15 @@ class MovementWorker(threading.Thread):
             )
         else:
             detected_name = self._detected_layer(observation)
+            marker_candidates_all = _layer_y_candidates(
+                observation.player.y, self.important_positions
+            )
+            marker_is_unambiguous = len(marker_candidates_all) == 1
+            if marker_is_unambiguous:
+                # This may deliberately be outside the active patrol range;
+                # the guard below returns None so fall/return recovery owns
+                # the transition instead of indexing a non-route layer.
+                detected_name = marker_candidates_all[0]
             # World-nearest override: every frame, over EVERY recorded
             # floor.  After a fall the tracker re-anchors to the new floor
             # (even layer1, outside the patrol range), so the world read
@@ -3099,10 +3161,24 @@ class MovementWorker(threading.Thread):
             # the current floor while the world anchor still matches it.
             world_name = (
                 self._nearest_world_layer_all(observation.world_y_diamonds)
-                if observation.world_y_diamonds is not None else None
+                if (observation.world_y_diamonds is not None
+                    and observation.structure_confidence >= 0.12)
+                else None
             )
-            if world_name is not None and world_name != detected_name:
+            if (not marker_is_unambiguous
+                    and world_name is not None
+                    and world_name != detected_name):
                 detected_name = world_name
+            elif (marker_is_unambiguous
+                    and world_name is not None
+                    and world_name != detected_name):
+                LOG.info(
+                    "LAYER signal disagreement: marker=%s world=%s "
+                    "world_y=%.6f confidence=%.3f; marker wins",
+                    marker_candidates_all[0], world_name,
+                    observation.world_y_diamonds,
+                    observation.structure_confidence,
+                )
             # Overlapping-band flicker guard: adjacent floors' recorded
             # Y bands can overlap (span +- tolerance), so a Y-only reading
             # can hit BOTH the current floor and a neighbour (observed:
@@ -3233,33 +3309,21 @@ class MovementWorker(threading.Thread):
             self.dropping_active_event.clear()
         if self.near_rope_event is not None:
             self.near_rope_event.clear()
+        if was_climbing:
+            # Confirmed rope arrival is stronger than an aliased OpenCV
+            # structure result. Establish the new floor's world origin now.
+            self._reanchor_tracker_to_current_layer(observation)
         returned_to_first = (
             self.first_layer is not None
             and detected_name == self.first_layer
             and previous_name != self.first_layer
         )
-        if returned_to_first and self.structure_tracker is not None:
-            first_layer = self.important_positions.get(self.first_layer, {})
-            anchor_world_y = (
-                first_layer.get("layer_world_y")
-                if isinstance(first_layer, dict) else None
-            )
-            reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
-            start_session = getattr(self.structure_tracker, "start_session", None)
-            if anchor_world_y is not None and callable(reanchor):
-                reanchor(float(anchor_world_y))
-                LOG.info(
-                    "MAP LOOP reset world Y at %s=%.6f",
-                    self.first_layer,
-                    float(anchor_world_y),
-                )
-            elif anchor_world_y is not None and callable(start_session):
-                start_session(float(anchor_world_y))
-                LOG.info(
-                    "MAP LOOP reset world Y at %s=%.6f",
-                    self.first_layer,
-                    float(anchor_world_y),
-                )
+        if returned_to_first and not was_climbing:
+            self._reanchor_tracker_to_current_layer(observation)
+            anchor_world_y = self._current_layer_world_y()
+            if anchor_world_y is not None:
+                LOG.info("MAP LOOP reset world Y at %s=%.6f",
+                         self.first_layer, anchor_world_y)
         if was_climbing:
             LOG.info("CLIMB complete: detected %s at y=%.6f",
                      detected_name, observation.player.y)
@@ -3283,7 +3347,9 @@ class MovementWorker(threading.Thread):
             return None
         return self._route_layers[self._route_layer_index]
 
-    def _start_patrol_on(self, floor: str) -> None:
+    def _start_patrol_on(
+        self, floor: str, observation: Optional[MinimapObservation] = None
+    ) -> None:
         """Restart patrol from ``floor`` (must be inside the patrol range)."""
         self._route_layer_index = self._route_layers.index(floor)
         self._route_phase = "left"
@@ -3300,7 +3366,7 @@ class MovementWorker(threading.Thread):
             self.climbing_active_event.clear()
         if self.near_rope_event is not None:
             self.near_rope_event.clear()
-        self._reanchor_tracker_to_current_layer()
+        self._reanchor_tracker_to_current_layer(observation)
 
     def _detect_floor_all(self, observation: MinimapObservation) -> Optional[str]:
         """Detect the floor over ALL recorded layers (not just the patrol
@@ -3490,6 +3556,9 @@ class MovementWorker(threading.Thread):
         self._fall_last_y = None
         self._fall_frames = 0
         if self._return_mode is not None:
+            # Re-anchor only after the fall stopped and a floor was confirmed.
+            # On stairs, X chooses/interpolates the matching recorded world-Y.
+            self._reanchor_tracker_to_layer(floor, observation)
             if (self._return_mode == "climb-to-route"
                     and floor in self._route_layers
                     and not self._return_climb_arrival_ready(floor)):
@@ -3499,11 +3568,13 @@ class MovementWorker(threading.Thread):
             return True
         if floor in self._route_layers:
             if self._current_route_floor() == floor:
+                self._reanchor_tracker_to_layer(floor, observation)
                 return True  # same-floor bounce: keep patrolling
-            self._start_patrol_on(floor)
+            self._start_patrol_on(floor, observation)
             LOG.warning("FALL RECOVERY: landed on %s; restarting patrol", floor)
         else:
             number = _layer_number(floor)
+            self._reanchor_tracker_to_layer(floor, observation)
             self._return_mode = (
                 "climb-to-route" if number < self._patrol_range_min
                 else "drop-to-route"
@@ -3577,6 +3648,7 @@ class MovementWorker(threading.Thread):
         if floor is None or floor in self._route_layers:
             return
         number = _layer_number(floor)
+        self._reanchor_tracker_to_layer(floor, observation)
         self._return_mode = (
             "climb-to-route" if number < self._patrol_range_min
             else "drop-to-route"
@@ -4098,7 +4170,12 @@ class MovementWorker(threading.Thread):
 
         if self._climb_state.up_held or self._climb_state.phase != "idle":
             return observation
-        canonical = self._current_layer_world_y()
+        floor = self._current_route_floor()
+        layer = self.important_positions.get(floor, {}) if floor else {}
+        canonical = _layer_world_anchor_at_x(
+            layer,
+            observation.player.x if observation.player is not None else None,
+        )
         if canonical is None:
             return observation
         return replace(
@@ -4107,11 +4184,32 @@ class MovementWorker(threading.Thread):
             structure_confidence=max(observation.structure_confidence, 1.0),
         )
 
-    def _reanchor_tracker_to_current_layer(self) -> None:
-        canonical = self._current_layer_world_y()
+    def _reanchor_tracker_to_layer(
+        self,
+        layer_name: str,
+        observation: Optional[MinimapObservation] = None,
+    ) -> None:
+        layer = self.important_positions.get(layer_name, {})
+        canonical = _layer_world_anchor_at_x(
+            layer,
+            (observation.player.x
+             if observation is not None and observation.player is not None
+             else None),
+        )
         reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
         if canonical is not None and callable(reanchor):
             reanchor(canonical)
+            return
+        start_session = getattr(self.structure_tracker, "start_session", None)
+        if canonical is not None and callable(start_session):
+            start_session(canonical)
+
+    def _reanchor_tracker_to_current_layer(
+        self, observation: Optional[MinimapObservation] = None
+    ) -> None:
+        floor = self._current_route_floor()
+        if floor is not None:
+            self._reanchor_tracker_to_layer(floor, observation)
 
     def _log_detected_layer(
         self,
@@ -4382,6 +4480,7 @@ class MovementWorker(threading.Thread):
                         self._descending_to_first = True
                     if self._on_first_layer(observation):
                         self._reset_route_loop()
+                        self._reanchor_tracker_to_current_layer(observation)
                         route_target_x, route_is_rope, route_label = self._route_target(observation)
                 elif (self.dropping_active_event is not None
                         and self.dropping_active_event.is_set()):

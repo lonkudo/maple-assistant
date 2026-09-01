@@ -196,6 +196,18 @@ startup does not depend on a recent recording frame or stable contour voting.
 - Patrol startup detects the character's actual recorded layer from the fresh
   adaptive minimap before anchoring world Y; it does not assume the character
   is already on the configured first patrol layer.
+- Layer detection fuses marker Y and scroll-compensated world Y instead of
+  letting OpenCV tracking override the visible marker unconditionally. When
+  marker Y matches exactly one recorded layer, that unambiguous layer wins;
+  world Y resolves only overlapping/aliased marker bands and must itself fall
+  inside a recorded world band. A confirmed rope arrival immediately
+  re-anchors world Y to the new layer, so a stale lower-floor reading cannot
+  turn a valid layer3 patrol back into layer2 before the final drop.
+- Stair-shaped layers retain the recorder's canonical anti-alias anchor, but
+  also use the saved per-point `observed_world_y` values when their changes
+  agree with adaptive diamond-space Y. This creates a real world-Y interval
+  for paths such as left-high/middle/right-low. Confirmed landings interpolate
+  the re-anchor from character X; airborne frames are never used as anchors.
 - A marker-only position verifier runs every 0.75 seconds using the existing
   movement observation. Two matching out-of-range readings clear stale
   climb/drop state and start return-to-route without another capture or image

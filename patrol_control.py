@@ -34,12 +34,38 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     return min(values) - tolerance, max(values)
 
 
-def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
-    values = []
+def _coherent_observed_world_values(layer: Any) -> list[float]:
+    """Use raw per-point world Y only when it agrees with diamond-space Y."""
+
+    readings: list[tuple[float, float]] = []
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
-        point = layer.get(point_name)
-        if isinstance(point, dict) and "world_y" in point:
-            values.append(float(point["world_y"]))
+        point = layer.get(point_name) if isinstance(layer, dict) else None
+        coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
+        if (not isinstance(point, dict)
+                or not isinstance(coordinate, dict)
+                or "observed_world_y" not in point
+                or "y_diamond" not in coordinate
+                or float(point.get("tracking_confidence", 0.0)) < 0.12):
+            continue
+        readings.append((
+            float(point["observed_world_y"]),
+            float(coordinate["y_diamond"]),
+        ))
+    if len(readings) < 2:
+        return []
+    offsets = [world_y - diamond_y for world_y, diamond_y in readings]
+    if max(offsets) - min(offsets) > 0.35:
+        return []
+    return [world_y for world_y, _ in readings]
+
+
+def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    values = _coherent_observed_world_values(layer)
+    if not values:
+        for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+            point = layer.get(point_name)
+            if isinstance(point, dict) and "world_y" in point:
+                values.append(float(point["world_y"]))
     if not values and isinstance(layer, dict) and "layer_world_y" in layer:
         values = [float(layer["layer_world_y"])]
     if not values:

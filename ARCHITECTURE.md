@@ -222,10 +222,27 @@ Screen-space floor detection uses a band from the minimum to maximum Y of all
 recorded points on a layer, with tolerance applied above the topmost point.
 World-space detection uses the corresponding scroll-compensated world-Y band.
 
+The two signals have explicit priority. A marker Y that matches exactly one
+recorded layer is direct visible-floor evidence and wins over world Y. World Y
+is used to disambiguate overlapping marker bands and is accepted only inside a
+calibrated layer world band; the old unconditional "nearest anchor" snap was
+removed because a phase-correlation alias could identify layer2 while the
+marker visibly occupied layer3.
+
+Recording keeps both a canonical layer anchor and each point's raw
+`observed_world_y`. The raw values form a stair-layer interval only when they
+track the point's adaptive `coordinate_v2.y_diamond` within a bounded residual;
+otherwise they are treated as repeating-platform aliases and the canonical
+anchor remains authoritative. On a confirmed stair landing, the world anchor
+is interpolated by character X between coherent recorded points.
+
 `_resync_route_layer()` runs on fresh frames. During a climb it accepts only
 the immediate expected next layer and requires stable frame/time confirmation.
 A short Up compensation window clears the rope lip before route ownership is
-released. During intentional descent or return-to-route, those dedicated
+released. Confirmed climb arrival re-anchors the structure tracker to the new
+layer before the next patrol frame. Confirmed fall/drop landings re-anchor only
+after vertical motion stops; no airborne sample is allowed to redefine the
+world origin. During intentional descent or return-to-route, those dedicated
 states prevent generic resync from hijacking the route.
 
 ### 5.3 Walking and endpoints

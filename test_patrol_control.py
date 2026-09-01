@@ -161,6 +161,28 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertEqual(right["world_y"], -7.25)
             self.assertEqual(right["observed_world_y"], -.10)
 
+    def test_layer_world_lookup_accepts_coherent_stair_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "map.json"
+            data = profile()
+            data["route_order"] = ["layer1"]
+            layer = data["layers"]["layer1"]
+            layer["layer_world_y"] = 1.5
+            layer["world_y_tolerance"] = .75
+            layer["left_most_pos"].update({
+                "x": .22, "world_y": 1.5, "observed_world_y": 1.5,
+                "tracking_confidence": .5,
+                "coordinate_v2": {"y_diamond": 1.5},
+            })
+            layer["right_most_pos"].update({
+                "x": .74, "world_y": 1.5, "observed_world_y": 2.836,
+                "tracking_confidence": .7,
+                "coordinate_v2": {"y_diamond": 2.833},
+            })
+            controller = PatrolController(path, data)
+
+            self.assertEqual(controller.layer_for_world_y(2.8), "layer1")
+
     def test_record_rejects_unknown_layer_y(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = PatrolController(Path(directory) / "map.json", profile())

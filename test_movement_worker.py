@@ -29,6 +29,8 @@ from movement_worker import (
     _send_tap,
     _drop_through_platform,
     _dispatched_position_matches,
+    _layer_world_y_band,
+    _layer_world_anchor_at_x,
 )
 
 
@@ -40,6 +42,113 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_stair_layer_uses_coherent_observed_world_y_range(self):
+        layer = {
+            "layer_world_y": 1.5,
+            "world_y_tolerance": .75,
+            "left_most_pos": {
+                "x": .223684, "y": .594737, "world_y": 1.5,
+                "observed_world_y": 1.5, "tracking_confidence": .5,
+                "coordinate_v2": {"y_diamond": 1.5},
+            },
+            "rope_pos": {
+                "x": .609649, "y": .636842, "world_y": 1.5,
+                "observed_world_y": 2.169521, "tracking_confidence": .66,
+                "coordinate_v2": {"y_diamond": 2.166667},
+            },
+            "right_most_pos": {
+                "x": .741228, "y": .678947, "world_y": 1.5,
+                "observed_world_y": 2.836091, "tracking_confidence": .73,
+                "coordinate_v2": {"y_diamond": 2.833333},
+            },
+        }
+
+        self.assertEqual(_layer_world_y_band(layer, .75), (.75, 2.836091))
+        self.assertAlmostEqual(
+            _layer_world_anchor_at_x(layer, .741228), 2.836091
+        )
+        self.assertAlmostEqual(
+            _layer_world_anchor_at_x(layer, .609649), 2.169521
+        )
+
+    def test_unique_layer3_marker_beats_stale_layer2_world_y_and_drops(self):
+        class Sender:
+            def __init__(self): self.released = []
+            def key_up(self, key): self.released.append(key); return True
+
+        class Tracker:
+            def __init__(self): self.anchors = []
+            def reanchor_world_y(self, value): self.anchors.append(value)
+
+        positions = {
+            "layer2": {
+                "layer_y": .489474, "y_tolerance": .02,
+                "layer_world_y": -.161795, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .390351, "y": .489474,
+                                  "world_y": -.161795},
+                "right_most_pos": {"x": .653509, "y": .489474,
+                                   "world_y": -.161795},
+                "rope_pos": {"x": .758772, "y": .489474,
+                             "world_y": -.161795},
+            },
+            "layer3": {
+                "layer_y": .310526, "y_tolerance": .02,
+                "layer_world_y": -2.998875, "world_y_tolerance": .75,
+                "left_most_pos": {"x": .469298, "y": .310526,
+                                  "world_y": -2.998875},
+                "right_most_pos": {"x": .679825, "y": .310526,
+                                   "world_y": -2.998875},
+            },
+        }
+        tracker = Tracker()
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer2", "layer3"],
+            first_layer="layer2",
+            final_layer_action="drop_to_first_layer",
+            patrol_start_layer="layer2",
+            patrol_end_layer="layer3",
+            patrol_cycles_per_layer=2,
+            structure_tracker=tracker,
+            climb_layer_confirm_frames=1,
+            climb_layer_confirm_seconds=0.0,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        on_layer3_with_stale_world = MinimapObservation(
+            Point(.55, .310526), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-.161795, structure_confidence=.7,
+        )
+
+        self.assertEqual(
+            worker._resync_route_layer(on_layer3_with_stale_world), "layer2"
+        )
+        self.assertEqual(
+            worker._resync_route_layer(on_layer3_with_stale_world), "layer3"
+        )
+        self.assertEqual(worker._current_route_floor(), "layer3")
+        self.assertEqual(tracker.anchors, [-2.998875])
+        # Even if the next raw OpenCV reading still describes layer2, the
+        # unique visible layer3 marker keeps the final-layer route state.
+        self.assertEqual(
+            worker._resync_route_layer(on_layer3_with_stale_world), "layer3"
+        )
+        self.assertEqual(worker._current_route_floor(), "layer3")
+
+        left = replace(on_layer3_with_stale_world, player=Point(.46, .310526))
+        right = replace(on_layer3_with_stale_world, player=Point(.69, .310526))
+        for _ in range(2):
+            target, _, _ = worker._route_target(left)
+            self.assertTrue(worker._advance_route_endpoint(left, target))
+            target, _, _ = worker._route_target(right)
+            self.assertTrue(worker._advance_route_endpoint(right, target))
+        self.assertEqual(worker._route_phase, "drop")
+        self.assertEqual(
+            worker._route_target(right)[2], "layer3.drop-to-first"
+        )
+
     def test_default_stair_jump_waits_ten_frames_through_attack_animation(self):
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(), important_positions={}
@@ -809,7 +918,7 @@ class MovementTests(unittest.TestCase):
         # Not yet on the route: standing on layer1 (world anchor 2.0).
         on_layer1 = MinimapObservation(
             Point(.76, .349), None, .9, (0, 0, 1, 1),
-            world_y_diamonds=2.0,
+            world_y_diamonds=2.0, structure_confidence=.9,
         )
         self.assertIsNone(worker._resync_route_layer(on_layer1))
         self.assertIsNone(worker._route_layer_index)
@@ -819,7 +928,7 @@ class MovementTests(unittest.TestCase):
         worker._route_phase = "rope"
         fell_to_layer1 = MinimapObservation(
             Point(.60, .349), None, .9, (0, 0, 1, 1),
-            world_y_diamonds=2.0,
+            world_y_diamonds=2.0, structure_confidence=.9,
         )
         self.assertIsNone(worker._resync_route_layer(fell_to_layer1))
         self.assertEqual(worker._route_layer_index, 1)
