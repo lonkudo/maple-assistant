@@ -150,7 +150,8 @@ def _layer_point_ys(layer: Any) -> list[float]:
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     """Layer band from its recorded point Ys.
 
-    band = (uppermost point Y - tolerance, lowermost point Y).
+    band = (uppermost point Y - tolerance,
+            lowermost point Y + tolerance / 3).
     A layer whose points span a Y range (wide platform / minimap
     perspective) is fully detected while standing anywhere on the
     platform; the old mean +- tolerance band excluded the platform ends,
@@ -167,12 +168,15 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    # Existing recordings store y_tolerance=0.02. Use half of that value for
-    # the upper arrival margin so adjacent/nearby floors cannot both claim a
-    # marker that is visibly on the higher layer. The full recorded point
-    # span still covers stair-shaped paths from highest Y through lowest Y.
-    effective_tolerance = max(0.0, float(tolerance)) * 0.5
-    return min(values) - effective_tolerance, max(values)
+    # The full tolerance above the visually highest point covers climb/drop
+    # arrival movement. Only one third is allowed below the confirmed layer
+    # base: enough for OpenCV/marker quantization noise without making the
+    # band unnecessarily reach toward the layer below.
+    effective_tolerance = max(0.0, float(tolerance))
+    return (
+        min(values) - effective_tolerance,
+        max(values) + effective_tolerance / 3.0,
+    )
 
 
 def _coherent_observed_world_points(

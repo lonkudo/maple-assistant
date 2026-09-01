@@ -43,7 +43,7 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
-    def test_layer_y_band_uses_half_tolerance_above_recorded_span(self):
+    def test_layer_y_band_uses_full_upper_and_one_third_lower_tolerance(self):
         layer = {
             "y_tolerance": .02,
             "layer_y": .636842,
@@ -52,12 +52,36 @@ class MovementTests(unittest.TestCase):
             "right_most_pos": {"x": .8, "y": .678947},
         }
 
+        band = _layer_y_band(layer, .02)
+        self.assertAlmostEqual(band[0], .574737)
+        self.assertAlmostEqual(band[1], .6856136666666667)
+        self.assertEqual(detect_layer_by_y(.574737, {"layer1": layer}), "layer1")
+        self.assertIsNone(detect_layer_by_y(.574736, {"layer1": layer}))
         self.assertEqual(
-            _layer_y_band(layer, .02),
-            (.584737, .678947),
+            detect_layer_by_y(.685613, {"layer1": layer}), "layer1"
         )
-        self.assertEqual(detect_layer_by_y(.584737, {"layer1": layer}), "layer1")
-        self.assertIsNone(detect_layer_by_y(.584736, {"layer1": layer}))
+        self.assertIsNone(detect_layer_by_y(.685615, {"layer1": layer}))
+
+    def test_quantized_layer3_base_wins_even_when_bench_layer_overlaps(self):
+        layers = {
+            "layer2": {
+                "y_tolerance": .02,
+                "layer_y": .40,
+                "left_most_pos": {"x": .2, "y": .489474},
+                "rope_pos": {"x": .8, "y": .310526},
+            },
+            "layer3": {
+                "y_tolerance": .02,
+                "layer_y": .310526,
+                "left_most_pos": {"x": .45, "y": .310526},
+                "right_most_pos": {"x": .65, "y": .310526},
+            },
+        }
+
+        # Both bands can contain the same quantized marker coordinate, but
+        # candidate ranking must choose the closest recorded layer base.
+        self.assertEqual(detect_layer_by_y(.310526, layers), "layer3")
+        self.assertEqual(detect_layer_by_y(.316, layers), "layer3")
 
     def test_patrol_start_on_layer3_clears_stale_return_and_starts_fresh(self):
         class Sender:

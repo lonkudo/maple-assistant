@@ -215,10 +215,11 @@ startup does not depend on a recent recording frame or stable contour voting.
   inside a recorded world band. A confirmed rope arrival immediately
   re-anchors world Y to the new layer, so a stale lower-floor reading cannot
   turn a valid final-layer patrol back into the preceding layer before drop.
-- A layer's marker-Y band is `(highest recorded Y - y_tolerance / 2,
-  lowest recorded Y)`. The stored tolerance remains unchanged for update
-  compatibility, but only half is used as the upper arrival margin; the full
-  recorded point span still covers stair-shaped layers.
+- A layer's marker-Y band is `(highest recorded Y - y_tolerance,
+  lowest recorded Y + y_tolerance / 3)`. The full upper margin covers
+  climb/drop arrival motion; the smaller lower margin absorbs OpenCV marker
+  precision noise around the confirmed layer base without excessive overlap.
+  The full recorded point span still covers stair-shaped layers.
 - Stair-shaped layers retain the recorder's canonical anti-alias anchor, but
   also use the saved per-point `observed_world_y` values when their changes
   agree with adaptive diamond-space Y. This creates a real world-Y interval

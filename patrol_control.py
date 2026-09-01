@@ -27,12 +27,14 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    # band = (topmost point Y - half tolerance, lowermost point Y): the margin
-    # is applied only ABOVE the topmost point (where climbs/drops arrive),
-    # not below the lowermost point, so the band does not reach into the
-    # layer BELOW - adjacent floors' bands overlap less.
-    effective_tolerance = max(0.0, float(tolerance)) * 0.5
-    return min(values) - effective_tolerance, max(values)
+    # The full margin above covers climb/drop arrival movement. A smaller
+    # one-third margin below the confirmed layer base absorbs OpenCV marker
+    # precision noise without excessive overlap with the layer below.
+    effective_tolerance = max(0.0, float(tolerance))
+    return (
+        min(values) - effective_tolerance,
+        max(values) + effective_tolerance / 3.0,
+    )
 
 
 def _coherent_observed_world_values(layer: Any) -> list[float]:

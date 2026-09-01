@@ -219,10 +219,11 @@ horizontal cycles.
 ### 5.2 Layer detection
 
 Screen-space floor detection uses a band from the minimum to maximum Y of all
-recorded points on a layer, with half of the stored `y_tolerance` applied above
-the topmost point: `(min(recorded Y) - y_tolerance / 2, max(recorded Y))`.
-No margin is added below the bottommost point. This narrows adjacent-floor
-overlap without removing the recorded vertical span of a stair-shaped layer.
+recorded points on a layer: `(min(recorded Y) - y_tolerance,
+max(recorded Y) + y_tolerance / 3)`. The full margin above covers vertical
+arrival movement; the smaller margin below absorbs OpenCV marker quantization
+at the confirmed layer base without excessive adjacent-floor overlap. The
+recorded vertical span of a stair-shaped layer remains intact.
 World-space detection uses the corresponding scroll-compensated world-Y band.
 The recorder retains both the canonical layer world Y and each point's raw
 `observed_world_y`. Coherent point readings describe stairs or benches. A
