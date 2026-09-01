@@ -167,7 +167,12 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    return min(values) - tolerance, max(values)
+    # Existing recordings store y_tolerance=0.02. Use half of that value for
+    # the upper arrival margin so adjacent/nearby floors cannot both claim a
+    # marker that is visibly on the higher layer. The full recorded point
+    # span still covers stair-shaped paths from highest Y through lowest Y.
+    effective_tolerance = max(0.0, float(tolerance)) * 0.5
+    return min(values) - effective_tolerance, max(values)
 
 
 def _coherent_observed_world_points(

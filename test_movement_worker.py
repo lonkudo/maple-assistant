@@ -29,6 +29,7 @@ from movement_worker import (
     _send_tap,
     _drop_through_platform,
     _dispatched_position_matches,
+    _layer_y_band,
     _layer_world_y_band,
     _layer_world_anchor_at_x,
 )
@@ -42,6 +43,22 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_layer_y_band_uses_half_tolerance_above_recorded_span(self):
+        layer = {
+            "y_tolerance": .02,
+            "layer_y": .636842,
+            "left_most_pos": {"x": .2, "y": .594737},
+            "rope_pos": {"x": .6, "y": .636842},
+            "right_most_pos": {"x": .8, "y": .678947},
+        }
+
+        self.assertEqual(
+            _layer_y_band(layer, .02),
+            (.584737, .678947),
+        )
+        self.assertEqual(detect_layer_by_y(.584737, {"layer1": layer}), "layer1")
+        self.assertIsNone(detect_layer_by_y(.584736, {"layer1": layer}))
+
     def test_patrol_start_on_layer3_clears_stale_return_and_starts_fresh(self):
         class Sender:
             def __init__(self): self.released = []

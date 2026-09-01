@@ -219,7 +219,10 @@ horizontal cycles.
 ### 5.2 Layer detection
 
 Screen-space floor detection uses a band from the minimum to maximum Y of all
-recorded points on a layer, with tolerance applied above the topmost point.
+recorded points on a layer, with half of the stored `y_tolerance` applied above
+the topmost point: `(min(recorded Y) - y_tolerance / 2, max(recorded Y))`.
+No margin is added below the bottommost point. This narrows adjacent-floor
+overlap without removing the recorded vertical span of a stair-shaped layer.
 World-space detection uses the corresponding scroll-compensated world-Y band.
 
 The two signals have explicit priority. A marker Y that matches exactly one
