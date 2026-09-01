@@ -2085,6 +2085,11 @@ class MovementWorker(threading.Thread):
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
         self._route_patrol_cycle = 1
+        # Start Patrol performs its own focused capture and floor detection.
+        # Transfer that result into this worker on its next frame so a stale
+        # Stop/Start climb, return, or route index cannot survive the restart.
+        self._patrol_start_lock = threading.Lock()
+        self._pending_patrol_start_floor: Optional[str] = None
         # A failed stair approach can force the route to reverse direction.
         # Do not immediately count that new endpoint as reached while the
         # marker is still standing at the blocked position.
@@ -3347,6 +3352,82 @@ class MovementWorker(threading.Thread):
             return None
         return self._route_layers[self._route_layer_index]
 
+    def prepare_patrol_start(self, floor: str) -> None:
+        """Queue the independently detected startup floor for this worker."""
+
+        with self._patrol_start_lock:
+            self._pending_patrol_start_floor = str(floor)
+
+    def _apply_pending_patrol_start(
+        self, observation: MinimapObservation
+    ) -> bool:
+        """Begin a fresh patrol or return using Start Patrol's floor result.
+
+        This runs on the movement thread, after the latest route snapshot was
+        loaded, so resetting key/state ownership cannot race normal movement.
+        """
+
+        with self._patrol_start_lock:
+            floor = self._pending_patrol_start_floor
+            self._pending_patrol_start_floor = None
+        if floor is None:
+            return False
+
+        self._release_climb_up()
+        self._release_walk_hold()
+        self._climb_state = ClimbState()
+        self._descending_to_first = False
+        self._return_mode = None
+        self._return_from_floor = None
+        self._return_arrival_floor = None
+        self._fall_pending = False
+        self._fall_frames = 0
+        self._fall_last_y = None
+        self._forced_phase_entry = None
+        self._aligned_frames = 0
+        self._rope_approach_direction = None
+        self._rope_attempted = False
+        self._route_patrol_cycle = 1
+        self._last_drop_attempt = float("-inf")
+        self._patrol_busy_until = 0.0
+        self._reset_stair_state()
+        for event in (
+            self.climbing_active_event,
+            self.dropping_active_event,
+            self.near_rope_event,
+            self.moving_active_event,
+        ):
+            if event is not None:
+                event.clear()
+
+        if floor in self._route_layers:
+            self._start_patrol_on(floor, observation)
+            phases = self._layer_phases(floor)
+            self._route_phase = phases[0] if phases else "stand"
+            LOG.info(
+                "PATROL START: detected %s in patrol range; starting at %s "
+                "cycle 1/%d",
+                floor, self._route_phase, self.patrol_cycles_per_layer,
+            )
+            return True
+
+        self._route_layer_index = None
+        number = _layer_number(floor)
+        self._return_mode = (
+            "climb-to-route" if number < self._patrol_range_min
+            else "drop-to-route"
+        )
+        self._return_from_floor = floor
+        self._reanchor_tracker_to_layer(floor, observation)
+        LOG.warning(
+            "PATROL START: detected %s outside patrol range; %s",
+            floor,
+            "climbing back to route"
+            if self._return_mode == "climb-to-route"
+            else "dropping back to route",
+        )
+        return True
+
     def _start_patrol_on(
         self, floor: str, observation: Optional[MinimapObservation] = None
     ) -> None:
@@ -4433,6 +4514,7 @@ class MovementWorker(threading.Thread):
                     # 连续 3 帧即判定卡住并跳。
                     self._current_stair_jump_stall = 0.012
                 self._sync_patrol_controller(coordinate_layout)
+                self._apply_pending_patrol_start(observation)
                 # Cheap periodic sanity check over the marker already found
                 # above. It can recover from a monster knock-down even when a
                 # stale climb/drop phase would reject normal reconciliation.

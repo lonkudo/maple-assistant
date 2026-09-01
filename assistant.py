@@ -578,28 +578,36 @@ def main() -> int:
                 diamond_height=marker_height,
             )
         snapshot = patrol_controller.snapshot(layout)
-        detected_name = (
-            detect_layer_by_y(marker.y, snapshot.layers)
-            if marker is not None else None
-        )
-        anchor_name = str(detected_name or patrol_controller.first_layer() or (
-            snapshot.route_order[0] if snapshot.route_order else ""
-        ))
-        anchor_layer = snapshot.layers.get(anchor_name, {})
-        anchor_world_y = anchor_layer.get("layer_world_y")
         if not snapshot.route_order:
-            # Nothing recorded: stand-still + attack mode.  Skip the world-Y
-            # re-anchor - there is no patrol route to anchor.
+            # Nothing recorded: stand-still + attack mode. Skip floor/world-Y
+            # setup because there is no patrol route to select.
             logging.info(
                 "MAP SESSION no patrol route recorded; standing still + attack"
             )
             return
+        detected_name = (
+            detect_layer_by_y(marker.y, snapshot.layers)
+            if marker is not None else None
+        )
+        if marker is None:
+            raise OSError(
+                "yellow character marker was not detected during patrol startup"
+            )
+        if detected_name is None:
+            raise OSError(
+                f"character marker Y={marker.y:.6f} does not match any "
+                "recorded layer; record the current map layers again"
+            )
+        anchor_name = str(detected_name)
+        anchor_layer = snapshot.layers.get(anchor_name, {})
+        anchor_world_y = anchor_layer.get("layer_world_y")
         if anchor_world_y is None:
             raise OSError(
                 f"{anchor_name or 'first layer'} has no recorded world Y; "
                 "record this map once"
             )
         structure_tracker.start_session(float(anchor_world_y))
+        movement_worker.prepare_patrol_start(anchor_name)
         logging.info(
             "MAP SESSION detected %s from marker_y=%s; re-anchoring "
             "world_y=%.6f",

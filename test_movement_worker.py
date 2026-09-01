@@ -42,6 +42,103 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
+    def test_patrol_start_on_layer3_clears_stale_return_and_starts_fresh(self):
+        class Sender:
+            def __init__(self): self.released = []
+            def key_up(self, key): self.released.append(key); return True
+
+        positions = {
+            "layer1": {
+                "layer_y": .636842,
+                "left_most_pos": {"x": .20, "y": .594737},
+                "rope_pos": {"x": .60, "y": .636842},
+                "right_most_pos": {"x": .80, "y": .678947},
+            },
+            "layer2": {
+                "layer_y": .489474,
+                "left_most_pos": {"x": .372807, "y": .489474},
+                "right_most_pos": {"x": .697368, "y": .489474},
+                "rope_pos": {"x": .758772, "y": .489474},
+            },
+            "layer3": {
+                "layer_y": .310526,
+                "left_most_pos": {"x": .486842, "y": .310526},
+                "right_most_pos": {"x": .697368, "y": .310526},
+            },
+        }
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions=positions,
+            route_order=["layer1", "layer2", "layer3"],
+            patrol_start_layer="layer2", patrol_end_layer="layer3",
+            patrol_cycles_per_layer=2,
+        )
+        # Simulate state left behind by an earlier fall/Stop Patrol.
+        worker._route_layer_index = 0
+        worker._route_phase = "rope"
+        worker._route_patrol_cycle = 2
+        worker._return_mode = "climb-to-route"
+        worker._return_from_floor = "layer1"
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        observation = MinimapObservation(
+            Point(.609649, .310526), None, .9, (0, 0, 1, 1)
+        )
+
+        worker.prepare_patrol_start("layer3")
+        self.assertTrue(worker._apply_pending_patrol_start(observation))
+
+        self.assertEqual(worker._current_route_floor(), "layer3")
+        self.assertEqual(worker._route_phase, "left")
+        self.assertEqual(worker._route_patrol_cycle, 1)
+        self.assertIsNone(worker._return_mode)
+        self.assertEqual(worker._climb_state.phase, "idle")
+        self.assertEqual(sender.released, ["up"])
+        self.assertEqual(
+            worker._route_target(observation)[2], "layer3.left-most"
+        )
+
+    def test_patrol_start_outside_range_enters_return_from_actual_floor(self):
+        positions = {
+            "layer1": {
+                "layer_y": .636842,
+                "left_most_pos": {"x": .20, "y": .594737},
+                "rope_pos": {"x": .60, "y": .636842},
+                "right_most_pos": {"x": .80, "y": .678947},
+            },
+            "layer2": {
+                "layer_y": .489474,
+                "left_most_pos": {"x": .37, "y": .489474},
+                "right_most_pos": {"x": .70, "y": .489474},
+                "rope_pos": {"x": .76, "y": .489474},
+            },
+            "layer3": {
+                "layer_y": .310526,
+                "left_most_pos": {"x": .49, "y": .310526},
+                "right_most_pos": {"x": .70, "y": .310526},
+            },
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+            route_order=["layer1", "layer2", "layer3"],
+            patrol_start_layer="layer2", patrol_end_layer="layer3",
+        )
+        observation = MinimapObservation(
+            Point(.40, .62), None, .9, (0, 0, 1, 1)
+        )
+
+        worker.prepare_patrol_start("layer1")
+        self.assertTrue(worker._apply_pending_patrol_start(observation))
+
+        self.assertIsNone(worker._route_layer_index)
+        self.assertEqual(worker._return_mode, "climb-to-route")
+        self.assertEqual(worker._return_from_floor, "layer1")
+        target, is_rope, label = worker._route_target(observation)
+        self.assertEqual(target, .60)
+        self.assertTrue(is_rope)
+        self.assertEqual(label, "return.climb")
+
     def test_stair_layer_uses_coherent_observed_world_y_range(self):
         layer = {
             "layer_world_y": 1.5,

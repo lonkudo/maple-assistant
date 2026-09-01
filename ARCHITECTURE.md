@@ -245,6 +245,16 @@ after vertical motion stops; no airborne sample is allowed to redefine the
 world origin. During intentional descent or return-to-route, those dedicated
 states prevent generic resync from hijacking the route.
 
+Start Patrol has a separate state handoff. `prepare_map_session()` performs a
+focused capture, resolves the marker against every recorded layer, establishes
+the initial world anchor, and queues that floor through
+`MovementWorker.prepare_patrol_start()`. The movement thread consumes it only
+after refreshing the current route snapshot, clears all previous vertical and
+endpoint state, then either starts the detected in-range layer at its first
+phase/cycle or enters return-to-route from the detected out-of-range layer.
+Missing/off-band startup markers are fatal to that start attempt, but leave the
+UI and process running with live input disarmed.
+
 ### 5.3 Walking and endpoints
 
 Far movement uses a bounded continuous hold; final correction duration is

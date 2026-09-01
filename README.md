@@ -70,6 +70,13 @@ The application starts with live input disarmed. Input is enabled only after
 Start Patrol first selects and verifies the game in the foreground, then loads
 the normalized minimap border saved by recording and scales it to the current
 client resolution. It does not require the border contour to repeat at startup.
+The focused startup capture must detect the yellow marker inside a recorded
+layer before input is armed. That detected floor is handed directly to the
+movement worker: an in-range floor starts from its first recorded patrol action
+at cycle 1, while an out-of-range floor immediately starts return-to-route.
+Every Start Patrol clears stale climb, drop, fall, stair, and return state left
+by an earlier Stop Patrol, so starting on layer3 cannot inherit a layer1/layer2
+rope recovery.
 For a legacy route without saved calibration, startup can discover an OpenCV
 border only when its region independently contains the yellow character
 diamond; the broad fallback search region is never used as map geometry.
@@ -195,7 +202,9 @@ startup does not depend on a recent recording frame or stable contour voting.
   readings such as `marker_y=0` are ignored.
 - Patrol startup detects the character's actual recorded layer from the fresh
   adaptive minimap before anchoring world Y; it does not assume the character
-  is already on the configured first patrol layer.
+  is already on the configured first patrol layer. Startup refuses to arm
+  movement when the marker is missing or does not match any recorded layer,
+  instead of silently assigning the configured first layer.
 - Layer detection fuses marker Y and scroll-compensated world Y instead of
   letting OpenCV tracking override the visible marker unconditionally. When
   marker Y matches exactly one recorded layer, that unambiguous layer wins;
