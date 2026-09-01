@@ -11,7 +11,7 @@ class CountdownWorkerTests(unittest.TestCase):
     def test_expiry_plays_sound_and_resets_full_interval(self) -> None:
         stop = threading.Event()
         played = []
-        sound = Path("sound/beep.mp3")
+        sound = Path("sound/dingdong.mp3")
         with mock.patch("countdown_worker.SECONDS_PER_HOUR", 1.0):
             worker = CountdownWorker(
                 stop,
@@ -38,7 +38,7 @@ class CountdownWorkerTests(unittest.TestCase):
         stop = threading.Event()
         with mock.patch("countdown_worker.SECONDS_PER_HOUR", 100.0):
             worker = CountdownWorker(
-                stop, sound_path=Path("sound/beep.mp3"),
+                stop, sound_path=Path("sound/dingdong.mp3"),
                 enabled=True, interval_hours=1.0,
             )
             worker.set_remaining_seconds(20.0)
@@ -55,7 +55,7 @@ class CountdownWorkerTests(unittest.TestCase):
         stop = threading.Event()
         with mock.patch("countdown_worker.SECONDS_PER_HOUR", 100.0):
             worker = CountdownWorker(
-                stop, sound_path=Path("sound/beep.mp3"),
+                stop, sound_path=Path("sound/dingdong.mp3"),
                 enabled=True, interval_hours=1.0,
             )
             worker.set_remaining_seconds(20.0)
@@ -67,7 +67,7 @@ class CountdownWorkerTests(unittest.TestCase):
 
     def test_disabled_timer_does_not_accept_remaining_deadline(self) -> None:
         worker = CountdownWorker(
-            threading.Event(), sound_path=Path("sound/beep.mp3"),
+            threading.Event(), sound_path=Path("sound/dingdong.mp3"),
             enabled=False, interval_hours=1.0,
         )
         worker.set_remaining_seconds(20.0)
@@ -75,19 +75,19 @@ class CountdownWorkerTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual(remaining, interval)
 
-    def test_expiry_requests_visual_alert_with_the_beep(self) -> None:
+    def test_expiry_requests_visual_alert_with_the_sound(self) -> None:
         flashes = []
         worker = CountdownWorker(
-            threading.Event(), sound_path=Path("sound/beep.mp3"), enabled=True,
+            threading.Event(), sound_path=Path("sound/dingdong.mp3"), enabled=True,
             play_sound=lambda _path: None, flash_callback=lambda: flashes.append(True),
         )
         worker._fire_and_reset()
         self.assertEqual(flashes, [True])
 
-    def test_expiry_requests_message_alert_with_the_beep(self) -> None:
+    def test_expiry_requests_message_alert_with_the_sound(self) -> None:
         alerts = []
         worker = CountdownWorker(
-            threading.Event(), sound_path=Path("sound/beep.mp3"), enabled=True,
+            threading.Event(), sound_path=Path("sound/dingdong.mp3"), enabled=True,
             play_sound=lambda _path: None, alert_callback=alerts.append,
         )
         worker._fire_and_reset()
@@ -98,7 +98,7 @@ class CountdownWorkerTests(unittest.TestCase):
         flashes = []
         alerts = []
         worker = CountdownWorker(
-            threading.Event(), sound_path=Path("sound/beep.mp3"), enabled=True,
+            threading.Event(), sound_path=Path("sound/dingdong.mp3"), enabled=True,
             play_sound=played.append,
             flash_callback=lambda: flashes.append(True),
             alert_callback=alerts.append,

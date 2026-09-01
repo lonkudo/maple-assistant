@@ -114,7 +114,7 @@ class CharacterWorker(Thread):
         self._alert_sound_path = Path(
             alert_sound_path
             if alert_sound_path is not None
-            else Path(__file__).resolve().parent / "sound" / "beep.mp3"
+            else Path(__file__).resolve().parent / "sound" / "dingdong.mp3"
         )
         self._play_alert_sound = play_alert_sound or play_mp3
         self._flash_callback = flash_callback

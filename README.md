@@ -101,13 +101,13 @@ remains idle before Start Patrol.
   resumes after a short transient dip, and stops patrol after sustained loss.
 - `ShutdownWorker` optionally stops the PC after a configured duration.
 - `CountdownWorker` independently repeats an adjustable countdown, plays
-  `sound/beep.mp3` at zero, and immediately resets for the next interval.
+  `sound/dingdong.mp3` at zero, and immediately resets for the next interval.
 - The optional **掉线警报** consumes `CharacterWorker`'s existing yellow-marker
   result and raises an alert after three consecutive missing frames.
 - The optional **测谎警报** samples the shared full-client capture every one
   second and alarms when it finds a HUD-scaled `#c9ced0` square.
 - The independent **声音提醒**, **闪烁提醒**, and **消息提醒** choices deliver
-  every countdown, disconnect, and lie-detector event through beep audio, two
+  every countdown, disconnect, and lie-detector event through ding-dong audio, two
   red full-screen flashes, and Telegram respectively.
 - The optional **消息提醒** queues those same events to a separate Telegram
   worker with a machine marker, event type, and local timestamp. The worker
@@ -477,7 +477,7 @@ square disappears, a later match can alert again. The detector never saves
 screenshots, so no used image files remain to delete.
 
 The reminder row controls event delivery independently: **声音提醒** plays
-`sound/beep.mp3`; **闪烁提醒** makes the primary screen flash red for 0.5
+`sound/dingdong.mp3`; **闪烁提醒** makes the primary screen flash red for 0.5
 seconds, turn off for 0.3 seconds, then flash red for another 0.5 seconds; and
 **消息提醒** sends Telegram messages. Disabling sound does not disable either
 of the other outputs.

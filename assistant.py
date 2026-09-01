@@ -660,7 +660,7 @@ def main() -> int:
     telegram_notifier = TelegramNotifier(stop_event)
     countdown_worker = CountdownWorker(
         stop_event,
-        sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
+        sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
         enabled=False,
         interval_hours=1.0,
         flash_callback=screen_blinker.request_blink,
@@ -671,7 +671,7 @@ def main() -> int:
         stop_event,
         enabled=False,
         scan_interval=1.0,
-        sound_path=Path(__file__).resolve().parent / "sound" / "beep.mp3",
+        sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
     )
@@ -857,7 +857,7 @@ def main() -> int:
             movement_worker, "_last_minimap_region", None
         ),
         alert_sound_path=(
-            Path(__file__).resolve().parent / "sound" / "beep.mp3"
+            Path(__file__).resolve().parent / "sound" / "dingdong.mp3"
         ),
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,

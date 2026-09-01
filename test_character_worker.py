@@ -16,7 +16,7 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             queue.Queue(), queue.Queue(), threading.Event(),
             disconnect_alert_enabled=enabled,
             disconnect_alert_misses=misses,
-            alert_sound_path=Path("sound/beep.mp3"),
+            alert_sound_path=Path("sound/dingdong.mp3"),
             play_alert_sound=callback,
         )
 
@@ -34,9 +34,9 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
         self.assertFalse(played_event.wait(.05))
         worker._update_disconnect_alert(False)
         self.assertTrue(played_event.wait(.5))
-        self.assertEqual(played, [Path("sound/beep.mp3")])
+        self.assertEqual(played, [Path("sound/dingdong.mp3")])
 
-        # A sustained loss beeps only once. Seeing the marker again re-arms
+        # A sustained loss plays only once. Seeing the marker again re-arms
         # the next independently confirmed loss episode.
         worker._update_disconnect_alert(False)
         worker._update_disconnect_alert(False)
@@ -63,9 +63,9 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             if played:
                 break
             threading.Event().wait(.01)
-        self.assertEqual(played, [Path("sound/beep.mp3")])
+        self.assertEqual(played, [Path("sound/dingdong.mp3")])
 
-    def test_disconnect_alert_requests_visual_alert_with_the_beep(self):
+    def test_disconnect_alert_requests_visual_alert_with_the_sound(self):
         flashed = threading.Event()
         worker = CharacterWorker(
             queue.Queue(), queue.Queue(), threading.Event(),
@@ -75,7 +75,7 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
         worker._update_disconnect_alert(False)
         self.assertTrue(flashed.wait(.5))
 
-    def test_disconnect_alert_requests_message_alert_with_the_beep(self):
+    def test_disconnect_alert_requests_message_alert_with_the_sound(self):
         alerted = threading.Event()
         events = []
 
@@ -126,7 +126,7 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             frames, positions, stop,
             disconnect_alert_enabled=True,
             disconnect_alert_misses=1,
-            alert_sound_path=Path("sound/beep.mp3"),
+            alert_sound_path=Path("sound/dingdong.mp3"),
             play_alert_sound=play,
         )
         frames.put(SimpleNamespace(

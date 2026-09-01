@@ -87,7 +87,7 @@ class LieDetectorWorkerTests(unittest.TestCase):
 
         worker = LieDetectorWorker(
             queue.Queue(), threading.Event(), enabled=True,
-            sound_path=Path("sound/beep.mp3"),
+            sound_path=Path("sound/dingdong.mp3"),
             play_alert_sound=play,
         )
         match = (10, 20, 40, 40)
@@ -101,7 +101,7 @@ class LieDetectorWorkerTests(unittest.TestCase):
         self.assertTrue(played_event.wait(.5))
         self.assertEqual(len(played), 2)
 
-    def test_lie_alert_requests_visual_alert_with_the_beep(self):
+    def test_lie_alert_requests_visual_alert_with_the_sound(self):
         flashed = threading.Event()
         worker = LieDetectorWorker(
             queue.Queue(), threading.Event(), enabled=True,
@@ -110,7 +110,7 @@ class LieDetectorWorkerTests(unittest.TestCase):
         worker._update_alert((10, 20, 40, 40))
         self.assertTrue(flashed.wait(.5))
 
-    def test_lie_alert_requests_message_alert_with_the_beep(self):
+    def test_lie_alert_requests_message_alert_with_the_sound(self):
         alerted = threading.Event()
         events = []
 
@@ -148,7 +148,7 @@ class LieDetectorWorkerTests(unittest.TestCase):
                 image.putpixel((x, y), LIE_COLOR)
         worker = LieDetectorWorker(
             frames, stop, enabled=True, scan_interval=.05,
-            sound_path=Path("sound/beep.mp3"),
+            sound_path=Path("sound/dingdong.mp3"),
             play_alert_sound=lambda _path: alerted.set(),
         )
         worker.start()

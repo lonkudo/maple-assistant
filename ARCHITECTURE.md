@@ -98,7 +98,7 @@ exactly match the movement analysis. This prevents the startup fallback crop
 from overwriting a valid layer marker with a clipped `marker_y=0` reading.
 The optional disconnect alarm consumes that same detector result rather than
 capturing or detecting again. Three consecutive missing results trigger one
-background `sound/beep.mp3`; a later valid marker re-arms the next alert.
+background `sound/dingdong.mp3`; a later valid marker re-arms the next alert.
 
 ## 3. Input ownership and foreground safety
 
@@ -537,7 +537,7 @@ git -c core.quotepath=false ls-files
 | `system_config.json` | Tracked internal calibration, replaced by application updates |
 | `config.json` | Legacy unified backup/migration source; no longer written |
 | Former split settings JSONs | Legacy migration sources only; excluded from releases |
-| `sound/beep.mp3` | Countdown reminder sound shipped in releases |
+| `sound/dingdong.mp3` | Shared countdown and alert sound shipped in releases |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
 | `install.ps1`, `安装.bat` | Request UAC up front, silently bootstrap Python 3.10 in a hidden installer process, then create `.venv`, dependencies, and launchers |
