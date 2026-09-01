@@ -275,7 +275,10 @@ def main() -> int:
         WindowKeySender,
     )
     from attack_worker import AttackWorker
-    from shutdown_worker import ShutdownWorker
+    from random_jump_worker import RandomJumpWorker
+    from hotkey_worker import HotkeyWorker
+    # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
+    # from shutdown_worker import ShutdownWorker
     from countdown_worker import CountdownWorker
     from lie_detector_worker import LieDetectorWorker
     from screen_blinker import ScreenBlinker
@@ -658,12 +661,17 @@ def main() -> int:
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
-    shutdown_worker = ShutdownWorker(
+    random_jump_worker = RandomJumpWorker(
         key_sender,
         stop_event,
-        enabled=False,
-        hours=3.0,
+        climbing_active_event=climbing_active,
+        automation_active_event=automation_active,
     )
+    # TEMPORARILY DISABLED together with its hidden UI controls.
+    # shutdown_worker = ShutdownWorker(...)
+    shutdown_worker = None
+    hotkey_actions: "queue.Queue[str]" = queue.Queue(maxsize=32)
+    hotkey_worker = HotkeyWorker(stop_event, hotkey_actions)
 
     def save_recording_minimap_calibration(snapshot: object) -> None:
         """Publish recording's verified border for independent patrol use."""
@@ -898,7 +906,8 @@ def main() -> int:
         movement_worker,
         status_worker,
         *attack_workers,
-        shutdown_worker,
+        random_jump_worker,
+        hotkey_worker,
         screen_blinker,
         countdown_worker,
         lie_detector_worker,
@@ -924,6 +933,8 @@ def main() -> int:
             map_identity_store=map_identity_store,
             status_worker=status_worker,
             attack_worker=attack_worker,
+            random_jump_worker=random_jump_worker,
+            hotkey_queue=hotkey_actions,
             movement_worker=movement_worker,
             character_worker=character_worker,
             shutdown_worker=shutdown_worker,

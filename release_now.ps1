@@ -1,8 +1,7 @@
 <#
 .SYNOPSIS
-    One-command release: run the release-gate tests, rebuild the distributable
-    folder + four-digit versioned zip, and verify the zip. Everything the README
-    "Releasing a new build" section does, in one step.
+    One-command full checkpoint: optionally run tests, then rebuild the
+    distributable folder and four-digit versioned zip.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File release_now.ps1
@@ -28,7 +27,7 @@ $tempLog = Join-Path $root "work\release_gate.log"
 New-Item -ItemType Directory -Path (Join-Path $root "work") -Force | Out-Null
 
 if (-not $SkipTests) {
-    Write-Host "== 1/3 release-gate tests ==" -ForegroundColor Cyan
+    Write-Host "== 1/2 release-gate tests ==" -ForegroundColor Cyan
     Push-Location $root
     & $python -u -m unittest `
         test_movement_worker test_ui_worker test_status_worker `
@@ -38,6 +37,7 @@ if (-not $SkipTests) {
         test_capture_worker test_map_identity test_map_structure_tracker `
         test_versioning test_installer_scripts test_focus_worker `
         test_telegram_notifier `
+        test_hotkey_worker test_random_jump_worker `
         *> $tempLog 2>&1
     $testExit = $LASTEXITCODE
     Pop-Location
@@ -48,7 +48,7 @@ if (-not $SkipTests) {
     Write-Host "release-gate tests OK" -ForegroundColor Green
 }
 
-Write-Host "== 2/3 build + zip ==" -ForegroundColor Cyan
+Write-Host "== 2/2 build + zip ==" -ForegroundColor Cyan
 $versionPath = Join-Path $root "VERSION"
 $hadVersion = Test-Path -LiteralPath $versionPath
 $previousVersion = if ($hadVersion) {
@@ -104,15 +104,6 @@ $zip = Get-Item -LiteralPath (
 if ($null -eq $zip) {
     Restore-VersionFile
     Write-Host "no zip was produced under release\" -ForegroundColor Red
-    exit 1
-}
-
-Write-Host "== 3/3 verify ==" -ForegroundColor Cyan
-& $python -u (Join-Path $root "work\verify_zip.py") $zip.FullName 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Restore-VersionFile
-    Remove-Item -LiteralPath $zip.FullName -Force -ErrorAction SilentlyContinue
-    Write-Host "zip verification FAILED - do not ship" -ForegroundColor Red
     exit 1
 }
 

@@ -2187,10 +2187,11 @@ class MovementTests(unittest.TestCase):
                     mock.patch("movement_worker.time.sleep"):
                 worker._trigger_other_player_switch(1)
 
-            # Post-switch: route reset to layer1/left and world Y re-anchored
-            # to layer1 - the character respawned at the map entry.
-            self.assertEqual(worker._route_layer_index, 0)
-            self.assertEqual(worker._route_phase, "left")
+            # Post-switch: the physical floor is queued for the movement
+            # thread. It—not the channel-switch thread—will start patrol or
+            # return-to-route from the actual landing floor.
+            self.assertEqual(worker._route_layer_index, 1)
+            self.assertEqual(worker._pending_patrol_start_floor, "layer1")
             self.assertEqual(tracker.anchors, [11.32])
 
     def test_switch_skips_drug_when_hp_healthy(self):
@@ -2351,11 +2352,12 @@ class MovementTests(unittest.TestCase):
         worker.last_observation = MinimapObservation(
             Point(.5, .5), None, .9, (0, 0, 1, 1)
         )
-        with mock.patch.object(worker, "_on_first_layer",
-                               side_effect=[False, True]), \
+        with mock.patch.object(worker, "_detect_floor_all",
+                               side_effect=["layer2", "layer1"]), \
                 mock.patch("movement_worker.time.sleep"):
-            worker._drop_to_first_layer()
+            landed = worker._drop_to_first_layer()
         # Exactly one Alt+Down chord, then stop.
+        self.assertEqual(landed, "layer1")
         self.assertEqual(sender.events.count(("down", "down")), 1)
         self.assertEqual(sender.events.count(("down", "alt")), 1)
 

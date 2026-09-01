@@ -100,11 +100,17 @@ remains idle before Start Patrol.
   rope approach/climbing, fall recovery, route return, and self-rescue.
 - `StatusWorker` reads HP/MP/EXP and sends configured potion or buff keys.
 - `AttackWorker` performs the optional fixed-rate attack mode.
+- `RandomJumpWorker` optionally taps the fixed jump key on its own independently
+  configured `base + random gap` timer and observes the same patrol/climb input
+  gates as fixed attack.
+- `HotkeyWorker` listens only for physical Ctrl chords, ignores injected
+  `SendInput` events, and queues UI actions without calling Tk from its hook.
 - The UI can launch `yolo-detection/live_view.py` as a second process for
   target-aware attacks and main-screen rope sensing.
 - `FocusWorker` releases held keys on a focus dip, tries to refocus the game,
   resumes after a short transient dip, and stops patrol after sustained loss.
-- `ShutdownWorker` optionally stops the PC after a configured duration.
+- Scheduled shutdown is temporarily hidden and its preserved `ShutdownWorker`
+  is not started.
 - `CountdownWorker` independently repeats an adjustable countdown, plays
   `sound/dingdong.mp3` at zero, and immediately resets for the next interval.
 - The optional **掉线警报** consumes `CharacterWorker`'s existing yellow-marker
@@ -123,6 +129,13 @@ remains idle before Start Patrol.
 See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
 inventory.
+
+The **攻击模式** panel also contains optional **随机跳跃**. It always uses Alt
+(no key-binding field), owns a separate worker, and has its own base-time slider
+plus 0.1-second random-gap buttons. Its actual interval is shown beside the
+slider as `(base, base + random_gap)`. Fixed attack uses the same compact range
+display. The former long “随机攻击间隔” hint is hidden. The scheduled-shutdown
+row is temporarily hidden and no shutdown worker is started.
 
 ## Recording and patrol behavior
 
@@ -388,26 +401,33 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
 
 ### Workflow
 
-- Tests: `.venv\Scripts\python.exe -m unittest <modules>`; full gate =
-  `release_now.ps1` (uses `yolo-detection\venv313` when present).
-- Release + commit every change: `powershell -NoProfile -ExecutionPolicy Bypass
-  -File .\release_now.ps1`, then `git add` the changed source/tests/docs +
-  `VERSION`, commit on `feature/continue-development`, push to origin.
+- Every behavior change always gets a new four-digit release package.
+- Routine iterations do not repeatedly update these documents, run the full
+  test/verification gate, or create Git commits. Do those checkpoint tasks only
+  when the user explicitly says **update**, or immediately before context is
+  nearly exhausted and the session must be compacted.
+- ZIP verification through the former ignored `work\verify_zip.py` helper was
+  redundant and has been removed from the publishing procedure.
+- At a checkpoint, update `README.md` and `ARCHITECTURE.md`, run relevant tests,
+  review/stage only intended tracked files, commit on
+  `feature/continue-development`, and push when available.
 - PowerShell uses `;` not `&&`; avoid `(Get-Content -Raw)` re-writes of UTF-8
   files (encoding corruption history: use the edit tool instead).
 
 ## Publishing a release
 
-Every project update must produce a new release and a Git commit. Run the
-canonical workflow from the repository root:
+Every project update must produce a new package. For a quick iteration, advance
+`VERSION` and run `build_release.ps1 -Version NNNN -Zip`. For a requested
+checkpoint, run:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
 ```
 
-`发布.bat` invokes the same script. A real release must not use `-SkipTests`.
+`发布.bat` invokes the same script. `-SkipTests` is appropriate for an ordinary
+iteration; omit it when the user requests an update/checkpoint.
 
-The script performs three gated stages:
+The script performs two stages:
 
 1. **Release-gate tests** using
    `yolo-detection\venv313\Scripts\python.exe` when present, otherwise
@@ -416,20 +436,15 @@ The script performs three gated stages:
 2. **Advance version, build, and ZIP.** `VERSION` is a four-digit counter from
    `0000` through `9999`. A missing file starts at `0000`; every later
    successful `release_now.ps1` run advances it once. The value is restored if
-   build or verification fails. `build_release.ps1` receives that version. The destination
+   the build fails. `build_release.ps1` receives that version. The destination
    `release\MapleAssistant\` is rebuilt from scratch, runtime files and model
    weights are copied, ignored development/test artifacts are excluded, old
    ZIPs are removed, and `MapleAssistant-v{0000..9999}.zip` is created. The
    packaged `VERSION` file drives the visible `Maple 助手 (vNNNN)` UI label.
-3. **ZIP verification** via `work\verify_zip.py`. A verification failure means
-   the ZIP must not be shipped.
-
 Important publishing details:
 
 - `build_release.ps1` must remain UTF-8 with BOM for Windows PowerShell 5.1.
   `release_now.ps1` repairs the BOM automatically when needed.
-- `work\verify_zip.py` is currently a required local helper inside a
-  Git-ignored directory. Confirm it exists before publishing on a fresh clone.
 - Version `9999` is terminal: publishing stops with an error instead of
   wrapping back to `0000`.
 - `release\` is Git-ignored. The ZIP is a delivery artifact, not part of the
@@ -439,7 +454,7 @@ Important publishing details:
   internal fixes follow the application version.
 - A successful command prints `release ready: <absolute zip path>`.
 
-After a successful release, save the source change:
+At an update/checkpoint, save the source change after the release:
 
 ```powershell
 git diff --check
@@ -449,8 +464,7 @@ git commit -m "describe the completed change"
 git status --short
 ```
 
-The final status should be clean. Record the release ZIP name and commit hash in
-the session handoff.
+Record the release ZIP name every time. Record the commit hash at checkpoints.
 
 ## Development checks
 
@@ -460,9 +474,8 @@ Run a focused test first, then the relevant module suite. For movement work:
 py -3.10 -m unittest test_movement_worker
 ```
 
-The canonical release gate is defined in `release_now.ps1`; do not maintain a
-second handwritten test list in this README. Run the release script before
-shipping even when focused tests already passed.
+The optional full checkpoint gate is defined in `release_now.ps1`; do not
+maintain a second handwritten test list here.
 
 Stop a console run with `Ctrl+C`. Keep the game visible during calibration and
 use `--dry-run` whenever input injection is not intended.
@@ -511,3 +524,22 @@ the Windows clipboard; double-click it to focus the game, open chat with Enter,
 paste with Ctrl+V, and send with Enter; long-press it for one second to edit it;
 and long-press its adjacent `×` button for one second to delete it. Quick messages are stored
 in the ignored `user_config.json` and survive application updates.
+
+## Physical hotkeys and action sounds
+
+`hotkey.json` owns the global bindings. `HotkeyWorker` uses a low-level Windows
+keyboard hook, ignores `LLKHF_INJECTED`/lower-integrity injected events, and
+does not add a custom `dwExtraInfo` fingerprint. Unrelated keys pass through
+normally. The matched chord's second key is consumed and each physical press
+fires once until released:
+
+- `Ctrl+1` through `Ctrl+0` send the oldest ten quick messages. The binding is
+  positional: deleting a message shifts every later message/key forward.
+- `Ctrl+Left` records the selected layer's left-most point.
+- `Ctrl+Right` records the selected layer's right-most point.
+- `Ctrl+grave` (Ctrl plus the backtick key) toggles Start/Stop Patrol.
+
+Recording is blocked while patrol is active. A successful recording or patrol
+start plays `sound/success.mp3`; a recording failure, blocked recording, or
+patrol stop plays `sound/fail.mp3`. Playback runs outside Tk so it cannot freeze
+the UI.

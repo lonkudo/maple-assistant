@@ -29,6 +29,7 @@ from minimap_detector import (
 from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
+from countdown_worker import play_mp3
 from versioning import version_label
 
 
@@ -494,6 +495,9 @@ class UiWorker(threading.Thread):
     # Keep the implementation below intact so it can be restored quickly;
     # README.md documents the matching installer change.
     _YOLO_MONSTER_DETECTION_ENABLED = False
+    # TEMPORARY: keep scheduled-shutdown code/settings available, but do not
+    # expose its controls or start its worker.
+    _SHOW_SHUTDOWN_PANEL = False
     _FIXED_RANDOM_GAP_STEP = 0.1
     _FIXED_RANDOM_GAP_MAX = 5.0
 
@@ -511,6 +515,8 @@ class UiWorker(threading.Thread):
         map_identity_store: Optional[MapIdentityStore] = None,
         status_worker: Any = None,
         attack_worker: Any = None,
+        random_jump_worker: Any = None,
+        hotkey_queue: Optional["queue.Queue[str]"] = None,
         movement_worker: Any = None,
         character_worker: Any = None,
         shutdown_worker: Any = None,
@@ -541,6 +547,10 @@ class UiWorker(threading.Thread):
         # Fixed-rate attack worker (AttackWorker) the Fixed Attack panel
         # toggles: enabled flag, interval and attack key are applied live.
         self.attack_worker = attack_worker
+        # Independent Alt timer. It shares only the attack worker's runtime
+        # gating events and exposes no configurable key binding.
+        self.random_jump_worker = random_jump_worker
+        self.hotkey_queue = hotkey_queue
         # Movement worker whose jump-rope logic follows the attack mode:
         # Fixed Attack mode runs without YOLO, so the minimap logic must own
         # the rope jump there.
@@ -961,26 +971,66 @@ class UiWorker(threading.Thread):
                 fixed_key_row, text="3.0s", width=5
             )
             self._fixed_interval_label.pack(side="left", padx=(0, 6))
-            ttk.Label(fixed_key_row, text="随机间差:").pack(side="left")
+            self._fixed_range_label = ttk.Label(
+                fixed_key_row, text="(3.0s, 3.1s)", width=14
+            )
+            self._fixed_range_label.pack(side="left")
+            fixed_gap_row = ttk.Frame(fixed_panel)
+            fixed_gap_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(fixed_gap_row, text="随机间差:").pack(side="left")
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
             ttk.Button(
-                fixed_key_row, text="−", width=2,
+                fixed_gap_row, text="−", width=2,
                 command=lambda: self._fixed_adjust_random_gap(-0.1),
             ).pack(side="left", padx=(3, 2))
             self._fixed_random_gap_label = ttk.Label(
-                fixed_key_row, text="0.1s", width=5, anchor="center"
+                fixed_gap_row, text="0.1s", width=5, anchor="center"
             )
             self._fixed_random_gap_label.pack(side="left")
             ttk.Button(
-                fixed_key_row, text="+", width=2,
+                fixed_gap_row, text="+", width=2,
                 command=lambda: self._fixed_adjust_random_gap(0.1),
             ).pack(side="left", padx=(2, 0))
-            self._fixed_range_label = ttk.Label(
-                fixed_panel,
-                text="随机攻击间隔: (3.0s, 3.1s)  基础=3.0s + 随机=0.0~0.1s",
-                justify="left",
+
+            jump_row = ttk.Frame(fixed_panel)
+            jump_row.pack(fill="x", pady=(6, 0))
+            self._random_jump_enabled_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                jump_row, text="随机跳跃",
+                variable=self._random_jump_enabled_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", padx=(0, 8))
+            ttk.Label(jump_row, text="每").pack(side="left")
+            self._random_jump_interval_var = tk.DoubleVar(value=3.0)
+            ttk.Scale(
+                jump_row, from_=0.5, to=10.0, orient="horizontal",
+                length=105, variable=self._random_jump_interval_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", padx=(0, 6))
+            self._random_jump_interval_label = ttk.Label(
+                jump_row, text="3.0s", width=5
             )
-            self._fixed_range_label.pack(anchor="w", pady=(6, 0))
+            self._random_jump_interval_label.pack(side="left", padx=(0, 6))
+            self._random_jump_range_label = ttk.Label(
+                jump_row, text="(3.0s, 3.1s)", width=14
+            )
+            self._random_jump_range_label.pack(side="left")
+            jump_gap_row = ttk.Frame(fixed_panel)
+            jump_gap_row.pack(fill="x", pady=(4, 0))
+            ttk.Label(jump_gap_row, text="跳跃随机间差:").pack(side="left")
+            self._random_jump_gap_var = tk.DoubleVar(value=0.1)
+            ttk.Button(
+                jump_gap_row, text="−", width=2,
+                command=lambda: self._random_jump_adjust_gap(-0.1),
+            ).pack(side="left", padx=(3, 2))
+            self._random_jump_gap_label = ttk.Label(
+                jump_gap_row, text="0.1s", width=5, anchor="center"
+            )
+            self._random_jump_gap_label.pack(side="left")
+            ttk.Button(
+                jump_gap_row, text="+", width=2,
+                command=lambda: self._random_jump_adjust_gap(0.1),
+            ).pack(side="left", padx=(2, 0))
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left",
                 wraplength=440,
@@ -1178,7 +1228,8 @@ class UiWorker(threading.Thread):
             )
             extra_panel.pack(fill="x", pady=(0, 8))
             shutdown_row = ttk.Frame(extra_panel)
-            shutdown_row.pack(fill="x")
+            if self._SHOW_SHUTDOWN_PANEL:
+                shutdown_row.pack(fill="x")
             self._shutdown_enabled_var = tk.BooleanVar(value=False)
             shutdown_check = ttk.Checkbutton(
                 shutdown_row, text="运行后定时关闭",
@@ -1211,10 +1262,13 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            self._shutdown_status.pack(anchor="w", pady=(6, 0))
+            if self._SHOW_SHUTDOWN_PANEL:
+                self._shutdown_status.pack(anchor="w", pady=(6, 0))
 
             alarm_row = ttk.Frame(extra_panel)
-            alarm_row.pack(fill="x", pady=(8, 0))
+            alarm_row.pack(
+                fill="x", pady=((8 if self._SHOW_SHUTDOWN_PANEL else 0), 0)
+            )
             ttk.Label(alarm_row, text="警报:").pack(side="left")
 
             self._disconnect_alert_var = tk.BooleanVar(value=False)
@@ -1473,7 +1527,51 @@ class UiWorker(threading.Thread):
         self._refresh_countdown_status()
         self._refresh_telegram_status()
         self._poll_yolo_exit()
+        self._drain_hotkey_actions()
         root.after(self.refresh_ms, self._poll)
+
+    def _drain_hotkey_actions(self) -> None:
+        """Run physical hotkey actions safely on Tk's owning thread."""
+
+        actions = self.hotkey_queue
+        if actions is None:
+            return
+        while True:
+            try:
+                action = actions.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if action.startswith("quick_message:"):
+                    self._send_quick_message(int(action.partition(":")[2]))
+                elif action.startswith("record:"):
+                    boundary = action.partition(":")[2]
+                    self._record_endpoint(boundary)
+                elif action == "toggle_patrol":
+                    if (self.patrol_controller is not None
+                            and self.patrol_controller.is_enabled()):
+                        self._stop_patrol()
+                    else:
+                        self._start_patrol()
+            except Exception:
+                LOG.exception("hotkey action failed: %s", action)
+                self._play_action_sound(False)
+            finally:
+                try:
+                    actions.task_done()
+                except (AttributeError, ValueError):
+                    pass
+
+    def _play_action_sound(self, success: bool) -> None:
+        """Play UI action feedback without blocking Tk."""
+
+        name = "success.mp3" if success else "fail.mp3"
+        path = Path(__file__).resolve().parent / "sound" / name
+        threading.Thread(
+            target=play_mp3, args=(path,),
+            name=f"action-sound-{'success' if success else 'fail'}",
+            daemon=True,
+        ).start()
 
     def _poll_yolo_exit(self) -> None:
         """Detect a YOLO subprocess that died silently (usually missing deps)."""
@@ -1667,10 +1765,15 @@ class UiWorker(threading.Thread):
                 return None
         return snapshot
 
-    def _record_endpoint(self, boundary: str) -> None:
+    def _record_endpoint(self, boundary: str) -> bool:
         if self.patrol_controller is None:
             self._control_status.configure(text="巡逻控制器不可用。")
-            return
+            self._play_action_sound(False)
+            return False
+        if self.patrol_controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法录制，请先停止巡逻。")
+            self._play_action_sound(False)
+            return False
         snapshot = self._capture_snapshot_for_recording()
         if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
             LOG.warning(
@@ -1684,7 +1787,8 @@ class UiWorker(threading.Thread):
             self._control_status.configure(
                 text="无法录制: 最新画面中未检测到黄色菱形标记。"
             )
-            return
+            self._play_action_sound(False)
+            return False
         if not is_verified_border(snapshot.detection):
             LOG.warning(
                 "RECORD REJECTED: border source=%s window=%s client=%s",
@@ -1695,7 +1799,8 @@ class UiWorker(threading.Thread):
             self._control_status.configure(
                 text="无法录制: 未检测到可保存的小地图边框。"
             )
-            return
+            self._play_action_sound(False)
+            return False
         try:
             # Border calibration is an independent recording output. Save it
             # before route coordinates so patrol never depends on UI timing.
@@ -1719,7 +1824,8 @@ class UiWorker(threading.Thread):
             LOG.warning("record rejected: layer=%s point=%s error=%s",
                         self.patrol_controller.selected_layer(), boundary, exc)
             self._control_status.configure(text=f"无法录制: {exc}")
-            return
+            self._play_action_sound(False)
+            return False
         labels = {
             "left_most_pos": "最左",
             "rope_pos": "绳索",
@@ -1734,6 +1840,8 @@ class UiWorker(threading.Thread):
                   f"x={recorded.x:.6f}, y={recorded.y:.6f}")
         )
         self._refresh_patrol_controls()
+        self._play_action_sound(True)
+        return True
 
     def _yolo_settings_path(self) -> Path:
         """JSON file holding the YOLO panel settings."""
@@ -1804,6 +1912,16 @@ class UiWorker(threading.Thread):
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
+            "random_jump_enabled": bool(
+                getattr(self, "_random_jump_enabled_var", None).get()
+                if hasattr(self, "_random_jump_enabled_var") else False
+            ),
+            "random_jump_interval_seconds": round(
+                float(getattr(self, "_random_jump_interval_var", None).get())
+                if hasattr(self, "_random_jump_interval_var") else 3.0,
+                1,
+            ),
+            "random_jump_gap_seconds": self._random_jump_gap_seconds(),
         }
 
     def _fixed_random_gap_seconds(self) -> float:
@@ -1828,6 +1946,26 @@ class UiWorker(threading.Thread):
         self._fixed_random_gap_var.set(value)
         self._fixed_on_change()
 
+    def _random_jump_gap_seconds(self) -> float:
+        """Return the clamped random-jump delay ceiling."""
+
+        var = getattr(self, "_random_jump_gap_var", None)
+        raw = 0.1 if var is None else float(var.get())
+        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+
+    def _random_jump_adjust_gap(self, delta: float) -> None:
+        current = self._random_jump_gap_seconds()
+        value = round(
+            max(0.0, min(
+                self._FIXED_RANDOM_GAP_MAX,
+                current + (self._FIXED_RANDOM_GAP_STEP if delta > 0
+                           else -self._FIXED_RANDOM_GAP_STEP),
+            )),
+            1,
+        )
+        self._random_jump_gap_var.set(value)
+        self._fixed_on_change()
+
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
 
@@ -1845,9 +1983,19 @@ class UiWorker(threading.Thread):
             self._fixed_random_gap_label.configure(text=f"{random_gap:.1f}s")
         if hasattr(self, "_fixed_range_label"):
             self._fixed_range_label.configure(
-                text=(f"随机攻击间隔: ({interval:.1f}s, "
-                      f"{interval + random_gap:.1f}s)  "
-                      f"基础={interval:.1f}s + 随机=0.0~{random_gap:.1f}s")
+                text=f"({interval:.1f}s, {interval + random_gap:.1f}s)"
+            )
+        if hasattr(self, "_random_jump_interval_var"):
+            jump_interval = float(self._random_jump_interval_var.get())
+            jump_gap = self._random_jump_gap_seconds()
+            self._random_jump_gap_var.set(jump_gap)
+            self._random_jump_interval_label.configure(
+                text=f"{jump_interval:.1f}s"
+            )
+            self._random_jump_gap_label.configure(text=f"{jump_gap:.1f}s")
+            self._random_jump_range_label.configure(
+                text=(f"({jump_interval:.1f}s, "
+                      f"{jump_interval + jump_gap:.1f}s)")
             )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
@@ -1896,6 +2044,18 @@ class UiWorker(threading.Thread):
         if not worker.set_key(key):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
                         key, worker.attack_key)
+        jump_worker = getattr(self, "random_jump_worker", None)
+        if jump_worker is not None:
+            jump_worker.enabled = bool(
+                data.get("random_jump_enabled", False)
+            )
+            jump_worker.jump_interval = max(
+                0.25,
+                float(data.get("random_jump_interval_seconds", 3.0)),
+            )
+            jump_worker.jump_jitter_seconds = max(
+                0.0, float(data.get("random_jump_gap_seconds", 0.1))
+            )
 
     def _fixed_refresh_grey(self) -> None:
         """Grey the YOLO panel + update status lines for the active mode."""
@@ -1995,6 +2155,21 @@ class UiWorker(threading.Thread):
                 key = str(data["attack_key"]).strip()
                 if key in BINDABLE_KEYS:
                     self._fixed_attack_key_var.set(key)
+            if ("random_jump_enabled" in data
+                    and hasattr(self, "_random_jump_enabled_var")):
+                self._random_jump_enabled_var.set(bool(
+                    data["random_jump_enabled"]
+                ))
+            if ("random_jump_interval_seconds" in data
+                    and hasattr(self, "_random_jump_interval_var")):
+                self._random_jump_interval_var.set(float(
+                    data["random_jump_interval_seconds"]
+                ))
+            if ("random_jump_gap_seconds" in data
+                    and hasattr(self, "_random_jump_gap_var")):
+                self._random_jump_gap_var.set(float(
+                    data["random_jump_gap_seconds"]
+                ))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed fixed attack settings",
                         exc_info=True)
@@ -2504,22 +2679,29 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
         self._quick_message_press_job = None
+        self._send_quick_message(index)
+        return "break"
+
+    def _send_quick_message(self, index: int) -> bool:
+        """Send one live list item; deletion naturally shifts later keys."""
+
         if not self._copy_quick_message(index):
-            return "break"
+            return False
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
         send = getattr(sender, "send_clipboard_message", None)
         if send is None:
             self._quick_message_status.configure(text="发送失败：游戏输入未接入。")
-            return "break"
+            return False
         try:
             if send() is False:
                 raise OSError("无法聚焦游戏窗口")
             self._quick_message_status.configure(
                 text=f"已发送：{self._quick_messages[index]}"
             )
+            return True
         except Exception as exc:
             self._quick_message_status.configure(text=f"发送失败：{exc}")
-        return "break"
+            return False
 
     def _quick_message_begin_edit(self, index: int) -> None:
         self._quick_message_press_job = None
@@ -3235,18 +3417,20 @@ class UiWorker(threading.Thread):
         )
         self._refresh_patrol_controls()
 
-    def _start_patrol(self) -> None:
+    def _start_patrol(self) -> bool:
         if self.patrol_controller is None:
             self._control_status.configure(text="巡逻控制器不可用。")
-            return
+            self._play_action_sound(False)
+            return False
         if self.patrol_controller.is_enabled():
-            return
+            return True
         if not self.patrol_controller.can_start():
             self._control_status.configure(
                 text=("无法开始: 每层至少录制一个巡逻点 (最左 / 绳索 / 最右)。"
                       "不录制任何点时将原地站立只进行攻击。")
             )
-            return
+            self._play_action_sound(False)
+            return False
         self._control_status.configure(text="正在选择游戏窗口…")
         if self._root is not None:
             self._root.update_idletasks()
@@ -3257,7 +3441,8 @@ class UiWorker(threading.Thread):
                 self._control_status.configure(
                     text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
-                return
+                self._play_action_sound(False)
+                return False
         self.patrol_controller.set_enabled(True)
         # 攻击模式为「YOLO 检测」时，开始巡逻自动启动 YOLO 检测
         # （已在运行则跳过；缺依赖/模型会在状态栏给出提示）。
@@ -3266,10 +3451,13 @@ class UiWorker(threading.Thread):
             self._yolo_start()
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已开始。")
+        self._play_action_sound(True)
+        return True
 
-    def _stop_patrol(self) -> None:
+    def _stop_patrol(self) -> bool:
         if self.patrol_controller is None:
-            return
+            self._play_action_sound(False)
+            return False
         self.patrol_controller.set_enabled(False)
         if self.on_patrol_stop is not None:
             self.on_patrol_stop()
@@ -3281,6 +3469,8 @@ class UiWorker(threading.Thread):
         self._trim_log_lines(100)
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已停止。")
+        self._play_action_sound(False)
+        return True
 
     def _add_layer_above(self) -> None:
         if self.patrol_controller is None:

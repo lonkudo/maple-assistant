@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "ignore_injected": true,
+  "bindings": [
+    {"keys": "ctrl+1", "action": "quick_message:0", "block_original": true},
+    {"keys": "ctrl+2", "action": "quick_message:1", "block_original": true},
+    {"keys": "ctrl+3", "action": "quick_message:2", "block_original": true},
+    {"keys": "ctrl+4", "action": "quick_message:3", "block_original": true},
+    {"keys": "ctrl+5", "action": "quick_message:4", "block_original": true},
+    {"keys": "ctrl+6", "action": "quick_message:5", "block_original": true},
+    {"keys": "ctrl+7", "action": "quick_message:6", "block_original": true},
+    {"keys": "ctrl+8", "action": "quick_message:7", "block_original": true},
+    {"keys": "ctrl+9", "action": "quick_message:8", "block_original": true},
+    {"keys": "ctrl+0", "action": "quick_message:9", "block_original": true},
+    {"keys": "ctrl+left", "action": "record:left_most_pos", "block_original": true},
+    {"keys": "ctrl+right", "action": "record:right_most_pos", "block_original": true},
+    {"keys": "ctrl+grave", "action": "toggle_patrol", "block_original": true}
+  ]
+}

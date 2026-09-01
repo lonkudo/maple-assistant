@@ -1628,8 +1628,8 @@ class MovementWorker(threading.Thread):
         try:
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
-            self._drop_to_first_layer()
-            self._restart_patrol_from_first_layer()
+            landed_floor = self._drop_to_first_layer()
+            self._restart_patrol_from_first_layer(landed_floor)
         except Exception:
             LOG.exception("self-rescue failed")
         finally:
@@ -2696,8 +2696,8 @@ class MovementWorker(threading.Thread):
                 # The character may not respawn at layer1: drop down to it
                 # first, then restart the patrol from a clean layer1 state
                 # (route + world-Y anchor reset).
-                self._drop_to_first_layer()
-                self._restart_patrol_from_first_layer()
+                landed_floor = self._drop_to_first_layer()
+                self._restart_patrol_from_first_layer(landed_floor)
         except Exception:
             LOG.exception("player channel switch failed")
         finally:
@@ -2705,71 +2705,83 @@ class MovementWorker(threading.Thread):
                 self.patrol_controller.set_enabled(True)
             self._player_switch_active = False
 
-    def _drop_to_first_layer(self) -> None:
-        """Drop through platforms until the character stands on layer1.
+    def _bottom_recorded_layer(self) -> Optional[str]:
+        """Return the physical bottom recorded floor, independent of route.
 
-        After a channel change the character can spawn on ANY layer (not
-        necessarily layer1).  Repeated Alt+Down chords fall through the
-        platforms; the loop ends when the minimap marker reaches layer1's
-        band (marker-Y check, robust against the stale world-Y anchor
-        right after a channel change).  Capped so a stuck character cannot
-        drop forever.
+        ``first_layer`` is the configured patrol-range start and can therefore
+        be layer2/layer3.  Self-rescue must instead descend to the map's real
+        bottom before handing control back to return-to-route.
         """
 
-        if (self.first_layer is None
-                or self.first_layer not in self._route_layers):
-            return
-        if len(self._route_layers) <= 1:
-            # Single-layer route: the character is already on the first
-            # (and only) layer - there is no lower platform to drop
-            # through.  Skipping keeps the self-rescue instant instead of
-            # pressing Alt+Down up to 30 times against the ground.
-            LOG.info("single-layer map: skipping drop to %s", self.first_layer)
-            return
+        floors = [
+            name for name, layer in self.important_positions.items()
+            if isinstance(layer, dict) and "layer_y" in layer
+        ]
+        return min(floors, key=_layer_number) if floors else None
+
+    def _drop_to_first_layer(self) -> Optional[str]:
+        """Drop through platforms until the physical bottom floor is reached.
+
+        After a channel change the character can spawn on ANY layer (not
+        necessarily the patrol-range start).  Before every Alt+Down chord the
+        latest marker is matched against *all* recorded floor bands.  This is
+        deliberately marker-first and does not trust a stale world-Y anchor.
+        Capped so a stuck character cannot drop forever.
+        """
+
+        bottom_floor = self._bottom_recorded_layer()
+        if bottom_floor is None:
+            LOG.warning("self-rescue drop: no recorded floor is available")
+            return None
         max_attempts = 30
         for attempt in range(1, max_attempts + 1):
             obs = self.last_observation
-            if obs is not None and self._on_first_layer(obs):
-                LOG.info("channel-switch drop: reached %s (attempt %d)",
-                         self.first_layer, attempt)
-                return
-            LOG.info("channel-switch drop: attempt %d/%d (Alt+Down)",
-                     attempt, max_attempts)
+            detected_floor = (
+                self._detect_floor_all(obs) if obs is not None else None
+            )
+            if detected_floor == bottom_floor:
+                self._reanchor_tracker_to_layer(bottom_floor, obs)
+                LOG.info(
+                    "self-rescue drop: reached physical bottom %s "
+                    "(attempt %d); patrol start is %s",
+                    bottom_floor, attempt, self.first_layer,
+                )
+                return bottom_floor
+            LOG.info(
+                "self-rescue drop: current=%s target=%s attempt %d/%d "
+                "(Alt+Down)",
+                detected_floor or "unknown", bottom_floor,
+                attempt, max_attempts,
+            )
             try:
                 _drop_through_platform(
                     self.key_sender, self.drop_chord_hold_seconds
                 )
             except Exception:
-                LOG.warning("drop suppressed during channel-switch descent",
+                LOG.warning("drop suppressed during self-rescue descent",
                             exc_info=True)
             time.sleep(self.drop_retry_seconds)
-        LOG.warning("channel-switch drop: gave up after %d attempts",
-                    max_attempts)
-
-    def _restart_patrol_from_first_layer(self) -> None:
-        """Reset the route + world-Y anchor to the first layer (post-switch)."""
-
-        if (not self._route_layers or self.first_layer is None
-                or self.first_layer not in self._route_layers):
-            return
-        self._reset_route_loop()
-        layer = self.important_positions.get(self.first_layer, {})
-        anchor_world_y = (
-            layer.get("layer_world_y") if isinstance(layer, dict) else None
+        LOG.warning(
+            "self-rescue drop: gave up after %d attempts without confirming %s",
+            max_attempts, bottom_floor,
         )
-        if anchor_world_y is not None and self.structure_tracker is not None:
-            reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
-            start_session = getattr(
-                self.structure_tracker, "start_session", None
-            )
-            if callable(reanchor):
-                reanchor(float(anchor_world_y))
-                LOG.info("MAP LOOP reset world Y at %s=%.6f",
-                         self.first_layer, float(anchor_world_y))
-            elif callable(start_session):
-                start_session(float(anchor_world_y))
-        LOG.info("channel switch complete: patrol restarted from %s",
-                 self.first_layer)
+        return None
+
+    def _restart_patrol_from_first_layer(
+        self, landed_floor: Optional[str]
+    ) -> None:
+        """Queue patrol/return state from the floor rescue actually reached."""
+
+        if landed_floor is None or not self._route_layers:
+            return
+        # Apply on the movement thread after the controller is re-enabled.
+        # If the physical bottom is below the configured patrol range this
+        # naturally enters climb-to-route instead of pretending it is layer2.
+        self.prepare_patrol_start(landed_floor)
+        LOG.info(
+            "self-rescue complete on %s; queued fresh patrol/return detection",
+            landed_floor,
+        )
 
     def _other_players_on_latest_frame(self) -> int:
         """Red-diamond count on the most recent loop frame (post-switch)."""

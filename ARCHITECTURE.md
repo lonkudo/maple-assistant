@@ -26,8 +26,10 @@ assistant.py (primary process)
     MovementWorker     route, walk/Z, stairs, climb, drop, recovery
     StatusWorker       HP/MP detection, potions, buffs
     AttackWorker       optional fixed-rate attack
+    RandomJumpWorker   optional independent timed Alt jump
+    HotkeyWorker       physical-only Ctrl chord hook -> UI action queue
     FocusWorker        foreground gate, refocus, key release
-    ShutdownWorker     optional timed shutdown
+    ShutdownWorker     preserved but temporarily not constructed
     CountdownWorker    independent repeating MP3 reminder
     LieDetectorWorker  1-second full-client pure-white-square alarm
     ScreenBlinker       optional two-flash red visual alarm
@@ -116,6 +118,15 @@ implementation. It:
 The UI starts with input disarmed. **Start Patrol** prepares the map session,
 selects the game window, and arms input. **Stop Patrol** disables input and
 releases keys.
+
+`HotkeyWorker` installs `WH_KEYBOARD_LL` on its own thread. It ignores keyboard
+events marked `LLKHF_INJECTED` or `LLKHF_LOWER_IL_INJECTED`, uses no custom
+`dwExtraInfo` tag, and never calls Tk directly. Physical Ctrl chords enqueue
+short action names into a bounded queue; `UiWorker._poll()` drains that queue
+on Tk's owning thread. Quick-message indices always address the live insertion
+order, so deletion automatically compacts `Ctrl+1` through `Ctrl+0`. Recording
+hotkeys refuse to run while patrol is enabled. Action feedback MP3 playback is
+launched on a daemon thread and does not block the hook or Tk.
 
 The start transition has an explicit capture-only phase. After
 `WindowKeySender.select_window()` and foreground verification,
@@ -460,6 +471,10 @@ shipped, runtime-read-only `system_config.json`.
 | `yolo_detection` | user | UiWorker and YOLO launch settings |
 | `ui_window` | user | Tk window geometry helpers |
 
+`hotkey.json` is a dedicated shipped hotkey map rather than a section in
+`user_config.json`. It currently defines the physical Ctrl message, recording,
+and patrol-toggle chords.
+
 The debug UI starts at 1200x900 px. Restored window geometry is capped to
 900 px high during startup (and to the available screen height on smaller
 displays), while the user can still resize and persist a smaller window.
@@ -482,26 +497,24 @@ The canonical release command is:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
 ```
 
-`发布.bat` is the double-click wrapper. The workflow is:
+`发布.bat` is the double-click wrapper. A full checkpoint workflow is:
 
-1. Run the exact release-gate suite defined in `release_now.ps1`; save output
+1. Optionally run the exact release-gate suite defined in `release_now.ps1`; save output
    to `work/release_gate.log`; abort on nonzero exit.
 2. Ensure `build_release.ps1` has its required UTF-8 BOM.
 3. The release script advances the four-digit `VERSION` counter (`0000` to
    `9999`) and runs `build_release.ps1 -Version NNNN -Zip`, which recreates
    `release/MapleAssistant`, copies runtime files/assets/model weights, removes
-   old ZIPs, and creates `release/MapleAssistant-vNNNN.zip`. Failed build or
-   verification restores the prior counter; `9999` never wraps.
-4. Run the local verifier `work/verify_zip.py` against the newest ZIP; abort
-   if verification fails.
-5. Inspect `git diff --check` and `git status`, stage only intended source,
+   old ZIPs, and creates `release/MapleAssistant-vNNNN.zip`. A failed build
+   restores the prior counter; `9999` never wraps.
+4. Inspect `git diff --check` and `git status`, stage only intended source,
    tests, and docs, commit, and verify a clean worktree.
 
-Every project update requires a new successful release and a new Git commit.
-Release ZIPs are ignored and are not committed. `work/verify_zip.py` is also
-ignored but currently required by the release script, so a fresh environment
-must restore/provide it before publishing. Do not use `-SkipTests` for a real
-release.
+Every project change requires a new release package, but docs, full tests,
+verification work, and Git commits are checkpoint operations only: perform
+them when the user explicitly says **update**, or just before context
+compaction. The redundant ignored `work/verify_zip.py` procedure is removed.
+Release ZIPs remain ignored and are not committed.
 
 ## 10. Repository file inventory
 
@@ -523,8 +536,10 @@ git -c core.quotepath=false ls-files
 | `character_worker.py` | Minimap character-position stream and shared-result disconnect alert |
 | `status_worker.py` | SendInput sender, status detection, potions/buffs |
 | `attack_worker.py` | Fixed-rate attack thread |
+| `random_jump_worker.py` | Independent optional fixed-Alt timer |
+| `hotkey_worker.py` | Physical-only low-level Ctrl hotkey hook and action queue publisher |
 | `focus_worker.py` | Foreground/refocus gate and key release |
-| `shutdown_worker.py` | Optional timed shutdown |
+| `shutdown_worker.py` | Preserved timed-shutdown implementation; temporarily unwired/hidden |
 | `countdown_worker.py` | Independent repeating countdown and MP3 playback |
 | `lie_detector_worker.py` | Resolution-scaled in-memory lie-event detection |
 | `screen_blinker.py` | Optional queued two-flash red full-screen notifier |
@@ -545,9 +560,11 @@ git -c core.quotepath=false ls-files
 |---|---|
 | `user_config.json` | Ignored UI settings and recordings, generated/migrated at runtime |
 | `system_config.json` | Tracked internal calibration, replaced by application updates |
+| `hotkey.json` | Dedicated shipped global-hotkey bindings |
 | `config.json` | Legacy unified backup/migration source; no longer written |
 | Former split settings JSONs | Legacy migration sources only; excluded from releases |
 | `sound/dingdong.mp3` | Shared countdown and alert sound shipped in releases |
+| `sound/success.mp3`, `sound/fail.mp3` | Recording and patrol action feedback |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
 | `install.ps1`, `安装.bat` | Request UAC up front, silently bootstrap Python 3.10 in a hidden installer process, then create `.venv`, dependencies, and launchers |
@@ -592,12 +609,14 @@ test_countdown_worker.py
 test_lie_detector_worker.py
 test_screen_blinker.py
 test_focus_worker.py
+test_hotkey_worker.py
 test_map_identity.py
 test_map_structure_tracker.py
 test_minimap_detector.py
 test_movement_worker.py
 test_patrol_control.py
 test_pickup_worker.py
+test_random_jump_worker.py
 test_shutdown_worker.py
 test_single_instance.py
 test_status_worker.py
@@ -643,7 +662,7 @@ These exist locally but are not guaranteed in a clone or commit:
 | Path | Contents/handling |
 |---|---|
 | `.venv/`, `yolo-detection/venv313/` | Local Python environments; never commit |
-| `work/` | Logs, state JSON, debug captures, ad-hoc diagnostics, release gate log, and required local `verify_zip.py` |
+| `work/` | Logs, state JSON, debug captures, ad-hoc diagnostics, and release gate log |
 | `VERSION`, `versioning.py` | Four-digit release counter and UI version label |
 | `release/` | Rebuilt distributable directory and `MapleAssistant-vNNNN.zip` |
 | `recording-assets/` | Map-name index/reference images and map-structure reference; packaged when present |
@@ -658,12 +677,11 @@ These exist locally but are not guaranteed in a clone or commit:
 1. Read `README.md` and this file before modifying behavior.
 2. Inspect `git status --short`; preserve unrelated user changes.
 3. Use logs to identify the state transition that actually fired.
-4. Add a regression test reproducing the trace before or with the fix.
-5. Run focused tests, then the relevant complete test modules.
-6. Update this inventory when adding/removing/renaming files or changing
-   ownership and data flow.
-7. Run `release_now.ps1` without `-SkipTests`.
-8. Verify the new ZIP, run `git diff --check`, and review the diff.
-9. Commit intended tracked changes and confirm a clean worktree.
-10. Hand off the behavior change, test count, ZIP path, commit hash, and any
-    remaining operational caveat.
+4. Always build a newly numbered release package for every behavior change.
+5. Only when the user says **update**, or before context compaction: add/run
+   relevant tests, update both handoff documents, run `git diff --check`, and
+   review/stage/commit intended tracked changes.
+6. Update this inventory at those checkpoints when files, ownership, or data
+   flow changed.
+7. Hand off the ZIP path every time; include test count and commit hash for a
+   checkpoint.
