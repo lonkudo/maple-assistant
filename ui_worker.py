@@ -726,6 +726,12 @@ class UiWorker(threading.Thread):
             )
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
+            # While the OS runs its own move/resize loop Windows draws the
+            # frame outline; freeze client repaints until the shape is
+            # confirmed, then repaint once (avoids relayout/repaint lag on
+            # every resize step).  Also frees WM_SIZE handling for the
+            # drag-move path below.
+            self._install_resize_redraw_freeze(root)
 
             if caption_installed:
                 self._build_caption_bar(root, tk, app_version)
@@ -1710,39 +1716,282 @@ class UiWorker(threading.Thread):
         # Dragging any empty part of the bar moves the window (manual
         # geometry drag: after WS_CAPTION is removed the OS caption hit-test
         # is gone, so native HTCAPTION dragging would not move the window).
+        # A cheap outline follows the cursor; the real window is only
+        # repositioned once on release so Tk is not relaid out + repainted on
+        # every mouse move (that made dragging/resizing laggy).
         def _press(event: Any) -> None:
-            self._caption_drag_origin = (event.x_root, event.y_root)
-            self._caption_origin_geometry = (
-                self._root.winfo_x(), self._root.winfo_y()
-            )
+            self._caption_drag_begin(event)
 
         def _motion(event: Any) -> None:
-            origin = getattr(self, "_caption_drag_origin", None)
-            if origin is None:
-                return
-            dx = event.x_root - origin[0]
-            dy = event.y_root - origin[1]
-            x, y = self._caption_origin_geometry
-            try:
-                self._root.geometry(f"+{x + dx}+{y + dy}")
-            except Exception:
-                pass
+            self._caption_drag_move(event)
 
         def _release(_event: Any) -> None:
-            self._caption_drag_origin = None
+            self._caption_drag_end()
 
         for widget in (bar, title):
             widget.bind("<ButtonPress-1>", _press)
             widget.bind("<B1-Motion>", _motion)
             widget.bind("<ButtonRelease-1>", _release)
 
-    def _caption_drag_start(self, event: Any) -> None:
-        """Compatibility hook; drag handling is bound directly on the bar."""
+    def _caption_drag_begin(self, event: Any) -> None:
+        """Start an outline-only caption drag (no live window moves)."""
 
         self._caption_drag_origin = (event.x_root, event.y_root)
         self._caption_origin_geometry = (
             self._root.winfo_x(), self._root.winfo_y()
         )
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        outline = getattr(self, "_drag_outline", None)
+        if outline is not None:
+            try:
+                outline.destroy()
+            except Exception:
+                pass
+            self._drag_outline = None
+        try:
+            import tkinter as tk
+
+            outline = tk.Toplevel(root)
+            outline.overrideredirect(True)
+            outline.attributes("-topmost", True)
+            transparent = False
+            try:
+                # Transparent interior so only the border reads as an
+                # outline (Windows supports -transparentcolor).
+                outline.attributes("-transparentcolor", "#010203")
+                transparent = True
+            except Exception:
+                try:
+                    # Fallback: translucent ghost rectangle.
+                    outline.attributes("-alpha", 0.35)
+                except Exception:
+                    pass
+            outline.configure(bg="#010203")
+            width = max(root.winfo_width(), 100)
+            height = max(root.winfo_height(), 100)
+            canvas = tk.Canvas(
+                outline, bg="#010203", highlightthickness=0, bd=0,
+                width=width, height=height,
+            )
+            canvas.pack(fill="both", expand=True)
+            if transparent:
+                # 1px border inset so it is fully inside the window.
+                canvas.create_rectangle(
+                    1, 1, width - 2, height - 2,
+                    outline="#2f6fdf", width=1,
+                )
+            x = root.winfo_rootx()
+            y = root.winfo_rooty()
+            outline.geometry(f"{width}x{height}+{x}+{y}")
+            self._drag_outline = outline
+        except Exception:
+            self._drag_outline = None
+
+    def _caption_drag_move(self, event: Any) -> None:
+        """Move only the cheap outline; the real window stays put."""
+
+        origin = getattr(self, "_caption_drag_origin", None)
+        if origin is None:
+            return
+        outline = getattr(self, "_drag_outline", None)
+        if outline is None:
+            return
+        dx = event.x_root - origin[0]
+        dy = event.y_root - origin[1]
+        x, y = self._caption_origin_geometry
+        try:
+            outline.geometry(f"+{x + dx}+{y + dy}")
+        except Exception:
+            pass
+
+    def _caption_drag_end(self) -> None:
+        """Drop the outline and apply the final position exactly once."""
+
+        origin = getattr(self, "_caption_drag_origin", None)
+        if origin is None:
+            return
+        outline = getattr(self, "_drag_outline", None)
+        final_x = final_y = None
+        if outline is not None:
+            try:
+                geometry = outline.winfo_geometry()
+                match = re.search(r"([+-]\d+)([+-]\d+)$", geometry)
+                if match:
+                    final_x = int(match.group(1))
+                    final_y = int(match.group(2))
+            except Exception:
+                pass
+            try:
+                outline.destroy()
+            except Exception:
+                pass
+            self._drag_outline = None
+        if final_x is not None and final_y is not None:
+            try:
+                self._root.geometry(f"+{final_x}+{final_y}")
+            except Exception:
+                pass
+        self._caption_drag_origin = None
+
+    def _caption_drag_start(self, event: Any) -> None:
+        """Compatibility hook; drag handling is bound directly on the bar."""
+
+        self._caption_drag_begin(event)
+
+    def _install_resize_redraw_freeze(self, root: Any) -> bool:
+        """Suppress client repaints while the window is being moved/resized.
+
+        Windows runs its own modal move/resize loop between
+        WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE and draws the window outline
+        itself; Tk only needs to repaint the CONTENT once the new shape is
+        final.  Without this, Tk relayouts + repaints the whole (heavy) UI
+        on every WM_SIZE step, which is what makes dragging/resizing laggy.
+        Returns False (keep default live redraw) on any failure.
+        """
+
+        try:
+            if sys.platform != "win32":
+                return False
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            hwnd = int(getattr(self, "_caption_hwnd", 0) or 0)
+            if not hwnd:
+                hwnd = int(user32.GetParent(root.winfo_id()))
+            if not hwnd:
+                hwnd = int(root.winfo_id())
+            if not hwnd:
+                return False
+
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(
+                LRESULT, wintypes.HWND, wintypes.UINT,
+                wintypes.WPARAM, wintypes.LPARAM,
+            )
+
+            WM_ENTERSIZEMOVE = 0x0231
+            WM_EXITSIZEMOVE = 0x0232
+            WM_SETREDRAW = 0x000B
+            RDW_INVALIDATE = 0x0001
+            RDW_ERASE = 0x0004
+            RDW_ALLCHILDREN = 0x0080
+            RDW_UPDATENOW = 0x0100
+            GWLP_WNDPROC = -4
+
+            # Explicit argtypes keep 64-bit HWND/pointer values intact
+            # (ctypes would otherwise truncate them to 32-bit ints).
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.SendMessageW.restype = LRESULT
+            user32.RedrawWindow.argtypes = [
+                wintypes.HWND, wintypes.LPRECT, wintypes.HRGN, wintypes.UINT,
+            ]
+            user32.RedrawWindow.restype = wintypes.BOOL
+            user32.SetWindowLongPtrW.argtypes = [
+                wintypes.HWND, ctypes.c_int, ctypes.c_void_p,
+            ]
+            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+            user32.CallWindowProcW.argtypes = [
+                WNDPROC, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.CallWindowProcW.restype = LRESULT
+            user32.DefWindowProcW.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.DefWindowProcW.restype = LRESULT
+
+            state = {"frozen": False}
+
+            def _unfreeze_now() -> None:
+                if not state["frozen"]:
+                    return
+                state["frozen"] = False
+                try:
+                    user32.SendMessageW(hwnd, WM_SETREDRAW, 1, 0)
+                    user32.RedrawWindow(
+                        hwnd, None, None,
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN
+                        | RDW_UPDATENOW,
+                    )
+                except Exception:
+                    pass
+
+            @WNDPROC
+            def _wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+                try:
+                    if msg == WM_ENTERSIZEMOVE:
+                        state["frozen"] = True
+                        user32.SendMessageW(hwnd, WM_SETREDRAW, 0, 0)
+                        # Watchdog: never leave the window frozen if the
+                        # matching WM_EXITSIZEMOVE is somehow missed.
+                        root = getattr(self, "_root", None)
+                        if root is not None:
+                            try:
+                                job = getattr(
+                                    self, "_resize_unfreeze_job", None
+                                )
+                                if job is not None:
+                                    try:
+                                        root.after_cancel(job)
+                                    except Exception:
+                                        pass
+                                self._resize_unfreeze_job = root.after(
+                                    4000, _unfreeze_now
+                                )
+                            except Exception:
+                                pass
+                    elif msg == WM_EXITSIZEMOVE:
+                        state["frozen"] = False
+                        root = getattr(self, "_root", None)
+                        if root is not None:
+                            try:
+                                job = getattr(
+                                    self, "_resize_unfreeze_job", None
+                                )
+                                if job is not None:
+                                    try:
+                                        root.after_cancel(job)
+                                    except Exception:
+                                        pass
+                                    self._resize_unfreeze_job = None
+                            except Exception:
+                                pass
+                        user32.SendMessageW(hwnd, WM_SETREDRAW, 1, 0)
+                        user32.RedrawWindow(
+                            hwnd, None, None,
+                            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN
+                            | RDW_UPDATENOW,
+                        )
+                except Exception:
+                    pass
+                old_proc = getattr(self, "_old_wndproc", None)
+                if old_proc is not None:
+                    return user32.CallWindowProcW(
+                        old_proc, hwnd, msg, wparam, lparam
+                    )
+                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            # Keep the callback alive for the whole UI lifetime.
+            self._resize_wndproc_cb = _wndproc
+            self._resize_freeze_state = state
+            old_ptr = user32.SetWindowLongPtrW(
+                hwnd, GWLP_WNDPROC, ctypes.cast(_wndproc, ctypes.c_void_p).value
+            )
+            if not old_ptr:
+                return False
+            self._old_wndproc = ctypes.cast(old_ptr, WNDPROC)
+            self._resize_freeze_hwnd = hwnd
+            return True
+        except Exception:
+            LOG.debug("resize redraw freeze unavailable", exc_info=True)
+            return False
 
     def _caption_minimize(self) -> None:
         """Minimize to the taskbar (native iconify still works)."""
@@ -1820,6 +2069,15 @@ class UiWorker(threading.Thread):
             return
         if self.stop_event.is_set():
             root.destroy()
+            return
+        # While a move/resize modal loop is running the client is frozen
+        # (repaint suppressed); skip the heavy snapshot render + log insert
+        # so the resize stays light, but keep the poll cadence alive.
+        frozen = bool(
+            getattr(self, "_resize_freeze_state", {}).get("frozen", False)
+        )
+        if frozen:
+            root.after(self.refresh_ms, self._poll)
             return
         latest = None
         while True:
