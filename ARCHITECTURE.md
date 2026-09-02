@@ -403,7 +403,12 @@ SIDE BY SIDE in one vertical band - HP (red) left, MP (blue) middle, EXP
 (`bar_zones`) with its own full-width reference, so the three can never be
 mixed (blue UI decoration above the bars is excluded by the vertical
 `bar_band`).  Potion use requires confirmed low readings and retries blocked
-sends.  Its configuration also owns optional periodic buffs.
+sends.  Its configuration also owns optional periodic buffs: the 增益 panel
+rows (增益1/增益2/增益3, `drug_settings.json`) each carry a hotkey, an interval,
+and an enabled switch, wired end-to-end through `StatusConfig`
+(`buff1`/`buff2`/`buff3` key/interval/enabled), the `_check_buffs` loop, and
+`apply_drug_settings`.  Each row displays its own state; there is no extra
+bottom status echo line in the panel.
 
 The potion panel is placed in column 2 where the hidden YOLO panel previously
 appeared. The adjacent Quick Messages panel persists up to 20 strings in the
@@ -411,8 +416,11 @@ user-owned `additional_functions` section. Its buttons use the shared 1-second
 gesture convention: short-click copies, two releases within 0.6 seconds
 reliably implement double-click across Windows themes and explicitly focus the
 game and send Enter, Ctrl+V, Enter, long-press edits, and long-pressing the
-adjacent delete icon removes that row. The Telegram machine marker uses the
-same long-press-to-entry, focus-out-to-button interaction.
+adjacent delete icon removes that row.  After any row add/edit/delete the UI
+calls `_refit_window_to_content()`, which re-fits the window height to the
+taller column's required height so the window grows with new rows and shrinks
+back when rows are deleted (no residual bottom padding).  The Telegram machine
+marker uses the same long-press-to-entry, focus-out-to-button interaction.
 
 `CountdownWorker` has no gameplay dependencies: it owns only a monotonic
 deadline, configured interval, wake event, and alert callbacks. At expiry it
@@ -495,9 +503,35 @@ shipped, runtime-read-only `system_config.json`.
 `user_config.json`. It currently defines the physical Ctrl message, recording,
 and patrol-toggle chords.
 
-The debug UI starts at 1200x900 px. Restored window geometry is capped to
-900 px high during startup (and to the available screen height on smaller
-displays), while the user can still resize and persist a smaller window.
+The debug UI window geometry follows a whole-window, format-versioned model
+in `ui_worker.py`:
+
+- Default logical size is 1086 x 680 (`_INITIAL_WINDOW_WIDTH` /
+  `_INITIAL_WINDOW_HEIGHT`), applied only AFTER the UI is built, with
+  `pack_propagate(False)` on the container, columns, debug frame, and caption
+  bar so content can never spread the window at startup.
+- The window is DPI-unaware: Windows scales it like other apps (150% →
+  ~1629 x 1020 physical; 125% → ~1358 x 850).  The logical height 680 is the
+  machine-measured natural content height, so no clipping or blank space
+  appears at either scale.
+- Layout: column 0 fixed 550px, column 1 fixed 500px (grid `minsize`, both
+  `weight=0`), 12px gap + 24px container padding = the 1086 default width.
+- The native caption strip is removed once (Win32 `WS_CAPTION`, keeping
+  native resize borders/min/max flags/taskbar) and replaced by an in-window
+  34px caption row hosting the title, the `?` help button, and `－ □ ×`
+  buttons.  Caption drags move the window via an outline-only overlay;
+  resize performance is pure Tk (root-only Configure-burst guard pausing the
+  heavy snapshot render).  No Win32 window-proc subclassing and no
+  `WM_SETREDRAW` - both crashed in earlier versions and are banned.
+- Quick-message row changes call `_refit_window_to_content()`: the window
+  height is set to chrome + the taller column's required height (clamped to
+  minsize), so rows added grow the window and rows deleted shrink it back
+  with no leftover bottom padding.
+- `_GEOMETRY_FORMAT` (= 5) version-tags the record in the ignored
+  `ui_window_settings.json`; a stale/legacy/manual record (older caption or
+  content-only semantics, DPI-aware physical pixels, remembered manual
+  resizes) is ignored once so every machine opens at the current default
+  instead of restoring a mismatched size.
 
 User sections migrate once from the old unified `config.json` or former split
 JSON files. System sections never migrate from those files: the release-owned

@@ -400,13 +400,52 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
 
 ### UI layout (`ui_worker.py`)
 
-- Two FIXED 500px columns (controls | debug/YOLO); initial window 1036x672;
-  height user-resizable, width min 1036.
-- Debug log panel: frame height 313px so the visible log text area is exactly
-  280px (`pack_propagate(False)`; LabelFrame label+border eat ~33px). The log
-  auto-scrolls to bottom (`_log_text.see("end")` in `_drain_logs`).
-- Drug-panel sliders use `length=60` so column 2 stays within 500px.
-- No in-window header; window title is `Maple 助手 (vNNNN)`.
+- **Whole-window geometry, fixed-width columns.** The default window is
+  1086 x 680 LOGICAL px (`_INITIAL_WINDOW_WIDTH`/`_INITIAL_WINDOW_HEIGHT`)
+  and stays DPI-unaware, so Windows scales it like every other app: at 150%
+  the physical size is ~1629 x 1020 and at 125% ~1358 x 850.  The 680
+  logical height is the natural content height measured on the real
+  machine; nothing is clipped and no extra blank space appears.
+- **Column 0 fixed 550px, column 1 fixed 500px** (grid minsizes, both
+  `weight=0`) + 12px gap + 24px container padding = 1086px.  Left column:
+  patrol/attack/countdown/extra controls (警报 row fits on one line).
+  Right column: drug/增益, quick messages, and the debug log at full width.
+  `container`/`columns`/debug frame all use `pack_propagate(False)` so
+  content can never spread the window at startup.
+- **In-window caption row (34px, `_build_caption_bar`).**  The native
+  caption strip is removed once via Win32 `WS_CAPTION` (resize borders,
+  min/max flags, system menu and taskbar entry all stay), replaced by a
+  Tk row: title `Maple 助手 (vNNNN)`, a `?` help button, and `－ □ ×`
+  window buttons.  Dragging the caption row moves the window with an
+  outline-only overlay (`_caption_drag_begin/move/end`) so drags never lag.
+- **Resize is pure Tk** (`_install_resize_burst_guard`): a root-only
+  Configure-burst detector pauses the heavy snapshot render while a
+  resize burst is active and resumes ~300 ms after it settles.  No Win32
+  window-proc subclassing and no `WM_SETREDRAW` (both crashed in earlier
+  versions); startup renders immediately.
+- **Window-height auto-fit for quick messages.**  Adding/editing/deleting a
+  quick-message row calls `_refit_window_to_content()`, which sets the
+  window height to exactly the taller column's required height + window
+  chrome (clamped to minsize): rows added grow the window, rows deleted
+  shrink it back, and no leftover padding is ever left at the bottom.
+- **Persisted geometry is format-versioned** (`_GEOMETRY_FORMAT = 5` in
+  `ui_window_settings.json`).  Records written by an older layout/caption
+  semantic or a DPI-aware run (e.g. 1275x904, 1620x1050, 1635x1272) are
+  ignored ONCE, so the window opens at the current default on every machine
+  instead of restoring a stale manual size.
+- Debug log panel: frame height 313px so the visible log text area is
+  exactly 280px (`pack_propagate(False)`; LabelFrame label+border eat
+  ~33px). The log auto-scrolls to bottom (`_log_text.see("end")` in
+  `_drain_logs`).
+- The `?` help popup is hover-triggered (show ~180 ms after hover, hide
+  after leave) and styled exactly like the yellow bind-key hint: single
+  label, bg `#fffbd6`, fg `#202020`, relief solid, wraplength ~430.  Inside
+  it the bindings render as an aligned two-column table
+  (bold `按键 | 功能` header, keys right-aligned, functions left-aligned);
+  the ten quick-message chords collapse to one line
+  (`Ctrl+1 ~ Ctrl+0 → 发送第 1~10 条快捷消息`).  If the native caption
+  cannot be removed, a small floating `?` at the top-right opens the same
+  popup.
 
 ### Workflow
 
@@ -495,7 +534,11 @@ to move the current deadline anywhere from zero to the full interval. For
 example, with a `1.0h` interval, dragging the bar to `20m 00s` makes the next
 event occur in 20 minutes. At zero, the selected reminder outputs run and the
 bar resets to the full interval. The timer does not depend on patrol or attack
-being active.
+being active.  The 循环警报 interval and remaining-time sliders sit on one row
+in the left column (the window is wide enough that they no longer wrap); the
+remaining-time label is wide enough to show `1h 00m 00s` / `12h 00m 00s`
+without truncation.  The 固定攻击/随机跳跃 base-time rows carry a
+right-aligned random-gap group with an expanding slider.
 
 Selecting **掉线警报** reuses the normal per-frame yellow-character-diamond
 detection. Three consecutive missing frames confirm the loss and raise one
@@ -531,8 +574,12 @@ The **快捷消息** panel lives beside the potion controls in column 2. Add any
 number of reusable messages (maximum 20). Short-click a message to copy it to
 the Windows clipboard; double-click it to focus the game, open chat with Enter,
 paste with Ctrl+V, and send with Enter; long-press it for one second to edit it;
-and long-press its adjacent `×` button for one second to delete it. Quick messages are stored
-in the ignored `user_config.json` and survive application updates.
+and long-press its adjacent `×` button for one second to delete it. Quick messages are
+stored in the ignored `additional_functions_settings.json` (alongside the other
+Additional Functions values) and survive application updates.  Adding,
+editing, or deleting a row refits the window height exactly to the content
+(grow on add, shrink back on delete) - no leftover blank space remains at the
+bottom of the panel.
 
 ## Physical hotkeys and action sounds
 
