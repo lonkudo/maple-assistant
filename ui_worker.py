@@ -38,8 +38,10 @@ LOG = logging.getLogger(__name__)
 # The debug UI uses two columns (controls + debug/YOLO); the initial
 # window (including the in-window caption bar when active) is 1050x720.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1050
-_INITIAL_WINDOW_HEIGHT = 720
+_INITIAL_WINDOW_WIDTH = 1086
+_INITIAL_WINDOW_HEIGHT = 840
+# Column 0 is FIXED at 550px, column 1 at 500px (both fully visible inside
+# the 1086px default: 550 + 500 + 12px column gap + 24px container padding).
 
 # Height of the custom in-window caption bar.  Tk cannot add widgets into
 # the native OS caption, so the assistant window removes the native caption
@@ -724,12 +726,13 @@ class UiWorker(threading.Thread):
 
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
-            # Column 1 is FIXED at 550px wide (wide enough for the 警报 row
-            # plus the 循环 间隔/剩余 controls on one line).  Column 2 is
-            # flexible so a wider window grows the debug column instead of
-            # leaving empty space (min 500px so the log panel stays usable).
+            # Column 0 is FIXED at 550px, column 1 FIXED at 500px (grid
+            # columns 0/1): the 警报 row fits on one line in the left column
+            # and the drug/quick-message panels keep their full text width in
+            # the right one.  Both fit inside the 1086px default window
+            # (550 + 500 + 12px gap + 24px container padding).
             columns.columnconfigure(0, weight=0, minsize=550)
-            columns.columnconfigure(1, weight=1, minsize=430)
+            columns.columnconfigure(1, weight=0, minsize=500)
             columns.rowconfigure(0, weight=1)
             col1 = ttk.Frame(columns)
             col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
@@ -1027,6 +1030,25 @@ class UiWorker(threading.Thread):
             ).pack(side="left")
             fixed_key_row = ttk.Frame(fixed_panel)
             fixed_key_row.pack(fill="x", pady=(6, 0))
+            # Random-gap steppers live at the RIGHT edge of the row so the
+            # two slider rows share one aligned column of 随机 controls.
+            fixed_random_group = ttk.Frame(fixed_key_row)
+            fixed_random_group.pack(side="right")
+            ttk.Label(fixed_random_group, text="随机:").pack(side="left")
+            self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
+            ttk.Button(
+                fixed_random_group, text="−", width=2,
+                command=lambda: self._fixed_adjust_random_gap(-0.1),
+            ).pack(side="left", padx=(3, 2))
+            self._fixed_random_gap_label = ttk.Label(
+                fixed_random_group, text="0.1s", width=4, anchor="center"
+            )
+            self._fixed_random_gap_label.pack(side="left")
+            ttk.Button(
+                fixed_random_group, text="+", width=2,
+                command=lambda: self._fixed_adjust_random_gap(0.1),
+            ).pack(side="left", padx=(2, 0))
+
             ttk.Label(fixed_key_row, text="按键:").pack(
                 side="left", padx=(0, 4)
             )
@@ -1045,15 +1067,16 @@ class UiWorker(threading.Thread):
             self._attach_bind_hint(fixed_key_button)
             ttk.Label(fixed_key_row, text="每").pack(side="left")
             # Fixed attack period: horizontal slider (progress-bar style),
-            # 0.2-10 s, default 3 s.
+            # 0.2-10 s, default 3 s.  It expands so the value/random-gap
+            # controls stay fully visible at the row's right side.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
             fixed_interval_slider = ttk.Scale(
                 fixed_key_row, from_=0.2, to=10.0, orient="horizontal",
-                length=90,
                 variable=self._fixed_interval_var,
                 command=self._fixed_on_change,
             )
-            fixed_interval_slider.pack(side="left", padx=(0, 2))
+            fixed_interval_slider.pack(side="left", fill="x", expand=True,
+                                       padx=(0, 2))
             self._fixed_interval_label = ttk.Label(
                 fixed_key_row, text="3.0s", width=5
             )
@@ -1062,23 +1085,27 @@ class UiWorker(threading.Thread):
                 fixed_key_row, text="(3.0s, 3.1s)", width=13
             )
             self._fixed_range_label.pack(side="left")
-            ttk.Label(fixed_key_row, text="随机:").pack(side="left")
-            self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
-            ttk.Button(
-                fixed_key_row, text="−", width=2,
-                command=lambda: self._fixed_adjust_random_gap(-0.1),
-            ).pack(side="left", padx=(3, 2))
-            self._fixed_random_gap_label = ttk.Label(
-                fixed_key_row, text="0.1s", width=4, anchor="center"
-            )
-            self._fixed_random_gap_label.pack(side="left")
-            ttk.Button(
-                fixed_key_row, text="+", width=2,
-                command=lambda: self._fixed_adjust_random_gap(0.1),
-            ).pack(side="left", padx=(2, 0))
 
             jump_row = ttk.Frame(fixed_panel)
             jump_row.pack(fill="x", pady=(6, 0))
+            # Same right-aligned random-gap group for the jump row.
+            jump_random_group = ttk.Frame(jump_row)
+            jump_random_group.pack(side="right")
+            ttk.Label(jump_random_group, text="随机:").pack(side="left")
+            self._random_jump_gap_var = tk.DoubleVar(value=0.1)
+            ttk.Button(
+                jump_random_group, text="−", width=2,
+                command=lambda: self._random_jump_adjust_gap(-0.1),
+            ).pack(side="left", padx=(3, 2))
+            self._random_jump_gap_label = ttk.Label(
+                jump_random_group, text="0.1s", width=4, anchor="center"
+            )
+            self._random_jump_gap_label.pack(side="left")
+            ttk.Button(
+                jump_random_group, text="+", width=2,
+                command=lambda: self._random_jump_adjust_gap(0.1),
+            ).pack(side="left", padx=(2, 0))
+
             self._random_jump_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 jump_row, text="跳跃", width=7,
@@ -1089,9 +1116,9 @@ class UiWorker(threading.Thread):
             self._random_jump_interval_var = tk.DoubleVar(value=3.0)
             ttk.Scale(
                 jump_row, from_=0.2, to=10.0, orient="horizontal",
-                length=90, variable=self._random_jump_interval_var,
+                variable=self._random_jump_interval_var,
                 command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 2))
+            ).pack(side="left", fill="x", expand=True, padx=(0, 2))
             self._random_jump_interval_label = ttk.Label(
                 jump_row, text="3.0s", width=5
             )
@@ -1100,20 +1127,6 @@ class UiWorker(threading.Thread):
                 jump_row, text="(3.0s, 3.1s)", width=13
             )
             self._random_jump_range_label.pack(side="left")
-            ttk.Label(jump_row, text="随机:").pack(side="left")
-            self._random_jump_gap_var = tk.DoubleVar(value=0.1)
-            ttk.Button(
-                jump_row, text="−", width=2,
-                command=lambda: self._random_jump_adjust_gap(-0.1),
-            ).pack(side="left", padx=(3, 2))
-            self._random_jump_gap_label = ttk.Label(
-                jump_row, text="0.1s", width=4, anchor="center"
-            )
-            self._random_jump_gap_label.pack(side="left")
-            ttk.Button(
-                jump_row, text="+", width=2,
-                command=lambda: self._random_jump_adjust_gap(0.1),
-            ).pack(side="left", padx=(2, 0))
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left",
                 wraplength=440,
@@ -1423,7 +1436,7 @@ class UiWorker(threading.Thread):
                 side="left", padx=(2, 2)
             )
             self._countdown_interval_label = ttk.Label(
-                alarm_row, text="1.0h", width=4
+                alarm_row, text="1.0h", width=6
             )
             self._countdown_interval_label.pack(side="left")
 
@@ -1446,8 +1459,10 @@ class UiWorker(threading.Thread):
             self._countdown_remaining_slider.bind(
                 "<ButtonRelease-1>", self._countdown_drag_end
             )
+            # Width must hold the longest formatted value (e.g. "12h 00m 00s")
+            # so the remaining text is never clipped.
             self._countdown_remaining_label = ttk.Label(
-                alarm_row, text="1h 00m", width=7
+                alarm_row, text="1h 00m 00s", width=12
             )
             self._countdown_remaining_label.pack(side="left")
             self._countdown_status = ttk.Label(
