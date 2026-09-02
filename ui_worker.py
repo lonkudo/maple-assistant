@@ -2491,13 +2491,18 @@ class UiWorker(threading.Thread):
         """Apply the shutdown settings to the ShutdownWorker live."""
 
         worker = getattr(self, "shutdown_worker", None)
-        if worker is None:
+        if worker is not None:
+            worker.enabled = bool(data.get("shutdown_enabled", False))
+            worker.set_hours(float(data.get("shutdown_hours", 3.0)))
+        else:
+            # Scheduled shutdown is temporarily disabled (no worker is
+            # constructed), but the alarm/reminder wiring below is
+            # independent and MUST still be applied live.  An early return
+            # here silently killed 掉线警报, 测谎警报, and the 声音/闪烁/消息
+            # toggles whenever shutdown_worker is None.
             self._shutdown_status.configure(
                 text="定时关闭: 工作线程未接入 (无界面模式)。"
             )
-            return
-        worker.enabled = bool(data.get("shutdown_enabled", False))
-        worker.set_hours(float(data.get("shutdown_hours", 3.0)))
         # Other-player auto channel switch -> movement worker (live).
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
@@ -2536,13 +2541,13 @@ class UiWorker(threading.Thread):
                 str(data.get("telegram_machine_name", "")),
             )
             notifier.set_enabled(bool(data.get("telegram_enabled", False)))
-        if worker.enabled:
+        if worker is not None and worker.enabled:
             self._shutdown_status.configure(
                 text=f"定时关闭已启动: 游戏将在 "
                      f"{float(data.get('shutdown_hours', 3.0)):.1f}小时后关闭 "
                      f"(Alt+F4 后停止所有工作线程)。"
             )
-        else:
+        elif worker is not None:
             self._shutdown_status.configure(
                 text="定时关闭: 未启用 - 游戏继续运行。"
             )
