@@ -39,9 +39,12 @@ LOG = logging.getLogger(__name__)
 # window (including the in-window caption bar when active) is 1050x720.
 # The height stays user-resizable (only the minimum is enforced).
 _INITIAL_WINDOW_WIDTH = 1086
-_INITIAL_WINDOW_HEIGHT = 840
+_INITIAL_WINDOW_HEIGHT = 680
 # Column 0 is FIXED at 550px, column 1 at 500px (both fully visible inside
 # the 1086px default: 550 + 500 + 12px column gap + 24px container padding).
+# Height 680 is the natural content height: on a 150%-scaled display this
+# logical height physically renders at 1020 px (680 x 1.5), which is exactly
+# the height the two-column content needs - no clipping, no extra space.
 
 # Height of the custom in-window caption bar.  Tk cannot add widgets into
 # the native OS caption, so the assistant window removes the native caption
@@ -682,96 +685,11 @@ class UiWorker(threading.Thread):
         # when that happens instead of leaving them stale.
         self._patrol_ui_running: Optional[bool] = None
 
-    @staticmethod
-    def _display_scale_factor() -> float:
-        """Real primary-display scale factor (physical / logical width).
-
-        The UI is intentionally DPI-unaware: Windows bitmap-scales the whole
-        window so text and layout keep the exact same proportions as on a
-        100% display, and the window WIDTH stays consistent with every other
-        scaled app.  Only the initial HEIGHT is compensated so its physical
-        size lands at the configured value on 125%/150% displays instead of
-        opening taller than intended.
-        """
-
-        if sys.platform != "win32":
-            return 1.0
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            logical_width = int(user32.GetSystemMetrics(0))  # SM_CXSCREEN
-            if logical_width <= 0:
-                return 1.0
-
-            class DEVMODEW(ctypes.Structure):
-                _fields_ = [
-                    ("dmDeviceName", wintypes.WCHAR * 32),
-                    ("dmSpecVersion", wintypes.WORD),
-                    ("dmDriverVersion", wintypes.WORD),
-                    ("dmSize", wintypes.WORD),
-                    ("dmDriverExtra", wintypes.WORD),
-                    ("dmFields", wintypes.DWORD),
-                    ("dmPosition", wintypes.LONG * 2),
-                    ("dmDisplayOrientation", wintypes.DWORD),
-                    ("dmDisplayFixedOutput", wintypes.DWORD),
-                    ("dmColor", wintypes.SHORT),
-                    ("dmDuplex", wintypes.SHORT),
-                    ("dmYResolution", wintypes.SHORT),
-                    ("dmTTOption", wintypes.SHORT),
-                    ("dmCollate", wintypes.SHORT),
-                    ("dmFormName", wintypes.WCHAR * 32),
-                    ("dmLogPixels", wintypes.WORD),
-                    ("dmBitsPerPel", wintypes.DWORD),
-                    ("dmPelsWidth", wintypes.DWORD),
-                    ("dmPelsHeight", wintypes.DWORD),
-                    ("dmDisplayFlags", wintypes.DWORD),
-                    ("dmDisplayFrequency", wintypes.DWORD),
-                    ("dmICMMethod", wintypes.DWORD),
-                    ("dmICMIntent", wintypes.DWORD),
-                    ("dmMediaType", wintypes.DWORD),
-                    ("dmDitherType", wintypes.DWORD),
-                    ("dmReserved1", wintypes.DWORD),
-                    ("dmReserved2", wintypes.DWORD),
-                    ("dmPanningWidth", wintypes.DWORD),
-                    ("dmPanningHeight", wintypes.DWORD),
-                ]
-
-            mode = DEVMODEW()
-            mode.dmSize = ctypes.sizeof(DEVMODEW)
-            ENUM_CURRENT_SETTINGS = -1
-            ok = user32.EnumDisplaySettingsW(
-                None, ENUM_CURRENT_SETTINGS, ctypes.byref(mode)
-            )
-            if not ok or mode.dmPelsWidth <= 0:
-                return 1.0
-            physical_width = float(mode.dmPelsWidth)
-            scale = physical_width / float(logical_width)
-            if scale < 1.0 or scale > 4.0:
-                return 1.0
-            return scale
-        except Exception:
-            LOG.debug("display scale detection unavailable", exc_info=True)
-            return 1.0
-
     def run(self) -> None:
         try:
             import tkinter as tk
             from tkinter import ttk
             self._ttk = ttk
-
-            # The UI stays DPI-unaware on purpose: Windows bitmap-scales the
-            # whole window so the WIDTH matches every other scaled app on the
-            # machine (a DPI-aware window would look unnaturally narrow next
-            # to 150%-scaled siblings).  Only the initial HEIGHT is
-            # compensated: the logical height is divided by the display scale
-            # so its PHYSICAL size is the configured value on every machine
-            # (e.g. 840 physical px at 150% scaling instead of 840*1.5).
-            scale = self._display_scale_factor()
-            initial_height = max(
-                560, round(_INITIAL_WINDOW_HEIGHT / scale)
-            )
 
             root = tk.Tk()
             self._root = root
@@ -782,8 +700,13 @@ class UiWorker(threading.Thread):
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
             # 不会因调试窗口抢到前台而松开按键、角色跳离绳索。窗口位置与大小
             # 按上次保存的几何恢复（可移动、可调整），默认不再固定左上角。
+            # The size constants are LOGICAL pixels: on scaled displays
+            # (125%/150%) Windows bitmap-scales the DPI-unaware window, so a
+            # 1086x680 logical window physically renders 1358x850 / 1629x1020
+            # - the width scales with every other app and the height stays the
+            # natural content height (no clipping, no extra space).
             restored = _load_window_geometry(
-                f"{_INITIAL_WINDOW_WIDTH}x{initial_height}+40+40"
+                f"{_INITIAL_WINDOW_WIDTH}x{_INITIAL_WINDOW_HEIGHT}+40+40"
             )
             clamped = _clamp_window_geometry(
                 restored, screen_width, screen_height,
@@ -799,8 +722,7 @@ class UiWorker(threading.Thread):
             root.geometry(clamped)
             root.minsize(
                 _INITIAL_WINDOW_WIDTH,
-                round((560 + (_CAPTION_HEIGHT if caption_installed else 0))
-                     / scale),
+                560 + (_CAPTION_HEIGHT if caption_installed else 0),
             )
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
