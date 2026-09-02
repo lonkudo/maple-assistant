@@ -147,13 +147,28 @@ def _clamp_window_geometry(
     return f"{width}x{height}+{x}+{y}"
 
 
+# Format of the persisted window-geometry record.  Bumped whenever the
+# meaning of the stored geometry changes (whole-window vs content-only vs
+# caption semantics), so machines with a stale file from an older release
+# fall back to the current default once instead of restoring a mismatched
+# size (e.g. 1275x904 from an older layout on a Win10 box).
+_GEOMETRY_FORMAT = 2
+
+
 def _load_window_geometry(default_geometry: str) -> str:
     """Return the saved debug UI geometry, or ``default_geometry`` when the
-    settings file is missing/corrupt.  Never raises."""
+    settings file is missing/corrupt/stale.  Never raises.
+
+    Only records written by the CURRENT geometry format are honored: older
+    files (different caption/size semantics) are ignored once so the window
+    opens at the intended initial size on every machine.
+    """
     try:
         data = json.loads(
             _window_geometry_settings_path().read_text(encoding="utf-8")
         )
+        if int(data.get("format", 0)) != _GEOMETRY_FORMAT:
+            return default_geometry
         geometry = data.get("geometry")
         if isinstance(geometry, str) and _parse_window_geometry(geometry):
             return geometry
@@ -166,7 +181,9 @@ def _save_window_geometry(geometry: str) -> None:
     """Persist the debug UI window geometry for the next startup."""
     try:
         _window_geometry_settings_path().write_text(
-            json.dumps({"geometry": geometry}, indent=2) + "\n",
+            json.dumps({"format": _GEOMETRY_FORMAT, "geometry": geometry},
+                       indent=2)
+            + "\n",
             encoding="utf-8",
         )
     except Exception:

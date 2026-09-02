@@ -1622,6 +1622,50 @@ class WindowGeometryHelperTests(unittest.TestCase):
                     "1100x800+60+70",
                 )
 
+    def test_load_window_geometry_ignores_stale_legacy_format(self) -> None:
+        # A geometry saved by an OLD release (no "format" field, e.g.
+        # content-only/caption semantics or another default layout) must NOT
+        # override the current initial size: the Win10 report showed the
+        # window opening at a stale 1275x904 while Win11 (fresh config)
+        # opened at the new default.  Old records fall back to the default.
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / "ui_window_settings.json"
+            legacy.write_text(
+                '{"geometry": "1275x904+40+40"}', encoding="utf-8"
+            )
+            with mock.patch(
+                "ui_worker._window_geometry_settings_path",
+                return_value=legacy,
+            ):
+                self.assertEqual(
+                    _load_window_geometry("1086x840+40+40"),
+                    "1086x840+40+40",
+                )
+
+    def test_load_window_geometry_ignores_wrong_format_version(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            future = Path(directory) / "ui_window_settings.json"
+            future.write_text(
+                '{"format": 99, "geometry": "1275x904+40+40"}',
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "ui_worker._window_geometry_settings_path",
+                return_value=future,
+            ):
+                self.assertEqual(
+                    _load_window_geometry("1086x840+40+40"),
+                    "1086x840+40+40",
+                )
+
     def test_load_window_geometry_falls_back_to_default(self) -> None:
         import tempfile
         from pathlib import Path
