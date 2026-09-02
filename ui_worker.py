@@ -1841,14 +1841,17 @@ class UiWorker(threading.Thread):
         self._caption_drag_begin(event)
 
     def _install_resize_redraw_freeze(self, root: Any) -> bool:
-        """Suppress client repaints while the window is being moved/resized.
+        """Suppress client repaints during a move/resize burst, safely.
 
-        Windows runs its own modal move/resize loop between
-        WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE and draws the window outline
-        itself; Tk only needs to repaint the CONTENT once the new shape is
-        final.  Without this, Tk relayouts + repaints the whole (heavy) UI
-        on every WM_SIZE step, which is what makes dragging/resizing laggy.
-        Returns False (keep default live redraw) on any failure.
+        Tk receives a burst of <Configure> events while the user drags the
+        window or its resize borders, and repaints the whole (heavy) UI on
+        every step - that is the lag.  Instead of subclassing the window
+        procedure (which crashed), this detects the burst from ordinary Tk
+        events and sends WM_SETREDRAW(FALSE) to the window from the normal
+        event loop: Windows keeps drawing the frame outline, the client stops
+        repainting, and when the Configure burst settles (~350 ms without a
+        new event) WM_SETREDRAW(TRUE) + RedrawWindow paint the final shape
+        once.  Returns False (keep default live redraw) on any failure.
         """
 
         try:
@@ -1866,50 +1869,37 @@ class UiWorker(threading.Thread):
             if not hwnd:
                 return False
 
-            LRESULT = ctypes.c_ssize_t
-            WNDPROC = ctypes.WINFUNCTYPE(
-                LRESULT, wintypes.HWND, wintypes.UINT,
-                wintypes.WPARAM, wintypes.LPARAM,
-            )
-
-            WM_ENTERSIZEMOVE = 0x0231
-            WM_EXITSIZEMOVE = 0x0232
             WM_SETREDRAW = 0x000B
             RDW_INVALIDATE = 0x0001
             RDW_ERASE = 0x0004
             RDW_ALLCHILDREN = 0x0080
             RDW_UPDATENOW = 0x0100
-            GWLP_WNDPROC = -4
 
-            # Explicit argtypes keep 64-bit HWND/pointer values intact
-            # (ctypes would otherwise truncate them to 32-bit ints).
+            # Explicit argtypes keep 64-bit HWND values intact.
             user32.SendMessageW.argtypes = [
                 wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                 wintypes.LPARAM,
             ]
-            user32.SendMessageW.restype = LRESULT
+            user32.SendMessageW.restype = ctypes.c_ssize_t
             user32.RedrawWindow.argtypes = [
                 wintypes.HWND, wintypes.LPRECT, wintypes.HRGN, wintypes.UINT,
             ]
             user32.RedrawWindow.restype = wintypes.BOOL
-            user32.SetWindowLongPtrW.argtypes = [
-                wintypes.HWND, ctypes.c_int, ctypes.c_void_p,
-            ]
-            user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-            user32.CallWindowProcW.argtypes = [
-                WNDPROC, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
-                wintypes.LPARAM,
-            ]
-            user32.CallWindowProcW.restype = LRESULT
-            user32.DefWindowProcW.argtypes = [
-                wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
-                wintypes.LPARAM,
-            ]
-            user32.DefWindowProcW.restype = LRESULT
 
-            state = {"frozen": False}
+            state = {"frozen": False, "last": 0.0}
+            self._resize_freeze_state = state
+            self._resize_freeze_hwnd = hwnd
 
-            def _unfreeze_now() -> None:
+            def _freeze() -> None:
+                if state["frozen"]:
+                    return
+                state["frozen"] = True
+                try:
+                    user32.SendMessageW(hwnd, WM_SETREDRAW, 0, 0)
+                except Exception:
+                    pass
+
+            def _unfreeze() -> None:
                 if not state["frozen"]:
                     return
                 state["frozen"] = False
@@ -1923,71 +1913,30 @@ class UiWorker(threading.Thread):
                 except Exception:
                     pass
 
-            @WNDPROC
-            def _wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
-                try:
-                    if msg == WM_ENTERSIZEMOVE:
-                        state["frozen"] = True
-                        user32.SendMessageW(hwnd, WM_SETREDRAW, 0, 0)
-                        # Watchdog: never leave the window frozen if the
-                        # matching WM_EXITSIZEMOVE is somehow missed.
-                        root = getattr(self, "_root", None)
-                        if root is not None:
-                            try:
-                                job = getattr(
-                                    self, "_resize_unfreeze_job", None
-                                )
-                                if job is not None:
-                                    try:
-                                        root.after_cancel(job)
-                                    except Exception:
-                                        pass
-                                self._resize_unfreeze_job = root.after(
-                                    4000, _unfreeze_now
-                                )
-                            except Exception:
-                                pass
-                    elif msg == WM_EXITSIZEMOVE:
-                        state["frozen"] = False
-                        root = getattr(self, "_root", None)
-                        if root is not None:
-                            try:
-                                job = getattr(
-                                    self, "_resize_unfreeze_job", None
-                                )
-                                if job is not None:
-                                    try:
-                                        root.after_cancel(job)
-                                    except Exception:
-                                        pass
-                                    self._resize_unfreeze_job = None
-                            except Exception:
-                                pass
-                        user32.SendMessageW(hwnd, WM_SETREDRAW, 1, 0)
-                        user32.RedrawWindow(
-                            hwnd, None, None,
-                            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN
-                            | RDW_UPDATENOW,
-                        )
-                except Exception:
-                    pass
-                old_proc = getattr(self, "_old_wndproc", None)
-                if old_proc is not None:
-                    return user32.CallWindowProcW(
-                        old_proc, hwnd, msg, wparam, lparam
-                    )
-                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+            def _schedule_settle() -> None:
+                job = getattr(self, "_resize_settle_job", None)
+                if job is not None:
+                    try:
+                        root.after_cancel(job)
+                    except Exception:
+                        pass
+                self._resize_settle_job = root.after(350, _unfreeze)
 
-            # Keep the callback alive for the whole UI lifetime.
-            self._resize_wndproc_cb = _wndproc
-            self._resize_freeze_state = state
-            old_ptr = user32.SetWindowLongPtrW(
-                hwnd, GWLP_WNDPROC, ctypes.cast(_wndproc, ctypes.c_void_p).value
-            )
-            if not old_ptr:
-                return False
-            self._old_wndproc = ctypes.cast(old_ptr, WNDPROC)
-            self._resize_freeze_hwnd = hwnd
+            def _on_configure(_event: Any) -> None:
+                now = time.monotonic()
+                if state["frozen"]:
+                    # Still in the burst: postpone the settle redraw.
+                    state["last"] = now
+                    _schedule_settle()
+                    return
+                previous = state["last"]
+                state["last"] = now
+                if previous and (now - previous) < 0.25:
+                    _freeze()
+                    _schedule_settle()
+
+            self._resize_configure_handler = _on_configure
+            root.bind("<Configure>", _on_configure, add="+")
             return True
         except Exception:
             LOG.debug("resize redraw freeze unavailable", exc_info=True)
