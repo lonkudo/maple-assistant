@@ -3494,25 +3494,32 @@ class UiWorker(threading.Thread):
         enabled = bool(data.get("enabled", True))
         state_text = "已启用 (hotkey.json → enabled: true)" if enabled \
             else "已停用 (hotkey.json → enabled: false)"
-        sections = [
-            (
-                f"快捷键总开关: {state_text}\n"
-                "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
-                "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
-                "修改 hotkey.json 后需重启程序生效。"
-            ),
-        ]
-        lines = ["当前快捷键绑定 (hotkey.json):"]
+        header_text = (
+            f"快捷键总开关: {state_text}\n"
+            "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
+            "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
+            "修改 hotkey.json 后需重启程序生效。"
+        )
+        footer_text = (
+            "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
+            "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
+            "ignore_injected=true 只响应真实物理按键。\n"
+            "移开鼠标即自动关闭本提示。"
+        )
+
+        # Binding list as an aligned two-column table: keys on the left
+        # (right-aligned), explanations on the right (left-aligned).  Each
+        # column is one multi-line Label so every row lines up.
         bindings = data.get("bindings", [])
-        if not bindings:
-            lines.append("  (未配置任何绑定)")
+        key_lines: list[str] = []
+        label_lines: list[str] = []
         quick_messages = []
         for item in bindings:
             if not isinstance(item, dict):
                 continue
             action = str(item.get("action", ""))
             # The ten quick-message slots (Ctrl+1..Ctrl+9, Ctrl+0) share one
-            # line instead of ten identical rows.
+            # row instead of ten identical rows.
             if action.startswith("quick_message:"):
                 quick_messages.append(
                     (str(item.get("keys", "")), action)
@@ -3520,39 +3527,61 @@ class UiWorker(threading.Thread):
                 continue
             keys = self._help_key_label(item.get("keys", ""))
             action_label = self._help_action_label(action)
-            lines.append(f"  {keys:<12} → {action_label}")
+            key_lines.append(keys)
+            label_lines.append(action_label)
         if quick_messages:
             keys_label = self._help_key_label(quick_messages[0][0])
             last_keys = self._help_key_label(quick_messages[-1][0])
             if len(quick_messages) > 1 and keys_label != last_keys:
-                line = f"  {keys_label} ~ {last_keys}"
+                key_lines.append(f"{keys_label} ~ {last_keys}")
             else:
-                line = f"  {keys_label}"
+                key_lines.append(keys_label)
             first_index = int(quick_messages[0][1].partition(":")[2])
-            lines.append(
-                f"{line} → 发送第 {first_index + 1}~"
+            label_lines.append(
+                f"发送第 {first_index + 1}~"
                 f"{first_index + len(quick_messages)} 条快捷消息"
             )
-        sections.append("\n".join(lines))
-        sections.append(
-            "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
-            "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
-            "ignore_injected=true 只响应真实物理按键。\n"
-            "移开鼠标即自动关闭本提示。"
+
+        content = tk.Frame(
+            popup, bg="#fffbd6", padx=7, pady=4, bd=1, relief="solid"
         )
+        content.pack(fill="x")
+        tk.Label(
+            content, text=header_text, justify="left",
+            background="#fffbd6", foreground="#202020",
+            wraplength=430, anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+
+        if key_lines:
+            table = tk.Frame(content, bg="#fffbd6")
+            table.pack(fill="x", pady=(2, 4))
+            tk.Label(
+                table, text="按键", background="#fffbd6",
+                foreground="#202020", font=("", 9, "bold"),
+                anchor="e", width=18,
+            ).grid(row=0, column=0, sticky="e", padx=(0, 10))
+            tk.Label(
+                table, text="功能", background="#fffbd6",
+                foreground="#202020", font=("", 9, "bold"),
+                anchor="w",
+            ).grid(row=0, column=1, sticky="w")
+            key_column = tk.Label(
+                table, text="\n".join(key_lines), justify="right",
+                background="#fffbd6", foreground="#202020",
+                anchor="e", width=18,
+            )
+            key_column.grid(row=1, column=0, sticky="e", padx=(0, 10))
+            tk.Label(
+                table, text="\n".join(label_lines), justify="left",
+                background="#fffbd6", foreground="#202020",
+                anchor="w",
+            ).grid(row=1, column=1, sticky="w")
 
         tk.Label(
-            popup,
-            text="\n\n".join(sections),
-            justify="left",
-            background="#fffbd6",
-            foreground="#202020",
-            relief="solid",
-            borderwidth=1,
-            padx=7,
-            pady=4,
-            wraplength=430,
-        ).pack(fill="x")
+            content, text=footer_text, justify="left",
+            background="#fffbd6", foreground="#202020",
+            wraplength=430, anchor="w",
+        ).pack(fill="x", pady=(4, 0))
 
         # Stay open while the pointer is over the popup; hover-out closes it.
         self._help_bind_popup_hover(popup)
