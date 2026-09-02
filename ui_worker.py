@@ -3506,12 +3506,33 @@ class UiWorker(threading.Thread):
         bindings = data.get("bindings", [])
         if not bindings:
             lines.append("  (未配置任何绑定)")
+        quick_messages = []
         for item in bindings:
             if not isinstance(item, dict):
                 continue
+            action = str(item.get("action", ""))
+            # The ten quick-message slots (Ctrl+1..Ctrl+9, Ctrl+0) share one
+            # line instead of ten identical rows.
+            if action.startswith("quick_message:"):
+                quick_messages.append(
+                    (str(item.get("keys", "")), action)
+                )
+                continue
             keys = self._help_key_label(item.get("keys", ""))
-            action = self._help_action_label(str(item.get("action", "")))
-            lines.append(f"  {keys:<12} → {action}")
+            action_label = self._help_action_label(action)
+            lines.append(f"  {keys:<12} → {action_label}")
+        if quick_messages:
+            keys_label = self._help_key_label(quick_messages[0][0])
+            last_keys = self._help_key_label(quick_messages[-1][0])
+            if len(quick_messages) > 1 and keys_label != last_keys:
+                line = f"  {keys_label} ~ {last_keys}"
+            else:
+                line = f"  {keys_label}"
+            first_index = int(quick_messages[0][1].partition(":")[2])
+            lines.append(
+                f"{line} → 发送第 {first_index + 1}~"
+                f"{first_index + len(quick_messages)} 条快捷消息"
+            )
         sections.append("\n".join(lines))
         sections.append(
             "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
