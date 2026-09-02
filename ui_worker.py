@@ -39,7 +39,7 @@ LOG = logging.getLogger(__name__)
 # window (including the in-window caption bar when active) is 1050x720.
 # The height stays user-resizable (only the minimum is enforced).
 _INITIAL_WINDOW_WIDTH = 1086
-_INITIAL_WINDOW_HEIGHT = 840
+_INITIAL_WINDOW_HEIGHT = 1030
 # Column 0 is FIXED at 550px, column 1 at 500px (both fully visible inside
 # the 1086px default: 550 + 500 + 12px column gap + 24px container padding).
 
@@ -740,9 +740,14 @@ class UiWorker(threading.Thread):
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
+            # Content must never dictate the window size: the initial size is
+            # fixed by the geometry applied after the UI is built, and the
+            # inner panels must not spread the window open on first display.
+            container.pack_propagate(False)
 
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
+            columns.pack_propagate(False)
             # Column 0 is FIXED at 550px, column 1 FIXED at 500px (grid
             # columns 0/1): the 警报 row fits on one line in the left column
             # and the drug/quick-message panels keep their full text width in
@@ -1590,6 +1595,13 @@ class UiWorker(threading.Thread):
             self._log_text.configure(yscrollcommand=log_scroll.set)
             self._log_text.pack(side="left", fill="both", expand=True)
             log_scroll.pack(side="right", fill="y")
+
+            # Pin the window to the configured initial geometry AFTER all
+            # content has been built: pack propagation from the panels would
+            # otherwise let the content spread the window open taller than
+            # the requested initial size on the very first display.
+            root.update_idletasks()
+            root.geometry(clamped)
 
             root.after(0, self._poll)
             root.mainloop()
@@ -3293,7 +3305,7 @@ class UiWorker(threading.Thread):
         like a tooltip) instead of a second framed dialog, so it does not
         steal focus from the game.  Hover-triggered: it appears while the
         pointer is over the "?" (or the popup itself) and disappears on
-        mouse-leave; the in-popup 关闭 button also closes it.
+        mouse-leave; hovering the popup keeps it open, moving away closes it.
         """
 
         root = getattr(self, "_root", None)
@@ -3363,14 +3375,13 @@ class UiWorker(threading.Thread):
             text=(
                 "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
                 "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
-                "ignore_injected=true 只响应真实物理按键。"
+                "ignore_injected=true 只响应真实物理按键。\n"
+                "移开鼠标即自动关闭本提示。"
             ),
             justify="left",
             background="#ffffff",
             wraplength=430,
-        ).pack(side="left", fill="x", expand=True)
-        ttk.Button(bottom, text="关闭",
-                   command=self._hide_hotkey_help).pack(side="right")
+        ).pack(fill="x")
 
         # Stay open while the pointer is over the popup; hover-out closes it.
         self._help_bind_popup_hover(popup)
