@@ -367,6 +367,15 @@ def main() -> int:
     def stop_patrol_after_focus_loss() -> None:
         patrol_controller.set_enabled(False)
 
+    def stop_patrol_for_disconnect() -> None:
+        """Immediately disarm patrol input after a confirmed disconnect."""
+
+        if not patrol_controller.is_enabled():
+            return
+        patrol_controller.set_enabled(False)
+        _stop_live_input(key_sender, automation_active)
+        logging.warning("PATROL STOPPED: disconnect alert triggered")
+
     rope_profile = map_profile["rope"]
     minimap_region = MINIMAP_FALLBACK_REGION
     status_defaults = StatusConfig()
@@ -899,6 +908,7 @@ def main() -> int:
         ),
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
+        on_disconnect=stop_patrol_for_disconnect,
     )
     core_workers = [
         capture_worker,

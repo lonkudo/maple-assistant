@@ -22,16 +22,15 @@ from PIL import Image
 
 LOG = logging.getLogger(__name__)
 
-# Keys the UI bind buttons may capture - game-usable hotkeys only: the
-# modifiers (except alt, which is the jump key), navigation/edit keys, the
-# 1-9 number row above the letters, and "a" (many players bind a buff/skill
-# or an attack there).  Everything else (other letters, F-keys, numpad,
-# punctuation) is intentionally not bindable to avoid conflicts with game
-# bindings.
+# Keys the UI bind buttons may capture.  The ordinary Q--M letter keys and
+# slash are useful skill bindings; Z remains reserved for pickup/movement.
+# Alt and arrow keys stay unavailable because patrol uses them for movement.
 BINDABLE_KEYS = frozenset({
     "shift", "ctrl", "space", "delete", "end",
     "pagedown", "pageup", "home", "insert",
-    "a",
+    "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
+    "a", "s", "d", "f", "g", "h", "j", "k", "l",
+    "x", "c", "v", "b", "n", "m", "slash",
     "1", "2", "3", "4", "5", "6", "7", "8", "9",
 })
 

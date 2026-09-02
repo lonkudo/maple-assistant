@@ -199,6 +199,9 @@ class PatrolControllerTests(unittest.TestCase):
             controller.record_endpoint("rope_pos", .49, .70)
             self.assertTrue(controller.layer_is_complete("layer1"))
             controller.set_enabled(True)
+            with self.assertRaisesRegex(ValueError, "停止巡逻"):
+                controller.add_layer_above()
+            controller.set_enabled(False)
             self.assertEqual(controller.add_layer_above(), "layer3")
             self.assertFalse(controller.is_enabled())
             self.assertEqual(controller.selected_layer(), "layer3")
@@ -208,7 +211,7 @@ class PatrolControllerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "final layer"):
                 controller.record_endpoint("rope_pos", .52, .42)
             snapshot = controller.snapshot()
-            self.assertEqual(snapshot.route_order, ("layer1",))
+            self.assertEqual(snapshot.route_order, ("layer1", "layer3"))
             self.assertEqual(snapshot.layers["layer1"]["rope_pos"]["x"], .49)
             self.assertNotIn("rope_pos", snapshot.layers["layer3"])
 
@@ -221,8 +224,9 @@ class PatrolControllerTests(unittest.TestCase):
 
             self.assertEqual(controller.add_layer_above(), "layer2")
             self.assertEqual(tuple(controller.snapshot().layers), ("layer1", "layer2"))
-            # Empty route = stand-still + attack mode, so it is startable.
-            self.assertTrue(controller.can_start())
+            # The newly added top floor is immediately part of the range;
+            # patrol stays disabled until it has a recorded action point.
+            self.assertFalse(controller.can_start())
 
     def test_new_layer_first_point_records_its_y(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

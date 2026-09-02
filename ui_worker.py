@@ -385,10 +385,9 @@ def layer_display_order(layer_names: list[str]) -> tuple[str, ...]:
 def keysym_to_scan_key(keysym: str) -> Optional[str]:
     """Map a Tk keysym to a bindable scan-code key name, or None.
 
-    Only the game-usable hotkeys are bindable (``BINDABLE_KEYS``: shift /
-    ctrl / alt / space / delete / end / pageup / pagedown / home / insert
-    and the 1-9 number row).  Escape cancels key capture and restores the
-    previous binding; every other key is ignored.
+    Only the game-usable hotkeys listed in ``BINDABLE_KEYS`` are bindable.
+    Escape cancels key capture and restores the previous binding; every other
+    key is ignored.
     """
 
     if not keysym:
@@ -429,7 +428,10 @@ def bindable_keys_hint() -> str:
 
     ordered = [
         "1", "2", "3", "4", "5", "6", "7", "8", "9",
-        "a", "space", "ctrl", "shift", "delete", "end",
+        "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",
+        "a", "s", "d", "f", "g", "h", "j", "k", "l",
+        "x", "c", "v", "b", "n", "m", "slash",
+        "space", "ctrl", "shift", "delete", "end",
         "home", "insert", "pageup", "pagedown",
     ]
     available = " / ".join(name for name in ordered if name in BINDABLE_KEYS)
@@ -609,6 +611,10 @@ class UiWorker(threading.Thread):
         self._unlocked_points: set[tuple[str, str]] = set()
         self._record_press_job: Any = None
         self._record_hold_fired = False
+        self._attack_hotkey_sound_job: Any = None
+        # A hotkey callback can be delivered twice by Windows during a focus
+        # transition.  Never stack identical success/failure MP3 feedback.
+        self._last_action_sound_at: dict[bool, float] = {}
 
     def run(self) -> None:
         try:
@@ -681,10 +687,17 @@ class UiWorker(threading.Thread):
                 action_row, text="添加楼层", command=self._add_layer_above
             )
             self._add_layer_button.pack(side="left", padx=(0, 8))
+            self._delete_layer_button = ttk.Button(
+                action_row, text="删除楼层", command=self._delete_highest_layer
+            )
+            self._delete_layer_button.pack(side="left", padx=(0, 8))
             self._reset_recording_button = ttk.Button(
                 action_row, text="重置录制", command=self._reset_recording
             )
             self._reset_recording_button.pack(side="left")
+            # One shared radio value makes the currently selected recording
+            # layer visible and clickable in every dynamically built row.
+            self._selected_layer_var = tk.StringVar(value="")
             # Contiguous patrol floor range: patrol ONLY the selected floors
             # (a single floor is allowed); a fall outside the range makes the
             # character return to it.  layer1 is no longer implicitly the
@@ -940,55 +953,53 @@ class UiWorker(threading.Thread):
             ).pack(side="left")
             fixed_key_row = ttk.Frame(fixed_panel)
             fixed_key_row.pack(fill="x", pady=(6, 0))
-            ttk.Label(fixed_key_row, text="攻击按键:").pack(
+            ttk.Label(fixed_key_row, text="按键:").pack(
                 side="left", padx=(0, 4)
             )
             self._fixed_attack_key_var = tk.StringVar(value="ctrl")
             fixed_key_button = ttk.Button(
                 fixed_key_row, text=self._fixed_attack_key_var.get(),
-                width=10, style="Locked.TButton",
+                width=5, style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     fixed_key_button, self._fixed_attack_key_var,
                     "_fixed_attack_key_previous",
                     lambda: self._fixed_on_change(),
                 ),
             )
-            fixed_key_button.pack(side="left", padx=(0, 10))
+            fixed_key_button.pack(side="left", padx=(0, 4))
             self._fixed_key_button = fixed_key_button
             self._attach_bind_hint(fixed_key_button)
             ttk.Label(fixed_key_row, text="每").pack(side="left")
             # Fixed attack period: horizontal slider (progress-bar style),
-            # 0.5-10 s, default 3 s.
+            # 0.2-10 s, default 3 s.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
             fixed_interval_slider = ttk.Scale(
-                fixed_key_row, from_=0.5, to=10.0, orient="horizontal",
-                length=105,
+                fixed_key_row, from_=0.2, to=10.0, orient="horizontal",
+                length=90,
                 variable=self._fixed_interval_var,
                 command=self._fixed_on_change,
             )
-            fixed_interval_slider.pack(side="left", padx=(0, 6))
+            fixed_interval_slider.pack(side="left", padx=(0, 2))
             self._fixed_interval_label = ttk.Label(
                 fixed_key_row, text="3.0s", width=5
             )
-            self._fixed_interval_label.pack(side="left", padx=(0, 6))
+            self._fixed_interval_label.pack(side="left", padx=(0, 2))
             self._fixed_range_label = ttk.Label(
-                fixed_key_row, text="(3.0s, 3.1s)", width=14
+                fixed_key_row, text="(3.0s, 3.1s)", width=13
             )
             self._fixed_range_label.pack(side="left")
-            fixed_gap_row = ttk.Frame(fixed_panel)
-            fixed_gap_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(fixed_gap_row, text="随机间差:").pack(side="left")
+            ttk.Label(fixed_key_row, text="随机:").pack(side="left")
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
             ttk.Button(
-                fixed_gap_row, text="−", width=2,
+                fixed_key_row, text="−", width=2,
                 command=lambda: self._fixed_adjust_random_gap(-0.1),
             ).pack(side="left", padx=(3, 2))
             self._fixed_random_gap_label = ttk.Label(
-                fixed_gap_row, text="0.1s", width=5, anchor="center"
+                fixed_key_row, text="0.1s", width=4, anchor="center"
             )
             self._fixed_random_gap_label.pack(side="left")
             ttk.Button(
-                fixed_gap_row, text="+", width=2,
+                fixed_key_row, text="+", width=2,
                 command=lambda: self._fixed_adjust_random_gap(0.1),
             ).pack(side="left", padx=(2, 0))
 
@@ -996,39 +1007,37 @@ class UiWorker(threading.Thread):
             jump_row.pack(fill="x", pady=(6, 0))
             self._random_jump_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                jump_row, text="随机跳跃",
+                jump_row, text="跳跃", width=7,
                 variable=self._random_jump_enabled_var,
                 command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 8))
+            ).pack(side="left", padx=(0, 4))
             ttk.Label(jump_row, text="每").pack(side="left")
             self._random_jump_interval_var = tk.DoubleVar(value=3.0)
             ttk.Scale(
-                jump_row, from_=0.5, to=10.0, orient="horizontal",
-                length=105, variable=self._random_jump_interval_var,
+                jump_row, from_=0.2, to=10.0, orient="horizontal",
+                length=90, variable=self._random_jump_interval_var,
                 command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 6))
+            ).pack(side="left", padx=(0, 2))
             self._random_jump_interval_label = ttk.Label(
                 jump_row, text="3.0s", width=5
             )
-            self._random_jump_interval_label.pack(side="left", padx=(0, 6))
+            self._random_jump_interval_label.pack(side="left", padx=(0, 2))
             self._random_jump_range_label = ttk.Label(
-                jump_row, text="(3.0s, 3.1s)", width=14
+                jump_row, text="(3.0s, 3.1s)", width=13
             )
             self._random_jump_range_label.pack(side="left")
-            jump_gap_row = ttk.Frame(fixed_panel)
-            jump_gap_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(jump_gap_row, text="跳跃随机间差:").pack(side="left")
+            ttk.Label(jump_row, text="随机:").pack(side="left")
             self._random_jump_gap_var = tk.DoubleVar(value=0.1)
             ttk.Button(
-                jump_gap_row, text="−", width=2,
+                jump_row, text="−", width=2,
                 command=lambda: self._random_jump_adjust_gap(-0.1),
             ).pack(side="left", padx=(3, 2))
             self._random_jump_gap_label = ttk.Label(
-                jump_gap_row, text="0.1s", width=5, anchor="center"
+                jump_row, text="0.1s", width=4, anchor="center"
             )
             self._random_jump_gap_label.pack(side="left")
             ttk.Button(
-                jump_gap_row, text="+", width=2,
+                jump_row, text="+", width=2,
                 command=lambda: self._random_jump_adjust_gap(0.1),
             ).pack(side="left", padx=(2, 0))
             self._fixed_status = ttk.Label(
@@ -1274,7 +1283,7 @@ class UiWorker(threading.Thread):
             self._disconnect_alert_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 alarm_row,
-                text="掉线警报",
+                text="掉线",
                 variable=self._disconnect_alert_var,
                 command=self._shutdown_on_change,
             ).pack(side="left", padx=(4, 8))
@@ -1282,14 +1291,14 @@ class UiWorker(threading.Thread):
             self._lie_alert_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 alarm_row,
-                text="测谎警报",
+                text="测谎",
                 variable=self._lie_alert_var,
                 command=self._shutdown_on_change,
             ).pack(side="left", padx=(0, 8))
 
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
-                alarm_row, text="循环警报",
+                alarm_row, text="循环",
                 variable=self._countdown_enabled_var,
                 command=self._countdown_on_change,
             )
@@ -1351,7 +1360,7 @@ class UiWorker(threading.Thread):
             self._sound_alert_var = tk.BooleanVar(value=True)
             ttk.Checkbutton(
                 reminder_row,
-                text="声音提醒",
+                text="声音",
                 variable=self._sound_alert_var,
                 command=self._shutdown_on_change,
             ).pack(side="left", padx=(4, 8))
@@ -1359,7 +1368,7 @@ class UiWorker(threading.Thread):
             self._screen_blink_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 reminder_row,
-                text="闪烁提醒",
+                text="闪烁",
                 variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
             ).pack(side="left", padx=(0, 8))
@@ -1367,7 +1376,7 @@ class UiWorker(threading.Thread):
             self._telegram_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 reminder_row,
-                text="消息提醒",
+                text="消息",
                 variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
@@ -1543,16 +1552,32 @@ class UiWorker(threading.Thread):
                 return
             try:
                 if action.startswith("quick_message:"):
-                    self._send_quick_message(int(action.partition(":")[2]))
+                    if not self._send_quick_message(
+                        int(action.partition(":")[2])
+                    ):
+                        self._play_action_sound(False)
                 elif action.startswith("record:"):
                     boundary = action.partition(":")[2]
-                    self._record_endpoint(boundary)
+                    self._play_action_sound(self._record_endpoint(boundary))
+                elif action == "select_next_layer":
+                    self._play_action_sound(self._select_next_layer())
+                elif action == "select_next_patrol_start":
+                    self._play_action_sound(self._select_next_patrol_start())
+                elif action.startswith("adjust_fixed_attack_interval:"):
+                    self._hotkey_adjust_fixed_interval(
+                        float(action.partition(":")[2])
+                    )
+                elif action == "add_highest_layer":
+                    self._play_action_sound(self._add_layer_above())
+                elif action == "delete_highest_layer":
+                    self._play_action_sound(self._delete_highest_layer())
                 elif action == "toggle_patrol":
                     if (self.patrol_controller is not None
                             and self.patrol_controller.is_enabled()):
                         self._stop_patrol()
+                        self._play_action_sound(False)
                     else:
-                        self._start_patrol()
+                        self._play_action_sound(self._start_patrol())
             except Exception:
                 LOG.exception("hotkey action failed: %s", action)
                 self._play_action_sound(False)
@@ -1565,6 +1590,13 @@ class UiWorker(threading.Thread):
     def _play_action_sound(self, success: bool) -> None:
         """Play UI action feedback without blocking Tk."""
 
+        now = time.monotonic()
+        previous = self._last_action_sound_at.get(success, float("-inf"))
+        if now - previous < 1.0:
+            LOG.info("action sound suppressed (duplicate): %s",
+                     "success" if success else "fail")
+            return
+        self._last_action_sound_at[success] = now
         name = "success.mp3" if success else "fail.mp3"
         path = Path(__file__).resolve().parent / "sound" / name
         threading.Thread(
@@ -1768,11 +1800,9 @@ class UiWorker(threading.Thread):
     def _record_endpoint(self, boundary: str) -> bool:
         if self.patrol_controller is None:
             self._control_status.configure(text="巡逻控制器不可用。")
-            self._play_action_sound(False)
             return False
         if self.patrol_controller.is_enabled():
             self._control_status.configure(text="巡逻中无法录制，请先停止巡逻。")
-            self._play_action_sound(False)
             return False
         snapshot = self._capture_snapshot_for_recording()
         if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
@@ -1787,7 +1817,6 @@ class UiWorker(threading.Thread):
             self._control_status.configure(
                 text="无法录制: 最新画面中未检测到黄色菱形标记。"
             )
-            self._play_action_sound(False)
             return False
         if not is_verified_border(snapshot.detection):
             LOG.warning(
@@ -1799,7 +1828,6 @@ class UiWorker(threading.Thread):
             self._control_status.configure(
                 text="无法录制: 未检测到可保存的小地图边框。"
             )
-            self._play_action_sound(False)
             return False
         try:
             # Border calibration is an independent recording output. Save it
@@ -1824,7 +1852,6 @@ class UiWorker(threading.Thread):
             LOG.warning("record rejected: layer=%s point=%s error=%s",
                         self.patrol_controller.selected_layer(), boundary, exc)
             self._control_status.configure(text=f"无法录制: {exc}")
-            self._play_action_sound(False)
             return False
         labels = {
             "left_most_pos": "最左",
@@ -1840,7 +1867,7 @@ class UiWorker(threading.Thread):
                   f"x={recorded.x:.6f}, y={recorded.y:.6f}")
         )
         self._refresh_patrol_controls()
-        self._play_action_sound(True)
+        return True
         return True
 
     def _yolo_settings_path(self) -> Path:
@@ -1908,7 +1935,7 @@ class UiWorker(threading.Thread):
         return {
             "attack_mode": str(self._attack_mode_var.get()),
             "interval_seconds": round(
-                float(self._fixed_interval_var.get()), 1
+                max(0.2, float(self._fixed_interval_var.get())), 1
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
@@ -1917,7 +1944,9 @@ class UiWorker(threading.Thread):
                 if hasattr(self, "_random_jump_enabled_var") else False
             ),
             "random_jump_interval_seconds": round(
-                float(getattr(self, "_random_jump_interval_var", None).get())
+                max(0.2, float(
+                    getattr(self, "_random_jump_interval_var", None).get()
+                ))
                 if hasattr(self, "_random_jump_interval_var") else 3.0,
                 1,
             ),
@@ -1966,6 +1995,36 @@ class UiWorker(threading.Thread):
         self._random_jump_gap_var.set(value)
         self._fixed_on_change()
 
+    def _hotkey_adjust_fixed_interval(self, delta: float) -> bool:
+        """Apply one held Ctrl+[ / Ctrl+] fixed-attack interval step."""
+
+        if (not hasattr(self, "_fixed_interval_var")
+                or self._root is None):
+            return False
+        current = float(self._fixed_interval_var.get())
+        value = round(max(0.2, min(10.0, current + float(delta))), 1)
+        if value == round(current, 1):
+            return False
+        self._fixed_interval_var.set(value)
+        self._fixed_on_change()
+
+        previous = self._attack_hotkey_sound_job
+        if previous is not None:
+            try:
+                self._root.after_cancel(previous)
+            except Exception:
+                pass
+        self._attack_hotkey_sound_job = self._root.after(
+            2000, self._finish_hotkey_attack_adjustment
+        )
+        return True
+
+    def _finish_hotkey_attack_adjustment(self) -> None:
+        """Play one success tone after the held interval adjustment settles."""
+
+        self._attack_hotkey_sound_job = None
+        self._play_action_sound(True)
+
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
 
@@ -1974,7 +2033,8 @@ class UiWorker(threading.Thread):
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
                 and self._attack_mode_var.get() != "fixed"):
             self._attack_mode_var.set("fixed")
-        interval = float(self._fixed_interval_var.get())
+        interval = max(0.2, float(self._fixed_interval_var.get()))
+        self._fixed_interval_var.set(interval)
         random_gap = self._fixed_random_gap_seconds()
         if hasattr(self, "_fixed_random_gap_var"):
             self._fixed_random_gap_var.set(random_gap)
@@ -1986,7 +2046,10 @@ class UiWorker(threading.Thread):
                 text=f"({interval:.1f}s, {interval + random_gap:.1f}s)"
             )
         if hasattr(self, "_random_jump_interval_var"):
-            jump_interval = float(self._random_jump_interval_var.get())
+            jump_interval = max(
+                0.2, float(self._random_jump_interval_var.get())
+            )
+            self._random_jump_interval_var.set(jump_interval)
             jump_gap = self._random_jump_gap_seconds()
             self._random_jump_gap_var.set(jump_gap)
             self._random_jump_interval_label.configure(
@@ -2035,7 +2098,7 @@ class UiWorker(threading.Thread):
             mode = "fixed"
         worker.enabled = bool(mode == "fixed")
         worker.attack_interval = max(
-            0.25, float(data.get("interval_seconds", 3.0))
+            0.2, float(data.get("interval_seconds", 3.0))
         )
         worker.attack_jitter_seconds = max(
             0.0, float(data.get("random_gap_seconds", 0.1))
@@ -2050,7 +2113,7 @@ class UiWorker(threading.Thread):
                 data.get("random_jump_enabled", False)
             )
             jump_worker.jump_interval = max(
-                0.25,
+                0.2,
                 float(data.get("random_jump_interval_seconds", 3.0)),
             )
             jump_worker.jump_jitter_seconds = max(
@@ -3383,6 +3446,8 @@ class UiWorker(threading.Thread):
         except ValueError as exc:
             self._control_status.configure(text=str(exc))
             return
+        if hasattr(self, "_selected_layer_var"):
+            self._selected_layer_var.set(layer_name)
         key = (layer_name, boundary)
         saved_endpoint = self.patrol_controller.endpoint(layer_name, boundary)
         if record_button_is_locked(saved_endpoint, key in self._unlocked_points):
@@ -3403,6 +3468,8 @@ class UiWorker(threading.Thread):
         except ValueError as exc:
             self._control_status.configure(text=str(exc))
             return
+        if hasattr(self, "_selected_layer_var"):
+            self._selected_layer_var.set(layer_name)
         key = (layer_name, boundary)
         saved_endpoint = self.patrol_controller.endpoint(layer_name, boundary)
         if not record_button_is_locked(saved_endpoint, key in self._unlocked_points):
@@ -3420,7 +3487,6 @@ class UiWorker(threading.Thread):
     def _start_patrol(self) -> bool:
         if self.patrol_controller is None:
             self._control_status.configure(text="巡逻控制器不可用。")
-            self._play_action_sound(False)
             return False
         if self.patrol_controller.is_enabled():
             return True
@@ -3429,7 +3495,6 @@ class UiWorker(threading.Thread):
                 text=("无法开始: 每层至少录制一个巡逻点 (最左 / 绳索 / 最右)。"
                       "不录制任何点时将原地站立只进行攻击。")
             )
-            self._play_action_sound(False)
             return False
         self._control_status.configure(text="正在选择游戏窗口…")
         if self._root is not None:
@@ -3441,7 +3506,6 @@ class UiWorker(threading.Thread):
                 self._control_status.configure(
                     text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
-                self._play_action_sound(False)
                 return False
         self.patrol_controller.set_enabled(True)
         # 攻击模式为「YOLO 检测」时，开始巡逻自动启动 YOLO 检测
@@ -3451,12 +3515,10 @@ class UiWorker(threading.Thread):
             self._yolo_start()
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已开始。")
-        self._play_action_sound(True)
         return True
 
     def _stop_patrol(self) -> bool:
         if self.patrol_controller is None:
-            self._play_action_sound(False)
             return False
         self.patrol_controller.set_enabled(False)
         if self.on_patrol_stop is not None:
@@ -3469,23 +3531,23 @@ class UiWorker(threading.Thread):
         self._trim_log_lines(100)
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已停止。")
-        self._play_action_sound(False)
         return True
 
-    def _add_layer_above(self) -> None:
+    def _add_layer_above(self) -> bool:
         if self.patrol_controller is None:
             self._control_status.configure(text="巡逻控制器不可用。")
-            return
+            return False
         try:
             layer_name = self.patrol_controller.add_layer_above()
         except (OSError, ValueError) as exc:
             self._control_status.configure(text=f"无法添加楼层: {exc}")
-            return
+            return False
         self._control_status.configure(
             text=(f"已选择 {layer_name}。请手动移动到该层并录制任意巡逻点 "
                   "(最左 / 绳索 / 最右)。巡逻已暂停。")
         )
         self._refresh_patrol_controls()
+        return True
 
     def _reset_recording(self) -> None:
         if self.patrol_controller is None:
@@ -3525,6 +3587,7 @@ class UiWorker(threading.Thread):
             self._start_patrol_button.configure(state="disabled")
             self._stop_patrol_button.configure(state="disabled")
             self._add_layer_button.configure(state="disabled")
+            self._delete_layer_button.configure(state="disabled")
             self._reset_recording_button.configure(state="disabled")
             return
         running = self.patrol_controller.is_enabled()
@@ -3537,6 +3600,8 @@ class UiWorker(threading.Thread):
         layer_names = list(layer_display_order(layer_names))
         self._update_patrol_range_combos(layer_names)
         self._ensure_layer_rows(tuple(layer_names))
+        if hasattr(self, "_selected_layer_var"):
+            self._selected_layer_var.set(selected)
         button_labels = {
             "left_most_pos": "最左",
             "rope_pos": "绳索",
@@ -3578,6 +3643,9 @@ class UiWorker(threading.Thread):
         self._start_patrol_button.configure(state=start_state)
         self._stop_patrol_button.configure(state=stop_state)
         self._add_layer_button.configure(state="normal")
+        self._delete_layer_button.configure(
+            state="normal" if len(layer_names) > 1 else "disabled"
+        )
         self._reset_recording_button.configure(state="normal")
 
     def _update_patrol_range_combos(self, display_names: list[str]) -> None:
@@ -3606,6 +3674,89 @@ class UiWorker(threading.Thread):
         """Reverse of ``_patrol_display_name`` (``楼层2`` -> ``layer2``)."""
         match = re.search(r"(\d+)$", display)
         return f"layer{match.group(1)}" if match else display
+
+    def _select_recording_layer(self, layer_name: str) -> bool:
+        """Select one recording row without changing the patrol range."""
+
+        if self.patrol_controller is None:
+            return False
+        try:
+            self.patrol_controller.select_layer(layer_name)
+        except ValueError as exc:
+            self._control_status.configure(text=f"无法选择楼层: {exc}")
+            return False
+        if hasattr(self, "_selected_layer_var"):
+            self._selected_layer_var.set(layer_name)
+        self._control_status.configure(
+            text=f"已选择 {self._patrol_display_name(layer_name)}。"
+        )
+        self._refresh_patrol_controls()
+        return True
+
+    def _delete_highest_layer(self) -> bool:
+        """Delete the numeric top layer, regardless of the selected row."""
+
+        if self.patrol_controller is None:
+            self._control_status.configure(text="巡逻控制器不可用。")
+            return False
+        try:
+            removed = self.patrol_controller.remove_highest_layer()
+            selected = self.patrol_controller.selected_layer()
+        except (OSError, ValueError) as exc:
+            self._control_status.configure(text=f"无法删除楼层: {exc}")
+            return False
+        self._control_status.configure(
+            text=(f"已删除 {self._patrol_display_name(removed)}。已选择 "
+                  f"{self._patrol_display_name(selected)}；巡逻已暂停。")
+        )
+        self._refresh_patrol_controls()
+        return True
+
+    def _select_next_layer(self) -> bool:
+        """Cycle selected recording layer in numeric order, wrapping N -> 1."""
+
+        if self.patrol_controller is None:
+            return False
+        snapshot = self.patrol_controller.snapshot()
+        names = sorted(
+            snapshot.layers,
+            key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
+        )
+        if not names:
+            return False
+        current = self.patrol_controller.selected_layer()
+        next_index = (names.index(current) + 1) % len(names) if current in names else 0
+        return self._select_recording_layer(names[next_index])
+
+    def _select_next_patrol_start(self) -> bool:
+        """Cycle patrol start in numeric order, wrapping top back to layer1."""
+
+        if self.patrol_controller is None:
+            return False
+        snapshot = self.patrol_controller.snapshot()
+        names = sorted(
+            snapshot.layers,
+            key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
+        )
+        if not names:
+            return False
+        start, end = self.patrol_controller.patrol_range()
+        next_index = (names.index(start) + 1) % len(names) if start in names else 0
+        next_start = names[next_index]
+        if (end not in names or int("".join(filter(str.isdigit, end)) or 0)
+                < int("".join(filter(str.isdigit, next_start)) or 0)):
+            end = next_start
+        try:
+            self.patrol_controller.set_patrol_range(next_start, end)
+        except (OSError, ValueError) as exc:
+            self._control_status.configure(text=f"无法设置巡逻起始楼层: {exc}")
+            return False
+        self._control_status.configure(
+            text=(f"巡逻楼层: {self._patrol_display_name(next_start)} → "
+                  f"{self._patrol_display_name(end)}。")
+        )
+        self._refresh_patrol_controls()
+        return True
 
     def _patrol_range_changed(self, _event: Any = None) -> None:
         """Apply the UI-selected contiguous patrol floor range."""
@@ -3648,10 +3799,19 @@ class UiWorker(threading.Thread):
         for layer_name in layer_names:
             row = ttk.Frame(self._layer_rows_frame)
             row.pack(fill="x", pady=3)
+            selector = ttk.Radiobutton(
+                row,
+                variable=self._selected_layer_var,
+                value=layer_name,
+                command=lambda layer=layer_name: (
+                    self._select_recording_layer(layer)
+                ),
+            )
+            selector.pack(side="left", padx=(0, 1))
             # ``layer1`` previously reserved 18 text columns, leaving a large
             # blank strip and clipping the action buttons. ``楼层N`` fits in
             # seven columns, including room for multi-digit floor numbers.
-            label = ttk.Label(row, width=7)
+            label = ttk.Label(row, width=6)
             label.pack(side="left", padx=(0, 2))
             self._layer_labels[layer_name] = label
             for point_name, point_label in point_labels:

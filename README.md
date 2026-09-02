@@ -168,6 +168,12 @@ Adaptive recordings include `coordinate_v2` metadata based on minimap canvas
 and diamond dimensions. Legacy ratio-only points still run, but should be
 re-recorded when the UI labels them as a legacy layout.
 
+When the saved and live minimap canvases are the same geometry (allowing one
+pixel of capture rounding), patrol uses the recorded normalized point directly.
+It does not re-project that point from a fluctuating yellow-diamond size. This
+keeps a recorded rope X stable after a monster knockback while retaining
+adaptive projection for a genuinely resized or moved minimap.
+
 Recording does not require patrol to be active. After **重置录制**, the next
 record-button click focuses the game, resets stale minimap geometry, and takes
 up to three fresh one-off samples. A point is accepted only after an OpenCV
@@ -185,7 +191,10 @@ startup does not depend on a recent recording frame or stable contour voting.
   refine the jump direction and timing but do not control the route.
 - Rope-stall recovery is armed only after repeated no-progress frames within
   the rope alignment range. While the rope is farther away, movement keeps
-  walking across the platform and cannot start a recovery jump.
+  walking across the platform and cannot start a recovery jump. After a
+  knockback, a far-away rope target that remains visually stationary for six
+  frames releases and re-arms the walk hold; it does not turn that situation
+  into a climb jump.
 - Stair adaptation requires ten consecutive no-progress frames (about 2.5
   seconds). Progress is measured cumulatively from a stable anchor, so several
   small but real movements reset the counter and attack animations do not
@@ -536,10 +545,26 @@ fires once until released:
 - `Ctrl+1` through `Ctrl+0` send the oldest ten quick messages. The binding is
   positional: deleting a message shifts every later message/key forward.
 - `Ctrl+Left` records the selected layer's left-most point.
+- `Ctrl+Up` records the selected layer's rope point.
 - `Ctrl+Right` records the selected layer's right-most point.
+- `Ctrl+Down` selects the next layer, wrapping from the highest layer to
+  layer 1. The selected layer is visibly marked in the UI.
+- `Ctrl+Home` selects the next patrol-start layer, wrapping from the highest
+  layer to layer 1. The patrol end is never allowed below that start.
+- `Ctrl+Insert` adds a new highest layer; `Ctrl+Delete` removes the highest
+  layer. Adding a layer extends the patrol end to it; deleting clamps the
+  patrol range to the remaining highest layer. These topology changes are
+  deliberately blocked while patrol is active.
+- Hold `Ctrl+[` or `Ctrl+]` to decrease or increase fixed attack base time in
+  0.1-second steps. Releasing the chord for two seconds plays the single
+  success confirmation sound. The base time and random jump base time both
+  allow a minimum of 0.2 seconds.
 - `Ctrl+grave` (Ctrl plus the backtick key) toggles Start/Stop Patrol.
 
 Recording is blocked while patrol is active. A successful recording or patrol
 start plays `sound/success.mp3`; a recording failure, blocked recording, or
 patrol stop plays `sound/fail.mp3`. Playback runs outside Tk so it cannot freeze
-the UI.
+the UI. Ordinary internal failures do not play either sound. Except for the
+intentional repeating `Ctrl+[`/`Ctrl+]` adjustment, each hotkey action has a
+two-second cooldown and a held chord fires only once until its target key is
+released.

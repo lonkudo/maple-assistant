@@ -29,7 +29,7 @@ class RandomJumpWorker(threading.Thread):
         super().__init__(name="random-jump-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
-        self.jump_interval = max(0.25, float(jump_interval))
+        self.jump_interval = max(0.2, float(jump_interval))
         self.jump_jitter_seconds = max(0.0, float(jump_jitter_seconds))
         self.climbing_active_event = climbing_active_event
         self.automation_active_event = automation_active_event

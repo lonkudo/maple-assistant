@@ -193,7 +193,11 @@ contiguous slice from `patrol_start_layer` through `patrol_end_layer`.
 Recorded points contain normalized X/Y. New recordings also store
 `coordinate_v2` diamond-relative coordinates and recorded canvas geometry.
 `PatrolController.snapshot(layout)` projects these stable coordinates into the
-current minimap layout and scales layer tolerance.
+current minimap layout and scales layer tolerance. When the current canvas is
+the recorded canvas within one capture-rounding pixel, it instead retains the
+raw saved normalized point. Diamond-size noise must not move a rope target on
+an otherwise unchanged minimap; a material canvas change still selects the
+adaptive projection path.
 
 Map identity is handled separately by `MapIdentityStore`, using ignored
 reference images below `recording-assets/map-names/`. Starting patrol verifies
@@ -316,7 +320,9 @@ right jump-climb timing. Stale/missing YOLO state falls back to minimap logic.
 The platform-edge stall path requires both a rope-approach route and repeated
 no-progress samples within the rope alignment threshold. Recovery also checks
 that threshold itself, so a distant rope target always remains an ordinary
-walk and cannot enter the jump-climb state machine.
+walk and cannot enter the jump-climb state machine. A far-target stationary
+run re-arms the directional walk hold after six frames, which recovers from a
+monster knockback or externally released key without inventing a jump.
 
 The straight-up center zone and attachment verification are intentionally
 separate. Only `under_rope_tolerance` may turn a planned directional jump into
@@ -360,7 +366,21 @@ enabled through the UI. It periodically presses the selected attack key and
 honors climb/return suppression. Its next delay is uniformly selected from the
 UI-configured `(base interval, base interval + random gap)` range. The random
 gap ceiling is persisted in 0.1-second increments and applied to the live
-worker without restart.
+worker without restart. Fixed attack and the independent random-jump Alt worker
+both accept a 0.2-second minimum base interval. Valid fixed-attack bindings
+cover ordinary letter, punctuation, and navigation inputs but deliberately
+exclude Z because movement owns pickup.
+
+`HotkeyWorker` is a physical-key-only low-level hook that queues UI actions;
+it never injects game input and ignores injected keyboard events. Its dedicated
+`hotkey.json` map defines Ctrl quick-message, recording, patrol-toggle,
+selected-layer, patrol-start, topology, and fixed-attack-frequency chords. A
+nonrepeat action requires its target key to be released and is cooled down for
+two seconds; only Ctrl-bracket frequency adjustment accepts operating-system
+key repeat, with the UI debouncing its confirmation sound until two seconds
+after the final adjustment. Topology changes are rejected while patrol owns a
+route, preventing a route mutation from stopping movement while attack remains
+active.
 
 The YOLO monster subprocess is temporarily feature-disabled while its model is
 retrained. The UI forces fixed attack, hides the preserved YOLO panel/mode via

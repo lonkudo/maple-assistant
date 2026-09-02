@@ -698,6 +698,7 @@ class PatrolController:
                     continue
                 adaptive_points += 1
                 recorded_layout = coordinate.get("recorded_layout")
+                same_canvas_geometry = False
                 if isinstance(recorded_layout, dict):
                     try:
                         width_ratio = (
@@ -733,11 +734,36 @@ class PatrolController:
                         # corrupts layer Y.  Preserve the recorded raw point.
                         incompatible_layout = True
                         continue
+                    # If the minimap canvas itself has not changed, retain
+                    # the original normalized point. Yellow-diamond pixel
+                    # size can fluctuate by a pixel between OpenCV frames;
+                    # re-projecting through that noise shifted a saved rope
+                    # (for example 0.609649 -> 0.584649) on the same map.
+                    try:
+                        same_canvas_geometry = (
+                            abs(float(recorded_layout["analysis_width"])
+                                - layout.analysis_width) <= 1.0
+                            and abs(float(recorded_layout["analysis_height"])
+                                    - layout.analysis_height) <= 1.0
+                            and abs(float(recorded_layout["canvas_left"])
+                                    - layout.canvas_left) <= 1.0
+                            and abs(float(recorded_layout["canvas_top"])
+                                    - layout.canvas_top) <= 1.0
+                            and abs(float(recorded_layout["canvas_width"])
+                                    - layout.canvas_width) <= 1.0
+                            and abs(float(recorded_layout["canvas_height"])
+                                    - layout.canvas_height) <= 1.0
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        same_canvas_geometry = False
                 try:
-                    x, y = layout.project(
-                        float(coordinate["x_diamond"]),
-                        float(coordinate["y_diamond"]),
-                    )
+                    if same_canvas_geometry:
+                        x, y = float(point["x"]), float(point["y"])
+                    else:
+                        x, y = layout.project(
+                            float(coordinate["x_diamond"]),
+                            float(coordinate["y_diamond"]),
+                        )
                 except (KeyError, TypeError, ValueError):
                     continue
                 # 钳制到小地图有效范围 [0.02, 0.98]：菱形尺寸随分辨率变化时
@@ -765,6 +791,8 @@ class PatrolController:
         """Always create and select a new highest numeric layer."""
 
         with self._lock:
+            if self._enabled:
+                raise ValueError("请先停止巡逻，再添加楼层")
             layers = self._profile.setdefault("layers", {})
             numeric_layers = [
                 int(match.group(1))
@@ -780,10 +808,60 @@ class PatrolController:
                 "y_tolerance": 0.020000,
                 "calibration_status": "awaiting_left_rope_right",
             }
+            # A new top floor becomes the patrol-range end immediately.  It
+            # is routed now, so Start remains safely disabled until that new
+            # floor has at least one recorded action point.
+            route = self._profile.setdefault("route_order", [])
+            if next_name not in route:
+                route.append(next_name)
+            self._profile["patrol_end_layer"] = next_name
             self._selected_layer = next_name
             self._enabled = False
             self._persist_locked()
             return next_name
+
+    def remove_highest_layer(self) -> str:
+        """Remove the highest numeric layer and select the new top layer."""
+
+        with self._lock:
+            if self._enabled:
+                raise ValueError("请先停止巡逻，再删除楼层")
+            layers = self._profile.setdefault("layers", {})
+            numeric_layers = sorted(
+                (
+                    (int(match.group(1)), name)
+                    for name in layers
+                    if (match := re.search(r"(\d+)$", name)) is not None
+                ),
+                key=lambda item: item[0],
+            )
+            if len(numeric_layers) <= 1:
+                raise ValueError("至少需要保留一个楼层")
+
+            old_start, _old_end = self.patrol_range_locked()
+            _, highest_name = numeric_layers[-1]
+            del layers[highest_name]
+            remaining_names = [name for _, name in numeric_layers[:-1]]
+            route = [
+                name for name in self._profile.get("route_order", [])
+                if name in layers
+            ]
+            route.extend(name for name in remaining_names if name not in route)
+            self._profile["route_order"] = route
+
+            self._selected_layer = remaining_names[-1]
+            self._enabled = False
+            # Top-layer additions always extend the patrol end, so deleting
+            # that layer must bring the end back to the new highest floor.
+            # Preserve the start where possible, clamping it to the end.
+            new_end = remaining_names[-1]
+            new_start = old_start if old_start in layers else new_end
+            if _layer_number(new_start) > _layer_number(new_end):
+                new_start = new_end
+            self._profile["patrol_start_layer"] = new_start
+            self._profile["patrol_end_layer"] = new_end
+            self._persist_locked()
+            return highest_name
 
     def _persist_locked(self) -> None:
         if self.config_store is not None:

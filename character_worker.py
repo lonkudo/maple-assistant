@@ -97,6 +97,7 @@ class CharacterWorker(Thread):
         play_alert_sound: Optional[Callable[[Path], None]] = None,
         flash_callback: Optional[Callable[[], None]] = None,
         alert_callback: Optional[Callable[[str], None]] = None,
+        on_disconnect: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(name="character-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -119,6 +120,7 @@ class CharacterWorker(Thread):
         self._play_alert_sound = play_alert_sound or play_mp3
         self._flash_callback = flash_callback
         self._alert_callback = alert_callback
+        self._on_disconnect = on_disconnect
 
     def set_disconnect_alert(self, enabled: bool) -> None:
         """Enable/disable the missing-yellow-marker alarm live from the UI."""
@@ -180,9 +182,15 @@ class CharacterWorker(Thread):
         if should_alert:
             LOG.warning(
                 "DISCONNECT ALERT: yellow character marker missing for %d "
-                "consecutive frames; triggering reminders",
+                "consecutive frames; stopping patrol and triggering reminders",
                 self._disconnect_missing_frames,
             )
+            if self._on_disconnect is not None:
+                try:
+                    self._on_disconnect()
+                except Exception:
+                    LOG.warning("disconnect alert could not stop patrol",
+                                exc_info=True)
             # MCI playback waits until the MP3 ends. Keep marker detection at
             # full cadence by moving only audio playback to a tiny daemon.
             threading.Thread(

@@ -1650,6 +1650,7 @@ class MovementWorker(threading.Thread):
             self._rope_approach_phase_label = route_label
             self._rope_approach_last_x = player_x
             self._rope_approach_stall_frames = 0
+            self._rope_approach_far_stall_frames = 0
             return False
         last_x = self._rope_approach_last_x
         self._rope_approach_last_x = player_x
@@ -1660,9 +1661,19 @@ class MovementWorker(threading.Thread):
             rope_x is not None
             and abs(player_x - rope_x) <= ROPE_STALL_ALIGNMENT_RANGE
         )
-        if moved or not aligned:
+        if moved:
             self._rope_approach_stall_frames = 0
+            self._rope_approach_far_stall_frames = 0
             return False
+        if not aligned:
+            # A monster hit can leave the game ignoring an already-held
+            # direction key while the marker is still on the platform. This
+            # is separate from near-rope recovery: far from the rope we only
+            # re-arm walking, never jump-climb.
+            self._rope_approach_stall_frames = 0
+            self._rope_approach_far_stall_frames += 1
+            return False
+        self._rope_approach_far_stall_frames = 0
         self._rope_approach_stall_frames += 1
         # 卡在边缘且 X 不动时尽快起跳（2 帧，约 0.2-0.5s）：拖太久角色
         # 会一直停在边缘刷原地。
@@ -2145,6 +2156,7 @@ class MovementWorker(threading.Thread):
         # an attached climb (Up, no Z).
         self._rope_approach_last_x: Optional[float] = None
         self._rope_approach_stall_frames = 0
+        self._rope_approach_far_stall_frames = 0
         self._rope_approach_phase_label: Optional[str] = None
         self._rope_stuck_recoveries = 0
         # 自救：巡逻 5 分钟一检；若角色在小地图上连续 20 帧位置不变
@@ -5106,6 +5118,14 @@ class MovementWorker(threading.Thread):
                                 observation, route_target_x
                             )
                             continue
+                        if (is_rope_approach
+                                and self._rope_approach_far_stall_frames >= 6):
+                            LOG.warning(
+                                "ROPE approach walk frozen far from rope; "
+                                "re-arming %s", decision.key
+                            )
+                            self._rope_approach_far_stall_frames = 0
+                            self._release_walk_hold()
                         # Cancellable walk hold: the movement key is released
                         # within ~20ms when the attack selects a target, so
                         # the character can face and hit a monster behind it.

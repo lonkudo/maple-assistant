@@ -13,7 +13,14 @@
     {"keys": "ctrl+9", "action": "quick_message:8", "block_original": true},
     {"keys": "ctrl+0", "action": "quick_message:9", "block_original": true},
     {"keys": "ctrl+left", "action": "record:left_most_pos", "block_original": true},
+    {"keys": "ctrl+up", "action": "record:rope_pos", "block_original": true},
     {"keys": "ctrl+right", "action": "record:right_most_pos", "block_original": true},
+    {"keys": "ctrl+down", "action": "select_next_layer", "block_original": true},
+    {"keys": "ctrl+home", "action": "select_next_patrol_start", "block_original": true},
+    {"keys": "ctrl+bracketleft", "action": "adjust_fixed_attack_interval:-0.1", "block_original": true},
+    {"keys": "ctrl+bracketright", "action": "adjust_fixed_attack_interval:+0.1", "block_original": true},
+    {"keys": "ctrl+insert", "action": "add_highest_layer", "block_original": true},
+    {"keys": "ctrl+delete", "action": "delete_highest_layer", "block_original": true},
     {"keys": "ctrl+grave", "action": "toggle_patrol", "block_original": true}
   ]
 }

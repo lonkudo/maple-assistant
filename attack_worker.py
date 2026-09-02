@@ -44,7 +44,7 @@ class AttackWorker(threading.Thread):
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
-        self.attack_interval = max(0.25, attack_interval)
+        self.attack_interval = max(0.2, attack_interval)
         # 下一次攻击 = configured interval + UI-configurable random gap.
         self.attack_jitter_seconds = max(0.0, float(attack_jitter_seconds))
         self.attack_key = str(attack_key).casefold()

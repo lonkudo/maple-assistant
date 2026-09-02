@@ -10,6 +10,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from typing import Any, Optional
 
 
@@ -41,7 +42,14 @@ KEY_VK = {
     "8": 0x38,
     "9": 0x39,
     "left": 0x25,
+    "up": 0x26,
+    "down": 0x28,
     "right": 0x27,
+    "home": 0x24,
+    "insert": 0x2D,
+    "delete": 0x2E,
+    "bracketleft": 0xDB,
+    "bracketright": 0xDD,
     "grave": 0xC0,
 }
 
@@ -73,6 +81,8 @@ class HotkeyWorker(threading.Thread):
         self._bindings: dict[int, tuple[str, bool]] = {}
         self._ctrl_down = False
         self._fired: set[int] = set()
+        self.cooldown_seconds = 2.0
+        self._last_action_at: dict[str, float] = {}
         self._hook: Any = None
         self._hook_proc: Any = None
         self._load_config()
@@ -100,8 +110,17 @@ class HotkeyWorker(threading.Thread):
         self._bindings = bindings
 
     def _queue_action(self, action: str) -> None:
+        repeatable = action.startswith("adjust_fixed_attack_interval:")
+        now = time.monotonic()
+        last = self._last_action_at.get(action)
+        if (not repeatable and last is not None
+                and now - last < self.cooldown_seconds):
+            LOG.info("hotkey cooldown: %s", action)
+            return
         try:
             self.action_queue.put_nowait(action)
+            if not repeatable:
+                self._last_action_at[action] = now
             LOG.info("hotkey triggered: %s", action)
         except queue.Full:
             LOG.warning("hotkey action queue full; ignored %s", action)
@@ -158,18 +177,24 @@ class HotkeyWorker(threading.Thread):
                     self._ctrl_down = True
                 elif is_up:
                     self._ctrl_down = False
-                    self._fired.clear()
                 return user32.CallNextHookEx(self._hook, code, message, l_param)
 
             binding = self._bindings.get(vk)
-            if self.enabled and binding is not None and self._ctrl_down:
+            if binding is not None:
                 action, block_original = binding
-                if is_down and vk not in self._fired:
-                    self._fired.add(vk)
-                    self._queue_action(action)
-                elif is_up:
+                was_fired = vk in self._fired
+                repeatable = action.startswith("adjust_fixed_attack_interval:")
+                if is_up:
+                    # A held physical key may only fire once.  In particular,
+                    # releasing and pressing Ctrl again while still holding
+                    # the other key must not turn it into a second action.
                     self._fired.discard(vk)
-                if block_original:
+                elif (self.enabled and self._ctrl_down
+                      and is_down and (repeatable or not was_fired)):
+                    if not repeatable:
+                        self._fired.add(vk)
+                    self._queue_action(action)
+                if block_original and (self._ctrl_down or was_fired):
                     return 1
             return user32.CallNextHookEx(self._hook, code, message, l_param)
 
