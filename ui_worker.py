@@ -2993,8 +2993,8 @@ class UiWorker(threading.Thread):
             window,
             text=(
                 f"快捷键总开关: {state_text}\n"
-                "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 外，其余快捷键"
-                "都会临时停用，停止巡逻后自动恢复。\n"
+                "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
+                "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
                 "修改 hotkey.json 后需重启程序生效。"
             ),
             justify="left",
@@ -3027,8 +3027,9 @@ class UiWorker(threading.Thread):
         lines.append("启用 / 停用机制:")
         lines.append("  1. 总开关: hotkey.json 中的 \"enabled\" 字段。")
         lines.append("     true = 启用全部快捷键; false = 全部停用。")
-        lines.append("  2. 巡逻保护: 开始巡逻后自动临时停用除 Ctrl+` 外")
-        lines.append("     的所有快捷键 (防止误触影响挂机); 停止巡逻后恢复。")
+        lines.append("  2. 巡逻保护: 开始巡逻后自动临时停用除 Ctrl+` 和")
+        lines.append("     Ctrl+[ / Ctrl+] (固定攻击间隔) 外的所有快捷键;")
+        lines.append("     停止巡逻后恢复。")
         lines.append("  3. 忽略注入: ignore_injected=true 时只响应真实物理按键,")
         lines.append("     程序自动注入的按键不会触发快捷键。")
         lines.append("  4. 修改 hotkey.json 后需重启程序生效。")

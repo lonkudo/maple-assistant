@@ -62,10 +62,16 @@ class HotkeyWorkerTests(unittest.TestCase):
         self.assertTrue(worker._binding_allowed("toggle_patrol"))
 
         worker.set_patrol_running(True)
-        # While patrol runs only the patrol-toggle chord stays live.
+        # While patrol runs only the patrol-toggle chord and the fixed-attack
+        # interval adjustment stay live.
         self.assertFalse(worker._binding_allowed("quick_message:0"))
         self.assertFalse(worker._binding_allowed("record:left_most_pos"))
-        self.assertFalse(worker._binding_allowed("adjust_fixed_attack_interval:+0.1"))
+        self.assertTrue(
+            worker._binding_allowed("adjust_fixed_attack_interval:+0.1")
+        )
+        self.assertTrue(
+            worker._binding_allowed("adjust_fixed_attack_interval:-0.1")
+        )
         self.assertTrue(worker._binding_allowed("toggle_patrol"))
 
         worker.set_patrol_running(False)

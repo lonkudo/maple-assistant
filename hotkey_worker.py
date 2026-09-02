@@ -99,11 +99,19 @@ class HotkeyWorker(threading.Thread):
         self._patrol_running = bool(running)
 
     def _binding_allowed(self, action: str) -> bool:
-        """True when this binding may fire in the current mode."""
+        """True when this binding may fire in the current mode.
+
+        While patrol runs most bindings are temporarily disabled so a stray
+        chord cannot fire into the game mid-route.  The patrol-toggle chord
+        stays live so patrol can always be stopped, and the fixed-attack
+        interval adjustment stays live so the attack cadence can be tuned
+        while patrol is running.
+        """
 
         if not self._patrol_running:
             return True
-        return action == "toggle_patrol"
+        return (action == "toggle_patrol"
+                or action.startswith("adjust_fixed_attack_interval:"))
 
     def _load_config(self) -> None:
         try:
