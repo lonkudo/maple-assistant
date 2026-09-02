@@ -149,11 +149,12 @@ def _clamp_window_geometry(
 
 # Format of the persisted window-geometry record.  Bumped whenever the
 # meaning of the stored geometry changes (whole-window vs content-only vs
-# caption semantics or DPI awareness), so machines with a stale file from
-# an older release fall back to the current default once instead of
-# restoring a mismatched size (e.g. 1275x904 / 1620x1050 / 1635x1272 from
-# an older layout, a remembered manual resize, or a pre-DPI-aware run).
-_GEOMETRY_FORMAT = 4
+# caption semantics or DPI-aware coordinate space), so machines with a
+# stale file from an older release fall back to the current default once
+# instead of restoring a mismatched size (e.g. 1275x904 / 1620x1050 /
+# 1635x1272 from an older layout, a remembered manual resize, or a
+# DPI-aware run that stored physical-pixel sizes).
+_GEOMETRY_FORMAT = 5
 
 
 def _load_window_geometry(default_geometry: str) -> str:
@@ -682,78 +683,77 @@ class UiWorker(threading.Thread):
         self._patrol_ui_running: Optional[bool] = None
 
     @staticmethod
-    def _enable_ui_dpi_awareness() -> None:
-        """Make the current (Tk UI) thread DPI-aware on Windows.
+    def _display_scale_factor() -> float:
+        """Real primary-display scale factor (physical / logical width).
 
-        Tk on Windows is DPI-unaware by default: when the display runs at
-        125%/150% scaling, Windows bitmap-scales the whole window, so a
-        configured 1086x840 initial window physically opens larger (e.g.
-        ~1275x904 at 125%, ~1635x1272 at 150%).  Setting the per-thread DPI
-        awareness context before the Tk root is created makes one logical
-        pixel equal one physical pixel, so the window opens at the configured
-        size on every machine.  Only this thread's context is changed; the
-        capture/worker threads are unaffected.  Older systems without the
-        per-thread API simply keep the previous behavior.
+        The UI is intentionally DPI-unaware: Windows bitmap-scales the whole
+        window so text and layout keep the exact same proportions as on a
+        100% display, and the window WIDTH stays consistent with every other
+        scaled app.  Only the initial HEIGHT is compensated so its physical
+        size lands at the configured value on 125%/150% displays instead of
+        opening taller than intended.
         """
 
         if sys.platform != "win32":
-            return
+            return 1.0
         try:
             import ctypes
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32
-            # DPI_AWARENESS_CONTEXT_* pseudo-handles (negative values).
-            # Prefer per-monitor v2, then per-monitor, then system aware.
-            for context in (-4, -3, -2):
-                try:
-                    user32.SetThreadDpiAwarenessContext(
-                        wintypes.HANDLE(context)
-                    )
-                    return
-                except Exception:
-                    continue
+            logical_width = int(user32.GetSystemMetrics(0))  # SM_CXSCREEN
+            if logical_width <= 0:
+                return 1.0
+
+            class DEVMODEW(ctypes.Structure):
+                _fields_ = [
+                    ("dmDeviceName", wintypes.WCHAR * 32),
+                    ("dmSpecVersion", wintypes.WORD),
+                    ("dmDriverVersion", wintypes.WORD),
+                    ("dmSize", wintypes.WORD),
+                    ("dmDriverExtra", wintypes.WORD),
+                    ("dmFields", wintypes.DWORD),
+                    ("dmPosition", wintypes.LONG * 2),
+                    ("dmDisplayOrientation", wintypes.DWORD),
+                    ("dmDisplayFixedOutput", wintypes.DWORD),
+                    ("dmColor", wintypes.SHORT),
+                    ("dmDuplex", wintypes.SHORT),
+                    ("dmYResolution", wintypes.SHORT),
+                    ("dmTTOption", wintypes.SHORT),
+                    ("dmCollate", wintypes.SHORT),
+                    ("dmFormName", wintypes.WCHAR * 32),
+                    ("dmLogPixels", wintypes.WORD),
+                    ("dmBitsPerPel", wintypes.DWORD),
+                    ("dmPelsWidth", wintypes.DWORD),
+                    ("dmPelsHeight", wintypes.DWORD),
+                    ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD),
+                    ("dmICMMethod", wintypes.DWORD),
+                    ("dmICMIntent", wintypes.DWORD),
+                    ("dmMediaType", wintypes.DWORD),
+                    ("dmDitherType", wintypes.DWORD),
+                    ("dmReserved1", wintypes.DWORD),
+                    ("dmReserved2", wintypes.DWORD),
+                    ("dmPanningWidth", wintypes.DWORD),
+                    ("dmPanningHeight", wintypes.DWORD),
+                ]
+
+            mode = DEVMODEW()
+            mode.dmSize = ctypes.sizeof(DEVMODEW)
+            ENUM_CURRENT_SETTINGS = -1
+            ok = user32.EnumDisplaySettingsW(
+                None, ENUM_CURRENT_SETTINGS, ctypes.byref(mode)
+            )
+            if not ok or mode.dmPelsWidth <= 0:
+                return 1.0
+            physical_width = float(mode.dmPelsWidth)
+            scale = physical_width / float(logical_width)
+            if scale < 1.0 or scale > 4.0:
+                return 1.0
+            return scale
         except Exception:
-            LOG.debug("thread DPI awareness unavailable", exc_info=True)
-
-    @staticmethod
-    def _apply_ui_font_scaling(root: Any) -> None:
-        """Scale Tk fonts to match the physical DPI of the primary display.
-
-        After the UI thread becomes DPI-aware, Tk still renders fonts with
-        its default 96-DPI metrics unless told otherwise, which would make
-        text look tiny on a 150% display.  ``tk scaling`` converts points to
-        pixels; setting it from the real system DPI keeps the UI text the
-        same physical size as before on every machine.  Newer Tk versions
-        auto-scale fonts when DPI-aware, so only adjust when the current
-        scaling does not already match the physical DPI (avoid doubling).
-        """
-
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            gdi32 = ctypes.windll.gdi32
-            hdc = user32.GetDC(None)
-            if not hdc:
-                return
-            try:
-                LOGPIXELSY = 90
-                dpi = int(gdi32.GetDeviceCaps(hdc, LOGPIXELSY))
-            finally:
-                user32.ReleaseDC(None, hdc)
-            if dpi <= 0:
-                return
-            expected = float(dpi) / 72.0
-            current = float(root.tk.call("tk", "scaling"))
-            if abs(current - expected) / expected < 0.05:
-                return
-            root.tk.call("tk", "scaling", expected)
-        except Exception:
-            LOG.debug("UI font scaling unavailable", exc_info=True)
+            LOG.debug("display scale detection unavailable", exc_info=True)
+            return 1.0
 
     def run(self) -> None:
         try:
@@ -761,19 +761,20 @@ class UiWorker(threading.Thread):
             from tkinter import ttk
             self._ttk = ttk
 
-            # Make THIS thread (the Tk/UI thread) DPI-aware BEFORE the root
-            # window is created.  Without it, Windows treats the app as
-            # DPI-unaware and bitmap-scales the whole window by the display
-            # scaling factor: on a 150% display the configured 1086x840
-            # initial window physically opens at ~1635x1272.  DPI awareness
-            # makes one logical px == one physical px, so the window opens at
-            # the configured size on every machine.  Only the UI thread's
-            # context is changed - capture/worker threads keep their own.
-            self._enable_ui_dpi_awareness()
+            # The UI stays DPI-unaware on purpose: Windows bitmap-scales the
+            # whole window so the WIDTH matches every other scaled app on the
+            # machine (a DPI-aware window would look unnaturally narrow next
+            # to 150%-scaled siblings).  Only the initial HEIGHT is
+            # compensated: the logical height is divided by the display scale
+            # so its PHYSICAL size is the configured value on every machine
+            # (e.g. 840 physical px at 150% scaling instead of 840*1.5).
+            scale = self._display_scale_factor()
+            initial_height = max(
+                560, round(_INITIAL_WINDOW_HEIGHT / scale)
+            )
 
             root = tk.Tk()
             self._root = root
-            self._apply_ui_font_scaling(root)
             app_version = version_label()
             root.title(f"Maple 助手 ({app_version})")
             screen_width = root.winfo_screenwidth()
@@ -782,7 +783,7 @@ class UiWorker(threading.Thread):
             # 不会因调试窗口抢到前台而松开按键、角色跳离绳索。窗口位置与大小
             # 按上次保存的几何恢复（可移动、可调整），默认不再固定左上角。
             restored = _load_window_geometry(
-                f"{_INITIAL_WINDOW_WIDTH}x{_INITIAL_WINDOW_HEIGHT}+40+40"
+                f"{_INITIAL_WINDOW_WIDTH}x{initial_height}+40+40"
             )
             clamped = _clamp_window_geometry(
                 restored, screen_width, screen_height,
@@ -793,12 +794,13 @@ class UiWorker(threading.Thread):
             # buttons (Tk cannot add widgets to the OS caption bar).  Native
             # resize borders and the taskbar entry are preserved.  The
             # in-window caption is part of the Tk client, so geometry is
-            # whole-window (1050x720 includes the caption row).
+            # whole-window (the default 1086 width includes the caption row).
             caption_installed = self._install_custom_caption(root, tk)
             root.geometry(clamped)
             root.minsize(
                 _INITIAL_WINDOW_WIDTH,
-                560 + (_CAPTION_HEIGHT if caption_installed else 0),
+                round((560 + (_CAPTION_HEIGHT if caption_installed else 0))
+                     / scale),
             )
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
