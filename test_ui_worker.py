@@ -206,6 +206,27 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(patrol_button_states(False, True), ("normal", "disabled"))
         self.assertEqual(patrol_button_states(True, True), ("disabled", "normal"))
 
+    def test_help_key_and_action_labels(self) -> None:
+        worker = UiWorker.__new__(UiWorker)
+        self.assertEqual(worker._help_key_label("ctrl+grave"), "Ctrl+`")
+        self.assertEqual(worker._help_key_label("ctrl+left"), "Ctrl+←")
+        self.assertEqual(worker._help_key_label("ctrl+bracketleft"), "Ctrl+[")
+        self.assertEqual(worker._help_key_label("ctrl+1"), "Ctrl+1")
+        self.assertEqual(
+            worker._help_action_label("quick_message:0"), "发送第 1 条快捷消息"
+        )
+        self.assertEqual(
+            worker._help_action_label("quick_message:9"), "发送第 10 条快捷消息"
+        )
+        self.assertEqual(
+            worker._help_action_label("toggle_patrol"),
+            "开始 / 停止巡逻 (Ctrl+`)",
+        )
+        self.assertEqual(
+            worker._help_action_label("record:rope_pos"),
+            "录制当前图层的 绳索 点",
+        )
+
     def test_log_queue_drops_oldest_messages_at_capacity(self) -> None:
         handler = UiLogHandler(capacity=20)
         handler.setFormatter(logging.Formatter("%(message)s"))

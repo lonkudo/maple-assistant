@@ -1466,6 +1466,24 @@ class UiWorker(threading.Thread):
             self._log_text.pack(side="left", fill="both", expand=True)
             log_scroll.pack(side="right", fill="y")
 
+            # Top-right "?" help entry point (Tk cannot add widgets into the
+            # native caption bar, so the button floats at the window's top-
+            # right corner, just left of the caption's minimize/close area).
+            self._help_button = tk.Button(
+                root,
+                text="?",
+                font=("Segoe UI", 9, "bold"),
+                width=2,
+                height=1,
+                relief="raised",
+                bd=1,
+                cursor="hand2",
+                command=self._show_hotkey_help,
+            )
+            self._help_button.place(
+                relx=1.0, x=-10, y=6, anchor="ne"
+            )
+
             root.after(0, self._poll)
             root.mainloop()
         except Exception:
@@ -2892,6 +2910,134 @@ class UiWorker(threading.Thread):
             self._telegram_status.configure(
                 text=f"消息提醒: 状态读取失败 - {exc}"
             )
+
+    # Human-readable key labels for the help dialog (mirrors hotkey.json
+    # KEY_VK spellings used by HotkeyWorker).
+    _HELP_KEY_LABELS = {
+        "left": "←", "right": "→", "up": "↑", "down": "↓",
+        "home": "Home", "insert": "Insert", "delete": "Delete",
+        "bracketleft": "[", "bracketright": "]", "grave": "`",
+        "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
+        "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
+    }
+
+    _HELP_ACTION_LABELS = {
+        "record:left_most_pos": "录制当前图层的 最左 巡逻点",
+        "record:rope_pos": "录制当前图层的 绳索 点",
+        "record:right_most_pos": "录制当前图层的 最右 巡逻点",
+        "select_next_layer": "选择下一个录制图层 (Ctrl+↓)",
+        "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
+        "add_highest_layer": "添加最高楼层",
+        "delete_highest_layer": "删除最高楼层",
+        "toggle_patrol": "开始 / 停止巡逻 (Ctrl+`)",
+        "adjust_fixed_attack_interval:-0.1": "缩短固定攻击间隔 0.1 秒",
+        "adjust_fixed_attack_interval:+0.1": "加长固定攻击间隔 0.1 秒",
+    }
+
+    def _help_key_label(self, keys: str) -> str:
+        """Turn a hotkey.json ``ctrl+grave`` style chord into ``Ctrl+` ``."""
+
+        parts = [part.strip() for part in str(keys).split("+")]
+        if not parts:
+            return str(keys)
+        modifier = "Ctrl+" if parts[0].casefold() == "ctrl" else ""
+        key = parts[-1].casefold()
+        label = self._HELP_KEY_LABELS.get(key, key.title())
+        return f"{modifier}{label}"
+
+    def _help_action_label(self, action: str) -> str:
+        """Chinese description for one hotkey action name."""
+
+        if action.startswith("quick_message:"):
+            index = int(action.partition(":")[2])
+            return f"发送第 {index + 1} 条快捷消息"
+        return self._HELP_ACTION_LABELS.get(action, action)
+
+    def _show_hotkey_help(self) -> None:
+        """Popup listing every hotkey binding and its enable/disable rules."""
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        # Reuse an existing help window instead of stacking duplicates.
+        existing = getattr(self, "_help_window", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    return
+            except Exception:
+                pass
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+
+            data = json.loads(
+                (Path(__file__).resolve().parent / "hotkey.json")
+                .read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            data = {}
+
+        window = tk.Toplevel(root)
+        window.title("快捷键说明 (Maple 助手)")
+        window.transient(root)
+        window.geometry("560x560")
+        window.configure(padx=12, pady=12)
+        self._help_window = window
+
+        enabled = bool(data.get("enabled", True))
+        state_text = "已启用 (hotkey.json → enabled: true)" if enabled \
+            else "已停用 (hotkey.json → enabled: false)"
+        heading = ttk.Label(
+            window,
+            text=(
+                f"快捷键总开关: {state_text}\n"
+                "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 外，其余快捷键"
+                "都会临时停用，停止巡逻后自动恢复。\n"
+                "修改 hotkey.json 后需重启程序生效。"
+            ),
+            justify="left",
+            wraplength=520,
+        )
+        heading.pack(fill="x", pady=(0, 8))
+
+        text = tk.Text(window, height=20, wrap="none", state="disabled",
+                       font=("Microsoft YaHei UI", 9))
+        scroll = ttk.Scrollbar(
+            window, orient="vertical", command=text.yview
+        )
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        lines = []
+        lines.append("当前快捷键绑定 (hotkey.json):")
+        lines.append("")
+        bindings = data.get("bindings", [])
+        if not bindings:
+            lines.append("  (未配置任何绑定)")
+        for item in bindings:
+            if not isinstance(item, dict):
+                continue
+            keys = self._help_key_label(item.get("keys", ""))
+            action = self._help_action_label(str(item.get("action", "")))
+            lines.append(f"  {keys:<12} → {action}")
+        lines.append("")
+        lines.append("启用 / 停用机制:")
+        lines.append("  1. 总开关: hotkey.json 中的 \"enabled\" 字段。")
+        lines.append("     true = 启用全部快捷键; false = 全部停用。")
+        lines.append("  2. 巡逻保护: 开始巡逻后自动临时停用除 Ctrl+` 外")
+        lines.append("     的所有快捷键 (防止误触影响挂机); 停止巡逻后恢复。")
+        lines.append("  3. 忽略注入: ignore_injected=true 时只响应真实物理按键,")
+        lines.append("     程序自动注入的按键不会触发快捷键。")
+        lines.append("  4. 修改 hotkey.json 后需重启程序生效。")
+        text.configure(state="normal")
+        text.insert("1.0", "\n".join(lines) + "\n")
+        text.configure(state="disabled")
+
+        ttk.Button(window, text="关闭",
+                   command=window.destroy).pack(pady=(8, 0))
 
     def _refresh_shutdown_status(self) -> None:
         """Live countdown in the status line (called every UI poll tick)."""
