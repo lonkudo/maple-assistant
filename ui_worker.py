@@ -1369,6 +1369,7 @@ class UiWorker(threading.Thread):
             # icon also requires a 1s long press.
             quick_panel = ttk.LabelFrame(col2, text="快捷消息", padding=10)
             quick_panel.pack(fill="x", pady=(0, 8))
+            self._quick_panel = quick_panel
             quick_header = ttk.Frame(quick_panel)
             quick_header.pack(fill="x")
             ttk.Button(
@@ -3109,6 +3110,15 @@ class UiWorker(threading.Thread):
         frame = getattr(self, "_quick_messages_frame", None)
         if frame is None:
             return
+        panel = getattr(self, "_quick_panel", None)
+        root = getattr(self, "_root", None)
+        previous_height = None
+        if panel is not None and root is not None:
+            try:
+                root.update_idletasks()
+                previous_height = panel.winfo_height()
+            except Exception:
+                previous_height = None
         # Clear the active-entry identity before destroying widgets so a
         # destruction-induced FocusOut cannot recursively save/render.
         self._quick_edit_entry = None
@@ -3157,6 +3167,43 @@ class UiWorker(threading.Thread):
                 "<ButtonRelease-1>",
                 lambda event, i=index: self._quick_delete_release(i),
             )
+        # Tk grows the window when rows are added but does NOT shrink it back
+        # after a delete; refit the window height to the new panel height so
+        # the UI reduces again after deletion.
+        if panel is not None and root is not None:
+            try:
+                root.update_idletasks()
+                new_height = panel.winfo_height()
+                if (previous_height is not None
+                        and abs(new_height - previous_height) >= 2):
+                    self._resize_window_by(
+                        new_height - previous_height, root
+                    )
+            except Exception:
+                pass
+
+    def _resize_window_by(self, delta: int, root: Any) -> None:
+        """Grow/shrink the whole window by ``delta`` pixels vertically.
+
+        Used after quick-message rows are added or removed so the window
+        height follows its content (Tk auto-grows on add but leaves the
+        window tall after a delete).  Keeps position and clamps to the
+        window minimum height.
+        """
+
+        if not delta:
+            return
+        try:
+            if root.state() == "zoomed":
+                return
+            width = root.winfo_width()
+            height = root.winfo_height()
+            x = root.winfo_x()
+            y = root.winfo_y()
+            new_height = max(height + delta, 200)
+            root.geometry(f"{width}x{new_height}+{x}+{y}")
+        except Exception:
+            LOG.debug("window height refit failed", exc_info=True)
 
     def _quick_messages_save(self) -> None:
         self._shutdown_save_settings(self._shutdown_collect_data())
