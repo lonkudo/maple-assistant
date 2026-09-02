@@ -17,6 +17,8 @@ from ui_worker import (
     rope_unavailable_hint,
     tooltip_cursor_top_right_position,
     _clamp_window_geometry,
+    _geometry_with_caption,
+    _geometry_without_caption,
     _load_window_geometry,
     _parse_window_geometry,
     _save_window_geometry,
@@ -1512,6 +1514,27 @@ class UiLogHandlerTests(unittest.TestCase):
 
 
 class WindowGeometryHelperTests(unittest.TestCase):
+    def test_geometry_with_caption_adds_height_and_keeps_position(self) -> None:
+        self.assertEqual(
+            _geometry_with_caption("1036x672+40+40"),
+            "1036x706+40+40",
+        )
+        self.assertEqual(
+            _geometry_with_caption("980x560+120-40", 40),
+            "980x600+120-40",
+        )
+
+    def test_geometry_without_caption_strips_height(self) -> None:
+        self.assertEqual(
+            _geometry_without_caption("1036x706+40+40"),
+            "1036x672+40+40",
+        )
+        # Never shrinks below a sane floor even for tiny geometries.
+        width, height, _, _ = _parse_window_geometry(
+            _geometry_without_caption("1036x60+0+0")
+        )
+        self.assertGreaterEqual(height, 200)
+
     def test_parse_window_geometry_accepts_position_and_negative_x(self) -> None:
         self.assertEqual(
             _parse_window_geometry("1200x1000+40+40"),

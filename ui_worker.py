@@ -42,6 +42,12 @@ LOG = logging.getLogger(__name__)
 _INITIAL_WINDOW_WIDTH = 1036
 _INITIAL_WINDOW_HEIGHT = 672
 
+# Height of the custom in-window caption bar.  Tk cannot add widgets into
+# the native OS caption, so the assistant window removes the native caption
+# (keeping the OS resize borders and taskbar entry) and draws its own title
+# row: app title on the left, then ？/－/□/× on the right at the same level.
+_CAPTION_HEIGHT = 34
+
 
 def tooltip_cursor_top_right_position(
     pointer_x: int,
@@ -58,6 +64,36 @@ def tooltip_cursor_top_right_position(
     y = pointer_y - tooltip_height - 10
     y = max(top + 4, min(y, max(top + 4, bottom - tooltip_height - 4)))
     return x, y
+
+
+def _geometry_with_caption(
+    geometry: str, caption_height: int = _CAPTION_HEIGHT
+) -> str:
+    """Add the custom caption height to a stored content geometry.
+
+    Saved geometries describe the CONTENT area only (the same meaning they
+    had before the custom caption existed), so restoring adds the caption
+    back on top of the client area.
+    """
+
+    parsed = _parse_window_geometry(geometry)
+    if parsed is None:
+        return geometry
+    width, height, x, y = parsed
+    return f"{width}x{height + int(caption_height)}{x:+d}{y:+d}"
+
+
+def _geometry_without_caption(
+    geometry: str, caption_height: int = _CAPTION_HEIGHT
+) -> str:
+    """Strip the custom caption height before persisting content geometry."""
+
+    parsed = _parse_window_geometry(geometry)
+    if parsed is None:
+        return geometry
+    width, height, x, y = parsed
+    height = max(height - int(caption_height), 200)
+    return f"{width}x{height}{x:+d}{y:+d}"
 
 
 def _window_geometry_settings_path() -> Any:
@@ -644,15 +680,49 @@ class UiWorker(threading.Thread):
             restored = _load_window_geometry(
                 f"{_INITIAL_WINDOW_WIDTH}x{_INITIAL_WINDOW_HEIGHT}+40+40"
             )
-            root.geometry(_clamp_window_geometry(
+            clamped = _clamp_window_geometry(
                 restored, screen_width, screen_height,
-            ))
+            )
+
+            # Replace the native caption with an in-window one so the help
+            # "?" can sit at the same level as the title and the window
+            # buttons (Tk cannot add widgets to the OS caption bar).  Native
+            # resize borders and the taskbar entry are preserved.
+            caption_installed = self._install_custom_caption(root, tk)
+            if caption_installed:
+                # Saved geometry describes the CONTENT area (see
+                # _geometry_for_save), so add the caption height back when
+                # restoring; the content below the caption keeps its old size.
+                clamped = _geometry_with_caption(clamped)
+            root.geometry(clamped)
             # The two columns are fixed at 500px each (plus padding/gap, so
             # 1036px total), and the window must never shrink below that;
             # the height stays user-resizable from the 672px initial value.
-            root.minsize(_INITIAL_WINDOW_WIDTH, 560)
+            root.minsize(
+                _INITIAL_WINDOW_WIDTH,
+                560 + (_CAPTION_HEIGHT if caption_installed else 0),
+            )
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
+
+            if caption_installed:
+                self._build_caption_bar(root, tk, app_version)
+            else:
+                # Fallback when the custom caption cannot be installed: keep
+                # the native caption and float a small ? at the top-right of
+                # the content so the help dialog stays reachable.
+                self._help_button = tk.Button(
+                    root,
+                    text="?",
+                    font=("Segoe UI", 9, "bold"),
+                    width=2,
+                    height=1,
+                    relief="raised",
+                    bd=1,
+                    cursor="hand2",
+                    command=self._show_hotkey_help,
+                )
+                self._help_button.place(relx=1.0, x=-10, y=6, anchor="ne")
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
@@ -1466,24 +1536,6 @@ class UiWorker(threading.Thread):
             self._log_text.pack(side="left", fill="both", expand=True)
             log_scroll.pack(side="right", fill="y")
 
-            # Top-right "?" help entry point (Tk cannot add widgets into the
-            # native caption bar, so the button floats at the window's top-
-            # right corner, just left of the caption's minimize/close area).
-            self._help_button = tk.Button(
-                root,
-                text="?",
-                font=("Segoe UI", 9, "bold"),
-                width=2,
-                height=1,
-                relief="raised",
-                bd=1,
-                cursor="hand2",
-                command=self._show_hotkey_help,
-            )
-            self._help_button.place(
-                relx=1.0, x=-10, y=6, anchor="ne"
-            )
-
             root.after(0, self._poll)
             root.mainloop()
         except Exception:
@@ -1493,15 +1545,165 @@ class UiWorker(threading.Thread):
             self._root = None
             LOG.info("UI worker stopped")
 
+    def _install_custom_caption(self, root: Any, tk: Any) -> bool:
+        """Hide the native caption so an in-window one can host the ? button.
+
+        Only the caption strip (WS_CAPTION) is removed; the native thick
+        resize border, min/max flags, system menu and taskbar entry are all
+        kept, so the window still resizes, snaps and minimizes like before.
+        Returns False (keep the native caption) on any failure.
+        """
+
+        try:
+            if sys.platform != "win32":
+                return False
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            root.update_idletasks()
+            hwnd = int(user32.GetParent(root.winfo_id()))
+            if not hwnd:
+                hwnd = int(root.winfo_id())
+            if not hwnd:
+                return False
+            GWL_STYLE = -16
+            WS_CAPTION = 0x00C00000
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            if not style:
+                return False
+            user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_CAPTION)
+            # Refresh the frame so the caption disappears immediately.
+            SWP_FRAMECHANGED = 0x0020
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+            self._caption_hwnd = hwnd
+            return True
+        except Exception:
+            LOG.warning("custom caption unavailable; using native caption",
+                        exc_info=True)
+            return False
+
+    def _build_caption_bar(
+        self, root: Any, tk: Any, app_version: str
+    ) -> None:
+        """Draw the in-window caption row: title + ？ － □ × buttons."""
+
+        bar = tk.Frame(root, bg="#f0f0f0", height=_CAPTION_HEIGHT)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self._caption_bar = bar
+
+        title = tk.Label(
+            bar, text=f"Maple 助手 ({app_version})", bg="#f0f0f0",
+            anchor="w",
+        )
+        title.pack(side="left", padx=(10, 0))
+        self._caption_title = title
+
+        def _button(text: str, command: Any) -> Any:
+            button = tk.Button(
+                bar, text=text, command=command, relief="flat",
+                bd=0, bg="#f0f0f0", activebackground="#dcdcdc",
+                width=3, cursor="hand2",
+            )
+            button.pack(side="right", fill="y")
+            return button
+
+        self._caption_close_button = _button("×", self._on_debug_window_close)
+        self._caption_max_button = _button("□", self._caption_toggle_maximize)
+        self._caption_min_button = _button("－", self._caption_minimize)
+        self._help_button = _button("?", self._show_hotkey_help)
+
+        # Dragging any empty part of the bar moves the window (manual
+        # geometry drag: after WS_CAPTION is removed the OS caption hit-test
+        # is gone, so native HTCAPTION dragging would not move the window).
+        def _press(event: Any) -> None:
+            self._caption_drag_origin = (event.x_root, event.y_root)
+            self._caption_origin_geometry = (
+                self._root.winfo_x(), self._root.winfo_y()
+            )
+
+        def _motion(event: Any) -> None:
+            origin = getattr(self, "_caption_drag_origin", None)
+            if origin is None:
+                return
+            dx = event.x_root - origin[0]
+            dy = event.y_root - origin[1]
+            x, y = self._caption_origin_geometry
+            try:
+                self._root.geometry(f"+{x + dx}+{y + dy}")
+            except Exception:
+                pass
+
+        def _release(_event: Any) -> None:
+            self._caption_drag_origin = None
+
+        for widget in (bar, title):
+            widget.bind("<ButtonPress-1>", _press)
+            widget.bind("<B1-Motion>", _motion)
+            widget.bind("<ButtonRelease-1>", _release)
+
+    def _caption_drag_start(self, event: Any) -> None:
+        """Compatibility hook; drag handling is bound directly on the bar."""
+
+        self._caption_drag_origin = (event.x_root, event.y_root)
+        self._caption_origin_geometry = (
+            self._root.winfo_x(), self._root.winfo_y()
+        )
+
+    def _caption_minimize(self) -> None:
+        """Minimize to the taskbar (native iconify still works)."""
+
+        root = getattr(self, "_root", None)
+        if root is not None:
+            try:
+                root.iconify()
+            except Exception:
+                LOG.warning("minimize failed", exc_info=True)
+
+    def _caption_toggle_maximize(self) -> None:
+        """Toggle native maximize/restore for the frameless window."""
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        try:
+            if root.state() == "zoomed":
+                root.state("normal")
+            else:
+                root.state("zoomed")
+        except Exception:
+            LOG.warning("maximize toggle failed", exc_info=True)
+
     def _on_debug_window_close(self) -> None:
         """Close handler: remember the window geometry, then destroy."""
         root = self._root
         if root is not None:
             try:
-                _save_window_geometry(root.winfo_geometry())
+                _save_window_geometry(self._geometry_for_save(root))
             except Exception:
-                LOG.debug("could not save debug UI geometry on close", exc_info=True)
+                LOG.debug("could not save debug UI geometry on close",
+                          exc_info=True)
             root.destroy()
+
+    def _geometry_for_save(self, root: Any) -> str:
+        """Content-only geometry for persistence.
+
+        The custom in-window caption adds its own height to the Tk window;
+        store the geometry WITHOUT it so the restored content area keeps the
+        same meaning it had before the caption existed.
+        """
+
+        geometry = root.winfo_geometry()
+        if getattr(self, "_caption_bar", None) is not None:
+            return _geometry_without_caption(geometry)
+        return geometry
 
     def _schedule_window_geometry_save(self, root: Any, delay_ms: int = 3000) -> None:
         """Periodically persist the debug UI geometry while it is open.
@@ -1515,7 +1717,7 @@ class UiWorker(threading.Thread):
             if self._root is not root:
                 return
             try:
-                _save_window_geometry(root.winfo_geometry())
+                _save_window_geometry(self._geometry_for_save(root))
             except Exception:
                 LOG.debug("could not save debug UI geometry", exc_info=True)
             try:
@@ -2954,43 +3156,47 @@ class UiWorker(threading.Thread):
         return self._HELP_ACTION_LABELS.get(action, action)
 
     def _show_hotkey_help(self) -> None:
-        """Popup listing every hotkey binding and its enable/disable rules."""
+        """Floating help popup anchored under the caption-row "?" button.
+
+        The popup is a borderless transient window (a floating message,
+        like a tooltip) instead of a second framed dialog, so it does not
+        steal focus from the game.
+        """
 
         root = getattr(self, "_root", None)
         if root is None:
             return
-        # Reuse an existing help window instead of stacking duplicates.
-        existing = getattr(self, "_help_window", None)
+        existing = getattr(self, "_help_popup", None)
         if existing is not None:
             try:
                 if existing.winfo_exists():
-                    existing.lift()
-                    return
+                    existing.destroy()
             except Exception:
                 pass
-        try:
-            import tkinter as tk
-            from tkinter import ttk
+        import tkinter as tk
+        from tkinter import ttk
 
+        data = {}
+        try:
             data = json.loads(
                 (Path(__file__).resolve().parent / "hotkey.json")
                 .read_text(encoding="utf-8")
             )
         except (OSError, ValueError):
-            data = {}
+            pass
 
-        window = tk.Toplevel(root)
-        window.title("快捷键说明 (Maple 助手)")
-        window.transient(root)
-        window.geometry("560x560")
-        window.configure(padx=12, pady=12)
-        self._help_window = window
+        popup = tk.Toplevel(root)
+        popup.overrideredirect(True)      # floating message, no window frame
+        popup.configure(bg="#ffffff", padx=10, pady=10,
+                        highlightbackground="#888888", highlightthickness=1)
+        popup.attributes("-topmost", False)
+        self._help_popup = popup
 
         enabled = bool(data.get("enabled", True))
         state_text = "已启用 (hotkey.json → enabled: true)" if enabled \
             else "已停用 (hotkey.json → enabled: false)"
-        heading = ttk.Label(
-            window,
+        ttk.Label(
+            popup,
             text=(
                 f"快捷键总开关: {state_text}\n"
                 "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
@@ -2998,22 +3204,11 @@ class UiWorker(threading.Thread):
                 "修改 hotkey.json 后需重启程序生效。"
             ),
             justify="left",
-            wraplength=520,
-        )
-        heading.pack(fill="x", pady=(0, 8))
+            background="#ffffff",
+            wraplength=430,
+        ).pack(fill="x")
 
-        text = tk.Text(window, height=20, wrap="none", state="disabled",
-                       font=("Microsoft YaHei UI", 9))
-        scroll = ttk.Scrollbar(
-            window, orient="vertical", command=text.yview
-        )
-        text.configure(yscrollcommand=scroll.set)
-        text.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        lines = []
-        lines.append("当前快捷键绑定 (hotkey.json):")
-        lines.append("")
+        lines = ["当前快捷键绑定 (hotkey.json):"]
         bindings = data.get("bindings", [])
         if not bindings:
             lines.append("  (未配置任何绑定)")
@@ -3023,22 +3218,55 @@ class UiWorker(threading.Thread):
             keys = self._help_key_label(item.get("keys", ""))
             action = self._help_action_label(str(item.get("action", "")))
             lines.append(f"  {keys:<12} → {action}")
-        lines.append("")
-        lines.append("启用 / 停用机制:")
-        lines.append("  1. 总开关: hotkey.json 中的 \"enabled\" 字段。")
-        lines.append("     true = 启用全部快捷键; false = 全部停用。")
-        lines.append("  2. 巡逻保护: 开始巡逻后自动临时停用除 Ctrl+` 和")
-        lines.append("     Ctrl+[ / Ctrl+] (固定攻击间隔) 外的所有快捷键;")
-        lines.append("     停止巡逻后恢复。")
-        lines.append("  3. 忽略注入: ignore_injected=true 时只响应真实物理按键,")
-        lines.append("     程序自动注入的按键不会触发快捷键。")
-        lines.append("  4. 修改 hotkey.json 后需重启程序生效。")
-        text.configure(state="normal")
-        text.insert("1.0", "\n".join(lines) + "\n")
-        text.configure(state="disabled")
+        ttk.Label(
+            popup, text="\n".join(lines), justify="left",
+            background="#ffffff",
+        ).pack(fill="x", pady=(6, 0))
 
-        ttk.Button(window, text="关闭",
-                   command=window.destroy).pack(pady=(8, 0))
+        bottom = ttk.Frame(popup)
+        bottom.pack(fill="x", pady=(8, 0))
+        ttk.Label(
+            bottom,
+            text=(
+                "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
+                "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
+                "ignore_injected=true 只响应真实物理按键。"
+            ),
+            justify="left",
+            background="#ffffff",
+            wraplength=430,
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(bottom, text="关闭",
+                   command=popup.destroy).pack(side="right")
+
+        def _close_on_escape(_event: Any = None) -> None:
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+
+        popup.bind("<Escape>", _close_on_escape)
+        popup.bind("<FocusOut>", lambda _e: root.after(50, _close_on_escape))
+        popup.focus_set()
+
+        # Position below the caption-row "?" (or top-right as fallback).
+        popup.update_idletasks()
+        width = popup.winfo_reqwidth()
+        height = popup.winfo_reqheight()
+        anchor = getattr(self, "_help_button", None)
+        x = root.winfo_rootx() + root.winfo_width() - width - 12
+        y = root.winfo_rooty() + _CAPTION_HEIGHT + 4
+        if anchor is not None:
+            try:
+                x = anchor.winfo_rootx() - width + anchor.winfo_width()
+                y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+            except Exception:
+                pass
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        x = max(4, min(x, screen_width - width - 8))
+        y = max(4, min(y, screen_height - height - 8))
+        popup.geometry(f"+{x}+{y}")
 
     def _refresh_shutdown_status(self) -> None:
         """Live countdown in the status line (called every UI poll tick)."""
