@@ -3473,7 +3473,6 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
         import tkinter as tk
-        from tkinter import ttk
 
         data = {}
         try:
@@ -3484,29 +3483,25 @@ class UiWorker(threading.Thread):
         except (OSError, ValueError):
             pass
 
+        # Same look as the bindable-keys hint on the attack/buff key buttons:
+        # one yellow ("#fffbd6") tooltip-style label with a solid border.
         popup = tk.Toplevel(root)
         popup.overrideredirect(True)      # floating message, no window frame
-        popup.configure(bg="#ffffff", padx=10, pady=10,
-                        highlightbackground="#888888", highlightthickness=1)
+        popup.configure(bg="#fffbd6")
         popup.attributes("-topmost", False)
         self._help_popup = popup
 
         enabled = bool(data.get("enabled", True))
         state_text = "已启用 (hotkey.json → enabled: true)" if enabled \
             else "已停用 (hotkey.json → enabled: false)"
-        ttk.Label(
-            popup,
-            text=(
+        sections = [
+            (
                 f"快捷键总开关: {state_text}\n"
                 "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
                 "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
                 "修改 hotkey.json 后需重启程序生效。"
             ),
-            justify="left",
-            background="#ffffff",
-            wraplength=430,
-        ).pack(fill="x")
-
+        ]
         lines = ["当前快捷键绑定 (hotkey.json):"]
         bindings = data.get("bindings", [])
         if not bindings:
@@ -3517,23 +3512,24 @@ class UiWorker(threading.Thread):
             keys = self._help_key_label(item.get("keys", ""))
             action = self._help_action_label(str(item.get("action", "")))
             lines.append(f"  {keys:<12} → {action}")
-        ttk.Label(
-            popup, text="\n".join(lines), justify="left",
-            background="#ffffff",
-        ).pack(fill="x", pady=(6, 0))
+        sections.append("\n".join(lines))
+        sections.append(
+            "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
+            "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
+            "ignore_injected=true 只响应真实物理按键。\n"
+            "移开鼠标即自动关闭本提示。"
+        )
 
-        bottom = ttk.Frame(popup)
-        bottom.pack(fill="x", pady=(8, 0))
-        ttk.Label(
-            bottom,
-            text=(
-                "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
-                "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
-                "ignore_injected=true 只响应真实物理按键。\n"
-                "移开鼠标即自动关闭本提示。"
-            ),
+        tk.Label(
+            popup,
+            text="\n\n".join(sections),
             justify="left",
-            background="#ffffff",
+            background="#fffbd6",
+            foreground="#202020",
+            relief="solid",
+            borderwidth=1,
+            padx=7,
+            pady=4,
             wraplength=430,
         ).pack(fill="x")
 
