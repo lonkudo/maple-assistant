@@ -615,6 +615,12 @@ class UiWorker(threading.Thread):
         # A hotkey callback can be delivered twice by Windows during a focus
         # transition.  Never stack identical success/failure MP3 feedback.
         self._last_action_sound_at: dict[bool, float] = {}
+        # Last patrol running state the UI buttons were rendered for.  Patrol
+        # can be stopped OUTSIDE the UI (disconnect alert / sustained focus
+        # loss call ``patrol_controller.set_enabled(False)`` directly in
+        # assistant.py); the poll sync below refreshes the Start/Stop buttons
+        # when that happens instead of leaving them stale.
+        self._patrol_ui_running: Optional[bool] = None
 
     def run(self) -> None:
         try:
@@ -1532,12 +1538,31 @@ class UiWorker(threading.Thread):
                 LOG.exception("could not update debug UI")
         self._drain_logs()
         self._refresh_automation_status()
+        self._sync_patrol_ui_state()
         self._refresh_shutdown_status()
         self._refresh_countdown_status()
         self._refresh_telegram_status()
         self._poll_yolo_exit()
         self._drain_hotkey_actions()
         root.after(self.refresh_ms, self._poll)
+
+    def _sync_patrol_ui_state(self) -> None:
+        """Refresh patrol buttons when patrol stopped outside the UI.
+
+        Disconnect alerts and sustained focus loss stop patrol directly on
+        the controller from assistant.py (no UI action runs), so without
+        this check the Stop button stayed enabled and Start stayed greyed
+        even though patrol had already stopped.
+        """
+
+        if (self.patrol_controller is None
+                or not hasattr(self, "_start_patrol_button")):
+            return
+        running = bool(self.patrol_controller.is_enabled())
+        if running == getattr(self, "_patrol_ui_running", None):
+            return
+        self._refresh_patrol_controls()
+        self._patrol_ui_running = running
 
     def _drain_hotkey_actions(self) -> None:
         """Run physical hotkey actions safely on Tk's owning thread."""
@@ -3596,6 +3621,7 @@ class UiWorker(threading.Thread):
             self._reset_recording_button.configure(state="disabled")
             return
         running = self.patrol_controller.is_enabled()
+        self._patrol_ui_running = bool(running)
         can_start = self.patrol_controller.can_start()
         selected = self.patrol_controller.selected_layer()
         snapshot = self.patrol_controller.snapshot()

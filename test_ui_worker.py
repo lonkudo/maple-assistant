@@ -1351,6 +1351,52 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertEqual(loader.character_worker.sound_calls, [False])
             self.assertEqual(loader.lie_detector_worker.sound_calls, [False])
 
+    def test_poll_syncs_patrol_buttons_after_external_stop(self) -> None:
+        # Disconnect alerts / focus loss stop patrol directly on the
+        # controller without a UI action.  The poll sync must refresh the
+        # Start/Stop buttons so Stop greys out and Start re-enables.
+        class Controller:
+            def __init__(self, running):
+                self.running = running
+
+            def is_enabled(self):
+                return self.running
+
+        class Button:
+            def __init__(self):
+                self.state = ""
+
+            def configure(self, **kwargs):
+                if "state" in kwargs:
+                    self.state = kwargs["state"]
+
+        refreshes = []
+        worker = UiWorker.__new__(UiWorker)
+        worker.patrol_controller = Controller(running=False)
+        worker._patrol_ui_running = True   # UI still shows running
+        worker._start_patrol_button = Button()
+        worker._stop_patrol_button = Button()
+        worker._refresh_patrol_controls = lambda: refreshes.append(True)
+
+        worker._sync_patrol_ui_state()
+
+        self.assertEqual(refreshes, [True])
+        self.assertFalse(worker._patrol_ui_running)
+
+    def test_poll_skips_refresh_when_patrol_state_unchanged(self) -> None:
+        refreshes = []
+        worker = UiWorker.__new__(UiWorker)
+        worker.patrol_controller = type(
+            "Controller", (), {"is_enabled": lambda self: False}
+        )()
+        worker._patrol_ui_running = False
+        worker._start_patrol_button = object()
+        worker._refresh_patrol_controls = lambda: refreshes.append(True)
+
+        worker._sync_patrol_ui_state()
+
+        self.assertEqual(refreshes, [])
+
     def test_alerts_still_apply_when_shutdown_worker_is_none(self) -> None:
         import tempfile
         from pathlib import Path
