@@ -590,15 +590,18 @@ class StatusConfig:
     mp_ratio_threshold: float = 0.3
     hp_enabled: bool = True
     mp_enabled: bool = True
-    # Periodic buff keys (the two extra Drug panel rows): the bound key is
+    # Periodic buff keys (the extra Drug panel rows): the bound key is
     # tapped on a TIMER (``buffN_interval`` seconds, default 10 minutes)
     # instead of a bar-ratio threshold.  Disabled or empty keys never fire.
     buff1_key: str = "home"
     buff2_key: str = "insert"
+    buff3_key: str = "pageup"
     buff1_interval: float = 600.0
     buff2_interval: float = 600.0
+    buff3_interval: float = 600.0
     buff1_enabled: bool = False
     buff2_enabled: bool = False
+    buff3_enabled: bool = False
     # Three side-by-side bars in the fixed-pixel 370x57 info bar (measured
     # on the real client: HP red x ~7-91, MP blue x ~96-230, EXP yellow
     # x ~237-363, all in the same vertical band).  Zones are (name, left,
@@ -854,7 +857,8 @@ class StatusWorker(threading.Thread):
         # Monotonic timestamps of the last periodic buff tap (per buff row).
         # 增益为"定时触发"，不从开局立即触发：起始时间戳设为当前时刻，
         # 第一个增益会在 interval 秒后才按（用户会先手动触发第一次增益）。
-        self._last_buff = {"buff1": time.monotonic(), "buff2": time.monotonic()}
+        self._last_buff = {"buff1": time.monotonic(), "buff2": time.monotonic(),
+                          "buff3": time.monotonic()}
 
     def _tap_potion(self, key: str) -> bool:
         """Tap the potion key, retrying briefly if the first attempt is blocked.
@@ -951,6 +955,8 @@ class StatusWorker(threading.Thread):
              config.buff1_enabled),
             ("buff2", config.buff2_key, config.buff2_interval,
              config.buff2_enabled),
+            ("buff3", config.buff3_key, config.buff3_interval,
+             config.buff3_enabled),
         ):
             if not enabled or not key or interval <= 0:
                 continue
@@ -1071,8 +1077,9 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
 
     ``data`` uses the UI's form: key names, integer percents (0..100) for
     ``hp_threshold``/``mp_threshold``, and MINUTES for the periodic buff
-    ``buff1_interval``/``buff2_interval`` (converted to seconds).  Unsupported
-    or unknown keys are ignored (the existing binding stays).
+    ``buff1_interval``/``buff2_interval``/``buff3_interval`` (converted to
+    seconds).  Unsupported or unknown keys are ignored (the existing binding
+    stays).
     """
 
     kwargs: dict[str, object] = {}
@@ -1080,8 +1087,10 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         ("hp_key", "hp_key"), ("mp_key", "mp_key"),
         ("hp_enabled", "hp_enabled"), ("mp_enabled", "mp_enabled"),
         ("buff1_key", "buff1_key"), ("buff2_key", "buff2_key"),
+        ("buff3_key", "buff3_key"),
         ("buff1_enabled", "buff1_enabled"),
         ("buff2_enabled", "buff2_enabled"),
+        ("buff3_enabled", "buff3_enabled"),
     ):
         if data_key not in data:
             continue
@@ -1108,6 +1117,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
     for field_name, data_key in (
         ("buff1_interval", "buff1_interval"),
         ("buff2_interval", "buff2_interval"),
+        ("buff3_interval", "buff3_interval"),
     ):
         if data_key not in data:
             continue

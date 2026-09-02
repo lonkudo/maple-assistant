@@ -1193,8 +1193,10 @@ class UiLogHandlerTests(unittest.TestCase):
             w._mp_key_button = Button()
             w._buff1_interval_label = Label()
             w._buff2_interval_label = Label()
+            w._buff3_interval_label = Label()
             w._buff1_key_button = Button()
             w._buff2_key_button = Button()
+            w._buff3_key_button = Button()
             w._hp_key_var = Var("delete")
             w._mp_key_var = Var("end")
             w._hp_threshold_var = Var(50)
@@ -1203,11 +1205,13 @@ class UiLogHandlerTests(unittest.TestCase):
             w._mp_use_var = Var(True)
             w._buff1_key_var = Var("home")
             w._buff2_key_var = Var("insert")
+            w._buff3_key_var = Var("pageup")
             w._buff1_interval_var = Var(10.0)
             w._buff2_interval_var = Var(10.0)
+            w._buff3_interval_var = Var(10.0)
             w._buff1_use_var = Var(False)
             w._buff2_use_var = Var(False)
-            w._drug_status = Label()
+            w._buff3_use_var = Var(False)
             return w
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1216,6 +1220,9 @@ class UiLogHandlerTests(unittest.TestCase):
             worker._buff1_interval_var.set(12.5)
             worker._buff1_key_var.set("pagedown")
             worker._buff2_use_var.set(True)
+            worker._buff3_use_var.set(True)
+            worker._buff3_interval_var.set(8.0)
+            worker._buff3_key_var.set("home")
 
             def fake_path(self):
                 return Path(directory) / "drug_settings.json"
@@ -1229,13 +1236,17 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertEqual(data["buff1_interval"], 12.5)
                 self.assertEqual(data["buff1_key"], "pagedown")
                 self.assertTrue(data["buff2_enabled"])
+                self.assertTrue(data["buff3_enabled"])
+                self.assertEqual(data["buff3_interval"], 8.0)
+                self.assertEqual(data["buff3_key"], "home")
                 # Applied LIVE to the status worker detector config.
                 config = worker.status_worker.detector.config
                 self.assertTrue(config.buff1_enabled)
                 self.assertAlmostEqual(config.buff1_interval, 750.0)
                 self.assertEqual(config.buff1_key, "pagedown")
-                self.assertIn("增益1", worker._drug_status.text)
-                self.assertIn("12.5分钟", worker._drug_status.text)
+                self.assertTrue(config.buff3_enabled)
+                self.assertAlmostEqual(config.buff3_interval, 480.0)
+                self.assertEqual(config.buff3_key, "home")
 
                 loader = make_worker()
                 with mock.patch.object(UiWorker, "_drug_settings_path",
@@ -1245,12 +1256,19 @@ class UiLogHandlerTests(unittest.TestCase):
                 self.assertEqual(loader._buff1_interval_var.get(), 12.5)
                 self.assertEqual(loader._buff1_key_var.get(), "pagedown")
                 self.assertTrue(loader._buff2_use_var.get())
+                self.assertTrue(loader._buff3_use_var.get())
+                self.assertEqual(loader._buff3_interval_var.get(), 8.0)
+                self.assertEqual(loader._buff3_key_var.get(), "home")
                 self.assertTrue(
                     loader.status_worker.detector.config.buff1_enabled
+                )
+                self.assertTrue(
+                    loader.status_worker.detector.config.buff3_enabled
                 )
                 self.assertEqual(
                     loader._buff1_interval_label.text, "12.5min"
                 )
+                self.assertEqual(loader._buff3_interval_label.text, "8.0min")
 
     def test_player_check_selection_persists_and_applies_to_mover(self) -> None:
         import json

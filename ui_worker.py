@@ -35,12 +35,11 @@ from versioning import version_label
 
 LOG = logging.getLogger(__name__)
 
-# The debug UI uses two fixed 500px columns (controls + debug/YOLO); the
-# initial size is 1036x672 (two 500px columns + 24px container padding +
-# 12px column gap; header removed, so the height can be compact).  The
-# height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1036
-_INITIAL_WINDOW_HEIGHT = 672
+# The debug UI uses two columns (controls + debug/YOLO); the initial
+# window (including the in-window caption bar when active) is 1050x720.
+# The height stays user-resizable (only the minimum is enforced).
+_INITIAL_WINDOW_WIDTH = 1050
+_INITIAL_WINDOW_HEIGHT = 720
 
 # Height of the custom in-window caption bar.  Tk cannot add widgets into
 # the native OS caption, so the assistant window removes the native caption
@@ -687,17 +686,11 @@ class UiWorker(threading.Thread):
             # Replace the native caption with an in-window one so the help
             # "?" can sit at the same level as the title and the window
             # buttons (Tk cannot add widgets to the OS caption bar).  Native
-            # resize borders and the taskbar entry are preserved.
+            # resize borders and the taskbar entry are preserved.  The
+            # in-window caption is part of the Tk client, so geometry is
+            # whole-window (1050x720 includes the caption row).
             caption_installed = self._install_custom_caption(root, tk)
-            if caption_installed:
-                # Saved geometry describes the CONTENT area (see
-                # _geometry_for_save), so add the caption height back when
-                # restoring; the content below the caption keeps its old size.
-                clamped = _geometry_with_caption(clamped)
             root.geometry(clamped)
-            # The two columns are fixed at 500px each (plus padding/gap, so
-            # 1036px total), and the window must never shrink below that;
-            # the height stays user-resizable from the 672px initial value.
             root.minsize(
                 _INITIAL_WINDOW_WIDTH,
                 560 + (_CAPTION_HEIGHT if caption_installed else 0),
@@ -720,22 +713,23 @@ class UiWorker(threading.Thread):
                     relief="raised",
                     bd=1,
                     cursor="hand2",
-                    command=self._show_hotkey_help,
                 )
                 self._help_button.place(relx=1.0, x=-10, y=6, anchor="ne")
+                # Hover-triggered help (same behavior as the caption ?).
+                self._help_button.bind("<Enter>", self._help_hover_show)
+                self._help_button.bind("<Leave>", self._help_hover_leave)
 
             container = ttk.Frame(root, padding=12)
             container.pack(fill="both", expand=True)
 
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
-            # Both columns are FIXED at 500px wide: the layout no longer
-            # scales with the window width (weight=0, so a wider window
-            # leaves the columns at their fixed width and the height is the
-            # resizable dimension).  Initial window height 650px; the user
-            # can still drag the height (only the minimum is enforced).
-            columns.columnconfigure(0, weight=0, minsize=500)
-            columns.columnconfigure(1, weight=0, minsize=500)
+            # Column 1 is FIXED at 550px wide (wide enough for the 警报 row
+            # plus the 循环 间隔/剩余 controls on one line).  Column 2 is
+            # flexible so a wider window grows the debug column instead of
+            # leaving empty space (min 500px so the log panel stays usable).
+            columns.columnconfigure(0, weight=0, minsize=550)
+            columns.columnconfigure(1, weight=1, minsize=430)
             columns.rowconfigure(0, weight=1)
             col1 = ttk.Frame(columns)
             col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
@@ -1280,11 +1274,42 @@ class UiWorker(threading.Thread):
                 buff2_row, text="10.0min", width=8
             )
             self._buff2_interval_label.pack(side="left")
-            self._drug_status = ttk.Label(
-                drug_panel, text="药品面板就绪。", justify="left",
-                wraplength=440,
+            buff3_row = ttk.Frame(drug_panel)
+            buff3_row.pack(fill="x", pady=(6, 0))
+            self._buff3_use_var = tk.BooleanVar(value=False)
+            buff3_use_button = ttk.Checkbutton(
+                buff3_row, text="增益 3", variable=self._buff3_use_var,
+                command=self._drug_on_change,
             )
-            self._drug_status.pack(anchor="w", pady=(6, 0))
+            buff3_use_button.pack(side="left")
+            ttk.Label(buff3_row, text="按键:").pack(side="left", padx=(8, 4))
+            self._buff3_key_var = tk.StringVar(value="pageup")
+            buff3_key_button = ttk.Button(
+                buff3_row, text=self._buff3_key_var.get(), width=14,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    buff3_key_button, self._buff3_key_var,
+                    "_buff3_key_previous",
+                    lambda: self._drug_on_change(),
+                ),
+            )
+            buff3_key_button.pack(side="left", padx=(0, 10))
+            self._buff3_key_button = buff3_key_button
+            self._attach_bind_hint(buff3_key_button)
+            ttk.Label(buff3_row, text="每").pack(side="left")
+            self._buff3_interval_var = tk.DoubleVar(value=10.0)
+            buff3_interval_slider = ttk.Scale(
+                buff3_row, from_=0.5, to=30.0, orient="horizontal",
+                variable=self._buff3_interval_var,
+                command=self._drug_on_change,
+                length=60,
+            )
+            buff3_interval_slider.pack(side="left", fill="x",
+                                       expand=True, padx=(8, 8))
+            self._buff3_interval_label = ttk.Label(
+                buff3_row, text="10.0min", width=8
+            )
+            self._buff3_interval_label.pack(side="left")
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
@@ -1366,7 +1391,7 @@ class UiWorker(threading.Thread):
                 text="掉线",
                 variable=self._disconnect_alert_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left", padx=(4, 8))
+            ).pack(side="left", padx=(4, 6))
 
             self._lie_alert_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
@@ -1374,7 +1399,7 @@ class UiWorker(threading.Thread):
                 text="测谎",
                 variable=self._lie_alert_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left", padx=(0, 8))
+            ).pack(side="left", padx=(0, 6))
 
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
@@ -1384,37 +1409,35 @@ class UiWorker(threading.Thread):
             )
             self._countdown_check.pack(side="left")
 
-            countdown_row = ttk.Frame(extra_panel)
-            countdown_row.pack(fill="x", pady=(4, 0))
-            ttk.Label(countdown_row, text="间隔").pack(side="left")
+            # 循环 的 间隔/剩余 progress bars sit on the SAME line as the
+            # 掉线/测谎/循环 checkboxes (column 1 is 550px wide to fit).
+            ttk.Label(alarm_row, text="间隔").pack(side="left", padx=(8, 0))
             self._countdown_interval_var = tk.DoubleVar(value=1.0)
             self._countdown_interval_slider = ttk.Scale(
-                countdown_row, from_=0.1, to=12.0, orient="horizontal",
-                length=70,
+                alarm_row, from_=0.1, to=12.0, orient="horizontal",
+                length=45,
                 variable=self._countdown_interval_var,
                 command=self._countdown_on_change,
             )
             self._countdown_interval_slider.pack(
-                side="left", padx=(4, 4)
+                side="left", padx=(2, 2)
             )
             self._countdown_interval_label = ttk.Label(
-                countdown_row, text="1.0h", width=6
+                alarm_row, text="1.0h", width=4
             )
             self._countdown_interval_label.pack(side="left")
 
-            ttk.Label(countdown_row, text="剩余").pack(
-                side="left", padx=(6, 0)
-            )
+            ttk.Label(alarm_row, text="剩余").pack(side="left", padx=(6, 0))
             self._countdown_remaining_var = tk.DoubleVar(value=3600.0)
             self._countdown_remaining_slider = ttk.Scale(
-                countdown_row, from_=0.0, to=3600.0,
+                alarm_row, from_=0.0, to=3600.0,
                 orient="horizontal",
-                length=70,
+                length=45,
                 variable=self._countdown_remaining_var,
                 command=self._countdown_remaining_on_drag,
             )
             self._countdown_remaining_slider.pack(
-                side="left", padx=(4, 4)
+                side="left", padx=(2, 2)
             )
             self._countdown_dragging = False
             self._countdown_remaining_slider.bind(
@@ -1424,7 +1447,7 @@ class UiWorker(threading.Thread):
                 "<ButtonRelease-1>", self._countdown_drag_end
             )
             self._countdown_remaining_label = ttk.Label(
-                countdown_row, text="1h 00m", width=9
+                alarm_row, text="1h 00m", width=7
             )
             self._countdown_remaining_label.pack(side="left")
             self._countdown_status = ttk.Label(
@@ -1599,6 +1622,12 @@ class UiWorker(threading.Thread):
         bar.pack_propagate(False)
         self._caption_bar = bar
 
+        # A thin bottom line visually separates the caption row from the
+        # application content below it.
+        separator = tk.Frame(root, bg="#c8c8c8", height=1)
+        separator.pack(fill="x")
+        self._caption_separator = separator
+
         title = tk.Label(
             bar, text=f"Maple 助手 ({app_version})", bg="#f0f0f0",
             anchor="w",
@@ -1618,7 +1647,11 @@ class UiWorker(threading.Thread):
         self._caption_close_button = _button("×", self._on_debug_window_close)
         self._caption_max_button = _button("□", self._caption_toggle_maximize)
         self._caption_min_button = _button("－", self._caption_minimize)
-        self._help_button = _button("?", self._show_hotkey_help)
+        self._help_button = _button("?", None)
+        # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
+        # (the popup is floating and never takes keyboard focus).
+        self._help_button.bind("<Enter>", self._help_hover_show)
+        self._help_button.bind("<Leave>", self._help_hover_leave)
 
         # Dragging any empty part of the bar moves the window (manual
         # geometry drag: after WS_CAPTION is removed the OS caption hit-test
@@ -1693,17 +1726,14 @@ class UiWorker(threading.Thread):
             root.destroy()
 
     def _geometry_for_save(self, root: Any) -> str:
-        """Content-only geometry for persistence.
+        """Geometry for persistence (whole window, caption included).
 
-        The custom in-window caption adds its own height to the Tk window;
-        store the geometry WITHOUT it so the restored content area keeps the
-        same meaning it had before the caption existed.
+        The custom caption bar is part of the Tk client, so the raw
+        winfo geometry already describes the whole window; no adjustment is
+        needed.
         """
 
-        geometry = root.winfo_geometry()
-        if getattr(self, "_caption_bar", None) is not None:
-            return _geometry_without_caption(geometry)
-        return geometry
+        return root.winfo_geometry()
 
     def _schedule_window_geometry_save(self, root: Any, delay_ms: int = 3000) -> None:
         """Periodically persist the debug UI geometry while it is open.
@@ -2572,10 +2602,16 @@ class UiWorker(threading.Thread):
             self._buff2_interval_label.configure(
                 text=f"{self._buff2_interval_var.get():.1f}min"
             )
+        if hasattr(self, "_buff3_interval_label"):
+            self._buff3_interval_label.configure(
+                text=f"{self._buff3_interval_var.get():.1f}min"
+            )
         if hasattr(self, "_buff1_key_button"):
             self._buff1_key_button.configure(text=self._buff1_key_var.get())
         if hasattr(self, "_buff2_key_button"):
             self._buff2_key_button.configure(text=self._buff2_key_var.get())
+        if hasattr(self, "_buff3_key_button"):
+            self._buff3_key_button.configure(text=self._buff3_key_var.get())
         data = {
             "hp_key": self._hp_key_var.get().strip(),
             "mp_key": self._mp_key_var.get().strip(),
@@ -2585,10 +2621,13 @@ class UiWorker(threading.Thread):
             "mp_enabled": bool(self._mp_use_var.get()),
             "buff1_key": self._buff1_key_var.get().strip(),
             "buff2_key": self._buff2_key_var.get().strip(),
+            "buff3_key": self._buff3_key_var.get().strip(),
             "buff1_interval": round(float(self._buff1_interval_var.get()), 1),
             "buff2_interval": round(float(self._buff2_interval_var.get()), 1),
+            "buff3_interval": round(float(self._buff3_interval_var.get()), 1),
             "buff1_enabled": bool(self._buff1_use_var.get()),
             "buff2_enabled": bool(self._buff2_use_var.get()),
+            "buff3_enabled": bool(self._buff3_use_var.get()),
         }
         self._drug_save_settings(data)
         self._drug_apply_to_worker(data)
@@ -2619,14 +2658,20 @@ class UiWorker(threading.Thread):
                 self._buff1_key_var.set(str(data["buff1_key"]))
             if "buff2_key" in data:
                 self._buff2_key_var.set(str(data["buff2_key"]))
+            if "buff3_key" in data:
+                self._buff3_key_var.set(str(data["buff3_key"]))
             if "buff1_interval" in data:
                 self._buff1_interval_var.set(float(data["buff1_interval"]))
             if "buff2_interval" in data:
                 self._buff2_interval_var.set(float(data["buff2_interval"]))
+            if "buff3_interval" in data:
+                self._buff3_interval_var.set(float(data["buff3_interval"]))
             if "buff1_enabled" in data:
                 self._buff1_use_var.set(bool(data["buff1_enabled"]))
             if "buff2_enabled" in data:
                 self._buff2_use_var.set(bool(data["buff2_enabled"]))
+            if "buff3_enabled" in data:
+                self._buff3_use_var.set(bool(data["buff3_enabled"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed drug settings", exc_info=True)
             return
@@ -2644,31 +2689,18 @@ class UiWorker(threading.Thread):
             LOG.warning("could not save drug settings", exc_info=True)
 
     def _drug_apply_to_worker(self, data: dict) -> None:
-        """Apply the drug settings to the StatusWorker's detector config."""
+        """Apply the drug settings to the StatusWorker's detector config.
+
+        Rows carry their own keys/sliders/checkboxes, so no echo status line
+        is kept below the panel (the 药品/增益 summary line was removed).
+        """
 
         worker = getattr(self, "status_worker", None)
         if worker is None:
-            self._drug_status.configure(
-                text="药品: 状态工作线程未接入 (无界面模式)。"
-            )
             return
         try:
             config = apply_drug_settings(worker.detector.config, data)
             worker.detector.config = config
-            self._drug_status.configure(
-                text=(
-                    f"药品: HP<{data['hp_threshold']}% 按键={data['hp_key']} "
-                    f"({'开' if data['hp_enabled'] else '关'}) | "
-                    f"MP<{data['mp_threshold']}% 按键={data['mp_key']} "
-                    f"({'开' if data['mp_enabled'] else '关'})\n"
-                    f"增益1: 按键={data['buff1_key']} 每 "
-                    f"{data['buff1_interval']}分钟 "
-                    f"({'开' if data['buff1_enabled'] else '关'}) | "
-                    f"增益2: 按键={data['buff2_key']} 每 "
-                    f"{data['buff2_interval']}分钟 "
-                    f"({'开' if data['buff2_enabled'] else '关'})"
-                )
-            )
         except Exception as exc:
             LOG.warning("drug settings apply failed: %s", exc)
 
@@ -3155,12 +3187,81 @@ class UiWorker(threading.Thread):
             return f"发送第 {index + 1} 条快捷消息"
         return self._HELP_ACTION_LABELS.get(action, action)
 
+    def _help_hover_show(self, _event: Any = None) -> None:
+        """Show the help popup on hover (mouse-enter), debounced briefly."""
+
+        self._help_cancel_jobs()
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        existing = getattr(self, "_help_popup", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    return
+            except Exception:
+                pass
+        self._help_show_job = root.after(180, self._show_hotkey_help)
+
+    def _help_hover_leave(self, _event: Any = None) -> None:
+        """Hide the help popup when the pointer leaves (mouse-leave).
+
+        A short grace period keeps the popup open while the pointer travels
+        from the ? button onto the popup itself; entering the popup cancels
+        the pending hide (see ``_help_bind_popup_hover``).
+        """
+
+        self._help_cancel_jobs()
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        self._help_hide_job = root.after(220, self._hide_hotkey_help)
+
+    def _help_cancel_jobs(self) -> None:
+        """Cancel pending show/hide timers for the hover help popup."""
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        for attr in ("_help_show_job", "_help_hide_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    root.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def _help_bind_popup_hover(self, popup: Any) -> None:
+        """Keep the popup alive while the pointer is over it."""
+
+        popup.bind("<Enter>", self._help_cancel_jobs, add="+")
+        popup.bind(
+            "<Leave>", lambda _e: self._help_hover_leave(), add="+"
+        )
+
+    def _hide_hotkey_help(self) -> None:
+        """Destroy the floating help popup if it is still open."""
+
+        self._help_cancel_jobs()
+        popup = getattr(self, "_help_popup", None)
+        if popup is None:
+            return
+        try:
+            if popup.winfo_exists():
+                popup.destroy()
+        except Exception:
+            pass
+        self._help_popup = None
+
     def _show_hotkey_help(self) -> None:
         """Floating help popup anchored under the caption-row "?" button.
 
         The popup is a borderless transient window (a floating message,
         like a tooltip) instead of a second framed dialog, so it does not
-        steal focus from the game.
+        steal focus from the game.  Hover-triggered: it appears while the
+        pointer is over the "?" (or the popup itself) and disappears on
+        mouse-leave; the in-popup 关闭 button also closes it.
         """
 
         root = getattr(self, "_root", None)
@@ -3170,7 +3271,7 @@ class UiWorker(threading.Thread):
         if existing is not None:
             try:
                 if existing.winfo_exists():
-                    existing.destroy()
+                    return
             except Exception:
                 pass
         import tkinter as tk
@@ -3237,17 +3338,10 @@ class UiWorker(threading.Thread):
             wraplength=430,
         ).pack(side="left", fill="x", expand=True)
         ttk.Button(bottom, text="关闭",
-                   command=popup.destroy).pack(side="right")
+                   command=self._hide_hotkey_help).pack(side="right")
 
-        def _close_on_escape(_event: Any = None) -> None:
-            try:
-                popup.destroy()
-            except Exception:
-                pass
-
-        popup.bind("<Escape>", _close_on_escape)
-        popup.bind("<FocusOut>", lambda _e: root.after(50, _close_on_escape))
-        popup.focus_set()
+        # Stay open while the pointer is over the popup; hover-out closes it.
+        self._help_bind_popup_hover(popup)
 
         # Position below the caption-row "?" (or top-right as fallback).
         popup.update_idletasks()

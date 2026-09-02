@@ -325,27 +325,34 @@ class StatusTests(unittest.TestCase):
         self.assertFalse(updated.hp_enabled)
         self.assertTrue(updated.mp_enabled)
         # Keys outside the bindable whitelist are ignored: the existing
-        # binding stays.
-        unchanged = apply_drug_settings(config, {"hp_key": "q"})
+        # binding stays.  (``alt`` is a real key but NOT in the whitelist.)
+        unchanged = apply_drug_settings(config, {"hp_key": "alt"})
         self.assertEqual(unchanged.hp_key, config.hp_key)
 
     def test_apply_drug_settings_maps_buff_keys_intervals_and_enabled(self) -> None:
         config = StatusConfig()
         updated = apply_drug_settings(config, {
             "buff1_key": "home", "buff2_key": "space",
+            "buff3_key": "pageup",
             "buff1_interval": 10.0, "buff2_interval": 5.5,
+            "buff3_interval": 20.0,
             "buff1_enabled": True, "buff2_enabled": True,
+            "buff3_enabled": True,
         })
         self.assertEqual(updated.buff1_key, "home")
         self.assertEqual(updated.buff2_key, "space")
+        self.assertEqual(updated.buff3_key, "pageup")
         # Minutes in the UI form become seconds in the worker config.
         self.assertAlmostEqual(updated.buff1_interval, 600.0)
         self.assertAlmostEqual(updated.buff2_interval, 330.0)
+        self.assertAlmostEqual(updated.buff3_interval, 1200.0)
         self.assertTrue(updated.buff1_enabled)
         self.assertTrue(updated.buff2_enabled)
+        self.assertTrue(updated.buff3_enabled)
         # Unbindable key and malformed interval are ignored: defaults stay.
+        # (``alt`` is a real key but NOT in the bindable whitelist.)
         ignored = apply_drug_settings(config, {
-            "buff1_key": "q", "buff2_interval": "oops",
+            "buff1_key": "alt", "buff2_interval": "oops",
         })
         self.assertEqual(ignored.buff1_key, config.buff1_key)
         self.assertEqual(ignored.buff2_interval, config.buff2_interval)
