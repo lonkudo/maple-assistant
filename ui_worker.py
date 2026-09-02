@@ -39,7 +39,7 @@ LOG = logging.getLogger(__name__)
 # window (including the in-window caption bar when active) is 1050x720.
 # The height stays user-resizable (only the minimum is enforced).
 _INITIAL_WINDOW_WIDTH = 1086
-_INITIAL_WINDOW_HEIGHT = 1030
+_INITIAL_WINDOW_HEIGHT = 840
 # Column 0 is FIXED at 550px, column 1 at 500px (both fully visible inside
 # the 1086px default: 550 + 500 + 12px column gap + 24px container padding).
 
