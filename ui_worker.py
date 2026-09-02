@@ -764,6 +764,7 @@ class UiWorker(threading.Thread):
             columns = ttk.Frame(container)
             columns.pack(fill="both", expand=True, pady=(8, 0))
             columns.pack_propagate(False)
+            self._columns_frame = columns
             # Column 0 is FIXED at 550px, column 1 FIXED at 500px (grid
             # columns 0/1): the 警报 row fits on one line in the left column
             # and the drug/quick-message panels keep their full text width in
@@ -774,8 +775,10 @@ class UiWorker(threading.Thread):
             columns.rowconfigure(0, weight=1)
             col1 = ttk.Frame(columns)
             col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+            self._col1_frame = col1
             col2 = ttk.Frame(columns)
             col2.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            self._col2_frame = col2
 
             controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=10)
             controls.pack(fill="x", pady=(12, 8))
@@ -1369,7 +1372,6 @@ class UiWorker(threading.Thread):
             # icon also requires a 1s long press.
             quick_panel = ttk.LabelFrame(col2, text="快捷消息", padding=10)
             quick_panel.pack(fill="x", pady=(0, 8))
-            self._quick_panel = quick_panel
             quick_header = ttk.Frame(quick_panel)
             quick_header.pack(fill="x")
             ttk.Button(
@@ -3110,15 +3112,6 @@ class UiWorker(threading.Thread):
         frame = getattr(self, "_quick_messages_frame", None)
         if frame is None:
             return
-        panel = getattr(self, "_quick_panel", None)
-        root = getattr(self, "_root", None)
-        previous_height = None
-        if panel is not None and root is not None:
-            try:
-                root.update_idletasks()
-                previous_height = panel.winfo_height()
-            except Exception:
-                previous_height = None
         # Clear the active-entry identity before destroying widgets so a
         # destruction-induced FocusOut cannot recursively save/render.
         self._quick_edit_entry = None
@@ -3167,43 +3160,6 @@ class UiWorker(threading.Thread):
                 "<ButtonRelease-1>",
                 lambda event, i=index: self._quick_delete_release(i),
             )
-        # Tk grows the window when rows are added but does NOT shrink it back
-        # after a delete; refit the window height to the new panel height so
-        # the UI reduces again after deletion.
-        if panel is not None and root is not None:
-            try:
-                root.update_idletasks()
-                new_height = panel.winfo_height()
-                if (previous_height is not None
-                        and abs(new_height - previous_height) >= 2):
-                    self._resize_window_by(
-                        new_height - previous_height, root
-                    )
-            except Exception:
-                pass
-
-    def _resize_window_by(self, delta: int, root: Any) -> None:
-        """Grow/shrink the whole window by ``delta`` pixels vertically.
-
-        Used after quick-message rows are added or removed so the window
-        height follows its content (Tk auto-grows on add but leaves the
-        window tall after a delete).  Keeps position and clamps to the
-        window minimum height.
-        """
-
-        if not delta:
-            return
-        try:
-            if root.state() == "zoomed":
-                return
-            width = root.winfo_width()
-            height = root.winfo_height()
-            x = root.winfo_x()
-            y = root.winfo_y()
-            new_height = max(height + delta, 200)
-            root.geometry(f"{width}x{new_height}+{x}+{y}")
-        except Exception:
-            LOG.debug("window height refit failed", exc_info=True)
 
     def _quick_messages_save(self) -> None:
         self._shutdown_save_settings(self._shutdown_collect_data())
@@ -3216,6 +3172,7 @@ class UiWorker(threading.Thread):
         index = len(self._quick_messages) - 1
         self._quick_messages_save()
         self._render_quick_messages(index)
+        self._refit_window_to_content()
 
     def _quick_message_press(self, index: int) -> None:
         self._quick_message_hold_fired = False
@@ -3317,6 +3274,7 @@ class UiWorker(threading.Thread):
             self._quick_messages[index] = text[:500]
             self._quick_messages_save()
         self._render_quick_messages()
+        self._refit_window_to_content()
 
     def _quick_delete_press(self, index: int) -> None:
         self._quick_delete_hold_fired = False
@@ -3342,6 +3300,49 @@ class UiWorker(threading.Thread):
             self._quick_messages_save()
             self._render_quick_messages()
             self._quick_message_status.configure(text=f"已删除：{deleted}")
+            self._refit_window_to_content()
+
+    def _refit_window_to_content(self) -> None:
+        """Fit the window height exactly to the UI content.
+
+        Called after quick-message rows are added/removed/edited so the
+        window grows when rows are added and shrinks back when they are
+        deleted (Tk never shrinks automatically).  The target height is
+        derived from the taller column's REQUIRED height plus the window
+        chrome, so the fit is exact - no leftover padding and no growth
+        beyond the content.
+        """
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        try:
+            if root.state() == "zoomed":
+                return
+            columns = getattr(self, "_columns_frame", None)
+            col1 = getattr(self, "_col1_frame", None)
+            col2 = getattr(self, "_col2_frame", None)
+            if columns is None or col1 is None or col2 is None:
+                return
+            root.update_idletasks()
+            chrome = root.winfo_height() - columns.winfo_height()
+            needed = chrome + max(col1.winfo_reqheight(),
+                                  col2.winfo_reqheight())
+            try:
+                min_height = int(root.minsize()[1]) or 200
+            except Exception:
+                min_height = 200
+            needed = max(needed, min_height)
+            current = root.winfo_height()
+            if abs(needed - current) < 2:
+                return
+            width = root.winfo_width()
+            x = root.winfo_x()
+            y = root.winfo_y()
+            root.geometry(f"{width}x{needed}+{x}+{y}")
+            root.update_idletasks()
+        except Exception:
+            LOG.debug("window content refit failed", exc_info=True)
 
     def _telegram_change_token(self) -> None:
         """Ask for a token, then let the notifier validate it asynchronously."""
