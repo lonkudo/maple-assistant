@@ -519,6 +519,7 @@ class UiWorker(threading.Thread):
         attack_worker: Any = None,
         random_jump_worker: Any = None,
         hotkey_queue: Optional["queue.Queue[str]"] = None,
+        hotkey_worker: Any = None,
         movement_worker: Any = None,
         character_worker: Any = None,
         shutdown_worker: Any = None,
@@ -553,6 +554,9 @@ class UiWorker(threading.Thread):
         # gating events and exposes no configurable key binding.
         self.random_jump_worker = random_jump_worker
         self.hotkey_queue = hotkey_queue
+        # Physical hotkey hook whose bindings are temporarily disabled while
+        # patrol runs (only the patrol-toggle chord stays live).
+        self.hotkey_worker = hotkey_worker
         # Movement worker whose jump-rope logic follows the attack mode:
         # Fixed Attack mode runs without YOLO, so the minimap logic must own
         # the rope jump there.
@@ -3620,8 +3624,14 @@ class UiWorker(threading.Thread):
             self._delete_layer_button.configure(state="disabled")
             self._reset_recording_button.configure(state="disabled")
             return
-        running = self.patrol_controller.is_enabled()
+        running = bool(self.patrol_controller.is_enabled())
         self._patrol_ui_running = bool(running)
+        # Physical hotkeys follow the same state: while patrol runs every
+        # binding except the patrol-toggle chord is temporarily disabled.
+        hotkeys = getattr(self, "hotkey_worker", None)
+        setter = getattr(hotkeys, "set_patrol_running", None)
+        if setter is not None:
+            setter(bool(running))
         can_start = self.patrol_controller.can_start()
         selected = self.patrol_controller.selected_layer()
         snapshot = self.patrol_controller.snapshot()

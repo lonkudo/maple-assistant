@@ -53,6 +53,24 @@ class HotkeyWorkerTests(unittest.TestCase):
             worker._bindings[KEY_VK["grave"]][0], "toggle_patrol"
         )
 
+    def test_patrol_running_allows_only_toggle_patrol(self) -> None:
+        config = Path(__file__).with_name("hotkey.json")
+        worker = HotkeyWorker(threading.Event(), queue.Queue(), config_path=config)
+        # Not patrolling: every binding is allowed.
+        self.assertTrue(worker._binding_allowed("quick_message:0"))
+        self.assertTrue(worker._binding_allowed("record:left_most_pos"))
+        self.assertTrue(worker._binding_allowed("toggle_patrol"))
+
+        worker.set_patrol_running(True)
+        # While patrol runs only the patrol-toggle chord stays live.
+        self.assertFalse(worker._binding_allowed("quick_message:0"))
+        self.assertFalse(worker._binding_allowed("record:left_most_pos"))
+        self.assertFalse(worker._binding_allowed("adjust_fixed_attack_interval:+0.1"))
+        self.assertTrue(worker._binding_allowed("toggle_patrol"))
+
+        worker.set_patrol_running(False)
+        self.assertTrue(worker._binding_allowed("quick_message:0"))
+
 
 if __name__ == "__main__":
     unittest.main()

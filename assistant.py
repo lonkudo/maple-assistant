@@ -945,6 +945,7 @@ def main() -> int:
             attack_worker=attack_worker,
             random_jump_worker=random_jump_worker,
             hotkey_queue=hotkey_actions,
+            hotkey_worker=hotkey_worker,
             movement_worker=movement_worker,
             character_worker=character_worker,
             shutdown_worker=shutdown_worker,

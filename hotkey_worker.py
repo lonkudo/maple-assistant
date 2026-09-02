@@ -85,7 +85,25 @@ class HotkeyWorker(threading.Thread):
         self._last_action_at: dict[str, float] = {}
         self._hook: Any = None
         self._hook_proc: Any = None
+        # While patrol runs, every physical hotkey except the patrol-toggle
+        # chord is temporarily disabled: automation owns the keyboard and a
+        # stray Ctrl chord (for example a quick message) must not fire into
+        # the game mid-route.  ``toggle_patrol`` stays live so patrol can
+        # always be stopped from the keyboard.
+        self._patrol_running = False
         self._load_config()
+
+    def set_patrol_running(self, running: bool) -> None:
+        """Disable all bindings except ``toggle_patrol`` while patrol runs."""
+
+        self._patrol_running = bool(running)
+
+    def _binding_allowed(self, action: str) -> bool:
+        """True when this binding may fire in the current mode."""
+
+        if not self._patrol_running:
+            return True
+        return action == "toggle_patrol"
 
     def _load_config(self) -> None:
         try:
@@ -182,6 +200,13 @@ class HotkeyWorker(threading.Thread):
             binding = self._bindings.get(vk)
             if binding is not None:
                 action, block_original = binding
+                if not self._binding_allowed(action):
+                    # Patrol is running: this chord is temporarily disabled.
+                    # Treat it as unbound - never queue it and do not consume
+                    # it, so the key still reaches the game/other apps.
+                    return user32.CallNextHookEx(
+                        self._hook, code, message, l_param
+                    )
                 was_fired = vk in self._fired
                 repeatable = action.startswith("adjust_fixed_attack_interval:")
                 if is_up:
