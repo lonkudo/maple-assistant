@@ -84,6 +84,13 @@ class CountdownWorker(threading.Thread):
             0.01, float(interval_hours) * SECONDS_PER_HOUR
         )
         self._deadline: Optional[float] = None
+        # True while an expiry's reminders are being dispatched (the sound
+        # playback blocks the worker thread).  A stale ``remaining=0`` from
+        # the UI (the bar still shows 0:00 until the next poll) must not
+        # re-arm the deadline to "now" during that window: doing so made the
+        # run loop fire the end event a SECOND time as soon as the playback
+        # finished (ding-dong + flash + notifier all ran twice).
+        self._firing = False
 
     @property
     def enabled(self) -> bool:
@@ -131,7 +138,7 @@ class CountdownWorker(threading.Thread):
         now = time.monotonic()
         with self._lock:
             remaining = max(0.0, min(float(seconds), self._interval_seconds))
-            if self._enabled:
+            if self._enabled and not (self._firing and remaining <= 0.0):
                 self._deadline = now + remaining
         self._wake_event.set()
 
@@ -157,22 +164,30 @@ class CountdownWorker(threading.Thread):
                 return
             self._deadline = now + self._interval_seconds
             sound_enabled = self._sound_enabled
+            self._firing = True
         LOG.info("COUNTDOWN reached zero: triggering reminders and resetting")
-        if self._flash_callback is not None:
-            try:
-                self._flash_callback()
-            except Exception:
-                LOG.warning("COUNTDOWN screen blink callback failed", exc_info=True)
-        if self._alert_callback is not None:
-            try:
-                self._alert_callback("循环警报")
-            except Exception:
-                LOG.warning("COUNTDOWN message callback failed", exc_info=True)
-        if sound_enabled:
-            try:
-                self._play_sound(self.sound_path)
-            except Exception:
-                LOG.warning("COUNTDOWN sound callback failed", exc_info=True)
+        try:
+            if self._flash_callback is not None:
+                try:
+                    self._flash_callback()
+                except Exception:
+                    LOG.warning("COUNTDOWN screen blink callback failed",
+                                exc_info=True)
+            if self._alert_callback is not None:
+                try:
+                    self._alert_callback("循环警报")
+                except Exception:
+                    LOG.warning("COUNTDOWN message callback failed",
+                                exc_info=True)
+            if sound_enabled:
+                try:
+                    self._play_sound(self.sound_path)
+                except Exception:
+                    LOG.warning("COUNTDOWN sound callback failed",
+                                exc_info=True)
+        finally:
+            with self._lock:
+                self._firing = False
 
     def run(self) -> None:
         LOG.info("countdown worker started")

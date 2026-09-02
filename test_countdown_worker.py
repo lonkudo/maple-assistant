@@ -34,6 +34,47 @@ class CountdownWorkerTests(unittest.TestCase):
         self.assertAlmostEqual(interval, .08, places=2)
         self.assertGreater(remaining, .02)
 
+    def test_stale_zero_drag_during_fire_does_not_fire_twice(self) -> None:
+        # The UI drag-end re-applies remaining=0 while the expiry sound is
+        # still playing (the bar still shows 0:00).  That stale re-arm must
+        # not make the run loop fire the end event a second time once the
+        # playback finishes.
+        stop = threading.Event()
+        sound_started = threading.Event()
+        release_sound = threading.Event()
+        fired = []
+
+        def blocking_sound(_path: Path) -> None:
+            fired.append(time.monotonic())
+            sound_started.set()
+            release_sound.wait(2.0)
+
+        with mock.patch("countdown_worker.SECONDS_PER_HOUR", 100.0):
+            worker = CountdownWorker(
+                stop,
+                sound_path=Path("sound/dingdong.mp3"),
+                enabled=True,
+                interval_hours=1.0,
+                poll_interval=.01,
+                play_sound=blocking_sound,
+            )
+            worker.start()
+            worker.set_remaining_seconds(0.0)
+            self.assertTrue(sound_started.wait(1.0))
+            # UI echo: bar still at 0:00 -> drag release re-applies zero
+            # while the ding-dong is still playing.
+            worker.set_remaining_seconds(0.0)
+            worker.set_remaining_seconds(0.0)
+            release_sound.set()
+            time.sleep(.2)
+            enabled, _interval, remaining = worker.snapshot()
+            stop.set()
+            worker._wake_event.set()
+            worker.join(1.0)
+        self.assertEqual(len(fired), 1)
+        self.assertTrue(enabled)
+        self.assertGreater(remaining, .0)
+
     def test_remaining_can_be_dragged_within_interval(self) -> None:
         stop = threading.Event()
         with mock.patch("countdown_worker.SECONDS_PER_HOUR", 100.0):
