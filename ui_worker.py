@@ -151,8 +151,9 @@ def _clamp_window_geometry(
 # meaning of the stored geometry changes (whole-window vs content-only vs
 # caption semantics), so machines with a stale file from an older release
 # fall back to the current default once instead of restoring a mismatched
-# size (e.g. 1275x904 from an older layout on a Win10 box).
-_GEOMETRY_FORMAT = 2
+# size (e.g. 1275x904 / 1620x1050 from an older layout or a remembered
+# manual resize on a scaled display).
+_GEOMETRY_FORMAT = 3
 
 
 def _load_window_geometry(default_geometry: str) -> str:
