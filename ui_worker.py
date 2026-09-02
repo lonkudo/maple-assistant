@@ -149,11 +149,11 @@ def _clamp_window_geometry(
 
 # Format of the persisted window-geometry record.  Bumped whenever the
 # meaning of the stored geometry changes (whole-window vs content-only vs
-# caption semantics), so machines with a stale file from an older release
-# fall back to the current default once instead of restoring a mismatched
-# size (e.g. 1275x904 / 1620x1050 from an older layout or a remembered
-# manual resize on a scaled display).
-_GEOMETRY_FORMAT = 3
+# caption semantics or DPI awareness), so machines with a stale file from
+# an older release fall back to the current default once instead of
+# restoring a mismatched size (e.g. 1275x904 / 1620x1050 / 1635x1272 from
+# an older layout, a remembered manual resize, or a pre-DPI-aware run).
+_GEOMETRY_FORMAT = 4
 
 
 def _load_window_geometry(default_geometry: str) -> str:
@@ -681,14 +681,99 @@ class UiWorker(threading.Thread):
         # when that happens instead of leaving them stale.
         self._patrol_ui_running: Optional[bool] = None
 
+    @staticmethod
+    def _enable_ui_dpi_awareness() -> None:
+        """Make the current (Tk UI) thread DPI-aware on Windows.
+
+        Tk on Windows is DPI-unaware by default: when the display runs at
+        125%/150% scaling, Windows bitmap-scales the whole window, so a
+        configured 1086x840 initial window physically opens larger (e.g.
+        ~1275x904 at 125%, ~1635x1272 at 150%).  Setting the per-thread DPI
+        awareness context before the Tk root is created makes one logical
+        pixel equal one physical pixel, so the window opens at the configured
+        size on every machine.  Only this thread's context is changed; the
+        capture/worker threads are unaffected.  Older systems without the
+        per-thread API simply keep the previous behavior.
+        """
+
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            # DPI_AWARENESS_CONTEXT_* pseudo-handles (negative values).
+            # Prefer per-monitor v2, then per-monitor, then system aware.
+            for context in (-4, -3, -2):
+                try:
+                    user32.SetThreadDpiAwarenessContext(
+                        wintypes.HANDLE(context)
+                    )
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            LOG.debug("thread DPI awareness unavailable", exc_info=True)
+
+    @staticmethod
+    def _apply_ui_font_scaling(root: Any) -> None:
+        """Scale Tk fonts to match the physical DPI of the primary display.
+
+        After the UI thread becomes DPI-aware, Tk still renders fonts with
+        its default 96-DPI metrics unless told otherwise, which would make
+        text look tiny on a 150% display.  ``tk scaling`` converts points to
+        pixels; setting it from the real system DPI keeps the UI text the
+        same physical size as before on every machine.  Newer Tk versions
+        auto-scale fonts when DPI-aware, so only adjust when the current
+        scaling does not already match the physical DPI (avoid doubling).
+        """
+
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            hdc = user32.GetDC(None)
+            if not hdc:
+                return
+            try:
+                LOGPIXELSY = 90
+                dpi = int(gdi32.GetDeviceCaps(hdc, LOGPIXELSY))
+            finally:
+                user32.ReleaseDC(None, hdc)
+            if dpi <= 0:
+                return
+            expected = float(dpi) / 72.0
+            current = float(root.tk.call("tk", "scaling"))
+            if abs(current - expected) / expected < 0.05:
+                return
+            root.tk.call("tk", "scaling", expected)
+        except Exception:
+            LOG.debug("UI font scaling unavailable", exc_info=True)
+
     def run(self) -> None:
         try:
             import tkinter as tk
             from tkinter import ttk
             self._ttk = ttk
 
+            # Make THIS thread (the Tk/UI thread) DPI-aware BEFORE the root
+            # window is created.  Without it, Windows treats the app as
+            # DPI-unaware and bitmap-scales the whole window by the display
+            # scaling factor: on a 150% display the configured 1086x840
+            # initial window physically opens at ~1635x1272.  DPI awareness
+            # makes one logical px == one physical px, so the window opens at
+            # the configured size on every machine.  Only the UI thread's
+            # context is changed - capture/worker threads keep their own.
+            self._enable_ui_dpi_awareness()
+
             root = tk.Tk()
             self._root = root
+            self._apply_ui_font_scaling(root)
             app_version = version_label()
             root.title(f"Maple 助手 ({app_version})")
             screen_width = root.winfo_screenwidth()
