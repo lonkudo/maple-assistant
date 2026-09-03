@@ -277,6 +277,7 @@ def main() -> int:
     from attack_worker import AttackWorker
     from random_jump_worker import RandomJumpWorker
     from hotkey_worker import HotkeyWorker
+    from motion_arbiter import MotionArbiter
     # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
     # from shutdown_worker import ShutdownWorker
     from countdown_worker import CountdownWorker
@@ -658,6 +659,13 @@ def main() -> int:
             float(anchor_world_y),
         )
     attack_workers = []
+    # Jump/buff motion keys are executed one at a time by the motion arbiter
+    # (0.9s jump window / 0.6s buff window).  Fixed attack defers while the
+    # arbiter is busy, so a jump or buff tap never lands inside action
+    # motion and gets swallowed by the game.
+    motion_arbiter = MotionArbiter(
+        key_sender, stop_event, climbing_active_event=climbing_active,
+    )
     # The fixed-rate attack worker always exists so the UI can toggle it
     # live (Fixed Attack panel).  Without --enable-attack it starts disabled
     # and only waits; the panel flips ``enabled`` when the mode is selected.
@@ -667,6 +675,7 @@ def main() -> int:
         args.attack_interval,
         climbing_active_event=climbing_active,
         automation_active_event=automation_active,
+        motion_arbiter=motion_arbiter,
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
@@ -675,6 +684,7 @@ def main() -> int:
         stop_event,
         climbing_active_event=climbing_active,
         automation_active_event=automation_active,
+        motion_arbiter=motion_arbiter,
     )
     # TEMPORARILY DISABLED together with its hidden UI controls.
     # shutdown_worker = ShutdownWorker(...)
@@ -738,6 +748,7 @@ def main() -> int:
         status_state_path=str(
             Path(__file__).with_name("work") / "status_state.json"
         ),
+        motion_arbiter=motion_arbiter,
     )
     movement_worker = MovementWorker(
             movement_frames,
@@ -915,6 +926,7 @@ def main() -> int:
         character_worker,
         movement_worker,
         status_worker,
+        motion_arbiter,
         *attack_workers,
         random_jump_worker,
         hotkey_worker,

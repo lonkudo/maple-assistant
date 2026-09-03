@@ -1069,12 +1069,18 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left")
+            ttk.Radiobutton(
+                mode_row, text="跳跃攻击", value="jump_attack",
+                variable=self._attack_mode_var,
+                command=self._fixed_on_mode_change,
+            ).pack(side="left", padx=(0, 8))
             fixed_key_row = ttk.Frame(fixed_panel)
             fixed_key_row.pack(fill="x", pady=(6, 0))
             # Random-gap steppers live at the RIGHT edge of the row so the
             # two slider rows share one aligned column of 随机 controls.
             fixed_random_group = ttk.Frame(fixed_key_row)
             fixed_random_group.pack(side="right")
+            self._fixed_random_group = fixed_random_group
             ttk.Label(fixed_random_group, text="随机:").pack(side="left")
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
             ttk.Button(
@@ -1106,29 +1112,35 @@ class UiWorker(threading.Thread):
             fixed_key_button.pack(side="left", padx=(0, 4))
             self._fixed_key_button = fixed_key_button
             self._attach_bind_hint(fixed_key_button)
-            ttk.Label(fixed_key_row, text="每").pack(side="left")
+            # The interval/range controls sit in their own sub-frame so the
+            # 跳跃攻击 mode can hide them and leave only the 按键 row.
+            fixed_interval_group = ttk.Frame(fixed_key_row)
+            fixed_interval_group.pack(side="left", fill="x", expand=True)
+            ttk.Label(fixed_interval_group, text="每").pack(side="left")
             # Fixed attack period: horizontal slider (progress-bar style),
             # 0.2-10 s, default 3 s.  It expands so the value/random-gap
             # controls stay fully visible at the row's right side.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
             fixed_interval_slider = ttk.Scale(
-                fixed_key_row, from_=0.2, to=10.0, orient="horizontal",
+                fixed_interval_group, from_=0.2, to=10.0, orient="horizontal",
                 variable=self._fixed_interval_var,
                 command=self._fixed_on_change,
             )
             fixed_interval_slider.pack(side="left", fill="x", expand=True,
                                        padx=(0, 2))
             self._fixed_interval_label = ttk.Label(
-                fixed_key_row, text="3.0s", width=5
+                fixed_interval_group, text="3.0s", width=5
             )
             self._fixed_interval_label.pack(side="left", padx=(0, 2))
             self._fixed_range_label = ttk.Label(
-                fixed_key_row, text="(3.0s, 3.1s)", width=13
+                fixed_interval_group, text="(3.0s, 3.1s)", width=13
             )
             self._fixed_range_label.pack(side="left")
+            self._fixed_interval_group = fixed_interval_group
 
             jump_row = ttk.Frame(fixed_panel)
             jump_row.pack(fill="x", pady=(6, 0))
+            self._jump_row = jump_row
             # Same right-aligned random-gap group for the jump row.
             jump_random_group = ttk.Frame(jump_row)
             jump_random_group.pack(side="right")
@@ -1155,8 +1167,10 @@ class UiWorker(threading.Thread):
             ).pack(side="left", padx=(0, 4))
             ttk.Label(jump_row, text="每").pack(side="left")
             self._random_jump_interval_var = tk.DoubleVar(value=3.0)
+            # Jump motion occupies 0.9s, so the minimum trigger interval is
+            # 1.0s (a faster repeat would pile up stale jump events).
             ttk.Scale(
-                jump_row, from_=0.2, to=10.0, orient="horizontal",
+                jump_row, from_=1.0, to=10.0, orient="horizontal",
                 variable=self._random_jump_interval_var,
                 command=self._fixed_on_change,
             ).pack(side="left", fill="x", expand=True, padx=(0, 2))
@@ -1173,6 +1187,10 @@ class UiWorker(threading.Thread):
                 wraplength=440,
             )
             self._fixed_load_settings()
+            # Defensive: after the window realizes, re-render the mode rows
+            # once so the 跳跃 row visibility always matches the selected
+            # attack mode (fixed -> visible, jump attack -> hidden).
+            root.after(200, self._fixed_refresh_rows)
 
             # Drug (HP/MP potion) panel: key binds + percent trigger sliders.
             # The StatusWorker taps the bound key when the bar ratio drops
@@ -1258,7 +1276,7 @@ class UiWorker(threading.Thread):
             buff1_row.pack(fill="x", pady=(6, 0))
             self._buff1_use_var = tk.BooleanVar(value=False)
             buff1_use_button = ttk.Checkbutton(
-                buff1_row, text="增益 1", variable=self._buff1_use_var,
+                buff1_row, text="宠物食品", variable=self._buff1_use_var,
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
@@ -1296,7 +1314,7 @@ class UiWorker(threading.Thread):
             buff2_row.pack(fill="x", pady=(6, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
             buff2_use_button = ttk.Checkbutton(
-                buff2_row, text="增益 2", variable=self._buff2_use_var,
+                buff2_row, text="增益 1", variable=self._buff2_use_var,
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
@@ -1332,7 +1350,7 @@ class UiWorker(threading.Thread):
             buff3_row.pack(fill="x", pady=(6, 0))
             self._buff3_use_var = tk.BooleanVar(value=False)
             buff3_use_button = ttk.Checkbutton(
-                buff3_row, text="增益 3", variable=self._buff3_use_var,
+                buff3_row, text="增益 2", variable=self._buff3_use_var,
                 command=self._drug_on_change,
             )
             buff3_use_button.pack(side="left")
@@ -2284,6 +2302,11 @@ class UiWorker(threading.Thread):
         if self.patrol_controller.is_enabled():
             self._control_status.configure(text="巡逻中无法录制，请先停止巡逻。")
             return False
+        if not self.patrol_controller.snapshot().layers:
+            self._control_status.configure(
+                text="无法录制: 没有楼层，请先点击「添加楼层」。"
+            )
+            return False
         snapshot = self._capture_snapshot_for_recording()
         if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
             LOG.warning(
@@ -2424,7 +2447,7 @@ class UiWorker(threading.Thread):
                 if hasattr(self, "_random_jump_enabled_var") else False
             ),
             "random_jump_interval_seconds": round(
-                max(0.2, float(
+                max(1.0, float(
                     getattr(self, "_random_jump_interval_var", None).get()
                 ))
                 if hasattr(self, "_random_jump_interval_var") else 3.0,
@@ -2505,14 +2528,41 @@ class UiWorker(threading.Thread):
         self._attack_hotkey_sound_job = None
         self._play_action_sound(True)
 
+    def _fixed_refresh_rows(self) -> None:
+        """Render the 随机跳跃 row for the active attack mode.
+
+        固定攻击: the independent random-jump row stays visible (behavior
+        unchanged).  跳跃攻击: the jump is bundled into every attack beat, so
+        the row hides; the 按键 + interval + random-gap config stays visible.
+        The row is unconditionally re-packed on every call so mode switches
+        always re-render it dynamically.
+        """
+
+        mode = str(getattr(self, "_attack_mode_var", None).get()
+                   if hasattr(self, "_attack_mode_var") else "fixed")
+        jump_row = getattr(self, "_jump_row", None)
+        status = getattr(self, "_fixed_status", None)
+        if jump_row is None:
+            return
+        if jump_row.winfo_manager():
+            jump_row.pack_forget()
+        if mode != "jump_attack":
+            if status is not None and status.winfo_manager():
+                jump_row.pack(fill="x", pady=(6, 0), before=status)
+            else:
+                jump_row.pack(fill="x", pady=(6, 0))
+
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
 
         if not hasattr(self, "_fixed_interval_label"):
             return
+        mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and self._attack_mode_var.get() != "fixed"):
+                and mode not in ("fixed", "jump_attack")):
+            mode = "fixed"
             self._attack_mode_var.set("fixed")
+        self._fixed_refresh_rows()
         interval = max(0.2, float(self._fixed_interval_var.get()))
         self._fixed_interval_var.set(interval)
         random_gap = self._fixed_random_gap_seconds()
@@ -2527,7 +2577,7 @@ class UiWorker(threading.Thread):
             )
         if hasattr(self, "_random_jump_interval_var"):
             jump_interval = max(
-                0.2, float(self._random_jump_interval_var.get())
+                1.0, float(self._random_jump_interval_var.get())
             )
             self._random_jump_interval_var.set(jump_interval)
             jump_gap = self._random_jump_gap_seconds()
@@ -2574,9 +2624,11 @@ class UiWorker(threading.Thread):
             )
             return
         mode = str(data.get("attack_mode", "fixed"))
-        if not self._YOLO_MONSTER_DETECTION_ENABLED:
+        if (not self._YOLO_MONSTER_DETECTION_ENABLED
+                and mode not in ("fixed", "jump_attack")):
             mode = "fixed"
-        worker.enabled = bool(mode == "fixed")
+        worker.jump_attack = bool(mode == "jump_attack")
+        worker.enabled = bool(mode in ("fixed", "jump_attack"))
         worker.attack_interval = max(
             0.2, float(data.get("interval_seconds", 3.0))
         )
@@ -2589,11 +2641,13 @@ class UiWorker(threading.Thread):
                         key, worker.attack_key)
         jump_worker = getattr(self, "random_jump_worker", None)
         if jump_worker is not None:
+            # 跳跃攻击 owns the jump inside its bundle, so the independent
+            # random-jump worker is switched off in that mode.
             jump_worker.enabled = bool(
                 data.get("random_jump_enabled", False)
-            )
+            ) and mode != "jump_attack"
             jump_worker.jump_interval = max(
-                0.2,
+                1.0,
                 float(data.get("random_jump_interval_seconds", 3.0)),
             )
             jump_worker.jump_jitter_seconds = max(
@@ -2603,9 +2657,10 @@ class UiWorker(threading.Thread):
     def _fixed_refresh_grey(self) -> None:
         """Grey the YOLO panel + update status lines for the active mode."""
 
+        mode = str(self._attack_mode_var.get())
         fixed_mode = (
             not self._YOLO_MONSTER_DETECTION_ENABLED
-            or str(self._attack_mode_var.get()) == "fixed"
+            or mode in ("fixed", "jump_attack")
         )
         if fixed_mode:
             # Only one attack engine at a time: selecting Fixed Attack stops
@@ -2628,14 +2683,23 @@ class UiWorker(threading.Thread):
             if fixed_mode:
                 interval = float(self._fixed_interval_var.get())
                 random_gap = self._fixed_random_gap_seconds()
-                self._fixed_status.configure(
-                    text=(f"固定攻击已启用 - 按键 "
-                          f"{self._fixed_attack_key_var.get()}；"
-                          f"基础 {interval:.1f}s；随机间差 {random_gap:.1f}s；"
-                          f"范围 ({interval:.1f}s, "
-                          f"{interval + random_gap:.1f}s)。"
-                          "YOLO 怪物检测暂时停用。")
-                )
+                if mode == "jump_attack":
+                    self._fixed_status.configure(
+                        text=(f"跳跃攻击已启用 - 按键 "
+                              f"{self._fixed_attack_key_var.get()}；"
+                              f"先跳跃、0.3s 后攻击；每 "
+                              f"{interval:.1f}s (+随机 {random_gap:.1f}s)。"
+                              "YOLO 怪物检测暂时停用。")
+                    )
+                else:
+                    self._fixed_status.configure(
+                        text=(f"固定攻击已启用 - 按键 "
+                              f"{self._fixed_attack_key_var.get()}；"
+                              f"基础 {interval:.1f}s；随机间差 {random_gap:.1f}s；"
+                              f"范围 ({interval:.1f}s, "
+                              f"{interval + random_gap:.1f}s)。"
+                              "YOLO 怪物检测暂时停用。")
+                    )
             else:
                 self._fixed_status.configure(
                     text="固定攻击未启用 - 使用 YOLO 检测模式。"
@@ -2681,10 +2745,11 @@ class UiWorker(threading.Thread):
         try:
             if "attack_mode" in data:
                 mode = str(data["attack_mode"])
-                if mode in ("yolo", "fixed"):
+                if mode in ("yolo", "fixed", "jump_attack"):
                     self._attack_mode_var.set(mode)
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
-                self._attack_mode_var.set("fixed")
+                if self._attack_mode_var.get() not in ("fixed", "jump_attack"):
+                    self._attack_mode_var.set("fixed")
             if "interval_seconds" in data:
                 self._fixed_interval_var.set(
                     float(data["interval_seconds"])
@@ -2705,8 +2770,8 @@ class UiWorker(threading.Thread):
                 ))
             if ("random_jump_interval_seconds" in data
                     and hasattr(self, "_random_jump_interval_var")):
-                self._random_jump_interval_var.set(float(
-                    data["random_jump_interval_seconds"]
+                self._random_jump_interval_var.set(max(
+                    1.0, float(data["random_jump_interval_seconds"])
                 ))
             if ("random_jump_gap_seconds" in data
                     and hasattr(self, "_random_jump_gap_var")):
@@ -4445,7 +4510,7 @@ class UiWorker(threading.Thread):
         self._stop_patrol_button.configure(state=stop_state)
         self._add_layer_button.configure(state="normal")
         self._delete_layer_button.configure(
-            state="normal" if len(layer_names) > 1 else "disabled"
+            state="normal" if len(layer_names) > 0 else "disabled"
         )
         self._reset_recording_button.configure(state="normal")
 
@@ -4506,10 +4571,13 @@ class UiWorker(threading.Thread):
         except (OSError, ValueError) as exc:
             self._control_status.configure(text=f"无法删除楼层: {exc}")
             return False
-        self._control_status.configure(
-            text=(f"已删除 {self._patrol_display_name(removed)}。已选择 "
-                  f"{self._patrol_display_name(selected)}；巡逻已暂停。")
-        )
+        if selected:
+            message = (f"已删除 {self._patrol_display_name(removed)}。已选择 "
+                       f"{self._patrol_display_name(selected)}；巡逻已暂停。")
+        else:
+            message = (f"已删除 {self._patrol_display_name(removed)}。"
+                       "已无楼层；可直接开始巡逻原地攻击/跳跃。")
+        self._control_status.configure(text=message)
         self._refresh_patrol_controls()
         return True
 

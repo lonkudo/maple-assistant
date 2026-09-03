@@ -406,6 +406,70 @@ class PatrolControllerTests(unittest.TestCase):
                 controller.snapshot().route_order, ("layer1", "layer2")
             )
 
+    def test_single_layer_can_be_deleted_down_to_zero_layers(self) -> None:
+        # The last layer is deletable: with zero layers patrol stays
+        # startable (stand-still attack/jump mode) and re-adding starts
+        # over at layer1.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recording.json"
+            data = {
+                "map_name": "stand",
+                "route_order": [],
+                "layers": {
+                    "layer1": {
+                        "y_tolerance": 0.02,
+                        "calibration_status": "awaiting_left_rope_right",
+                    }
+                },
+            }
+            path.write_text(json.dumps(data), encoding="utf-8")
+            controller = PatrolController(path, data)
+
+            self.assertEqual(controller.remove_highest_layer(), "layer1")
+            snapshot = controller.snapshot()
+            self.assertEqual(snapshot.layers, {})
+            self.assertEqual(snapshot.route_order, ())
+            self.assertEqual(snapshot.selected_layer, "")
+            self.assertEqual(snapshot.patrol_start_layer, "")
+            self.assertEqual(snapshot.patrol_end_layer, "")
+            self.assertFalse(snapshot.patrol_range_set)
+            # Zero layers is still startable: the worker stands still and
+            # only attacks/jumps on the spot.
+            self.assertTrue(controller.can_start())
+            # Removing again has nothing to remove.
+            with self.assertRaises(ValueError):
+                controller.remove_highest_layer()
+
+            # Adding after zero layers restarts at layer1 and selects it.
+            self.assertEqual(controller.add_layer_above(), "layer1")
+            self.assertEqual(controller.selected_layer(), "layer1")
+            self.assertIn("layer1", controller.snapshot().layers)
+
+    def test_record_with_zero_layers_is_rejected_without_junk_layer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = {
+                "map_name": "stand",
+                "route_order": [],
+                "layers": {},
+            }
+            controller = PatrolController(Path(directory) / "map.json", data)
+            self.assertEqual(controller.selected_layer(), "")
+            with self.assertRaises(ValueError):
+                controller.record_endpoint("left_most_pos", 0.5, 0.7)
+            # Recording must not fabricate a layer out of thin air.
+            self.assertEqual(controller.snapshot().layers, {})
+
+    def test_delete_middle_and_top_layers_keeps_bottom_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = PatrolController(Path(directory) / "map.json", profile())
+            controller.select_layer("layer1")
+            self.assertEqual(controller.remove_highest_layer(), "layer2")
+            self.assertEqual(controller.selected_layer(), "layer1")
+            self.assertEqual(controller.patrol_range(), ("layer1", "layer1"))
+            snapshot = controller.snapshot()
+            self.assertEqual(tuple(snapshot.layers), ("layer1",))
+            self.assertEqual(snapshot.route_order, ("layer1",))
+
 
 if __name__ == "__main__":
     unittest.main()

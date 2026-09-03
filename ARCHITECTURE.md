@@ -24,9 +24,10 @@ assistant.py (primary process)
     CaptureWorker      capture + latest-frame fan-out
     CharacterWorker    independent minimap character position stream
     MovementWorker     route, walk/Z, stairs, climb, drop, recovery
-    StatusWorker       HP/MP detection, potions, buffs
-    AttackWorker       optional fixed-rate attack
-    RandomJumpWorker   optional independent timed Alt jump
+    StatusWorker       HP/MP detection, direct potions, buff rows -> arbiter
+    AttackWorker       fixed-rate attack or 跳跃攻击 bundle (jump +300ms key)
+    RandomJumpWorker   optional independent timed Alt jump (base min 1.0s)
+    MotionArbiter      serializes jump/buff motion keys vs attack cadence
     HotkeyWorker       physical-only Ctrl chord hook -> UI action queue
     FocusWorker        foreground gate, refocus, key release
     ShutdownWorker     preserved but temporarily not constructed
@@ -120,13 +121,36 @@ selects the game window, and arms input. **Stop Patrol** disables input and
 releases keys.
 
 `HotkeyWorker` installs `WH_KEYBOARD_LL` on its own thread. It ignores keyboard
-events marked `LLKHF_INJECTED` or `LLKHF_LOWER_IL_INJECTED`, uses no custom
-`dwExtraInfo` tag, and never calls Tk directly. Physical Ctrl chords enqueue
+events injected by itself (every assistant SendInput key carries the
+`SELF_INPUT_EXTRA_INFO` `dwExtraInfo` stamp) or from a lower integrity level
+(`LLKHF_LOWER_IL_INJECTED`), and never calls Tk directly. Same-integrity
+foreign injection (Mouse Without Borders, remote-desktop clients) is treated
+as physical input. Physical Ctrl chords enqueue
 short action names into a bounded queue; `UiWorker._poll()` drains that queue
 on Tk's owning thread. Quick-message indices always address the live insertion
 order, so deletion automatically compacts `Ctrl+1` through `Ctrl+0`. Recording
 hotkeys refuse to run while patrol is enabled. Action feedback MP3 playback is
 launched on a daemon thread and does not block the hook or Tk.
+
+`MotionArbiter` (motion_arbiter.py) is the single executor for jump and buff
+motion keys, because MapleStory action motion drops a key pressed during
+another action. It owns a FIFO queue (one pending jump, one per buff key -
+duplicates collapse) and one worker thread. A queued jump is tapped as Alt and
+locks further motion for 0.9s; a queued buff key tap locks for 0.6s; attack is
+deferred while events are queued or executing. Events wait 0.3s after the last
+attack tap (attack-motion grace) and a pending jump is dropped while
+climb/return input is active (movement owns Alt there). `AttackWorker` asks
+`is_idle()` before each beat, waits when busy, and calls `note_attack()` after
+every successful tap. HP/MP potions deliberately stay on their urgent direct
+path, outside the queue.
+
+`AttackWorker` runs two modes selected in the 攻击模式 panel:
+固定攻击 taps the attack key on `base + random gap` and leaves the random jump
+independent (its events go through the arbiter). 跳跃攻击 makes every beat a
+bundle - jump (Alt) then the attack key 300ms later (`jump_attack_delay`) -
+repeating on the same stored interval; in that mode the random-jump worker is
+switched off and no jump event is registered to the arbiter queue. The bundle
+still waits for the arbiter to be idle so buff windows never collide with it.
 
 The start transition has an explicit capture-only phase. After
 `WindowKeySender.select_window()` and foreground verification,
@@ -166,8 +190,9 @@ names. Movement stage logs are compact (`PATROL|`, `CLIMB|`, and
 Control ownership rules:
 
 - `MovementWorker` owns Left, Right, Alt+Up, Up, Alt+Down, and walking Z.
-- `StatusWorker` owns potion and buff keys.
-- `AttackWorker` owns the configured fixed attack key.
+- `StatusWorker` owns potion keys (direct) and queued buff keys.
+- `AttackWorker` owns the configured attack key (fixed or 跳跃攻击 bundle).
+- `MotionArbiter` owns the timed execution of jump and buff motion keys.
 - `AttackExecutor` in the YOLO subprocess owns facing and the configured YOLO
   attack key, subject to patrol-state gating.
 - `pickup_worker.py` remains in the repository, but the primary runtime no
@@ -372,7 +397,9 @@ cover ordinary letter, punctuation, and navigation inputs but deliberately
 exclude Z because movement owns pickup.
 
 `HotkeyWorker` is a physical-key-only low-level hook that queues UI actions;
-it never injects game input and ignores injected keyboard events. Its dedicated
+it never injects game input and ignores only self-injected or lower-integrity
+keyboard events, while same-integrity foreign injection (Mouse Without Borders,
+remote-desktop clients) counts as physical input. Its dedicated
 `hotkey.json` map defines Ctrl quick-message, recording, patrol-toggle,
 selected-layer, patrol-start, topology, and fixed-attack-frequency chords. A
 nonrepeat action requires its target key to be released and is cooled down for
@@ -404,7 +431,7 @@ SIDE BY SIDE in one vertical band - HP (red) left, MP (blue) middle, EXP
 mixed (blue UI decoration above the bars is excluded by the vertical
 `bar_band`).  Potion use requires confirmed low readings and retries blocked
 sends.  Its configuration also owns optional periodic buffs: the 增益 panel
-rows (增益1/增益2/增益3, `drug_settings.json`) each carry a hotkey, an interval,
+rows (宠物食品/增益1/增益2, `drug_settings.json`) each carry a hotkey, an interval,
 and an enabled switch, wired end-to-end through `StatusConfig`
 (`buff1`/`buff2`/`buff3` key/interval/enabled), the `_check_buffs` loop, and
 `apply_drug_settings`.  Each row displays its own state; there is no extra

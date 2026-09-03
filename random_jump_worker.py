@@ -25,14 +25,21 @@ class RandomJumpWorker(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
         jump_jitter_seconds: float = 0.1,
+        motion_arbiter: Any = None,
     ) -> None:
         super().__init__(name="random-jump-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
-        self.jump_interval = max(0.2, float(jump_interval))
+        # Jump motion is 0.9s in the arbiter, so the trigger time minimum is
+        # 1.0s: a faster repeat would queue a backlog of stale jumps.
+        self.jump_interval = max(1.0, float(jump_interval))
         self.jump_jitter_seconds = max(0.0, float(jump_jitter_seconds))
         self.climbing_active_event = climbing_active_event
         self.automation_active_event = automation_active_event
+        # Optional MotionArbiter: the tick registers a jump event instead of
+        # tapping Alt immediately, so the tap happens in a motion-free window
+        # (never while attack/buff motion is playing).
+        self.motion_arbiter = motion_arbiter
         self.enabled = False
         self.initial_offset = (
             self.jump_interval / 2.0
@@ -75,6 +82,11 @@ class RandomJumpWorker(threading.Thread):
             elif (self.climbing_active_event is not None
                   and self.climbing_active_event.is_set()):
                 LOG.info("random jump skipped: climb/return input is active")
+            elif self.motion_arbiter is not None:
+                if self.motion_arbiter.request_jump():
+                    LOG.info("random jump queued: alt")
+                else:
+                    LOG.info("random jump skip: arbiter stopping")
             else:
                 LOG.info("random jump repetition: alt")
                 self.jump_once()

@@ -98,13 +98,24 @@ remains idle before Start Patrol.
   minimap, yellow/red diamonds, and scroll-compensated map position.
 - `MovementWorker` owns patrol movement, endpoint sequencing, stair jumps,
   rope approach/climbing, fall recovery, route return, and self-rescue.
-- `StatusWorker` reads HP/MP/EXP and sends configured potion or buff keys.
-- `AttackWorker` performs the optional fixed-rate attack mode.
-- `RandomJumpWorker` optionally taps the fixed jump key on its own independently
-  configured `base + random gap` timer and observes the same patrol/climb input
-  gates as fixed attack.
-- `HotkeyWorker` listens only for physical Ctrl chords, ignores injected
-  `SendInput` events, and queues UI actions without calling Tk from its hook.
+- `StatusWorker` reads HP/MP/EXP and sends potions directly (urgent,
+  bar-verified path); the periodic buff rows (宠物食品/增益1/增益2) are
+  queued to the motion arbiter instead of tapped raw.
+- `AttackWorker` runs the fixed-rate attack (固定攻击) or the 跳跃攻击 bundle
+  (jump first, then the attack key 300ms later); both defer while the
+  motion arbiter is busy and report their tap for the attack-motion grace.
+- `RandomJumpWorker` optionally queues an Alt jump on its own
+  `base + random gap` timer (base minimum 1.0s) and observes the same
+  patrol/climb input gates as fixed attack.
+- `MotionArbiter` (motion_arbiter.py) is the single executor for jump and
+  buff motion keys: a FIFO queue (duplicates collapse), one tap at a time,
+  a 0.9s lock after a jump and 0.6s after a buff, attack suppressed while
+  events are queued/executing, and a 0.3s grace after every attack tap so
+  attack motion cannot swallow the next event.
+- `HotkeyWorker` listens for physical and foreign-injected Ctrl chords,
+  ignores only the assistant's own `SendInput` events (stamped with a
+  `dwExtraInfo` fingerprint) plus lower-integrity injection, and queues UI
+  actions without calling Tk from its hook.
 - The UI can launch `yolo-detection/live_view.py` as a second process for
   target-aware attacks and main-screen rope sensing.
 - `FocusWorker` releases held keys on a focus dip, tries to refocus the game,
@@ -130,12 +141,16 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for worker wiring, state machines,
 cross-process coordination, configuration ownership, and the complete file
 inventory.
 
-The **攻击模式** panel also contains optional **随机跳跃**. It always uses Alt
-(no key-binding field), owns a separate worker, and has its own base-time slider
-plus 0.1-second random-gap buttons. Its actual interval is shown beside the
-slider as `(base, base + random_gap)`. Fixed attack uses the same compact range
-display. The former long “随机攻击间隔” hint is hidden. The scheduled-shutdown
-row is temporarily hidden and no shutdown worker is started.
+The **攻击模式** panel offers **固定攻击** and **跳跃攻击** (plus YOLO when it is
+restored). 固定攻击 keeps its behavior unchanged: the independent **随机跳跃**
+row (Alt, own `base + random gap` timer, base minimum 1.0s) may be enabled and
+its jump events are queued to the motion arbiter. 跳跃攻击 bundles the jump
+into every beat - Alt, then the configured attack key 300ms later - so the
+随机跳跃 row hides in that mode and no jump event enters the arbiter queue;
+the 按键/interval/random-gap config stays visible and the bundle repeats on the
+stored interval cadence. Both modes show the actual range as
+`(base, base + random_gap)`. The scheduled-shutdown row is temporarily hidden
+and no shutdown worker is started.
 
 ## Recording and patrol behavior
 
@@ -157,6 +172,12 @@ Each recorded point is an independent action. A layer can therefore be:
 Layers are executed in numeric bottom-to-top order. The selected patrol range
 is contiguous. A character that lands below it climbs back; one above it drops
 back. Return-to-route input suppresses attacks until the route is reached.
+
+Layers may be deleted down to **none** (`Ctrl+Delete` / 删除楼层). Patrol
+stays startable with zero layers: with no route the character stands still on
+the spot and only attacks/jumps there (stand-still mode, same as an empty
+recording). Recording requires at least one layer; 添加楼层 after zero starts
+over at 楼层1.
 
 `patrol_cycles_per_layer` in `system_config.json` -> `rope_calibration` defaults to `2`. Every
 layer completes two full horizontal Left/Right cycles before it climbs or,
@@ -450,8 +471,11 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
 ### Workflow
 
 - Every behavior change always gets a new four-digit release package.
-- Routine iterations do not repeatedly update these documents, run the full
-  test/verification gate, or create Git commits. Do those checkpoint tasks only
+- Routine iterations do not repeatedly update these documents, run focused or
+  full test suites, or create Git commits. Run tests only when the user
+  explicitly asks (or when a change touches delicate timing/input logic such
+  as movement, attack, jump, buff, or hotkey workers - then run only the
+  affected module's suite). Do checkpoint tasks (docs, full gate, commit) only
   when the user explicitly says **update**, or immediately before context is
   nearly exhausted and the session must be compacted.
 - ZIP verification through the former ignored `work\verify_zip.py` helper was
@@ -464,16 +488,23 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
 
 ## Publishing a release
 
-Every project update must produce a new package. For a quick iteration, advance
-`VERSION` and run `build_release.ps1 -Version NNNN -Zip`. For a requested
-checkpoint, run:
+Every project update must produce a new package. **The standard routine
+release is ONE command from the repository root:**
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
-`发布.bat` invokes the same script. `-SkipTests` is appropriate for an ordinary
-iteration; omit it when the user requests an update/checkpoint.
+It advances `VERSION` by one, rebuilds `release\MapleAssistant\`, and creates
+`release\MapleAssistant-vNNNN.zip`; success prints
+`release ready: <absolute zip path>`. `发布.bat` invokes the same script.
+`-SkipTests` is the default for ordinary iterations - do not run tests for a
+routine release unless the user asks.
+
+For a requested update/checkpoint, run the script WITHOUT `-SkipTests`.
+Note: the full gate is currently RED on one pre-existing, unrelated failure
+(`test_ui_worker.UiLogHandlerTests.test_keysym_to_scan_key_limits_to_bindable_hotkeys`)
+- repair or skip it deliberately when a checkpoint gate is requested.
 
 The script performs two stages:
 
@@ -584,10 +615,15 @@ bottom of the panel.
 ## Physical hotkeys and action sounds
 
 `hotkey.json` owns the global bindings. `HotkeyWorker` uses a low-level Windows
-keyboard hook, ignores `LLKHF_INJECTED`/lower-integrity injected events, and
-does not add a custom `dwExtraInfo` fingerprint. Unrelated keys pass through
-normally. The matched chord's second key is consumed and each physical press
-fires once until released:
+keyboard hook. Every key event Maple Assistant injects itself is stamped with a
+custom `dwExtraInfo` fingerprint (`SELF_INPUT_EXTRA_INFO` in `hotkey_worker.py`,
+set by `WindowKeySender`); the hook ignores only those self-injected events
+plus lower-integrity (`LLKHF_LOWER_IL_INJECTED`) injection, so the assistant's
+own gameplay keys can never drive the chords while same-integrity
+keyboard-sharing tools (Mouse Without Borders, remote-desktop clients) still
+trigger them. `"ignore_injected": false` in `hotkey.json` accepts every
+injected event. Unrelated keys pass through normally. The matched chord's
+second key is consumed and each physical press fires once until released:
 
 - `Ctrl+1` through `Ctrl+0` send the oldest ten quick messages. The binding is
   positional: deleting a message shifts every later message/key forward.
@@ -599,13 +635,15 @@ fires once until released:
 - `Ctrl+Home` selects the next patrol-start layer, wrapping from the highest
   layer to layer 1. The patrol end is never allowed below that start.
 - `Ctrl+Insert` adds a new highest layer; `Ctrl+Delete` removes the highest
-  layer. Adding a layer extends the patrol end to it; deleting clamps the
+  layer (down to none - zero-layer patrol is startable stand-still mode).
+  Adding a layer extends the patrol end to it; deleting clamps the
   patrol range to the remaining highest layer. These topology changes are
   deliberately blocked while patrol is active.
 - Hold `Ctrl+[` or `Ctrl+]` to decrease or increase fixed attack base time in
   0.1-second steps. Releasing the chord for two seconds plays the single
-  success confirmation sound. The base time and random jump base time both
-  allow a minimum of 0.2 seconds.
+  success confirmation sound. The fixed attack base time allows a minimum of
+  0.2 seconds; the random jump base time minimum is 1.0 seconds (a jump
+  motion window occupies 0.9s).
 - `Ctrl+grave` (Ctrl plus the backtick key) toggles Start/Stop Patrol.
 
 Recording is blocked while patrol is active. A successful recording or patrol

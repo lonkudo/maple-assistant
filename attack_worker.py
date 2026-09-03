@@ -40,6 +40,9 @@ class AttackWorker(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
         attack_jitter_seconds: float = 0.1,
+        motion_arbiter: Any = None,
+        jump_attack: bool = False,
+        jump_attack_delay: float = 0.3,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
@@ -56,6 +59,16 @@ class AttackWorker(threading.Thread):
         self.enabled = True
         self.climbing_active_event = climbing_active_event
         self.automation_active_event = automation_active_event
+        # Optional MotionArbiter: while jump/buff events are queued or
+        # executing (their action motion is playing) the attack is deferred
+        # until the arbiter is idle, so attack motion cannot swallow them.
+        self.motion_arbiter = motion_arbiter
+        # 跳跃攻击 mode: every cadence beat emits a bundle - jump (Alt) first,
+        # then the attack key ``jump_attack_delay`` (default 0.3s) later.  The
+        # jump belongs to the attack bundle in this mode, so NO jump event is
+        # registered into the motion-arbiter queue.
+        self.jump_attack = bool(jump_attack)
+        self.jump_attack_delay = max(0.0, float(jump_attack_delay))
         self.initial_offset = (
             self.attack_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
@@ -78,7 +91,21 @@ class AttackWorker(threading.Thread):
         ignored by MapleStory between input polls.  Prefer the key sender's
         normal ``tap`` method, which holds the scan code for 25 ms just like
         the reliable potion input path.
+
+        In 跳跃攻击 mode the beat is a bundle: tap the jump key (Alt), wait
+        ``jump_attack_delay`` (300ms), then tap the configured attack key.
         """
+
+        if self.jump_attack:
+            tap = getattr(self.key_sender, "tap", None)
+            if not callable(tap):
+                return False
+            if tap("alt") is False:
+                return False
+            if self.stop_event.wait(self.jump_attack_delay):
+                # Stopping mid-bundle: skip the attack half.
+                return False
+            return tap(self.attack_key) is not False
 
         tap = getattr(self.key_sender, "tap", None)
         if callable(tap):
@@ -108,17 +135,33 @@ class AttackWorker(threading.Thread):
         while not self.stop_event.is_set():
             if self.stop_event.wait(max(0.0, next_attack - time.monotonic())):
                 break
-            if not self.enabled:
-                pass
-            elif (self.automation_active_event is not None
+            can_fire = self.enabled
+            if can_fire and (self.automation_active_event is not None
                     and not self.automation_active_event.is_set()):
-                pass
-            elif (self.climbing_active_event is not None
+                can_fire = False
+            if can_fire and (self.climbing_active_event is not None
                     and self.climbing_active_event.is_set()):
                 LOG.info("attack skipped: climb/return input is active")
-            else:
+                can_fire = False
+            if can_fire and self.motion_arbiter is not None:
+                # Jump/buff motion owns the keyboard while queued/executing:
+                # wait for the arbiter to go idle, then re-check the gates
+                # (patrol may have stopped while we waited).
+                if not self.motion_arbiter.is_idle():
+                    self.motion_arbiter.wait_until_idle()
+                    can_fire = bool(self.enabled and self.motion_arbiter.is_idle())
+                    if can_fire and (self.automation_active_event is not None
+                            and not self.automation_active_event.is_set()):
+                        can_fire = False
+                    if can_fire and (self.climbing_active_event is not None
+                            and self.climbing_active_event.is_set()):
+                        LOG.info("attack skipped: climb/return input is active")
+                        can_fire = False
+            if can_fire:
                 LOG.info("attack repetition: %s", self.attack_key)
-                self.attack_once()
+                if self.attack_once() and self.motion_arbiter is not None:
+                    # Anchor the arbiter's attack-motion grace window.
+                    self.motion_arbiter.note_attack()
             # The random component is additive only: attack + random_gap.
             next_attack = time.monotonic() + self.next_delay()
         LOG.info("attack worker stopped")

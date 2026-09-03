@@ -193,7 +193,7 @@ class PatrolController:
         self._enabled = bool(profile.get("patrol_enabled", False))
         route = list(profile.get("route_order", []))
         layers = profile.get("layers", {})
-        self._selected_layer = route[-1] if route else next(iter(layers), "layer1")
+        self._selected_layer = route[-1] if route else next(iter(layers), "")
         # Contiguous patrol floor range lives in the profile
         # (``patrol_start_layer`` / ``patrol_end_layer``) so recordings, the
         # UI and the movement worker all see the same persisted selection.
@@ -545,8 +545,13 @@ class PatrolController:
             raise ValueError(f"unsupported patrol point: {boundary}")
         with self._lock:
             layer_name = self._selected_layer
-            layers = self._profile.setdefault("layers", {})
-            layer = layers.setdefault(layer_name, {"y_tolerance": 0.020000})
+            if layer_name not in self._profile.get("layers", {}):
+                raise ValueError(
+                    "没有可录制的楼层；请先点击「添加楼层」"
+                    if not layer_name else f"所选楼层 {layer_name} 不存在"
+                )
+            layers = self._profile["layers"]
+            layer = layers[layer_name]
             if boundary == "rope_pos" and layer_name == self._final_layer_name_locked():
                 raise ValueError("Rope cannot be recorded on the final layer")
             match = re.search(r"(\d+)$", layer_name)
@@ -835,8 +840,8 @@ class PatrolController:
                 ),
                 key=lambda item: item[0],
             )
-            if len(numeric_layers) <= 1:
-                raise ValueError("至少需要保留一个楼层")
+            if not numeric_layers:
+                raise ValueError("没有可删除的楼层")
 
             old_start, _old_end = self.patrol_range_locked()
             _, highest_name = numeric_layers[-1]
@@ -849,15 +854,24 @@ class PatrolController:
             route.extend(name for name in remaining_names if name not in route)
             self._profile["route_order"] = route
 
-            self._selected_layer = remaining_names[-1]
             self._enabled = False
-            # Top-layer additions always extend the patrol end, so deleting
-            # that layer must bring the end back to the new highest floor.
-            # Preserve the start where possible, clamping it to the end.
-            new_end = remaining_names[-1]
-            new_start = old_start if old_start in layers else new_end
-            if _layer_number(new_start) > _layer_number(new_end):
-                new_start = new_end
+            if remaining_names:
+                self._selected_layer = remaining_names[-1]
+                # Top-layer additions always extend the patrol end, so
+                # deleting that layer must bring the end back to the new
+                # highest floor.  Preserve the start where possible, clamping
+                # it to the end.
+                new_end = remaining_names[-1]
+                new_start = old_start if old_start in layers else new_end
+                if _layer_number(new_start) > _layer_number(new_end):
+                    new_start = new_end
+            else:
+                # The last layer was deleted: no floors remain.  Patrol stays
+                # startable - with no route the character stands still and
+                # only attacks/jumps - so clear the selection and range
+                # instead of keeping a stale layer1 reference.
+                self._selected_layer = ""
+                new_start = new_end = ""
             self._profile["patrol_start_layer"] = new_start
             self._profile["patrol_end_layer"] = new_end
             self._persist_locked()

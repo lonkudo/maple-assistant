@@ -30,6 +30,13 @@ VK_CONTROL = 0x11
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
 
+# dwExtraInfo stamp placed on every key event Maple Assistant injects itself
+# (status_worker.WindowKeySender._send_scan_code). The hook ignores only these
+# self-marked events plus lower-integrity injection, so keystrokes injected by
+# other same-integrity tools (Mouse Without Borders, ToDesk, remote-desktop
+# clients) still trigger the chords.
+SELF_INPUT_EXTRA_INFO = 0x4D4150  # "MAP"
+
 KEY_VK = {
     "0": 0x30,
     "1": 0x31,
@@ -57,10 +64,14 @@ KEY_VK = {
 class HotkeyWorker(threading.Thread):
     """Observe physical Ctrl chords and queue actions for the Tk thread.
 
-    Assistant-generated ``SendInput`` events carry ``LLKHF_INJECTED`` and are
-    ignored. No custom ``dwExtraInfo`` marker is used. Only a matched chord's
-    second key is consumed; all unrelated physical keyboard events continue
-    through ``CallNextHookEx`` unchanged.
+    Events injected by Maple Assistant itself - every SendInput key event is
+    stamped with ``SELF_INPUT_EXTRA_INFO`` in ``WindowKeySender`` - and
+    lower-integrity injected events are ignored, so the assistant's own
+    gameplay keys (the attack Ctrl presses, Ctrl+V quick-message chords) can
+    never drive the chord state machine. Same-integrity injection from other
+    tools (Mouse Without Borders, ToDesk, remote desktops) is treated like
+    physical input. Only a matched chord's second key is consumed; all
+    unrelated keyboard events continue through ``CallNextHookEx`` unchanged.
     """
 
     def __init__(
@@ -135,6 +146,25 @@ class HotkeyWorker(threading.Thread):
                 bindings[vk] = (action, bool(item.get("block_original", True)))
         self._bindings = bindings
 
+    def _should_ignore_injected(self, flags: int, extra_info: int) -> bool:
+        """Whether an injected key event must be dropped by the hook.
+
+        With ``ignore_injected`` enabled the hook ignores only events injected
+        by Maple Assistant itself (they carry ``SELF_INPUT_EXTRA_INFO`` and
+        include attack Ctrl presses and Ctrl+V quick-message chords) and
+        lower-integrity injection (``LLKHF_LOWER_IL_INJECTED``, a spoofing
+        vector). Foreign same-integrity injection such as Mouse Without
+        Borders keystrokes is treated like physical input. An explicit
+        ``ignore_injected=false`` accepts every event, exactly as before this
+        distinction existed.
+        """
+
+        if not self.ignore_injected:
+            return False
+        lower_il = bool(flags & LLKHF_LOWER_IL_INJECTED)
+        self_marked = int(extra_info) == SELF_INPUT_EXTRA_INFO
+        return lower_il or self_marked
+
     def _queue_action(self, action: str) -> None:
         repeatable = action.startswith("adjust_fixed_attack_interval:")
         now = time.monotonic()
@@ -189,10 +219,9 @@ class HotkeyWorker(threading.Thread):
             event = ctypes.cast(
                 l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)
             ).contents
-            injected = bool(
-                event.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)
-            )
-            if self.ignore_injected and injected:
+            if self._should_ignore_injected(
+                int(event.flags), int(event.dwExtraInfo)
+            ):
                 return user32.CallNextHookEx(self._hook, code, message, l_param)
 
             vk = int(event.vkCode)

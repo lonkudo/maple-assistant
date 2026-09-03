@@ -20,6 +20,8 @@ from typing import Optional, Protocol, Sequence
 import numpy as np
 from PIL import Image
 
+from hotkey_worker import SELF_INPUT_EXTRA_INFO
+
 LOG = logging.getLogger(__name__)
 
 # Keys the UI bind buttons may capture.  The ordinary Q--M letter keys and
@@ -488,7 +490,13 @@ class WindowKeySender:
 
     @staticmethod
     def _send_scan_code(scan_code: int, *, key_up: bool, extended: bool) -> None:
-        """Inject one hardware-like keyboard transition with Win32 SendInput."""
+        """Inject one hardware-like keyboard transition with Win32 SendInput.
+
+        Every injected event is stamped with ``SELF_INPUT_EXTRA_INFO`` in
+        ``dwExtraInfo`` so ``HotkeyWorker`` can tell the assistant's own keys
+        from foreign injection (Mouse Without Borders, remote desktops) and
+        keep its chord state machine clean.
+        """
 
         from ctypes import wintypes
 
@@ -541,7 +549,9 @@ class WindowKeySender:
             flags |= KEYEVENTF_EXTENDEDKEY
         if key_up:
             flags |= KEYEVENTF_KEYUP
-        event = INPUT(type=1, ki=KEYBDINPUT(0, scan_code, flags, 0, 0))
+        event = INPUT(type=1, ki=KEYBDINPUT(
+            0, scan_code, flags, 0, SELF_INPUT_EXTRA_INFO
+        ))
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
         user32.SendInput.restype = wintypes.UINT
@@ -824,6 +834,7 @@ class StatusWorker(threading.Thread):
         potion_verify_seconds: float = 1.25,
         potion_verify_retries: int = 1,
         status_state_path: Optional[str] = None,
+        motion_arbiter: Any = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -831,6 +842,11 @@ class StatusWorker(threading.Thread):
         self.stop_event = stop_event
         self.detector = detector or BarStatusDetector()
         self.automation_active_event = automation_active_event
+        # Optional MotionArbiter: periodic buff taps are queued and executed
+        # in a motion-free window instead of being fired straight into
+        # whatever action motion is playing.  HP/MP potions stay urgent and
+        # keep their direct, bar-verified path.
+        self.motion_arbiter = motion_arbiter
         self.potion_cooldown = max(0.0, potion_cooldown)
         self.low_frames_required = max(1, low_frames_required)
         # Potions are the highest-priority action: if a tap is blocked
@@ -961,6 +977,14 @@ class StatusWorker(threading.Thread):
             if not enabled or not key or interval <= 0:
                 continue
             if now - self._last_buff[name] < interval:
+                continue
+            if self.motion_arbiter is not None:
+                # Register the tap for the motion arbiter; the timer is only
+                # re-armed when the arbiter accepted the event.
+                if self.motion_arbiter.request_buff(key):
+                    self._last_buff[name] = now
+                    LOG.warning("%s refresh: queued %s (every %.0fs)",
+                                name.upper(), key, interval)
                 continue
             if self.key_sender.tap(key):
                 self._last_buff[name] = now
