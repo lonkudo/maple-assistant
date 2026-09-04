@@ -3064,10 +3064,13 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(climb(sender, right_of_rope, state,
                                    preferred_direction="up", rope_x=.5),
                              "up-toward-rope")
-            # Character right of the rope: the retry must jump LEFT toward it.
+            # Inside the under-rope tolerance the retry stays a PLAIN straight
+            # jump: the character must get two jump+climb attempts before any
+            # sideways jump is tried (sideways recovery is the failed-cycle
+            # block's job, and a +-0.005 offset is marker noise).
             self.assertEqual(climb(sender, right_of_rope, state,
                                    preferred_direction="up", rope_x=.5),
-                             "left-retry-toward-rope")
+                             "up-retry-toward-rope")
 
         sender, state = Sender(), ClimbState()
         left_of_rope = MinimapObservation(Point(.495, .70), None, .9, (0, 0, 1, 1))
@@ -3075,8 +3078,33 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(climb(sender, left_of_rope, state,
                                    preferred_direction="up", rope_x=.5),
                              "up-toward-rope")
-            # Character left of the rope: the retry must jump RIGHT toward it.
+            # Same under-rope rule on the left side.
             self.assertEqual(climb(sender, left_of_rope, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "up-retry-toward-rope")
+
+        # CLEARLY off the rope (outside the under-rope tolerance): a failed
+        # straight jump retries toward the rope SIDE the character is on -
+        # never a blind direction that pushes it away from the rope.
+        sender, state = Sender(), ClimbState()
+        offset_right = MinimapObservation(Point(.53, .70), None, .9, (0, 0, 1, 1))
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, offset_right, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "up-toward-rope")
+            # Character right of the rope: the retry must jump LEFT toward it.
+            self.assertEqual(climb(sender, offset_right, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "left-retry-toward-rope")
+
+        sender, state = Sender(), ClimbState()
+        offset_left = MinimapObservation(Point(.47, .70), None, .9, (0, 0, 1, 1))
+        with patch("movement_worker.time.sleep"):
+            self.assertEqual(climb(sender, offset_left, state,
+                                   preferred_direction="up", rope_x=.5),
+                             "up-toward-rope")
+            # Character left of the rope: the retry must jump RIGHT toward it.
+            self.assertEqual(climb(sender, offset_left, state,
                                    preferred_direction="up", rope_x=.5),
                              "right-retry-toward-rope")
 

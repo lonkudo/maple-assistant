@@ -263,6 +263,26 @@ startup does not depend on a recent recording frame or stable contour voting.
   inside a recorded world band. A confirmed rope arrival immediately
   re-anchors world Y to the new layer, so a stale lower-floor reading cannot
   turn a valid final-layer patrol back into the preceding layer before drop.
+- Monster knock-downs are reconciled world-Y-authoritatively: the raw marker Y
+  is screen-relative on a scrolling minimap and the OpenCV world-Y tracker
+  lags a fast fall, so after a fall stops the landing floor is resolved from
+  the raw world-Y reading once it stabilizes (3 frames / ~0.15 diamonds, or a
+  1.2 s timeout), and the tracker is re-anchored to the TRUE landing layer -
+  layer1, layer2 or any other.  A landing at/below the lowest recorded band
+  always resolves to the bottom floor (nothing lower exists).  Without this a
+  knock-down could leave the world-Y origin on the pre-fall floor, climb
+  attach/arrival verification (world-Y progress based) would misread, and the
+  character could keep walking the stale route instead of returning.
+- The world-Y origin is kept honest continuously: while cruising on a
+  confirmed floor a drift watchdog re-anchors the tracker when incremental
+  phase-correlation drift exceeds its threshold (default 0.35 diamonds,
+  checked every 2 s), and the idle "pin" only masks the world-Y reading while
+  the marker Y still agrees with the believed floor - after a knock-down an
+  off-band marker leaves the raw reading visible to reconciliation.
+  Tuning lives in ``system_config.json`` -> ``rope_calibration``
+  (``fall_settle_min_frames``, ``fall_settle_epsilon``,
+  ``fall_settle_max_seconds``, ``world_drift_check_interval_seconds``,
+  ``world_drift_reanchor_threshold``).
 - A layer's marker-Y band is `(highest recorded Y - y_tolerance,
   lowest recorded Y + y_tolerance / 3)`. The full upper margin covers
   climb/drop arrival motion; the smaller lower margin absorbs OpenCV marker
@@ -363,6 +383,42 @@ latest commit message. Push before handing off; keep user-owned JSON files
 `ui_window_settings.json`) UNCOMMITTED - they are runtime-modified on the live
 machine.
 
+### 2026-09-04 session (v0101 - v0107): knock-down recovery + world-Y anchoring
+
+Bug chain: after a monster knock-down to below-range layer1 (map scrolls in Y,
+so raw marker Y is screen-relative; OpenCV world Y is authoritative but lags
+fast falls and drifts via incremental correlation), the character could end up
+stuck with "weird" Alt+Down drops and failed return climbs.
+
+- **v0101** Self-rescue is state-aware: in-range stuck restarts in place (no
+  drop out of the range); below-range / return-mode never Alt+Downs, re-runs
+  the return climb, and stops patrol cleanly after `rescue_cycle_limit`
+  consecutive failures. `_drop_to_first_layer` treats a marker at/below the
+  bottom floor band as "already arrived" (no more 30-chord drop storms).
+- **v0102** Under-rope recovery: two plain Alt+Up attempts first, then sideways
+  climb jumps alternating left/right (worker-level side + streak). Directional
+  climb chords now hold Up from the START of the jump (persistent path) - the
+  old chord-then-Up activated ~100ms late and missed rope grabs.
+- **v0103** Rescue pre-flight probe `_rescue_verify_stuck_by_probe`: block
+  attacks ~2s, force walk right then left; if the marker moves the rescue is
+  cancelled (no drop/restart) - kills false rescues caused by attack-freeze.
+- **v0104** TRUE layer recognition via world-Y re-anchoring:
+  `_resolve_fall`/`_reconcile_landed_floor` wait for the tracker to settle
+  after a fall, classify by world-Y bands over ALL layers (marker Y only as an
+  unambiguous fallback) and re-anchor to the true layer; at/below the lowest
+  band resolves to the bottom floor (also added to `_detect_floor_all`). The
+  idle world-Y pin only masks while the marker Y agrees with the believed
+  floor; raw world Y is captured per frame; a drift watchdog re-anchors while
+  cruising. New tunables (fall_settle_*, world_drift_*, rescue_*, lateral)
+  shipped in `system_config.json`.
+- **v0105-v0107** UI: 调试日志 replaced by a 运行日志 LabelFrame panel that
+  shows only significant events (patrol started/ended incl. external stops,
+  ERROR+) as plain hint-style text; two top-right icon buttons appear when
+  patrol has ended (archive = copy the in-memory 600-line run log, person =
+  copy user settings); the log lives in memory only (UiLogHandler deque, no
+  per-line disk I/O). Patrol-state sync is debounced over two polls so a
+  transient self-rescue toggle never looks like a patrol stop.
+
 ### HUD geometry (measured on the real client, 1366x768 reference)
 
 HUD regions are ABSOLUTE client pixels at the HUD reference size (client
@@ -430,7 +486,7 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
 - **Column 0 fixed 550px, column 1 fixed 500px** (grid minsizes, both
   `weight=0`) + 12px gap + 24px container padding = 1086px.  Left column:
   patrol/attack/countdown/extra controls (警报 row fits on one line).
-  Right column: drug/增益, quick messages, and the debug log at full width.
+  Right column: drug/增益, quick messages, and the compact 运行日志 panel.
   `container`/`columns`/debug frame all use `pack_propagate(False)` so
   content can never spread the window at startup.
 - **In-window caption row (34px, `_build_caption_bar`).**  The native
@@ -454,10 +510,17 @@ region (0.75x at 1024x768). Key constants live in `assistant.py`:
   semantic or a DPI-aware run (e.g. 1275x904, 1620x1050, 1635x1272) are
   ignored ONCE, so the window opens at the current default on every machine
   instead of restoring a stale manual size.
-- Debug log panel: frame height 313px so the visible log text area is
-  exactly 280px (`pack_propagate(False)`; LabelFrame label+border eat
-  ~33px). The log auto-scrolls to bottom (`_log_text.see("end")` in
-  `_drain_logs`).
+- Debug log panel: now 运行日志, a real LabelFrame panel (title + outline)
+  like the other panels.  Inside, the messages are shown like the plain
+  message hints of the 图层校准与巡逻 panel (normal ttk.Label text) and only
+  significant events appear - patrol started, patrol ended, and ERROR+
+  records (critical bugs) - as the latest few compact lines (older display
+  lines scroll away; the full recent stream stays in memory).  The two icon
+  buttons sit at the panel's top-right and appear once patrol has ended
+  (report time): the archive icon copies the running log, the user icon
+  copies the user settings JSON to the clipboard.  The latest 600 formatted
+  log lines are retained in memory only (UiLogHandler history deque, oldest
+  dropped like garbage); no per-line disk I/O is added by the UI log.
 - The `?` help popup is hover-triggered (show ~180 ms after hover, hide
   after leave) and styled exactly like the yellow bind-key hint: single
   label, bg `#fffbd6`, fg `#202020`, relief solid, wraplength ~430.  Inside

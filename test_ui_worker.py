@@ -232,9 +232,12 @@ class UiLogHandlerTests(unittest.TestCase):
     def test_log_queue_drops_oldest_messages_at_capacity(self) -> None:
         handler = UiLogHandler(capacity=20)
         handler.setFormatter(logging.Formatter("%(message)s"))
+        # Only SIGNIFICANT records (ERROR+ or patrol start/end markers) reach
+        # the display queue; the queue still drops the oldest at capacity.
         for index in range(25):
             handler.emit(logging.LogRecord(
-                "test", logging.INFO, __file__, 1, f"message-{index}", (), None
+                "test", logging.ERROR, __file__, 1,
+                f"message-{index}", (), None,
             ))
 
         messages = []
@@ -243,6 +246,45 @@ class UiLogHandlerTests(unittest.TestCase):
         self.assertEqual(len(messages), 20)
         self.assertEqual(messages[0], "message-5")
         self.assertEqual(messages[-1], "message-24")
+
+    def test_log_handler_keeps_full_history_and_filters_display(self) -> None:
+        handler = UiLogHandler(capacity=20, history=600)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        for index in range(650):
+            level = logging.ERROR if index % 50 == 0 else logging.INFO
+            message = (
+                f"msg-{index}"
+                if index % 50 != 0
+                else f"msg-{index}"
+            )
+            handler.emit(logging.LogRecord(
+                "test", level, __file__, 1, message, (), None,
+            ))
+        # History is bounded at 600 and drops the oldest like garbage.
+        history = handler.history_text().split("\n")
+        self.assertEqual(len(history), 600)
+        self.assertEqual(history[0], "msg-50")
+        self.assertEqual(history[-1], "msg-649")
+        # Only the ERROR records reached the display queue.
+        messages = []
+        while not handler.messages.empty():
+            messages.append(handler.messages.get_nowait())
+        self.assertEqual(
+            messages,
+            [f"msg-{index}" for index in range(0, 650, 50)],
+        )
+        # Patrol start/end markers are significant too.
+        from ui_worker import LOG_RUN_START, LOG_RUN_STOP
+        handler.emit(logging.LogRecord(
+            "test", logging.INFO, __file__, 1, LOG_RUN_START + "。", (), None,
+        ))
+        handler.emit(logging.LogRecord(
+            "test", logging.INFO, __file__, 1, LOG_RUN_STOP + "。", (), None,
+        ))
+        messages = []
+        while not handler.messages.empty():
+            messages.append(handler.messages.get_nowait())
+        self.assertEqual(len(messages), 2)
 
     def test_long_press_unlocks_and_clears_then_short_click_records(self) -> None:
         class Controller:
@@ -1419,6 +1461,11 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._stop_patrol_button = Button()
         worker._refresh_patrol_controls = lambda: refreshes.append(True)
 
+        # A real change must hold for TWO consecutive polls (a debounce so
+        # transient controller toggles - e.g. a self-rescue - never look
+        # like a patrol stop).
+        worker._sync_patrol_ui_state()
+        self.assertEqual(refreshes, [])  # first differing poll: pending
         worker._sync_patrol_ui_state()
 
         self.assertEqual(refreshes, [True])

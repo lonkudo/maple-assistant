@@ -576,6 +576,12 @@ class ClimbState:
     baseline_y: Optional[float] = None
     baseline_world_y: Optional[float] = None
     failed_shift_used: bool = False
+    # Sideways climb-jump attempts already made on this approach to reach a
+    # rope whose bottom a straight jump cannot reach (stairs/benches beside
+    # the rope).  The side is chosen by the worker and alternates every
+    # failed cycle; this counter is informational (log + alternation within
+    # one continuous approach).
+    lateral_hop_cycles: int = 0
     up_held: bool = False
     progress_check_frames: int = 0
     attach_frames: int = 0
@@ -629,7 +635,16 @@ def _directional_jump_climb(
     climb_duration: float,
     persistent_up: bool = False,
 ) -> bool:
-    """Press Alt+Left/Right as one overlapping chord, then hold Up."""
+    """Press Alt+<direction> as one overlapping chord; Up goes active EARLY.
+
+    For sideways jumps (left/right) Up is held from the very moment the jump
+    starts, not after the chord is released: the character can touch the
+    rope mid-jump and the grab registers immediately.  Releasing the chord
+    first made Up activate too late - the character had already sailed past
+    the rope (observed: lateral grab attempts reaching the rope but failing
+    to climb).  The straight-up case keeps its own order (Up is its
+    direction key and is re-pressed for the climb hold).
+    """
 
     if not _sender_is_safe(sender):
         LOG.warning("directional climb suppressed: target window is not safely selected")
@@ -643,28 +658,49 @@ def _directional_jump_climb(
     LOG.info("CLIMB recovery: press Alt+%s together, then hold Up", direction)
     direction_claimed = False
     alt_claimed = False
+    up_claimed = False
+    failed = True
     try:
-        # These two key-down events remain active concurrently for the entire
+        # The direction and Alt keys remain active concurrently for the whole
         # directional jump window. They are not separate press() operations.
-        direction_claimed = key_down(direction) is not False
-        if not direction_claimed:
-            return False
+        if direction != "up":
+            direction_claimed = key_down(direction) is not False
+            if not direction_claimed:
+                return False
         alt_claimed = key_down("alt") is not False
         if not alt_claimed:
             return False
+        if direction != "up" and persistent_up:
+            # Worker (persistent) climbs hold Up from the very start of the
+            # sideways jump so the rope grab is live the instant the jump
+            # touches the rope; releasing the chord first let the character
+            # sail past the rope before Up activated and the grab missed.
+            up_claimed = key_down("up") is not False
+            if not up_claimed:
+                return False
         time.sleep(max(0.025, direction_hold))
+        failed = False
     finally:
         if alt_claimed:
             key_up("alt")
         if direction_claimed:
             key_up(direction)
-    # Grab immediately after the directional jump chord. Any gap here lets
-    # the character pass the rope before Up becomes active.
-    if persistent_up:
-        up_ok = key_down("up")
-    else:
-        up_ok = press("up", duration=climb_duration)
-    return up_ok is not False
+        if up_claimed and failed:
+            # A failed/aborted chord must never leave Up physically held.
+            key_up("up")
+    # Straight-up chord: Up was the direction key and was released with the
+    # chord; press it again so the climb grab stays active.
+    if direction == "up":
+        if persistent_up:
+            up_ok = key_down("up")
+        else:
+            up_ok = press("up", duration=climb_duration)
+        return up_ok is not False
+    # Sideways chord.  Persistent climbs already hold Up from the jump
+    # start; legacy timed callers keep pressing Up right after the chord.
+    if not up_claimed:
+        return press("up", duration=climb_duration) is not False
+    return True
 
 
 def _drop_through_platform(
@@ -720,6 +756,10 @@ def climb(
     arrival_y: Optional[float] = None,
     arrival_tolerance: float = 0.02,
     arrival_in_progress: bool = False,
+    # Side for the under-rope lateral recovery (see the failed-cycle block):
+    # the worker alternates it after every sideways climb jump.  Left when
+    # unset (direct/legacy callers).
+    lateral_hop_side: Optional[str] = None,
 ) -> str:
     """Try to grab the rope and verify it from the next minimap screenshot.
 
@@ -1026,12 +1066,11 @@ def climb(
             rope_x is not None
             and abs(rope_x - player.x) <= straight_up_tolerance
         )
-        if (inside_straight_up_zone
-                and (state.phase != "check-primary-up"
-                     or state.failed_shift_used)):
-            # Do not repeat the same lateral chord while X is not changing.
-            # After the one allowed side retry/correction, recovery stays
-            # vertical instead of walking the character off the platform.
+        if inside_straight_up_zone:
+            # Right under the rope: the retry stays a plain straight jump so
+            # the character always gets TWO plain jump+climb attempts per
+            # cycle before any sideways climb jump is tried.  Lateral
+            # recovery lives in the failed-cycle block below, not here.
             retry_direction = "up"
         elif preferred_direction in ("left", "right"):
             retry_direction = preferred_direction
@@ -1067,9 +1106,66 @@ def climb(
             return f"{retry_direction}-retry-toward-rope"
         return "input-blocked"
 
-    # Both attempts failed. Shift slightly TOWARD the live rope before
-    # restarting on a later screenshot; the old hard-coded Right correction
-    # moved away from ropes positioned to the left.
+    # Both attempts failed.  Recovery depends on where the character is:
+    #
+    # - RIGHT UNDER THE ROPE (straight-up zone): two plain jump+climb
+    #   attempts already failed, so this rope bottom hangs above jump reach
+    #   here (or a knock-down left the character on a step below it).  Try a
+    #   real SIDEWAYS climb jump - Alt+Left / Alt+Right with Up held from the
+    #   very start of the jump (the worker alternates the side every failed
+    #   cycle): a stair/bench beside the rope may be reachable and the rope
+    #   grabbable from the higher spot, and the early Up also grabs the rope
+    #   the moment the sideways jump touches it.
+    # - ELSEWHERE: keep the legacy one-time correction toward the rope.
+    under_rope = bool(
+        rope_x is not None
+        and player is not None
+        and abs(rope_x - player.x) <= straight_up_tolerance
+    )
+    if under_rope:
+        side = (
+            lateral_hop_side
+            if lateral_hop_side in ("left", "right") else "left"
+        )
+        state.lateral_hop_cycles += 1
+
+        def climb_jump_side() -> bool:
+            return _directional_jump_climb(
+                sender, side, nudge_duration, climb_duration, persistent_up
+            )
+        ok = climb_jump_side() if action_lock is None else False
+        if action_lock is not None:
+            with action_lock:
+                ok = climb_jump_side()
+        if ok:
+            state.baseline_y = player.y
+            state.baseline_world_y = (
+                observation.world_y_diamonds
+                if observation.structure_confidence >= 0.12 else None
+            )
+            state.phase = "check-opposite"
+            state.up_held = persistent_up
+            state.progress_check_frames = 0
+            state.attach_frames = 0
+            state.recent_y = []
+            state.last_world_y = state.baseline_world_y
+            state.stalled_frames = 0
+            LOG.warning(
+                "CLIMB under-rope straight jumps failed; sideways climb jump "
+                "%s with early Up (lateral #%d)",
+                side, state.lateral_hop_cycles,
+            )
+            return f"{side}-lateral-toward-rope"
+        state.phase = "idle"
+        state.baseline_y = None
+        state.baseline_world_y = None
+        state.up_held = False
+        state.progress_check_frames = 0
+        state.last_world_y = None
+        state.stalled_frames = 0
+        state.recent_y = []
+        LOG.warning("CLIMB under-rope sideways climb jump %s was blocked", side)
+        return "input-blocked"
     if state.failed_shift_used:
         state.phase = "idle"
         state.baseline_y = None
@@ -1454,11 +1550,14 @@ class MovementWorker(threading.Thread):
             arrival_y=arrival_y,
             arrival_tolerance=arrival_tolerance,
             arrival_in_progress=arrival_in_progress,
+            lateral_hop_side=self._climb_lateral_side,
         )
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
             self._climb_arrival_at = time.monotonic()
             self._climb_cycle_reset()
+            # A real grab ended the under-rope lateral-recovery streak.
+            self._climb_lateral_streak = 0
             if self._return_mode == "climb-to-route":
                 # Return climb landed on a higher floor: re-detect where we
                 # are instead of advancing the normal route.  An in-range
@@ -1472,6 +1571,19 @@ class MovementWorker(threading.Thread):
             # used up: a stuck-under-the-rope character restarts the route
             # at left-most after a few cycles instead of jumping in place.
             self._climb_cycle_failed()
+        elif isinstance(result, str) and result.endswith("-lateral-toward-rope"):
+            # Under-rope sideways climb jump: alternate the side for the
+            # next attempt and count the streak.  The walk back to the rope
+            # must NOT reset this streak (walks reset the ordinary failure
+            # counter), otherwise a rope the sideways jumps cannot reach
+            # would loop forever without ever restarting the approach.
+            self._climb_lateral_side = (
+                "right" if self._climb_lateral_side == "left" else "left"
+            )
+            self._climb_lateral_streak += 1
+            if self._climb_lateral_streak >= self.climb_lateral_cycles_reset:
+                self._climb_lateral_streak = 0
+                self._escalate_failed_climb_approach()
         return result
 
     def _rescue_stuck_check(
@@ -1615,6 +1727,89 @@ class MovementWorker(threading.Thread):
             # frame) look stationary forever despite large total travel.
             self._rescue_last_pos = Point(pos.x, pos.y)
 
+    def _rescue_verify_stuck_by_probe(self) -> bool:
+        """True when the character is REALLY stuck and recovery may drop.
+
+        Frequent attacks can hold the character still for longer than the
+        stuck window (fixed attack keeps tapping while a monster stands in
+        range): the marker freezes and a false self-rescue fires.  Before any
+        Alt+Down / patrol-restart the rescue blocks the attack workers and
+        forces a short walk right then left; when the marker moves, the
+        character was never stuck and the rescue is cancelled - no drop to
+        layer1, no patrol restart.
+        """
+        obs = self.last_observation
+        if obs is None or obs.player is None:
+            # No marker to verify movement against: a missing marker is its
+            # own stuck condition and keeps the legacy descent behavior.
+            return True
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning(
+                "SELF-RESCUE probe skipped: game window not safely selected; "
+                "resuming patrol instead of dropping"
+            )
+            return False
+        self._release_climb_up()
+        self._release_walk_hold()
+        # Block the attack workers for the whole probe so an attack cannot
+        # keep freezing the character or race the probe keys.
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.set()
+        blocked_until = (
+            time.monotonic() + self.rescue_probe_attack_block_seconds
+        )
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        moved = False
+        try:
+            for direction in ("right", "left"):
+                anchor_obs = self.last_observation
+                if anchor_obs is None or anchor_obs.player is None:
+                    continue
+                anchor = anchor_obs.player.x
+                claimed = False
+                try:
+                    if key_down is None or key_down(direction) is False:
+                        break
+                    claimed = True
+                    time.sleep(min(
+                        self.rescue_probe_hold_seconds,
+                        max(0.0, blocked_until - time.monotonic()),
+                    ))
+                finally:
+                    if claimed and key_up is not None:
+                        key_up(direction)
+                time.sleep(self.rescue_probe_settle_seconds)
+                current = self.last_observation
+                if (current is not None and current.player is not None
+                        and abs(current.player.x - anchor)
+                        >= self.rescue_probe_move_threshold):
+                    LOG.warning(
+                        "SELF-RESCUE probe: marker moved %+.6f during the %s "
+                        "nudge; character is not stuck",
+                        current.player.x - anchor, direction,
+                    )
+                    moved = True
+                    break
+        finally:
+            # The probe's busy claims end here.  When the rescue then runs
+            # its drop/restart those paths manage their own events; when the
+            # rescue is cancelled the patrol and attacks simply resume.
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.clear()
+            if self.dropping_active_event is not None:
+                self.dropping_active_event.clear()
+        if moved:
+            return False
+        LOG.warning(
+            "SELF-RESCUE probe: no marker movement after right/left nudges "
+            "(%.1fs attack block); character confirmed stuck",
+            self.rescue_probe_attack_block_seconds,
+        )
+        return True
+
     def _trigger_rescue(self) -> None:
         """Start the self-rescue in a background thread (guarded once)."""
         if self._rescue_active:
@@ -1624,17 +1819,96 @@ class MovementWorker(threading.Thread):
                          daemon=True).start()
 
     def _run_rescue(self) -> None:
-        """Drop to layer1 and restart the patrol from a clean state."""
+        """Recover a stuck patrol without leaving the patrol range.
+
+        Every rescue first VERIFIES the character is genuinely stuck: attacks
+        are blocked and the character is forced to walk right then left (see
+        ``_rescue_verify_stuck_by_probe``).  A character frozen by frequent
+        attacks moves as soon as the attacks stop - the rescue is cancelled
+        and no Alt+Down / patrol restart happens.  Only a confirmed stuck
+        character reaches the stateful recovery below:
+
+        - On an in-range recorded floor: restart patrol there in place.  A
+          stuck in-range character must never be dropped down to the map's
+          physical bottom - with an explicit patrol range the bottom floor
+          (e.g. layer1) may lie OUTSIDE the range, and the drop would turn a
+          recoverable stall into a full below-range return.
+        - Below the patrol range (return/climb-to-route active, or a
+          detected floor below the range): never drop deeper.  Re-run the
+          return climb from a clean state and count the cycle; when the
+          return cannot be restored after ``rescue_cycle_limit`` rescues the
+          worker stops patrol with an error instead of looping Alt+Down /
+          Alt+Up forever at a rope it cannot grab.
+        - Otherwise (marker missing / floor unknown): the guarded physical
+          descent to the bottom floor re-establishes a known state.
+        """
+        give_up = False
         try:
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
-            landed_floor = self._drop_to_first_layer()
-            self._restart_patrol_from_first_layer(landed_floor)
+            # Pre-flight: a character frozen by frequent attacks is NOT stuck.
+            if not self._rescue_verify_stuck_by_probe():
+                LOG.warning(
+                    "SELF-RESCUE aborted: character moves when attacks are "
+                    "blocked; resuming patrol (no drop, no restart)"
+                )
+                return
+            obs = self.last_observation
+            floor = self._detect_floor_all(obs) if obs is not None else None
+            if floor is not None and floor in self._route_layers:
+                self._rescue_cycles = 0
+                self._restart_patrol_from_first_layer(floor)
+                LOG.warning(
+                    "SELF-RESCUE: restarting patrol on %s in place (no drop "
+                    "out of the patrol range)", floor,
+                )
+            elif (self._return_mode == "climb-to-route"
+                    or (floor is not None
+                        and _layer_number(floor) < self._patrol_range_min)):
+                self._rescue_cycles += 1
+                restart_floor = (
+                    floor or self._return_from_floor
+                    or self._bottom_recorded_layer()
+                )
+                LOG.warning(
+                    "SELF-RESCUE: below patrol range (on %s); re-running "
+                    "return climb without dropping (cycle %d/%d)",
+                    restart_floor, self._rescue_cycles,
+                    self.rescue_cycle_limit,
+                )
+                self._restart_patrol_from_first_layer(restart_floor)
+                if self._rescue_cycles >= self.rescue_cycle_limit:
+                    LOG.error(
+                        "SELF-RESCUE: return-to-route failed %d times from "
+                        "below the patrol range; stopping patrol (rope climb "
+                        "unreachable from the landing spot)",
+                        self._rescue_cycles,
+                    )
+                    give_up = True
+                    self._return_mode = None
+                    self._return_from_floor = None
+                    self._return_arrival_floor = None
+                    self._descending_to_first = False
+                    self._route_layer_index = None
+                    self._release_climb_up()
+                    self._climb_state = ClimbState()
+                    with self._patrol_start_lock:
+                        self._pending_patrol_start_floor = None
+                    for event in (self.climbing_active_event,
+                                  self.dropping_active_event,
+                                  self.near_rope_event,
+                                  self.moving_active_event):
+                        if event is not None:
+                            event.clear()
+            else:
+                self._rescue_cycles = 0
+                landed_floor = self._drop_to_first_layer()
+                self._restart_patrol_from_first_layer(landed_floor)
         except Exception:
             LOG.exception("self-rescue failed")
         finally:
             if self.patrol_controller is not None:
-                self.patrol_controller.set_enabled(True)
+                self.patrol_controller.set_enabled(not give_up)
             self._rescue_active = False
 
     def _rope_approach_stalled(
@@ -1913,6 +2187,11 @@ class MovementWorker(threading.Thread):
         climb_failed_shift_right_seconds: float = 0.01,
         climb_attempt_interval_seconds: float = 1.0,
         climb_failed_cycles_reset: int = 3,
+        # Consecutive under-rope sideways climb-jump failures before the rope
+        # approach restarts from left-most (walk away, re-approach from the
+        # edge) - same ladder as climb_failed_cycles_reset but for the
+        # lateral recovery, which is NOT reset by the walk back to the rope.
+        climb_lateral_cycles_reset: int = 3,
         patrol_cycles_per_layer: int = 2,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
@@ -1944,6 +2223,20 @@ class MovementWorker(threading.Thread):
         # the patrol range).
         fall_detect_frames: int = 3,
         fall_marker_y_gain: float = 0.015,
+        # Landing reconciliation after a fall/knock-down: the raw marker Y is
+        # screen-relative on a scrolling minimap and the OpenCV world-Y
+        # tracker lags fast vertical motion, so the landing floor is resolved
+        # from world-Y samples only after they stabilize, then the tracker is
+        # re-anchored to the true layer (cancelling lag/drift).
+        fall_settle_min_frames: int = 3,
+        fall_settle_epsilon: float = 0.15,
+        fall_settle_max_seconds: float = 1.2,
+        # World-Y drift watchdog: while cruising on a believed floor the
+        # tracker's incremental correlation can drift over time; when the raw
+        # world Y drifts from the floor's expected anchor beyond this bound
+        # the tracker is silently re-anchored.
+        world_drift_check_interval_seconds: float = 2.0,
+        world_drift_reanchor_threshold: float = 0.35,
         drop_chord_hold_seconds: float = 0.10,
         drop_retry_seconds: float = 1.0,
         minimap_detector: Any = None,
@@ -1967,6 +2260,20 @@ class MovementWorker(threading.Thread):
         other_player_check_interval_seconds: float = 60.0,
         rescue_check_interval_seconds: float = 300.0,
         rescue_stuck_frames: int = 20,
+        # Consecutive self-rescue cycles that end below the patrol range
+        # (return-to-route could not be restored): after this many the worker
+        # stops patrol instead of dropping/retrying forever from a spot whose
+        # rope climb cannot grab.
+        rescue_cycle_limit: int = 3,
+        # Self-rescue pre-flight: frequent attacks can freeze the character
+        # past the stuck window (fixed attack keeps tapping while a monster
+        # stands in range), so before ANY drop/restart the rescue blocks the
+        # attacks and forces a short walk right then left to verify the
+        # character is really stuck.  These tune that probe.
+        rescue_probe_attack_block_seconds: float = 2.0,
+        rescue_probe_hold_seconds: float = 0.7,
+        rescue_probe_settle_seconds: float = 0.2,
+        rescue_probe_move_threshold: float = 0.006,
         other_player_drug_taps: int = 3,
         other_player_drug_gap_seconds: float = 1.0,
         other_player_hp_threshold: float = 0.70,
@@ -2042,6 +2349,15 @@ class MovementWorker(threading.Thread):
         # 同一层爬楼反复失败的"重置回最左"次数：超过上限后升级为完整自救
         # （回第一层 + 重启 + 重锚定），避免无限在同一层巡逻不爬楼。
         self._climb_restarts = 0
+        # Under-rope lateral recovery state: the side to try next (alternates
+        # after every sideways climb jump) and the consecutive-failure streak
+        # that restarts the rope approach once the rope cannot be reached
+        # even from the side (stairs/bench hops included).
+        self.climb_lateral_cycles_reset = max(
+            1, int(climb_lateral_cycles_reset)
+        )
+        self._climb_lateral_side = "left"
+        self._climb_lateral_streak = 0
         # 爬楼失败时记录上一次的标记 X，用于检测"X 冻结"（绳子不可达）。
         self._climb_last_x: Optional[float] = None
         self.near_rope_seconds = near_rope_seconds
@@ -2175,6 +2491,20 @@ class MovementWorker(threading.Thread):
         self._rescue_off_route_frames = 0
         self._rescue_off_route_anchor: Optional[Point] = None
         self._rescue_active = False
+        self.rescue_cycle_limit = max(1, int(rescue_cycle_limit))
+        self._rescue_cycles = 0
+        self.rescue_probe_attack_block_seconds = max(
+            0.5, float(rescue_probe_attack_block_seconds)
+        )
+        self.rescue_probe_hold_seconds = max(
+            0.1, float(rescue_probe_hold_seconds)
+        )
+        self.rescue_probe_settle_seconds = max(
+            0.0, float(rescue_probe_settle_seconds)
+        )
+        self.rescue_probe_move_threshold = max(
+            0.002, float(rescue_probe_move_threshold)
+        )
         # Cross-process attack coordination: when the YOLO attack worker
         # reports an active target, patrol movement pauses (attack priority).
         self._attack_state = (
@@ -2316,6 +2646,30 @@ class MovementWorker(threading.Thread):
         self._fall_last_y: Optional[float] = None
         self._fall_frames = 0
         self._fall_pending = False
+        # Landing-reconciliation settle state (see _reconcile_landed_floor):
+        # confident world-Y samples collected after a fall stops, until they
+        # stabilize or the settle window times out.
+        self.fall_settle_min_frames = max(2, int(fall_settle_min_frames))
+        self.fall_settle_epsilon = max(0.02, float(fall_settle_epsilon))
+        self.fall_settle_max_seconds = max(
+            0.3, float(fall_settle_max_seconds)
+        )
+        self._fall_settle_started: Optional[float] = None
+        self._fall_settle_world: list[float] = []
+        # World-Y drift watchdog tuning (see _world_drift_check):
+        self.world_drift_check_interval_seconds = max(
+            0.5, float(world_drift_check_interval_seconds)
+        )
+        self.world_drift_reanchor_threshold = max(
+            0.05, float(world_drift_reanchor_threshold)
+        )
+        self._last_world_drift_check = 0.0
+        self._last_fall_resolved_at: Optional[float] = None
+        # Raw (pre-pin) world-Y reading of the current frame, captured where
+        # the structure tracker result is merged so reconciliation and the
+        # drift watchdog never see the pinned/aliased value.
+        self._raw_world_y: Optional[float] = None
+        self._raw_structure_confidence = 0.0
         self._return_mode: Optional[str] = None  # "climb-to-route" | "drop-to-route"
         # Floor the return started from: while climbing back, a failed
         # grab falls the marker back to a Y between every recorded band;
@@ -2746,6 +3100,22 @@ class MovementWorker(threading.Thread):
             LOG.warning("self-rescue drop: no recorded floor is available")
             return None
         max_attempts = 30
+        # A marker that already reads at-or-below the bottom floor's band is
+        # treated as "bottom reached": dropping further is impossible (the
+        # character is on/under the map's lowest floor) and repeating Alt+Down
+        # there would only push the character deeper / into the void.  Same
+        # at-or-below tolerance as the final-drop arrival check.  Without this
+        # a character knocked into a pit under the bottom floor (marker just
+        # outside every band) made the descent send Alt+Down chords over and
+        # over (observed: endless "jump down" under the layer1 rope).
+        bottom_layer = self.important_positions.get(bottom_floor, {})
+        bottom_band = (
+            _layer_y_band(
+                bottom_layer,
+                float(bottom_layer.get("y_tolerance", 0.020000)),
+            )
+            if isinstance(bottom_layer, dict) else None
+        )
         for attempt in range(1, max_attempts + 1):
             obs = self.last_observation
             detected_floor = (
@@ -2757,6 +3127,16 @@ class MovementWorker(threading.Thread):
                     "self-rescue drop: reached physical bottom %s "
                     "(attempt %d); patrol start is %s",
                     bottom_floor, attempt, self.first_layer,
+                )
+                return bottom_floor
+            if (obs is not None and obs.player is not None
+                    and bottom_band is not None
+                    and obs.player.y >= bottom_band[1] - 1e-9):
+                self._reanchor_tracker_to_layer(bottom_floor, obs)
+                LOG.warning(
+                    "self-rescue drop: marker y=%.6f already at/below the %s "
+                    "band (bottom %.6f); no drop needed",
+                    obs.player.y, bottom_floor, bottom_band[1],
                 )
                 return bottom_floor
             LOG.info(
@@ -3327,6 +3707,10 @@ class MovementWorker(threading.Thread):
             self._climb_arrival_at = time.monotonic()
         self._release_climb_up()
         self._route_layer_index = detected_index
+        # The marker is confirmed on an in-range route layer: any below-range
+        # rescue streak is over.
+        self._rescue_cycles = 0
+        self._climb_lateral_streak = 0
         self._route_phase = "left"
         self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
@@ -3416,6 +3800,7 @@ class MovementWorker(threading.Thread):
         self._fall_pending = False
         self._fall_frames = 0
         self._fall_last_y = None
+        self._reset_fall_settle()
         self._forced_phase_entry = None
         self._aligned_frames = 0
         self._rope_approach_direction = None
@@ -3466,6 +3851,9 @@ class MovementWorker(threading.Thread):
     ) -> None:
         """Restart patrol from ``floor`` (must be inside the patrol range)."""
         self._route_layer_index = self._route_layers.index(floor)
+        # Back inside the patrol range: any below-range rescue streak is over.
+        self._rescue_cycles = 0
+        self._climb_lateral_streak = 0
         self._route_phase = "left"
         self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
@@ -3499,9 +3887,32 @@ class MovementWorker(threading.Thread):
                 name: layer for name, layer in layers.items()
                 if isinstance(layer, dict) and "layer_world_y" in layer
             }
-            return detect_layer_by_world_y(
+            world_name = detect_layer_by_world_y(
                 observation.world_y_diamonds, world_layers
             )
+            if world_name is not None:
+                return world_name
+        # At/below the lowest recorded band: the character is on (or under)
+        # the bottom floor - nothing lower exists.  This guarantees the
+        # bottom floor is recognized even when its recorded band does not
+        # cover the exact landing spot (e.g. a right-side knock-down into
+        # the pit under a stair floor), so the return-to-route starts
+        # instead of the stale route keeping the character walking.
+        if observation.player is not None:
+            bottom_floor = self._bottom_recorded_layer()
+            bottom_layer = (
+                self.important_positions.get(bottom_floor, {})
+                if bottom_floor is not None else {}
+            )
+            band = (
+                _layer_y_band(
+                    bottom_layer,
+                    float(bottom_layer.get("y_tolerance", 0.020000)),
+                )
+                if isinstance(bottom_layer, dict) else None
+            )
+            if band is not None and observation.player.y >= band[1] - 1e-9:
+                return bottom_floor
         return None
 
     def _verify_out_of_range_floor(
@@ -3560,6 +3971,7 @@ class MovementWorker(threading.Thread):
         self._fall_pending = False
         self._fall_frames = 0
         self._fall_last_y = None
+        self._reset_fall_settle()
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
         if self.dropping_active_event is not None:
@@ -3661,20 +4073,132 @@ class MovementWorker(threading.Thread):
             return False
         return True
 
-    def _resolve_fall(self, observation: MinimapObservation) -> bool:
-        """Called when a fall stops: re-detect the floor and act.
+    def _reset_fall_settle(self) -> None:
+        """Clear the landing-reconciliation settle state."""
 
-        In-range floor restarts patrol there (a same-floor bounce - jump /
-        small pit - is ignored and patrol continues); an out-of-range floor
-        starts the return-to-route climb/drop.  Returns False while no floor
-        can be identified yet (kept pending for the next frame).
+        self._fall_settle_started = None
+        self._fall_settle_world = []
+
+    def _reconcile_landed_floor(
+        self, observation: MinimapObservation
+    ) -> Optional[str]:
+        """Resolve the landing floor after a fall - world-Y authoritative.
+
+        The raw marker Y is screen-relative on a scrolling minimap and the
+        OpenCV world-Y tracker LAGS a fast knock-down fall, so the landing
+        floor is resolved from the raw (pre-pin) world-Y reading only after
+        it has stabilized (or the settle window times out).  World-Y bands
+        over every recorded layer are the primary evidence; the marker Y is
+        only a fallback when it matches exactly one recorded layer; and a
+        reading at/below the lowest recorded band resolves to the bottom
+        floor (nothing lower exists).  Returns None while still settling or
+        genuinely unknown - the caller keeps the fall pending and retries on
+        the next frame.
         """
-        floor = self._detect_floor_all(observation)
+
+        now = time.monotonic()
+        if self._fall_settle_started is None:
+            self._fall_settle_started = now
+        world_ok = bool(
+            self._raw_world_y is not None
+            and self._raw_structure_confidence >= 0.12
+        )
+        if world_ok:
+            self._fall_settle_world.append(self._raw_world_y)
+            if len(self._fall_settle_world) > 8:
+                self._fall_settle_world.pop(0)
+        settled = False
+        if len(self._fall_settle_world) >= self.fall_settle_min_frames:
+            window = self._fall_settle_world[-self.fall_settle_min_frames:]
+            settled = (
+                max(window) - min(window)
+            ) <= self.fall_settle_epsilon
+        timed_out = (
+            now - self._fall_settle_started
+        ) >= self.fall_settle_max_seconds
+        floor: Optional[str] = None
+        if settled or (timed_out and world_ok):
+            world_layers = {
+                name: layer
+                for name, layer in self.important_positions.items()
+                if isinstance(layer, dict) and "layer_world_y" in layer
+            }
+            if world_layers:
+                floor = detect_layer_by_world_y(
+                    self._fall_settle_world[-1], world_layers
+                )
+                if floor is not None:
+                    LOG.info(
+                        "FALL RECONCILE: settled worldY %.6f -> %s",
+                        self._fall_settle_world[-1], floor,
+                    )
+        if floor is None and observation.player is not None:
+            # Marker-Y fallback: only an unambiguous single-band reading is
+            # accepted - screen Y is scroll-dependent, so ambiguous readings
+            # are ignored rather than guessed.
+            marker_layers = {
+                name: layer
+                for name, layer in self.important_positions.items()
+                if isinstance(layer, dict) and "layer_y" in layer
+            }
+            candidates = _layer_y_candidates(
+                observation.player.y, marker_layers
+            )
+            if len(candidates) == 1:
+                floor = candidates[0]
+                LOG.info(
+                    "FALL RECONCILE: marker fallback y=%.6f -> %s",
+                    observation.player.y, floor,
+                )
+        if floor is None and observation.player is not None:
+            # At/below the lowest recorded band: the character is on (or
+            # under) the bottom floor - nothing lower exists.  This is what
+            # guarantees layer1 is recognized after knock-downs whose exact
+            # landing spot the recorded band does not cover.
+            bottom_floor = self._bottom_recorded_layer()
+            bottom_layer = (
+                self.important_positions.get(bottom_floor, {})
+                if bottom_floor is not None else {}
+            )
+            band = (
+                _layer_y_band(
+                    bottom_layer,
+                    float(bottom_layer.get("y_tolerance", 0.020000)),
+                )
+                if isinstance(bottom_layer, dict) else None
+            )
+            if band is not None and observation.player.y >= band[1] - 1e-9:
+                floor = bottom_floor
+                LOG.warning(
+                    "FALL RECONCILE: marker y=%.6f at/below the %s band "
+                    "(bottom %.6f); resolving to the bottom floor",
+                    observation.player.y, bottom_floor, band[1],
+                )
+        if floor is None and not timed_out:
+            # Still absorbing the tracker lag: keep the fall pending.
+            return None
+        return floor
+
+    def _resolve_fall(self, observation: MinimapObservation) -> bool:
+        """Called when a fall stops: resolve the true landing floor and act.
+
+        The landing floor is resolved through ``_reconcile_landed_floor``
+        (world-Y authoritative after a settle window - see there) and the
+        tracker is re-anchored to it, so a monster knock-down can never
+        leave the world-Y origin on the pre-fall floor.  An in-range floor
+        restarts patrol there (a same-floor bounce is ignored and patrol
+        continues); an out-of-range floor starts the return-to-route
+        climb/drop.  Returns False while the landing is still being
+        resolved (kept pending for the next frame).
+        """
+        floor = self._reconcile_landed_floor(observation)
         if floor is None:
             return False
         self._fall_pending = False
         self._fall_last_y = None
         self._fall_frames = 0
+        self._reset_fall_settle()
+        self._last_fall_resolved_at = time.monotonic()
         if self._return_mode is not None:
             if (self._return_mode == "climb-to-route"
                     and floor in self._route_layers
@@ -3753,6 +4277,61 @@ class MovementWorker(threading.Thread):
             self._fall_pending = True
             self._resolve_fall(observation)
         self._fall_frames = 0
+
+    def _world_drift_check(
+        self, observation: MinimapObservation, now: float
+    ) -> None:
+        """Re-anchor the world-Y tracker when it drifts while cruising.
+
+        The tracker prefers incremental phase correlation, whose per-frame
+        error accumulates: over minutes the world-Y origin slowly shifts
+        even while the character stands or walks on the same floor, and a
+        shifted origin makes layer recognition wrong.  Every confirmed
+        landing/arrival re-anchors, but between those events this throttled
+        check compares the RAW world Y against the believed floor's expected
+        anchor at the marker X and re-anchors silently when the gap exceeds
+        ``world_drift_reanchor_threshold``.  It only runs while the floor
+        belief is corroborated by an in-band marker reading and no vertical
+        action is active, so it can never fight a climb/drop/return.
+        """
+
+        if (now - self._last_world_drift_check
+                < self.world_drift_check_interval_seconds):
+            return
+        self._last_world_drift_check = now
+        if (self._climb_state.phase != "idle"
+                or self._climb_state.up_held
+                or self._return_mode is not None
+                or self._descending_to_first
+                or self._fall_pending
+                or observation.player is None):
+            return
+        if (self._last_fall_resolved_at is not None
+                and now - self._last_fall_resolved_at < 1.5):
+            # A fresh landing reconcile owns the origin; do not race it.
+            return
+        if (self._raw_world_y is None
+                or self._raw_structure_confidence < 0.12):
+            return
+        if not self.patrol_enabled or not self._route_layers:
+            return
+        floor = self._current_route_floor()
+        if floor is None:
+            return
+        if not self._layer_band_contains(floor, observation.player.y):
+            return
+        layer = self.important_positions.get(floor, {})
+        expected = _layer_world_anchor_at_x(layer, observation.player.x)
+        if expected is None:
+            return
+        gap = abs(self._raw_world_y - expected)
+        if gap >= self.world_drift_reanchor_threshold:
+            LOG.warning(
+                "WORLD-Y DRIFT: raw worldY %.6f is %.3f away from the %s "
+                "anchor at x=%.4f; re-anchoring",
+                self._raw_world_y, gap, floor, observation.player.x,
+            )
+            self._reanchor_tracker_to_current_layer(observation)
 
     def _maybe_begin_return_if_out_of_range(
         self, observation: MinimapObservation
@@ -4143,6 +4722,10 @@ class MovementWorker(threading.Thread):
 
     def _reset_route_loop(self) -> None:
         self._route_layer_index = self._route_layers.index(self.first_layer)
+        # The final drop landed back on the (in-range) loop floor: a below-
+        # range rescue streak is over.
+        self._rescue_cycles = 0
+        self._climb_lateral_streak = 0
         self._route_phase = "left"
         self._route_patrol_cycle = 1
         self._forced_phase_entry = None
@@ -4221,13 +4804,29 @@ class MovementWorker(threading.Thread):
         if self._climb_failures < self.climb_failed_cycles_reset:
             return False
         self._climb_failures = 0
+        self._escalate_failed_climb_approach()
+        return True
+
+    def _escalate_failed_climb_approach(self) -> None:
+        """One full failed rope approach: restart the route at left-most.
+
+        The character walks away from the rope and re-approaches it from the
+        platform edge, where the directional jump grabs reliably.  Physical
+        Up is released FIRST: the failure can arrive right after a sideways
+        climb jump that still owns the Up key, and wiping the climb state
+        without releasing it would leave the character walking with Up held
+        forever.  Repeated restarts (or a frozen marker X = the rope is
+        unreachable from this side) escalate to the full self-rescue.
+        """
+        self._release_climb_up()
         self._route_phase = "left"
         self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         self._climb_restarts += 1
         LOG.warning(
-            "CLIMB failed %d cycles at the rope; restarting patrol from left-most",
-            self.climb_failed_cycles_reset,
+            "CLIMB failed at the rope; restarting patrol from left-most "
+            "(restart %d)",
+            self._climb_restarts,
         )
         # X 冻结检测：跳向绳子的过程中标记 X 纹丝不动 → 绳子从这一侧
         # 够不到（墙/平台边缘挡住），别等 4 次重启，直接升级自救。
@@ -4314,15 +4913,36 @@ class MovementWorker(threading.Thread):
     def _pin_stationary_layer_world_y(
         self, observation: MinimapObservation
     ) -> MinimapObservation:
-        """Ignore OpenCV vertical aliases while no vertical action is active."""
+        """Ignore OpenCV vertical aliases only while the floor is confirmed.
+
+        The world-Y reading is pinned to the believed floor's canonical
+        anchor ONLY while the marker Y itself still agrees with that floor's
+        band (the character is visibly cruising on it).  On a scrolling
+        minimap the raw marker Y is screen-relative, so after a knock-down
+        it can read off-band while the character truly sits on another
+        floor - pinning then would hide the landing from the world-Y
+        channel, so the raw tracker reading passes through for the landing
+        reconciliation to re-anchor to the true layer.
+        """
 
         if self._climb_state.up_held or self._climb_state.phase != "idle":
             return observation
+        if observation.player is None:
+            return observation
         floor = self._current_route_floor()
-        layer = self.important_positions.get(floor, {}) if floor else {}
+        if floor is None:
+            return observation
+        layer = self.important_positions.get(floor)
+        if not isinstance(layer, dict):
+            return observation
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        if (band is None
+                or not (band[0] - 1e-9 <= observation.player.y
+                        <= band[1] + 1e-9)):
+            return observation
         canonical = _layer_world_anchor_at_x(
-            layer,
-            observation.player.x if observation.player is not None else None,
+            layer, observation.player.x
         )
         if canonical is None:
             return observation
@@ -4477,6 +5097,12 @@ class MovementWorker(threading.Thread):
                 self._last_frame = frame
                 self._last_minimap_region = minimap_region
                 observation = analyze_minimap(frame, minimap_region)
+                # Raw (pre-pin) world-Y state of this frame, refreshed below
+                # when the structure tracker runs; used by landing
+                # reconciliation and the world-Y drift watchdog so they never
+                # see the aliased/pinned value.
+                self._raw_world_y = None
+                self._raw_structure_confidence = 0.0
                 if self.structure_tracker is not None and minimap_detection is not None:
                     analysis_rgb = np.asarray(
                         frame.image.crop(minimap_detection.analysis_box).convert("RGB")
@@ -4485,6 +5111,8 @@ class MovementWorker(threading.Thread):
                     tracking = self.structure_tracker.analyze(
                         frame, minimap_detection, structure_marker
                     )
+                    self._raw_world_y = tracking.world_y_diamonds
+                    self._raw_structure_confidence = tracking.confidence
                     observation = replace(
                         observation,
                         world_y_diamonds=tracking.world_y_diamonds,
@@ -4606,6 +5234,10 @@ class MovementWorker(threading.Thread):
                 # re-detected and patrol restarts there, or the character
                 # returns to the patrol floor range.
                 self._track_fall(observation)
+                # World-Y drift watchdog: while cruising on a believed floor
+                # the incremental tracker can drift over time; re-anchor
+                # silently before the drift can poison layer recognition.
+                self._world_drift_check(observation, time.monotonic())
                 # Out-of-range floor with no fall in progress: start the
                 # return right away (no attacking during it).
                 self._maybe_begin_return_if_out_of_range(observation)

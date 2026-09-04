@@ -287,6 +287,39 @@ calibrated layer world band; the old unconditional "nearest anchor" snap was
 removed because a phase-correlation alias could identify layer2 while the
 marker visibly occupied layer3.
 
+On a scrolling minimap the raw marker Y is screen-relative, so it cannot name
+a floor on its own and can read OFF every recorded band at a landing spot that
+recording never covered (e.g. a knock-down into the pit under a stair floor).
+Layer recognition therefore re-anchors the world-Y tracker instead of masking
+it:
+
+- ``_pin_stationary_layer_world_y`` pins the world-Y reading to the believed
+  floor's canonical anchor ONLY while the marker Y still agrees with that
+  floor's band (visible cruising).  An off-band marker after a knock-down
+  leaves the RAW tracker reading untouched so the landing reconciliation can
+  see it.
+- Every confirmed landing / rope arrival re-anchors the tracker to the true
+  layer (``_reanchor_tracker_to_layer``), cancelling incremental drift.
+- ``_detect_floor_all`` resolves a marker at/below the LOWEST recorded band to
+  the bottom floor - nothing lower exists, so the bottom floor is recognized
+  even when its recorded band does not cover the exact landing spot.
+- A world-Y drift watchdog (``_world_drift_check``) re-anchors silently while
+  cruising: the tracker prefers incremental phase correlation, whose per-frame
+  error accumulates, so every few seconds the raw world Y is compared with the
+  believed floor's expected anchor at the marker X and corrected when the gap
+  exceeds ``world_drift_reanchor_threshold`` (0.35 diamonds).
+
+A knock-down fall is reconciled in ``_resolve_fall`` ->
+``_reconcile_landed_floor``: the OpenCV world-Y tracker LAGS a fast fall, so
+confident world-Y samples are collected until they stabilize (3 frames within
+``fall_settle_epsilon`` 0.15 diamonds, or the 1.2 s settle window times out)
+and the landing floor is resolved world-Y-authoritatively over every recorded
+layer; the marker Y is only a fallback when it matches exactly one layer, and
+an at/below-bottom reading resolves to the bottom floor.  The tracker is then
+re-anchored to the resolved floor - a monster knock-down can never leave the
+world-Y origin on the pre-fall floor, which is what lets climb attach/arrival
+verification (world-Y progress based) work on the way back up.
+
 Recording keeps both a canonical layer anchor and each point's raw
 `observed_world_y`. The raw values form a stair-layer interval only when they
 track the point's adaptive `coordinate_v2.y_diamond` within a bounded residual;
@@ -370,6 +403,18 @@ only suppresses unsafe stair jumps during settling.
 - Landing inside the patrol range restarts or continues that floor.
 - Landing below the range starts climb-to-route using each current floor's
   rope; landing above starts drop-to-route.
+- A knock-down landing is reconciled WORLD-Y-authoritatively: the raw marker Y
+  is screen-relative on a scrolling minimap, and the OpenCV tracker lags fast
+  falls, so the landing floor is resolved only after the raw world Y stabilizes
+  (settle window) and the tracker is re-anchored to the resolved floor
+  (``_resolve_fall`` / ``_reconcile_landed_floor``).  A landing at/below the
+  lowest recorded band resolves to the bottom floor - the bottom is always
+  recognized, so the return-to-route starts instead of a stale route keeping
+  the character walking on the wrong floor.
+- The world-Y origin is continuously kept honest: while cruising on a
+  confirmed floor the drift watchdog re-anchors when incremental correlation
+  drift exceeds its threshold, and the idle pin only masks the reading while
+  the marker Y agrees with the believed floor.
 - Every 0.75 seconds, a state-independent verifier reuses the already detected
   yellow marker. Two matching readings on a recorded out-of-range floor clear
   obsolete climb/drop state and enter the same return path; it adds no capture
@@ -554,6 +599,19 @@ in `ui_worker.py`:
   height is set to chrome + the taller column's required height (clamped to
   minsize), so rows added grow the window and rows deleted shrink it back
   with no leftover bottom padding.
+- 运行日志 (running-log) panel: a LabelFrame panel (title + outline) like
+  the other panels.  Its messages are shown in the plain message-hint style
+  of the 图层校准与巡逻 panel (normal ttk.Label text): only the latest few
+  significant events - patrol started, patrol ended (including external/
+  auto stops), and ERROR+ records.  Two icon buttons sit at the panel's
+  top-right and appear while patrol is NOT running (report time): the
+  archive icon copies the in-memory running log, the user icon copies the
+  user settings JSON.  `UiLogHandler` retains the latest 600 formatted lines
+  in memory (deque, oldest dropped) - no per-line disk I/O; the ordinary
+  file handler still owns the on-disk log.  Lifecycle markers are logged
+  from `_start_patrol`/`_stop_patrol`/`_sync_patrol_ui_state`; the
+  patrol-state sync is debounced over two polls so a transient controller
+  toggle (e.g. a self-rescue) never looks like a patrol stop.
 - `_GEOMETRY_FORMAT` (= 5) version-tags the record in the ignored
   `ui_window_settings.json`; a stale/legacy/manual record (older caption or
   content-only semantics, DPI-aware physical pixels, remembered manual

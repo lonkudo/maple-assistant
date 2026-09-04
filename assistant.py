@@ -802,6 +802,9 @@ def main() -> int:
             climb_failed_cycles_reset=int(
                 calibration.get("climb_failed_cycles_reset", 3)
             ),
+            climb_lateral_cycles_reset=int(
+                calibration.get("climb_lateral_cycles_reset", 3)
+            ),
             patrol_cycles_per_layer=int(
                 calibration.get("patrol_cycles_per_layer", 2)
             ),
@@ -831,6 +834,36 @@ def main() -> int:
             # Falling recovery knobs (see rope_calibration.json).
             fall_detect_frames=int(calibration.get("fall_detect_frames", 3)),
             fall_marker_y_gain=float(calibration.get("fall_marker_y_gain", 0.015)),
+            # Landing reconciliation (world-Y settle + re-anchor to the true
+            # layer after a knock-down) and the world-Y drift watchdog.
+            fall_settle_min_frames=int(
+                calibration.get("fall_settle_min_frames", 3)
+            ),
+            fall_settle_epsilon=float(
+                calibration.get("fall_settle_epsilon", 0.15)
+            ),
+            fall_settle_max_seconds=float(
+                calibration.get("fall_settle_max_seconds", 1.2)
+            ),
+            world_drift_check_interval_seconds=float(
+                calibration.get("world_drift_check_interval_seconds", 2.0)
+            ),
+            world_drift_reanchor_threshold=float(
+                calibration.get("world_drift_reanchor_threshold", 0.35)
+            ),
+            rescue_cycle_limit=int(calibration.get("rescue_cycle_limit", 3)),
+            rescue_probe_attack_block_seconds=float(
+                calibration.get("rescue_probe_attack_block_seconds", 2.0)
+            ),
+            rescue_probe_hold_seconds=float(
+                calibration.get("rescue_probe_hold_seconds", 0.7)
+            ),
+            rescue_probe_settle_seconds=float(
+                calibration.get("rescue_probe_settle_seconds", 0.2)
+            ),
+            rescue_probe_move_threshold=float(
+                calibration.get("rescue_probe_move_threshold", 0.006)
+            ),
             drop_chord_hold_seconds=float(
                 calibration.get("drop_chord_hold_seconds", 0.10)
             ),
@@ -977,6 +1010,8 @@ def main() -> int:
             ),
             on_recording_verified=save_recording_minimap_calibration,
             log_queue=ui_log_handler.messages if ui_log_handler is not None else None,
+            ui_log_handler=ui_log_handler,
+            user_config_path=str(config_store.user_path),
             automation_active_event=automation_active,
         )
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 from marker_detector import DiamondSizeTracker, detect_yellow_diamond
 from map_identity import MapIdentityStore
@@ -310,15 +311,38 @@ class HoverTooltip:
 
 
 class UiLogHandler(logging.Handler):
-    """Feed formatted logs to Tk without allowing an unbounded backlog."""
+    """Feed formatted logs to Tk without an unbounded backlog or disk I/O.
 
-    def __init__(self, capacity: int = 300) -> None:
+    The UI panel shows only SIGNIFICANT events - patrol started, patrol
+    ended, and ERROR+ (critical bugs) - while a bounded in-memory history
+    keeps the latest ``history`` formatted lines (default 600) for the
+    "copy running log" action.  Oldest lines are dropped like garbage once
+    the history is full; nothing is written to disk here (the ordinary file
+    handler owns the on-disk log).
+    """
+
+    def __init__(self, capacity: int = 300, history: int = 600) -> None:
         super().__init__()
         self.messages: "queue.Queue[str]" = queue.Queue(maxsize=max(20, capacity))
+        self._history: "collections.deque[str]" = collections.deque(
+            maxlen=max(50, int(history))
+        )
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _significant(record: logging.LogRecord, message: str) -> bool:
+        if record.levelno >= logging.ERROR:
+            # Critical bugs (LOG.error / LOG.exception / CRITICAL).
+            return True
+        return LOG_RUN_START in message or LOG_RUN_STOP in message
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = self.format(record)
+            with self._lock:
+                self._history.append(message)
+            if not self._significant(record, message):
+                return
             while True:
                 try:
                     self.messages.put_nowait(message)
@@ -330,6 +354,48 @@ class UiLogHandler(logging.Handler):
                         return
         except Exception:
             self.handleError(record)
+
+    def history_text(self) -> str:
+        """Latest retained log lines, oldest first (bounded, in memory)."""
+
+        with self._lock:
+            return "\n".join(self._history)
+
+
+# The 运行日志 panel displays only significant events: patrol started /
+# patrol ended and ERROR+ records (critical bugs).  The full recent stream
+# is retained in memory (UiLogHandler history, default 600 lines) and is
+# copied to the clipboard by the archive icon button.
+LOG_RUN_START = "巡逻已开始"
+LOG_RUN_STOP = "巡逻已停止"
+
+
+def _make_log_icon(kind: str) -> ImageTk.PhotoImage:
+    """16x16 monochrome glyph for the running-log action buttons.
+
+    ``archive`` = a document sheet (copy the running log); ``user`` = a
+    person silhouette (copy the user settings).  Drawn with PIL so the
+    glyphs render identically on every Windows theme/font set.
+    """
+
+    size = 16
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    ink = (70, 70, 70, 255)
+    paper = (248, 248, 248, 255)
+    if kind == "archive":
+        # Document sheet with a folded corner and two content lines.
+        draw.rectangle((2, 3, 13, 14), fill=paper, outline=ink)
+        draw.line((2, 3, 7, 3, 10, 6), fill=ink)  # folded corner hint
+        draw.line((5, 8, 12, 8), fill=ink)
+        draw.line((5, 11, 12, 11), fill=ink)
+    elif kind == "user":
+        # Head + shoulders silhouette.
+        draw.ellipse((4, 1, 12, 9), outline=ink)
+        draw.arc((1, 8, 15, 20), start=180, end=360, fill=ink)
+    else:
+        raise ValueError(f"unknown log icon kind: {kind!r}")
+    return ImageTk.PhotoImage(image)
 
 
 @dataclass(frozen=True)
@@ -591,6 +657,8 @@ class UiWorker(threading.Thread):
         on_capture_now: Optional[Callable[[], Any]] = None,
         on_recording_verified: Optional[Callable[[DebugSnapshot], None]] = None,
         log_queue: Optional["queue.Queue[str]"] = None,
+        ui_log_handler: Any = None,
+        user_config_path: Optional[str] = None,
         automation_active_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
@@ -655,6 +723,8 @@ class UiWorker(threading.Thread):
         self.on_capture_now = on_capture_now
         self.on_recording_verified = on_recording_verified
         self.log_queue = log_queue
+        self.ui_log_handler = ui_log_handler
+        self.user_config_path = user_config_path
         self.automation_active_event = automation_active_event
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
@@ -684,6 +754,10 @@ class UiWorker(threading.Thread):
         # assistant.py); the poll sync below refreshes the Start/Stop buttons
         # when that happens instead of leaving them stale.
         self._patrol_ui_running: Optional[bool] = None
+        # Debounce for external patrol-state changes (a self-rescue can
+        # disable and re-enable the controller within seconds; only a state
+        # that holds for two consecutive polls is treated as a real change).
+        self._patrol_pending_running: Optional[bool] = None
 
     def run(self) -> None:
         try:
@@ -1608,30 +1682,44 @@ class UiWorker(threading.Thread):
                 self._map_name_label = ttk.Label(col1)
                 self._map_name_label.pack(anchor="w", pady=(4, 0))
 
-            debug_frame = ttk.LabelFrame(col2, text="调试日志", padding=6)
-            # The log panel is FIXED so it must not stretch with the window
-            # (that inflated the actual window height beyond the configured
-            # initial value).  The LabelFrame's own label + border take ~33px
-            # off the inner area, so the frame is 313px to make the visible
-            # log text area exactly 280px.  Only the log text inside
-            # scrolls; the window itself resizes vertically without the log
-            # panel growing.
-            debug_frame.configure(height=313)
-            debug_frame.pack_propagate(False)
-            debug_frame.pack(fill="x", pady=(10, 0))
-            self._log_text = tk.Text(
-                debug_frame,
-                height=10,
-                wrap="none",
-                state="disabled",
-                font=("Consolas", 9),
+            # 运行日志 panel: a real LabelFrame panel (title + outline) like
+            # the other panels.  Messages inside keep the plain hint style
+            # of the 图层校准与巡逻 status hints; the two icon buttons sit at
+            # the panel's top-right and appear once patrol has ended (report
+            # time): the archive button copies the running log, the user
+            # button copies user settings.  Only significant events are
+            # shown (the latest few lines); the full 600-line in-memory
+            # history stays available through the archive button - no disk
+            # I/O per line.
+            log_panel = ttk.LabelFrame(col2, text="运行日志", padding=(6, 4))
+            log_panel.pack(fill="x", pady=(10, 0))
+            log_actions = ttk.Frame(log_panel)
+            log_actions.pack(fill="x")
+            self._log_archive_photo = _make_log_icon("archive")
+            self._log_user_photo = _make_log_icon("user")
+            self._copy_log_button = ttk.Button(
+                log_actions,
+                image=self._log_archive_photo,
+                command=self._copy_running_log,
+                takefocus=False,
             )
-            log_scroll = ttk.Scrollbar(
-                debug_frame, orient="vertical", command=self._log_text.yview
+            self._copy_config_button = ttk.Button(
+                log_actions,
+                image=self._log_user_photo,
+                command=self._copy_user_config,
+                takefocus=False,
             )
-            self._log_text.configure(yscrollcommand=log_scroll.set)
-            self._log_text.pack(side="left", fill="both", expand=True)
-            log_scroll.pack(side="right", fill="y")
+            self._copy_config_button.pack(side="right", padx=(3, 0))
+            self._copy_log_button.pack(side="right", padx=(3, 0))
+            self._log_display_lines: list[str] = []
+            self._log_label = ttk.Label(
+                log_panel,
+                text="",
+                justify="left",
+                anchor="w",
+                wraplength=430,
+            )
+            self._log_label.pack(fill="x", anchor="w", pady=(3, 0))
 
             # Pin the window to the configured initial geometry AFTER all
             # content has been built: pack propagation from the panels would
@@ -2025,7 +2113,10 @@ class UiWorker(threading.Thread):
         Disconnect alerts and sustained focus loss stop patrol directly on
         the controller from assistant.py (no UI action runs), so without
         this check the Stop button stayed enabled and Start stayed greyed
-        even though patrol had already stopped.
+        even though patrol had already stopped.  A controller toggle can
+        also be TRANSIENT (a self-rescue disables and re-enables patrol
+        within seconds), so the new state must hold for two consecutive
+        polls before it is treated as a real change and logged.
         """
 
         if (self.patrol_controller is None
@@ -2033,9 +2124,23 @@ class UiWorker(threading.Thread):
             return
         running = bool(self.patrol_controller.is_enabled())
         if running == getattr(self, "_patrol_ui_running", None):
+            self._patrol_pending_running = None
             return
+        if getattr(self, "_patrol_pending_running", None) != running:
+            self._patrol_pending_running = running
+            return
+        self._patrol_pending_running = None
+        was_running = bool(getattr(self, "_patrol_ui_running", False))
         self._refresh_patrol_controls()
         self._patrol_ui_running = running
+        if hasattr(self, "_update_log_icon_visibility"):
+            self._update_log_icon_visibility()
+        if was_running and not running:
+            # Patrol ended outside the UI (auto-stop / focus loss / rescue
+            # give-up): surface it in the running log.
+            LOG.info(LOG_RUN_STOP + "（外部/自动停止）。")
+        elif not was_running and running:
+            LOG.info(LOG_RUN_START + "。")
 
     def _drain_hotkey_actions(self) -> None:
         """Run physical hotkey actions safely on Tk's owning thread."""
@@ -2166,7 +2271,7 @@ class UiWorker(threading.Thread):
         self._automation_status_label.configure(text=text)
 
     def _drain_logs(self) -> None:
-        if self.log_queue is None or not hasattr(self, "_log_text"):
+        if self.log_queue is None or not hasattr(self, "_log_label"):
             return
         messages: list[str] = []
         while True:
@@ -2176,26 +2281,80 @@ class UiWorker(threading.Thread):
                 break
         if not messages:
             return
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", "\n".join(messages) + "\n")
-        line_count = int(self._log_text.index("end-1c").split(".")[0])
-        if line_count > 300:
-            self._log_text.delete("1.0", f"{line_count - 300}.0")
-        self._log_text.see("end")
-        self._log_text.configure(state="disabled")
+        # Hint-style display (same look as the plain message hints): only the
+        # latest few significant events, one compact line each.  The full
+        # 600-line in-memory history stays available through the copy action.
+        for message in messages:
+            line = " ".join(message.splitlines())
+            if len(line) > 220:
+                line = line[:220] + "…"
+            self._log_display_lines.append(line)
+        del self._log_display_lines[:-8]
+        self._log_label.configure(text="\n".join(self._log_display_lines))
 
     def _trim_log_lines(self, limit: int) -> None:
-        """Keep only the latest ``limit`` lines in the debug log widget."""
-        if not hasattr(self, "_log_text"):
+        """Keep only the latest ``limit`` lines in the running-log display."""
+        if not hasattr(self, "_log_display_lines"):
             return
         try:
-            self._log_text.configure(state="normal")
-            line_count = int(self._log_text.index("end-1c").split(".")[0])
-            if line_count > limit:
-                self._log_text.delete("1.0", f"{line_count - limit}.0")
-            self._log_text.configure(state="disabled")
+            if len(self._log_display_lines) > limit:
+                del self._log_display_lines[:-limit]
+            self._log_label.configure(text="\n".join(self._log_display_lines))
         except Exception:
             pass
+
+    def _update_log_icon_visibility(self) -> None:
+        """Show the copy icons only after patrol has ended (report time)."""
+
+        if not hasattr(self, "_copy_log_button"):
+            return
+        running = bool(
+            self.patrol_controller is not None
+            and self.patrol_controller.is_enabled()
+        )
+        for button in (self._copy_log_button, self._copy_config_button):
+            if running:
+                button.pack_forget()
+            elif not button.winfo_manager():
+                button.pack(side="right", padx=(3, 0))
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        root = getattr(self, "_root", None)
+        if root is None:
+            LOG.warning("clipboard copy skipped: UI root not ready")
+            return
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(text)
+        except Exception:
+            LOG.exception("clipboard copy failed")
+
+    def _copy_running_log(self) -> None:
+        """Archive button: copy the in-memory running log to the clipboard."""
+
+        text = ""
+        if self.ui_log_handler is not None:
+            text = self.ui_log_handler.history_text()
+        if not text.strip():
+            text = "(暂无运行日志)"
+        self._copy_to_clipboard(text)
+        LOG.info("运行日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
+
+    def _copy_user_config(self) -> None:
+        """User icon button: copy the user settings JSON to the clipboard."""
+
+        text = ""
+        if self.user_config_path:
+            try:
+                text = Path(self.user_config_path).read_text(encoding="utf-8")
+            except OSError as exc:
+                LOG.error("复制用户配置失败: %s", exc)
+                self._copy_to_clipboard(f"(无法读取用户配置: {exc})")
+                return
+        if not text.strip():
+            text = "(用户配置文件不存在或为空)"
+        self._copy_to_clipboard(text)
+        LOG.info("用户配置已复制到剪贴板")
 
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
@@ -4374,6 +4533,7 @@ class UiWorker(threading.Thread):
             self._yolo_start()
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已开始。")
+        LOG.info(LOG_RUN_START + "。")
         return True
 
     def _stop_patrol(self) -> bool:
@@ -4386,8 +4546,7 @@ class UiWorker(threading.Thread):
         # mode the character stands and the YOLO executor attacks, so without
         # this the character would keep attacking after Stop Patrol.
         self._yolo_stop()
-        # 每次停止巡逻：调试日志只保留最新 100 条。
-        self._trim_log_lines(100)
+        LOG.info(LOG_RUN_STOP + "。")
         self._refresh_patrol_controls()
         self._control_status.configure(text="巡逻已停止。")
         return True
@@ -4448,9 +4607,13 @@ class UiWorker(threading.Thread):
             self._add_layer_button.configure(state="disabled")
             self._delete_layer_button.configure(state="disabled")
             self._reset_recording_button.configure(state="disabled")
+            if hasattr(self, "_update_log_icon_visibility"):
+                self._update_log_icon_visibility()
             return
         running = bool(self.patrol_controller.is_enabled())
         self._patrol_ui_running = bool(running)
+        if hasattr(self, "_update_log_icon_visibility"):
+            self._update_log_icon_visibility()
         # Physical hotkeys follow the same state: while patrol runs every
         # binding except the patrol-toggle chord is temporarily disabled.
         hotkeys = getattr(self, "hotkey_worker", None)
