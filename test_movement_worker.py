@@ -134,7 +134,12 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._route_patrol_cycle, 1)
         self.assertIsNone(worker._return_mode)
         self.assertEqual(worker._climb_state.phase, "idle")
-        self.assertEqual(sender.released, ["up"])
+        # A fresh patrol start releases every movement key once (a game-side
+        # stuck key from the previous run must not survive the restart).
+        self.assertEqual(
+            sender.released,
+            ["up", "up", "down", "left", "right", "alt", "z"],
+        )
         self.assertEqual(
             worker._route_target(observation)[2], "layer3.left-most"
         )
@@ -365,6 +370,86 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(sender.events.count(("down", "right")), 2)
         self.assertEqual(sender.events.count(("down", "z")), 2)
         self.assertTrue(pickup_active.is_set())
+
+    def test_stuck_walk_releases_all_held_keys(self) -> None:
+        # A knock-down / focus dip can make the game MISS key-ups: the game
+        # keeps old keys pressed (walking right, holding Up, pickup Z, ...)
+        # even though the worker already released them.  At STUCK detections
+        # EVERY movement key is re-released once (harmless if already up) so
+        # the next re-arm applies cleanly - event-driven only, never a timer.
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.events = []
+                self.owned = {"right", "up"}   # game-side stuck keys
+            def key_down(self, key):
+                self.events.append(("down", key))
+                self.owned.add(key)
+                return True
+            def key_up(self, key):
+                self.events.append(("up", key))
+                self.owned.discard(key)
+                return True
+            def press(self, key, duration=0):
+                self.events.append(("press", key, duration))
+                return True
+            def is_target_focused(self):
+                return True
+            def is_key_down(self, key):
+                return key in self.owned
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={},
+        )
+        # The stuck release clears every movement key without pressing
+        # anything itself.
+        worker._release_stuck_keys()
+        self.assertEqual(
+            [key for kind, key in sender.events if kind == "up"],
+            ["up", "down", "left", "right", "alt", "z"],
+        )
+        self.assertFalse(sender.owned)
+        self.assertEqual(sender.events.count(("down", "left")), 0)
+        # Normal walk arming must NOT release anything (no timer): the
+        # direction is simply held.
+        sender.events = []
+        self.assertTrue(worker._send_walk_hold(
+            MovementDecision("left", "walk", 2.0)))
+        self.assertEqual(sender.events, [("down", "left"), ("down", "z")])
+
+    def test_confirmed_fall_releases_all_keys_once(self) -> None:
+        # A knock-down mid-action can leave a key stuck in the game (its
+        # key-up was lost).  As soon as an unexpected fall is confirmed every
+        # movement key is released ONCE so the character lands free instead
+        # of being pushed against a wall by the stuck key.
+        class Sender:
+            dry_run = True
+            def __init__(self):
+                self.ups = []
+            def key_up(self, key):
+                self.ups.append(key)
+                return True
+            def key_down(self, key):
+                return True
+            def press(self, key, duration=0):
+                return True
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(),
+            important_positions={},
+        )
+        obs = MinimapObservation(Point(.5, .50), None, .9, (0, 0, 1, 1))
+        # Falling frames (marker Y drops fast); the release fires once when
+        # the fall is confirmed and never again for the same fall.
+        for y in (.52, .54, .56, .58, .60):
+            worker._track_fall(MinimapObservation(
+                Point(.5, y), None, .9, (0, 0, 1, 1)
+            ))
+        self.assertEqual(sender.ups, ["up", "down", "left", "right", "alt", "z"])
+        self.assertTrue(worker._fall_keys_released)
 
     def test_layer_debug_logging_accepts_float_player_y(self) -> None:
         worker = MovementWorker(

@@ -418,6 +418,24 @@ stuck with "weird" Alt+Down drops and failed return climbs.
   copy user settings); the log lives in memory only (UiLogHandler deque, no
   per-line disk I/O). Patrol-state sync is debounced over two polls so a
   transient self-rescue toggle never looks like a patrol stop.
+- **v0108-v0113** Game-side STUCK-KEY protection. Root cause: a key-up can be
+  LOST by the game when it is posted during a knock-down / focus blip (or at
+  the moment a patrol stops), so the game keeps the old key pressed forever:
+  the character walks right while the bot holds left (right-edge incident),
+  or is pinned against the left edge / walks right at the right edge after a
+  knock-down (left-edge incidents, repeated).  Fixes, all event-driven (no
+  timer, no needless key spam):
+  - `_release_stuck_keys()` - unconditional key-ups for up/down/left/right/
+    alt/z plus the sender's release-all - runs ONLY at stuck detections:
+    far-from-rope frozen walk, rope-edge/on-rope stall recovery, stair-jump
+    stall (v0109-v0110), and once as soon as a fall is confirmed (v0111).
+  - Direction switches at left-most/right-most endpoints re-send the old
+    direction's key-up after the new key is down (v0112) - endpoints are
+    where direction flips and a lost key-up pins the character into the
+    edge it just reached.
+  - Patrol start releases every movement key once: on the input-armed edge
+    and on every fresh patrol/return state apply (v0113) - a key stuck
+    from the previous run's stop cannot freeze the new patrol.
 
 ### HUD geometry (measured on the real client, 1366x768 reference)
 

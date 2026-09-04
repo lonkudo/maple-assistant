@@ -1969,6 +1969,10 @@ class MovementWorker(threading.Thread):
             return
         if self._climb_state.phase != "idle":
             return  # already climbing
+        # Stuck at the rope area while a walk was issued: clear any game-side
+        # stuck key (lost key-up during a knock-down) before the climb/jump
+        # recovery below takes over.
+        self._release_stuck_keys()
         gap = rope_x - observation.player.x
         if abs(gap) > ROPE_STALL_ALIGNMENT_RANGE:
             # Defensive second gate: callers must never convert an ordinary
@@ -2085,6 +2089,27 @@ class MovementWorker(threading.Thread):
             except Exception:
                 LOG.exception("hold manager failed")
 
+    def _release_stuck_keys(self) -> None:
+        """Release EVERY key the bot may be holding at a stuck detection.
+
+        A knock-down / focus dip can make the game MISS a key-up, so the game
+        keeps an OLD key pressed - walking right, holding Up on a rope,
+        pickup Z, Alt - even though the sender already released it.  At a
+        stuck detection all movement keys are re-released: unconditional
+        key-ups for the full movement set (clears game-side stuck presses the
+        sender no longer owns) plus the sender's release-all (clears whatever
+        the bot still owns).  The next frame's decisions re-press only what
+        is actually needed.  Never runs on a timer - stuck events only.
+        """
+
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_up is not None:
+            for key in ("up", "down", "left", "right", "alt", "z"):
+                key_up(key)
+        release_all = getattr(self.key_sender, "release_all_keys", None)
+        if callable(release_all):
+            release_all()
+
     def _send_walk_hold(self, decision: MovementDecision) -> bool:
         """Schedule a direction-key hold: press now, release after the
         duration (or early on attack) via the hold-manager thread.
@@ -2130,6 +2155,7 @@ class MovementWorker(threading.Thread):
                     if self.pickup_active_event is not None:
                         self.pickup_active_event.clear()
             if self._walk_hold_key != decision.key:
+                previous = self._walk_hold_key
                 # 换方向：先松开旧键再按新键。
                 self._release_walk_hold()
                 claimed = key_down(decision.key) is not False
@@ -2141,6 +2167,19 @@ class MovementWorker(threading.Thread):
                     )
                     return False
                 self._walk_hold_key = decision.key
+                if previous in ("left", "right"):
+                    # Direction switches happen AT the left-most/right-most
+                    # endpoints - exactly where a key-up can get lost (a
+                    # knock-down / focus blip at that moment).  The game then
+                    # keeps the OLD direction, which points INTO the edge the
+                    # character just reached: it pins against the wall and
+                    # freezes while this worker already presses the new
+                    # direction.  Re-send the old key's key-up once after the
+                    # new key is down (redundant + harmless) so the game-side
+                    # stuck press is cleared.
+                    key_up_old = getattr(self.key_sender, "key_up", None)
+                    if key_up_old is not None:
+                        key_up_old(previous)
             if not self._walk_hold_z:
                 if key_down("z") is not False:
                     self._walk_hold_z = True
@@ -2448,6 +2487,9 @@ class MovementWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
+        # True once the automation input gate has been observed active, so the
+        # disarmed->armed edge (Start Patrol) can be detected exactly once.
+        self._automation_was_active = False
         # Set while the character is actively walking (left/right decisions),
         # used by the pickup worker to only tap Z during movement.
         self.moving_active_event = moving_active_event
@@ -2646,6 +2688,11 @@ class MovementWorker(threading.Thread):
         self._fall_last_y: Optional[float] = None
         self._fall_frames = 0
         self._fall_pending = False
+        # Set once per confirmed fall: every movement key was released (see
+        # ``_release_stuck_keys``) so a key whose key-up the game missed
+        # during the knock-down cannot pin the character against a wall after
+        # landing.
+        self._fall_keys_released = False
         # Landing-reconciliation settle state (see _reconcile_landed_floor):
         # confident world-Y samples collected after a fall stops, until they
         # stabilize or the settle window times out.
@@ -3792,6 +3839,10 @@ class MovementWorker(threading.Thread):
 
         self._release_climb_up()
         self._release_walk_hold()
+        # A fresh patrol start must not inherit a game-side stuck movement key
+        # from the previous run (its key-up can be lost when patrol stopped):
+        # release every movement key once before the new route begins.
+        self._release_stuck_keys()
         self._climb_state = ClimbState()
         self._descending_to_first = False
         self._return_mode = None
@@ -3800,6 +3851,7 @@ class MovementWorker(threading.Thread):
         self._fall_pending = False
         self._fall_frames = 0
         self._fall_last_y = None
+        self._fall_keys_released = False
         self._reset_fall_settle()
         self._forced_phase_entry = None
         self._aligned_frames = 0
@@ -3971,6 +4023,7 @@ class MovementWorker(threading.Thread):
         self._fall_pending = False
         self._fall_frames = 0
         self._fall_last_y = None
+        self._fall_keys_released = False
         self._reset_fall_settle()
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
@@ -4197,6 +4250,7 @@ class MovementWorker(threading.Thread):
         self._fall_pending = False
         self._fall_last_y = None
         self._fall_frames = 0
+        self._fall_keys_released = False
         self._reset_fall_settle()
         self._last_fall_resolved_at = time.monotonic()
         if self._return_mode is not None:
@@ -4269,6 +4323,16 @@ class MovementWorker(threading.Thread):
             return
         if y - last >= self._fall_marker_y_gain:
             self._fall_frames += 1
+            # A knock-down mid-action can leave a key stuck in the game (its
+            # key-up was lost during the knock): release EVERY movement key
+            # once as soon as the fall is confirmed, so the character lands
+            # free instead of being pushed against the first wall in the
+            # stuck direction (observed: stuck Left pinned at the left edges
+            # of layer2 and layer1 after a knock-down).
+            if (self._fall_frames >= self._fall_detect_frames
+                    and not self._fall_keys_released):
+                self._fall_keys_released = True
+                self._release_stuck_keys()
             return
         # The fall stopped (marker Y no longer dropping fast).
         if self._fall_pending:
@@ -5013,6 +5077,7 @@ class MovementWorker(threading.Thread):
             try:
                 if (self.automation_active_event is not None
                         and not self.automation_active_event.is_set()):
+                    self._automation_was_active = False
                     self._release_climb_up()
                     self._release_walk_hold()
                     if self.climbing_active_event is not None:
@@ -5026,6 +5091,14 @@ class MovementWorker(threading.Thread):
                     # Each (re)start of patrol gets a fresh jump-grace window.
                     self._patrol_started_at = None
                     continue
+                if (self.automation_active_event is not None
+                        and not self._automation_was_active):
+                    # Input just got armed (Start Patrol): clear any movement
+                    # key the game may still hold from a previous run whose
+                    # key-up was lost at stop (observed: character stuck as
+                    # soon as a new patrol started).  Runs once per arm.
+                    self._automation_was_active = True
+                    self._release_stuck_keys()
                 if self._patrol_started_at is None:
                     self._patrol_started_at = time.monotonic()
                 # Attack priority: while the YOLO attack worker reports an
@@ -5698,6 +5771,10 @@ class MovementWorker(threading.Thread):
                     elif decision.key.startswith("stair_jump_"):
                         # Stuck at a recorded stair trigger: hold the travel
                         # direction and tap Alt (jump) mid-hold to clear it.
+                        # Clear any game-side stuck keys first (lost key-ups
+                        # during a knock-down) so the held jump direction
+                        # really applies.
+                        self._release_stuck_keys()
                         self._send_stair_jump(decision)
                     elif decision.key in ("left", "right"):
                         # 陈旧爬绳输入刹车：决策是普通左右走，但爬绳状态仍认为
@@ -5757,6 +5834,11 @@ class MovementWorker(threading.Thread):
                                 "re-arming %s", decision.key
                             )
                             self._rope_approach_far_stall_frames = 0
+                            # Stuck while a walk is issued: the game may be
+                            # holding keys whose key-ups were lost (knock-down
+                            # / focus dip).  Release every movement key once -
+                            # the re-arm below re-presses what is needed.
+                            self._release_stuck_keys()
                             self._release_walk_hold()
                         # Cancellable walk hold: the movement key is released
                         # within ~20ms when the attack selects a target, so
