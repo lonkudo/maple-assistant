@@ -518,7 +518,7 @@ class TradeWorker(threading.Thread):
             self.capture_active_event.clear()
             self.overlay.clear()
 
-    def _accept(self) -> None:
+    def _accept(self, message: str) -> None:
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
             LOG.warning("trade accept ignored: game window unavailable")
             return
@@ -529,7 +529,15 @@ class TradeWorker(threading.Thread):
         LOG.info("trade accept click client=%s screen=%s", ACCEPT_INVITATION, point)
         VirtualMouse.click(*point)
         time.sleep(0.20)
-        self._confirm_trade(geometry)
+        confirmed = self._confirm_trade(geometry)
+        LOG.info("trade acceptance confirmation submitted=%s", confirmed)
+        if not confirmed:
+            return
+        # Let the accepted trade dialog settle before entering chat text.
+        time.sleep(0.35)
+        if self._send_message(geometry, message):
+            self._play_success()
+            LOG.info("trade acceptance workflow completed")
 
     def run(self) -> None:
         self.overlay.start()
@@ -544,7 +552,7 @@ class TradeWorker(threading.Thread):
                     if action == "trade:invite":
                         self._invite(message)
                     elif action == "trade:accept":
-                        self._accept()
+                        self._accept(message)
                 except Exception:
                     LOG.exception("trade action failed: %s", action)
                 finally:
