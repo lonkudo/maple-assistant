@@ -4057,7 +4057,7 @@ class UiWorker(threading.Thread):
         "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
         "add_highest_layer": "添加最高楼层",
         "delete_highest_layer": "删除最高楼层",
-        "toggle_patrol": "开始 / 停止巡逻 (Ctrl+A)",
+        "toggle_patrol": "开始 / 停止巡逻 (Ctrl+`)",
         "adjust_fixed_attack_interval:-0.1": "缩短固定攻击间隔 0.1 秒",
         "adjust_fixed_attack_interval:+0.1": "加长固定攻击间隔 0.1 秒",
     }
@@ -4192,13 +4192,13 @@ class UiWorker(threading.Thread):
             else "已停用 (hotkey.json → enabled: false)"
         header_text = (
             f"快捷键总开关: {state_text}\n"
-            "巡逻运行时，除 Ctrl+A (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
+            "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
             "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
             "修改 hotkey.json 后需重启程序生效。"
         )
         footer_text = (
             "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
-            "巡逻中自动停用除 Ctrl+A 与攻击间隔外的快捷键; "
+            "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
             "ignore_injected=true 只响应真实物理按键。\n"
             "移开鼠标即自动关闭本提示。"
         )
