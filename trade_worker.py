@@ -471,6 +471,16 @@ class TradeWorker(threading.Thread):
             # arrives or the assistant is stopped.
             if self._wait_for_trader(geometry):
                 self.overlay.clear()
+                # The detector overlay or another desktop window may now be
+                # foreground.  Focus the game again before its trade dialog
+                # receives the requested absolute click and Enter.
+                if (self.key_sender.select_window() is False
+                        or not self.key_sender.is_game_foreground()):
+                    LOG.warning(
+                        "trade confirmation aborted: game could not be "
+                        "refocused after trader detection"
+                    )
+                    return
                 # The trader marker may appear one frame before the game's
                 # confirmation dialog is clickable.  Let that dialog settle
                 # then complete click + Enter as a separate stage before any
