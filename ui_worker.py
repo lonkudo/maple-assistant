@@ -655,6 +655,7 @@ class UiWorker(threading.Thread):
         small_step_worker: Any = None,
         hotkey_queue: Optional["queue.Queue[str]"] = None,
         hotkey_worker: Any = None,
+        trade_worker: Any = None,
         movement_worker: Any = None,
         character_worker: Any = None,
         shutdown_worker: Any = None,
@@ -696,6 +697,9 @@ class UiWorker(threading.Thread):
         # Physical hotkey hook whose bindings are temporarily disabled while
         # patrol runs (only the patrol-toggle chord stays live).
         self.hotkey_worker = hotkey_worker
+        # Isolated Ctrl+Q/Ctrl+W trade workflow.  It uses the existing game
+        # capture worker only while checking for a trader.
+        self.trade_worker = trade_worker
         # Movement worker whose jump-rope logic follows the attack mode:
         # Fixed Attack mode runs without YOLO, so the minimap logic must own
         # the rope jump there.
@@ -2344,6 +2348,29 @@ class UiWorker(threading.Thread):
                         int(action.partition(":")[2])
                     ):
                         self._play_action_sound(False)
+                elif action.startswith("trade:"):
+                    message = (
+                        self._quick_messages[0]
+                        if getattr(self, "_quick_messages", []) else ""
+                    )
+                    if action == "trade:invite" and not message:
+                        self._quick_message_status.configure(
+                            text="交易失败：请先添加第一条快捷消息。"
+                        )
+                    elif self.trade_worker is None or not self.trade_worker.request(
+                        action, message
+                    ):
+                        self._quick_message_status.configure(
+                            text="交易失败：交易操作正在进行。"
+                        )
+                    elif action == "trade:invite":
+                        self._quick_message_status.configure(
+                            text="交易：正在邀请并等待交易者。"
+                        )
+                    else:
+                        self._quick_message_status.configure(
+                            text="交易：正在接受邀请。"
+                        )
                 elif action.startswith("record:"):
                     boundary = action.partition(":")[2]
                     self._play_action_sound(self._record_endpoint(boundary))
@@ -4020,7 +4047,7 @@ class UiWorker(threading.Thread):
         "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
         "add_highest_layer": "添加最高楼层",
         "delete_highest_layer": "删除最高楼层",
-        "toggle_patrol": "开始 / 停止巡逻 (Ctrl+`)",
+        "toggle_patrol": "开始 / 停止巡逻 (Ctrl+A)",
         "adjust_fixed_attack_interval:-0.1": "缩短固定攻击间隔 0.1 秒",
         "adjust_fixed_attack_interval:+0.1": "加长固定攻击间隔 0.1 秒",
     }
@@ -4155,13 +4182,13 @@ class UiWorker(threading.Thread):
             else "已停用 (hotkey.json → enabled: false)"
         header_text = (
             f"快捷键总开关: {state_text}\n"
-            "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
+            "巡逻运行时，除 Ctrl+A (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
             "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
             "修改 hotkey.json 后需重启程序生效。"
         )
         footer_text = (
             "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
-            "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
+            "巡逻中自动停用除 Ctrl+A 与攻击间隔外的快捷键; "
             "ignore_injected=true 只响应真实物理按键。\n"
             "移开鼠标即自动关闭本提示。"
         )
@@ -4177,6 +4204,9 @@ class UiWorker(threading.Thread):
             if not isinstance(item, dict):
                 continue
             action = str(item.get("action", ""))
+            # Trade controls are intentionally not public help bindings.
+            if action.startswith("trade:"):
+                continue
             # The ten quick-message slots (Ctrl+1..Ctrl+9, Ctrl+0) share one
             # row instead of ten identical rows.
             if action.startswith("quick_message:"):

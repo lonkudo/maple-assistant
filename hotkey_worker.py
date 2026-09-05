@@ -42,6 +42,8 @@ SELF_INPUT_EXTRA_INFO = 0x4D4150  # "MAP"
 
 KEY_VK = {
     "a": 0x41,
+    "q": 0x51,
+    "w": 0x57,
     "0": 0x30,
     "1": 0x31,
     "2": 0x32,

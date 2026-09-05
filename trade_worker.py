@@ -1,0 +1,335 @@
+"""Independent trade automation: virtual clicks, presence checks, and overlays."""
+
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
+import logging
+import queue
+import sys
+import threading
+import time
+from typing import Any, Optional
+
+import numpy as np
+
+
+LOG = logging.getLogger(__name__)
+
+REFERENCE_CLIENT = (1366, 768)
+CHARACTER_SIZE = 65
+RANGE_SIZE = (650, 65)
+TRADE_MENU_OFFSET = (60, 60)
+CONFIRM_BUTTON = (240, 110)
+ACCEPT_INVITATION = (890, 668)
+TRADE_MESSAGE_BOX = (460, 200)
+PRESENCE_BOX = (140, 100, 180, 140)
+PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
+
+
+class TradeOverlayWorker(threading.Thread):
+    """Draw short-lived range/current-target rectangles without mouse input."""
+
+    def __init__(self, stop_event: threading.Event) -> None:
+        super().__init__(name="trade-overlay", daemon=True)
+        self.stop_event = stop_event
+        self._requests: "queue.Queue[list[tuple[int, int, int, int, str]]]" = (
+            queue.Queue(maxsize=1)
+        )
+
+    def show(self, rectangles: list[tuple[int, int, int, int, str]]) -> None:
+        try:
+            while True:
+                self._requests.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._requests.put_nowait(rectangles)
+        except queue.Full:
+            pass
+
+    def clear(self) -> None:
+        self.show([])
+
+    def run(self) -> None:  # pragma: no cover - visual Windows path
+        if sys.platform != "win32":
+            self.stop_event.wait()
+            return
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+            root.withdraw()
+            popups: list[Any] = []
+
+            def render(rectangles: list[tuple[int, int, int, int, str]]) -> None:
+                nonlocal popups
+                for popup in popups:
+                    try:
+                        popup.destroy()
+                    except Exception:
+                        pass
+                popups = []
+                for left, top, width, height, color in rectangles:
+                    popup = tk.Toplevel(root)
+                    popup.overrideredirect(True)
+                    popup.attributes("-topmost", True)
+                    popup.attributes("-alpha", 0.35)
+                    popup.configure(background=color)
+                    popup.geometry(f"{width}x{height}+{left}+{top}")
+                    popups.append(popup)
+
+            def poll() -> None:
+                if self.stop_event.is_set():
+                    render([])
+                    root.destroy()
+                    return
+                try:
+                    render(self._requests.get_nowait())
+                except queue.Empty:
+                    pass
+                root.after(35, poll)
+
+            root.after(0, poll)
+            root.mainloop()
+        except Exception:
+            LOG.exception("trade overlay stopped unexpectedly")
+
+
+class VirtualMouse:
+    """Windows SendInput mouse clicks; the physical cursor is not used."""
+
+    @staticmethod
+    def click(x: int, y: int, *, right: bool = False) -> None:
+        if sys.platform != "win32":
+            return
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+        left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        top = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        width = max(1, user32.GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1)
+        height = max(1, user32.GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1)
+        dx = round((int(x) - left) * 65535 / width)
+        dy = round((int(y) - top) * 65535 / height)
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", wintypes.WPARAM),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+
+        move = 0x0001 | 0x8000 | 0x4000  # MOVE | ABSOLUTE | VIRTUALDESK
+        down, up = (0x0008, 0x0010) if right else (0x0002, 0x0004)
+        events = (INPUT(0, MOUSEINPUT(dx, dy, 0, move, 0, 0)),
+                  INPUT(0, MOUSEINPUT(dx, dy, 0, move | down, 0, 0)),
+                  INPUT(0, MOUSEINPUT(dx, dy, 0, move | up, 0, 0)))
+        array_type = INPUT * len(events)
+        payload = array_type(*events)
+        sent = user32.SendInput(len(events), ctypes.byref(payload), ctypes.sizeof(INPUT))
+        if sent != len(events):
+            raise OSError(ctypes.get_last_error(), "trade virtual mouse click failed")
+
+
+class TradeWorker(threading.Thread):
+    """Processes Ctrl+Q invite flow and Ctrl+W acceptance flow independently."""
+
+    def __init__(
+        self,
+        frames: "queue.Queue[Any]",
+        stop_event: threading.Event,
+        capture_active_event: threading.Event,
+        key_sender: Any,
+        window_title: str,
+    ) -> None:
+        super().__init__(name="trade-worker", daemon=True)
+        self.frames = frames
+        self.stop_event = stop_event
+        self.capture_active_event = capture_active_event
+        self.key_sender = key_sender
+        self.window_title = window_title
+        self._requests: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=2)
+        self.overlay = TradeOverlayWorker(stop_event)
+
+    def request(self, action: str, message: str = "") -> bool:
+        try:
+            self._requests.put_nowait((action, message))
+            LOG.info("trade request queued: %s", action)
+            return True
+        except queue.Full:
+            LOG.warning("trade request ignored: busy")
+            return False
+
+    @staticmethod
+    def _scaled(value: int, client_width: int, client_height: int, *, y: bool = False) -> int:
+        reference = REFERENCE_CLIENT[1 if y else 0]
+        current = client_height if y else client_width
+        return round(value * current / reference)
+
+    def _client_geometry(self) -> Optional[tuple[int, int, int, int]]:
+        try:
+            import win32gui
+            hwnd = win32gui.FindWindow(None, self.window_title)
+            if not hwnd or not win32gui.IsWindowVisible(hwnd):
+                return None
+            left, top = win32gui.ClientToScreen(hwnd, (0, 0))
+            right, bottom = win32gui.ClientToScreen(hwnd, win32gui.GetClientRect(hwnd)[2:])
+            return left, top, right - left, bottom - top
+        except Exception:
+            LOG.exception("trade game window lookup failed")
+            return None
+
+    def _point(self, geometry: tuple[int, int, int, int], point: tuple[int, int]) -> tuple[int, int]:
+        left, top, width, height = geometry
+        return (
+            left + self._scaled(point[0], width, height),
+            top + self._scaled(point[1], width, height, y=True),
+        )
+
+    def _show_range(self, geometry: tuple[int, int, int, int], current: Optional[int] = None) -> None:
+        left, top, width, height = geometry
+        range_width = self._scaled(RANGE_SIZE[0], width, height)
+        range_height = self._scaled(RANGE_SIZE[1], width, height, y=True)
+        range_left = left + (width - range_width) // 2
+        range_top = top + (height - range_height) // 2
+        rectangles = [(range_left, range_top, range_width, range_height, "#8b2be2")]
+        if current is not None:
+            box_width = self._scaled(CHARACTER_SIZE, width, height)
+            box_height = self._scaled(CHARACTER_SIZE, width, height, y=True)
+            rectangles.append((range_left + current * box_width, range_top, box_width, box_height, "#00aaff"))
+        self.overlay.show(rectangles)
+
+    def _set_clipboard(self, message: str) -> bool:
+        try:
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(message, win32clipboard.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+            return True
+        except Exception:
+            LOG.exception("trade could not set clipboard")
+            return False
+
+    def _wait_for_trader(self, geometry: tuple[int, int, int, int], timeout: float = 20.0) -> bool:
+        self.capture_active_event.set()
+        deadline = time.monotonic() + timeout
+        try:
+            while not self.stop_event.is_set() and time.monotonic() < deadline:
+                try:
+                    frame = self.frames.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                image = getattr(frame, "image", None)
+                if image is None:
+                    continue
+                width, height = image.size
+                x, y, box_width, box_height = PRESENCE_BOX
+                left = self._scaled(x, width, height)
+                top = self._scaled(y, width, height, y=True)
+                right = min(width, left + self._scaled(box_width, width, height))
+                bottom = min(height, top + self._scaled(box_height, width, height, y=True))
+                pixels = np.asarray(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.int16)
+                blank_ratio = float(np.mean(np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)))
+                if blank_ratio < 0.985:
+                    LOG.info("trade trader detected (blank ratio %.3f)", blank_ratio)
+                    return True
+            LOG.info("trade wait timed out: trader not detected")
+            return False
+        finally:
+            self.capture_active_event.clear()
+
+    def _confirm_trade(self, geometry: tuple[int, int, int, int]) -> None:
+        VirtualMouse.click(*self._point(geometry, CONFIRM_BUTTON))
+        time.sleep(0.15)
+        self.key_sender.send_direct_keys("enter")
+
+    def _send_message(self, geometry: tuple[int, int, int, int], message: str) -> None:
+        if not message or not self._set_clipboard(message):
+            return
+        VirtualMouse.click(*self._point(geometry, TRADE_MESSAGE_BOX))
+        time.sleep(0.10)
+        self.key_sender.send_direct_keys("ctrl+v", "enter")
+
+    def _invite(self, message: str) -> None:
+        if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
+            LOG.warning("trade invite ignored: game window unavailable")
+            return
+        geometry = self._client_geometry()
+        if geometry is None:
+            return
+        try:
+            self._show_range(geometry)
+            time.sleep(0.35)
+            for index in range(10):
+                self._show_range(geometry, index)
+                time.sleep(0.18)
+                self.overlay.clear()
+                time.sleep(0.05)
+                left, top, width, height = geometry
+                range_width = self._scaled(RANGE_SIZE[0], width, height)
+                range_height = self._scaled(RANGE_SIZE[1], width, height, y=True)
+                box_width = self._scaled(CHARACTER_SIZE, width, height)
+                box_height = self._scaled(CHARACTER_SIZE, width, height, y=True)
+                center = (left + (width - range_width) // 2 + index * box_width + box_width // 2,
+                          top + (height - range_height) // 2 + box_height // 2)
+                VirtualMouse.click(*center, right=True)
+                time.sleep(0.18)
+                VirtualMouse.click(center[0] + self._scaled(TRADE_MENU_OFFSET[0], width, height),
+                                   center[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True))
+                time.sleep(0.18)
+                self._confirm_trade(geometry)
+                if self._wait_for_trader(geometry, timeout=1.0):
+                    self._confirm_trade(geometry)
+                    self._send_message(geometry, message)
+                    return
+            # Invite requests were sent; wait for the first trader to arrive.
+            if self._wait_for_trader(geometry):
+                self._confirm_trade(geometry)
+                self._send_message(geometry, message)
+        finally:
+            self.capture_active_event.clear()
+            self.overlay.clear()
+
+    def _accept(self) -> None:
+        if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
+            LOG.warning("trade accept ignored: game window unavailable")
+            return
+        geometry = self._client_geometry()
+        if geometry is None:
+            return
+        VirtualMouse.click(*self._point(geometry, ACCEPT_INVITATION))
+        time.sleep(0.20)
+        self._confirm_trade(geometry)
+
+    def run(self) -> None:
+        self.overlay.start()
+        LOG.info("trade worker started")
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    action, message = self._requests.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                try:
+                    if action == "trade:invite":
+                        self._invite(message)
+                    elif action == "trade:accept":
+                        self._accept()
+                except Exception:
+                    LOG.exception("trade action failed: %s", action)
+                finally:
+                    self._requests.task_done()
+        finally:
+            self.capture_active_event.clear()
+            self.overlay.clear()
+            LOG.info("trade worker stopped")
+
+
+__all__ = ["TradeWorker"]

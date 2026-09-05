@@ -300,6 +300,7 @@ def main() -> int:
     from random_jump_worker import RandomJumpWorker
     from small_step_worker import SmallStepWorker
     from hotkey_worker import HotkeyWorker
+    from trade_worker import TradeWorker
     from motion_arbiter import MotionArbiter
     # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
     # from shutdown_worker import ShutdownWorker
@@ -331,14 +332,17 @@ def main() -> int:
     automation_active = threading.Event()
     game_focused = threading.Event()
     patrol_preparing = threading.Event()
+    trade_capture_active = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
     character_frames: queue.Queue = queue.Queue(maxsize=1)
     lie_detector_frames: queue.Queue = queue.Queue(maxsize=1)
+    trade_frames: queue.Queue = queue.Queue(maxsize=1)
     character_positions: queue.Queue = queue.Queue(maxsize=1)
     subscribers = [
         movement_frames, status_frames, character_frames, lie_detector_frames,
+        trade_frames,
     ]
     if not args.no_ui:
         subscribers.append(ui_frames)
@@ -442,7 +446,9 @@ def main() -> int:
         # viewport scales).
         status_capture_box_provider=status_capture_pixel_box,
         status_capture_interval=args.status_interval,
-        capture_enabled_event=_AnyEvent(game_focused, patrol_preparing),
+        capture_enabled_event=_AnyEvent(
+            game_focused, patrol_preparing, trade_capture_active
+        ),
         fast_capture_event=dropping_active,
         fast_interval=0.10,
         # ==== ADDED pass debug flag into capture worker ====
@@ -776,6 +782,13 @@ def main() -> int:
         ),
         motion_arbiter=motion_arbiter,
     )
+    trade_worker = TradeWorker(
+        trade_frames,
+        stop_event,
+        trade_capture_active,
+        key_sender,
+        args.window_title,
+    )
     movement_worker = MovementWorker(
             movement_frames,
             key_sender,
@@ -1001,6 +1014,7 @@ def main() -> int:
         random_jump_worker,
         small_step_worker,
         hotkey_worker,
+        trade_worker,
         screen_blinker,
         countdown_worker,
         lie_detector_worker,
@@ -1030,6 +1044,7 @@ def main() -> int:
             small_step_worker=small_step_worker,
             hotkey_queue=hotkey_actions,
             hotkey_worker=hotkey_worker,
+            trade_worker=trade_worker,
             movement_worker=movement_worker,
             character_worker=character_worker,
             shutdown_worker=shutdown_worker,

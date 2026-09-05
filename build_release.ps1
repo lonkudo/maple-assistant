@@ -49,6 +49,7 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
                    # application update. system_config.json is intentionally
                    # included so internal calibration follows each version.
                    "config.json", "user_config.json",
+                   "trade_config.json",
                    "recording-configuration.json",
                    "rope_calibration.json", "drug_settings.json",
                    "fixed_attack_settings.json",

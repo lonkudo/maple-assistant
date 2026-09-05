@@ -587,6 +587,39 @@ class WindowKeySender:
         LOG.info("quick message pasted and sent to game window")
         return True
 
+    def send_direct_keys(self, *chords: str) -> bool:
+        """Send short explicit UI chords while patrol input is disarmed.
+
+        Trade confirmation/message dialogs need Enter and Ctrl+V without the
+        normal chat-opening Enter used by :meth:`send_clipboard_message`.
+        This remains serialized with all assistant input and never depends on
+        the patrol input-enabled gate.
+        """
+
+        normalized: list[tuple[str, ...]] = []
+        for chord in chords:
+            keys = tuple(part.strip().casefold() for part in str(chord).split("+") if part.strip())
+            if not keys or any(key not in self._SCAN for key in keys):
+                raise ValueError(f"unsupported direct key chord: {chord!r}")
+            normalized.append(keys)
+        if self.dry_run:
+            LOG.info("DRY-RUN direct keys: %s", ", ".join(chords))
+            return True
+
+        def transition(key: str, key_up: bool) -> None:
+            scan_code, extended = self._SCAN[key]
+            self._send_scan_code(scan_code, key_up=key_up, extended=extended)
+
+        with self._key_state_lock:
+            for keys in normalized:
+                for key in keys:
+                    transition(key, False)
+                time.sleep(0.025)
+                for key in reversed(keys):
+                    transition(key, True)
+                time.sleep(0.08)
+        return True
+
     @staticmethod
     def _send_scan_code(scan_code: int, *, key_up: bool, extended: bool) -> None:
         """Inject one hardware-like keyboard transition with Win32 SendInput.
