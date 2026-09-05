@@ -3715,17 +3715,21 @@ class UiWorker(threading.Thread):
         for index, message in enumerate(self._quick_messages):
             row = self._ttk.Frame(frame)
             row.pack(fill="x", pady=2)
+            # Grid keeps the message field visible between its fixed hotkey
+            # label and delete control.  Pack's expand calculation could give
+            # the button zero width after the hotkey label was added.
+            row.columnconfigure(1, weight=1)
             # Hotkey.json maps list positions 0..9 to Ctrl+1..Ctrl+0.  Keep
             # that index visible beside every message, including while it is
             # being edited, so a deletion/reorder is immediately obvious.
             key_number = (index + 1) % 10
             self._ttk.Label(
                 row, text=f"Ctrl+{key_number}", width=6, anchor="w"
-            ).pack(side="left", padx=(0, 4))
+            ).grid(row=0, column=0, sticky="w", padx=(0, 4))
             if edit_index == index:
                 entry = self._ttk.Entry(row, width=42)
                 entry.insert(0, message)
-                entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+                entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
                 self._quick_edit_entry = entry
                 entry.bind(
                     "<FocusOut>",
@@ -3743,7 +3747,7 @@ class UiWorker(threading.Thread):
                 entry.selection_range(0, "end")
             else:
                 button = self._ttk.Button(row, text=message, anchor="w")
-                button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+                button.grid(row=0, column=1, sticky="ew", padx=(0, 4))
                 button.bind(
                     "<ButtonPress-1>",
                     lambda event, i=index: self._quick_message_press(i),
@@ -3753,7 +3757,7 @@ class UiWorker(threading.Thread):
                     lambda event, i=index: self._quick_message_release(i),
                 )
             delete_button = self._ttk.Button(row, text="×", width=3)
-            delete_button.pack(side="left")
+            delete_button.grid(row=0, column=2, sticky="e")
             delete_button.bind(
                 "<ButtonPress-1>",
                 lambda event, i=index: self._quick_delete_press(i),
