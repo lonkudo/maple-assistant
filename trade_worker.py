@@ -403,9 +403,12 @@ class TradeWorker(threading.Thread):
     def _confirm_trade(self, geometry: tuple[int, int, int, int]) -> bool:
         """Confirm the open trade dialog at the requested screen position."""
 
-        # These are deliberately absolute full-screen coordinates from the
-        # trade UI specification, not minimap/client-relative game points.
-        VirtualMouse.click(*CONFIRM_BUTTON)
+        # (240, 110) is absolute inside the 1366×768 *game client*.  Convert
+        # it through the selected client origin so a windowed/offset game does
+        # not receive a desktop click at the wrong location.
+        point = self._point(geometry, CONFIRM_BUTTON)
+        LOG.info("trade confirm click client=%s screen=%s", CONFIRM_BUTTON, point)
+        VirtualMouse.click(*point)
         time.sleep(0.15)
         return bool(self.key_sender.send_direct_keys("enter"))
 
@@ -414,9 +417,9 @@ class TradeWorker(threading.Thread):
     ) -> bool:
         if not message or not self._set_clipboard(message):
             return False
-        # Like the confirm button, the dialog field is an absolute
-        # full-screen coordinate in the 1366×768 trade UI.
-        VirtualMouse.click(*TRADE_MESSAGE_BOX)
+        point = self._point(geometry, TRADE_MESSAGE_BOX)
+        LOG.info("trade message click client=%s screen=%s", TRADE_MESSAGE_BOX, point)
+        VirtualMouse.click(*point)
         time.sleep(0.10)
         return bool(self.key_sender.send_direct_keys("ctrl+v", "enter"))
 
@@ -522,7 +525,9 @@ class TradeWorker(threading.Thread):
         geometry = self._client_geometry()
         if geometry is None:
             return
-        VirtualMouse.click(*ACCEPT_INVITATION)
+        point = self._point(geometry, ACCEPT_INVITATION)
+        LOG.info("trade accept click client=%s screen=%s", ACCEPT_INVITATION, point)
+        VirtualMouse.click(*point)
         time.sleep(0.20)
         self._confirm_trade(geometry)
 
