@@ -1536,7 +1536,10 @@ class UiWorker(threading.Thread):
             # Persistent clipboard shortcuts. Short click copies, double-click
             # sends to game chat, and long press edits. The adjacent delete
             # icon also requires a 1s long press.
-            quick_panel = ttk.LabelFrame(col2, text="快捷消息", padding=10)
+            # Column 0 sequence: patrol calibration → attack mode → quick
+            # messages.  Keeping this utility beside the patrol controls
+            # makes the two columns visually balanced.
+            quick_panel = ttk.LabelFrame(col1, text="快捷消息", padding=10)
             quick_panel.pack(fill="x", pady=(0, 8))
             quick_header = ttk.Frame(quick_panel)
             quick_header.pack(fill="x")
@@ -1560,9 +1563,9 @@ class UiWorker(threading.Thread):
             extra_panel = ttk.LabelFrame(
                 col2, text="附加功能", padding=10
             )
-            # Constructed after 快捷消息 for code locality, but packed before
-            # it so the right column reads 药品 → 附加功能 → 快捷消息.
-            extra_panel.pack(fill="x", pady=(0, 8), before=quick_panel)
+            # This is constructed after the drug rows for code locality, but
+            # packed ahead of them: column 1 reads 附加功能 → 药品 → 运行日志.
+            extra_panel.pack(fill="x", pady=(0, 8), before=drug_panel)
             shutdown_row = ttk.Frame(extra_panel)
             if self._SHOW_SHUTDOWN_PANEL:
                 shutdown_row.pack(fill="x")
@@ -1767,7 +1770,7 @@ class UiWorker(threading.Thread):
             # shown (the latest few lines); the full 600-line in-memory
             # history stays available through the archive button - no disk
             # I/O per line.
-            log_panel = ttk.LabelFrame(col1, text="运行日志", padding=(6, 4))
+            log_panel = ttk.LabelFrame(col2, text="运行日志", padding=(6, 4))
             log_panel.pack(fill="x", pady=(10, 0))
             log_actions = ttk.Frame(log_panel)
             log_actions.pack(fill="x")
