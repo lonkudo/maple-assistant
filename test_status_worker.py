@@ -66,6 +66,17 @@ class DeferredBuffArbiter:
 
 
 class StatusTests(unittest.TestCase):
+    def test_disable_input_refocuses_before_resetting_held_keys(self) -> None:
+        sender = WindowKeySender("MapleStory", dry_run=False)
+        calls = []
+        sender.select_window = lambda: calls.append("select") or True
+        sender.reset_input_session = lambda reason: calls.append(("reset", reason)) or 1
+
+        sender.disable_input(refocus_before_release=True)
+
+        self.assertEqual(calls, ["select", ("reset", "input disabled")])
+        self.assertFalse(sender.input_is_enabled())
+
     def test_exact_window_title_lookup_avoids_fallback_enumeration(self) -> None:
         class FakeWin32Gui:
             @staticmethod

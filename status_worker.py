@@ -146,10 +146,30 @@ class WindowKeySender:
         self._input_enabled.set()
         LOG.info("live keyboard input enabled")
 
-    def disable_input(self) -> None:
-        """Block new keyboard events and release every currently held key."""
+    def disable_input(self, *, refocus_before_release: bool = False) -> None:
+        """Block input and release every assistant key.
 
+        A Tk button click makes the assistant window foreground before its
+        callback runs.  ``SendInput`` key-up events sent at that point can be
+        delivered to Tk instead of MapleStory, leaving the game-side walk key
+        stuck.  Stop Patrol therefore disarms workers first, then may restore
+        the game window solely to deliver the neutralising key-up sequence.
+        """
+
+        # Disarm before selecting a window: no worker may acquire a new key
+        # while the foreground transition is in progress.
         self._input_enabled.clear()
+        if refocus_before_release and not self.dry_run:
+            try:
+                if not self.select_window():
+                    LOG.warning("INPUT RESET: could not refocus game before key release")
+            except Exception:
+                # Still clear local ownership below.  A later Start Patrol
+                # does another unconditional scrub before it re-arms input.
+                LOG.warning(
+                    "INPUT RESET: game refocus failed before key release",
+                    exc_info=True,
+                )
         self.reset_input_session("input disabled")
         LOG.info("live keyboard input disabled")
 

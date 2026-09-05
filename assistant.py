@@ -177,9 +177,11 @@ def _start_live_input(
 def _stop_live_input(
     key_sender: object,
     automation_active_event: threading.Event,
+    *,
+    refocus_before_release: bool = False,
 ) -> None:
     automation_active_event.clear()
-    key_sender.disable_input()
+    key_sender.disable_input(refocus_before_release=refocus_before_release)
 
 
 def _capture_focused_game_frame(
@@ -1020,7 +1022,7 @@ def main() -> int:
                 patrol_preparing,
             ),
             on_patrol_stop=lambda: _stop_live_input(
-                key_sender, automation_active
+                key_sender, automation_active, refocus_before_release=True,
             ),
             on_capture_now=lambda: _capture_focused_game_frame(
                 key_sender, capture_worker.capture_now

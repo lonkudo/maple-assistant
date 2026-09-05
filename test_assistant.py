@@ -8,6 +8,7 @@ from assistant import (
     _capture_focused_game_frame,
     _compact_log_formatter,
     _start_live_input,
+    _stop_live_input,
     parse_args,
     status_capture_pixel_box,
 )
@@ -28,6 +29,9 @@ class FakeSender:
 
     def enable_input(self) -> None:
         self.calls.append("enable")
+
+    def disable_input(self, *, refocus_before_release: bool = False) -> None:
+        self.calls.append(("disable", refocus_before_release))
 
 
 class StartLiveInputTests(unittest.TestCase):
@@ -159,6 +163,16 @@ class StartLiveInputTests(unittest.TestCase):
             _start_live_input(sender, active)
         self.assertEqual(sender.calls, ["select", "verify"])
         self.assertFalse(active.is_set())
+
+    def test_stop_disarms_and_requests_game_refocus_for_ui_stop(self) -> None:
+        sender = FakeSender()
+        active = threading.Event()
+        active.set()
+
+        _stop_live_input(sender, active, refocus_before_release=True)
+
+        self.assertFalse(active.is_set())
+        self.assertEqual(sender.calls, [("disable", True)])
 
     def test_recording_capture_focuses_and_settles_before_capture(self) -> None:
         sender = FakeSender()
