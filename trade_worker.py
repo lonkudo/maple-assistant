@@ -18,7 +18,8 @@ LOG = logging.getLogger(__name__)
 
 REFERENCE_CLIENT = (1366, 768)
 CHARACTER_SIZE = 65
-RANGE_SIZE = (650, 65)
+GRID_DIMENSION = 3
+RANGE_SIZE = (CHARACTER_SIZE * GRID_DIMENSION, CHARACTER_SIZE * GRID_DIMENSION)
 TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
 ACCEPT_INVITATION = (890, 668)
@@ -198,17 +199,36 @@ class TradeWorker(threading.Thread):
             top + self._scaled(point[1], width, height, y=True),
         )
 
-    def _show_range(self, geometry: tuple[int, int, int, int], current: Optional[int] = None) -> None:
+    def _grid_geometry(
+        self, geometry: tuple[int, int, int, int]
+    ) -> tuple[int, int, int, int, int, int]:
+        """Return the centered 3×3 target grid in screen pixels."""
+
         left, top, width, height = geometry
-        range_width = self._scaled(RANGE_SIZE[0], width, height)
-        range_height = self._scaled(RANGE_SIZE[1], width, height, y=True)
-        range_left = left + (width - range_width) // 2
-        range_top = top + (height - range_height) // 2
+        grid_width = self._scaled(RANGE_SIZE[0], width, height)
+        grid_height = self._scaled(RANGE_SIZE[1], width, height, y=True)
+        box_width = self._scaled(CHARACTER_SIZE, width, height)
+        box_height = self._scaled(CHARACTER_SIZE, width, height, y=True)
+        return (
+            left + (width - grid_width) // 2,
+            top + (height - grid_height) // 2,
+            grid_width,
+            grid_height,
+            box_width,
+            box_height,
+        )
+
+    def _show_range(self, geometry: tuple[int, int, int, int], current: Optional[int] = None) -> None:
+        (range_left, range_top, range_width, range_height,
+         box_width, box_height) = self._grid_geometry(geometry)
         rectangles = [(range_left, range_top, range_width, range_height, "#8b2be2")]
         if current is not None:
-            box_width = self._scaled(CHARACTER_SIZE, width, height)
-            box_height = self._scaled(CHARACTER_SIZE, width, height, y=True)
-            rectangles.append((range_left + current * box_width, range_top, box_width, box_height, "#00aaff"))
+            row, column = divmod(current, GRID_DIMENSION)
+            rectangles.append((
+                range_left + column * box_width,
+                range_top + row * box_height,
+                box_width, box_height, "#00aaff",
+            ))
         self.overlay.show(rectangles)
 
     def _set_clipboard(self, message: str) -> bool:
@@ -275,18 +295,19 @@ class TradeWorker(threading.Thread):
         try:
             self._show_range(geometry)
             time.sleep(0.35)
-            for index in range(10):
+            for index in range(GRID_DIMENSION * GRID_DIMENSION):
                 self._show_range(geometry, index)
                 time.sleep(0.18)
                 self.overlay.clear()
                 time.sleep(0.05)
-                left, top, width, height = geometry
-                range_width = self._scaled(RANGE_SIZE[0], width, height)
-                range_height = self._scaled(RANGE_SIZE[1], width, height, y=True)
-                box_width = self._scaled(CHARACTER_SIZE, width, height)
-                box_height = self._scaled(CHARACTER_SIZE, width, height, y=True)
-                center = (left + (width - range_width) // 2 + index * box_width + box_width // 2,
-                          top + (height - range_height) // 2 + box_height // 2)
+                (range_left, range_top, _grid_width, _grid_height,
+                 box_width, box_height) = self._grid_geometry(geometry)
+                row, column = divmod(index, GRID_DIMENSION)
+                center = (
+                    range_left + column * box_width + box_width // 2,
+                    range_top + row * box_height + box_height // 2,
+                )
+                _left, _top, width, height = geometry
                 VirtualMouse.click(*center, right=True)
                 time.sleep(0.18)
                 VirtualMouse.click(center[0] + self._scaled(TRADE_MENU_OFFSET[0], width, height),
