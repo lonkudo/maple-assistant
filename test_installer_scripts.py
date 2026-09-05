@@ -33,6 +33,7 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn("shellapp.shellexecute", vbs)
         self.assertIn('"runas", 0', vbs)
         self.assertIn("pythonw.exe", vbs)
+        self.assertIn("startup_probe.py", vbs)
 
 
 if __name__ == "__main__":

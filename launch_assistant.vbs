@@ -4,7 +4,10 @@ Dim shellApp, files, root, pythonwPath, assistantPath, arguments, item
 Set files = CreateObject("Scripting.FileSystemObject")
 root = files.GetParentFolderName(WScript.ScriptFullName)
 pythonwPath = root & "\.venv\Scripts\pythonw.exe"
-assistantPath = root & "\assistant.py"
+' The probe records any exception that occurs before the normal application
+' logging is available.  pythonw deliberately has no console, so without it
+' a failed UAC launch looks like the BAT did nothing.
+assistantPath = root & "\startup_probe.py"
 arguments = QuoteArgument(assistantPath)
 For Each item In WScript.Arguments
     arguments = arguments & " " & QuoteArgument(CStr(item))
