@@ -1581,6 +1581,7 @@ class UiWorker(threading.Thread):
             shutdown_check = ttk.Checkbutton(
                 shutdown_row, text="运行后定时关闭",
                 variable=self._shutdown_enabled_var,
+                command=self._apply_optional_function_state,
             )
             shutdown_check.pack(side="left", padx=(0, 8))
             self._shutdown_check = shutdown_check
@@ -1622,6 +1623,7 @@ class UiWorker(threading.Thread):
                 alarm_row,
                 text="掉线",
                 variable=self._disconnect_alert_var,
+                command=self._apply_optional_function_state,
             ).pack(side="left", padx=(4, 6))
 
             self._lie_alert_var = tk.BooleanVar(value=False)
@@ -1629,12 +1631,14 @@ class UiWorker(threading.Thread):
                 alarm_row,
                 text="测谎",
                 variable=self._lie_alert_var,
+                command=self._apply_optional_function_state,
             ).pack(side="left", padx=(0, 6))
 
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
                 alarm_row, text="循环",
                 variable=self._countdown_enabled_var,
+                command=self._apply_optional_function_state,
             )
             self._countdown_check.pack(side="left")
 
@@ -1696,6 +1700,7 @@ class UiWorker(threading.Thread):
                 reminder_row,
                 text="声音",
                 variable=self._sound_alert_var,
+                command=self._apply_optional_function_state,
             ).pack(side="left", padx=(4, 8))
 
             self._screen_blink_var = tk.BooleanVar(value=False)
@@ -1703,6 +1708,7 @@ class UiWorker(threading.Thread):
                 reminder_row,
                 text="闪烁",
                 variable=self._screen_blink_var,
+                command=self._apply_optional_function_state,
             ).pack(side="left", padx=(0, 8))
 
             self._telegram_enabled_var = tk.BooleanVar(value=False)
@@ -1710,6 +1716,7 @@ class UiWorker(threading.Thread):
                 reminder_row,
                 text="消息",
                 variable=self._telegram_enabled_var,
+                command=self._apply_optional_function_state,
             ).pack(side="left")
             telegram_row = ttk.Frame(extra_panel)
             telegram_row.pack(fill="x", pady=(4, 0))
@@ -1748,9 +1755,9 @@ class UiWorker(threading.Thread):
                 player_row,
                 text="检测到其他玩家自动切换频道",
                 variable=self._player_check_var,
+                command=self._apply_optional_function_state,
             ).pack(side="left")
             self._shutdown_load_settings()
-            self._install_optional_function_state_traces()
 
             # Minimap / map-name preview widgets: built but hidden by default
             # (kept for future use - flip _SHOW_MINIMAP_PREVIEW to show).
@@ -3536,52 +3543,15 @@ class UiWorker(threading.Thread):
 
         return config_section_file("additional_functions")
 
-    def _install_optional_function_state_traces(self) -> None:
-        """Apply checkbox state after Tk has committed the user's click.
+    def _apply_optional_function_state(self) -> None:
+        """Persist and deliver checkbox values to all optional workers.
 
-        ``ttk.Checkbutton(command=...)`` can run while a themed control is
-        still repainting on some Windows machines.  The old immediate handler
-        occasionally read the previous value, making an uncheck require a
-        second click and leaving the worker state stale.  Variable traces plus
-        one idle callback read the final, rendered values exactly once.
+        This is called directly by each ``ttk.Checkbutton`` command.  Tk has
+        already committed the BooleanVar by that point, unlike the former
+        trace/``after_idle`` route which could leave a visual checkbox and its
+        worker on opposite values after a single click.
         """
 
-        if getattr(self, "_optional_function_traces_installed", False):
-            return
-        self._optional_function_traces_installed = True
-        self._optional_function_apply_job: Any = None
-        variables = (
-            self._shutdown_enabled_var,
-            self._disconnect_alert_var,
-            self._lie_alert_var,
-            self._countdown_enabled_var,
-            self._sound_alert_var,
-            self._screen_blink_var,
-            self._telegram_enabled_var,
-            self._player_check_var,
-        )
-        for variable in variables:
-            variable.trace_add(
-                "write", self._optional_function_state_changed
-            )
-
-    def _optional_function_state_changed(self, *_args: Any) -> None:
-        """Queue one live optional-function apply after a checkbox change."""
-
-        root = getattr(self, "_root", None)
-        if root is None or self._optional_function_apply_job is not None:
-            return
-        try:
-            self._optional_function_apply_job = root.after_idle(
-                self._apply_optional_function_state
-            )
-        except Exception:
-            self._optional_function_apply_job = None
-
-    def _apply_optional_function_state(self) -> None:
-        """Persist and deliver the final checkbox values to all workers."""
-
-        self._optional_function_apply_job = None
         try:
             # This applies disconnect/lie/sound/blink/Telegram/player-switch
             # together.  It intentionally does not reset countdown remaining
