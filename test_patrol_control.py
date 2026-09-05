@@ -443,7 +443,11 @@ class PatrolControllerTests(unittest.TestCase):
             # Adding after zero layers restarts at layer1 and selects it.
             self.assertEqual(controller.add_layer_above(), "layer1")
             self.assertEqual(controller.selected_layer(), "layer1")
-            self.assertIn("layer1", controller.snapshot().layers)
+            restored = controller.snapshot()
+            self.assertIn("layer1", restored.layers)
+            self.assertEqual(restored.patrol_start_layer, "layer1")
+            self.assertEqual(restored.patrol_end_layer, "layer1")
+            self.assertTrue(restored.patrol_range_set)
 
     def test_record_with_zero_layers_is_rejected_without_junk_layer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

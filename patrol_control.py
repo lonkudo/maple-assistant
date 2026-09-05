@@ -804,6 +804,10 @@ class PatrolController:
                 for name in layers
                 if (match := re.search(r"(\d+)$", name)) is not None
             ]
+            # Capture the effective range before adding the new top floor.
+            # A legacy/empty explicit range still resolves to the current
+            # bottom floor here, which is the correct start to preserve.
+            old_start, _old_end = self.patrol_range_locked()
             next_number = max(numeric_layers, default=0) + 1
             next_name = f"layer{next_number}"
             # Assignment is intentionally unconditional because next_number is
@@ -819,6 +823,14 @@ class PatrolController:
             route = self._profile.setdefault("route_order", [])
             if next_name not in route:
                 route.append(next_name)
+            # Adding from zero layers is a new patrol range, not an implicit
+            # fallback: persist layer1 as its explicit start so Ctrl+Home and
+            # the UI comboboxes have a real selection to operate on.  On an
+            # existing map preserve the chosen lower boundary, while every
+            # new highest floor becomes the patrol end.
+            self._profile["patrol_start_layer"] = (
+                next_name if not numeric_layers else old_start
+            )
             self._profile["patrol_end_layer"] = next_name
             self._selected_layer = next_name
             self._enabled = False
