@@ -14,6 +14,7 @@ import traceback
 
 
 LOG_PATH = Path(__file__).with_name("assistant-launch-error.log")
+STATUS_PATH = Path(__file__).with_name("assistant-launch-status.log")
 
 
 def _write_error(message: str) -> None:
@@ -22,14 +23,23 @@ def _write_error(message: str) -> None:
         handle.write(f"[{timestamp}] {message}\n")
 
 
+def _write_status(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with STATUS_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] {message}\n")
+
+
 def main() -> int:
     try:
+        _write_status("Python startup probe reached.")
         from assistant import main as run_assistant
 
         result = run_assistant()
         code = int(result or 0)
         if code:
             _write_error(f"Assistant exited during startup with code {code}.")
+        else:
+            _write_status("Assistant exited normally.")
         return code
     except KeyboardInterrupt:
         return 0
