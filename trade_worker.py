@@ -245,11 +245,32 @@ class TradeWorker(threading.Thread):
             LOG.exception("trade could not set clipboard")
             return False
 
-    def _wait_for_trader(self, geometry: tuple[int, int, int, int], timeout: float = 20.0) -> bool:
+    def _show_presence_area(self, geometry: tuple[int, int, int, int]) -> None:
+        """Show the exact trader-presence sample area while waiting."""
+
+        left, top, width, height = geometry
+        x, y, box_width, box_height = PRESENCE_BOX
+        self.overlay.show([(
+            left + self._scaled(x, width, height),
+            top + self._scaled(y, width, height, y=True),
+            self._scaled(box_width, width, height),
+            self._scaled(box_height, width, height, y=True),
+            "#ffd400",
+        )])
+
+    def _wait_for_trader(
+        self, geometry: tuple[int, int, int, int],
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Wait for a non-blank presence area, until stopped by default."""
+
         self.capture_active_event.set()
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        self._show_presence_area(geometry)
+        LOG.info("trade waiting for trader; detection area is highlighted")
         try:
-            while not self.stop_event.is_set() and time.monotonic() < deadline:
+            while (not self.stop_event.is_set() and
+                   (deadline is None or time.monotonic() < deadline)):
                 try:
                     frame = self.frames.get(timeout=0.5)
                 except queue.Empty:
@@ -268,7 +289,8 @@ class TradeWorker(threading.Thread):
                 if blank_ratio < 0.985:
                     LOG.info("trade trader detected (blank ratio %.3f)", blank_ratio)
                     return True
-            LOG.info("trade wait timed out: trader not detected")
+            if deadline is not None:
+                LOG.info("trade wait timed out: trader not detected")
             return False
         finally:
             self.capture_active_event.clear()
@@ -314,12 +336,11 @@ class TradeWorker(threading.Thread):
                                    center[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True))
                 time.sleep(0.18)
                 self._confirm_trade(geometry)
-                if self._wait_for_trader(geometry, timeout=1.0):
-                    self._confirm_trade(geometry)
-                    self._send_message(geometry, message)
-                    return
-            # Invite requests were sent; wait for the first trader to arrive.
+            # Finish the full 3×3 invitation pass before sampling for a
+            # trader.  The highlighted detection region remains visible
+            # until someone arrives or the assistant is stopped.
             if self._wait_for_trader(geometry):
+                self.overlay.clear()
                 self._confirm_trade(geometry)
                 self._send_message(geometry, message)
         finally:
