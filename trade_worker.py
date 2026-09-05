@@ -465,8 +465,17 @@ class TradeWorker(threading.Thread):
             # arrives or the assistant is stopped.
             if self._wait_for_trader(geometry):
                 self.overlay.clear()
-                if (self._confirm_trade(geometry)
-                        and self._send_message(geometry, message)):
+                # The trader marker may appear one frame before the game's
+                # confirmation dialog is clickable.  Let that dialog settle,
+                # then complete click + Enter as a separate stage before any
+                # chat/message interaction can occur.
+                if not self._wait_or_cancel(0.50):
+                    return
+                confirmed = self._confirm_trade(geometry)
+                LOG.info("trade confirmation submitted=%s", confirmed)
+                if not confirmed or not self._wait_or_cancel(0.35):
+                    return
+                if self._send_message(geometry, message):
                     self._play_success()
                     LOG.info("trade invite workflow completed")
         finally:
