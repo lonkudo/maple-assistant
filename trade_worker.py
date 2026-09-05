@@ -487,8 +487,10 @@ class TradeWorker(threading.Thread):
             if self._wait_for_trader(geometry):
                 self.overlay.clear()
                 # Overlay clear is delivered on its own Tk worker.  Give it
-                # a moment to destroy the topmost guide before focusing game.
-                if not self._wait_or_cancel(0.10):
+                # a moment to destroy the topmost guide and let the operator
+                # finish Mouse Without Borders movement before the synthetic
+                # click sequence takes control.
+                if not self._wait_or_cancel(2.00):
                     return
                 # The detector overlay or another desktop window may now be
                 # foreground.  Focus the game again before its trade dialog
@@ -499,12 +501,9 @@ class TradeWorker(threading.Thread):
                         "refocused after trader detection"
                     )
                     return
-                # The trader marker may appear one frame before the game's
-                # confirmation dialog is clickable.  Let that dialog settle
-                # then complete click + Enter as a separate stage before any
-                # chat/message interaction can occur.
-                if not self._wait_or_cancel(0.20):
-                    return
+                # The two-second operator handoff above replaces the former
+                # 200ms post-detection delay.  Confirm immediately after the
+                # game window has been restored to foreground.
                 confirmed = self._confirm_trade(geometry)
                 LOG.info("trade confirmation submitted=%s", confirmed)
                 if not confirmed or not self._wait_or_cancel(0.35):
