@@ -229,6 +229,17 @@ class TradeWorker(threading.Thread):
                 range_top + row * box_height,
                 box_width, box_height, "#00aaff",
             ))
+        # Keep the presence sample visible even while the target grid is
+        # shown, so the user can verify the exact area being evaluated.
+        left, top, width, height = geometry
+        x, y, presence_width, presence_height = PRESENCE_BOX
+        rectangles.append((
+            left + self._scaled(x, width, height),
+            top + self._scaled(y, width, height, y=True),
+            self._scaled(presence_width, width, height),
+            self._scaled(presence_height, width, height, y=True),
+            "#ffd400",
+        ))
         self.overlay.show(rectangles)
 
     def _set_clipboard(self, message: str) -> bool:
@@ -295,6 +306,36 @@ class TradeWorker(threading.Thread):
         finally:
             self.capture_active_event.clear()
 
+    def _presence_area_is_blank(
+        self, geometry: tuple[int, int, int, int]
+    ) -> bool:
+        """Return true when one fresh presence sample is the blank colour."""
+
+        self.capture_active_event.set()
+        try:
+            frame = self.frames.get(timeout=0.5)
+        except queue.Empty:
+            return False
+        image = getattr(frame, "image", None)
+        if image is None:
+            return False
+        width, height = image.size
+        x, y, box_width, box_height = PRESENCE_BOX
+        left = self._scaled(x, width, height)
+        top = self._scaled(y, width, height, y=True)
+        right = min(width, left + self._scaled(box_width, width, height))
+        bottom = min(height, top + self._scaled(box_height, width, height, y=True))
+        pixels = np.asarray(
+            image.crop((left, top, right, bottom)).convert("RGB"),
+            dtype=np.int16,
+        )
+        blank_ratio = float(np.mean(
+            np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)
+        ))
+        blank = blank_ratio >= 0.985
+        LOG.info("trade presence sample blank=%s ratio=%.3f", blank, blank_ratio)
+        return blank
+
     def _confirm_trade(self, geometry: tuple[int, int, int, int]) -> None:
         VirtualMouse.click(*self._point(geometry, CONFIRM_BUTTON))
         time.sleep(0.15)
@@ -315,6 +356,7 @@ class TradeWorker(threading.Thread):
         if geometry is None:
             return
         try:
+            self.capture_active_event.set()
             self._show_range(geometry)
             time.sleep(0.35)
             for index in range(GRID_DIMENSION * GRID_DIMENSION):
@@ -336,9 +378,19 @@ class TradeWorker(threading.Thread):
                                    center[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True))
                 time.sleep(0.18)
                 self._confirm_trade(geometry)
+                # A blank presence area means this trade request is now
+                # pending.  Do not continue inviting other targets: retain
+                # the yellow area and wait until the trader arrives.
+                if self._presence_area_is_blank(geometry):
+                    LOG.info(
+                        "trade invitation accepted as pending; "
+                        "stopping remaining target invites"
+                    )
+                    break
             # Finish the full 3×3 invitation pass before sampling for a
-            # trader.  The highlighted detection region remains visible
-            # until someone arrives or the assistant is stopped.
+            # trader, unless a pending invitation stopped it sooner.  The
+            # highlighted detection region remains visible until someone
+            # arrives or the assistant is stopped.
             if self._wait_for_trader(geometry):
                 self.overlay.clear()
                 self._confirm_trade(geometry)
