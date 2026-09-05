@@ -173,11 +173,19 @@ class TradeWorker(threading.Thread):
     def _client_geometry(self) -> Optional[tuple[int, int, int, int]]:
         try:
             import win32gui
-            hwnd = win32gui.FindWindow(None, self.window_title)
+            # Reuse the exact handle just selected by WindowKeySender.  Its
+            # lookup already supports title variants; a second exact-title
+            # FindWindow here would make trade fail on those clients.
+            hwnd = getattr(self.key_sender, "hwnd", None)
+            if not hwnd or not win32gui.IsWindow(hwnd):
+                hwnd = win32gui.FindWindow(None, self.window_title)
             if not hwnd or not win32gui.IsWindowVisible(hwnd):
                 return None
             left, top = win32gui.ClientToScreen(hwnd, (0, 0))
-            right, bottom = win32gui.ClientToScreen(hwnd, win32gui.GetClientRect(hwnd)[2:])
+            client_rect = win32gui.GetClientRect(hwnd)
+            right, bottom = win32gui.ClientToScreen(
+                hwnd, (client_rect[2], client_rect[3])
+            )
             return left, top, right - left, bottom - top
         except Exception:
             LOG.exception("trade game window lookup failed")
