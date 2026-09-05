@@ -24,7 +24,9 @@ TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
 ACCEPT_INVITATION = (890, 668)
 TRADE_MESSAGE_BOX = (460, 200)
-PRESENCE_BOX = (140, 100, 180, 140)
+# The small top-left client sample used to tell whether the trader has shown.
+# It is one quarter of the previous width and height (45×35 at 1366×768).
+PRESENCE_BOX = (0, 0, 45, 35)
 PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
 
 
@@ -154,9 +156,14 @@ class TradeWorker(threading.Thread):
         self.key_sender = key_sender
         self.window_title = window_title
         self._requests: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=2)
+        self._invite_lock = threading.Lock()
+        self._invite_pending = False
+        self._invite_cancel = threading.Event()
         self.overlay = TradeOverlayWorker(stop_event)
 
     def request(self, action: str, message: str = "") -> bool:
+        if action == "trade:invite":
+            return self.toggle_invite(message) == "started"
         try:
             self._requests.put_nowait((action, message))
             LOG.info("trade request queued: %s", action)
@@ -164,6 +171,32 @@ class TradeWorker(threading.Thread):
         except queue.Full:
             LOG.warning("trade request ignored: busy")
             return False
+
+    def toggle_invite(self, message: str) -> str:
+        """Start an invite sequence, or cancel the currently active one."""
+
+        with self._invite_lock:
+            if self._invite_pending:
+                self._invite_cancel.set()
+                LOG.info("trade invite cancellation requested")
+                return "cancelled"
+            try:
+                self._requests.put_nowait(("trade:invite", message))
+            except queue.Full:
+                LOG.warning("trade invite ignored: worker is busy")
+                return "busy"
+            self._invite_cancel.clear()
+            self._invite_pending = True
+            LOG.info("trade request queued: trade:invite")
+            return "started"
+
+    def _invite_cancelled(self) -> bool:
+        return self.stop_event.is_set() or self._invite_cancel.is_set()
+
+    def _wait_or_cancel(self, seconds: float) -> bool:
+        """Wait briefly, returning false as soon as Ctrl+Q cancels."""
+
+        return not self._invite_cancel.wait(seconds) and not self.stop_event.is_set()
 
     @staticmethod
     def _scaled(value: int, client_width: int, client_height: int, *, y: bool = False) -> int:
@@ -280,7 +313,7 @@ class TradeWorker(threading.Thread):
         self._show_presence_area(geometry)
         LOG.info("trade waiting for trader; detection area is highlighted")
         try:
-            while (not self.stop_event.is_set() and
+            while (not self._invite_cancelled() and
                    (deadline is None or time.monotonic() < deadline)):
                 try:
                     frame = self.frames.get(timeout=0.5)
@@ -300,7 +333,9 @@ class TradeWorker(threading.Thread):
                 if blank_ratio < 0.985:
                     LOG.info("trade trader detected (blank ratio %.3f)", blank_ratio)
                     return True
-            if deadline is not None:
+            if self._invite_cancel.is_set():
+                LOG.info("trade wait cancelled by Ctrl+Q")
+            elif deadline is not None:
                 LOG.info("trade wait timed out: trader not detected")
             return False
         finally:
@@ -311,6 +346,8 @@ class TradeWorker(threading.Thread):
     ) -> bool:
         """Return true when one fresh presence sample is the blank colour."""
 
+        if self._invite_cancelled():
+            return False
         self.capture_active_event.set()
         try:
             frame = self.frames.get(timeout=0.5)
@@ -349,6 +386,8 @@ class TradeWorker(threading.Thread):
         self.key_sender.send_direct_keys("ctrl+v", "enter")
 
     def _invite(self, message: str) -> None:
+        if self._invite_cancelled():
+            return
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
             LOG.warning("trade invite ignored: game window unavailable")
             return
@@ -358,12 +397,17 @@ class TradeWorker(threading.Thread):
         try:
             self.capture_active_event.set()
             self._show_range(geometry)
-            time.sleep(0.35)
+            if not self._wait_or_cancel(0.35):
+                return
             for index in range(GRID_DIMENSION * GRID_DIMENSION):
+                if self._invite_cancelled():
+                    return
                 self._show_range(geometry, index)
-                time.sleep(0.18)
+                if not self._wait_or_cancel(0.18):
+                    return
                 self.overlay.clear()
-                time.sleep(0.05)
+                if not self._wait_or_cancel(0.05):
+                    return
                 (range_left, range_top, _grid_width, _grid_height,
                  box_width, box_height) = self._grid_geometry(geometry)
                 row, column = divmod(index, GRID_DIMENSION)
@@ -373,10 +417,12 @@ class TradeWorker(threading.Thread):
                 )
                 _left, _top, width, height = geometry
                 VirtualMouse.click(*center, right=True)
-                time.sleep(0.18)
+                if not self._wait_or_cancel(0.18):
+                    return
                 VirtualMouse.click(center[0] + self._scaled(TRADE_MENU_OFFSET[0], width, height),
                                    center[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True))
-                time.sleep(0.18)
+                if not self._wait_or_cancel(0.18):
+                    return
                 self._confirm_trade(geometry)
                 # A blank presence area means this trade request is now
                 # pending.  Do not continue inviting other targets: retain
@@ -387,6 +433,8 @@ class TradeWorker(threading.Thread):
                         "stopping remaining target invites"
                     )
                     break
+                if self._invite_cancelled():
+                    return
             # Finish the full 3×3 invitation pass before sampling for a
             # trader, unless a pending invitation stopped it sooner.  The
             # highlighted detection region remains visible until someone
@@ -427,6 +475,10 @@ class TradeWorker(threading.Thread):
                 except Exception:
                     LOG.exception("trade action failed: %s", action)
                 finally:
+                    if action == "trade:invite":
+                        with self._invite_lock:
+                            self._invite_pending = False
+                            self._invite_cancel.clear()
                     self._requests.task_done()
         finally:
             self.capture_active_event.clear()

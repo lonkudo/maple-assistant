@@ -2357,15 +2357,25 @@ class UiWorker(threading.Thread):
                         self._quick_message_status.configure(
                             text="交易失败：请先添加第一条快捷消息。"
                         )
+                    elif action == "trade:invite" and self.trade_worker is not None:
+                        result = self.trade_worker.toggle_invite(message)
+                        if result == "cancelled":
+                            self._quick_message_status.configure(
+                                text="交易：已取消。"
+                            )
+                        elif result == "started":
+                            self._quick_message_status.configure(
+                                text="交易：正在邀请并等待交易者。"
+                            )
+                        else:
+                            self._quick_message_status.configure(
+                                text="交易失败：交易操作正在进行。"
+                            )
                     elif self.trade_worker is None or not self.trade_worker.request(
                         action, message
                     ):
                         self._quick_message_status.configure(
                             text="交易失败：交易操作正在进行。"
-                        )
-                    elif action == "trade:invite":
-                        self._quick_message_status.configure(
-                            text="交易：正在邀请并等待交易者。"
                         )
                     else:
                         self._quick_message_status.configure(

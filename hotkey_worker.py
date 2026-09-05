@@ -172,7 +172,14 @@ class HotkeyWorker(threading.Thread):
         return lower_il or self_marked
 
     def _queue_action(self, action: str) -> None:
-        repeatable = action.startswith("adjust_fixed_attack_interval:")
+        # Ctrl+Q is a start/cancel toggle.  It must bypass the normal two-
+        # second action cooldown so a second physical press can immediately
+        # cancel a pending trade wait.  MOD_NOREPEAT/the hook key-up state
+        # still prevent a held chord from firing repeatedly.
+        repeatable = (
+            action.startswith("adjust_fixed_attack_interval:")
+            or action == "trade:invite"
+        )
         now = time.monotonic()
         last = self._last_action_at.get(action)
         if (not repeatable and last is not None
