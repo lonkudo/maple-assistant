@@ -151,8 +151,10 @@ Physical Ctrl hotkeys are stored in [hotkey.json](hotkey.json):
 
 Each discrete hotkey has a cooldown. Recording hotkeys refuse route changes
 during patrol. The hook ignores assistant-generated input and does not steal
-ordinary game typing. Quick-message buttons short-click to copy, double-click
-to focus the game and send Enter → Ctrl+V → Enter, and long-press to edit.
+ordinary game typing. Every quick-message row is left-aligned and displays its
+current **Ctrl+1 … Ctrl+0** index; deleting a row immediately shifts the later
+indices. Buttons short-click to copy, double-click to focus the game and send
+Enter → Ctrl+V → Enter, and long-press to edit.
 
 ## Optional alerts
 

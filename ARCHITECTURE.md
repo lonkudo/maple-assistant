@@ -495,10 +495,12 @@ but their runtime roles are now explicit:
 | `buff2` / 增益 1 | queued action buff; countdown starts after successful completion |
 | `buff3` / 增益 2 | queued action buff; countdown starts after successful completion |
 
-The drug panel is at the top of UI column 1. Below it are 附加功能 and
-快捷消息. Quick messages persist in `additional_functions`; short click copies,
-double click focuses the game and sends Enter/Ctrl+V/Enter, and one-second
-presses edit or delete. Adding, editing, or deleting a row calls
+The UI stack is fixed: column 0 is 图层校准与巡逻, 攻击模式, 快捷消息; column 1
+is 附加功能, 药品, 运行日志. Quick messages persist in
+`additional_functions`; each row displays its current Ctrl+1 … Ctrl+0 index
+and left-aligns its message text. Short click copies, double click focuses the
+game and sends Enter/Ctrl+V/Enter, and one-second presses edit or delete.
+Adding, editing, or deleting a row calls
 `_refit_window_to_content()`.
 
 `CountdownWorker` has no gameplay dependencies: it owns only a monotonic
@@ -594,8 +596,8 @@ in `ui_worker.py`:
   when quick-message rows need more room.
 - Layout: column 0 fixed 550px, column 1 fixed 500px (grid `minsize`, both
   `weight=0`), 12px gap + 24px container padding = the 1086 default width.
-- UI layout: column 0 contains 图层校准与巡逻, 攻击模式, and 运行日志; column 1
-  contains 药品, 附加功能, and 快捷消息. Both columns share a small top inset
+- UI layout: column 0 contains 图层校准与巡逻, 攻击模式, and 快捷消息; column 1
+  contains 附加功能, 药品, and 运行日志. Both columns share a small top inset
   below the caption and are grid-anchored north-west.
 - The native caption strip is removed once (Win32 `WS_CAPTION`, keeping native
   resize borders/min/max flags/taskbar) and replaced by an in-window 34px row
@@ -610,7 +612,7 @@ in `ui_worker.py`:
   height is set to chrome + the taller column's required height (clamped to
   minsize), so rows added grow the window and rows deleted shrink it back
   with no leftover bottom padding.
-- 运行日志 (running-log) panel lives in column 0 as a LabelFrame like
+- 运行日志 (running-log) panel lives in column 1 as a LabelFrame like
   the other panels.  Its messages are shown in the plain message-hint style
   of the 图层校准与巡逻 panel (normal ttk.Label text): only the latest few
   significant events - patrol started, patrol ended (including external/

@@ -3715,6 +3715,13 @@ class UiWorker(threading.Thread):
         for index, message in enumerate(self._quick_messages):
             row = self._ttk.Frame(frame)
             row.pack(fill="x", pady=2)
+            # Hotkey.json maps list positions 0..9 to Ctrl+1..Ctrl+0.  Keep
+            # that index visible beside every message, including while it is
+            # being edited, so a deletion/reorder is immediately obvious.
+            key_number = (index + 1) % 10
+            self._ttk.Label(
+                row, text=f"Ctrl+{key_number}", width=6, anchor="w"
+            ).pack(side="left", padx=(0, 4))
             if edit_index == index:
                 entry = self._ttk.Entry(row, width=42)
                 entry.insert(0, message)
@@ -3735,7 +3742,7 @@ class UiWorker(threading.Thread):
                 entry.focus_set()
                 entry.selection_range(0, "end")
             else:
-                button = self._ttk.Button(row, text=message)
+                button = self._ttk.Button(row, text=message, anchor="w")
                 button.pack(side="left", fill="x", expand=True, padx=(0, 4))
                 button.bind(
                     "<ButtonPress-1>",
