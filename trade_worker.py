@@ -83,6 +83,21 @@ class TradeOverlayWorker(threading.Thread):
                     popup.attributes("-alpha", 0.35)
                     popup.configure(background=color)
                     popup.geometry(f"{width}x{height}+{left}+{top}")
+                    # The visual guide must never activate or intercept the
+                    # game.  Without these extended styles, a Tk Toplevel
+                    # can steal foreground focus while a trade is waiting.
+                    popup.update_idletasks()
+                    user32 = ctypes.windll.user32
+                    GWL_EXSTYLE = -20
+                    WS_EX_TRANSPARENT = 0x00000020
+                    WS_EX_NOACTIVATE = 0x08000000
+                    WS_EX_TOOLWINDOW = 0x00000080
+                    style = user32.GetWindowLongW(popup.winfo_id(), GWL_EXSTYLE)
+                    user32.SetWindowLongW(
+                        popup.winfo_id(), GWL_EXSTYLE,
+                        style | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+                        | WS_EX_TOOLWINDOW,
+                    )
                     popups.append(popup)
 
             def poll() -> None:
@@ -471,11 +486,14 @@ class TradeWorker(threading.Thread):
             # arrives or the assistant is stopped.
             if self._wait_for_trader(geometry):
                 self.overlay.clear()
+                # Overlay clear is delivered on its own Tk worker.  Give it
+                # a moment to destroy the topmost guide before focusing game.
+                if not self._wait_or_cancel(0.10):
+                    return
                 # The detector overlay or another desktop window may now be
                 # foreground.  Focus the game again before its trade dialog
                 # receives the requested absolute click and Enter.
-                if (self.key_sender.select_window() is False
-                        or not self.key_sender.is_game_foreground()):
+                if self.key_sender.select_window() is False:
                     LOG.warning(
                         "trade confirmation aborted: game could not be "
                         "refocused after trader detection"
