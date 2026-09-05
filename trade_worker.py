@@ -9,9 +9,12 @@ import queue
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+from countdown_worker import play_mp3
 
 
 LOG = logging.getLogger(__name__)
@@ -24,11 +27,10 @@ TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
 ACCEPT_INVITATION = (890, 668)
 TRADE_MESSAGE_BOX = (460, 200)
-# Tiny sample at the top-left of the original trader-check area.  Do not use
-# client (0, 0): that is unrelated game UI and can falsely trigger the next
-# confirmation click immediately.
-PRESENCE_BOX = (140, 100, 10, 10)
+# Small sample at the requested position inside the known trader-check area.
+PRESENCE_BOX = (145, 105, 20, 20)
 PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
+TRADER_PRESENT_FRAMES = 2
 
 
 class TradeOverlayWorker(threading.Thread):
@@ -313,6 +315,7 @@ class TradeWorker(threading.Thread):
         deadline = None if timeout is None else time.monotonic() + timeout
         self._show_presence_area(geometry)
         LOG.info("trade waiting for trader; detection area is highlighted")
+        present_frames = 0
         try:
             while (not self._invite_cancelled() and
                    (deadline is None or time.monotonic() < deadline)):
@@ -332,8 +335,16 @@ class TradeWorker(threading.Thread):
                 pixels = np.asarray(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.int16)
                 blank_ratio = float(np.mean(np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)))
                 if blank_ratio < 0.985:
-                    LOG.info("trade trader detected (blank ratio %.3f)", blank_ratio)
-                    return True
+                    present_frames += 1
+                    if present_frames >= TRADER_PRESENT_FRAMES:
+                        LOG.info(
+                            "trade trader detected after %d frames "
+                            "(blank ratio %.3f)",
+                            present_frames, blank_ratio,
+                        )
+                        return True
+                else:
+                    present_frames = 0
             if self._invite_cancel.is_set():
                 LOG.info("trade wait cancelled by Ctrl+Q")
             elif deadline is not None:
@@ -374,17 +385,30 @@ class TradeWorker(threading.Thread):
         LOG.info("trade presence sample blank=%s ratio=%.3f", blank, blank_ratio)
         return blank
 
-    def _confirm_trade(self, geometry: tuple[int, int, int, int]) -> None:
+    def _confirm_trade(self, geometry: tuple[int, int, int, int]) -> bool:
         VirtualMouse.click(*self._point(geometry, CONFIRM_BUTTON))
         time.sleep(0.15)
-        self.key_sender.send_direct_keys("enter")
+        return bool(self.key_sender.send_direct_keys("enter"))
 
-    def _send_message(self, geometry: tuple[int, int, int, int], message: str) -> None:
+    def _send_message(
+        self, geometry: tuple[int, int, int, int], message: str
+    ) -> bool:
         if not message or not self._set_clipboard(message):
-            return
+            return False
         VirtualMouse.click(*self._point(geometry, TRADE_MESSAGE_BOX))
         time.sleep(0.10)
-        self.key_sender.send_direct_keys("ctrl+v", "enter")
+        return bool(self.key_sender.send_direct_keys("ctrl+v", "enter"))
+
+    @staticmethod
+    def _play_success() -> None:
+        """Play completion feedback without holding up the trade worker."""
+
+        threading.Thread(
+            target=play_mp3,
+            args=(Path(__file__).resolve().parent / "sound" / "success.mp3",),
+            name="trade-success-sound",
+            daemon=True,
+        ).start()
 
     def _invite(self, message: str) -> None:
         if self._invite_cancelled():
@@ -424,7 +448,6 @@ class TradeWorker(threading.Thread):
                                    center[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True))
                 if not self._wait_or_cancel(0.18):
                     return
-                self._confirm_trade(geometry)
                 # A blank presence area means this trade request is now
                 # pending.  Do not continue inviting other targets: retain
                 # the yellow area and wait until the trader arrives.
@@ -442,8 +465,10 @@ class TradeWorker(threading.Thread):
             # arrives or the assistant is stopped.
             if self._wait_for_trader(geometry):
                 self.overlay.clear()
-                self._confirm_trade(geometry)
-                self._send_message(geometry, message)
+                if (self._confirm_trade(geometry)
+                        and self._send_message(geometry, message)):
+                    self._play_success()
+                    LOG.info("trade invite workflow completed")
         finally:
             self.capture_active_event.clear()
             self.overlay.clear()
