@@ -3715,21 +3715,17 @@ class UiWorker(threading.Thread):
         for index, message in enumerate(self._quick_messages):
             row = self._ttk.Frame(frame)
             row.pack(fill="x", pady=2)
-            # Grid keeps the message field visible between its fixed hotkey
-            # label and delete control.  Pack's expand calculation could give
-            # the button zero width after the hotkey label was added.
-            row.columnconfigure(1, weight=1)
             # Hotkey.json maps list positions 0..9 to Ctrl+1..Ctrl+0.  Keep
             # that index visible beside every message, including while it is
             # being edited, so a deletion/reorder is immediately obvious.
             key_number = (index + 1) % 10
-            self._ttk.Label(
-                row, text=f"Ctrl+{key_number}", width=6, anchor="w"
-            ).grid(row=0, column=0, sticky="w", padx=(0, 4))
             if edit_index == index:
+                self._ttk.Label(
+                    row, text=f"Ctrl+{key_number}", width=6, anchor="w"
+                ).pack(side="left", padx=(0, 4))
                 entry = self._ttk.Entry(row, width=42)
                 entry.insert(0, message)
-                entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+                entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
                 self._quick_edit_entry = entry
                 entry.bind(
                     "<FocusOut>",
@@ -3746,18 +3742,26 @@ class UiWorker(threading.Thread):
                 entry.focus_set()
                 entry.selection_range(0, "end")
             else:
-                button = self._ttk.Button(row, text=message, anchor="w")
-                button.grid(row=0, column=1, sticky="ew", padx=(0, 4))
-                button.bind(
+                # ttk.Button/Entry controls in this compact panel can be
+                # elided by certain Windows themes.  A single ttk.Label is
+                # always rendered and still supports the complete click,
+                # double-click, and long-press interaction through bindings.
+                message_label = self._ttk.Label(
+                    row, text=f"Ctrl+{key_number}   {message}", anchor="w"
+                )
+                message_label.pack(
+                    side="left", fill="x", expand=True, padx=(0, 4)
+                )
+                message_label.bind(
                     "<ButtonPress-1>",
                     lambda event, i=index: self._quick_message_press(i),
                 )
-                button.bind(
+                message_label.bind(
                     "<ButtonRelease-1>",
                     lambda event, i=index: self._quick_message_release(i),
                 )
-            delete_button = self._ttk.Button(row, text="×", width=3)
-            delete_button.grid(row=0, column=2, sticky="e")
+            delete_button = self._ttk.Label(row, text="×", width=3, anchor="center")
+            delete_button.pack(side="left")
             delete_button.bind(
                 "<ButtonPress-1>",
                 lambda event, i=index: self._quick_delete_press(i),
