@@ -22,7 +22,10 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
+WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
+MOD_CONTROL = 0x0002
+MOD_NOREPEAT = 0x4000
 LLKHF_LOWER_IL_INJECTED = 0x02
 LLKHF_INJECTED = 0x10
 
@@ -181,10 +184,72 @@ class HotkeyWorker(threading.Thread):
         except queue.Full:
             LOG.warning("hotkey action queue full; ignored %s", action)
 
+    def _run_registered_hotkeys(self) -> bool:
+        """Run native global Ctrl registrations when Windows accepts them.
+
+        A low-level hook can be installed successfully yet not receive keys
+        from particular game/overlay integrity contexts. ``RegisterHotKey``
+        is delivered by Windows to this worker's message queue and is more
+        reliable for this fixed set of global Ctrl chords. It also naturally
+        consumes the chord and uses ``MOD_NOREPEAT`` to prevent hold repeats.
+        """
+
+        user32 = ctypes.windll.user32
+        user32.RegisterHotKey.argtypes = (
+            wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT,
+        )
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+
+        registered: dict[int, str] = {}
+        for hotkey_id, (vk, binding) in enumerate(
+            sorted(self._bindings.items()), start=1
+        ):
+            action, _block_original = binding
+            if user32.RegisterHotKey(
+                None, hotkey_id, MOD_CONTROL | MOD_NOREPEAT, vk
+            ):
+                registered[hotkey_id] = action
+            else:
+                LOG.warning("could not register hotkey Ctrl+VK_%02X", vk)
+
+        # The hook below remains a compatibility fallback for machines where
+        # native global registration is disabled by policy or another app.
+        if not registered:
+            return False
+
+        LOG.info(
+            "hotkey worker started native registrations=%d/%d",
+            len(registered), len(self._bindings),
+        )
+        message = wintypes.MSG()
+        try:
+            while not self.stop_event.is_set():
+                while user32.PeekMessageW(
+                    ctypes.byref(message), None, 0, 0, PM_REMOVE
+                ):
+                    if message.message == WM_HOTKEY:
+                        action = registered.get(int(message.wParam))
+                        if (action is not None and self.enabled
+                                and self._binding_allowed(action)):
+                            self._queue_action(action)
+                    user32.TranslateMessage(ctypes.byref(message))
+                    user32.DispatchMessageW(ctypes.byref(message))
+                self.stop_event.wait(0.01)
+        finally:
+            for hotkey_id in registered:
+                user32.UnregisterHotKey(None, hotkey_id)
+            LOG.info("hotkey worker stopped")
+        return True
+
     def run(self) -> None:
         if sys.platform != "win32":
             LOG.warning("global hotkeys require Windows")
             self.stop_event.wait()
+            return
+
+        if self._run_registered_hotkeys():
             return
 
         ULONG_PTR = wintypes.WPARAM
