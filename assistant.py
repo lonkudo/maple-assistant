@@ -276,6 +276,7 @@ def main() -> int:
     )
     from attack_worker import AttackWorker
     from random_jump_worker import RandomJumpWorker
+    from small_step_worker import SmallStepWorker
     from hotkey_worker import HotkeyWorker
     from motion_arbiter import MotionArbiter
     # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
@@ -664,7 +665,10 @@ def main() -> int:
     # arbiter is busy, so a jump or buff tap never lands inside action
     # motion and gets swallowed by the game.
     motion_arbiter = MotionArbiter(
-        key_sender, stop_event, climbing_active_event=climbing_active,
+        key_sender,
+        stop_event,
+        climbing_active_event=climbing_active,
+        automation_active_event=automation_active,
     )
     # The fixed-rate attack worker always exists so the UI can toggle it
     # live (Fixed Attack panel).  Without --enable-attack it starts disabled
@@ -940,6 +944,17 @@ def main() -> int:
                 calibration.get("rescue_stuck_frames", 20)
             ),
     )
+    motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
+    motion_arbiter.set_buff_callback(movement_worker.perform_arbiter_buff)
+    motion_arbiter.set_motion_gate_callback(
+        movement_worker.motion_arbiter_motion_allowed
+    )
+    small_step_worker = SmallStepWorker(
+        stop_event,
+        automation_active_event=automation_active,
+        climbing_active_event=climbing_active,
+        motion_arbiter=motion_arbiter,
+    )
     character_worker = CharacterWorker(
         character_frames,
         character_positions,
@@ -962,6 +977,7 @@ def main() -> int:
         motion_arbiter,
         *attack_workers,
         random_jump_worker,
+        small_step_worker,
         hotkey_worker,
         screen_blinker,
         countdown_worker,
@@ -989,6 +1005,7 @@ def main() -> int:
             status_worker=status_worker,
             attack_worker=attack_worker,
             random_jump_worker=random_jump_worker,
+            small_step_worker=small_step_worker,
             hotkey_queue=hotkey_actions,
             hotkey_worker=hotkey_worker,
             movement_worker=movement_worker,

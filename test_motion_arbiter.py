@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 
-from motion_arbiter import MotionArbiter, JUMP
+from motion_arbiter import MICRO_STEP, MotionArbiter, JUMP
 
 
 class FakeSender:
@@ -126,6 +126,87 @@ class MotionArbiterTests(unittest.TestCase):
         self.assertFalse(arbiter.request_jump())
         self.assertFalse(arbiter.request_buff("home"))
         self.assertTrue(arbiter.is_idle())
+
+    def test_micro_step_uses_movement_callback(self) -> None:
+        sender = FakeSender()
+        calls = []
+        arbiter = self._arbiter(sender, threading.Event(), grace=0.0)
+        arbiter.set_micro_step_callback(lambda: calls.append("step") or True)
+        self.assertTrue(arbiter.request_micro_step())
+        self.assertTrue(wait_until(lambda: arbiter.is_idle()))
+        self.assertEqual(calls, ["step"])
+        self.assertEqual(sender.taps, [])
+        self.assertNotIn(MICRO_STEP, arbiter._queued)
+
+    def test_attack_reservation_blocks_micro_step_until_attack_finishes(self) -> None:
+        sender = FakeSender()
+        stop = threading.Event()
+        calls = []
+        arbiter = MotionArbiter(
+            sender, stop, attack_grace_seconds=0.0,
+            micro_step_motion_seconds=0.0,
+        )
+        arbiter.set_micro_step_callback(lambda: calls.append("step") or True)
+        self.assertTrue(arbiter.try_begin_attack())
+        self.assertTrue(arbiter.request_micro_step())
+        arbiter.start()
+        self.addCleanup(stop.set)
+        time.sleep(0.05)
+        # The queued callback must not begin in the attack key window.
+        self.assertEqual(calls, [])
+        self.assertFalse(arbiter.is_idle())
+        arbiter.finish_attack(True)
+        self.assertTrue(wait_until(lambda: calls == ["step"]))
+        self.assertTrue(wait_until(arbiter.is_idle))
+
+    def test_requests_are_rejected_when_patrol_is_not_active(self) -> None:
+        sender = FakeSender()
+        stop = threading.Event()
+        active = threading.Event()
+        arbiter = MotionArbiter(
+            sender, stop, automation_active_event=active,
+        )
+        self.assertFalse(arbiter.request_jump())
+        active.set()
+        self.assertTrue(arbiter.request_jump())
+        active.clear()
+        # An already queued input is removed rather than sent after Stop.
+        arbiter.start()
+        self.addCleanup(stop.set)
+        self.assertTrue(wait_until(arbiter.is_idle))
+        self.assertEqual(sender.taps, [])
+
+    def test_buff_waits_for_safe_horizontal_stage_before_executing(self) -> None:
+        sender = FakeSender()
+        stop = threading.Event()
+        allowed = [False]
+        arbiter = MotionArbiter(sender, stop)
+        arbiter.set_motion_gate_callback(lambda: allowed[0])
+        self.assertFalse(arbiter.request_jump())
+        # Buffs register at timer expiry but stay pending until movement is in
+        # patrol/rope horizontal travel.  They must not be dropped just
+        # because the timer expired during a climb or landing transition.
+        self.assertTrue(arbiter.request_buff("home"))
+        self.assertFalse(arbiter.request_micro_step())
+        allowed[0] = True
+        self.assertTrue(arbiter.request_jump())
+
+    def test_buff_completion_callback_runs_after_motion_window(self) -> None:
+        sender = FakeSender()
+        stop = threading.Event()
+        allowed = [False]
+        completed = []
+        arbiter = self._arbiter(sender, stop, buff=0.06, grace=0.0)
+        arbiter.set_motion_gate_callback(lambda: allowed[0])
+        self.assertTrue(arbiter.request_buff("home", completed.append))
+        time.sleep(0.03)
+        self.assertEqual(sender.taps, [])
+        self.assertEqual(completed, [])
+        allowed[0] = True
+        self.assertTrue(wait_until(lambda: sender.taps == ["home"]))
+        # Completion is intentionally later than the key tap: the next
+        # countdown begins only after the action window has finished.
+        self.assertTrue(wait_until(lambda: completed == [True]))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ from config_store import (
     ConfigSectionFile,
     ConfigStore,
     DEFAULT_SYSTEM_CONFIG,
+    USER_CONFIG_VERSION_KEY,
+    user_config_version,
 )
 
 
@@ -131,6 +133,24 @@ class ConfigStoreTests(unittest.TestCase):
             )
         )
         self.assertEqual(tracked, DEFAULT_SYSTEM_CONFIG)
+
+    def test_user_config_version_changes_only_when_content_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = self._store(root)
+            config_path = root / "user_config.json"
+            first = user_config_version(config_path)
+            self.assertTrue(first)
+            self.assertIn(USER_CONFIG_VERSION_KEY, json.loads(config_path.read_text()))
+
+            original = store.read_section("drug")
+            store.write_section("drug", original)
+            self.assertEqual(user_config_version(config_path), first)
+
+            changed = dict(original)
+            changed["hp_threshold"] = 61
+            store.write_section("drug", changed)
+            self.assertNotEqual(user_config_version(config_path), first)
 
 
 if __name__ == "__main__":

@@ -97,6 +97,12 @@ class WindowKeySender:
         "kp_multiply": (0x37, False), "kp_divide": (0x35, True),
         "kp_enter": (0x1C, True), "kp_decimal": (0x53, True),
     }
+    # MapleStory treats these as mutually exclusive motion directions.  They
+    # must never be left down together: Left+Right (or Up+Down) pins the
+    # character in place.  Alt and Z deliberately stay outside this set so a
+    # jump chord and pickup can overlap their intended companion inputs.
+    _DIRECTION_KEYS = frozenset({"left", "right", "up", "down"})
+    _MOVEMENT_KEYS = ("left", "right", "up", "down", "alt", "z")
 
     def __init__(
         self,
@@ -119,6 +125,12 @@ class WindowKeySender:
         self._selection_lock = threading.Lock()
         self._key_state_lock = threading.Lock()
         self._key_owners: dict[str, int] = {}
+        # SendInput can be accepted by Windows while the game misses one
+        # transition.  Keep a separate best-effort physical ledger so a
+        # lifecycle scrub can re-send key-up even after the logical owner
+        # table was cleared by Stop Patrol or a focus dip.
+        self._physical_keys: set[str] = set()
+        self._input_session = 0
         self._input_enabled = threading.Event()
         if input_enabled:
             self._input_enabled.set()
@@ -127,6 +139,10 @@ class WindowKeySender:
     def enable_input(self) -> None:
         """Allow workers to emit keyboard events after explicit UI activation."""
 
+        # Start from a neutral game-side keyboard state.  This is intentionally
+        # before arming new inputs, so an old worker cannot carry a missed key
+        # release into the new patrol session.
+        self.reset_input_session("start patrol")
         self._input_enabled.set()
         LOG.info("live keyboard input enabled")
 
@@ -134,21 +150,67 @@ class WindowKeySender:
         """Block new keyboard events and release every currently held key."""
 
         self._input_enabled.clear()
-        self.release_all_keys()
+        self.reset_input_session("input disabled")
         LOG.info("live keyboard input disabled")
 
-    def release_all_keys(self) -> None:
-        """Release owned keys without changing the UI-controlled input state."""
+    def _emit_locked(self, key: str, *, key_up: bool) -> None:
+        """Emit and ledger one transition while the input state is locked."""
+
+        if not self.dry_run:
+            scan_code, extended = self._SCAN[key]
+            self._send_scan_code(scan_code, key_up=key_up, extended=extended)
+        if key_up:
+            self._physical_keys.discard(key)
+        else:
+            self._physical_keys.add(key)
+
+    def force_key_up(self, key: str, *, reason: str = "recovery") -> bool:
+        """Unconditionally inject key-up and forget every claim for ``key``.
+
+        This is the recovery path for a game-side key that may still be held
+        after a lost transition.  It intentionally works when the logical
+        owner count is already zero.
+        """
+
+        key = key.casefold()
+        if key not in self._SCAN:
+            raise ValueError(f"unsupported key: {key}")
+        with self._key_state_lock:
+            self._key_owners.pop(key, None)
+            self._emit_locked(key, key_up=True)
+        LOG.info("key-up forced=%s reason=%s", key, reason)
+        return True
+
+    def reset_input_session(self, reason: str = "reset") -> int:
+        """Create a neutral input generation and scrub all bot motion keys."""
 
         with self._key_state_lock:
-            held_keys = tuple(self._key_owners)
+            keys = set(self._key_owners) | self._physical_keys
+            # Always include the bot's movement keys.  A missed game-side
+            # key-up is precisely the situation where neither local table
+            # can prove the key remains down.
+            keys.update(self._MOVEMENT_KEYS)
             self._key_owners.clear()
-        if not self.dry_run:
-            for key in held_keys:
-                scan_code, extended = self._SCAN[key]
-                self._send_scan_code(scan_code, key_up=True, extended=extended)
-        if held_keys:
-            LOG.info("released held keys: %s", ", ".join(held_keys))
+            for key in sorted(keys):
+                self._emit_locked(key, key_up=True)
+            self._input_session += 1
+            session = self._input_session
+        LOG.info(
+            "INPUT RESET session=%d reason=%s forced_keys=%s",
+            session, reason, ", ".join(sorted(keys)),
+        )
+        return session
+
+    def release_all_keys(self, *, reason: str = "release all") -> None:
+        """Release and forget all assistant keys without changing input state."""
+
+        self.reset_input_session(reason)
+
+    def input_session(self) -> int:
+        """Monotonic generation used by workers to discard stale local holds."""
+
+        with self._key_state_lock:
+            return self._input_session
 
     def input_is_enabled(self) -> bool:
         return self._input_enabled.is_set()
@@ -383,10 +445,25 @@ class WindowKeySender:
             LOG.debug("blocked key-down=%s: game window is not foreground", key)
             return False
         with self._key_state_lock:
+            # Stop Patrol clears this event before acquiring the same lock for
+            # its forced releases.  Check again under the lock so a queued
+            # worker cannot inject a late key-down after Stop was clicked.
+            if not self.input_is_enabled():
+                LOG.debug("blocked key-down=%s: input disarmed during wait", key)
+                return False
+            if key in self._DIRECTION_KEYS:
+                # Direction transitions are serialized centrally.  Release
+                # every conflicting direction BEFORE pressing this one; Z and
+                # Alt are intentionally unaffected and may still overlap.
+                for other in self._DIRECTION_KEYS - {key}:
+                    if (other in self._key_owners
+                            or other in self._physical_keys):
+                        self._key_owners.pop(other, None)
+                        self._emit_locked(other, key_up=True)
+                        LOG.info("key-up forced=%s reason=direction-switch", other)
             owners = self._key_owners.get(key, 0)
-            if owners == 0 and not self.dry_run:
-                scan_code, extended = self._SCAN[key]
-                self._send_scan_code(scan_code, key_up=False, extended=extended)
+            if owners == 0:
+                self._emit_locked(key, key_up=False)
             self._key_owners[key] = owners + 1
         LOG.info("key-down=%s owners=%d", key, owners + 1)
         return True
@@ -404,9 +481,7 @@ class WindowKeySender:
                 self._key_owners[key] = remaining
             else:
                 self._key_owners.pop(key, None)
-                if not self.dry_run:
-                    scan_code, extended = self._SCAN[key]
-                    self._send_scan_code(scan_code, key_up=True, extended=extended)
+                self._emit_locked(key, key_up=True)
         LOG.info("key-up=%s owners=%d", key, remaining)
         return True
 
@@ -422,17 +497,16 @@ class WindowKeySender:
             raise ValueError("repeat_key_down is only for movement directions")
         if not self.input_is_enabled():
             return False
-        with self._key_state_lock:
-            owned = self._key_owners.get(key, 0) > 0
-        if not owned:
-            return False
         if self.dry_run:
             LOG.info("DRY-RUN repeat key-down=%s", key)
             return True
         if not self._foreground_matches():
             return False
-        scan_code, extended = self._SCAN[key]
-        self._send_scan_code(scan_code, key_up=False, extended=extended)
+        with self._key_state_lock:
+            if (not self.input_is_enabled()
+                    or self._key_owners.get(key, 0) <= 0):
+                return False
+            self._emit_locked(key, key_up=False)
         return True
 
     def is_key_down(self, key: str) -> bool:
@@ -476,6 +550,11 @@ class WindowKeySender:
             self._key_owners.clear()
             for key in held_keys:
                 transition(key, True)
+                self._physical_keys.discard(key)
+            # The message interaction intentionally cancels gameplay holds.
+            # Advance the generation so a persistent climb cannot assume Up
+            # is still down after its chat key sequence.
+            self._input_session += 1
             direct_tap("enter")
             # Older/slower clients need time to open chat before Ctrl+V and
             # to consume the clipboard paste before the final Enter.
@@ -870,11 +949,16 @@ class StatusWorker(threading.Thread):
         self._potion_verification: dict[str, Optional[dict[str, float | int]]] = {
             "hp": None, "mp": None,
         }
-        # Monotonic timestamps of the last periodic buff tap (per buff row).
+        # Monotonic timestamps of the last completed timed action (per row).
         # 增益为"定时触发"，不从开局立即触发：起始时间戳设为当前时刻，
         # 第一个增益会在 interval 秒后才按（用户会先手动触发第一次增益）。
         self._last_buff = {"buff1": time.monotonic(), "buff2": time.monotonic(),
                           "buff3": time.monotonic()}
+        # Buff 2/3 can wait in MotionArbiter while climbing.  Keep one local
+        # in-flight marker so an elapsed timer cannot enqueue duplicates; it
+        # clears only when the arbiter reports success/failure.
+        self._buff_pending = {"buff2": False, "buff3": False}
+        self._buff_timer_lock = threading.Lock()
 
     def _tap_potion(self, key: str) -> bool:
         """Tap the potion key, retrying briefly if the first attempt is blocked.
@@ -976,18 +1060,54 @@ class StatusWorker(threading.Thread):
         ):
             if not enabled or not key or interval <= 0:
                 continue
-            if now - self._last_buff[name] < interval:
+            with self._buff_timer_lock:
+                due = now - self._last_buff[name] >= interval
+                pending = self._buff_pending.get(name, False)
+            if not due or pending:
+                continue
+            if name == "buff1":
+                # 宠物食品 is a periodic drug, not an action buff.  It is
+                # intentionally sent directly and never pauses patrol or
+                # joins MotionArbiter's directional handoff.
+                if self.key_sender.tap(key):
+                    with self._buff_timer_lock:
+                        self._last_buff[name] = time.monotonic()
+                    LOG.warning("宠物食品 refresh: used %s (every %.0fs)",
+                                key, interval)
                 continue
             if self.motion_arbiter is not None:
-                # Register the tap for the motion arbiter; the timer is only
-                # re-armed when the arbiter accepted the event.
-                if self.motion_arbiter.request_buff(key):
-                    self._last_buff[name] = now
+                # The timer is deliberately NOT restarted when queued.  It
+                # restarts only after the arbiter has tapped the key, waited
+                # through the action window, and called this completion hook.
+                def _completed(ok: bool, *, _name: str = name,
+                               _key: str = key, _interval: float = interval) -> None:
+                    with self._buff_timer_lock:
+                        self._buff_pending[_name] = False
+                        if ok:
+                            self._last_buff[_name] = time.monotonic()
+                    if ok:
+                        LOG.warning("%s refresh: completed %s (every %.0fs)",
+                                    _name.upper(), _key, _interval)
+                    else:
+                        LOG.warning("%s refresh: not sent; timer remains due",
+                                    _name.upper())
+
+                # Claim the local pending marker *before* handing the request
+                # to the arbiter.  The arbiter can execute very quickly on an
+                # idle patrol; claiming afterward could overwrite its already
+                # delivered completion callback and leave the timer stuck.
+                with self._buff_timer_lock:
+                    self._buff_pending[name] = True
+                if self.motion_arbiter.request_buff(key, _completed):
                     LOG.warning("%s refresh: queued %s (every %.0fs)",
                                 name.upper(), key, interval)
+                else:
+                    with self._buff_timer_lock:
+                        self._buff_pending[name] = False
                 continue
             if self.key_sender.tap(key):
-                self._last_buff[name] = now
+                with self._buff_timer_lock:
+                    self._last_buff[name] = time.monotonic()
                 LOG.warning("%s refresh: tapped %s (every %.0fs)",
                             name.upper(), key, interval)
 

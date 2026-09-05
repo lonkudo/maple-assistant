@@ -3,7 +3,7 @@ import threading
 import time
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import numpy as np
 from PIL import Image
@@ -370,6 +370,79 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(sender.events.count(("down", "right")), 2)
         self.assertEqual(sender.events.count(("down", "z")), 2)
         self.assertTrue(pickup_active.is_set())
+
+    def test_small_step_interrupts_walk_and_leaves_no_direction_held(self):
+        class Sender:
+            dry_run = True
+
+            def __init__(self):
+                self.events = []
+                self.owned = set()
+
+            def key_down(self, key):
+                self.events.append(("down", key))
+                self.owned.add(key)
+                return True
+
+            def key_up(self, key):
+                self.events.append(("up", key))
+                self.owned.discard(key)
+                return True
+
+            def force_key_up(self, key, **_kwargs):
+                self.events.append(("force-up", key))
+                self.owned.discard(key)
+                return True
+
+            def is_target_focused(self):
+                return True
+
+        sender = Sender()
+        worker = MovementWorker(
+            queue.Queue(), sender, threading.Event(), important_positions={}
+        )
+        with patch("movement_worker.time.sleep") as sleep:
+            self.assertTrue(worker.perform_micro_step())
+        self.assertEqual(sleep.call_args_list, [call(.15), call(.15)])
+        self.assertEqual(sender.events[-4:], [
+            ("down", "right"), ("up", "right"),
+            ("down", "left"), ("up", "left"),
+        ])
+        self.assertFalse(any(kind == "force-up" for kind, _key in sender.events))
+        self.assertFalse(sender.owned)
+
+    def test_small_step_left_right_option_uses_left_first(self) -> None:
+        class Sender:
+            dry_run = True
+            def __init__(self): self.events = []
+            def key_down(self, key): self.events.append(("down", key)); return True
+            def key_up(self, key): self.events.append(("up", key)); return True
+            def is_target_focused(self): return True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+            small_step_left_first=True,
+        )
+        with patch("movement_worker.time.sleep"):
+            self.assertTrue(worker.perform_micro_step())
+        self.assertEqual(worker.key_sender.events, [
+            ("down", "left"), ("up", "left"),
+            ("down", "right"), ("up", "right"),
+        ])
+
+    def test_motion_arbiter_allows_started_empty_route_standstill(self) -> None:
+        class Sender:
+            dry_run = True
+            def is_target_focused(self): return True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+            patrol_enabled=True,
+        )
+        self.assertEqual(worker._route_layers, [])
+        self.assertTrue(worker.motion_arbiter_motion_allowed())
+        worker.patrol_enabled = False
+        self.assertFalse(worker.motion_arbiter_motion_allowed())
 
     def test_stuck_walk_releases_all_held_keys(self) -> None:
         # A knock-down / focus dip can make the game MISS key-ups: the game
@@ -3109,6 +3182,11 @@ class MovementTests(unittest.TestCase):
         # The only sleep is the Alt+Right chord hold. There is no post-jump
         # delay before press("up") begins.
         sleep.assert_called_once_with(.10)
+        self.assertEqual(sender.events, [
+            ("down", "right"), ("down", "alt"),
+            ("up", "alt"), ("up", "right"),
+            ("press", "up", .45),
+        ])
         self.assertEqual(sender.events[-1], ("press", "up", .45))
 
     def test_under_rope_up_chord_is_alt_up_not_sideways(self):

@@ -54,6 +54,17 @@ class FakeSender:
         return True
 
 
+class DeferredBuffArbiter:
+    """Records a buff request and completes it only when the test says so."""
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    def request_buff(self, key, on_complete=None) -> bool:
+        self.requests.append((key, on_complete))
+        return True
+
+
 class StatusTests(unittest.TestCase):
     def test_exact_window_title_lookup_avoids_fallback_enumeration(self) -> None:
         class FakeWin32Gui:
@@ -382,6 +393,45 @@ class StatusTests(unittest.TestCase):
         worker._process_frame(status_image(1.0, 1.0))
         self.assertEqual(sender.keys, ["home", "insert", "home", "insert"])
 
+    def test_queued_buff_restarts_its_timer_only_after_completion(self) -> None:
+        sender = FakeSender()
+        arbiter = DeferredBuffArbiter()
+        worker = StatusWorker(
+            queue.Queue(), sender, threading.Event(), motion_arbiter=arbiter,
+        )
+        worker.detector.config = replace(
+            worker.detector.config,
+            buff1_enabled=False,
+            buff2_key="insert", buff2_interval=60.0, buff2_enabled=True,
+        )
+        original = time.monotonic() - 61.0
+        worker._last_buff["buff2"] = original
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual([key for key, _ in arbiter.requests], ["insert"])
+        # A queued request does not reset the deadline or pile up a duplicate.
+        self.assertEqual(worker._last_buff["buff2"], original)
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(len(arbiter.requests), 1)
+        arbiter.requests[0][1](True)
+        self.assertGreater(worker._last_buff["buff2"], original)
+        self.assertFalse(worker._buff_pending["buff2"])
+
+    def test_pet_food_is_direct_periodic_drug_not_arbiter_motion(self) -> None:
+        sender = FakeSender()
+        arbiter = DeferredBuffArbiter()
+        worker = StatusWorker(
+            queue.Queue(), sender, threading.Event(), motion_arbiter=arbiter,
+        )
+        worker.detector.config = replace(
+            worker.detector.config,
+            buff1_key="home", buff1_interval=60.0, buff1_enabled=True,
+            buff2_enabled=False, buff3_enabled=False,
+        )
+        worker._last_buff["buff1"] = time.monotonic() - 61.0
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual(sender.keys, ["home"])
+        self.assertEqual(arbiter.requests, [])
+
     def test_disabled_or_unbound_buff_never_taps(self) -> None:
         sender = FakeSender()
         worker = StatusWorker(queue.Queue(), sender, threading.Event())
@@ -421,6 +471,8 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(events, [])
 
         sender.enable_input()
+        # Enabling begins with a deliberate neutral-keyboard scrub.
+        events.clear()
         sender._foreground_matches = lambda: True
         self.assertTrue(sender.tap("ctrl"))
         self.assertEqual(events, [False, True])
@@ -497,6 +549,42 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(events, [False])               # no physical key-up yet
         self.assertTrue(sender.key_up("left"))         # movement finishes
         self.assertEqual(events, [False, True])
+
+    def test_direction_change_forces_conflicting_key_up_before_new_down(self) -> None:
+        sender = WindowKeySender("game", dry_run=False)
+        sender._foreground_matches = lambda: True
+        events = []
+        sender._send_scan_code = lambda code, key_up, extended: events.append(
+            (code, key_up)
+        )
+
+        self.assertTrue(sender.key_down("right"))
+        self.assertTrue(sender.key_down("left"))
+
+        right = sender._SCAN["right"][0]
+        left = sender._SCAN["left"][0]
+        self.assertEqual(events, [
+            (right, False), (right, True), (left, False),
+        ])
+        self.assertFalse(sender.is_key_down("right"))
+        self.assertTrue(sender.is_key_down("left"))
+
+    def test_forced_release_emits_key_up_after_ownership_was_forgotten(self) -> None:
+        sender = WindowKeySender("game", dry_run=False)
+        sender._foreground_matches = lambda: True
+        events = []
+        sender._send_scan_code = lambda code, key_up, extended: events.append(
+            (code, key_up)
+        )
+
+        self.assertTrue(sender.key_down("right"))
+        sender.release_all_keys(reason="focus dip")
+        # The logical table is empty now, but a direction switch must still
+        # send a physical right-up in case the game missed the first one.
+        self.assertTrue(sender.force_key_up("right", reason="restart scrub"))
+
+        right = sender._SCAN["right"][0]
+        self.assertEqual(events.count((right, True)), 2)
 
     def test_status_state_file_publishes_hp_ratio(self) -> None:
         import json

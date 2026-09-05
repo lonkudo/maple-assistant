@@ -149,10 +149,10 @@ class UiLogHandlerTests(unittest.TestCase):
         # "a" is bindable (players bind buffs/skills there).
         self.assertEqual(keysym_to_scan_key("a"), "a")
         self.assertEqual(keysym_to_scan_key("A"), "a")
-        # Everything else is NOT bindable (other letters, F-keys, numpad,
-        # "0", punctuation, Escape): the previous binding must stay.
-        self.assertIsNone(keysym_to_scan_key("q"))
-        self.assertIsNone(keysym_to_scan_key("Q"))
+        # The expanded fixed-attack set accepts Q through M (except Z,
+        # reserved for pickup); unsupported keys keep the prior binding.
+        self.assertEqual(keysym_to_scan_key("q"), "q")
+        self.assertEqual(keysym_to_scan_key("Q"), "q")
         self.assertIsNone(keysym_to_scan_key("F4"))
         self.assertIsNone(keysym_to_scan_key("0"))
         self.assertIsNone(keysym_to_scan_key("Tab"))
@@ -1019,6 +1019,50 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._fixed_adjust_random_gap(-.1)
 
         self.assertEqual(changes, [.2, .1, 0.0])
+
+    def test_random_gap_button_hold_repeats_until_release(self) -> None:
+        class Button:
+            def __init__(self):
+                self.bindings = {}
+                self.jobs = {}
+                self.cancelled = []
+                self._next = 0
+
+            def bind(self, event, callback):
+                self.bindings[event] = callback
+
+            def after(self, delay, callback):
+                self._next += 1
+                job = f"job-{self._next}"
+                self.jobs[job] = (delay, callback)
+                return job
+
+            def after_idle(self, callback):
+                callback()
+
+            def state(self, _states):
+                pass
+
+            def after_cancel(self, job):
+                self.cancelled.append(job)
+                self.jobs.pop(job, None)
+
+        worker = UiWorker.__new__(UiWorker)
+        button = Button()
+        calls = []
+        worker._bind_repeat_step_button(button, lambda: calls.append("step"))
+
+        button.bindings["<ButtonPress-1>"]()
+        self.assertEqual(calls, ["step"])
+        first_job = next(iter(button.jobs))
+        self.assertEqual(button.jobs[first_job][0], 250)
+        button.jobs.pop(first_job)[1]()
+        self.assertEqual(calls, ["step", "step"])
+        repeated_job = next(iter(button.jobs))
+        self.assertEqual(button.jobs[repeated_job][0], 100)
+        button.bindings["<ButtonRelease-1>"]()
+        self.assertIn(repeated_job, button.cancelled)
+        self.assertNotIn("<Leave>", button.bindings)
 
     def test_shutdown_panel_roundtrip_and_worker_apply(self) -> None:
         import json

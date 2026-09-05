@@ -132,17 +132,27 @@ order, so deletion automatically compacts `Ctrl+1` through `Ctrl+0`. Recording
 hotkeys refuse to run while patrol is enabled. Action feedback MP3 playback is
 launched on a daemon thread and does not block the hook or Tk.
 
-`MotionArbiter` (motion_arbiter.py) is the single executor for jump and buff
-motion keys, because MapleStory action motion drops a key pressed during
-another action. It owns a FIFO queue (one pending jump, one per buff key -
-duplicates collapse) and one worker thread. A queued jump is tapped as Alt and
-locks further motion for 0.9s; a queued buff key tap locks for 0.6s; attack is
-deferred while events are queued or executing. Events wait 0.3s after the last
-attack tap (attack-motion grace) and a pending jump is dropped while
-climb/return input is active (movement owns Alt there). `AttackWorker` asks
-`is_idle()` before each beat, waits when busy, and calls `note_attack()` after
-every successful tap. HP/MP potions deliberately stay on their urgent direct
-path, outside the queue.
+`MotionArbiter` (motion_arbiter.py) serializes jump, action-buff, and
+small-step motions because the game can drop a key pressed during another
+action. It has one FIFO executor, one pending jump, one pending small-step,
+and one pending event per buff key; duplicates collapse. A jump locks further
+motion for 0.9s, an action buff for 0.6s, and every queued action observes a
+0.3s post-attack grace.
+
+The safe-stage rule is deliberate: jump and small-step can register only on a
+normal Left/Right patrol or rope-approach walk. Timed action buffs may register
+as soon as their timer expires, including during climb/drop/landing, but remain
+queued until that safe stage returns. At execution, the arbiter calls
+`MovementWorker.perform_arbiter_buff()`: the movement worker takes its
+direction lock, releases the patrol Left/Right/Z hold, taps the key, and the
+following patrol frame re-arms walking. A buff completion callback restarts its
+timer only after the full action window ends successfully. A failed send clears
+the pending marker but leaves the timer due for retry.
+
+`AttackWorker` atomically reserves the arbiter before each beat and reports its
+successful tap for the grace period. A pending buff that is waiting for an
+unsafe stage does not unnecessarily block attacks; when the stage becomes safe,
+the reservation rules make the buff wait for any already-started attack.
 
 `AttackWorker` runs two modes selected in the 攻击模式 panel:
 固定攻击 taps the attack key on `base + random gap` and leaves the random jump
@@ -190,9 +200,11 @@ names. Movement stage logs are compact (`PATROL|`, `CLIMB|`, and
 Control ownership rules:
 
 - `MovementWorker` owns Left, Right, Alt+Up, Up, Alt+Down, and walking Z.
-- `StatusWorker` owns potion keys (direct) and queued buff keys.
+- `StatusWorker` owns HP/MP and pet-food drug timing; it schedules timed action
+  buffs and receives their completion result.
 - `AttackWorker` owns the configured attack key (fixed or 跳跃攻击 bundle).
-- `MotionArbiter` owns the timed execution of jump and buff motion keys.
+- `MotionArbiter` owns queue order and action windows; `MovementWorker` owns
+  the atomic directional handoff used to emit a queued buff.
 - `AttackExecutor` in the YOLO subprocess owns facing and the configured YOLO
   attack key, subject to patrol-state gating.
 - `pickup_worker.py` remains in the repository, but the primary runtime no
@@ -468,31 +480,26 @@ rope/character geometry. The UI prefers a local
 `yolo-detection/venv313`, then falls back to the assistant's current Python
 environment.
 
-`StatusWorker` analyzes the status capture independently.  The capture region
-is the FIXED-PIXEL 357x57 bottom-middle info bar; inside it three bars sit
-SIDE BY SIDE in one vertical band - HP (red) left, MP (blue) middle, EXP
-(yellow) right.  Each bar is measured only inside its own horizontal zone
-(`bar_zones`) with its own full-width reference, so the three can never be
-mixed (blue UI decoration above the bars is excluded by the vertical
-`bar_band`).  Potion use requires confirmed low readings and retries blocked
-sends.  Its configuration also owns optional periodic buffs: the 增益 panel
-rows (宠物食品/增益1/增益2, `drug_settings.json`) each carry a hotkey, an interval,
-and an enabled switch, wired end-to-end through `StatusConfig`
-(`buff1`/`buff2`/`buff3` key/interval/enabled), the `_check_buffs` loop, and
-`apply_drug_settings`.  Each row displays its own state; there is no extra
-bottom status echo line in the panel.
+`StatusWorker` analyzes the independent fixed-pixel status capture. HP (red),
+MP (blue), and EXP (yellow) occupy separate horizontal zones of one vertical
+band, each with its own full-width reference; their readings therefore cannot
+be mixed. HP/MP use confirmed low readings, retry blocked sends, and verify
+the bar response.
 
-The potion panel is placed in column 2 where the hidden YOLO panel previously
-appeared. The adjacent Quick Messages panel persists up to 20 strings in the
-user-owned `additional_functions` section. Its buttons use the shared 1-second
-gesture convention: short-click copies, two releases within 0.6 seconds
-reliably implement double-click across Windows themes and explicitly focus the
-game and send Enter, Ctrl+V, Enter, long-press edits, and long-pressing the
-adjacent delete icon removes that row.  After any row add/edit/delete the UI
-calls `_refit_window_to_content()`, which re-fits the window height to the
-taller column's required height so the window grows with new rows and shrinks
-back when rows are deleted (no residual bottom padding).  The Telegram machine
-marker uses the same long-press-to-entry, focus-out-to-button interaction.
+`StatusConfig` still uses the historical `buff1`/`buff2`/`buff3` storage names,
+but their runtime roles are now explicit:
+
+| Stored row / UI label | Runtime path |
+|---|---|
+| `buff1` / 宠物食品 | periodic drug; direct tap; no motion-arbiter or movement conflict |
+| `buff2` / 增益 1 | queued action buff; countdown starts after successful completion |
+| `buff3` / 增益 2 | queued action buff; countdown starts after successful completion |
+
+The drug panel is at the top of UI column 1. Below it are 附加功能 and
+快捷消息. Quick messages persist in `additional_functions`; short click copies,
+double click focuses the game and sends Enter/Ctrl+V/Enter, and one-second
+presses edit or delete. Adding, editing, or deleting a row calls
+`_refit_window_to_content()`.
 
 `CountdownWorker` has no gameplay dependencies: it owns only a monotonic
 deadline, configured interval, wake event, and alert callbacks. At expiry it
@@ -578,35 +585,40 @@ and patrol-toggle chords.
 The debug UI window geometry follows a whole-window, format-versioned model
 in `ui_worker.py`:
 
-- Default logical size is 1086 x 680 (`_INITIAL_WINDOW_WIDTH` /
-  `_INITIAL_WINDOW_HEIGHT`), applied only AFTER the UI is built, with
-  `pack_propagate(False)` on the container, columns, debug frame, and caption
-  bar so content can never spread the window at startup.
-- The window is DPI-unaware: Windows scales it like other apps (150% →
-  ~1629 x 1020 physical; 125% → ~1358 x 850).  The logical height 680 is the
-  machine-measured natural content height, so no clipping or blank space
-  appears at either scale.
+- The default logical width is 1086. The nominal initial height is 560, but
+  the root stays hidden until `_refit_window_to_content()` measures the taller
+  column and selects the compact non-clipping height. An oversized saved height
+  therefore cannot leave a large blank region below the panels.
+- The window is DPI-unaware, so Windows scales it like other apps. Its minimum
+  content height is 500 plus the custom caption; content fitting may grow it
+  when quick-message rows need more room.
 - Layout: column 0 fixed 550px, column 1 fixed 500px (grid `minsize`, both
   `weight=0`), 12px gap + 24px container padding = the 1086 default width.
-- The native caption strip is removed once (Win32 `WS_CAPTION`, keeping
-  native resize borders/min/max flags/taskbar) and replaced by an in-window
-  34px caption row hosting the title, the `?` help button, and `－ □ ×`
-  buttons.  Caption drags move the window via an outline-only overlay;
-  resize performance is pure Tk (root-only Configure-burst guard pausing the
-  heavy snapshot render).  No Win32 window-proc subclassing and no
-  `WM_SETREDRAW` - both crashed in earlier versions and are banned.
+- UI layout: column 0 contains 图层校准与巡逻, 攻击模式, and 运行日志; column 1
+  contains 药品, 附加功能, and 快捷消息. Both columns share a small top inset
+  below the caption and are grid-anchored north-west.
+- The native caption strip is removed once (Win32 `WS_CAPTION`, keeping native
+  resize borders/min/max flags/taskbar) and replaced by an in-window 34px row
+  hosting the title, update, help, and `－ □ ×` buttons. Caption dragging uses
+  four thin outline windows only; on release it calls native position-only
+  `SetWindowPos` instead of Tk `geometry('+x+y')`, preventing the black client
+  repaint previously visible after a drag. Resize performance is pure Tk: a
+  root-only Configure guard ignores position-only events and pauses only heavy
+  rendering during a true size-change burst. No window-proc subclassing or
+  `WM_SETREDRAW` is permitted.
 - Quick-message row changes call `_refit_window_to_content()`: the window
   height is set to chrome + the taller column's required height (clamped to
   minsize), so rows added grow the window and rows deleted shrink it back
   with no leftover bottom padding.
-- 运行日志 (running-log) panel: a LabelFrame panel (title + outline) like
+- 运行日志 (running-log) panel lives in column 0 as a LabelFrame like
   the other panels.  Its messages are shown in the plain message-hint style
   of the 图层校准与巡逻 panel (normal ttk.Label text): only the latest few
   significant events - patrol started, patrol ended (including external/
   auto stops), and ERROR+ records.  Two icon buttons sit at the panel's
   top-right and appear while patrol is NOT running (report time): the
   archive icon copies the in-memory running log, the user icon copies the
-  user settings JSON.  `UiLogHandler` retains the latest 600 formatted lines
+  user settings JSON, and 导出配置 overwrites the Desktop export. `UiLogHandler`
+  retains the latest 600 formatted lines
   in memory (deque, oldest dropped) - no per-line disk I/O; the ordinary
   file handler still owns the on-disk log.  Lifecycle markers are logged
   from `_start_patrol`/`_stop_patrol`/`_sync_patrol_ui_state`; the
@@ -624,6 +636,13 @@ JSON files. System sections never migrate from those files: the release-owned
 `user_config.json` is ignored/excluded while `system_config.json` is tracked and
 packaged. `yolo-detection/config.yaml` remains the model subproject's lower-level
 developer configuration.
+
+`config_store.py` writes `user_config_updated_at` only when user-owned content
+actually changes. `update_manager.py` uses that tag when the title-bar update
+button finds a newer Desktop ZIP/folder: equal nonempty tags keep the installed
+user configuration; otherwise the packaged/Desktop user configuration is copied
+and the process restarts through a hidden helper. `导出配置` intentionally
+overwrites the Desktop `user_config.json` export.
 
 Persistent user recordings and generated assets may be modified at runtime.
 Avoid overwriting them during unrelated code changes.
@@ -657,8 +676,9 @@ Release ZIPs remain ignored and are not committed.
 
 ## 10. Repository file inventory
 
-This inventory reflects the current tracked files. Regenerate the source list
-with:
+This inventory reflects the active repository files, including current
+uncommitted runtime modules that must be added at the next checkpoint.
+Regenerate the tracked source list with:
 
 ```powershell
 git -c core.quotepath=false ls-files
@@ -672,6 +692,8 @@ git -c core.quotepath=false ls-files
 | `config_store.py` | User/system section router and legacy user migration |
 | `capture_worker.py` | Client capture, frame bus, region mapping |
 | `movement_worker.py` | Patrol and movement state machines |
+| `motion_arbiter.py` | FIFO serialization, action windows, and completion callbacks for jump/buff/small-step motions |
+| `small_step_worker.py` | Optional timed small-step scheduler; requests, but does not emit, the atomic movement action |
 | `character_worker.py` | Minimap character-position stream and shared-result disconnect alert |
 | `status_worker.py` | SendInput sender, status detection, potions/buffs |
 | `attack_worker.py` | Fixed-rate attack thread |
@@ -692,6 +714,8 @@ git -c core.quotepath=false ls-files
 | `map_structure_tracker.py` | Scroll/world-Y tracking and re-anchoring |
 | `map_identity.py` | Map-name visual reference storage/matching |
 | `ui_worker.py` | Tk dashboard, recording controls, settings, YOLO subprocess |
+| `update_manager.py` | Desktop release discovery, tagged user-config preservation, hidden restart helper |
+| `versioning.py` | Four-digit release version read/format helpers |
 
 ### Root configuration, installation, release, and documentation
 
@@ -746,6 +770,7 @@ test_character_worker.py
 test_config_store.py
 test_countdown_worker.py
 test_lie_detector_worker.py
+test_motion_arbiter.py
 test_screen_blinker.py
 test_focus_worker.py
 test_hotkey_worker.py
@@ -759,7 +784,11 @@ test_random_jump_worker.py
 test_shutdown_worker.py
 test_single_instance.py
 test_status_worker.py
+test_small_step_worker.py
+test_telegram_notifier.py
 test_ui_worker.py
+test_update_manager.py
+test_versioning.py
 test_yolo_decision.py
 ```
 

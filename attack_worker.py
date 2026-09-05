@@ -136,6 +136,7 @@ class AttackWorker(threading.Thread):
             if self.stop_event.wait(max(0.0, next_attack - time.monotonic())):
                 break
             can_fire = self.enabled
+            attack_lease = False
             if can_fire and (self.automation_active_event is not None
                     and not self.automation_active_event.is_set()):
                 can_fire = False
@@ -144,24 +145,38 @@ class AttackWorker(threading.Thread):
                 LOG.info("attack skipped: climb/return input is active")
                 can_fire = False
             if can_fire and self.motion_arbiter is not None:
-                # Jump/buff motion owns the keyboard while queued/executing:
-                # wait for the arbiter to go idle, then re-check the gates
-                # (patrol may have stopped while we waited).
-                if not self.motion_arbiter.is_idle():
+                # Reservation is deliberately atomic.  Checking idle and
+                # tapping separately allowed a queued 小碎步 to start between
+                # those operations, so a directional sequence could overlap
+                # the attack animation.  One lease owns this whole tap.
+                attack_lease = self.motion_arbiter.try_begin_attack()
+                if not attack_lease:
                     self.motion_arbiter.wait_until_idle()
-                    can_fire = bool(self.enabled and self.motion_arbiter.is_idle())
-                    if can_fire and (self.automation_active_event is not None
-                            and not self.automation_active_event.is_set()):
-                        can_fire = False
-                    if can_fire and (self.climbing_active_event is not None
-                            and self.climbing_active_event.is_set()):
-                        LOG.info("attack skipped: climb/return input is active")
-                        can_fire = False
+                    attack_lease = bool(
+                        self.enabled
+                        and self.motion_arbiter.try_begin_attack()
+                    )
+                can_fire = attack_lease
+                if can_fire and (self.automation_active_event is not None
+                        and not self.automation_active_event.is_set()):
+                    can_fire = False
+                if can_fire and (self.climbing_active_event is not None
+                        and self.climbing_active_event.is_set()):
+                    LOG.info("attack skipped: climb/return input is active")
+                    can_fire = False
+            if not can_fire and attack_lease and self.motion_arbiter is not None:
+                # A Stop/climb edge may happen directly after reservation.
+                # Always return it, otherwise motion input would stay blocked.
+                self.motion_arbiter.finish_attack(False)
+                attack_lease = False
             if can_fire:
                 LOG.info("attack repetition: %s", self.attack_key)
-                if self.attack_once() and self.motion_arbiter is not None:
-                    # Anchor the arbiter's attack-motion grace window.
-                    self.motion_arbiter.note_attack()
+                sent = False
+                try:
+                    sent = self.attack_once()
+                finally:
+                    if self.motion_arbiter is not None and attack_lease:
+                        self.motion_arbiter.finish_attack(sent)
             # The random component is additive only: attack + random_gap.
             next_attack = time.monotonic() + self.next_delay()
         LOG.info("attack worker stopped")

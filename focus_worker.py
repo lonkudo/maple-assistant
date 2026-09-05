@@ -116,7 +116,15 @@ class FocusWorker(threading.Thread):
                     self.automation_active_event.set()
                 else:
                     self.automation_active_event.clear()
-                    self.key_sender.release_all_keys()
+                    # One forced release at the active -> inactive edge is
+                    # enough.  Repeating resets every poll could race a
+                    # successful refocus/new input session.
+                    if input_enabled and previous is not False:
+                        reset = getattr(self.key_sender, "reset_input_session", None)
+                        if callable(reset):
+                            reset("focus dip")
+                        else:
+                            self.key_sender.release_all_keys()
                 now = time.monotonic()
                 if active:
                     if self._lost_since is not None:
@@ -165,7 +173,11 @@ class FocusWorker(threading.Thread):
         finally:
             self.automation_active_event.clear()
             self.game_focused_event.clear()
-            self.key_sender.release_all_keys()
+            reset = getattr(self.key_sender, "reset_input_session", None)
+            if callable(reset):
+                reset("focus worker stopped")
+            else:
+                self.key_sender.release_all_keys()
             LOG.info("focus worker stopped")
 
 

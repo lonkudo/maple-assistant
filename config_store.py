@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import threading
@@ -10,6 +11,7 @@ from typing import Any, Optional
 
 
 USER_CONFIG_NAME = "user_config.json"
+USER_CONFIG_VERSION_KEY = "user_config_updated_at"
 SYSTEM_CONFIG_NAME = "system_config.json"
 LEGACY_UNIFIED_NAME = "config.json"
 
@@ -94,8 +96,13 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "climb_failed_shift_right_seconds": .1,
         "climb_attempt_interval_seconds": 1.0,
         "climb_failed_cycles_reset": 3,
+        "climb_lateral_cycles_reset": 3,
         "drop_chord_hold_seconds": .1, "drop_retry_seconds": 1.5,
         "fall_detect_frames": 3, "fall_marker_y_gain": .015,
+        "fall_settle_min_frames": 3, "fall_settle_epsilon": .15,
+        "fall_settle_max_seconds": 1.2,
+        "world_drift_check_interval_seconds": 2.0,
+        "world_drift_reanchor_threshold": .35,
         "attack_block_max_seconds": 4.0,
         "near_rope_seconds": .5, "near_rope_range": .025,
         "near_rope_inner_range": .018, "near_rope_outer_range": .0229,
@@ -111,6 +118,11 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "stair_jump_climb_arrival_grace_seconds": 2.0,
         "other_player_check_interval_seconds": 0.0,
         "rescue_check_interval_seconds": 300.0, "rescue_stuck_frames": 20,
+        "rescue_cycle_limit": 3,
+        "rescue_probe_attack_block_seconds": 2.0,
+        "rescue_probe_hold_seconds": .7,
+        "rescue_probe_settle_seconds": .2,
+        "rescue_probe_move_threshold": .006,
         "patrol_enabled": False,
     },
 }
@@ -138,6 +150,40 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _user_content(data: dict[str, Any]) -> dict[str, Any]:
+    """Return settings only, excluding the update/export version tag."""
+
+    content = deepcopy(data)
+    content.pop(USER_CONFIG_VERSION_KEY, None)
+    return content
+
+
+def _new_user_config_version() -> str:
+    # Microseconds make consecutive UI edits inside the same second distinct.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def user_config_version(path: Path) -> str:
+    """Read the content version tag; empty means a legacy/unversioned file."""
+
+    value = _read_json(Path(path)).get(USER_CONFIG_VERSION_KEY, "")
+    return str(value) if isinstance(value, str) else ""
+
+
+def _write_user_json(path: Path, data: dict[str, Any], previous: dict[str, Any]) -> bool:
+    """Write only changed user settings and renew their timestamp tag."""
+
+    before = _user_content(previous)
+    after = _user_content(data)
+    previous_tag = user_config_version(path)
+    if before == after and previous_tag:
+        return False
+    output = deepcopy(after)
+    output[USER_CONFIG_VERSION_KEY] = _new_user_config_version()
+    _write_json(path, output)
+    return True
 
 
 class ConfigStore:
@@ -189,8 +235,10 @@ class ConfigStore:
                 if section in data:
                     del data[section]
                     changed = True
+            if not user_config_version(self.user_path):
+                changed = True
             if changed:
-                _write_json(self.user_path, data)
+                _write_user_json(self.user_path, data, _read_json(self.user_path))
 
     def _document_for_section(self, section: str) -> dict[str, Any]:
         if section in SYSTEM_SECTIONS:
@@ -216,8 +264,9 @@ class ConfigStore:
             raise KeyError(f"unknown configuration section: {section}")
         with self._lock:
             data = _read_json(self.user_path)
+            previous = deepcopy(data)
             data[section] = deepcopy(value)
-            _write_json(self.user_path, data)
+            _write_user_json(self.user_path, data, previous)
 
 class ConfigSectionFile:
     """Small read_text/write_text adapter for existing JSON UI helpers."""
@@ -288,6 +337,8 @@ __all__ = [
     "ConfigSectionFile", "ConfigStore", "DEFAULT_CONFIG",
     "DEFAULT_SYSTEM_CONFIG", "DEFAULT_USER_CONFIG", "LEGACY_UNIFIED_NAME",
     "SECTION_FILES", "SYSTEM_CONFIG_NAME", "SYSTEM_SECTIONS",
-    "USER_CONFIG_NAME", "USER_SECTIONS", "config_section_file",
+    "USER_CONFIG_NAME", "USER_CONFIG_VERSION_KEY", "USER_SECTIONS",
+    "config_section_file",
     "get_config_store",
+    "user_config_version",
 ]

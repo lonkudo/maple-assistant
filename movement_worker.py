@@ -635,15 +635,13 @@ def _directional_jump_climb(
     climb_duration: float,
     persistent_up: bool = False,
 ) -> bool:
-    """Press Alt+<direction> as one overlapping chord; Up goes active EARLY.
+    """Press Alt+direction, then hand off immediately to Up for the grab.
 
-    For sideways jumps (left/right) Up is held from the very moment the jump
-    starts, not after the chord is released: the character can touch the
-    rope mid-jump and the grab registers immediately.  Releasing the chord
-    first made Up activate too late - the character had already sailed past
-    the rope (observed: lateral grab attempts reaching the rope but failing
-    to climb).  The straight-up case keeps its own order (Up is its
-    direction key and is re-pressed for the climb hold).
+    Left/Right/Up/Down are centrally serialized by ``WindowKeySender``.  A
+    lateral rope jump therefore holds Alt+Left/Right for its configured jump
+    window, releases the lateral key, and sends Up with no deliberate sleep
+    between those two transitions.  This avoids both opposing directional
+    keys being down and the former visible lag before the rope grab.
     """
 
     if not _sender_is_safe(sender):
@@ -661,46 +659,42 @@ def _directional_jump_climb(
     up_claimed = False
     failed = True
     try:
-        # The direction and Alt keys remain active concurrently for the whole
-        # directional jump window. They are not separate press() operations.
-        if direction != "up":
-            direction_claimed = key_down(direction) is not False
-            if not direction_claimed:
-                return False
+        # Alt is independent.  Directional keys are mutually exclusive, so a
+        # sideways chord never overlaps its Left/Right with the following Up.
+        direction_claimed = key_down(direction) is not False
+        if not direction_claimed:
+            return False
         alt_claimed = key_down("alt") is not False
         if not alt_claimed:
             return False
-        if direction != "up" and persistent_up:
-            # Worker (persistent) climbs hold Up from the very start of the
-            # sideways jump so the rope grab is live the instant the jump
-            # touches the rope; releasing the chord first let the character
-            # sail past the rope before Up activated and the grab missed.
-            up_claimed = key_down("up") is not False
-            if not up_claimed:
-                return False
         time.sleep(max(0.025, direction_hold))
         failed = False
     finally:
         if alt_claimed:
             key_up("alt")
-        if direction_claimed:
+        # The order is intentional: lateral release immediately followed by
+        # Up creates a smooth handoff without ever holding both directions.
+        if direction_claimed and direction != "up":
             key_up(direction)
-        if up_claimed and failed:
-            # A failed/aborted chord must never leave Up physically held.
+        if direction_claimed and direction == "up" and failed:
             key_up("up")
-    # Straight-up chord: Up was the direction key and was released with the
-    # chord; press it again so the climb grab stays active.
+    # Straight-up retains the Alt+Up chord.  Persistent climbs leave Up down;
+    # timed callers release it before issuing their duration-limited Up press.
     if direction == "up":
         if persistent_up:
-            up_ok = key_down("up")
+            up_claimed = True
+            up_ok = True
         else:
+            key_up("up")
             up_ok = press("up", duration=climb_duration)
         return up_ok is not False
-    # Sideways chord.  Persistent climbs already hold Up from the jump
-    # start; legacy timed callers keep pressing Up right after the chord.
-    if not up_claimed:
-        return press("up", duration=climb_duration) is not False
-    return True
+    # Sideways chord: no intentional gap after releasing Left/Right.  Up is
+    # the very next input event, so a rope touched during the jump is grabbed
+    # without reintroducing conflicting directional holds.
+    if persistent_up:
+        up_claimed = key_down("up") is not False
+        return up_claimed
+    return press("up", duration=climb_duration) is not False
 
 
 def _drop_through_platform(
@@ -1529,7 +1523,11 @@ class MovementWorker(threading.Thread):
         arrival_in_progress = bool(
             self._climb_state.target_layer_frames > 0
         )
-        result = climb(
+        # A climb chord owns all directional keys while it is emitted.  This
+        # shares the same lock as 小碎步, so no left/right pair can land between
+        # Alt+side and the immediately-following Up grab.
+        with self._direction_lock:
+            result = climb(
             self.key_sender,
             observation,
             self._climb_state,
@@ -1550,8 +1548,8 @@ class MovementWorker(threading.Thread):
             arrival_y=arrival_y,
             arrival_tolerance=arrival_tolerance,
             arrival_in_progress=arrival_in_progress,
-            lateral_hop_side=self._climb_lateral_side,
-        )
+                lateral_hop_side=self._climb_lateral_side,
+            )
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
             self._climb_arrival_at = time.monotonic()
@@ -1890,6 +1888,9 @@ class MovementWorker(threading.Thread):
                     self._return_arrival_floor = None
                     self._descending_to_first = False
                     self._route_layer_index = None
+                    # The patrol is stopping: release every movement key so
+                    # nothing stays stuck in the game.
+                    self._release_stuck_keys()
                     self._release_climb_up()
                     self._climb_state = ClimbState()
                     with self._patrol_start_lock:
@@ -1925,6 +1926,7 @@ class MovementWorker(threading.Thread):
             self._rope_approach_last_x = player_x
             self._rope_approach_stall_frames = 0
             self._rope_approach_far_stall_frames = 0
+            self._rope_approach_far_stall_count = 0
             return False
         last_x = self._rope_approach_last_x
         self._rope_approach_last_x = player_x
@@ -1938,6 +1940,7 @@ class MovementWorker(threading.Thread):
         if moved:
             self._rope_approach_stall_frames = 0
             self._rope_approach_far_stall_frames = 0
+            self._rope_approach_far_stall_count = 0
             return False
         if not aligned:
             # A monster hit can leave the game ignoring an already-held
@@ -2022,7 +2025,8 @@ class MovementWorker(threading.Thread):
         state.attach_frames = 2  # already attached to the rope
         state.stalled_frames = 0
         state.arrival_frames = 0
-        self.key_sender.key_down("up")
+        with self._direction_lock:
+            self.key_sender.key_down("up")
         if self.climbing_active_event is not None:
             self.climbing_active_event.set()
         self._rope_stuck_recoveries += 1
@@ -2045,19 +2049,20 @@ class MovementWorker(threading.Thread):
     def _release_walk_hold(self) -> None:
         """Release the currently held walk direction (and Z) if any."""
         key_up = getattr(self.key_sender, "key_up", None)
-        with self._hold_lock:
-            if self._walk_hold_key is not None:
-                if key_up is not None:
-                    key_up(self._walk_hold_key)
-                self._walk_hold_key = None
-            if self._walk_hold_z:
-                if key_up is not None:
-                    key_up("z")
-                self._walk_hold_z = False
-                if self.pickup_active_event is not None:
-                    self.pickup_active_event.clear()
-                LOG.info("pickup: Z released with walk")
-            self._walk_hold_until = 0.0
+        with self._direction_lock:
+            with self._hold_lock:
+                if self._walk_hold_key is not None:
+                    if key_up is not None:
+                        key_up(self._walk_hold_key)
+                    self._walk_hold_key = None
+                if self._walk_hold_z:
+                    if key_up is not None:
+                        key_up("z")
+                    self._walk_hold_z = False
+                    if self.pickup_active_event is not None:
+                        self.pickup_active_event.clear()
+                    LOG.info("pickup: Z released with walk")
+                self._walk_hold_until = 0.0
 
     def _hold_manager(self) -> None:
         """Release the walk key when its hold deadline passes or the attack
@@ -2066,6 +2071,7 @@ class MovementWorker(threading.Thread):
         while not self.stop_event.is_set():
             time.sleep(0.02)
             try:
+                release = False
                 with self._hold_lock:
                     if self._walk_hold_key is None:
                         continue
@@ -2084,8 +2090,11 @@ class MovementWorker(threading.Thread):
                                 release = True
                         else:
                             self._attack_active_since = None
-                    if release:
-                        self._release_walk_hold()
+                # Do not acquire the directional lock while holding
+                # _hold_lock: 小碎步 takes them in the opposite order while it
+                # clears patrol, and lock inversion would deadlock input.
+                if release:
+                    self._release_walk_hold()
             except Exception:
                 LOG.exception("hold manager failed")
 
@@ -2102,13 +2111,18 @@ class MovementWorker(threading.Thread):
         is actually needed.  Never runs on a timer - stuck events only.
         """
 
-        key_up = getattr(self.key_sender, "key_up", None)
-        if key_up is not None:
-            for key in ("up", "down", "left", "right", "alt", "z"):
-                key_up(key)
-        release_all = getattr(self.key_sender, "release_all_keys", None)
-        if callable(release_all):
-            release_all()
+        with self._direction_lock:
+            force_key_up = getattr(self.key_sender, "force_key_up", None)
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(force_key_up):
+                for key in ("up", "down", "left", "right", "alt", "z"):
+                    force_key_up(key, reason="movement recovery")
+            elif key_up is not None:
+                for key in ("up", "down", "left", "right", "alt", "z"):
+                    key_up(key)
+            release_all = getattr(self.key_sender, "release_all_keys", None)
+            if callable(release_all):
+                release_all()
 
     def _send_walk_hold(self, decision: MovementDecision) -> bool:
         """Schedule a direction-key hold: press now, release after the
@@ -2134,7 +2148,7 @@ class MovementWorker(threading.Thread):
         key_down = getattr(self.key_sender, "key_down", None)
         if key_down is None:
             return _send_tap(self.key_sender, decision)
-        with self._hold_lock:
+        with self._direction_lock, self._hold_lock:
             # The focus worker releases all physical keys on a focus dip.  Its
             # release happens outside this hold state, so the worker can still
             # believe Right/Z are held after refocus and silently skip their
@@ -2177,8 +2191,11 @@ class MovementWorker(threading.Thread):
                     # direction.  Re-send the old key's key-up once after the
                     # new key is down (redundant + harmless) so the game-side
                     # stuck press is cleared.
+                    force_key_up = getattr(self.key_sender, "force_key_up", None)
                     key_up_old = getattr(self.key_sender, "key_up", None)
-                    if key_up_old is not None:
+                    if callable(force_key_up):
+                        force_key_up(previous, reason="walk direction switch")
+                    elif key_up_old is not None:
                         key_up_old(previous)
             if not self._walk_hold_z:
                 if key_down("z") is not False:
@@ -2294,6 +2311,7 @@ class MovementWorker(threading.Thread):
         rope_approach_creep_seconds: float = 0.25,
         rope_tiny_step_min_seconds: float = 0.05,
         rope_tiny_step_max_seconds: float = 0.15,
+        small_step_left_first: bool = False,
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
         other_player_check_interval_seconds: float = 60.0,
@@ -2490,6 +2508,10 @@ class MovementWorker(threading.Thread):
         # True once the automation input gate has been observed active, so the
         # disarmed->armed edge (Start Patrol) can be detected exactly once.
         self._automation_was_active = False
+        # Sender generations change whenever Stop, focus protection, or Start
+        # performs a forced keyboard scrub.  Local walk/climb bookkeeping from
+        # an older generation must never attempt to release a newer key claim.
+        self._input_session_seen: Optional[int] = None
         # Set while the character is actively walking (left/right decisions),
         # used by the pickup worker to only tap Z during movement.
         self.moving_active_event = moving_active_event
@@ -2504,6 +2526,17 @@ class MovementWorker(threading.Thread):
         # 松开交给独立的 hold 管理线程（_hold_manager）。这样主循环按
         # 最小地图帧率跑，卡住检测（10 帧 ≈ 2.5s）不会被 2 秒 hold 拖延。
         self._hold_lock = threading.RLock()
+        # Every L/R/U/D action takes this lock.  Normal patrol only holds it
+        # while changing a key; rope/stair/drop and 小碎步 retain it for their
+        # full chord so their directions cannot cross.
+        self._direction_lock = threading.RLock()
+        # UI-controlled order for the atomic micro-step.  False preserves a
+        # right-then-left nudge; the “左右” option selects left-then-right.
+        self.small_step_left_first = bool(small_step_left_first)
+        # Published from the movement loop.  Queued jump/buff/small-step
+        # input is only allowed while a normal horizontal patrol or rope
+        # approach decision is live.
+        self._motion_arbiter_stage: Optional[str] = None
         self._walk_hold_key: Optional[str] = None
         self._walk_hold_z = False
         self._walk_hold_until = 0.0
@@ -2515,6 +2548,7 @@ class MovementWorker(threading.Thread):
         self._rope_approach_last_x: Optional[float] = None
         self._rope_approach_stall_frames = 0
         self._rope_approach_far_stall_frames = 0
+        self._rope_approach_far_stall_count = 0
         self._rope_approach_phase_label: Optional[str] = None
         self._rope_stuck_recoveries = 0
         # 自救：巡逻 5 分钟一检；若角色在小地图上连续 20 帧位置不变
@@ -2934,32 +2968,41 @@ class MovementWorker(threading.Thread):
         if key_down is None or key_up is None:
             LOG.warning("stair jump requires key_down() and key_up(); suppressed")
             return False
-        claimed = key_down(direction) is not False
-        if not claimed:
-            return False
-        deadline = time.monotonic() + max(0.01, float(decision.duration))
-        alt_down = False
-        try:
-            lead = min(
-                max(0.0, self.stair_jump_lead_seconds),
-                max(0.01, float(decision.duration) * 0.5),
+        with self._direction_lock:
+            claimed = key_down(direction) is not False
+            if not claimed:
+                return False
+            deadline = time.monotonic() + max(0.01, float(decision.duration))
+            alt_down = False
+            try:
+                lead = min(
+                    max(0.0, self.stair_jump_lead_seconds),
+                    max(0.01, float(decision.duration) * 0.5),
+                )
+                if lead > 0:
+                    time.sleep(lead)
+                if key_down("alt") is not False:
+                    alt_down = True
+                    time.sleep(max(0.01, self.stair_jump_alt_hold_seconds))
+                # 跳一旦开始就让它完成：中途被攻击打断会让角色卡在坑/边缘
+                # （跳跃被压制 → 超过 2 秒不动）。攻击等待这一跳。
+                while time.monotonic() < deadline:
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(0.02)
+                return True
+            finally:
+                if alt_down:
+                    key_up("alt")
+                key_up(direction)
+
+    def _send_drop_through_platform(self) -> bool:
+        """Emit Alt+Down while excluding patrol and 小碎步 directions."""
+
+        with self._direction_lock:
+            return _drop_through_platform(
+                self.key_sender, self.drop_chord_hold_seconds
             )
-            if lead > 0:
-                time.sleep(lead)
-            if key_down("alt") is not False:
-                alt_down = True
-                time.sleep(max(0.01, self.stair_jump_alt_hold_seconds))
-            # 跳一旦开始就让它完成：中途被攻击打断会让角色卡在坑/边缘
-            # （跳跃被压制 → 超过 2 秒不动）。攻击等待这一跳。
-            while time.monotonic() < deadline:
-                if self.stop_event.is_set():
-                    break
-                time.sleep(0.02)
-            return True
-        finally:
-            if alt_down:
-                key_up("alt")
-            key_up(direction)
 
     def _attack_should_defer(self) -> bool:
         """True when an active attack must wait for a rope climb, a drop, or
@@ -3193,9 +3236,7 @@ class MovementWorker(threading.Thread):
                 attempt, max_attempts,
             )
             try:
-                _drop_through_platform(
-                    self.key_sender, self.drop_chord_hold_seconds
-                )
+                self._send_drop_through_platform()
             except Exception:
                 LOG.warning("drop suppressed during self-rescue descent",
                             exc_info=True)
@@ -4958,10 +4999,152 @@ class MovementWorker(threading.Thread):
 
     def _release_climb_up(self) -> None:
         if self._climb_state.up_held:
+            force_key_up = getattr(self.key_sender, "force_key_up", None)
             key_up = getattr(self.key_sender, "key_up", None)
-            if key_up is not None:
+            if callable(force_key_up):
+                force_key_up("up", reason="climb release")
+            elif key_up is not None:
                 key_up("up")
             self._climb_state.up_held = False
+
+    def _sync_input_session(self) -> None:
+        """Drop worker-local holds when the sender starts a new generation."""
+
+        getter = getattr(self.key_sender, "input_session", None)
+        if not callable(getter):
+            return
+        try:
+            current = int(getter())
+        except Exception:
+            LOG.debug("could not read input session", exc_info=True)
+            return
+        if self._input_session_seen is None:
+            self._input_session_seen = current
+            return
+        if current == self._input_session_seen:
+            return
+        previous = self._input_session_seen
+        self._input_session_seen = current
+        with self._direction_lock, self._hold_lock:
+            self._walk_hold_key = None
+            self._walk_hold_z = False
+            self._walk_hold_until = 0.0
+
+    def perform_micro_step(self) -> bool:
+        """Run one short Left/Right pair while temporarily pausing patrol.
+
+        Called only by ``MotionArbiter``.  The arbiter has already blocked
+        attack and other queued motions; this method clears the current patrol
+        walk, owns the directional sequence for 150 ms per side, and leaves
+        no direction down.  The following patrol frame naturally re-arms its
+        ordinary walk hold.
+        """
+
+        if not _sender_is_safe(self.key_sender):
+            LOG.info("small-step blocked: target window is not safely selected")
+            return False
+        if self._movement_busy_now():
+            LOG.info("small-step skipped: climb/drop input is active")
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_down is None or key_up is None:
+            return False
+        # Check and claim under the same directional lock.  A climb/drop
+        # cannot begin between this busy check and the first tiny step.
+        with self._direction_lock, self._hold_lock:
+            if self._movement_busy_now():
+                LOG.info("small-step skipped: climb/drop input is active")
+                return False
+            # Interrupt patrol cleanly.  This action owns only Left/Right:
+            # never force-release Up/Down, Alt, or any unrelated key.  The
+            # arbiter plus this directional lock keep jump/buff/climb/drop
+            # transactions outside this atomic two-step sequence.
+            self._release_walk_hold()
+            is_key_down = getattr(self.key_sender, "is_key_down", None)
+            if callable(is_key_down) and (
+                    is_key_down("up") or is_key_down("down")):
+                LOG.info("small-step skipped: vertical movement is active")
+                return False
+            if self.moving_active_event is not None:
+                self.moving_active_event.clear()
+            first = "left" if self.small_step_left_first else "right"
+            second = "right" if first == "left" else "left"
+            first_claimed = key_down(first) is not False
+            if not first_claimed:
+                return False
+            try:
+                time.sleep(0.15)
+            finally:
+                key_up(first)
+            second_claimed = key_down(second) is not False
+            if not second_claimed:
+                return False
+            try:
+                time.sleep(0.15)
+            finally:
+                key_up(second)
+        LOG.info("small-step complete: %s -> %s (150ms each)", first, second)
+        return True
+
+    def perform_arbiter_buff(self, key: str) -> bool:
+        """Tap one queued buff after cleanly yielding patrol movement.
+
+        This is called only by MotionArbiter.  It releases the ordinary
+        Left/Right(+Z) walk under the same directional lock used by climb,
+        drops and small-step, taps the buff, then leaves the next patrol frame
+        free to re-arm its previous direction.  It never runs during vertical
+        movement or a climb/transition.
+        """
+
+        if not key or not _sender_is_safe(self.key_sender):
+            return False
+        with self._direction_lock, self._hold_lock:
+            if not self.motion_arbiter_motion_allowed():
+                LOG.info("arbiter buff deferred: movement is not at a safe stage")
+                return False
+            self._release_walk_hold()
+            if self.moving_active_event is not None:
+                self.moving_active_event.clear()
+            try:
+                sent = self.key_sender.tap(key) is not False
+            except Exception:
+                LOG.exception("arbiter buff tap failed key=%s", key)
+                return False
+        if sent:
+            LOG.info("arbiter buff executed: %s; patrol will resume", key)
+        return sent
+
+    def motion_arbiter_motion_allowed(self) -> bool:
+        """Whether queued jump/buff/small-step input may be emitted now.
+
+        The arbiter may act while the current frame is a regular left/right
+        patrol walk or a walk toward a rope.  A started patrol with no route
+        is also safe: the character stands still and may still attack/buff.
+        Climb, drop, stair jump, alignment, and transition frames are
+        deliberately excluded.
+        """
+
+        with self._direction_lock:
+            decision = self.last_decision
+            if not _sender_is_safe(self.key_sender) or self._movement_busy_now():
+                return False
+            if self.patrol_enabled and not self._route_layers:
+                return True
+            return bool(
+                self._motion_arbiter_stage in ("patrol", "move-to-rope")
+                and decision is not None
+                and decision.key in ("left", "right")
+            )
+        self._climb_state = ClimbState()
+        if self.pickup_active_event is not None:
+            self.pickup_active_event.clear()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
+        LOG.info("movement reset stale holds for input session %d -> %d",
+                 previous, current)
 
     def _current_layer_world_y(self) -> Optional[float]:
         if (self._route_layer_index is None
@@ -5040,6 +5223,24 @@ class MovementWorker(threading.Thread):
         self, observation: Optional[MinimapObservation] = None
     ) -> None:
         floor = self._current_route_floor()
+        # During a return climb the route index can still describe the stale
+        # pre-fall floor (out-of-route floors never re-index it), so the
+        # "current" floor would anchor the world origin to the WRONG layer
+        # (observed: world Y re-anchored to layer2 at -0.178 while the
+        # character was still climbing up FROM layer1 - corrupting climb
+        # verification/arrival).  Anchor to the floor the return is actually
+        # climbing from: the detected floor first, then the recorded return
+        # floor.
+        if (floor is None
+                or self._return_mode == "climb-to-route"):
+            detected = (
+                self._detect_floor_all(observation)
+                if observation is not None else None
+            )
+            if detected is not None:
+                floor = detected
+            elif self._return_from_floor is not None:
+                floor = self._return_from_floor
         if floor is not None:
             self._reanchor_tracker_to_layer(floor, observation)
 
@@ -5075,9 +5276,17 @@ class MovementWorker(threading.Thread):
             except queue.Empty:
                 continue
             try:
+                self._sync_input_session()
                 if (self.automation_active_event is not None
                         and not self.automation_active_event.is_set()):
-                    self._automation_was_active = False
+                    if self._automation_was_active:
+                        # Patrol just stopped / input disarmed (Stop button,
+                        # focus loss, disconnect alert): release EVERY
+                        # movement key once so no key stays stuck in the game
+                        # for the next patrol (a lost key-up at stop freezes
+                        # the character at the next start otherwise).
+                        self._automation_was_active = False
+                        self._release_stuck_keys()
                     self._release_climb_up()
                     self._release_walk_hold()
                     if self.climbing_active_event is not None:
@@ -5666,6 +5875,15 @@ class MovementWorker(threading.Thread):
                     self._release_climb_up()
                     self._climb_state = ClimbState()
                     self._climb_cycle_reset()
+                if decision.key in ("left", "right"):
+                    if route_is_rope and not inside_rope_zone:
+                        self._motion_arbiter_stage = "move-to-rope"
+                    elif not route_is_rope:
+                        self._motion_arbiter_stage = "patrol"
+                    else:
+                        self._motion_arbiter_stage = None
+                else:
+                    self._motion_arbiter_stage = None
                 self.last_observation, self.last_decision = observation, decision
                 if observation.player is not None:
                     gap = ((active_target_x - observation.player.x)
@@ -5718,14 +5936,10 @@ class MovementWorker(threading.Thread):
                         if self.dropping_active_event is not None:
                             self.dropping_active_event.set()
                         if self.climb_attack_lock is None:
-                            drop_sent = _drop_through_platform(
-                                self.key_sender, self.drop_chord_hold_seconds
-                            )
+                            drop_sent = self._send_drop_through_platform()
                         else:
                             with self.climb_attack_lock:
-                                drop_sent = _drop_through_platform(
-                                    self.key_sender, self.drop_chord_hold_seconds
-                                )
+                                drop_sent = self._send_drop_through_platform()
                         if not drop_sent:
                             if self.climbing_active_event is not None:
                                 self.climbing_active_event.clear()
@@ -5834,12 +6048,34 @@ class MovementWorker(threading.Thread):
                                 "re-arming %s", decision.key
                             )
                             self._rope_approach_far_stall_frames = 0
+                            self._rope_approach_far_stall_count += 1
                             # Stuck while a walk is issued: the game may be
                             # holding keys whose key-ups were lost (knock-down
                             # / focus dip).  Release every movement key once -
                             # the re-arm below re-presses what is needed.
                             self._release_stuck_keys()
                             self._release_walk_hold()
+                            if self._rope_approach_far_stall_count >= 2:
+                                # Still frozen after a full key release and a
+                                # re-arm: a transient game lock (knock
+                                # animation / monster push / stuck input
+                                # state) may be blocking the walk - one
+                                # recovery jump in place, then re-approach.
+                                self._rope_approach_far_stall_count = 0
+                                LOG.warning(
+                                    "ROPE approach frozen after key release; "
+                                    "recovery jump"
+                                )
+                                press = getattr(
+                                    self.key_sender, "press", None
+                                )
+                                if press is not None:
+                                    press(
+                                        "alt",
+                                        duration=getattr(
+                                            self, "climb_nudge_seconds", 0.08
+                                        ),
+                                    )
                         # Cancellable walk hold: the movement key is released
                         # within ~20ms when the attack selects a target, so
                         # the character can face and hit a monster behind it.

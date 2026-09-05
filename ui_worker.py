@@ -31,21 +31,26 @@ from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
 from countdown_worker import play_mp3
-from versioning import version_label
+from versioning import read_version, version_label
+from update_manager import (
+    UpdateError, apply_desktop_update, export_user_config,
+    find_newer_desktop_update,
+    schedule_hidden_restart,
+)
 
 
 LOG = logging.getLogger(__name__)
 
 # The debug UI uses two columns (controls + debug/YOLO); the initial
-# window (including the in-window caption bar when active) is 1050x720.
+# window (including the in-window caption bar when active) is compact by
+# default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
 _INITIAL_WINDOW_WIDTH = 1086
-_INITIAL_WINDOW_HEIGHT = 680
+_INITIAL_WINDOW_HEIGHT = 560
 # Column 0 is FIXED at 550px, column 1 at 500px (both fully visible inside
 # the 1086px default: 550 + 500 + 12px column gap + 24px container padding).
-# Height 680 is the natural content height: on a 150%-scaled display this
-# logical height physically renders at 1020 px (680 x 1.5), which is exactly
-# the height the two-column content needs - no clipping, no extra space.
+# The default height is deliberately compact; users can still enlarge it and
+# their saved window size is never overwritten.
 
 # Height of the custom in-window caption bar.  Tk cannot add widgets into
 # the native OS caption, so the assistant window removes the native caption
@@ -626,7 +631,7 @@ class UiWorker(threading.Thread):
     # expose its controls or start its worker.
     _SHOW_SHUTDOWN_PANEL = False
     _FIXED_RANDOM_GAP_STEP = 0.1
-    _FIXED_RANDOM_GAP_MAX = 5.0
+    _FIXED_RANDOM_GAP_MAX = 30.0
 
     def __init__(
         self,
@@ -643,6 +648,7 @@ class UiWorker(threading.Thread):
         status_worker: Any = None,
         attack_worker: Any = None,
         random_jump_worker: Any = None,
+        small_step_worker: Any = None,
         hotkey_queue: Optional["queue.Queue[str]"] = None,
         hotkey_worker: Any = None,
         movement_worker: Any = None,
@@ -680,6 +686,8 @@ class UiWorker(threading.Thread):
         # Independent Alt timer. It shares only the attack worker's runtime
         # gating events and exposes no configurable key binding.
         self.random_jump_worker = random_jump_worker
+        # Timed directional micro-step; actual keys are owned by movement.
+        self.small_step_worker = small_step_worker
         self.hotkey_queue = hotkey_queue
         # Physical hotkey hook whose bindings are temporarily disabled while
         # patrol runs (only the patrol-toggle chord stays live).
@@ -766,6 +774,9 @@ class UiWorker(threading.Thread):
             self._ttk = ttk
 
             root = tk.Tk()
+            # Never map Tk's default tiny window.  The finished geometry is
+            # applied only after every panel has been built and laid out.
+            root.withdraw()
             self._root = root
             app_version = version_label()
             root.title(f"Maple 助手 ({app_version})")
@@ -796,7 +807,7 @@ class UiWorker(threading.Thread):
             root.geometry(clamped)
             root.minsize(
                 _INITIAL_WINDOW_WIDTH,
-                560 + (_CAPTION_HEIGHT if caption_installed else 0),
+                500 + (_CAPTION_HEIGHT if caption_installed else 0),
             )
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
             self._schedule_window_geometry_save(root)
@@ -828,7 +839,10 @@ class UiWorker(threading.Thread):
                 self._help_button.bind("<Enter>", self._help_hover_show)
                 self._help_button.bind("<Leave>", self._help_hover_leave)
 
-            container = ttk.Frame(root, padding=12)
+            # Keep the content flush beneath the custom caption.  The old
+            # uniform padding, plus the columns/controls top margins, made a
+            # visible white strip above only the left side of the UI.
+            container = ttk.Frame(root, padding=(12, 0, 12, 12))
             container.pack(fill="both", expand=True)
             # Content must never dictate the window size: the initial size is
             # fixed by the geometry applied after the UI is built, and the
@@ -836,6 +850,8 @@ class UiWorker(threading.Thread):
             container.pack_propagate(False)
 
             columns = ttk.Frame(container)
+            # A shared small top inset keeps both panel stacks visually clear
+            # of the title separator, without the old unequal left-only gap.
             columns.pack(fill="both", expand=True, pady=(8, 0))
             columns.pack_propagate(False)
             self._columns_frame = columns
@@ -846,16 +862,19 @@ class UiWorker(threading.Thread):
             # (550 + 500 + 12px gap + 24px container padding).
             columns.columnconfigure(0, weight=0, minsize=550)
             columns.columnconfigure(1, weight=0, minsize=500)
-            columns.rowconfigure(0, weight=1)
+            # Keep the two independently-sized stacks pinned to the very top
+            # of the available area.  A weighted grid row can leave a small
+            # theme-dependent lead-in above a LabelFrame on some systems.
+            columns.grid_anchor("nw")
             col1 = ttk.Frame(columns)
-            col1.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+            col1.grid(row=0, column=0, sticky="new", padx=(0, 6))
             self._col1_frame = col1
             col2 = ttk.Frame(columns)
-            col2.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            col2.grid(row=0, column=1, sticky="new", padx=(6, 0))
             self._col2_frame = col2
 
             controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=10)
-            controls.pack(fill="x", pady=(12, 8))
+            controls.pack(fill="x", pady=(0, 8))
             style = ttk.Style(root)
             style.configure("Locked.TButton", foreground="#777777")
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
@@ -1157,18 +1176,22 @@ class UiWorker(threading.Thread):
             self._fixed_random_group = fixed_random_group
             ttk.Label(fixed_random_group, text="随机:").pack(side="left")
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
-            ttk.Button(
+            fixed_gap_minus = ttk.Button(
                 fixed_random_group, text="−", width=2,
-                command=lambda: self._fixed_adjust_random_gap(-0.1),
-            ).pack(side="left", padx=(3, 2))
+            )
+            self._bind_repeat_step_button(
+                fixed_gap_minus, lambda: self._fixed_adjust_random_gap(-0.1)
+            )
+            fixed_gap_minus.pack(side="left", padx=(3, 2))
             self._fixed_random_gap_label = ttk.Label(
-                fixed_random_group, text="0.1s", width=4, anchor="center"
+                fixed_random_group, text="0.1s", width=5, anchor="center"
             )
             self._fixed_random_gap_label.pack(side="left")
-            ttk.Button(
-                fixed_random_group, text="+", width=2,
-                command=lambda: self._fixed_adjust_random_gap(0.1),
-            ).pack(side="left", padx=(2, 0))
+            fixed_gap_plus = ttk.Button(fixed_random_group, text="+", width=2)
+            self._bind_repeat_step_button(
+                fixed_gap_plus, lambda: self._fixed_adjust_random_gap(0.1)
+            )
+            fixed_gap_plus.pack(side="left", padx=(2, 0))
 
             ttk.Label(fixed_key_row, text="按键:").pack(
                 side="left", padx=(0, 4)
@@ -1207,7 +1230,7 @@ class UiWorker(threading.Thread):
             )
             self._fixed_interval_label.pack(side="left", padx=(0, 2))
             self._fixed_range_label = ttk.Label(
-                fixed_interval_group, text="(3.0s, 3.1s)", width=13
+                fixed_interval_group, text="(3.0s, 3.1s)", width=15
             )
             self._fixed_range_label.pack(side="left")
             self._fixed_interval_group = fixed_interval_group
@@ -1220,18 +1243,20 @@ class UiWorker(threading.Thread):
             jump_random_group.pack(side="right")
             ttk.Label(jump_random_group, text="随机:").pack(side="left")
             self._random_jump_gap_var = tk.DoubleVar(value=0.1)
-            ttk.Button(
-                jump_random_group, text="−", width=2,
-                command=lambda: self._random_jump_adjust_gap(-0.1),
-            ).pack(side="left", padx=(3, 2))
+            jump_gap_minus = ttk.Button(jump_random_group, text="−", width=2)
+            self._bind_repeat_step_button(
+                jump_gap_minus, lambda: self._random_jump_adjust_gap(-0.1)
+            )
+            jump_gap_minus.pack(side="left", padx=(3, 2))
             self._random_jump_gap_label = ttk.Label(
-                jump_random_group, text="0.1s", width=4, anchor="center"
+                jump_random_group, text="0.1s", width=5, anchor="center"
             )
             self._random_jump_gap_label.pack(side="left")
-            ttk.Button(
-                jump_random_group, text="+", width=2,
-                command=lambda: self._random_jump_adjust_gap(0.1),
-            ).pack(side="left", padx=(2, 0))
+            jump_gap_plus = ttk.Button(jump_random_group, text="+", width=2)
+            self._bind_repeat_step_button(
+                jump_gap_plus, lambda: self._random_jump_adjust_gap(0.1)
+            )
+            jump_gap_plus.pack(side="left", padx=(2, 0))
 
             self._random_jump_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
@@ -1253,9 +1278,58 @@ class UiWorker(threading.Thread):
             )
             self._random_jump_interval_label.pack(side="left", padx=(0, 2))
             self._random_jump_range_label = ttk.Label(
-                jump_row, text="(3.0s, 3.1s)", width=13
+                jump_row, text="(3.0s, 3.1s)", width=15
             )
             self._random_jump_range_label.pack(side="left")
+            step_row = ttk.Frame(fixed_panel)
+            step_row.pack(fill="x", pady=(6, 0))
+            self._small_step_row = step_row
+            step_random_group = ttk.Frame(step_row)
+            step_random_group.pack(side="right")
+            ttk.Label(step_random_group, text="随机:").pack(side="left")
+            self._small_step_gap_var = tk.DoubleVar(value=0.1)
+            step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
+            self._bind_repeat_step_button(
+                step_gap_minus, lambda: self._small_step_adjust_gap(-0.1)
+            )
+            step_gap_minus.pack(side="left", padx=(3, 2))
+            self._small_step_gap_label = ttk.Label(
+                step_random_group, text="0.1s", width=5, anchor="center"
+            )
+            self._small_step_gap_label.pack(side="left")
+            step_gap_plus = ttk.Button(step_random_group, text="+", width=2)
+            self._bind_repeat_step_button(
+                step_gap_plus, lambda: self._small_step_adjust_gap(0.1)
+            )
+            step_gap_plus.pack(side="left", padx=(2, 0))
+            self._small_step_enabled_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                step_row, text="小碎步", width=7,
+                variable=self._small_step_enabled_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", padx=(0, 4))
+            # Checked: 左 then 右.  Unchecked: 右 then 左.
+            self._small_step_left_first_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                step_row, text="左右", width=5,
+                variable=self._small_step_left_first_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", padx=(0, 4))
+            ttk.Label(step_row, text="每").pack(side="left")
+            self._small_step_interval_var = tk.DoubleVar(value=5.0)
+            ttk.Scale(
+                step_row, from_=3.0, to=30.0, orient="horizontal",
+                variable=self._small_step_interval_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", fill="x", expand=True, padx=(0, 2))
+            self._small_step_interval_label = ttk.Label(
+                step_row, text="5.0s", width=5
+            )
+            self._small_step_interval_label.pack(side="left", padx=(0, 2))
+            self._small_step_range_label = ttk.Label(
+                step_row, text="(5.0s, 5.1s)", width=15
+            )
+            self._small_step_range_label.pack(side="left")
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left",
                 wraplength=440,
@@ -1484,9 +1558,11 @@ class UiWorker(threading.Thread):
             # the game gets Alt+F4, the worker verifies the window is gone,
             # then every worker is stopped.
             extra_panel = ttk.LabelFrame(
-                col1, text="附加功能", padding=10
+                col2, text="附加功能", padding=10
             )
-            extra_panel.pack(fill="x", pady=(0, 8))
+            # Constructed after 快捷消息 for code locality, but packed before
+            # it so the right column reads 药品 → 附加功能 → 快捷消息.
+            extra_panel.pack(fill="x", pady=(0, 8), before=quick_panel)
             shutdown_row = ttk.Frame(extra_panel)
             if self._SHOW_SHUTDOWN_PANEL:
                 shutdown_row.pack(fill="x")
@@ -1691,7 +1767,7 @@ class UiWorker(threading.Thread):
             # shown (the latest few lines); the full 600-line in-memory
             # history stays available through the archive button - no disk
             # I/O per line.
-            log_panel = ttk.LabelFrame(col2, text="运行日志", padding=(6, 4))
+            log_panel = ttk.LabelFrame(col1, text="运行日志", padding=(6, 4))
             log_panel.pack(fill="x", pady=(10, 0))
             log_actions = ttk.Frame(log_panel)
             log_actions.pack(fill="x")
@@ -1709,6 +1785,12 @@ class UiWorker(threading.Thread):
                 command=self._copy_user_config,
                 takefocus=False,
             )
+            self._export_config_button = ttk.Button(
+                log_actions, text="导出配置",
+                command=self._export_user_config,
+                takefocus=False,
+            )
+            self._export_config_button.pack(side="right", padx=(3, 0))
             self._copy_config_button.pack(side="right", padx=(3, 0))
             self._copy_log_button.pack(side="right", padx=(3, 0))
             self._log_display_lines: list[str] = []
@@ -1727,6 +1809,13 @@ class UiWorker(threading.Thread):
             # the requested initial size on the very first display.
             root.update_idletasks()
             root.geometry(clamped)
+            # Fit the first displayed window to the taller column.  A
+            # previous release may have saved a manually enlarged height;
+            # keeping that stale value created a large empty area below the
+            # panels.  This runs while the root is still hidden, so the user
+            # sees only the compact finished layout.
+            self._refit_window_to_content()
+            root.deiconify()
 
             root.after(0, self._poll)
             root.mainloop()
@@ -1817,6 +1906,7 @@ class UiWorker(threading.Thread):
         self._caption_max_button = _button("□", self._caption_toggle_maximize)
         self._caption_min_button = _button("－", self._caption_minimize)
         self._help_button = _button("?", None)
+        self._update_button = _button("↻", self._check_desktop_update)
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
         self._help_button.bind("<Enter>", self._help_hover_show)
@@ -1842,61 +1932,117 @@ class UiWorker(threading.Thread):
             widget.bind("<B1-Motion>", _motion)
             widget.bind("<ButtonRelease-1>", _release)
 
+    def _check_desktop_update(self) -> None:
+        """Find and apply the highest newer Desktop release on user request."""
+
+        install_root = Path(__file__).resolve().parent
+        current = read_version(install_root / "VERSION")
+        LOG.info("更新：正在桌面查找比 v%s 更新的 Maple 助手安装包。", current)
+        try:
+            package = find_newer_desktop_update(current)
+            LOG.info("更新：找到 v%s，来源 %s", package.version, package.path)
+            result = apply_desktop_update(package, install_root)
+        except UpdateError as exc:
+            LOG.warning("更新失败：%s", exc)
+            return
+        except Exception:
+            LOG.exception("更新失败：发生未预期错误")
+            return
+        if result.config_copied:
+            config_text = f"已覆盖 user_config.json（来源: {result.config_source}）"
+        elif result.config_unchanged:
+            config_text = "Desktop user_config.json 版本未变化，未覆盖当前配置"
+        else:
+            config_text = "安装包未提供 user_config.json，已保留当前配置"
+        try:
+            schedule_hidden_restart(install_root)
+        except UpdateError as exc:
+            LOG.warning(
+                "更新完成：v%s，已覆盖 %d 个文件；%s。自动重启失败：%s。请手动关闭并重新启动助手。",
+                result.package.version, result.copied_files, config_text, exc,
+            )
+            return
+        LOG.info(
+            "更新完成：v%s，已覆盖 %d 个文件；%s。助手将在关闭后自动重新启动。",
+            result.package.version, result.copied_files, config_text,
+        )
+        # Stop live input before the helper starts a clean elevated instance.
+        self._stop_patrol()
+        root = getattr(self, "_root", None)
+        if root is not None:
+            root.after(250, self._on_debug_window_close)
+
     def _caption_drag_begin(self, event: Any) -> None:
         """Start an outline-only caption drag (no live window moves)."""
 
-        self._caption_drag_origin = (event.x_root, event.y_root)
-        self._caption_origin_geometry = (
-            self._root.winfo_x(), self._root.winfo_y()
-        )
         root = getattr(self, "_root", None)
         if root is None:
             return
-        outline = getattr(self, "_drag_outline", None)
-        if outline is not None:
-            try:
-                outline.destroy()
-            except Exception:
-                pass
-            self._drag_outline = None
+        self._caption_drag_origin = (event.x_root, event.y_root)
+        self._caption_origin_geometry = (root.winfo_x(), root.winfo_y())
+        self._destroy_drag_outline()
         try:
             import tkinter as tk
 
-            outline = tk.Toplevel(root)
-            outline.overrideredirect(True)
-            outline.attributes("-topmost", True)
-            transparent = False
-            try:
-                # Transparent interior so only the border reads as an
-                # outline (Windows supports -transparentcolor).
-                outline.attributes("-transparentcolor", "#010203")
-                transparent = True
-            except Exception:
-                try:
-                    # Fallback: translucent ghost rectangle.
-                    outline.attributes("-alpha", 0.35)
-                except Exception:
-                    pass
-            outline.configure(bg="#010203")
             width = max(root.winfo_width(), 100)
             height = max(root.winfo_height(), 100)
-            canvas = tk.Canvas(
-                outline, bg="#010203", highlightthickness=0, bd=0,
-                width=width, height=height,
-            )
-            canvas.pack(fill="both", expand=True)
-            if transparent:
-                # 1px border inset so it is fully inside the window.
-                canvas.create_rectangle(
-                    1, 1, width - 2, height - 2,
-                    outline="#2f6fdf", width=1,
-                )
             x = root.winfo_rootx()
             y = root.winfo_rooty()
-            outline.geometry(f"{width}x{height}+{x}+{y}")
-            self._drag_outline = outline
+            state = {"window": None, "borders": [], "width": width,
+                     "height": height, "x": x, "y": y}
+            # Always use four thin native windows.  Even a nominally
+            # transparent full-window overlay can be briefly rendered black
+            # by some Windows graphics drivers when it is moved or destroyed.
+            # These strips never own the inside of the rectangle, so no black
+            # box can be painted over the application.
+            for _ in range(4):
+                border = tk.Toplevel(root)
+                border.withdraw()
+                border.overrideredirect(True)
+                border.attributes("-topmost", True)
+                border.configure(bg="#2f6fdf")
+                state["borders"].append(border)
+            self._drag_outline = state
+            self._position_drag_outline(x, y)
         except Exception:
-            self._drag_outline = None
+            self._destroy_drag_outline()
+
+    def _position_drag_outline(self, x: int, y: int) -> None:
+        """Position the thin native border used while caption-dragging."""
+
+        state = getattr(self, "_drag_outline", None)
+        if not isinstance(state, dict):
+            return
+        state["x"] = x
+        state["y"] = y
+        width = state["width"]
+        height = state["height"]
+        # top, bottom, left, right; these are the only opaque pixels in the
+        # entire drag operation.
+        positions = (
+            (width, 1, x, y), (width, 1, x, y + height - 1),
+            (1, height, x, y), (1, height, x + width - 1, y),
+        )
+        for border, (w, h, px, py) in zip(state.get("borders", ()), positions):
+            border.geometry(f"{w}x{h}+{px}+{py}")
+            border.deiconify()
+
+    def _destroy_drag_outline(self) -> None:
+        """Hide first, then dispose of every outline surface."""
+
+        state = getattr(self, "_drag_outline", None)
+        self._drag_outline = None
+        if not isinstance(state, dict):
+            return
+        windows = [state.get("window"), *state.get("borders", ())]
+        for window in windows:
+            if window is None:
+                continue
+            try:
+                window.withdraw()
+                window.destroy()
+            except Exception:
+                pass
 
     def _caption_drag_move(self, event: Any) -> None:
         """Move only the cheap outline; the real window stays put."""
@@ -1904,14 +2050,13 @@ class UiWorker(threading.Thread):
         origin = getattr(self, "_caption_drag_origin", None)
         if origin is None:
             return
-        outline = getattr(self, "_drag_outline", None)
-        if outline is None:
+        if not isinstance(getattr(self, "_drag_outline", None), dict):
             return
         dx = event.x_root - origin[0]
         dy = event.y_root - origin[1]
         x, y = self._caption_origin_geometry
         try:
-            outline.geometry(f"+{x + dx}+{y + dy}")
+            self._position_drag_outline(x + dx, y + dy)
         except Exception:
             pass
 
@@ -1921,28 +2066,50 @@ class UiWorker(threading.Thread):
         origin = getattr(self, "_caption_drag_origin", None)
         if origin is None:
             return
-        outline = getattr(self, "_drag_outline", None)
-        final_x = final_y = None
-        if outline is not None:
-            try:
-                geometry = outline.winfo_geometry()
-                match = re.search(r"([+-]\d+)([+-]\d+)$", geometry)
-                if match:
-                    final_x = int(match.group(1))
-                    final_y = int(match.group(2))
-            except Exception:
-                pass
-            try:
-                outline.destroy()
-            except Exception:
-                pass
-            self._drag_outline = None
+        state = getattr(self, "_drag_outline", None)
+        final_x = state.get("x") if isinstance(state, dict) else None
+        final_y = state.get("y") if isinstance(state, dict) else None
+        # Hide the separate compositor surfaces before moving the real UI.
+        # The final move is deliberately native: Tk's geometry manager sends
+        # a full client relayout for a position-only change on some Windows
+        # builds, briefly painting controls black before restoring them.
+        self._destroy_drag_outline()
         if final_x is not None and final_y is not None:
-            try:
-                self._root.geometry(f"+{final_x}+{final_y}")
-            except Exception:
-                pass
+            self._move_window_without_tk_relayout(final_x, final_y)
         self._caption_drag_origin = None
+
+    def _move_window_without_tk_relayout(self, x: int, y: int) -> None:
+        """Move the top-level through Windows without asking Tk to relayout.
+
+        Tk ``geometry('+x+y')`` is correct functionally, but it can recreate
+        the entire client drawing surface after a manual caption drag.  A
+        native position-only move retains that surface and lets DWM move the
+        completed frame as one image.  The Tk fallback remains for platforms
+        where no native caption window exists.
+        """
+
+        hwnd = getattr(self, "_caption_hwnd", None)
+        if hwnd and sys.platform == "win32":
+            try:
+                import ctypes
+
+                SWP_NOSIZE = 0x0001
+                SWP_NOZORDER = 0x0004
+                SWP_NOACTIVATE = 0x0010
+                moved = ctypes.windll.user32.SetWindowPos(
+                    int(hwnd), None, int(x), int(y), 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                if moved:
+                    return
+                LOG.debug("native caption move failed; using Tk fallback")
+            except Exception:
+                LOG.debug("native caption move unavailable; using Tk fallback",
+                          exc_info=True)
+        try:
+            self._root.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
 
     def _caption_drag_start(self, event: Any) -> None:
         """Compatibility hook; drag handling is bound directly on the bar."""
@@ -1962,7 +2129,11 @@ class UiWorker(threading.Thread):
         extra heavy work during the gesture and resumes when it settles.
         """
 
-        state = {"active": False, "last": 0.0}
+        state = {
+            "active": False,
+            "last": 0.0,
+            "size": (root.winfo_width(), root.winfo_height()),
+        }
         self._resize_freeze_state = state
 
         def _settle() -> None:
@@ -1974,6 +2145,13 @@ class UiWorker(threading.Thread):
             # changes mean the user is dragging/resizing the window.
             if getattr(event, "widget", None) is not root:
                 return
+            size = (getattr(event, "width", 0), getattr(event, "height", 0))
+            # Moving a window also sends Configure events.  It does not
+            # reflow content, so it must never suspend rendering or it can
+            # leave stale/black-looking UI at the drop point.
+            if state["size"] == size:
+                return
+            state["size"] = size
             now = time.monotonic()
             if state["active"]:
                 state["last"] = now
@@ -2312,7 +2490,12 @@ class UiWorker(threading.Thread):
             self.patrol_controller is not None
             and self.patrol_controller.is_enabled()
         )
-        for button in (self._copy_log_button, self._copy_config_button):
+        for button in (
+            self._copy_log_button, self._copy_config_button,
+            getattr(self, "_export_config_button", None),
+        ):
+            if button is None:
+                continue
             if running:
                 button.pack_forget()
             elif not button.winfo_manager():
@@ -2356,6 +2539,19 @@ class UiWorker(threading.Thread):
         self._copy_to_clipboard(text)
         LOG.info("用户配置已复制到剪贴板")
 
+    def _export_user_config(self) -> None:
+        """Overwrite the Desktop copy used by the in-app updater."""
+
+        if not self.user_config_path:
+            LOG.warning("导出配置失败：当前用户配置路径不可用")
+            return
+        try:
+            target = export_user_config(Path(self.user_config_path))
+        except UpdateError as exc:
+            LOG.warning("导出配置失败：%s", exc)
+            return
+        LOG.info("用户配置已导出并覆盖到桌面：%s", target)
+
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
         recognized_name = detection.map_name or "OCR adapter not configured"
@@ -2388,11 +2584,15 @@ class UiWorker(threading.Thread):
             f"Configured map: {snapshot.configured_map_name or 'unknown'}\n"
             f"Recognized map: {recognized_name}"
         ))
-        minimap = snapshot.minimap_preview.copy()
-        minimap.thumbnail((360, 260), Image.Resampling.NEAREST)
-        name = snapshot.map_name_preview.copy()
-        name.thumbnail((360, 90), Image.Resampling.NEAREST)
         if self._SHOW_MINIMAP_PREVIEW and hasattr(self, "_minimap_label"):
+            # Preview panes are hidden in the compact UI.  Avoid copying and
+            # resizing two images on every poll when nobody can see them;
+            # this leaves the Tk event loop more time to paint cleanly after
+            # a resize or a drag drop.
+            minimap = snapshot.minimap_preview.copy()
+            minimap.thumbnail((360, 260), Image.Resampling.NEAREST)
+            name = snapshot.map_name_preview.copy()
+            name.thumbnail((360, 90), Image.Resampling.NEAREST)
             self._photo_minimap = ImageTk.PhotoImage(minimap)
             self._photo_map_name = ImageTk.PhotoImage(name)
             self._minimap_label.configure(image=self._photo_minimap)
@@ -2613,6 +2813,21 @@ class UiWorker(threading.Thread):
                 1,
             ),
             "random_jump_gap_seconds": self._random_jump_gap_seconds(),
+            "small_step_enabled": bool(
+                getattr(self, "_small_step_enabled_var", None).get()
+                if hasattr(self, "_small_step_enabled_var") else False
+            ),
+            "small_step_interval_seconds": round(
+                max(3.0, float(
+                    getattr(self, "_small_step_interval_var", None).get()
+                )) if hasattr(self, "_small_step_interval_var") else 5.0,
+                1,
+            ),
+            "small_step_gap_seconds": self._small_step_gap_seconds(),
+            "small_step_left_first": bool(
+                getattr(self, "_small_step_left_first_var", None).get()
+                if hasattr(self, "_small_step_left_first_var") else False
+            ),
         }
 
     def _fixed_random_gap_seconds(self) -> float:
@@ -2621,6 +2836,71 @@ class UiWorker(threading.Thread):
         var = getattr(self, "_fixed_random_gap_var", None)
         raw = 0.1 if var is None else float(var.get())
         return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+
+    def _bind_repeat_step_button(self, button: Any, callback: Any) -> None:
+        """Give a ± random-gap button click-and-hold acceleration.
+
+        A press applies one precise 0.1 s adjustment immediately.  Keeping
+        the mouse down for 0.25 s then repeats every 100 ms, so reaching a
+        useful multi-second random range does not require dozens of clicks.
+        Release cancels the repeat without a trailing adjustment.
+        """
+
+        jobs = getattr(self, "_repeat_step_jobs", None)
+        if jobs is None:
+            jobs = {}
+            self._repeat_step_jobs = jobs
+        key = id(button)
+
+        def stop_repeat(_event: Any = None) -> None:
+            job = jobs.pop(key, None)
+            if job is not None:
+                try:
+                    button.after_cancel(job)
+                except Exception:
+                    pass
+
+        def repeat() -> None:
+            # The entry disappears before a scheduled callback can run when
+            # the mouse button is released, so it cannot make an extra step.
+            if key not in jobs:
+                return
+            try:
+                callback()
+                jobs[key] = button.after(100, repeat)
+            except Exception:
+                jobs.pop(key, None)
+                LOG.debug("random-gap hold repeat stopped", exc_info=True)
+
+        def start_repeat(_event: Any = None) -> None:
+            stop_repeat()
+            callback()
+            try:
+                jobs[key] = button.after(250, repeat)
+            except Exception:
+                jobs.pop(key, None)
+                LOG.debug("random-gap hold repeat unavailable", exc_info=True)
+
+            # This is a setting stepper, not an action button.  Clear the
+            # native pressed state after the class binding has run so its
+            # visual style remains stable throughout a long hold.  We still
+            # allow the normal release handler to run and stop the timer.
+            def clear_pressed_style() -> None:
+                try:
+                    button.state(("!pressed",))
+                except Exception:
+                    pass
+            try:
+                button.after_idle(clear_pressed_style)
+            except Exception:
+                pass
+
+        button.bind("<ButtonPress-1>", start_repeat)
+        button.bind("<ButtonRelease-1>", stop_repeat)
+        # ttk.Button takes a pointer grab while clicked, so its release event
+        # still arrives even if the pointer is moved outside.  Do not cancel
+        # on <Leave>: refreshing a packed row can synthesize Leave and used
+        # to silently stop the repeat after its first adjustment.
 
     def _fixed_adjust_random_gap(self, delta: float) -> None:
         """Adjust the random delay ceiling using fixed 0.1-second steps."""
@@ -2655,6 +2935,24 @@ class UiWorker(threading.Thread):
             1,
         )
         self._random_jump_gap_var.set(value)
+        self._fixed_on_change()
+
+    def _small_step_gap_seconds(self) -> float:
+        var = getattr(self, "_small_step_gap_var", None)
+        raw = 0.1 if var is None else float(var.get())
+        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+
+    def _small_step_adjust_gap(self, delta: float) -> None:
+        current = self._small_step_gap_seconds()
+        value = round(
+            max(0.0, min(
+                self._FIXED_RANDOM_GAP_MAX,
+                current + (self._FIXED_RANDOM_GAP_STEP if delta > 0
+                           else -self._FIXED_RANDOM_GAP_STEP),
+            )),
+            1,
+        )
+        self._small_step_gap_var.set(value)
         self._fixed_on_change()
 
     def _hotkey_adjust_fixed_interval(self, delta: float) -> bool:
@@ -2700,16 +2998,23 @@ class UiWorker(threading.Thread):
         mode = str(getattr(self, "_attack_mode_var", None).get()
                    if hasattr(self, "_attack_mode_var") else "fixed")
         jump_row = getattr(self, "_jump_row", None)
+        step_row = getattr(self, "_small_step_row", None)
         status = getattr(self, "_fixed_status", None)
         if jump_row is None:
             return
-        if jump_row.winfo_manager():
-            jump_row.pack_forget()
+        for row in (jump_row, step_row):
+            if row is not None and row.winfo_manager():
+                row.pack_forget()
         if mode != "jump_attack":
             if status is not None and status.winfo_manager():
                 jump_row.pack(fill="x", pady=(6, 0), before=status)
             else:
                 jump_row.pack(fill="x", pady=(6, 0))
+        if step_row is not None and mode == "fixed":
+            if status is not None and status.winfo_manager():
+                step_row.pack(fill="x", pady=(6, 0), before=status)
+            else:
+                step_row.pack(fill="x", pady=(6, 0))
 
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
@@ -2721,7 +3026,10 @@ class UiWorker(threading.Thread):
                 and mode not in ("fixed", "jump_attack")):
             mode = "fixed"
             self._attack_mode_var.set("fixed")
-        self._fixed_refresh_rows()
+        # Layout is intentionally not refreshed here.  Sliders and long-hold
+        # random-gap buttons call this method repeatedly; packing/unpacking
+        # their rows on every 0.1 s tick made the visible line flicker or
+        # disappear.  Only an actual attack-mode change needs a layout pass.
         interval = max(0.2, float(self._fixed_interval_var.get()))
         self._fixed_interval_var.set(interval)
         random_gap = self._fixed_random_gap_seconds()
@@ -2749,6 +3057,21 @@ class UiWorker(threading.Thread):
                 text=(f"({jump_interval:.1f}s, "
                       f"{jump_interval + jump_gap:.1f}s)")
             )
+        if hasattr(self, "_small_step_interval_var"):
+            step_interval = max(
+                3.0, float(self._small_step_interval_var.get())
+            )
+            self._small_step_interval_var.set(step_interval)
+            step_gap = self._small_step_gap_seconds()
+            self._small_step_gap_var.set(step_gap)
+            self._small_step_interval_label.configure(
+                text=f"{step_interval:.1f}s"
+            )
+            self._small_step_gap_label.configure(text=f"{step_gap:.1f}s")
+            self._small_step_range_label.configure(
+                text=(f"({step_interval:.1f}s, "
+                      f"{step_interval + step_gap:.1f}s)")
+            )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
@@ -2759,8 +3082,9 @@ class UiWorker(threading.Thread):
         self._fixed_refresh_grey()
 
     def _fixed_on_mode_change(self) -> None:
-        """Attack mode radio changed: same as any other change."""
+        """Attack mode radio changed: refresh visibility once, then apply."""
 
+        self._fixed_refresh_rows()
         self._fixed_on_change()
 
     def _fixed_save_settings(self, data: dict) -> None:
@@ -2812,6 +3136,26 @@ class UiWorker(threading.Thread):
             jump_worker.jump_jitter_seconds = max(
                 0.0, float(data.get("random_jump_gap_seconds", 0.1))
             )
+        step_worker = getattr(self, "small_step_worker", None)
+        if step_worker is not None:
+            # 小碎步 deliberately belongs only to fixed-rate attack: jump
+            # attack already owns its movement beat, while YOLO owns a
+            # separate combat/movement strategy.
+            step_worker.enabled = bool(
+                data.get("small_step_enabled", False)
+            ) and mode == "fixed"
+            step_worker.step_interval = max(
+                3.0,
+                float(data.get("small_step_interval_seconds", 5.0)),
+            )
+            step_worker.step_jitter_seconds = max(
+                0.0, float(data.get("small_step_gap_seconds", 0.1))
+            )
+            mover = getattr(self, "movement_worker", None)
+            if mover is not None:
+                mover.small_step_left_first = bool(
+                    data.get("small_step_left_first", False)
+                )
 
     def _fixed_refresh_grey(self) -> None:
         """Grey the YOLO panel + update status lines for the active mode."""
@@ -2936,6 +3280,26 @@ class UiWorker(threading.Thread):
                     and hasattr(self, "_random_jump_gap_var")):
                 self._random_jump_gap_var.set(float(
                     data["random_jump_gap_seconds"]
+                ))
+            if ("small_step_enabled" in data
+                    and hasattr(self, "_small_step_enabled_var")):
+                self._small_step_enabled_var.set(bool(
+                    data["small_step_enabled"]
+                ))
+            if ("small_step_interval_seconds" in data
+                    and hasattr(self, "_small_step_interval_var")):
+                self._small_step_interval_var.set(max(
+                    3.0, float(data["small_step_interval_seconds"])
+                ))
+            if ("small_step_gap_seconds" in data
+                    and hasattr(self, "_small_step_gap_var")):
+                self._small_step_gap_var.set(float(
+                    data["small_step_gap_seconds"]
+                ))
+            if ("small_step_left_first" in data
+                    and hasattr(self, "_small_step_left_first_var")):
+                self._small_step_left_first_var.set(bool(
+                    data["small_step_left_first"]
                 ))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed fixed attack settings",
@@ -3529,9 +3893,10 @@ class UiWorker(threading.Thread):
     def _refit_window_to_content(self) -> None:
         """Fit the window height exactly to the UI content.
 
-        Called after quick-message rows are added/removed/edited so the
-        window grows when rows are added and shrinks back when they are
-        deleted (Tk never shrinks automatically).  The target height is
+        Called once before the first display and after quick-message rows are
+        added/removed/edited, so the window grows when rows are added and
+        shrinks back when they are deleted (Tk never shrinks automatically).
+        The target height is
         derived from the taller column's REQUIRED height plus the window
         chrome, so the fit is exact - no leftover padding and no growth
         beyond the content.
