@@ -41,6 +41,7 @@ VK_RCONTROL = 0xA3
 SELF_INPUT_EXTRA_INFO = 0x4D4150  # "MAP"
 
 KEY_VK = {
+    "a": 0x41,
     "0": 0x30,
     "1": 0x31,
     "2": 0x32,

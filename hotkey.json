@@ -21,6 +21,6 @@
     {"keys": "ctrl+bracketright", "action": "adjust_fixed_attack_interval:+0.1", "block_original": true},
     {"keys": "ctrl+insert", "action": "add_highest_layer", "block_original": true},
     {"keys": "ctrl+delete", "action": "delete_highest_layer", "block_original": true},
-    {"keys": "ctrl+grave", "action": "toggle_patrol", "block_original": true}
+    {"keys": "ctrl+a", "action": "toggle_patrol", "block_original": true}
   ]
 }
