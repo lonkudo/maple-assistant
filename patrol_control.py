@@ -369,20 +369,29 @@ class PatrolController:
     def patrol_range_locked(self) -> tuple[str, str]:
         """Effective contiguous patrol floor range (start, end).
 
-        Defaults to the recorded bottom/top floors when the range was never
-        set; ``patrol_start_layer``/``patrol_end_layer`` keys in the profile
-        override it.  A single floor is allowed (start == end).
+        The range is selected from the physical layer list, not
+        ``route_order``.  ``route_order`` deliberately contains only layers
+        with at least one recorded action, whereas the UI must immediately
+        show and persist a newly added (not-yet-recorded) top layer.  Movement
+        still filters to action-bearing layers before it moves, so this does
+        not make an empty layer patrolable.
+
+        Defaults to the lowest/highest existing floors when the range was
+        never set; ``patrol_start_layer``/``patrol_end_layer`` keys in the
+        profile override it.  A single floor is allowed (start == end).
         """
 
-        route = self._sorted_layer_names_locked()
-        if not route:
+        layers = sorted(
+            self._profile.get("layers", {}), key=_layer_number
+        )
+        if not layers:
             return "", ""
         start = str(self._profile.get("patrol_start_layer", "")).strip()
         end = str(self._profile.get("patrol_end_layer", "")).strip()
-        if not start or start not in route:
-            start = route[0]
-        if not end or end not in route:
-            end = route[-1]
+        if not start or start not in layers:
+            start = layers[0]
+        if not end or end not in layers:
+            end = layers[-1]
         return start, end
 
     def patrol_range(self) -> tuple[str, str]:

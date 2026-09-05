@@ -5166,11 +5166,25 @@ class UiWorker(threading.Thread):
             key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
         )
         display_values = [self._patrol_display_name(name) for name in numeric]
-        for combo in (self._patrol_start_combo, self._patrol_end_combo):
-            combo.configure(values=display_values)
         start, end = self.patrol_controller.patrol_range()
-        self._patrol_start_var.set(self._patrol_display_name(start))
-        self._patrol_end_var.set(self._patrol_display_name(end))
+        selected_values = (
+            self._patrol_display_name(start),
+            self._patrol_display_name(end),
+        )
+        # ``StringVar.set`` alone leaves ttk.Combobox's internal current
+        # index stale on some Windows/Tk builds.  Set the current index too,
+        # so add/delete/Ctrl+Home visibly update both controls immediately.
+        for combo, variable, selected in zip(
+            (self._patrol_start_combo, self._patrol_end_combo),
+            (self._patrol_start_var, self._patrol_end_var),
+            selected_values,
+        ):
+            combo.configure(values=display_values)
+            if selected in display_values:
+                combo.current(display_values.index(selected))
+            else:
+                combo.set("")
+            variable.set(selected if selected in display_values else "")
 
     def _patrol_display_name(self, layer_name: str) -> str:
         """UI display for a floor name (``layer2`` -> ``楼层2``)."""
@@ -5258,6 +5272,11 @@ class UiWorker(threading.Thread):
             end = next_start
         try:
             self.patrol_controller.set_patrol_range(next_start, end)
+            # Ctrl+Home changes the patrol's lower bound, so make the same
+            # layer visibly selected for recording as well.  Otherwise the
+            # radio circle could stay on a different layer and make the hotkey
+            # appear to have done nothing.
+            self.patrol_controller.select_layer(next_start)
         except (OSError, ValueError) as exc:
             self._control_status.configure(text=f"无法设置巡逻起始楼层: {exc}")
             return False
@@ -5278,6 +5297,15 @@ class UiWorker(threading.Thread):
             return
         start = self._patrol_name_from_display(start_display)
         end = self._patrol_name_from_display(end_display)
+        # Changing either side of a contiguous range must never leave the
+        # other side invalid.  Clamp the opposite control instead of rejecting
+        # the click and silently restoring the old selection.
+        if int("".join(filter(str.isdigit, start)) or 0) > int(
+                "".join(filter(str.isdigit, end)) or 0):
+            if getattr(_event, "widget", None) is self._patrol_start_combo:
+                end = start
+            else:
+                start = end
         try:
             self.patrol_controller.set_patrol_range(start, end)
         except ValueError as exc:

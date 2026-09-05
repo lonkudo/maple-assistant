@@ -449,6 +449,30 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertEqual(restored.patrol_end_layer, "layer1")
             self.assertTrue(restored.patrol_range_set)
 
+    def test_unrecorded_layers_still_define_the_patrol_range(self) -> None:
+        """Range controls must follow layer lifecycle, not action records."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = {
+                "map_name": "fresh",
+                # This is the normal fresh-recording shape: layer1 is visible
+                # in the UI but has no route action yet.
+                "route_order": [],
+                "layers": {
+                    "layer1": {
+                        "y_tolerance": 0.02,
+                        "calibration_status": "awaiting_left_rope_right",
+                    }
+                },
+            }
+            controller = PatrolController(Path(directory) / "map.json", data)
+
+            self.assertEqual(controller.patrol_range(), ("layer1", "layer1"))
+            self.assertEqual(controller.add_layer_above(), "layer2")
+            self.assertEqual(controller.patrol_range(), ("layer1", "layer2"))
+            self.assertEqual(controller.remove_highest_layer(), "layer2")
+            self.assertEqual(controller.patrol_range(), ("layer1", "layer1"))
+
     def test_record_with_zero_layers_is_rejected_without_junk_layer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = {
