@@ -31,7 +31,7 @@ class InstallerScriptTests(unittest.TestCase):
             encoding="utf-8-sig"
         ).lower()
         self.assertIn("shellapp.shellexecute", vbs)
-        self.assertIn('"open", 0', vbs)
+        self.assertIn('"runas", 0', vbs)
         self.assertIn("pythonw.exe", vbs)
         self.assertIn("startup_probe.py", vbs)
         self.assertIn("assistant-launch-status.log", vbs)

@@ -196,14 +196,13 @@ For Each item In WScript.Arguments
 Next
 
 Set shellApp = CreateObject("Shell.Application")
-' Start normally and hidden. Forcing UAC here can be rejected or blocked by
-' another machine's policy, and the hidden VBS then appears to do nothing.
-' The assistant only needs elevation when the game itself was explicitly
-' launched as administrator; normal game clients work without this fragile
-' second UAC step.
+' Use the same integrity level as an elevated game. Without this, Windows
+' will not deliver global low-level keyboard hooks for Ctrl hotkeys from the
+' game window. Error handling below makes a declined/blocked UAC request
+' visible instead of silently doing nothing.
 WriteStatus "Launcher requested a hidden Python start."
 On Error Resume Next
-shellApp.ShellExecute pythonwPath, arguments, root, "open", 0
+shellApp.ShellExecute pythonwPath, arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
     MsgBox "Maple Assistant could not start. Open assistant-launch-status.log in this folder.", 16, "Maple Assistant"

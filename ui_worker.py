@@ -375,7 +375,7 @@ LOG_RUN_START = "巡逻已开始"
 LOG_RUN_STOP = "巡逻已停止"
 
 
-def _make_log_icon(kind: str) -> ImageTk.PhotoImage:
+def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
     """16x16 monochrome glyph for the running-log action buttons.
 
     ``archive`` = a document sheet (copy the running log); ``user`` = a
@@ -400,7 +400,11 @@ def _make_log_icon(kind: str) -> ImageTk.PhotoImage:
         draw.arc((1, 8, 15, 20), start=180, end=360, fill=ink)
     else:
         raise ValueError(f"unknown log icon kind: {kind!r}")
-    return ImageTk.PhotoImage(image)
+    # The UI is built on an explicit Tk root.  Letting ImageTk choose the
+    # implicit default root can create ``pyimage`` in a different Tcl
+    # interpreter, after which ttk rejects it and the whole UI (and hotkey
+    # worker) shuts down during startup.
+    return ImageTk.PhotoImage(image, master=master)
 
 
 @dataclass(frozen=True)
@@ -1774,8 +1778,8 @@ class UiWorker(threading.Thread):
             log_panel.pack(fill="x", pady=(10, 0))
             log_actions = ttk.Frame(log_panel)
             log_actions.pack(fill="x")
-            self._log_archive_photo = _make_log_icon("archive")
-            self._log_user_photo = _make_log_icon("user")
+            self._log_archive_photo = _make_log_icon("archive", root)
+            self._log_user_photo = _make_log_icon("user", root)
             self._copy_log_button = ttk.Button(
                 log_actions,
                 image=self._log_archive_photo,
