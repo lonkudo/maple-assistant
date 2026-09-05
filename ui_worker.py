@@ -671,6 +671,7 @@ class UiWorker(threading.Thread):
         ui_log_handler: Any = None,
         user_config_path: Optional[str] = None,
         automation_active_event: Optional[threading.Event] = None,
+        ui_interaction_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -742,6 +743,8 @@ class UiWorker(threading.Thread):
         self.ui_log_handler = ui_log_handler
         self.user_config_path = user_config_path
         self.automation_active_event = automation_active_event
+        self.ui_interaction_event = ui_interaction_event
+        self._ui_interaction_clear_job: Any = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -825,6 +828,7 @@ class UiWorker(threading.Thread):
             # every resize step).  Also frees WM_SIZE handling for the
             # drag-move path below.
             self._install_resize_burst_guard(root)
+            self._install_ui_interaction_focus_hold(root)
 
             if caption_installed:
                 self._build_caption_bar(root, tk, app_version)
@@ -2176,6 +2180,46 @@ class UiWorker(threading.Thread):
 
         self._resize_configure_handler = _on_configure
         root.bind("<Configure>", _on_configure, add="+")
+
+    def _install_ui_interaction_focus_hold(self, root: Any) -> None:
+        """Let a UI click/drag complete before FocusWorker refocuses Maple.
+
+        Patrol normally refocuses the game immediately for safe keyboard
+        input.  That is correct for gameplay, but it interrupted Tk's mouse
+        release while adjusting a checkbox or Scale.  This app-local binding
+        holds automatic refocus for a short quiet period after every pointer
+        event; it does not affect keyboard input from other applications.
+        """
+
+        event = self.ui_interaction_event
+        if event is None:
+            return
+
+        def _hold(_pointer_event: Any = None) -> None:
+            event.set()
+            previous = self._ui_interaction_clear_job
+            if previous is not None:
+                try:
+                    root.after_cancel(previous)
+                except Exception:
+                    pass
+            try:
+                self._ui_interaction_clear_job = root.after(
+                    850, _release_hold
+                )
+            except Exception:
+                self._ui_interaction_clear_job = None
+                event.clear()
+
+        def _release_hold() -> None:
+            self._ui_interaction_clear_job = None
+            event.clear()
+
+        # ``bind_all`` is limited to this Tk interpreter.  It catches child
+        # controls too, unlike a toplevel-only binding, and the add form
+        # preserves each widget's normal click/drag behavior.
+        for sequence in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
+            root.bind_all(sequence, _hold, add="+")
 
     def _caption_minimize(self) -> None:
         """Minimize to the taskbar (native iconify still works)."""

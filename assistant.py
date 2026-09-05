@@ -331,6 +331,7 @@ def main() -> int:
     pickup_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
+    ui_interacting = threading.Event()
     patrol_preparing = threading.Event()
     trade_capture_active = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -1004,6 +1005,14 @@ def main() -> int:
         alert_callback=telegram_notifier.notify,
         on_disconnect=stop_patrol_for_disconnect,
     )
+    focus_worker = FocusWorker(
+        key_sender,
+        stop_event,
+        automation_active,
+        game_focused,
+        on_focus_lost=stop_patrol_after_focus_loss,
+        ui_interaction_event=ui_interacting,
+    )
     core_workers = [
         capture_worker,
         character_worker,
@@ -1019,13 +1028,7 @@ def main() -> int:
         countdown_worker,
         lie_detector_worker,
         telegram_notifier,
-        FocusWorker(
-            key_sender,
-            stop_event,
-            automation_active,
-            game_focused,
-            on_focus_lost=stop_patrol_after_focus_loss,
-        ),
+        focus_worker,
     ]
     ui_worker = None if args.no_ui else (
         UiWorker(
@@ -1067,6 +1070,7 @@ def main() -> int:
             ui_log_handler=ui_log_handler,
             user_config_path=str(config_store.user_path),
             automation_active_event=automation_active,
+            ui_interaction_event=ui_interacting,
         )
     )
 
