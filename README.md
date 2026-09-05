@@ -123,8 +123,8 @@ the timer due for a retry; duplicate waiting requests collapse to one per key.
 
 The compact UI has two top-aligned columns:
 
-- Left: **图层校准与巡逻**, **攻击模式**, **运行日志**.
-- Right: **药品**, **附加功能**, **快捷消息**.
+- Left: **图层校准与巡逻**, **攻击模式**, **快捷消息**.
+- Right: **附加功能**, **药品**, **运行日志**.
 
 Initial height is fitted to the taller column so stale saved geometry does not
 leave a large empty lower area. The custom title bar keeps native resize,
@@ -189,7 +189,7 @@ without it. To restore it after obtaining a better `weights/best.pt`, re-enable
 restore the documented installer dependency block, then update both handoff
 documents before publishing.
 
-## Release and maintenance
+## Release, testing, and maintenance
 
 Every behavior change requires a new numbered ZIP:
 
@@ -197,9 +197,10 @@ Every behavior change requires a new numbered ZIP:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
-For an explicit update/checkpoint, omit `-SkipTests`, run relevant tests,
-update both documents, inspect `git diff --check`, and commit only intended
-source, tests, and docs. `release_now.ps1` advances `VERSION`, rebuilds
+Testing is not a default ritual. Run only the smallest targeted check that is
+necessary to validate the code being changed; do not run duplicate or broad
+test suites merely as a routine step. Documentation-only edits do not require
+tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds
 `release/MapleAssistant`, and produces `MapleAssistant-vNNNN.zip`. Version
 `9999` never wraps.
 
@@ -224,5 +225,7 @@ source, tests, and docs. `release_now.ps1` advances `VERSION`, rebuilds
 2. Inspect `git status --short`; preserve user-owned configuration and unrelated edits.
 3. For movement/input bugs, follow the logged state transition and ownership path before changing thresholds.
 4. Keep Left/Right/Up/Down serialized; Z and Alt have their own valid movement roles.
-5. Build a new release ZIP for every behavior change.
-6. Update docs, run relevant tests, and commit only when the user requests an update or a handoff is needed.
+5. Build a new release ZIP for every behavior change; never build one for
+   documentation-only work.
+6. Run only a necessary targeted test, not redundant checks. Update docs and
+   commit only when the user requests an update or a handoff is needed.
