@@ -24,9 +24,8 @@ TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
 ACCEPT_INVITATION = (890, 668)
 TRADE_MESSAGE_BOX = (460, 200)
-# The small top-left client sample used to tell whether the trader has shown.
-# It is one quarter of the previous width and height (45×35 at 1366×768).
-PRESENCE_BOX = (0, 0, 45, 35)
+# Tiny top-left client sample used to tell whether the trader has shown.
+PRESENCE_BOX = (0, 0, 10, 10)
 PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
 
 
