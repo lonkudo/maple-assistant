@@ -7,6 +7,7 @@ from assistant import (
     _AnyEvent,
     _capture_focused_game_frame,
     _compact_log_formatter,
+    main as assistant_main,
     _start_live_input,
     _stop_live_input,
     parse_args,
@@ -49,6 +50,12 @@ class StartLiveInputTests(unittest.TestCase):
     def test_attack_worker_is_disabled_by_default(self) -> None:
         with patch("sys.argv", ["assistant.py"]):
             self.assertFalse(parse_args().enable_attack)
+
+    def test_duplicate_launch_explains_that_assistant_is_already_running(self) -> None:
+        with patch("assistant._acquire_single_instance_mutex", return_value=None), \
+             patch("assistant._show_already_running_notice") as notice:
+            self.assertEqual(assistant_main(), 0)
+        notice.assert_called_once_with()
 
     def test_status_capture_is_fast_for_potion_priority(self) -> None:
         with patch("sys.argv", ["assistant.py"]):

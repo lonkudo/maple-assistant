@@ -143,6 +143,25 @@ def _release_single_instance_mutex(handle: int | None) -> None:
     kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
+def _show_already_running_notice() -> None:
+    """Explain a duplicate launch when the hidden launcher has no console."""
+
+    if not hasattr(ctypes, "WinDLL"):
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MessageBoxW(
+            None,
+            "Maple 助手已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
+            "Maple 助手",
+            0x00000040,  # MB_ICONINFORMATION
+        )
+    except Exception:
+        # A duplicate launch must never crash merely because Windows cannot
+        # show the explanatory dialog (for example in a non-interactive test).
+        pass
+
+
 def _start_live_input(
     key_sender: object,
     automation_active_event: threading.Event,
@@ -246,6 +265,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     singleton_handle = _acquire_single_instance_mutex()
     if singleton_handle is None:
+        _show_already_running_notice()
         return 0
     args = parse_args()
     console_handler = logging.StreamHandler()
