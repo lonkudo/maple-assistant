@@ -156,6 +156,27 @@ current **Ctrl+1 … Ctrl+0** index; deleting a row immediately shifts the later
 indices. Buttons short-click to copy, double-click to focus the game and send
 Enter → Ctrl+V → Enter, and long-press to edit.
 
+### Trade hotkeys
+
+Trade is available in the normal Maple Assistant package and is deliberately
+kept outside the patrol UI and help list:
+
+- **Ctrl+Q** starts a trade invitation, or cancels the pending invitation.
+  Place the real cursor over the target player in the focused game first. The
+  assistant performs the right-click and Start Trade clicks with virtual mouse
+  input, waits up to one second for the trade dialog, then waits for the other
+  player to join. Once joined, it focuses the game, sends quick message 1,
+  and confirms the trade.
+- **Ctrl+W** accepts an incoming invitation, confirms the trade dialog, then
+  sends quick message 1.
+- **Esc** cancels only an active Ctrl+Q invitation. It has no special effect
+  when no invitation workflow is running.
+
+Trade coordinates use the client size: the 1366×768 and 1920×1080 HUD layout
+shares its fixed coordinates, while the 1075×768 layout scales them uniformly.
+The presence sample is intentionally invisible; trade does not create a Tk
+overlay or any visible target/range drawing.
+
 ## Optional alerts
 
 Alert sources are **掉线**, **测谎**, and **循环**. Output choices are independent:
@@ -182,6 +203,12 @@ preserve the installed user file. Do not overwrite user configuration during
 ordinary development or updates. Legacy `config.json` and former split JSON
 files are migration inputs only.
 
+Use **导入配置** in **运行日志** to select and atomically import a saved
+`user_config.json`; it takes effect after restart. **导出配置** overwrites the
+Desktop export and reports both import and export results in the running log.
+Fatal startup and worker failures are additionally recorded in root-level
+`error.log` for troubleshooting.
+
 ## YOLO status
 
 YOLO monster detection is temporarily disabled because the model is not yet
@@ -206,6 +233,12 @@ tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds
 `release/MapleAssistant`, and produces `MapleAssistant-vNNNN.zip`. Version
 `9999` never wraps.
 
+`release_no_trade.ps1` is a separate publisher for the special
+`MapleAssistant-vnt-0001.zip` package. It stages a copy of the current normal
+release, strips only trade wiring from that copy, verifies it, and zips it.
+It never changes the normal source tree; `main` stays the trade-enabled
+version.
+
 ## Important files
 
 | File | Responsibility |
@@ -216,9 +249,11 @@ tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds
 | `motion_arbiter.py` | serialized jump/buff/small-step actions |
 | `status_worker.py` | HP/MP bars, potions, timed drug/buff scheduling, shared key sender |
 | `attack_worker.py`, `random_jump_worker.py` | attack and optional jump timing |
+| `trade_worker.py` | Ctrl+Q/Ctrl+W virtual-input trade flows and invisible presence check |
 | `patrol_control.py` | route model and persistence |
 | `minimap_detector.py`, `marker_detector.py`, `map_structure_tracker.py` | minimap geometry, marker detection, world-Y tracking |
-| `config_store.py`, `update_manager.py` | configuration ownership and self-update |
+| `config_store.py`, `update_manager.py` | configuration ownership, import/export, and self-update |
+| `error.log` | rotating fatal-error log, generated beside the application |
 | `ARCHITECTURE.md` | detailed worker wiring and complete repository inventory |
 
 ## Future-agent checklist

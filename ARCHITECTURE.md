@@ -29,6 +29,7 @@ assistant.py (primary process)
     RandomJumpWorker   optional independent timed Alt jump (base min 1.0s)
     MotionArbiter      serializes jump/buff motion keys vs attack cadence
     HotkeyWorker       physical-only Ctrl chord hook -> UI action queue
+    TradeWorker        isolated Ctrl+Q/Ctrl+W virtual-input trade flows
     FocusWorker        foreground gate, refocus, key release
     ShutdownWorker     preserved but temporarily not constructed
     CountdownWorker    independent repeating MP3 reminder
@@ -44,7 +45,9 @@ yolo-detection/live_view.py (optional subprocess launched by UiWorker)
 `assistant.py` acquires a Windows single-instance mutex, constructs all shared
 events and latest-only queues, wires workers, starts the core threads, and owns
 shutdown. Imports are delayed so `assistant.py --help` works before optional
-dependencies are installed.
+dependencies are installed. It also writes ERROR-and-higher application output
+to rotating root-level `error.log`; `startup_probe.py` appends launcher-fatal
+tracebacks there so failures before normal logging are not lost.
 
 ## 2. Frame and position flow
 
@@ -131,6 +134,20 @@ on Tk's owning thread. Quick-message indices always address the live insertion
 order, so deletion automatically compacts `Ctrl+1` through `Ctrl+0`. Recording
 hotkeys refuse to run while patrol is enabled. Action feedback MP3 playback is
 launched on a daemon thread and does not block the hook or Tk.
+
+`TradeWorker` is independent of patrol movement and does not create a Tk
+overlay. Its `Ctrl+Q` flow uses the physical cursor only as the player target:
+after validating that the cursor is inside the focused client, it sends virtual
+right-click and Start Trade input. It requires a grey dialog presence sample
+within one second; a missing dialog aborts before any confirm or chat action.
+After the dialog appears, two non-grey samples mean the trader joined. The
+worker refocuses the game, sends quick message 1, then clicks Confirm Trade and
+presses Enter. `Ctrl+Q` again or Esc cancels this active invite immediately.
+`Ctrl+W` accepts an incoming invitation, confirms it, then sends quick message
+1. Trade coordinates have a fixed 1366×768 HUD basis (also used by 1920×1080)
+and uniformly scale at 1075×768. Trade uses the existing `FrameBus` only while
+an invitation is active, and its presence sample/drawings are intentionally
+invisible.
 
 `MotionArbiter` (motion_arbiter.py) serializes jump, action-buff, and
 small-step motions because the game can drop a key pressed during another
@@ -619,7 +636,10 @@ in `ui_worker.py`:
   auto stops), and ERROR+ records.  Two icon buttons sit at the panel's
   top-right and appear while patrol is NOT running (report time): the
   archive icon copies the in-memory running log, the user icon copies the
-  user settings JSON, and 导出配置 overwrites the Desktop export. `UiLogHandler`
+  user settings JSON, 导入配置 opens a JSON picker and atomically replaces the
+  active user settings, and 导出配置 overwrites the Desktop export. Import and
+  export results are significant running-log messages; imported settings apply
+  on the next launch. `UiLogHandler`
   retains the latest 600 formatted lines
   in memory (deque, oldest dropped) - no per-line disk I/O; the ordinary
   file handler still owns the on-disk log.  Lifecycle markers are logged
@@ -670,6 +690,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
 4. Inspect `git diff --check` and `git status`, stage only intended source,
    tests, and docs, commit, and verify a clean worktree.
 
+For the separately named no-trade distribution, run
+`release_no_trade.ps1`. It stages the current normal build under
+`release/MapleAssistant-vnt-0001`, removes only the copied trade worker,
+hotkeys, and wiring, verifies the staged Python files contain no trade wiring,
+then writes `release/MapleAssistant-vnt-0001.zip`. It does not alter the normal
+working source or branch: `main` is always the normal trade-enabled version.
+
 Every project change requires a new release package, but docs, full tests,
 verification work, and Git commits are checkpoint operations only: perform
 them when the user explicitly says **update**, or just before context
@@ -701,6 +728,7 @@ git -c core.quotepath=false ls-files
 | `attack_worker.py` | Fixed-rate attack thread |
 | `random_jump_worker.py` | Independent optional fixed-Alt timer |
 | `hotkey_worker.py` | Physical-only low-level Ctrl hotkey hook and action queue publisher |
+| `trade_worker.py` | Isolated Ctrl+Q/Ctrl+W virtual-input trade workflows and presence sampling |
 | `focus_worker.py` | Foreground/refocus gate and key release |
 | `shutdown_worker.py` | Preserved timed-shutdown implementation; temporarily unwired/hidden |
 | `countdown_worker.py` | Independent repeating countdown and MP3 playback |
@@ -738,6 +766,7 @@ git -c core.quotepath=false ls-files
 | `restart_assistant.ps1` | Development restart helper; excluded from release |
 | `build_release.ps1` | Minimal distributable folder and ZIP builder |
 | `release_now.ps1`, `发布.bat` | Canonical gated release workflow |
+| `release_no_trade.ps1` | Staged no-trade `MapleAssistant-vnt-0001` publisher; leaves normal source intact |
 | `README.md` | User/developer overview and operating workflow |
 | `ARCHITECTURE.md` | Technical handoff and full inventory |
 | `INSTALL.md` | Installation guide |
@@ -840,6 +869,7 @@ These exist locally but are not guaranteed in a clone or commit:
 | `map_profiles/` | Currently local/empty profile directory |
 | `yolo-detection/weights/best.onnx` | Optional local ONNX weight; packaged when present, not currently tracked |
 | `auto_system.log`, `yolo-detection/*.log` | Runtime logs |
+| `error.log`, `assistant-launch-error.log` | Rotating fatal-error and startup-probe diagnostics |
 | `__pycache__/`, `.idea/`, temporary directories | Generated development artifacts |
 
 ## 11. Change checklist for future sessions

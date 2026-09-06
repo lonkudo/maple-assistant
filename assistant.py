@@ -200,7 +200,12 @@ def _stop_live_input(
     refocus_before_release: bool = False,
 ) -> None:
     automation_active_event.clear()
-    key_sender.disable_input(refocus_before_release=refocus_before_release)
+    # Stopping patrol is a safety/lifecycle action. A failed best-effort
+    # key-up must be recorded, but it must never tear down the dashboard.
+    try:
+        key_sender.disable_input(refocus_before_release=refocus_before_release)
+    except Exception:
+        logging.exception("INPUT RESET failed while stopping patrol")
 
 
 def _capture_focused_game_frame(
@@ -284,6 +289,26 @@ def main() -> int:
     )
     file_log_handler.setFormatter(_compact_log_formatter())
     logging.getLogger().addHandler(file_log_handler)
+    # Keep critical failures separate from the high-frequency diagnostic log.
+    # The hidden launcher appends any fatal startup traceback here too.
+    error_log_handler = RotatingFileHandler(
+        Path(__file__).with_name("error.log"),
+        maxBytes=1_000_000,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    error_log_handler.setLevel(logging.ERROR)
+    error_log_handler.setFormatter(_compact_log_formatter())
+    logging.getLogger().addHandler(error_log_handler)
+
+    def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
+        logging.critical(
+            "uncaught exception in worker %s",
+            getattr(args.thread, "name", "unknown"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _log_uncaught_thread_error
 
     # Imports are delayed so `--help` works even before dependencies are installed.
     import numpy as np
@@ -331,7 +356,6 @@ def main() -> int:
     pickup_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
-    ui_interacting = threading.Event()
     patrol_preparing = threading.Event()
     trade_capture_active = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -1011,7 +1035,6 @@ def main() -> int:
         automation_active,
         game_focused,
         on_focus_lost=stop_patrol_after_focus_loss,
-        ui_interaction_event=ui_interacting,
     )
     core_workers = [
         capture_worker,
@@ -1070,7 +1093,6 @@ def main() -> int:
             ui_log_handler=ui_log_handler,
             user_config_path=str(config_store.user_path),
             automation_active_event=automation_active,
-            ui_interaction_event=ui_interacting,
         )
     )
 
@@ -1121,6 +1143,8 @@ def main() -> int:
             logging.getLogger().removeHandler(ui_log_handler)
         logging.getLogger().removeHandler(file_log_handler)
         file_log_handler.close()
+        logging.getLogger().removeHandler(error_log_handler)
+        error_log_handler.close()
         _release_single_instance_mutex(singleton_handle)
     return 0
 

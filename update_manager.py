@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -268,6 +269,40 @@ def export_user_config(source: Path, roots: Optional[Iterable[Path]] = None) -> 
     return target
 
 
+def import_user_config(source: Path, destination: Path) -> Path:
+    """Validate and atomically replace the live user configuration file.
+
+    Import deliberately changes only ``user_config.json``.  System tuning and
+    program files remain untouched, and the caller can restart cleanly before
+    any in-memory UI state writes over the imported settings.
+    """
+
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    if not source.is_file():
+        raise UpdateError("找不到要导入的 user_config.json。")
+    if source == destination:
+        raise UpdateError("所选文件已经是当前 user_config.json。")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UpdateError(f"配置文件不是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise UpdateError("配置文件格式错误：根内容必须是 JSON 对象。")
+    temporary = destination.with_suffix(destination.suffix + ".importing")
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise UpdateError(f"导入 user_config.json 失败: {exc}") from exc
+    return destination
+
+
 def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
     """Launch a hidden helper that restarts after this instance exits."""
 
@@ -313,5 +348,6 @@ def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
 __all__ = [
     "DesktopUpdate", "UpdateError", "UpdateResult", "apply_desktop_update",
     "desktop_roots", "export_user_config", "find_newer_desktop_update",
+    "import_user_config",
     "schedule_hidden_restart",
 ]

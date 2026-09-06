@@ -33,7 +33,7 @@ from config_store import config_section_file
 from countdown_worker import play_mp3
 from versioning import read_version, version_label
 from update_manager import (
-    UpdateError, apply_desktop_update, export_user_config,
+    UpdateError, apply_desktop_update, export_user_config, import_user_config,
     find_newer_desktop_update,
     schedule_hidden_restart,
 )
@@ -339,7 +339,12 @@ class UiLogHandler(logging.Handler):
         if record.levelno >= logging.ERROR:
             # Critical bugs (LOG.error / LOG.exception / CRITICAL).
             return True
-        return LOG_RUN_START in message or LOG_RUN_STOP in message
+        return (
+            LOG_RUN_START in message
+            or LOG_RUN_STOP in message
+            or LOG_CONFIG_IMPORT in message
+            or LOG_CONFIG_EXPORT in message
+        )
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -373,6 +378,8 @@ class UiLogHandler(logging.Handler):
 # copied to the clipboard by the archive icon button.
 LOG_RUN_START = "巡逻已开始"
 LOG_RUN_STOP = "巡逻已停止"
+LOG_CONFIG_IMPORT = "配置导入"
+LOG_CONFIG_EXPORT = "配置导出"
 
 
 def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
@@ -671,7 +678,6 @@ class UiWorker(threading.Thread):
         ui_log_handler: Any = None,
         user_config_path: Optional[str] = None,
         automation_active_event: Optional[threading.Event] = None,
-        ui_interaction_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -743,8 +749,6 @@ class UiWorker(threading.Thread):
         self.ui_log_handler = ui_log_handler
         self.user_config_path = user_config_path
         self.automation_active_event = automation_active_event
-        self.ui_interaction_event = ui_interaction_event
-        self._ui_interaction_clear_job: Any = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -828,7 +832,6 @@ class UiWorker(threading.Thread):
             # every resize step).  Also frees WM_SIZE handling for the
             # drag-move path below.
             self._install_resize_burst_guard(root)
-            self._install_ui_interaction_focus_hold(root)
 
             if caption_installed:
                 self._build_caption_bar(root, tk, app_version)
@@ -1585,7 +1588,7 @@ class UiWorker(threading.Thread):
             shutdown_check = ttk.Checkbutton(
                 shutdown_row, text="运行后定时关闭",
                 variable=self._shutdown_enabled_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             )
             shutdown_check.pack(side="left", padx=(0, 8))
             self._shutdown_check = shutdown_check
@@ -1627,7 +1630,7 @@ class UiWorker(threading.Thread):
                 alarm_row,
                 text="掉线",
                 variable=self._disconnect_alert_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             ).pack(side="left", padx=(4, 6))
 
             self._lie_alert_var = tk.BooleanVar(value=False)
@@ -1635,14 +1638,14 @@ class UiWorker(threading.Thread):
                 alarm_row,
                 text="测谎",
                 variable=self._lie_alert_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             ).pack(side="left", padx=(0, 6))
 
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
                 alarm_row, text="循环",
                 variable=self._countdown_enabled_var,
-                command=self._apply_optional_function_state,
+                command=self._countdown_on_change,
             )
             self._countdown_check.pack(side="left")
 
@@ -1704,7 +1707,7 @@ class UiWorker(threading.Thread):
                 reminder_row,
                 text="声音",
                 variable=self._sound_alert_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             ).pack(side="left", padx=(4, 8))
 
             self._screen_blink_var = tk.BooleanVar(value=False)
@@ -1712,7 +1715,7 @@ class UiWorker(threading.Thread):
                 reminder_row,
                 text="闪烁",
                 variable=self._screen_blink_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             ).pack(side="left", padx=(0, 8))
 
             self._telegram_enabled_var = tk.BooleanVar(value=False)
@@ -1720,7 +1723,7 @@ class UiWorker(threading.Thread):
                 reminder_row,
                 text="消息",
                 variable=self._telegram_enabled_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             ).pack(side="left")
             telegram_row = ttk.Frame(extra_panel)
             telegram_row.pack(fill="x", pady=(4, 0))
@@ -1759,7 +1762,7 @@ class UiWorker(threading.Thread):
                 player_row,
                 text="检测到其他玩家自动切换频道",
                 variable=self._player_check_var,
-                command=self._apply_optional_function_state,
+                command=self._shutdown_on_change,
             ).pack(side="left")
             self._shutdown_load_settings()
 
@@ -1781,23 +1784,22 @@ class UiWorker(threading.Thread):
             # button copies user settings.  Only significant events are
             # shown (the latest few lines); the full 600-line in-memory
             # history stays available through the archive button - no disk
-            # I/O per line.
+            # I/O per line.  Import/export have text buttons so their purpose
+            # remains clear without relying on an unlabeled icon.
             log_panel = ttk.LabelFrame(col2, text="运行日志", padding=(6, 4))
             log_panel.pack(fill="x", pady=(10, 0))
             log_actions = ttk.Frame(log_panel)
             log_actions.pack(fill="x")
             self._log_archive_photo = _make_log_icon("archive", root)
-            self._log_user_photo = _make_log_icon("user", root)
             self._copy_log_button = ttk.Button(
                 log_actions,
                 image=self._log_archive_photo,
                 command=self._copy_running_log,
                 takefocus=False,
             )
-            self._copy_config_button = ttk.Button(
-                log_actions,
-                image=self._log_user_photo,
-                command=self._copy_user_config,
+            self._import_config_button = ttk.Button(
+                log_actions, text="导入配置",
+                command=self._import_user_config,
                 takefocus=False,
             )
             self._export_config_button = ttk.Button(
@@ -1806,7 +1808,7 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._export_config_button.pack(side="right", padx=(3, 0))
-            self._copy_config_button.pack(side="right", padx=(3, 0))
+            self._import_config_button.pack(side="right", padx=(3, 0))
             self._copy_log_button.pack(side="right", padx=(3, 0))
             self._log_display_lines: list[str] = []
             self._log_label = ttk.Label(
@@ -2181,46 +2183,6 @@ class UiWorker(threading.Thread):
         self._resize_configure_handler = _on_configure
         root.bind("<Configure>", _on_configure, add="+")
 
-    def _install_ui_interaction_focus_hold(self, root: Any) -> None:
-        """Let a UI click/drag complete before FocusWorker refocuses Maple.
-
-        Patrol normally refocuses the game immediately for safe keyboard
-        input.  That is correct for gameplay, but it interrupted Tk's mouse
-        release while adjusting a checkbox or Scale.  This app-local binding
-        holds automatic refocus for a short quiet period after every pointer
-        event; it does not affect keyboard input from other applications.
-        """
-
-        event = self.ui_interaction_event
-        if event is None:
-            return
-
-        def _hold(_pointer_event: Any = None) -> None:
-            event.set()
-            previous = self._ui_interaction_clear_job
-            if previous is not None:
-                try:
-                    root.after_cancel(previous)
-                except Exception:
-                    pass
-            try:
-                self._ui_interaction_clear_job = root.after(
-                    850, _release_hold
-                )
-            except Exception:
-                self._ui_interaction_clear_job = None
-                event.clear()
-
-        def _release_hold() -> None:
-            self._ui_interaction_clear_job = None
-            event.clear()
-
-        # ``bind_all`` is limited to this Tk interpreter.  It catches child
-        # controls too, unlike a toplevel-only binding, and the add form
-        # preserves each widget's normal click/drag behavior.
-        for sequence in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
-            root.bind_all(sequence, _hold, add="+")
-
     def _caption_minimize(self) -> None:
         """Minimize to the taskbar (native iconify still works)."""
 
@@ -2579,7 +2541,7 @@ class UiWorker(threading.Thread):
             and self.patrol_controller.is_enabled()
         )
         for button in (
-            self._copy_log_button, self._copy_config_button,
+            self._copy_log_button, getattr(self, "_import_config_button", None),
             getattr(self, "_export_config_button", None),
         ):
             if button is None:
@@ -2611,34 +2573,46 @@ class UiWorker(threading.Thread):
         self._copy_to_clipboard(text)
         LOG.info("运行日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
-    def _copy_user_config(self) -> None:
-        """User icon button: copy the user settings JSON to the clipboard."""
+    def _import_user_config(self) -> None:
+        """Choose a saved user_config.json and load it for the next launch."""
 
-        text = ""
-        if self.user_config_path:
-            try:
-                text = Path(self.user_config_path).read_text(encoding="utf-8")
-            except OSError as exc:
-                LOG.error("复制用户配置失败: %s", exc)
-                self._copy_to_clipboard(f"(无法读取用户配置: {exc})")
-                return
-        if not text.strip():
-            text = "(用户配置文件不存在或为空)"
-        self._copy_to_clipboard(text)
-        LOG.info("用户配置已复制到剪贴板")
+        if not self.user_config_path:
+            LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_IMPORT)
+            return
+        try:
+            from tkinter import filedialog
+
+            source = filedialog.askopenfilename(
+                parent=self._root,
+                title="导入用户配置",
+                initialfile="user_config.json",
+                filetypes=(("用户配置", "user_config.json"), ("JSON 文件", "*.json")),
+            )
+        except Exception:
+            LOG.exception("%s失败：无法打开文件选择窗口", LOG_CONFIG_IMPORT)
+            return
+        if not source:
+            LOG.info("%s已取消", LOG_CONFIG_IMPORT)
+            return
+        try:
+            import_user_config(Path(source), Path(self.user_config_path))
+        except UpdateError as exc:
+            LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, exc)
+            return
+        LOG.info("%s成功：已载入 %s；重启助手后生效。", LOG_CONFIG_IMPORT, source)
 
     def _export_user_config(self) -> None:
         """Overwrite the Desktop copy used by the in-app updater."""
 
         if not self.user_config_path:
-            LOG.warning("导出配置失败：当前用户配置路径不可用")
+            LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_EXPORT)
             return
         try:
             target = export_user_config(Path(self.user_config_path))
         except UpdateError as exc:
-            LOG.warning("导出配置失败：%s", exc)
+            LOG.warning("%s失败：%s", LOG_CONFIG_EXPORT, exc)
             return
-        LOG.info("用户配置已导出并覆盖到桌面：%s", target)
+        LOG.info("%s成功：已导出到桌面 %s", LOG_CONFIG_EXPORT, target)
 
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
@@ -2681,8 +2655,14 @@ class UiWorker(threading.Thread):
             minimap.thumbnail((360, 260), Image.Resampling.NEAREST)
             name = snapshot.map_name_preview.copy()
             name.thumbnail((360, 90), Image.Resampling.NEAREST)
-            self._photo_minimap = ImageTk.PhotoImage(minimap)
-            self._photo_map_name = ImageTk.PhotoImage(name)
+            # Always bind preview images to this dashboard's interpreter.
+            # A trade overlay may temporarily own another Tk interpreter;
+            # implicit PhotoImage roots can then produce "pyimage does not
+            # exist" and abort the entire dashboard.
+            self._photo_minimap = ImageTk.PhotoImage(
+                minimap, master=self._root
+            )
+            self._photo_map_name = ImageTk.PhotoImage(name, master=self._root)
             self._minimap_label.configure(image=self._photo_minimap)
             self._map_name_label.configure(image=self._photo_map_name)
 
@@ -3586,27 +3566,6 @@ class UiWorker(threading.Thread):
         """JSON file holding the Additional Functions panel settings."""
 
         return config_section_file("additional_functions")
-
-    def _apply_optional_function_state(self) -> None:
-        """Persist and deliver checkbox values to all optional workers.
-
-        This is called directly by each ``ttk.Checkbutton`` command.  Tk has
-        already committed the BooleanVar by that point, unlike the former
-        trace/``after_idle`` route which could leave a visual checkbox and its
-        worker on opposite values after a single click.
-        """
-
-        try:
-            # This applies disconnect/lie/sound/blink/Telegram/player-switch
-            # together.  It intentionally does not reset countdown remaining
-            # time, which a slider change is allowed to do separately.
-            self._shutdown_on_change()
-            data = self._shutdown_collect_data()
-            self._countdown_apply_to_worker(data)
-            self._countdown_refresh_grey()
-            LOG.info("optional functions applied from checkbox state")
-        except Exception:
-            LOG.exception("optional functions state apply failed")
 
     def _shutdown_collect_data(self) -> dict:
         """Current Additional Functions panel values as a settings dict."""
@@ -4880,9 +4839,7 @@ class UiWorker(threading.Thread):
                 except Exception:
                     pass
                 self._yolo_launch_log = None
-            self._yolo_run_button.configure(state="normal")
-            self._yolo_stop_button.configure(state="disabled")
-            self._yolo_status.configure(text="YOLO 检测已停止。")
+            self._set_yolo_stopped_ui()
             return
         try:
             proc.terminate()
@@ -4900,10 +4857,41 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
             self._yolo_launch_log = None
-        self._yolo_run_button.configure(state="normal")
-        self._yolo_stop_button.configure(state="disabled")
-        self._yolo_status.configure(text="YOLO 检测已停止。")
+        self._set_yolo_stopped_ui()
         LOG.info("yolo detection stopped")
+
+    def _set_yolo_stopped_ui(self) -> None:
+        """Update the stopped state only while the Tk controls still exist.
+
+        The dashboard close handler destroys widgets before ``run`` enters
+        cleanup. Calling ``configure`` on one of those stale buttons raised
+        ``TclError`` and converted a normal close into an application crash.
+        """
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        try:
+            if not root.winfo_exists():
+                return
+        except Exception:
+            return
+        updates = (
+            ("_yolo_run_button", {"state": "normal"}),
+            ("_yolo_stop_button", {"state": "disabled"}),
+            ("_yolo_status", {"text": "YOLO 检测已停止。"}),
+        )
+        for attribute, options in updates:
+            widget = getattr(self, attribute, None)
+            if widget is None:
+                continue
+            try:
+                if widget.winfo_exists():
+                    widget.configure(**options)
+            except Exception:
+                # Process cleanup has already completed; stale UI feedback is
+                # not important enough to make the assistant exit.
+                LOG.debug("could not update closed YOLO UI", exc_info=True)
 
     def _yolo_sync_show_button(self) -> None:
         """Toggle the grey/inactive look based on the checked state."""
@@ -5033,7 +5021,12 @@ class UiWorker(threading.Thread):
             return False
         self.patrol_controller.set_enabled(False)
         if self.on_patrol_stop is not None:
-            self.on_patrol_stop()
+            try:
+                self.on_patrol_stop()
+            except Exception:
+                # A foreground/key-release problem must be recorded, but Stop
+                # Patrol must leave the dashboard usable for manual recovery.
+                LOG.exception("Stop Patrol input cleanup failed")
         # Stopping patrol also stops the YOLO attack subprocess: in stand-still
         # mode the character stands and the YOLO executor attacks, so without
         # this the character would keep attacking after Stop Patrol.
@@ -5066,7 +5059,10 @@ class UiWorker(threading.Thread):
         # Stop and release live input before mutating the recording.
         self.patrol_controller.set_enabled(False)
         if self.on_patrol_stop is not None:
-            self.on_patrol_stop()
+            try:
+                self.on_patrol_stop()
+            except Exception:
+                LOG.exception("Reset Recording input cleanup failed")
         try:
             self.patrol_controller.reset_recording()
             # A reset starts a fresh recording for the current map; adopt the

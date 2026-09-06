@@ -31,7 +31,6 @@ class FocusWorker(threading.Thread):
         focus_lost_grace_seconds: float = 2.5,
         refocus_interval_seconds: float = 1.0,
         on_focus_lost: Optional[Callable[[], None]] = None,
-        ui_interaction_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="focus-worker", daemon=True)
         self.key_sender = key_sender
@@ -42,12 +41,6 @@ class FocusWorker(threading.Thread):
         self.focus_lost_grace_seconds = max(0.0, float(focus_lost_grace_seconds))
         self.refocus_interval_seconds = max(0.25, float(refocus_interval_seconds))
         self.on_focus_lost = on_focus_lost
-        # The UI sets this only while the user is actively clicking or
-        # dragging one of its controls.  It prevents the automatic game
-        # refocus from stealing the mouse halfway through a checkbox click or
-        # progress-bar drag; input is paused safely and resumes once the game
-        # is refocused after the brief hold.
-        self.ui_interaction_event = ui_interaction_event
         self._lost_since: Optional[float] = None
         self._last_refocus_at: Optional[float] = None
         self._refocus_in_flight = False
@@ -69,9 +62,6 @@ class FocusWorker(threading.Thread):
 
         def _refocus_worker() -> None:
             try:
-                if (self.ui_interaction_event is not None
-                        and self.ui_interaction_event.is_set()):
-                    return
                 if self.key_sender.select_window():
                     LOG.info(
                         "AUTOMATION REFOCUS: game window brought back to "
@@ -110,10 +100,6 @@ class FocusWorker(threading.Thread):
         try:
             while not self.stop_event.is_set():
                 input_enabled = bool(self.key_sender.input_is_enabled())
-                ui_interacting = bool(
-                    self.ui_interaction_event is not None
-                    and self.ui_interaction_event.is_set()
-                )
                 # Stay completely idle while patrol is stopped.  The old
                 # unconditional probe searched for the game every 0.2s and
                 # also kept the capture pipeline running before Start Patrol.
@@ -121,12 +107,6 @@ class FocusWorker(threading.Thread):
                     bool(self.key_sender.is_game_foreground())
                     if input_enabled else False
                 )
-                # Treat a focused assistant control as a deliberate, safe
-                # automation pause.  Without this guard, a click on a
-                # checkbox/Scale immediately caused select_window() to steal
-                # focus back to the game before its release/drag completed.
-                if ui_interacting:
-                    game_focused = False
                 if game_focused:
                     self.game_focused_event.set()
                 else:
@@ -157,16 +137,6 @@ class FocusWorker(threading.Thread):
                         self._lost_since = None
                     previous = active
                 elif input_enabled:
-                    if ui_interacting:
-                        # Do not refocus or start the normal focus-loss timer
-                        # during a UI click/drag.  The UI clears this short
-                        # hold after its final pointer event, then normal
-                        # refocus resumes automatically.
-                        self._lost_since = None
-                        previous = False
-                        if self.stop_event.wait(self.poll_interval):
-                            break
-                        continue
                     # Game not focused while keyboard input is armed.  First
                     # try to restore the foreground automatically; the grace
                     # timer then decides between a transient dip (resume) and

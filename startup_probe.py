@@ -15,12 +15,17 @@ import traceback
 
 LOG_PATH = Path(__file__).with_name("assistant-launch-error.log")
 STATUS_PATH = Path(__file__).with_name("assistant-launch-status.log")
+ERROR_LOG_PATH = Path(__file__).with_name("error.log")
 
 
 def _write_error(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(f"[{timestamp}] {message}\n")
+    line = f"[{timestamp}] {message}\n"
+    # Keep the legacy launch log, but write every fatal traceback to the
+    # simple error.log requested for normal troubleshooting.
+    for path in (LOG_PATH, ERROR_LOG_PATH):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
 
 
 def _write_status(message: str) -> None:

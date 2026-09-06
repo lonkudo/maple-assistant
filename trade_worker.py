@@ -1,4 +1,4 @@
-"""Independent trade automation: virtual clicks, presence checks, and overlays."""
+"""Independent trade automation: virtual clicks and invisible presence checks."""
 
 from __future__ import annotations
 
@@ -15,14 +15,11 @@ from typing import Any, Optional
 import numpy as np
 
 from countdown_worker import play_mp3
+from minimap_detector import hud_scale_for
 
 
 LOG = logging.getLogger(__name__)
 
-REFERENCE_CLIENT = (1366, 768)
-CHARACTER_SIZE = 65
-GRID_DIMENSION = 3
-RANGE_SIZE = (CHARACTER_SIZE * GRID_DIMENSION, CHARACTER_SIZE * GRID_DIMENSION)
 TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
 ACCEPT_INVITATION = (885, 670)
@@ -30,95 +27,25 @@ TRADE_MESSAGE_BOX = (460, 200)
 # Small sample at the requested position inside the known trader-check area.
 PRESENCE_BOX = (145, 105, 20, 20)
 PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
+TRADE_DIALOG_GREY_FRAMES = 2
 TRADER_PRESENT_FRAMES = 2
-
-
-class TradeOverlayWorker(threading.Thread):
-    """Draw short-lived range/current-target rectangles without mouse input."""
-
-    def __init__(self, stop_event: threading.Event) -> None:
-        super().__init__(name="trade-overlay", daemon=True)
-        self.stop_event = stop_event
-        self._requests: "queue.Queue[list[tuple[int, int, int, int, str]]]" = (
-            queue.Queue(maxsize=1)
-        )
-
-    def show(self, rectangles: list[tuple[int, int, int, int, str]]) -> None:
-        try:
-            while True:
-                self._requests.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._requests.put_nowait(rectangles)
-        except queue.Full:
-            pass
-
-    def clear(self) -> None:
-        self.show([])
-
-    def run(self) -> None:  # pragma: no cover - visual Windows path
-        if sys.platform != "win32":
-            self.stop_event.wait()
-            return
-        try:
-            import tkinter as tk
-
-            root = tk.Tk()
-            root.withdraw()
-            popups: list[Any] = []
-
-            def render(rectangles: list[tuple[int, int, int, int, str]]) -> None:
-                nonlocal popups
-                for popup in popups:
-                    try:
-                        popup.destroy()
-                    except Exception:
-                        pass
-                popups = []
-                for left, top, width, height, color in rectangles:
-                    popup = tk.Toplevel(root)
-                    popup.overrideredirect(True)
-                    popup.attributes("-topmost", True)
-                    popup.attributes("-alpha", 0.35)
-                    popup.configure(background=color)
-                    popup.geometry(f"{width}x{height}+{left}+{top}")
-                    # The visual guide must never activate or intercept the
-                    # game.  Without these extended styles, a Tk Toplevel
-                    # can steal foreground focus while a trade is waiting.
-                    popup.update_idletasks()
-                    user32 = ctypes.windll.user32
-                    GWL_EXSTYLE = -20
-                    WS_EX_TRANSPARENT = 0x00000020
-                    WS_EX_NOACTIVATE = 0x08000000
-                    WS_EX_TOOLWINDOW = 0x00000080
-                    style = user32.GetWindowLongW(popup.winfo_id(), GWL_EXSTYLE)
-                    user32.SetWindowLongW(
-                        popup.winfo_id(), GWL_EXSTYLE,
-                        style | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
-                        | WS_EX_TOOLWINDOW,
-                    )
-                    popups.append(popup)
-
-            def poll() -> None:
-                if self.stop_event.is_set():
-                    render([])
-                    root.destroy()
-                    return
-                try:
-                    render(self._requests.get_nowait())
-                except queue.Empty:
-                    pass
-                root.after(35, poll)
-
-            root.after(0, poll)
-            root.mainloop()
-        except Exception:
-            LOG.exception("trade overlay stopped unexpectedly")
+VK_ESCAPE = 0x1B
 
 
 class VirtualMouse:
-    """Windows SendInput mouse clicks; the physical cursor is not used."""
+    """Windows SendInput mouse clicks, starting at the user's cursor."""
+
+    @staticmethod
+    def position() -> Optional[tuple[int, int]]:
+        """Return the current desktop cursor position without moving it."""
+
+        if sys.platform != "win32":
+            return None
+        point = wintypes.POINT()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            raise OSError(ctypes.get_last_error(), "could not read mouse position")
+        return int(point.x), int(point.y)
 
     @staticmethod
     def click(x: int, y: int, *, right: bool = False) -> None:
@@ -177,7 +104,6 @@ class TradeWorker(threading.Thread):
         self._invite_lock = threading.Lock()
         self._invite_pending = False
         self._invite_cancel = threading.Event()
-        self.overlay = TradeOverlayWorker(stop_event)
 
     def request(self, action: str, message: str = "") -> bool:
         if action == "trade:invite":
@@ -209,18 +135,49 @@ class TradeWorker(threading.Thread):
             return "started"
 
     def _invite_cancelled(self) -> bool:
-        return self.stop_event.is_set() or self._invite_cancel.is_set()
+        if self.stop_event.is_set() or self._invite_cancel.is_set():
+            return True
+        # Esc is deliberately polled only by an active trade request.  It is
+        # not registered as a permanent global hotkey, so normal game Esc
+        # behavior remains unchanged when no trade workflow is running.
+        if sys.platform == "win32":
+            try:
+                pressed = bool(
+                    ctypes.WinDLL("user32", use_last_error=True)
+                    .GetAsyncKeyState(VK_ESCAPE) & 0x8000
+                )
+            except Exception:
+                pressed = False
+            if pressed:
+                self._invite_cancel.set()
+                LOG.info("trade invite cancelled by Esc")
+                return True
+        return False
 
     def _wait_or_cancel(self, seconds: float) -> bool:
-        """Wait briefly, returning false as soon as Ctrl+Q cancels."""
+        """Interrupt a delay within 25ms when Ctrl+Q or Esc cancels."""
 
-        return not self._invite_cancel.wait(seconds) and not self.stop_event.is_set()
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while time.monotonic() < deadline:
+            if self._invite_cancelled():
+                return False
+            self._invite_cancel.wait(min(0.025, deadline - time.monotonic()))
+        return not self._invite_cancelled()
 
     @staticmethod
-    def _scaled(value: int, client_width: int, client_height: int, *, y: bool = False) -> int:
-        reference = REFERENCE_CLIENT[1 if y else 0]
-        current = client_height if y else client_width
-        return round(value * current / reference)
+    def _scaled(
+        value: int, client_width: int, client_height: int, *, y: bool = False,
+    ) -> int:
+        """Scale fixed game-UI coordinates with the game's uniform HUD scale.
+
+        1366×768 and larger clients keep this HUD at its original pixel size.
+        On smaller clients such as 1075×768, the game shrinks the *entire*
+        interface from its width, so Y must use the same factor as X rather
+        than the unchanged 768px client height.
+        """
+
+        del client_height, y
+        return round(value * hud_scale_for(client_width))
 
     def _client_geometry(self) -> Optional[tuple[int, int, int, int]]:
         try:
@@ -250,49 +207,6 @@ class TradeWorker(threading.Thread):
             top + self._scaled(point[1], width, height, y=True),
         )
 
-    def _grid_geometry(
-        self, geometry: tuple[int, int, int, int]
-    ) -> tuple[int, int, int, int, int, int]:
-        """Return the centered 3×3 target grid in screen pixels."""
-
-        left, top, width, height = geometry
-        grid_width = self._scaled(RANGE_SIZE[0], width, height)
-        grid_height = self._scaled(RANGE_SIZE[1], width, height, y=True)
-        box_width = self._scaled(CHARACTER_SIZE, width, height)
-        box_height = self._scaled(CHARACTER_SIZE, width, height, y=True)
-        return (
-            left + (width - grid_width) // 2,
-            top + (height - grid_height) // 2,
-            grid_width,
-            grid_height,
-            box_width,
-            box_height,
-        )
-
-    def _show_range(self, geometry: tuple[int, int, int, int], current: Optional[int] = None) -> None:
-        (range_left, range_top, range_width, range_height,
-         box_width, box_height) = self._grid_geometry(geometry)
-        rectangles = [(range_left, range_top, range_width, range_height, "#8b2be2")]
-        if current is not None:
-            row, column = divmod(current, GRID_DIMENSION)
-            rectangles.append((
-                range_left + column * box_width,
-                range_top + row * box_height,
-                box_width, box_height, "#00aaff",
-            ))
-        # Keep the presence sample visible even while the target grid is
-        # shown, so the user can verify the exact area being evaluated.
-        left, top, width, height = geometry
-        x, y, presence_width, presence_height = PRESENCE_BOX
-        rectangles.append((
-            left + self._scaled(x, width, height),
-            top + self._scaled(y, width, height, y=True),
-            self._scaled(presence_width, width, height),
-            self._scaled(presence_height, width, height, y=True),
-            "#ffd400",
-        ))
-        self.overlay.show(rectangles)
-
     def _set_clipboard(self, message: str) -> bool:
         try:
             import win32clipboard
@@ -307,18 +221,86 @@ class TradeWorker(threading.Thread):
             LOG.exception("trade could not set clipboard")
             return False
 
-    def _show_presence_area(self, geometry: tuple[int, int, int, int]) -> None:
-        """Show the exact trader-presence sample area while waiting."""
+    def _sample_presence_is_grey(
+        self, geometry: tuple[int, int, int, int]
+    ) -> Optional[bool]:
+        """Return whether one fresh presence sample is the dialog grey.
 
-        left, top, width, height = geometry
+        ``None`` means no usable frame arrived and is deliberately distinct
+        from non-grey: a slow capture must not be treated as a failed dialog.
+        """
+
+        try:
+            # Keep Esc cancellation responsive even when capture has not
+            # produced a new frame yet.
+            frame = self.frames.get(timeout=0.05)
+        except queue.Empty:
+            return None
+        image = getattr(frame, "image", None)
+        if image is None:
+            return None
+        width, height = image.size
         x, y, box_width, box_height = PRESENCE_BOX
-        self.overlay.show([(
-            left + self._scaled(x, width, height),
-            top + self._scaled(y, width, height, y=True),
-            self._scaled(box_width, width, height),
-            self._scaled(box_height, width, height, y=True),
-            "#ffd400",
-        )])
+        left = self._scaled(x, width, height)
+        top = self._scaled(y, width, height, y=True)
+        right = min(width, left + self._scaled(box_width, width, height))
+        bottom = min(height, top + self._scaled(box_height, width, height, y=True))
+        if right <= left or bottom <= top:
+            return None
+        pixels = np.asarray(
+            image.crop((left, top, right, bottom)).convert("RGB"),
+            dtype=np.int16,
+        )
+        grey_ratio = float(np.mean(
+            np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)
+        ))
+        LOG.info("trade presence sample grey=%s ratio=%.3f", grey_ratio >= 0.985, grey_ratio)
+        return grey_ratio >= 0.985
+
+    def _wait_for_trade_dialog(
+        self, geometry: tuple[int, int, int, int], timeout: float = 1.0,
+    ) -> bool:
+        """Require the grey trade-dialog state before waiting for a trader."""
+
+        self.capture_active_event.set()
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        grey_frames = 0
+        non_grey_frames = 0
+        try:
+            while (not self._invite_cancelled()
+                   and time.monotonic() < deadline):
+                grey = self._sample_presence_is_grey(geometry)
+                if grey is None:
+                    continue
+                if grey:
+                    grey_frames += 1
+                    non_grey_frames = 0
+                    if grey_frames >= TRADE_DIALOG_GREY_FRAMES:
+                        LOG.info("trade dialog observed; waiting for trader")
+                        return True
+                else:
+                    non_grey_frames += 1
+                    grey_frames = 0
+                    # If the expected grey dialog area never appears across
+                    # usable frames, Start Trade did not open its dialog.
+                    # Stop here: non-grey is *not* a trader arrival until a
+                    # grey dialog has first been confirmed.
+                    if non_grey_frames >= TRADE_DIALOG_GREY_FRAMES:
+                        LOG.warning(
+                            "trade dialog did not appear; aborting before "
+                            "message or confirmation"
+                        )
+                        return False
+            if self._invite_cancel.is_set():
+                LOG.info("trade dialog wait cancelled by Ctrl+Q")
+            else:
+                LOG.warning(
+                    "trade dialog wait timed out; aborting before message "
+                    "or confirmation"
+                )
+            return False
+        finally:
+            self.capture_active_event.clear()
 
     def _wait_for_trader(
         self, geometry: tuple[int, int, int, int],
@@ -328,34 +310,20 @@ class TradeWorker(threading.Thread):
 
         self.capture_active_event.set()
         deadline = None if timeout is None else time.monotonic() + timeout
-        self._show_presence_area(geometry)
-        LOG.info("trade waiting for trader; detection area is highlighted")
+        LOG.info("trade waiting for trader (presence check is hidden)")
         present_frames = 0
         try:
             while (not self._invite_cancelled() and
                    (deadline is None or time.monotonic() < deadline)):
-                try:
-                    frame = self.frames.get(timeout=0.5)
-                except queue.Empty:
+                grey = self._sample_presence_is_grey(geometry)
+                if grey is None:
                     continue
-                image = getattr(frame, "image", None)
-                if image is None:
-                    continue
-                width, height = image.size
-                x, y, box_width, box_height = PRESENCE_BOX
-                left = self._scaled(x, width, height)
-                top = self._scaled(y, width, height, y=True)
-                right = min(width, left + self._scaled(box_width, width, height))
-                bottom = min(height, top + self._scaled(box_height, width, height, y=True))
-                pixels = np.asarray(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.int16)
-                blank_ratio = float(np.mean(np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)))
-                if blank_ratio < 0.985:
+                if not grey:
                     present_frames += 1
                     if present_frames >= TRADER_PRESENT_FRAMES:
                         LOG.info(
                             "trade trader detected after %d frames "
-                            "(blank ratio %.3f)",
-                            present_frames, blank_ratio,
+                            "after confirmed dialog", present_frames,
                         )
                         return True
                 else:
@@ -368,38 +336,6 @@ class TradeWorker(threading.Thread):
         finally:
             self.capture_active_event.clear()
 
-    def _presence_area_is_blank(
-        self, geometry: tuple[int, int, int, int]
-    ) -> bool:
-        """Return true when one fresh presence sample is the blank colour."""
-
-        if self._invite_cancelled():
-            return False
-        self.capture_active_event.set()
-        try:
-            frame = self.frames.get(timeout=0.5)
-        except queue.Empty:
-            return False
-        image = getattr(frame, "image", None)
-        if image is None:
-            return False
-        width, height = image.size
-        x, y, box_width, box_height = PRESENCE_BOX
-        left = self._scaled(x, width, height)
-        top = self._scaled(y, width, height, y=True)
-        right = min(width, left + self._scaled(box_width, width, height))
-        bottom = min(height, top + self._scaled(box_height, width, height, y=True))
-        pixels = np.asarray(
-            image.crop((left, top, right, bottom)).convert("RGB"),
-            dtype=np.int16,
-        )
-        blank_ratio = float(np.mean(
-            np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)
-        ))
-        blank = blank_ratio >= 0.985
-        LOG.info("trade presence sample blank=%s ratio=%.3f", blank, blank_ratio)
-        return blank
-
     def _confirm_trade(self, geometry: tuple[int, int, int, int]) -> bool:
         """Confirm the open trade dialog at the requested screen position."""
 
@@ -409,7 +345,8 @@ class TradeWorker(threading.Thread):
         point = self._point(geometry, CONFIRM_BUTTON)
         LOG.info("trade confirm click client=%s screen=%s", CONFIRM_BUTTON, point)
         VirtualMouse.click(*point)
-        time.sleep(0.15)
+        if not self._wait_or_cancel(0.15):
+            return False
         return bool(self.key_sender.send_direct_keys("enter"))
 
     def _send_message(
@@ -420,7 +357,8 @@ class TradeWorker(threading.Thread):
         point = self._point(geometry, TRADE_MESSAGE_BOX)
         LOG.info("trade message click client=%s screen=%s", TRADE_MESSAGE_BOX, point)
         VirtualMouse.click(*point)
-        time.sleep(0.10)
+        if not self._wait_or_cancel(0.10):
+            return False
         return bool(self.key_sender.send_direct_keys("ctrl+v", "enter"))
 
     @staticmethod
@@ -444,79 +382,57 @@ class TradeWorker(threading.Thread):
         if geometry is None:
             return
         try:
-            self.capture_active_event.set()
-            self._show_range(geometry)
-            if not self._wait_or_cancel(0.35):
+            cursor = VirtualMouse.position()
+            if cursor is None:
+                LOG.warning("trade invite ignored: mouse position unavailable")
                 return
-            for index in range(GRID_DIMENSION * GRID_DIMENSION):
-                if self._invite_cancelled():
-                    return
-                self._show_range(geometry, index)
-                if not self._wait_or_cancel(0.18):
-                    return
-                self.overlay.clear()
-                if not self._wait_or_cancel(0.05):
-                    return
-                (range_left, range_top, _grid_width, _grid_height,
-                 box_width, box_height) = self._grid_geometry(geometry)
-                row, column = divmod(index, GRID_DIMENSION)
-                center = (
-                    range_left + column * box_width + box_width // 2,
-                    range_top + row * box_height + box_height // 2,
-                )
-                _left, _top, width, height = geometry
-                VirtualMouse.click(*center, right=True)
-                if not self._wait_or_cancel(0.18):
-                    return
-                VirtualMouse.click(center[0] + self._scaled(TRADE_MENU_OFFSET[0], width, height),
-                                   center[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True))
-                if not self._wait_or_cancel(0.18):
-                    return
-                # A blank presence area means this trade request is now
-                # pending.  Do not continue inviting other targets: retain
-                # the yellow area and wait until the trader arrives.
-                if self._presence_area_is_blank(geometry):
-                    LOG.info(
-                        "trade invitation accepted as pending; "
-                        "stopping remaining target invites"
-                    )
-                    break
-                if self._invite_cancelled():
-                    return
-            # Finish the full 3×3 invitation pass before sampling for a
-            # trader, unless a pending invitation stopped it sooner.  The
-            # highlighted detection region remains visible until someone
-            # arrives or the assistant is stopped.
+            left, top, width, height = geometry
+            if not (left <= cursor[0] < left + width and top <= cursor[1] < top + height):
+                LOG.warning("trade invite ignored: place the cursor on a trader in the game window first")
+                return
+            LOG.info("trade invite: using user cursor at screen=%s", cursor)
+            VirtualMouse.click(*cursor, right=True)
+            if not self._wait_or_cancel(0.18):
+                return
+            start_trade = (
+                cursor[0] + self._scaled(TRADE_MENU_OFFSET[0], width, height),
+                cursor[1] + self._scaled(TRADE_MENU_OFFSET[1], width, height, y=True),
+            )
+            LOG.info("trade start click screen=%s", start_trade)
+            VirtualMouse.click(*start_trade)
+            if not self._wait_or_cancel(0.18):
+                return
+            # Phase 1: the grey dialog must appear. If it does not, a
+            # non-grey sample means Start Trade failed, not that the trader
+            # has arrived; do not send a message or click confirmation.
+            if not self._wait_for_trade_dialog(geometry):
+                return
+            # Phase 2: after grey was observed, non-grey means the trader
+            # entered the dialog. The check remains completely invisible.
             if self._wait_for_trader(geometry):
-                self.overlay.clear()
-                # Overlay clear is delivered on its own Tk worker.  Give it
-                # a moment to destroy the topmost guide and let the operator
-                # finish Mouse Without Borders movement before the synthetic
-                # click sequence takes control.
-                if not self._wait_or_cancel(2.00):
+                if not self._wait_or_cancel(0.20):
                     return
                 # The detector overlay or another desktop window may now be
                 # foreground.  Focus the game again before its trade dialog
-                # receives the requested absolute click and Enter.
+                # receives the message and confirmation.
                 if self.key_sender.select_window() is False:
                     LOG.warning(
-                        "trade confirmation aborted: game could not be "
+                        "trade completion aborted: game could not be "
                         "refocused after trader detection"
                     )
                     return
-                # The two-second operator handoff above replaces the former
-                # 200ms post-detection delay.  Confirm immediately after the
-                # game window has been restored to foreground.
+                if not self._send_message(geometry, message):
+                    LOG.warning("trade message failed; confirmation skipped")
+                    return
+                if not self._wait_or_cancel(0.35):
+                    return
                 confirmed = self._confirm_trade(geometry)
                 LOG.info("trade confirmation submitted=%s", confirmed)
-                if not confirmed or not self._wait_or_cancel(0.35):
-                    return
-                if self._send_message(geometry, message):
+                if confirmed:
                     self._play_success()
                     LOG.info("trade invite workflow completed")
         finally:
             self.capture_active_event.clear()
-            self.overlay.clear()
 
     def _accept(self, message: str) -> None:
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
@@ -540,7 +456,6 @@ class TradeWorker(threading.Thread):
             LOG.info("trade acceptance workflow completed")
 
     def run(self) -> None:
-        self.overlay.start()
         LOG.info("trade worker started")
         try:
             while not self.stop_event.is_set():
@@ -563,7 +478,6 @@ class TradeWorker(threading.Thread):
                     self._requests.task_done()
         finally:
             self.capture_active_event.clear()
-            self.overlay.clear()
             LOG.info("trade worker stopped")
 
 

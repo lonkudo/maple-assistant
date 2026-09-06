@@ -144,43 +144,5 @@ class FocusWorkerTests(unittest.TestCase):
         self.assertFalse(active.is_set())
         self.assertFalse(game_focused.is_set())
 
-    def test_ui_interaction_pauses_without_refocusing_or_stopping(self) -> None:
-        """A checkbox/slider drag must not lose its mouse release to Maple."""
-
-        sender = FakeSender()
-        stop = threading.Event()
-        active = threading.Event()
-        game_focused = threading.Event()
-        ui_interacting = threading.Event()
-        worker = FocusWorker(
-            sender, stop, active, game_focused, poll_interval=0.01,
-            focus_lost_grace_seconds=0.05,
-            ui_interaction_event=ui_interacting,
-        )
-        worker.start()
-        try:
-            self.assertTrue(active.wait(0.5))
-            ui_interacting.set()
-            sender.focused = False
-            deadline = time.monotonic() + 0.3
-            while active.is_set() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertFalse(active.is_set())
-            # The UI hold prevents both immediate game refocus and the normal
-            # sustained-focus-loss stop while the pointer is still down.
-            time.sleep(0.10)
-            self.assertEqual(sender.select_calls, 0)
-            self.assertEqual(sender.disable_calls, 0)
-
-            ui_interacting.clear()
-            deadline = time.monotonic() + 0.5
-            while sender.select_calls < 1 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertGreaterEqual(sender.select_calls, 1)
-        finally:
-            stop.set()
-            worker.join(0.5)
-
-
 if __name__ == "__main__":
     unittest.main()
