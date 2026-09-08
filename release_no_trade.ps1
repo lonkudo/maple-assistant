@@ -8,10 +8,21 @@
     wiring from that copied folder before creating the no-trade ZIP.
 #>
 
+param(
+    [string]$Version
+)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    # Default to the current normal-release version, so the no-trade package
+    # always clearly identifies the exact source it was built from.
+    $Version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
+}
+if ($Version -notmatch '^\d{4}$') {
+    throw "Version must be a four-digit normal release number."
+}
 $releaseRoot = Join-Path $root "release"
-$packageName = "MapleAssistant-vnt-0001"
+$packageName = "MapleAssistant-vnt-$Version"
 $outRelative = "release\$packageName"
 $out = Join-Path $root $outRelative
 $zip = Join-Path $releaseRoot "$packageName.zip"
@@ -53,14 +64,14 @@ function Replace-RequiredRegex {
 Write-Host "== no-trade build: stage current source ==" -ForegroundColor Cyan
 & powershell -NoProfile -ExecutionPolicy Bypass `
     -File (Join-Path $root "build_release.ps1") `
-    -OutDir $outRelative -Version "0001"
+    -OutDir $outRelative -Version $Version
 if ($LASTEXITCODE -ne 0) {
     throw "Base release staging failed."
 }
 
 # The normal source is untouched from here onward: every edit targets $out.
 [System.IO.File]::WriteAllText(
-    (Join-Path $out "VERSION"), "0001`n", [System.Text.Encoding]::ASCII
+    (Join-Path $out "VERSION"), "$Version`n", [System.Text.Encoding]::ASCII
 )
 
 $assistant = Join-Path $out "assistant.py"

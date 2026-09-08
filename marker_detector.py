@@ -85,14 +85,21 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
     # decorations stay excluded by requiring a strong green channel (not
     # orange) and a weak blue channel (not white), plus the shape and
     # compactness checks below.
+    # Seed only from the bright core of the player diamond.  Some maps use
+    # ochre/yellow-brown terrain tiles that satisfy a broad yellow test; they
+    # are static and made every recording land on the same false coordinate.
+    # The true marker retains a compact, bright yellow core even when its
+    # anti-aliased outer pixels are darker.  Terrain can contain an isolated
+    # bright fleck, but not a marker-sized core; that measured size gate is
+    # what keeps this detector tied to the diamond rather than map art.
     yellow = (
-        (red >= 185)
-        & (green >= 175)
-        & (blue <= 185)
-        & (red >= green * 0.85)
-        & (green >= blue * 1.2)
+        (red >= 210)
+        & (green >= 198)
+        & (blue <= 180)
+        & (red >= green * 0.90)
+        & (green >= blue * 1.25)
     )
-    yellow_body = (red >= 190) & (green >= 175) & (blue <= 185)
+    yellow_body = (red >= 185) & (green >= 160) & (blue <= 190)
     height, width = yellow.shape
     candidates: list[tuple[float, MarkerDetection]] = []
     # The player diamond is SMALL: ~6-7 px at normal zoom on a 130-170 px
@@ -107,13 +114,19 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
     max_span = max(20, int(round(min_dimension * 0.18)))
     max_pixels = max(320, max_span * max_span)
     body_components = _components(yellow_body, min_pixels=3)
-    for component in _components(yellow, min_pixels=3):
+    for component in _components(yellow, min_pixels=5):
         ys, xs = component[:, 0], component[:, 1]
         strict_left, strict_top = int(xs.min()), int(ys.min())
         strict_right, strict_bottom = int(xs.max()) + 1, int(ys.max()) + 1
         span_x, span_y = strict_right - strict_left, strict_bottom - strict_top
         count = len(component)
-        if count > max_pixels or span_x > max_span or span_y > max_span:
+        if (
+            count > max_pixels
+            or span_x > max_span
+            or span_y > max_span
+            or span_x < 3
+            or span_y < 3
+        ):
             continue
         aspect = span_x / max(1, span_y)
         compact = count / max(1, span_x * span_y)

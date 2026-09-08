@@ -162,6 +162,15 @@ class MinimapDetectorTests(unittest.TestCase):
         image[80, 10:150] = (255, 220, 60)
         self.assertIsNone(detect_yellow_diamond(image))
 
+    def test_diamond_detector_rejects_tiny_bright_terrain_fleck(self) -> None:
+        """A 2x2 bright speck in terrain is not the player diamond."""
+
+        import numpy as np
+
+        image = np.zeros((171, 167, 3), dtype=np.uint8)
+        image[60:62, 80:82] = (255, 255, 136)
+        self.assertIsNone(detect_yellow_diamond(image))
+
     def test_diamond_detector_accepts_heavy_minimap_zoom(self) -> None:
         """A zoomed diamond inside a fixed panel must still be found.
 

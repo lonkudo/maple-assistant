@@ -28,7 +28,9 @@ assistant.py (primary process)
     AttackWorker       fixed-rate attack or 跳跃攻击 bundle (jump +300ms key)
     RandomJumpWorker   optional independent timed Alt jump (base min 1.0s)
     MotionArbiter      serializes jump/buff motion keys vs attack cadence
+    StairJumpWorker    one confirmed forward stair jump; waits out attack tail
     HotkeyWorker       physical-only Ctrl chord hook -> UI action queue
+    QuickPickupWorker  Ctrl+Z manual-only rapid Z pickup while patrol is off
     TradeWorker        isolated Ctrl+Q/Ctrl+W virtual-input trade flows
     FocusWorker        foreground gate, refocus, key release
     ShutdownWorker     preserved but temporarily not constructed
@@ -149,12 +151,21 @@ and uniformly scale at 1075×768. Trade uses the existing `FrameBus` only while
 an invitation is active, and its presence sample/drawings are intentionally
 invisible.
 
-`MotionArbiter` (motion_arbiter.py) serializes jump, action-buff, and
+`MotionArbiter` (motion_arbiter.py) serializes random jump, action-buff, and
 small-step motions because the game can drop a key pressed during another
 action. It has one FIFO executor, one pending jump, one pending small-step,
 and one pending event per buff key; duplicates collapse. A jump locks further
 motion for 0.9s, an action buff for 0.6s, and every queued action observes a
-0.3s post-attack grace.
+0.73s post-attack grace.
+
+`StairJumpWorker` is deliberately *not* a `MotionArbiter` event. The movement
+worker detects seven frozen minimap position samples at a patrol endpoint and
+registers one forward stair jump. The dedicated worker immediately blocks new
+attacks, waits for the current attack grace to finish, then adds one short Alt
+tap over the still-held patrol direction. It never calls the broad movement
+key scrub and never releases the current Left/Right/Z walk hold while waiting.
+Five detector samples are skipped after registration, and duplicate requests
+while the worker is active collapse into that one physical Alt tap.
 
 The safe-stage rule is deliberate: jump and small-step can register only on a
 normal Left/Right patrol or rope-approach walk. Timed action buffs may register
@@ -217,6 +228,8 @@ names. Movement stage logs are compact (`PATROL|`, `CLIMB|`, and
 Control ownership rules:
 
 - `MovementWorker` owns Left, Right, Alt+Up, Up, Alt+Down, and walking Z.
+- `StairJumpWorker` owns only the single Alt tap for a confirmed 台阶跳; it
+  borrows the currently held patrol direction but never owns a second route.
 - `StatusWorker` owns HP/MP and pet-food drug timing; it schedules timed action
   buffs and receives their completion result.
 - `AttackWorker` owns the configured attack key (fixed or 跳跃攻击 bundle).
@@ -525,7 +538,10 @@ deadline, configured interval, wake event, and alert callbacks. At expiry it
 re-arms the full interval before dispatching the selected reminder outputs.
 The UI reads a locked snapshot for its live progress scale. Dragging that scale
 sets a new remaining duration within `0..interval`; UI refresh pauses while the
-pointer owns the scale so it does not fight the drag.
+pointer owns the scale so it does not fight the drag. On UI shutdown,
+`timer_state.py` atomically writes the enabled flag, interval, and wall-clock
+deadline to ignored `timer.json`; startup restores it only if the deadline is
+still in the future.
 
 The UI separates alert sources (`掉线警报`, `测谎警报`, `循环警报`) from reminder
 outputs (`声音提醒`, `闪烁提醒`, `消息提醒`). Each source always emits its event;
@@ -721,8 +737,10 @@ git -c core.quotepath=false ls-files
 | `config_store.py` | User/system section router and legacy user migration |
 | `capture_worker.py` | Client capture, frame bus, region mapping |
 | `movement_worker.py` | Patrol and movement state machines |
-| `motion_arbiter.py` | FIFO serialization, action windows, and completion callbacks for jump/buff/small-step motions |
+| `motion_arbiter.py` | FIFO serialization, action windows, and completion callbacks for random-jump/buff/small-step motions |
+| `stair_jump_worker.py` | Dedicated one-action stair recovery: waits for attack tail while patrol walk continues |
 | `small_step_worker.py` | Optional timed small-step scheduler; requests, but does not emit, the atomic movement action |
+| `quick_pickup_worker.py` | Ctrl+Z manual-only rapid Z-pickup worker, disabled whenever patrol runs |
 | `character_worker.py` | Minimap character-position stream and shared-result disconnect alert |
 | `status_worker.py` | SendInput sender, status detection, potions/buffs |
 | `attack_worker.py` | Fixed-rate attack thread |
@@ -732,6 +750,7 @@ git -c core.quotepath=false ls-files
 | `focus_worker.py` | Foreground/refocus gate and key release |
 | `shutdown_worker.py` | Preserved timed-shutdown implementation; temporarily unwired/hidden |
 | `countdown_worker.py` | Independent repeating countdown and MP3 playback |
+| `timer_state.py` | Atomic ignored `timer.json` persistence for circular-alert deadline |
 | `lie_detector_worker.py` | Resolution-scaled in-memory lie-event detection |
 | `screen_blinker.py` | Optional queued two-flash red full-screen notifier |
 | `telegram_notifier.py` | Optional non-blocking Telegram BOT verification and alert delivery |

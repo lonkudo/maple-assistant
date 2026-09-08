@@ -22,13 +22,16 @@ LOG = logging.getLogger(__name__)
 
 TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
-ACCEPT_INVITATION = (885, 670)
+ACCEPT_INVITATION = (885, 672)
 TRADE_MESSAGE_BOX = (460, 200)
 # Small sample at the requested position inside the known trader-check area.
 PRESENCE_BOX = (145, 105, 20, 20)
 PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
 TRADE_DIALOG_GREY_FRAMES = 2
 TRADER_PRESENT_FRAMES = 2
+# A trade window that remains empty is a failed invitation, not a workflow
+# that should keep sampling the capture stream forever.
+TRADER_WAIT_TIMEOUT_SECONDS = 10.0
 VK_ESCAPE = 0x1B
 
 
@@ -304,17 +307,20 @@ class TradeWorker(threading.Thread):
 
     def _wait_for_trader(
         self, geometry: tuple[int, int, int, int],
-        timeout: Optional[float] = None,
+        timeout: float = TRADER_WAIT_TIMEOUT_SECONDS,
     ) -> bool:
-        """Wait for a non-blank presence area, until stopped by default."""
+        """Wait up to ``timeout`` seconds for a non-blank presence area."""
 
         self.capture_active_event.set()
-        deadline = None if timeout is None else time.monotonic() + timeout
-        LOG.info("trade waiting for trader (presence check is hidden)")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        LOG.info(
+            "trade waiting for trader (presence check is hidden; timeout=%.1fs)",
+            timeout,
+        )
         present_frames = 0
         try:
             while (not self._invite_cancelled() and
-                   (deadline is None or time.monotonic() < deadline)):
+                   time.monotonic() < deadline):
                 grey = self._sample_presence_is_grey(geometry)
                 if grey is None:
                     continue
@@ -330,8 +336,12 @@ class TradeWorker(threading.Thread):
                     present_frames = 0
             if self._invite_cancel.is_set():
                 LOG.info("trade wait cancelled by Ctrl+Q")
-            elif deadline is not None:
-                LOG.info("trade wait timed out: trader not detected")
+            else:
+                LOG.warning(
+                    "trade wait expired after %.1fs: trader not detected; "
+                    "stopping invite workflow",
+                    timeout,
+                )
             return False
         finally:
             self.capture_active_event.clear()

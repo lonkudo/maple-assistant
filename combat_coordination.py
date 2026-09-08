@@ -19,11 +19,15 @@ sees a half-written payload.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional, Tuple
+
+
+LOG = logging.getLogger(__name__)
 
 
 class AttackStateFile:
@@ -109,8 +113,14 @@ class PatrolStateFile:
         busy: bool,
         action: Optional[str] = None,
         facing: Optional[str] = None,
-    ) -> None:
-        """Persist the current patrol state (atomic temp+rename)."""
+    ) -> bool:
+        """Persist advisory patrol state without interrupting movement.
+
+        Windows may transiently deny an atomic replacement when Defender,
+        indexing, sync software, or an optional companion process has the
+        destination JSON open.  Patrol coordination is advisory; retries are
+        worthwhile, but a persistent lock must never discard a movement frame.
+        """
 
         data = {
             "busy": bool(busy),
@@ -125,13 +135,35 @@ class PatrolStateFile:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
-            os.replace(tmp, self.path)
+            for attempt in range(6):
+                try:
+                    os.replace(tmp, self.path)
+                    return True
+                except PermissionError as exc:
+                    if attempt == 5:
+                        LOG.warning(
+                            "patrol state write skipped after %d locked-file "
+                            "retries: %s",
+                            attempt + 1, exc,
+                        )
+                        return False
+                    # Keep the same complete temp file and retry its atomic
+                    # replacement; no reader can observe a partial payload.
+                    time.sleep(0.05)
         except Exception:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+        finally:
+            # A permanently locked destination leaves the staged temp file;
+            # remove it after returning False so `work/` cannot accumulate.
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
 
     def read(self) -> Optional[dict]:
         try:

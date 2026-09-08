@@ -3,7 +3,9 @@
   "map_name": "",
   "patrol_enabled": false,
   "climbing_enabled": true,
-  "route_order": [],
+  "route_order": [
+    "layer1"
+  ],
   "final_layer_action": "drop_to_first_layer",
   "first_layer": "layer1",
   "minimap_region": [
@@ -21,7 +23,56 @@
   "layers": {
     "layer1": {
       "y_tolerance": 0.05,
-      "calibration_status": "awaiting_left_rope_right"
+      "calibration_status": "final_layer_ready",
+      "y_tolerance_diamonds": 1.058333,
+      "layer_y": 0.767717,
+      "layer_y_source": "manual-ui",
+      "layer_world_y": 5.582728,
+      "world_y_tolerance": 0.75,
+      "right_most_pos": {
+        "x": 0.691235,
+        "y": 0.775591,
+        "source": "manual-ui",
+        "world_y": 5.582728,
+        "observed_world_y": 6.555874,
+        "tracking_confidence": 0.810152,
+        "coordinate_v2": {
+          "x_diamond": 9.083333,
+          "y_diamond": 5.666667,
+          "recorded_layout": {
+            "analysis_width": 251.0,
+            "analysis_height": 127.0,
+            "canvas_left": 5.0,
+            "canvas_top": 15.0,
+            "canvas_width": 228.0,
+            "canvas_height": 99.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      },
+      "left_most_pos": {
+        "x": 0.126,
+        "y": 0.759843,
+        "source": "manual-ui",
+        "world_y": 5.582728,
+        "observed_world_y": 5.993023,
+        "tracking_confidence": 0.948673,
+        "coordinate_v2": {
+          "x_diamond": -14.5,
+          "y_diamond": 5.333333,
+          "recorded_layout": {
+            "analysis_width": 250.0,
+            "analysis_height": 127.0,
+            "canvas_left": 5.0,
+            "canvas_top": 15.0,
+            "canvas_width": 227.0,
+            "canvas_height": 99.0,
+            "diamond_width": 6.0,
+            "diamond_height": 6.0
+          }
+        }
+      }
     }
   }
 }

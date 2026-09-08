@@ -1,5 +1,6 @@
 {
   "attack_mode": "fixed",
-  "interval_seconds": 1.0,
-  "attack_key": "shift"
+  "interval_seconds": 0.9,
+  "attack_key": "ctrl",
+  "stair_jump_enabled": true
 }

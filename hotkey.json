@@ -23,6 +23,7 @@
     {"keys": "ctrl+delete", "action": "delete_highest_layer", "block_original": true},
     {"keys": "ctrl+q", "action": "trade:invite", "block_original": true},
     {"keys": "ctrl+w", "action": "trade:accept", "block_original": true},
+    {"keys": "ctrl+z", "action": "quick_pickup:toggle", "block_original": true},
     {"keys": "ctrl+grave", "action": "toggle_patrol", "block_original": true}
   ]
 }

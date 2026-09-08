@@ -15,7 +15,7 @@ buff timers collide and the jump or buff tap silently does nothing.
 - only when the motion window is over does the next event dequeue - or the
   attack worker fire again;
 - every event additionally waits a short ``attack_grace_seconds`` (default
-  0.3s) after the last attack tap, so an attack motion that just started
+  0.73s) after the last attack tap, so an attack motion that just started
   cannot swallow the jump/buff tap.
 
 Attack taps are not queued (they keep their own cadence), but they do acquire
@@ -38,6 +38,7 @@ LOG = logging.getLogger(__name__)
 
 JUMP = "jump"
 MICRO_STEP = "micro_step"
+STAIR_JUMP = "stair_jump"
 
 
 class MotionArbiter(threading.Thread):
@@ -53,7 +54,7 @@ class MotionArbiter(threading.Thread):
         jump_motion_seconds: float = 0.9,
         buff_motion_seconds: float = 0.6,
         micro_step_motion_seconds: float = 0.25,
-        attack_grace_seconds: float = 0.3,
+        attack_grace_seconds: float = 0.73,
     ) -> None:
         super().__init__(name="motion-arbiter", daemon=True)
         self.key_sender = key_sender
@@ -69,6 +70,10 @@ class MotionArbiter(threading.Thread):
         # Installed after MovementWorker exists.  The arbiter serializes the
         # timing, while movement owns the directional key handoff itself.
         self._micro_step_callback: Any = None
+        # A confirmed stair stall borrows patrol's current direction and taps
+        # Alt.  It is queued only to serialize against attacks; it is not an
+        # ordinary directional arbiter motion.
+        self._stair_jump_callback: Any = None
         # Movement owns direction holds, so a queued buff borrows that same
         # owner for one atomic key tap before patrol resumes.
         self._buff_callback: Any = None
@@ -85,9 +90,18 @@ class MotionArbiter(threading.Thread):
         # motion and defers.  Therefore neither can begin inside the other.
         self._attack_reserved = False
         self._executing_token: Optional[str] = None
+        # A confirmed stair recovery owns Alt until MovementWorker has seen
+        # genuine horizontal travel again.  This prevents the independent
+        # random-jump timer from adding visually identical extra jumps while
+        # the stair recovery is still settling.
+        self._stair_recovery_locked = False
         # Completion callbacks belong to periodic-buff timers.  They are
         # invoked only once the key has completed its full motion window.
         self._buff_completion_callbacks: dict[str, list[Any]] = {}
+        # Stair detection must know whether its one queued action actually
+        # pressed Alt.  A failed/aborted queue entry is not a completed stair
+        # recovery and must be eligible for a later retry.
+        self._stair_jump_completion_callbacks: dict[str, list[Any]] = {}
 
     # ------------------------------------------------------------------ #
     # Registration (any thread)                                          #
@@ -98,7 +112,8 @@ class MotionArbiter(threading.Thread):
 
         with self._cv:
             if (not self._automation_allowed_locked()
-                    or not self._motion_gate_allows_locked()):
+                    or not self._motion_gate_allows_locked()
+                    or self._stair_recovery_locked):
                 return False
             if JUMP in self._queued:
                 return True
@@ -106,6 +121,21 @@ class MotionArbiter(threading.Thread):
             self._queued.add(JUMP)
             self._cv.notify_all()
             return True
+
+    def set_stair_recovery_lock(self, locked: bool) -> None:
+        """Reserve Alt for a detected stair until travel is confirmed again."""
+
+        with self._cv:
+            self._stair_recovery_locked = bool(locked)
+            if self._stair_recovery_locked and JUMP in self._queued:
+                # A generic random-jump token waiting behind an attack is not
+                # part of the stair recovery.  Drain it before it can create
+                # a second Alt press after the direction-preserving jump.
+                self._pending = deque(
+                    token for token in self._pending if token != JUMP
+                )
+                self._queued.discard(JUMP)
+            self._cv.notify_all()
 
     def request_buff(self, key: str, on_complete: Any = None) -> bool:
         """Queue one periodic buff key tap and notify after it completes.
@@ -146,11 +176,51 @@ class MotionArbiter(threading.Thread):
             self._cv.notify_all()
             return True
 
+    def request_stair_jump(self, direction: str, on_complete: Any = None) -> bool:
+        """Queue a confirmed direction-preserving stair jump.
+
+        Unlike ``request_jump``, this action does not replace patrol walking:
+        its movement callback holds the current left/right direction and
+        taps Alt.  The queue merely gives it exclusive time after an attack.
+        """
+
+        direction = str(direction).casefold()
+        if direction not in ("left", "right"):
+            return False
+        token = f"{STAIR_JUMP}:{direction}"
+        with self._cv:
+            if not self._automation_allowed_locked():
+                return False
+            if token in self._queued:
+                if callable(on_complete):
+                    self._stair_jump_completion_callbacks.setdefault(
+                        token, []
+                    ).append(on_complete)
+                return True
+            self._pending.append(token)
+            self._queued.add(token)
+            if callable(on_complete):
+                self._stair_jump_completion_callbacks[token] = [on_complete]
+            self._cv.notify_all()
+            return True
+
     def set_micro_step_callback(self, callback: Any) -> None:
         """Install MovementWorker's serialized micro-step implementation."""
 
         with self._cv:
             self._micro_step_callback = callback
+
+    def set_stair_jump_callback(self, callback: Any) -> None:
+        """Install MovementWorker's direction-preserving stair-jump action."""
+
+        with self._cv:
+            self._stair_jump_callback = callback
+
+    def stair_jump_pending(self) -> bool:
+        """Whether a confirmed stair jump owns the attack exclusion window."""
+
+        with self._cv:
+            return any(token.startswith(f"{STAIR_JUMP}:") for token in self._queued)
 
     def set_buff_callback(self, callback: Any) -> None:
         """Install MovementWorker's atomic buff handoff implementation."""
@@ -220,6 +290,16 @@ class MotionArbiter(threading.Thread):
             self._last_attack_at = time.monotonic()
             self._cv.notify_all()
 
+    def attack_motion_active(self) -> bool:
+        """True while a fixed-attack animation can mask movement progress."""
+
+        with self._cv:
+            return bool(
+                self._attack_reserved
+                or time.monotonic() - self._last_attack_at
+                < self.attack_grace_seconds
+            )
+
     # ------------------------------------------------------------------ #
     # Attack-facing state                                                #
     # ------------------------------------------------------------------ #
@@ -263,7 +343,9 @@ class MotionArbiter(threading.Thread):
         if self._pending and self._pending[0] == token:
             self._pending.popleft()
         self._queued.discard(token)
-        return self._buff_completion_callbacks.pop(token, [])
+        callbacks = self._buff_completion_callbacks.pop(token, [])
+        callbacks.extend(self._stair_jump_completion_callbacks.pop(token, []))
+        return callbacks
 
     @staticmethod
     def _notify_buff_completion(callbacks: list[Any], succeeded: bool) -> None:
@@ -289,6 +371,7 @@ class MotionArbiter(threading.Thread):
         # A request made before Stop Patrol must never execute later.  Drop it
         # here as well as at registration because it may have been queued just
         # before the automation gate was cleared.
+        is_stair_jump = token.startswith(f"{STAIR_JUMP}:")
         with self._cv:
             while not self.stop_event.is_set():
                 if not self._automation_allowed_locked():
@@ -296,7 +379,7 @@ class MotionArbiter(threading.Thread):
                     self._cv.notify_all()
                     self._notify_buff_completion(callbacks, False)
                     return
-                if not self._motion_gate_allows_locked():
+                if not is_stair_jump and not self._motion_gate_allows_locked():
                     if token.startswith("buff:"):
                         # A buff stays registered through climb/drop/landing
                         # and wakes itself as soon as ordinary travel returns.
@@ -341,7 +424,7 @@ class MotionArbiter(threading.Thread):
                 callbacks = self._pop_locked(token)
                 self._cv.notify_all()
                 dropped = True
-            elif not self._motion_gate_allows_locked():
+            elif not is_stair_jump and not self._motion_gate_allows_locked():
                 self._executing_token = None
                 if token.startswith("buff:"):
                     self._cv.notify_all()
@@ -353,6 +436,27 @@ class MotionArbiter(threading.Thread):
                 callbacks = []
         if dropped:
             self._notify_buff_completion(callbacks, False)
+            return
+
+        if is_stair_jump:
+            with self._cv:
+                callback = self._stair_jump_callback
+            try:
+                tap_ok = callable(callback) and callback(
+                    token.partition(":")[2]
+                ) is not False
+            except Exception:
+                LOG.exception("motion arbiter stair jump failed")
+                tap_ok = False
+            with self._cv:
+                callbacks = self._pop_locked(token)
+                self._executing_token = None
+                self._cv.notify_all()
+            self._notify_buff_completion(callbacks, tap_ok)
+            if tap_ok:
+                LOG.info("motion arbiter executed direction-preserving %s", token)
+            else:
+                LOG.warning("motion arbiter stair jump blocked; event drained")
             return
 
         if token == JUMP:

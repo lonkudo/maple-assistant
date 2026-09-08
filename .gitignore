@@ -10,7 +10,12 @@ recording-assets/
 release/
 config.json
 user_config.json
+timer.json
 boss_tracker/config.json
+ui_window_settings.json
+trade_config.json
+tradePicture/
+COMMIT_MSG.zip
 
 # local virtual environments
 .venv/

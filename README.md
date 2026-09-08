@@ -92,12 +92,23 @@ not required.
   the effective range in the UI.
 - **跳跃攻击** sends Alt followed by the attack key in each beat.
 - **随机跳跃** optionally queues an independent Alt jump.
-- **小碎步** optionally makes an atomic left/right or right/left 150 ms pair.
+- **台阶跳** watches for seven frozen minimap position samples at a patrol
+  boundary and issues one forward Alt jump; it then skips five detector
+  samples before it can qualify again.
+- **小碎步** optionally makes an atomic left/right or right/left 300 ms pair
+  with a 100 ms neutral gap.
 
 `MotionArbiter` serializes action motions against attack. It permits queued
 motions only during normal left/right patrol or movement toward a rope, waits
 briefly after an attack, and lets the movement worker cleanly pause/resume its
 normal walk hold.
+
+`StairJumpWorker` is intentionally separate from `MotionArbiter`. When 台阶跳
+qualifies, it stops *new* attacks and waits only for the tail of an in-flight
+attack. The normal patrol Left/Right hold remains active throughout that wait;
+the worker adds one short Alt tap rather than releasing and restarting the
+walk. This prevents the post-attack pause that could leave the character still
+before a stair.
 
 ### HP/MP and timed rows
 
@@ -148,6 +159,7 @@ Physical Ctrl hotkeys are stored in [hotkey.json](hotkey.json):
 | Ctrl+[ / Ctrl+] | decrease / increase fixed-attack base interval |
 | Ctrl+Insert / Ctrl+Delete | add / delete highest layer |
 | Ctrl+` | start or stop patrol |
+| Ctrl+Z | toggle manual rapid pickup while patrol is stopped |
 
 Each discrete hotkey has a cooldown. Recording hotkeys refuse route changes
 during patrol. The hook ignores assistant-generated input and does not steal
@@ -187,6 +199,9 @@ sends Telegram with machine name, event type, and time.
 - 测谎 scans the shared capture once per second for a resolution-scaled white
   square and saves no screenshots.
 - 循环 is an independent draggable countdown; it does not depend on patrol.
+- Its remaining deadline is saved to ignored `timer.json` when the UI closes.
+  A future, unexpired deadline is restored at the next start; expired timers
+  remain unselected.
 - Telegram failures only change UI/log status and never stop the assistant.
 
 ## Configuration and updates
@@ -196,6 +211,7 @@ sends Telegram with machine name, event type, and time.
 | `user_config.json` | user | route, minimap calibration, UI/drug/attack/alert/Telegram settings |
 | `system_config.json` | release | internal movement and rope calibration defaults |
 | `hotkey.json` | release | default Ctrl bindings |
+| `timer.json` | local runtime | remaining circular-alert deadline; never packaged or committed |
 
 `user_config.json` has a `user_config_updated_at` tag. The built-in updater
 compares this before replacing a Desktop configuration: matching nonempty tags
@@ -233,6 +249,14 @@ tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds
 `release/MapleAssistant`, and produces `MapleAssistant-vNNNN.zip`. Version
 `9999` never wraps.
 
+### Machine-specific diagnosis
+
+When an issue is reported from another machine, diagnose it only from the
+logs, screenshots, settings, and files explicitly supplied for that machine.
+Do not inspect or use this development machine's live settings, logs, or
+running state as evidence unless the user explicitly says the affected run is
+local.
+
 `release_no_trade.ps1` is a separate publisher for the special
 `MapleAssistant-vnt-0001.zip` package. It stages a copy of the current normal
 release, strips only trade wiring from that copy, verifies it, and zips it.
@@ -246,9 +270,12 @@ version.
 | `assistant.py` | application wiring and lifecycle |
 | `ui_worker.py` | Tk UI, recording, settings, update/export actions |
 | `movement_worker.py` | patrol, rope, fall/recovery, directional ownership |
-| `motion_arbiter.py` | serialized jump/buff/small-step actions |
+| `motion_arbiter.py` | serialized random-jump/buff/small-step actions |
+| `stair_jump_worker.py` | one-at-a-time stair Alt tap that preserves patrol walking |
 | `status_worker.py` | HP/MP bars, potions, timed drug/buff scheduling, shared key sender |
 | `attack_worker.py`, `random_jump_worker.py` | attack and optional jump timing |
+| `quick_pickup_worker.py` | Ctrl+Z manual-only rapid pickup when patrol is stopped |
+| `timer_state.py` | atomic persistence for the independent circular-alert deadline |
 | `trade_worker.py` | Ctrl+Q/Ctrl+W virtual-input trade flows and invisible presence check |
 | `patrol_control.py` | route model and persistence |
 | `minimap_detector.py`, `marker_detector.py`, `map_structure_tracker.py` | minimap geometry, marker detection, world-Y tracking |

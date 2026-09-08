@@ -324,7 +324,9 @@ def main() -> int:
     from attack_worker import AttackWorker
     from random_jump_worker import RandomJumpWorker
     from small_step_worker import SmallStepWorker
+    from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
+    from quick_pickup_worker import QuickPickupWorker
     from trade_worker import TradeWorker
     from motion_arbiter import MotionArbiter
     # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
@@ -748,6 +750,13 @@ def main() -> int:
     shutdown_worker = None
     hotkey_actions: "queue.Queue[str]" = queue.Queue(maxsize=32)
     hotkey_worker = HotkeyWorker(stop_event, hotkey_actions)
+    quick_pickup_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=8)
+    quick_pickup_worker = QuickPickupWorker(
+        key_sender,
+        stop_event,
+        quick_pickup_results,
+        patrol_running=patrol_controller.is_enabled,
+    )
 
     def save_recording_minimap_calibration(snapshot: object) -> None:
         """Publish recording's verified border for independent patrol use."""
@@ -937,6 +946,7 @@ def main() -> int:
             diamond_size_tracker=movement_diamond_tracker,
             structure_tracker=structure_tracker,
             automation_active_event=automation_active,
+            motion_arbiter=motion_arbiter,
             moving_active_event=moving_active,
             pickup_active_event=pickup_active,
             attack_state_path=str(
@@ -974,13 +984,13 @@ def main() -> int:
                 calibration.get("stair_jump_stall_diamonds", 0.25)
             ),
             stair_jump_stall_frames=int(
-                calibration.get("stair_jump_stall_frames", 10)
+                calibration.get("stair_jump_stall_frames", 7)
             ),
             patrol_start_grace_seconds=float(
                 calibration.get("patrol_start_grace_seconds", 3.0)
             ),
             stair_jump_attempts_max=int(
-                calibration.get("stair_jump_attempts_max", 3)
+                calibration.get("stair_jump_attempts_max", 1)
             ),
             stair_jump_grace_seconds=float(
                 calibration.get("stair_jump_grace_seconds", 0.8)
@@ -1005,6 +1015,14 @@ def main() -> int:
             ),
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
+    stair_jump_worker = StairJumpWorker(
+        stop_event,
+        automation_active_event=automation_active,
+        action_active_event=climbing_active,
+        motion_arbiter=motion_arbiter,
+        execute_callback=movement_worker.perform_stair_jump,
+    )
+    movement_worker.set_stair_jump_worker(stair_jump_worker)
     motion_arbiter.set_buff_callback(movement_worker.perform_arbiter_buff)
     motion_arbiter.set_motion_gate_callback(
         movement_worker.motion_arbiter_motion_allowed
@@ -1045,7 +1063,9 @@ def main() -> int:
         *attack_workers,
         random_jump_worker,
         small_step_worker,
+        stair_jump_worker,
         hotkey_worker,
+        quick_pickup_worker,
         trade_worker,
         screen_blinker,
         countdown_worker,
@@ -1070,6 +1090,8 @@ def main() -> int:
             small_step_worker=small_step_worker,
             hotkey_queue=hotkey_actions,
             hotkey_worker=hotkey_worker,
+            quick_pickup_worker=quick_pickup_worker,
+            quick_pickup_results=quick_pickup_results,
             trade_worker=trade_worker,
             movement_worker=movement_worker,
             character_worker=character_worker,

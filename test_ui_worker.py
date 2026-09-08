@@ -14,6 +14,7 @@ from ui_worker import (
     recorded_coordinate_text,
     machine_name_button_text,
     normalize_quick_messages,
+    quick_message_preview,
     rope_unavailable_hint,
     tooltip_cursor_top_right_position,
     _clamp_window_geometry,
@@ -39,6 +40,10 @@ class UiLogHandlerTests(unittest.TestCase):
             ["hello", "world"],
         )
         self.assertEqual(normalize_quick_messages(["a", "b"], 1), ["a"])
+
+    def test_quick_message_preview_ellipsizes_long_cjk_text(self) -> None:
+        self.assertEqual(quick_message_preview("短消息"), "短消息")
+        self.assertTrue(quick_message_preview("测" * 30).endswith("..."))
 
     def test_quick_message_short_click_copies_to_clipboard(self) -> None:
         class Root:

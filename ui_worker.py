@@ -12,6 +12,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -31,6 +32,7 @@ from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
 from countdown_worker import play_mp3
+from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
 from update_manager import (
     UpdateError, apply_desktop_update, export_user_config, import_user_config,
@@ -45,10 +47,9 @@ LOG = logging.getLogger(__name__)
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1086
+_INITIAL_WINDOW_WIDTH = 1036
 _INITIAL_WINDOW_HEIGHT = 560
-# Column 0 is FIXED at 550px, column 1 at 500px (both fully visible inside
-# the 1086px default: 550 + 500 + 12px column gap + 24px container padding).
+# Both columns are FIXED at 500px (500 + 500 + 12px gap + 24px padding).
 # The default height is deliberately compact; users can still enlarge it and
 # their saved window size is never overwritten.
 
@@ -163,7 +164,7 @@ def _clamp_window_geometry(
 # instead of restoring a mismatched size (e.g. 1275x904 / 1620x1050 /
 # 1635x1272 from an older layout, a remembered manual resize, or a
 # DPI-aware run that stored physical-pixel sizes).
-_GEOMETRY_FORMAT = 5
+_GEOMETRY_FORMAT = 6
 
 
 def _load_window_geometry(default_geometry: str) -> str:
@@ -445,9 +446,9 @@ def build_debug_snapshot(
 
     detection = detector.detect(frame.image)
     analysis_image = frame.image.crop(detection.analysis_box)
-    marker = detect_yellow_diamond(np.asarray(analysis_image.convert("RGB")))
     analysis_left, analysis_top, analysis_right, analysis_bottom = detection.analysis_box
     canvas_left, canvas_top, canvas_right, canvas_bottom = detection.canvas_box
+    marker = detect_yellow_diamond(np.asarray(analysis_image.convert("RGB")))
     coordinate_layout = None
     if marker is not None:
         marker_width, marker_height = marker.pixel_size
@@ -620,6 +621,25 @@ def normalize_quick_messages(value: Any, limit: int = 20) -> list[str]:
     return messages
 
 
+def quick_message_preview(message: str, max_units: int = 36) -> str:
+    """Fit a quick-message label without wrapping its compact row.
+
+    CJK characters use roughly two Latin-character cells. The complete value
+    remains available for its action and in the hover hint when shortened.
+    """
+
+    text = str(message)
+    used = 0
+    chars: list[str] = []
+    for char in text:
+        width = 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if used + width > max_units:
+            return "".join(chars).rstrip() + "..."
+        chars.append(char)
+        used += width
+    return text
+
+
 class UiWorker(threading.Thread):
     """Own the independent UI loop; Tk requires ``run`` on Python's main thread."""
 
@@ -662,6 +682,8 @@ class UiWorker(threading.Thread):
         small_step_worker: Any = None,
         hotkey_queue: Optional["queue.Queue[str]"] = None,
         hotkey_worker: Any = None,
+        quick_pickup_worker: Any = None,
+        quick_pickup_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         trade_worker: Any = None,
         movement_worker: Any = None,
         character_worker: Any = None,
@@ -704,6 +726,10 @@ class UiWorker(threading.Thread):
         # Physical hotkey hook whose bindings are temporarily disabled while
         # patrol runs (only the patrol-toggle chord stays live).
         self.hotkey_worker = hotkey_worker
+        # Manual-only rapid Z pickup has its own worker/result channel so it
+        # cannot arm the normal patrol automation workers.
+        self.quick_pickup_worker = quick_pickup_worker
+        self.quick_pickup_results = quick_pickup_results
         # Isolated Ctrl+Q/Ctrl+W trade workflow.  It uses the existing game
         # capture worker only while checking for a trader.
         self.trade_worker = trade_worker
@@ -759,6 +785,7 @@ class UiWorker(threading.Thread):
         # Key-bind buttons carry the bindable-hotkeys popout hint; the list
         # keeps the tooltips alive for the whole UI lifetime.
         self._bind_key_tooltips: list[HoverTooltip] = []
+        self._quick_message_tooltips: list[HoverTooltip] = []
         self._layer_labels: dict[str, Any] = {}
         self._layer_row_names: tuple[str, ...] = ()
         # Only explicit unlocks need UI state. Locking itself is derived from
@@ -802,7 +829,7 @@ class UiWorker(threading.Thread):
             # 按上次保存的几何恢复（可移动、可调整），默认不再固定左上角。
             # The size constants are LOGICAL pixels: on scaled displays
             # (125%/150%) Windows bitmap-scales the DPI-unaware window, so a
-            # 1086x680 logical window physically renders 1358x850 / 1629x1020
+            # 1036x680 logical window physically renders 1295x850 / 1554x1020
             # - the width scales with every other app and the height stays the
             # natural content height (no clipping, no extra space).
             restored = _load_window_geometry(
@@ -817,7 +844,7 @@ class UiWorker(threading.Thread):
             # buttons (Tk cannot add widgets to the OS caption bar).  Native
             # resize borders and the taskbar entry are preserved.  The
             # in-window caption is part of the Tk client, so geometry is
-            # whole-window (the default 1086 width includes the caption row).
+            # whole-window (the default 1036 width includes the caption row).
             caption_installed = self._install_custom_caption(root, tk)
             root.geometry(clamped)
             root.minsize(
@@ -869,13 +896,12 @@ class UiWorker(threading.Thread):
             # of the title separator, without the old unequal left-only gap.
             columns.pack(fill="both", expand=True, pady=(8, 0))
             columns.pack_propagate(False)
+            columns.grid_propagate(False)
             self._columns_frame = columns
-            # Column 0 is FIXED at 550px, column 1 FIXED at 500px (grid
-            # columns 0/1): the 警报 row fits on one line in the left column
-            # and the drug/quick-message panels keep their full text width in
-            # the right one.  Both fit inside the 1086px default window
-            # (550 + 500 + 12px gap + 24px container padding).
-            columns.columnconfigure(0, weight=0, minsize=550)
+            # Both stacks have the same compact fixed width. The child rows
+            # deliberately use short controls and ellipsized quick messages
+            # rather than making the left column wider than the right.
+            columns.columnconfigure(0, weight=0, minsize=500)
             columns.columnconfigure(1, weight=0, minsize=500)
             # Keep the two independently-sized stacks pinned to the very top
             # of the available area.  A weighted grid row can leave a small
@@ -888,11 +914,21 @@ class UiWorker(threading.Thread):
             col2.grid(row=0, column=1, sticky="new", padx=(6, 0))
             self._col2_frame = col2
 
-            controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=10)
+            controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=8)
             controls.pack(fill="x", pady=(0, 8))
             style = ttk.Style(root)
             style.configure("Locked.TButton", foreground="#777777")
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
+            # Recorded coordinates are the widest left-side cells. A compact
+            # record style keeps all three inside the 500px column.
+            style.configure("Record.TButton", font=("Segoe UI", 8), padding=(1, 1))
+            style.configure(
+                "RecordLocked.TButton", font=("Segoe UI", 8), padding=(1, 1),
+                foreground="#777777"
+            )
+            style.map(
+                "RecordLocked.TButton", foreground=[("!disabled", "#777777")]
+            )
             # Show Detection toggle: grey (inactive) until checked.
             style.configure("Off.TCheckbutton", foreground="#999999")
             style.map(
@@ -902,23 +938,23 @@ class UiWorker(threading.Thread):
             action_row = ttk.Frame(controls)
             action_row.pack(fill="x", pady=(0, 8))
             self._start_patrol_button = ttk.Button(
-                action_row, text="开始巡逻", command=self._start_patrol
+                action_row, text="开始巡逻", width=7, command=self._start_patrol
             )
-            self._start_patrol_button.pack(side="left", padx=(0, 8))
+            self._start_patrol_button.pack(side="left", padx=(0, 4))
             self._stop_patrol_button = ttk.Button(
-                action_row, text="停止巡逻", command=self._stop_patrol
+                action_row, text="停止巡逻", width=7, command=self._stop_patrol
             )
-            self._stop_patrol_button.pack(side="left", padx=(0, 8))
+            self._stop_patrol_button.pack(side="left", padx=(0, 4))
             self._add_layer_button = ttk.Button(
-                action_row, text="添加楼层", command=self._add_layer_above
+                action_row, text="添加楼层", width=7, command=self._add_layer_above
             )
-            self._add_layer_button.pack(side="left", padx=(0, 8))
+            self._add_layer_button.pack(side="left", padx=(0, 4))
             self._delete_layer_button = ttk.Button(
-                action_row, text="删除楼层", command=self._delete_highest_layer
+                action_row, text="删除楼层", width=7, command=self._delete_highest_layer
             )
-            self._delete_layer_button.pack(side="left", padx=(0, 8))
+            self._delete_layer_button.pack(side="left", padx=(0, 4))
             self._reset_recording_button = ttk.Button(
-                action_row, text="重置录制", command=self._reset_recording
+                action_row, text="重置录制", width=7, command=self._reset_recording
             )
             self._reset_recording_button.pack(side="left")
             # One shared radio value makes the currently selected recording
@@ -952,17 +988,28 @@ class UiWorker(threading.Thread):
             )
             self._layer_rows_frame = ttk.Frame(controls)
             self._layer_rows_frame.pack(fill="x")
+            # ``ttk.Label`` does not implement ``height`` on Tk 8.6 / Python
+            # 3.10.  Reserve text space with a fixed-height parent instead;
+            # the changing patrol-start status can then never shift the rows
+            # below it on older machines.
+            control_status_slot = ttk.Frame(controls, height=40)
+            control_status_slot.pack(fill="x", pady=(8, 0))
+            control_status_slot.pack_propagate(False)
             self._control_status = ttk.Label(
-                controls,
+                control_status_slot,
                 text="先录制 最左、绳索、最右，然后添加上方图层。",
                 justify="left",
                 wraplength=440,
+                width=54,
             )
-            self._control_status.pack(anchor="w", pady=(8, 0))
+            self._control_status.pack(anchor="w", fill="x")
+            automation_status_slot = ttk.Frame(controls, height=21)
+            automation_status_slot.pack(fill="x", pady=(5, 0))
+            automation_status_slot.pack_propagate(False)
             self._automation_status_label = ttk.Label(
-                controls, justify="left", wraplength=440
+                automation_status_slot, justify="left", wraplength=440, width=54
             )
-            self._automation_status_label.pack(anchor="w", pady=(5, 0))
+            self._automation_status_label.pack(anchor="w", fill="x")
             self._refresh_patrol_controls()
 
             # Detection info panel: hidden by default (kept for future use).
@@ -1151,7 +1198,7 @@ class UiWorker(threading.Thread):
             # the fixed worker lives in the assistant process (AttackWorker)
             # and is applied live.
             fixed_panel = ttk.LabelFrame(
-                col1, text="攻击模式", padding=10
+                col1, text="攻击模式", padding=8
             )
             fixed_panel.pack(fill="x", pady=(0, 8))
             mode_row = ttk.Frame(fixed_panel)
@@ -1184,10 +1231,11 @@ class UiWorker(threading.Thread):
             ).pack(side="left", padx=(0, 8))
             fixed_key_row = ttk.Frame(fixed_panel)
             fixed_key_row.pack(fill="x", pady=(6, 0))
-            # Random-gap steppers live at the RIGHT edge of the row so the
-            # two slider rows share one aligned column of 随机 controls.
-            fixed_random_group = ttk.Frame(fixed_key_row)
-            fixed_random_group.pack(side="right")
+            # Keep the original left-to-right gadget sequence together, then
+            # right-align that complete sequence in every attack row.
+            fixed_gadget_group = ttk.Frame(fixed_key_row)
+            fixed_gadget_group.pack(side="right")
+            fixed_random_group = ttk.Frame(fixed_gadget_group)
             self._fixed_random_group = fixed_random_group
             ttk.Label(fixed_random_group, text="随机:").pack(side="left")
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
@@ -1226,36 +1274,35 @@ class UiWorker(threading.Thread):
             self._attach_bind_hint(fixed_key_button)
             # The interval/range controls sit in their own sub-frame so the
             # 跳跃攻击 mode can hide them and leave only the 按键 row.
-            fixed_interval_group = ttk.Frame(fixed_key_row)
-            fixed_interval_group.pack(side="left", fill="x", expand=True)
+            fixed_interval_group = ttk.Frame(fixed_gadget_group)
+            fixed_interval_group.pack(side="left")
             ttk.Label(fixed_interval_group, text="每").pack(side="left")
-            # Fixed attack period: horizontal slider (progress-bar style),
-            # 0.2-10 s, default 3 s.  It expands so the value/random-gap
-            # controls stay fully visible at the row's right side.
+            # A deliberately short slider keeps the full attack row inside
+            # the compact left column without an artificial empty gap.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
             fixed_interval_slider = ttk.Scale(
                 fixed_interval_group, from_=0.2, to=10.0, orient="horizontal",
-                variable=self._fixed_interval_var,
+                variable=self._fixed_interval_var, length=82,
                 command=self._fixed_on_change,
             )
-            fixed_interval_slider.pack(side="left", fill="x", expand=True,
-                                       padx=(0, 2))
+            fixed_interval_slider.pack(side="left", padx=(0, 2))
             self._fixed_interval_label = ttk.Label(
                 fixed_interval_group, text="3.0s", width=5
             )
             self._fixed_interval_label.pack(side="left", padx=(0, 2))
             self._fixed_range_label = ttk.Label(
-                fixed_interval_group, text="(3.0s, 3.1s)", width=15
+                fixed_interval_group, text="(3.0s, 3.1s)", width=13
             )
             self._fixed_range_label.pack(side="left")
             self._fixed_interval_group = fixed_interval_group
+            fixed_random_group.pack(side="left", padx=(4, 0))
 
             jump_row = ttk.Frame(fixed_panel)
             jump_row.pack(fill="x", pady=(6, 0))
             self._jump_row = jump_row
-            # Same right-aligned random-gap group for the jump row.
-            jump_random_group = ttk.Frame(jump_row)
-            jump_random_group.pack(side="right")
+            jump_gadget_group = ttk.Frame(jump_row)
+            jump_gadget_group.pack(side="right")
+            jump_random_group = ttk.Frame(jump_gadget_group)
             ttk.Label(jump_random_group, text="随机:").pack(side="left")
             self._random_jump_gap_var = tk.DoubleVar(value=0.1)
             jump_gap_minus = ttk.Button(jump_random_group, text="−", width=2)
@@ -1274,33 +1321,43 @@ class UiWorker(threading.Thread):
             jump_gap_plus.pack(side="left", padx=(2, 0))
 
             self._random_jump_enabled_var = tk.BooleanVar(value=False)
+            self._stair_jump_enabled_var = tk.BooleanVar(value=True)
             ttk.Checkbutton(
-                jump_row, text="跳跃", width=7,
+                jump_row, text="台阶跳", width=6,
+                variable=self._stair_jump_enabled_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", padx=(0, 2))
+            ttk.Checkbutton(
+                jump_row, text="跳跃", width=5,
                 variable=self._random_jump_enabled_var,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 4))
-            ttk.Label(jump_row, text="每").pack(side="left")
+            jump_interval_group = ttk.Frame(jump_gadget_group)
+            jump_interval_group.pack(side="left")
+            ttk.Label(jump_interval_group, text="每").pack(side="left")
             self._random_jump_interval_var = tk.DoubleVar(value=3.0)
             # Jump motion occupies 0.9s, so the minimum trigger interval is
             # 1.0s (a faster repeat would pile up stale jump events).
             ttk.Scale(
-                jump_row, from_=1.0, to=10.0, orient="horizontal",
-                variable=self._random_jump_interval_var,
+                jump_interval_group, from_=1.0, to=10.0, orient="horizontal",
+                variable=self._random_jump_interval_var, length=82,
                 command=self._fixed_on_change,
-            ).pack(side="left", fill="x", expand=True, padx=(0, 2))
+            ).pack(side="left", padx=(0, 2))
             self._random_jump_interval_label = ttk.Label(
-                jump_row, text="3.0s", width=5
+                jump_interval_group, text="3.0s", width=5
             )
             self._random_jump_interval_label.pack(side="left", padx=(0, 2))
             self._random_jump_range_label = ttk.Label(
-                jump_row, text="(3.0s, 3.1s)", width=15
+                jump_interval_group, text="(3.0s, 3.1s)", width=13
             )
             self._random_jump_range_label.pack(side="left")
+            jump_random_group.pack(side="left", padx=(4, 0))
             step_row = ttk.Frame(fixed_panel)
             step_row.pack(fill="x", pady=(6, 0))
             self._small_step_row = step_row
-            step_random_group = ttk.Frame(step_row)
-            step_random_group.pack(side="right")
+            step_gadget_group = ttk.Frame(step_row)
+            step_gadget_group.pack(side="right")
+            step_random_group = ttk.Frame(step_gadget_group)
             ttk.Label(step_random_group, text="随机:").pack(side="left")
             self._small_step_gap_var = tk.DoubleVar(value=0.1)
             step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
@@ -1319,7 +1376,7 @@ class UiWorker(threading.Thread):
             step_gap_plus.pack(side="left", padx=(2, 0))
             self._small_step_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
-                step_row, text="小碎步", width=7,
+                step_row, text="小碎步", width=5,
                 variable=self._small_step_enabled_var,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 4))
@@ -1330,21 +1387,24 @@ class UiWorker(threading.Thread):
                 variable=self._small_step_left_first_var,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 4))
-            ttk.Label(step_row, text="每").pack(side="left")
+            step_interval_group = ttk.Frame(step_gadget_group)
+            step_interval_group.pack(side="left")
+            ttk.Label(step_interval_group, text="每").pack(side="left")
             self._small_step_interval_var = tk.DoubleVar(value=5.0)
             ttk.Scale(
-                step_row, from_=3.0, to=30.0, orient="horizontal",
-                variable=self._small_step_interval_var,
+                step_interval_group, from_=3.0, to=30.0, orient="horizontal",
+                variable=self._small_step_interval_var, length=82,
                 command=self._fixed_on_change,
-            ).pack(side="left", fill="x", expand=True, padx=(0, 2))
+            ).pack(side="left", padx=(0, 2))
             self._small_step_interval_label = ttk.Label(
-                step_row, text="5.0s", width=5
+                step_interval_group, text="5.0s", width=5
             )
             self._small_step_interval_label.pack(side="left", padx=(0, 2))
             self._small_step_range_label = ttk.Label(
-                step_row, text="(5.0s, 5.1s)", width=15
+                step_interval_group, text="(5.0s, 5.1s)", width=13
             )
             self._small_step_range_label.pack(side="left")
+            step_random_group.pack(side="left", padx=(4, 0))
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left",
                 wraplength=440,
@@ -1359,7 +1419,7 @@ class UiWorker(threading.Thread):
             # The StatusWorker taps the bound key when the bar ratio drops
             # below the chosen percent (debounced by frames + cooldown).
             drug_panel = ttk.LabelFrame(
-                col2, text="药品 (HP/MP 药水)", padding=10
+                col2, text="药品 (HP/MP 药水)", padding=(8, 6)
             )
             drug_panel.pack(fill="x", pady=(0, 8))
             hp_row = ttk.Frame(drug_panel)
@@ -1554,7 +1614,7 @@ class UiWorker(threading.Thread):
             # Column 0 sequence: patrol calibration → attack mode → quick
             # messages.  Keeping this utility beside the patrol controls
             # makes the two columns visually balanced.
-            quick_panel = ttk.LabelFrame(col1, text="快捷消息", padding=10)
+            quick_panel = ttk.LabelFrame(col1, text="快捷消息", padding=8)
             quick_panel.pack(fill="x", pady=(0, 8))
             quick_header = ttk.Frame(quick_panel)
             quick_header.pack(fill="x")
@@ -1576,7 +1636,7 @@ class UiWorker(threading.Thread):
             # the game gets Alt+F4, the worker verifies the window is gone,
             # then every worker is stopped.
             extra_panel = ttk.LabelFrame(
-                col2, text="附加功能", padding=10
+                col2, text="附加功能", padding=(8, 6)
             )
             # This is constructed after the drug rows for code locality, but
             # packed ahead of them: column 1 reads 附加功能 → 药品 → 运行日志.
@@ -1650,8 +1710,8 @@ class UiWorker(threading.Thread):
             self._countdown_check.pack(side="left")
 
             # 循环 的 间隔/剩余 progress bars sit on the SAME line as the
-            # 掉线/测谎/循环 checkboxes (column 1 is 550px wide to fit).
-            ttk.Label(alarm_row, text="间隔").pack(side="left", padx=(8, 0))
+            # 掉线/测谎/循环 checkboxes (column 1 is 500px wide to fit).
+            ttk.Label(alarm_row, text="间隔").pack(side="left", padx=(4, 0))
             self._countdown_interval_var = tk.DoubleVar(value=1.0)
             self._countdown_interval_slider = ttk.Scale(
                 alarm_row, from_=0.1, to=12.0, orient="horizontal",
@@ -1660,24 +1720,24 @@ class UiWorker(threading.Thread):
                 command=self._countdown_on_change,
             )
             self._countdown_interval_slider.pack(
-                side="left", padx=(2, 2)
+                side="left", padx=(1, 1)
             )
             self._countdown_interval_label = ttk.Label(
-                alarm_row, text="1.0h", width=6
+                alarm_row, text="1.0h", width=4
             )
             self._countdown_interval_label.pack(side="left")
 
-            ttk.Label(alarm_row, text="剩余").pack(side="left", padx=(6, 0))
+            ttk.Label(alarm_row, text="剩余").pack(side="left", padx=(2, 0))
             self._countdown_remaining_var = tk.DoubleVar(value=3600.0)
             self._countdown_remaining_slider = ttk.Scale(
                 alarm_row, from_=0.0, to=3600.0,
                 orient="horizontal",
-                length=45,
+                length=85,
                 variable=self._countdown_remaining_var,
                 command=self._countdown_remaining_on_drag,
             )
             self._countdown_remaining_slider.pack(
-                side="left", padx=(2, 2)
+                side="left", padx=(1, 1)
             )
             self._countdown_dragging = False
             self._countdown_remaining_slider.bind(
@@ -1686,10 +1746,9 @@ class UiWorker(threading.Thread):
             self._countdown_remaining_slider.bind(
                 "<ButtonRelease-1>", self._countdown_drag_end
             )
-            # Width must hold the longest formatted value (e.g. "12h 00m 00s")
-            # so the remaining text is never clipped.
+            # Clock notation is compact while still keeping every unit clear.
             self._countdown_remaining_label = ttk.Label(
-                alarm_row, text="1h 00m 00s", width=12
+                alarm_row, text="1:00:00", width=8
             )
             self._countdown_remaining_label.pack(side="left")
             self._countdown_status = ttk.Label(
@@ -1778,8 +1837,8 @@ class UiWorker(threading.Thread):
 
             # 运行日志 panel: a real LabelFrame panel (title + outline) like
             # the other panels.  Messages inside keep the plain hint style
-            # of the 图层校准与巡逻 status hints; the two icon buttons sit at
-            # the panel's top-right and appear once patrol has ended (report
+            # of the 图层校准与巡逻 status hints; the report controls sit at
+            # the panel's top-left and appear once patrol has ended (report
             # time): the archive button copies the running log, the user
             # button copies user settings.  Only significant events are
             # shown (the latest few lines); the full 600-line in-memory
@@ -1807,9 +1866,9 @@ class UiWorker(threading.Thread):
                 command=self._export_user_config,
                 takefocus=False,
             )
-            self._export_config_button.pack(side="right", padx=(3, 0))
-            self._import_config_button.pack(side="right", padx=(3, 0))
-            self._copy_log_button.pack(side="right", padx=(3, 0))
+            self._copy_log_button.pack(side="left", padx=(0, 3))
+            self._import_config_button.pack(side="left", padx=(0, 3))
+            self._export_config_button.pack(side="left")
             self._log_display_lines: list[str] = []
             self._log_label = ttk.Label(
                 log_panel,
@@ -2208,9 +2267,10 @@ class UiWorker(threading.Thread):
             LOG.warning("maximize toggle failed", exc_info=True)
 
     def _on_debug_window_close(self) -> None:
-        """Close handler: remember the window geometry, then destroy."""
+        """Persist the reminder deadline and UI geometry, then destroy."""
         root = self._root
         if root is not None:
+            self._save_countdown_resume_state()
             try:
                 _save_window_geometry(self._geometry_for_save(root))
             except Exception:
@@ -2340,6 +2400,7 @@ class UiWorker(threading.Thread):
     def _drain_hotkey_actions(self) -> None:
         """Run physical hotkey actions safely on Tk's owning thread."""
 
+        self._drain_quick_pickup_results()
         actions = self.hotkey_queue
         if actions is None:
             return
@@ -2387,6 +2448,19 @@ class UiWorker(threading.Thread):
                         self._quick_message_status.configure(
                             text="交易：正在接受邀请。"
                         )
+                elif action == "quick_pickup:toggle":
+                    patrol_running = bool(
+                        self.patrol_controller is not None
+                        and self.patrol_controller.is_enabled()
+                    )
+                    worker = self.quick_pickup_worker
+                    if patrol_running or worker is None or not worker.request_toggle():
+                        self._control_status.configure(
+                            text="快速拾取失败：请先停止巡逻。"
+                        )
+                        self._play_action_sound(False)
+                    else:
+                        self._control_status.configure(text="快速拾取：正在切换…")
                 elif action.startswith("record:"):
                     boundary = action.partition(":")[2]
                     self._play_action_sound(self._record_endpoint(boundary))
@@ -2415,6 +2489,36 @@ class UiWorker(threading.Thread):
             finally:
                 try:
                     actions.task_done()
+                except (AttributeError, ValueError):
+                    pass
+
+    def _drain_quick_pickup_results(self) -> None:
+        """Apply manual-pickup worker results on Tk's owning thread."""
+
+        results = self.quick_pickup_results
+        if results is None:
+            return
+        while True:
+            try:
+                state, detail = results.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if state == "started":
+                    self._control_status.configure(
+                        text="快速拾取已开启；再次按 Ctrl+Z 关闭。"
+                    )
+                    self._play_action_sound(True)
+                elif state == "failed":
+                    suffix = f"：{detail}" if detail else "。"
+                    self._control_status.configure(text=f"快速拾取失败{suffix}")
+                    self._play_action_sound(False)
+                elif state == "stopped":
+                    suffix = f"（{detail}）" if detail else ""
+                    self._control_status.configure(text=f"快速拾取已关闭{suffix}。")
+            finally:
+                try:
+                    results.task_done()
                 except (AttributeError, ValueError):
                     pass
 
@@ -2869,6 +2973,10 @@ class UiWorker(threading.Thread):
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
+            "stair_jump_enabled": bool(
+                getattr(self, "_stair_jump_enabled_var", None).get()
+                if hasattr(self, "_stair_jump_enabled_var") else True
+            ),
             "random_jump_enabled": bool(
                 getattr(self, "_random_jump_enabled_var", None).get()
                 if hasattr(self, "_random_jump_enabled_var") else False
@@ -3190,6 +3298,17 @@ class UiWorker(threading.Thread):
         if not worker.set_key(key):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
                         key, worker.attack_key)
+        mover = getattr(self, "movement_worker", None)
+        if mover is not None:
+            # 台阶跳 only taps Alt while retaining the already-active travel
+            # direction; it is not queued as a separate left/right motion.
+            mover.stair_jump_enabled = bool(
+                data.get("stair_jump_enabled", True)
+            ) and mode == "fixed"
+            mover.stair_jump_stall_frames = 7
+            # Seven frozen X/Y samples qualify one forward stair jump, then
+            # its detector skips five samples before collecting again.
+            mover.stair_jump_attempts_max = 1
         jump_worker = getattr(self, "random_jump_worker", None)
         if jump_worker is not None:
             # 跳跃攻击 owns the jump inside its bundle, so the independent
@@ -3219,7 +3338,6 @@ class UiWorker(threading.Thread):
             step_worker.step_jitter_seconds = max(
                 0.0, float(data.get("small_step_gap_seconds", 0.1))
             )
-            mover = getattr(self, "movement_worker", None)
             if mover is not None:
                 mover.small_step_left_first = bool(
                     data.get("small_step_left_first", False)
@@ -3334,6 +3452,11 @@ class UiWorker(threading.Thread):
                 key = str(data["attack_key"]).strip()
                 if key in BINDABLE_KEYS:
                     self._fixed_attack_key_var.set(key)
+            if ("stair_jump_enabled" in data
+                    and hasattr(self, "_stair_jump_enabled_var")):
+                self._stair_jump_enabled_var.set(bool(
+                    data["stair_jump_enabled"]
+                ))
             if ("random_jump_enabled" in data
                     and hasattr(self, "_random_jump_enabled_var")):
                 self._random_jump_enabled_var.set(bool(
@@ -3768,6 +3891,9 @@ class UiWorker(threading.Thread):
         frame = getattr(self, "_quick_messages_frame", None)
         if frame is None:
             return
+        for tooltip in self._quick_message_tooltips:
+            tooltip.destroy()
+        self._quick_message_tooltips.clear()
         # Clear the active-entry identity before destroying widgets so a
         # destruction-induced FocusOut cannot recursively save/render.
         self._quick_edit_entry = None
@@ -3784,7 +3910,7 @@ class UiWorker(threading.Thread):
                 self._ttk.Label(
                     row, text=f"Ctrl+{key_number}", width=6, anchor="w"
                 ).pack(side="left", padx=(0, 4))
-                entry = self._ttk.Entry(row, width=42)
+                entry = self._ttk.Entry(row, width=34)
                 entry.insert(0, message)
                 entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
                 self._quick_edit_entry = entry
@@ -3807,12 +3933,17 @@ class UiWorker(threading.Thread):
                 # elided by certain Windows themes.  A single ttk.Label is
                 # always rendered and still supports the complete click,
                 # double-click, and long-press interaction through bindings.
+                preview = quick_message_preview(message)
                 message_label = self._ttk.Label(
-                    row, text=f"Ctrl+{key_number}   {message}", anchor="w"
+                    row, text=f"Ctrl+{key_number}   {preview}", anchor="w"
                 )
                 message_label.pack(
                     side="left", fill="x", expand=True, padx=(0, 4)
                 )
+                if preview != message:
+                    tooltip = HoverTooltip(message_label, message)
+                    tooltip.set_enabled(True)
+                    self._quick_message_tooltips.append(tooltip)
                 message_label.bind(
                     "<ButtonPress-1>",
                     lambda event, i=index: self._quick_message_press(i),
@@ -4084,6 +4215,7 @@ class UiWorker(threading.Thread):
         "toggle_patrol": "开始 / 停止巡逻 (Ctrl+`)",
         "adjust_fixed_attack_interval:-0.1": "缩短固定攻击间隔 0.1 秒",
         "adjust_fixed_attack_interval:+0.1": "加长固定攻击间隔 0.1 秒",
+        "quick_pickup:toggle": "开启 / 关闭快速拾取（仅停止巡逻时）",
     }
 
     def _help_key_label(self, keys: str) -> str:
@@ -4354,9 +4486,7 @@ class UiWorker(threading.Thread):
         seconds = max(0, int(round(seconds)))
         hours, remainder = divmod(seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-        if hours:
-            return f"{hours}h {minutes:02d}m {seconds:02d}s"
-        return f"{minutes}m {seconds:02d}s"
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
 
     def _countdown_on_change(self, _value: str = "") -> None:
         """Persist/apply the repeating reminder interval and enabled state."""
@@ -4375,6 +4505,68 @@ class UiWorker(threading.Thread):
         self._shutdown_save_settings(data)
         self._countdown_apply_to_worker(data)
         self._countdown_refresh_grey()
+
+    def _save_countdown_resume_state(self) -> None:
+        """Save the current reminder's wall-clock deadline on UI close."""
+
+        worker = getattr(self, "countdown_worker", None)
+        if worker is None:
+            return
+        try:
+            enabled, interval, remaining = worker.snapshot()
+            deadline_at = time.time() + remaining if enabled else None
+            save_timer_state(
+                timer_state_path(),
+                enabled=enabled,
+                deadline_at=deadline_at,
+                interval_seconds=interval,
+            )
+            LOG.info(
+                "countdown resume state saved enabled=%s deadline_at=%s",
+                enabled,
+                f"{deadline_at:.3f}" if deadline_at is not None else "none",
+            )
+        except Exception:
+            LOG.warning("could not save countdown resume state", exc_info=True)
+
+    def _restore_countdown_resume_state(self) -> None:
+        """Restore a future saved deadline; expired deadlines stay unselected."""
+
+        state = load_timer_state(timer_state_path())
+        if not bool(state.get("enabled", False)):
+            return
+        try:
+            deadline_at = float(state["deadline_at"])
+            interval = max(0.01, float(state["interval_seconds"]))
+        except (KeyError, TypeError, ValueError):
+            LOG.warning("ignored malformed timer.json state")
+            return
+        remaining = deadline_at - time.time()
+        if remaining <= 0.0:
+            LOG.info("countdown resume deadline expired; leaving 循环 unselected")
+            return
+
+        # The UI's hour slider is the supported interval source. Restoring
+        # the recorded interval first guarantees the remaining slider does
+        # not clamp the durable deadline after a configuration change.
+        hours = max(0.1, min(12.0, interval / 3600.0))
+        interval = hours * 3600.0
+        remaining = min(remaining, interval)
+        self._countdown_interval_var.set(hours)
+        self._countdown_enabled_var.set(True)
+        data = self._shutdown_collect_data()
+        self._shutdown_save_settings(data)
+        self._countdown_apply_to_worker(data)
+        worker = getattr(self, "countdown_worker", None)
+        if worker is not None:
+            worker.set_remaining_seconds(remaining)
+        self._countdown_remaining_slider.configure(to=interval)
+        self._countdown_remaining_var.set(remaining)
+        self._countdown_remaining_label.configure(
+            text=self._format_countdown_seconds(remaining)
+        )
+        self._countdown_refresh_grey()
+        LOG.info("countdown restored from timer.json remaining=%.1fs", remaining)
 
     def _countdown_apply_to_worker(self, data: dict) -> None:
         worker = getattr(self, "countdown_worker", None)
@@ -4537,6 +4729,7 @@ class UiWorker(threading.Thread):
         self._shutdown_on_change()
         if hasattr(self, "_countdown_enabled_var"):
             self._countdown_on_change()
+            self._restore_countdown_resume_state()
         LOG.info("additional functions settings loaded from %s",
                  self._shutdown_settings_path())
 
@@ -5152,7 +5345,9 @@ class UiWorker(threading.Thread):
                 self._record_buttons[(layer_name, point)].configure(
                     text=text,
                     state="disabled" if final_rope else "normal",
-                    style="Locked.TButton" if locked else "TButton",
+                    style=(
+                        "RecordLocked.TButton" if locked else "Record.TButton"
+                    ),
                 )
                 if point == "rope_pos":
                     self._rope_tooltips[layer_name].set_enabled(final_rope)
@@ -5359,15 +5554,16 @@ class UiWorker(threading.Thread):
             # ``layer1`` previously reserved 18 text columns, leaving a large
             # blank strip and clipping the action buttons. ``楼层N`` fits in
             # seven columns, including room for multi-digit floor numbers.
-            label = ttk.Label(row, width=6)
+            label = ttk.Label(row, width=4)
             label.pack(side="left", padx=(0, 2))
             self._layer_labels[layer_name] = label
             for point_name, point_label in point_labels:
                 button = ttk.Button(
                     row,
                     text=f"录制 {point_label}",
+                    style="Record.TButton",
                 )
-                button.pack(side="left", fill="x", expand=True, padx=(0, 5))
+                button.pack(side="left", fill="x", expand=True, padx=(0, 2))
                 # 长按 1 秒 = 解锁并清除该点录制；短按 = 录制（仅对空点/
                 # 已解锁点生效，已录制的点短按无效）。
                 button.bind(

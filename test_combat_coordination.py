@@ -3,6 +3,7 @@
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from combat_coordination import (
@@ -167,6 +168,35 @@ class PatrolStateFileTests(unittest.TestCase):
         self.assertIsNone(state.facing())
         state.write(False, "drop", "up")
         self.assertIsNone(state.facing())
+
+    def test_transient_windows_file_lock_retries_then_writes(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        real_replace = __import__("os").replace
+        calls = []
+
+        def replace_once_locked(source, destination):
+            calls.append((source, destination))
+            if len(calls) == 1:
+                raise PermissionError(5, "Access denied")
+            return real_replace(source, destination)
+
+        with mock.patch("combat_coordination.os.replace", replace_once_locked), \
+             mock.patch("combat_coordination.time.sleep"):
+            self.assertTrue(state.write(True, "climb", "right"))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(state.is_busy())
+
+    def test_persistent_windows_file_lock_does_not_raise(self):
+        path = self._path()
+        state = PatrolStateFile(str(path))
+        with mock.patch(
+            "combat_coordination.os.replace",
+            side_effect=PermissionError(5, "Access denied"),
+        ), mock.patch("combat_coordination.time.sleep"):
+            self.assertFalse(state.write(True, "climb"))
+        self.assertFalse(path.exists())
+        self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

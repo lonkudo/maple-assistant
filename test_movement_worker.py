@@ -292,12 +292,12 @@ class MovementTests(unittest.TestCase):
             worker._route_target(right)[2], "layer3.drop-to-first"
         )
 
-    def test_default_stair_jump_waits_ten_frames_through_attack_animation(self):
+    def test_default_stair_jump_waits_seven_frames_through_attack_animation(self):
         worker = MovementWorker(
             queue.Queue(), object(), threading.Event(), important_positions={}
         )
 
-        self.assertEqual(worker.stair_jump_stall_frames, 10)
+        self.assertEqual(worker.stair_jump_stall_frames, 7)
 
     def test_dispatched_marker_must_match_current_frame_and_minimap_region(self):
         class Reading:
@@ -403,7 +403,7 @@ class MovementTests(unittest.TestCase):
         )
         with patch("movement_worker.time.sleep") as sleep:
             self.assertTrue(worker.perform_micro_step())
-        self.assertEqual(sleep.call_args_list, [call(.15), call(.15)])
+        self.assertEqual(sleep.call_args_list, [call(.30), call(.10), call(.30)])
         self.assertEqual(sender.events[-4:], [
             ("down", "right"), ("up", "right"),
             ("down", "left"), ("up", "left"),
@@ -2769,12 +2769,11 @@ class MovementTests(unittest.TestCase):
         worker._climb_state.up_held = False
         self.assertFalse(worker._attack_should_defer())
         # 卡在坑/边缘（台阶跳停滞中）：攻击让路，先跳出边缘。
-        worker._stair_state["stall_frames"] = 1
+        worker._stair_state["stall_frames"] = (
+            worker.stair_jump_stall_frames - 1
+        )
         self.assertTrue(worker._attack_should_defer())
         worker._stair_state["stall_frames"] = 0
-        worker._stair_state["attempts"] = 1
-        self.assertTrue(worker._attack_should_defer())
-        worker._stair_state["attempts"] = 0
         self.assertFalse(worker._attack_should_defer())
 
     def test_attack_suppression_clears_immediately_on_layer_arrival(self):
@@ -4543,7 +4542,32 @@ class StairJumpTests(unittest.TestCase):
         decision = worker._stair_jump_decision(
             stuck, "layer1.right-most", self._plan(.5, "right"), now + 2.5)
         self.assertEqual(decision.key, "stair_jump_right")
-        self.assertEqual(worker._stair_state["attempts"], 1)
+        self.assertEqual(worker._stair_state["stall_frames"], 1)
+
+    def test_stair_jump_uses_seven_position_xy_freeze_window(self):
+        worker = self._worker(stair_jump_stall_frames=7)
+        worker._route_layer_index = 0
+        worker._route_phase = "right"
+        plan = self._plan(.5, "right")
+
+        # X alone is not enough: a vertical change means the character is
+        # moving (for example, during a real jump), not stuck at a stair.
+        for index, y in enumerate((.700, .700, .650, .650, .650)):
+            moving_y = MinimapObservation(Point(.5, y), None, .9, (0, 0, 1, 1))
+            self.assertIsNone(worker._stair_jump_decision(
+                moving_y, "layer1.right-most", plan, 100.0 + index))
+
+        # A later seven-position window with six frozen X+Y transitions
+        # creates exactly one stair jump.
+        for index in range(6):
+            stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
+            self.assertIsNone(worker._stair_jump_decision(
+                stuck, "layer1.right-most", plan, 110.0 + index))
+        jump = worker._stair_jump_decision(
+            MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1)),
+            "layer1.right-most", plan, 116.0,
+        )
+        self.assertEqual(jump.key, "stair_jump_right")
 
     def test_stair_jump_suppressed_during_patrol_start_grace(self):
         # Right after Start Patrol the character stands still - that is not
@@ -4592,7 +4616,6 @@ class StairJumpTests(unittest.TestCase):
                 moving, "layer1.right-most", self._plan(px, "right"),
                 100.0 + index,
             ))
-        self.assertEqual(worker._stair_state["attempts"], 0)
         self.assertLess(worker._stair_state["stall_frames"], 3)
 
     def test_stuck_jumps_only_in_left_right_phases(self):
@@ -4606,30 +4629,28 @@ class StairJumpTests(unittest.TestCase):
             self.assertIsNone(worker._stair_jump_decision(
                 stuck, "layer1.rope", self._plan(.5, "right"), 100.0 + frame))
 
-    def test_grace_period_and_attempts_cap_stop_hop_in_place(self):
-        worker = self._worker(stair_jump_stall_frames=1,
-                              stair_jump_attempts_max=2)
+    def test_stair_jump_registration_skips_five_detection_frames(self):
+        worker = self._worker(stair_jump_stall_frames=2)
         worker._route_layer_index = 0
         worker._route_phase = "right"
         stuck = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
         plan = self._plan(.5, "right")
-        jump1 = worker._stair_jump_decision(stuck, "layer1.right-most", plan, 10.0)
+        self.assertIsNone(worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, 10.0))
+        jump1 = worker._stair_jump_decision(
+            stuck, "layer1.right-most", plan, 10.1)
         self.assertEqual(jump1.key, "stair_jump_right")
-        # Inside the grace window no second jump is issued.
-        self.assertIsNone(worker._stair_jump_decision(
-            stuck, "layer1.right-most", plan, 10.5))
-        # After grace the second (final) jump fires.
-        jump2 = worker._stair_jump_decision(
-            stuck, "layer1.right-most", plan, 13.0)
-        self.assertEqual(jump2.key, "stair_jump_right")
-        self.assertEqual(worker._stair_state["attempts"], 2)
-        # Attempts exhausted: no more jumps; the boundary is treated as
-        # unreachable and the phase is force-advanced (loops to the next
-        # recorded phase instead of pressing direction forever).
-        self.assertIsNone(worker._stair_jump_decision(
-            stuck, "layer1.right-most", plan, 16.0))
-        self.assertTrue(worker._stair_state["gave_up"])
-        self.assertEqual(worker._route_phase, "left")
+        worker._stair_jump_skip_frames = 5
+        for index in range(5):
+            self.assertIsNone(worker._stair_jump_decision(
+                stuck, "layer1.right-most", plan, 11.0 + index))
+        self.assertEqual(worker._stair_jump_skip_frames, 0)
+        self.assertEqual(
+            worker._stair_jump_decision(
+                stuck, "layer1.right-most", plan, 22.0
+            ).key,
+            "stair_jump_right",
+        )
 
     def test_forced_reversal_requires_real_movement_before_it_can_advance(self):
         """A blocked Right cannot skip the forced Left on the next frame."""
@@ -4663,14 +4684,13 @@ class StairJumpTests(unittest.TestCase):
             stuck, "layer1.right-most", self._plan(.5, "right"), 1.0)
         worker._stair_jump_decision(
             stuck, "layer1.right-most", self._plan(.5, "right"), 3.5)
-        self.assertEqual(worker._stair_state["attempts"], 1)
-        # A new phase label starts a fresh approach with a clean budget.
+        self.assertEqual(len(worker._stair_state["position_window"]), 2)
+        # A new phase label starts a fresh evidence window.
         worker._route_phase = "left"
         worker._stair_jump_decision(
             stuck, "layer1.left-most", self._plan(.5, "left"), 6.0)
         self.assertEqual(worker._stair_state["phase_label"], "layer1.left-most")
-        self.assertEqual(worker._stair_state["attempts"], 0)
-        self.assertEqual(worker._stair_state["stall_frames"], 1)
+        self.assertEqual(worker._stair_state["stall_frames"], 0)
 
     def test_send_stair_jump_holds_direction_and_taps_alt(self):
         class Sender:

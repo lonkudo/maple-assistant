@@ -50,7 +50,10 @@ class HotkeyWorkerTests(unittest.TestCase):
             worker._bindings[KEY_VK["right"]][0], "record:right_most_pos"
         )
         self.assertEqual(
-            worker._bindings[KEY_VK["a"]][0], "toggle_patrol"
+            worker._bindings[KEY_VK["z"]][0], "quick_pickup:toggle"
+        )
+        self.assertEqual(
+            worker._bindings[KEY_VK["grave"]][0], "toggle_patrol"
         )
 
     def test_patrol_running_allows_only_toggle_patrol(self) -> None:
@@ -66,6 +69,7 @@ class HotkeyWorkerTests(unittest.TestCase):
         # interval adjustment stay live.
         self.assertFalse(worker._binding_allowed("quick_message:0"))
         self.assertFalse(worker._binding_allowed("record:left_most_pos"))
+        self.assertFalse(worker._binding_allowed("quick_pickup:toggle"))
         self.assertTrue(
             worker._binding_allowed("adjust_fixed_attack_interval:+0.1")
         )

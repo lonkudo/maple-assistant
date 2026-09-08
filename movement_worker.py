@@ -2034,7 +2034,7 @@ class MovementWorker(threading.Thread):
                     "climbing up (Z paused)", self._rope_stuck_recoveries)
 
     def _movement_busy_now(self) -> bool:
-        """True only while climbing or dropping is actively in progress.
+        """True while vertical recovery or a confirmed stair action is active.
 
         The post-arrival timestamp still suppresses unsafe stair jumps, but it
         must not suppress attacks after the new layer has been confirmed.
@@ -2043,6 +2043,12 @@ class MovementWorker(threading.Thread):
                 and self.dropping_active_event.is_set()):
             return True
         if self._climb_state.phase != "idle":
+            return True
+        stair_jump_active = getattr(self.stair_jump_worker, "is_active", None)
+        if callable(stair_jump_active) and stair_jump_active():
+            # Keep the hold manager from dropping the ordinary Left/Right
+            # claim just because an attack animation is still being observed.
+            # The dedicated worker will add one short Alt tap on top of it.
             return True
         return False
 
@@ -2300,6 +2306,7 @@ class MovementWorker(threading.Thread):
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Any = None,
         automation_active_event: Optional[threading.Event] = None,
+        motion_arbiter: Any = None,
         attack_state_path: Optional[str] = None,
         attack_block_max_seconds: float = 4.0,
         rope_state_path: Optional[str] = None,
@@ -2340,9 +2347,9 @@ class MovementWorker(threading.Thread):
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
         stair_jump_stall_diamonds: float = 0.25,
-        stair_jump_stall_frames: int = 10,
+        stair_jump_stall_frames: int = 7,
         patrol_start_grace_seconds: float = 3.0,
-        stair_jump_attempts_max: int = 3,
+        stair_jump_attempts_max: int = 1,
         # 台阶/坑边尝试间隔 0.8s（原 2.5s）：地图坑多时角色卡在边缘会等
         # 很久才跳下一次——缩短间隔让角色更快跳出坑/边缘。
         stair_jump_grace_seconds: float = 0.8,
@@ -2505,6 +2512,21 @@ class MovementWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
+        # Optional in tests/headless integrations.  The normal assistant
+        # injects the shared arbiter so confirmed stair jumps can queue
+        # behind attack motions.
+        self.motion_arbiter = motion_arbiter
+        # Stair detection stays on this minimap-consuming worker, but the
+        # direction+Alt action runs on its own worker.  It waits for attack
+        # motion without making patrol release its current Left/Right hold.
+        self.stair_jump_worker: Any = None
+        # A registration is followed by a fixed five-frame detection quiet
+        # period.  This spans brief route-label changes and marker jitter
+        # after the hop, so one stair event cannot immediately register more
+        # Alt presses.
+        self._stair_jump_skip_frames = 0
+        self._stair_jump_completion_lock = threading.Lock()
+        self._stair_jump_completion: Optional[bool] = None
         # True once the automation input gate has been observed active, so the
         # disarmed->armed edge (Start Patrol) can be detected exactly once.
         self._automation_was_active = False
@@ -2799,15 +2821,47 @@ class MovementWorker(threading.Thread):
 
         self._stair_state = {
             "phase_label": None,   # e.g. "layer1.right-most"; reset on change
-            "stall_frames": 0,     # consecutive no-progress frames near a stair
-            # Anchor for cumulative progress. Comparing only adjacent frames
-            # misclassified normal ~0.008/frame walking as frozen because the
-            # old threshold was 0.012/frame.
-            "last_x": None,
-            "attempts": 0,         # jumps issued at the current blockage
-            "grace_until": 0.0,    # stall detection suspended until this time
-            "gave_up": False,      # attempts exhausted; stop jumping this phase
+            # The last N marker positions.  Stair recovery uses a sliding
+            # window instead of one unbroken run: minimap jitter or one
+            # moving frame must not turn a genuinely frozen character into a
+            # fresh sequence that can queue another jump.
+            "position_window": [],
+            "stall_frames": 0,     # frozen X+Y transitions in that window
         }
+
+    def _on_stair_jump_complete(self, succeeded: bool) -> None:
+        """Receive the dedicated worker result without mutating state there."""
+
+        with self._stair_jump_completion_lock:
+            self._stair_jump_completion = bool(succeeded)
+
+    def set_stair_jump_worker(self, worker: Any) -> None:
+        """Attach the dedicated stair-jump executor after construction."""
+
+        self.stair_jump_worker = worker
+
+    def _consume_stair_jump_completion(self) -> None:
+        """Apply the confirmed queue result on the movement thread.
+
+        The detector quiet-period starts when a token is registered, not when
+        it eventually executes.  A rejected token simply clears its local
+        evidence so the next normal five-frame window can retry.
+        """
+
+        with self._stair_jump_completion_lock:
+            completed = self._stair_jump_completion
+            self._stair_jump_completion = None
+        if completed is None:
+            return
+        if completed:
+            LOG.info("STAIR JUMP executed")
+            return
+        # The pending action never reached the game. Rebuild its evidence
+        # window so the next normal seven-sample freeze can retry.
+        state = self._stair_state
+        state["position_window"].clear()
+        state["stall_frames"] = 0
+        LOG.warning("STAIR JUMP did not execute; detector re-armed")
 
     @staticmethod
     def _is_walk_key(key: Optional[str]) -> bool:
@@ -2858,14 +2912,12 @@ class MovementWorker(threading.Thread):
     ) -> Optional[MovementDecision]:
         """Return a stair-jump decision when walking is blocked by a stair.
 
-        Runs only in the move-to-left-most / move-to-right-most phases.  When
-        the marker stalls (X not advancing while a walk hold is being issued)
-        for ``stair_jump_stall_frames`` consecutive frames, a stair blocks the
-        walk: return ``stair_jump_<direction>`` so the sender holds the travel
-        direction and taps Alt (jump) mid-hold to clear it.  No jump points
-        need to be recorded - any impassable stair is jumped automatically.
-        Jumps are rate-limited by a grace window and capped so a truly
-        impassable wall cannot make the character hop in place forever.
+        Runs only in the move-to-left-most / move-to-right-most phases.  A
+        seven-position sliding window has six transitions; when all six are
+        frozen in *both* X and Y, a stair blocks the walk and the worker emits
+        one ``stair_jump_<direction>`` action.  No jump points need to be
+        recorded - any impassable stair is jumped automatically.  The action
+        is then locked for the rest of that patrol leg.
         """
 
         if (not self.stair_jump_enabled or observation.player is None
@@ -2895,51 +2947,60 @@ class MovementWorker(threading.Thread):
             direction = "right"
         else:
             return None
+        # A registered stair event owns the next five detection frames. The
+        # counter lives outside per-route state, so a transient left/right
+        # route reset cannot produce four immediate re-registrations.
+        if self._stair_jump_skip_frames > 0:
+            self._stair_jump_skip_frames -= 1
+            return None
         state = self._stair_state
         if state["phase_label"] != route_label:
             self._reset_stair_state()
             state = self._stair_state
             state["phase_label"] = route_label
         px = observation.player.x
-        anchor_x = state["last_x"]
-        moved = (
-            anchor_x is not None
-            and abs(px - anchor_x) >= self._current_stair_jump_stall
+        window = state["position_window"]
+        # Fixed attacks may create minor marker jitter or briefly suppress a
+        # walk hold. They must count as frozen time for stair recovery rather
+        # than breaking the evidence window. Use the previous sample while
+        # the arbiter reports an attack animation; the queued stair action
+        # itself still waits for that attack to finish before pressing Alt.
+        attack_motion_active = getattr(
+            self.motion_arbiter, "attack_motion_active", None
         )
-        if moved:
-            # Cumulative progress across several small frame-to-frame steps is
-            # still real walking. Re-anchor only after enough total movement;
-            # otherwise a steady sub-threshold walk eventually looks frozen.
-            state["last_x"] = px
+        if (window and callable(attack_motion_active)
+                and attack_motion_active()):
+            window.append(window[-1])
+        else:
+            window.append((px, observation.player.y))
+        window_size = max(2, self.stair_jump_stall_frames)
+        if len(window) > window_size:
+            del window[:-window_size]
+        if len(window) < window_size:
             state["stall_frames"] = 0
-            state["attempts"] = 0
-            state["gave_up"] = False
             return None
-        if anchor_x is None:
-            state["last_x"] = px
-        if now < state["grace_until"] or state["gave_up"]:
+        threshold = self._current_stair_jump_stall
+        frozen_steps = sum(
+            1
+            for previous, current in zip(window, window[1:])
+            if (abs(current[0] - previous[0]) < threshold
+                and abs(current[1] - previous[1]) < threshold)
+        )
+        state["stall_frames"] = frozen_steps
+        net_frozen = (
+            abs(window[-1][0] - window[0][0]) < threshold
+            and abs(window[-1][1] - window[0][1]) < threshold
+        )
+        # With the default seven-position window there are six transitions;
+        # all six must be frozen in both axes.  A one-frame slide therefore
+        # cannot restart a separate consecutive-frame counter.  The net
+        # movement guard keeps normal slow walking (small but accumulating
+        # steps) from being mistaken for a stair.
+        if frozen_steps < window_size - 1 or not net_frozen:
             return None
-        state["stall_frames"] += 1
-        if state["stall_frames"] < self.stair_jump_stall_frames:
-            return None
-        if state["attempts"] >= self.stair_jump_attempts_max:
-            if not state["gave_up"]:
-                LOG.warning(
-                    "STAIR JUMP gave up at x=%.6f (%s): %d attempts without "
-                    "progress; the boundary may be unreachable",
-                    px, route_label, state["attempts"],
-                )
-                state["gave_up"] = True
-                # 边界不可达（墙角/越界目标）：角色已在实际可到达的边界处，
-                # 强制完成当前相位进入下一相位，而不是无限按方向键+Z。
-                self._force_advance_phase(px)
-            return None
-        state["attempts"] += 1
-        state["stall_frames"] = 0
-        state["grace_until"] = now + self.stair_jump_grace_seconds
         LOG.info(
-            "STAIR JUMP %s at x=%.6f attempt=%d/%d",
-            direction, px, state["attempts"], self.stair_jump_attempts_max,
+            "STAIR JUMP %s at x=%.6f after %d frozen X/Y transitions",
+            direction, px, frozen_steps,
         )
         return MovementDecision(
             f"stair_jump_{direction}",
@@ -2984,6 +3045,11 @@ class MovementWorker(threading.Thread):
                 if key_down("alt") is not False:
                     alt_down = True
                     time.sleep(max(0.01, self.stair_jump_alt_hold_seconds))
+                    # Alt is the jump *tap*, not the movement hold. Keeping
+                    # it down through the direction hold makes the game
+                    # auto-repeat jumps from one stair event.
+                    key_up("alt")
+                    alt_down = False
                 # 跳一旦开始就让它完成：中途被攻击打断会让角色卡在坑/边缘
                 # （跳跃被压制 → 超过 2 秒不动）。攻击等待这一跳。
                 while time.monotonic() < deadline:
@@ -2995,6 +3061,69 @@ class MovementWorker(threading.Thread):
                 if alt_down:
                     key_up("alt")
                 key_up(direction)
+
+    def perform_stair_jump(self, direction: str) -> bool:
+        """Add one Alt tap to an already-running patrol direction.
+
+        The patrol walk remains owned by ``_send_walk_hold`` while the
+        dedicated worker waits for an attack animation.  Do not scrub all
+        movement keys here: that was the source of the visible pause after an
+        attack completed.  This method takes a short, additional direction
+        claim only when patrol no longer owns it, then releases only that
+        claim after the Alt tap.
+        """
+
+        direction = str(direction).casefold()
+        if (direction not in ("left", "right") or not self.patrol_enabled
+                or (self.automation_active_event is not None
+                    and not self.automation_active_event.is_set())):
+            return False
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning("stair jump suppressed: target window is not safely selected")
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_down is None or key_up is None:
+            LOG.warning("stair jump requires key_down() and key_up(); suppressed")
+            return False
+        with self._direction_lock:
+            is_key_down = getattr(self.key_sender, "is_key_down", None)
+            walk_is_held = bool(
+                self._walk_hold_key == direction
+                and (not callable(is_key_down) or is_key_down(direction))
+            )
+            added_direction_claim = False
+            if not walk_is_held:
+                added_direction_claim = key_down(direction) is not False
+                if not added_direction_claim:
+                    return False
+            alt_down = False
+            try:
+                lead = max(0.0, self.stair_jump_lead_seconds)
+                if lead and self.stop_event.wait(lead):
+                    return False
+                if key_down("alt") is False:
+                    return False
+                alt_down = True
+                if self.stop_event.wait(self.stair_jump_alt_hold_seconds):
+                    return False
+                key_up("alt")
+                alt_down = False
+                return True
+            finally:
+                if alt_down:
+                    key_up("alt")
+                if added_direction_claim:
+                    key_up(direction)
+
+    def perform_queued_stair_jump(self, direction: str) -> bool:
+        """Compatibility entry point for older integrations.
+
+        Production now calls :meth:`perform_stair_jump` through the dedicated
+        ``StairJumpWorker`` rather than the shared motion-arbiter queue.
+        """
+
+        return self.perform_stair_jump(direction)
 
     def _send_drop_through_platform(self) -> bool:
         """Emit Alt+Down while excluding patrol and 小碎步 directions."""
@@ -3030,10 +3159,11 @@ class MovementWorker(threading.Thread):
         # patrol route before fighting again.
         if self._return_mode is not None:
             return True
-        # 卡在坑/边缘（台阶跳正要发出或正在重试）：攻击先等一跳。
+        # A fully qualified stair window owns one Alt action before an
+        # attack-target pause can interrupt it.
         return bool(
-            self._stair_state.get("stall_frames", 0) >= 1
-            or self._stair_state.get("attempts", 0) > 0
+            self._stair_state.get("stall_frames", 0)
+            >= max(1, self.stair_jump_stall_frames - 1)
         )
 
     def set_yolo_detection_active(self, active: bool) -> None:
@@ -3901,6 +4031,9 @@ class MovementWorker(threading.Thread):
         self._route_patrol_cycle = 1
         self._last_drop_attempt = float("-inf")
         self._patrol_busy_until = 0.0
+        with self._stair_jump_completion_lock:
+            self._stair_jump_completion = None
+        self._stair_jump_skip_frames = 0
         self._reset_stair_state()
         for event in (
             self.climbing_active_event,
@@ -5035,9 +5168,9 @@ class MovementWorker(threading.Thread):
 
         Called only by ``MotionArbiter``.  The arbiter has already blocked
         attack and other queued motions; this method clears the current patrol
-        walk, owns the directional sequence for 150 ms per side, and leaves
-        no direction down.  The following patrol frame naturally re-arms its
-        ordinary walk hold.
+        walk, owns the directional sequence for 300 ms per side with a 100 ms
+        neutral gap between directions, and leaves no direction down. The
+        following patrol frame naturally re-arms its ordinary walk hold.
         """
 
         if not _sender_is_safe(self.key_sender):
@@ -5074,17 +5207,24 @@ class MovementWorker(threading.Thread):
             if not first_claimed:
                 return False
             try:
-                time.sleep(0.15)
+                time.sleep(0.30)
             finally:
                 key_up(first)
+            # Let the game's movement state observe the release before the
+            # opposite direction is pressed; without this neutral window,
+            # latency can make repeated micro-steps drift in one direction.
+            time.sleep(0.10)
             second_claimed = key_down(second) is not False
             if not second_claimed:
                 return False
             try:
-                time.sleep(0.15)
+                time.sleep(0.30)
             finally:
                 key_up(second)
-        LOG.info("small-step complete: %s -> %s (150ms each)", first, second)
+        LOG.info(
+            "small-step complete: %s -> %s (300ms each; 100ms neutral)",
+            first, second,
+        )
         return True
 
     def perform_arbiter_buff(self, key: str) -> bool:
@@ -5492,6 +5632,7 @@ class MovementWorker(threading.Thread):
                     self._current_stair_jump_stall = 0.012
                 self._sync_patrol_controller(coordinate_layout)
                 self._apply_pending_patrol_start(observation)
+                self._consume_stair_jump_completion()
                 # Cheap periodic sanity check over the marker already found
                 # above. It can recover from a monster knock-down even when a
                 # stale climb/drop phase would reject normal reconciliation.
@@ -5804,6 +5945,14 @@ class MovementWorker(threading.Thread):
                     # climb-back / drop-back is protected like a rope climb.
                     or self._return_mode is not None
                 )
+                # A confirmed stair stall is handled by its own worker.  It
+                # blocks new attacks while waiting for an existing one to
+                # finish, but leaves the patrol walk held during that wait.
+                stair_jump_active = getattr(
+                    self.stair_jump_worker, "is_active", None
+                )
+                if callable(stair_jump_active):
+                    climbing_now = climbing_now or bool(stair_jump_active())
                 if self.climbing_active_event is not None:
                     if climbing_now:
                         self.climbing_active_event.set()
@@ -5907,7 +6056,11 @@ class MovementWorker(threading.Thread):
                 now = time.monotonic()
                 # 非行走决策（爬绳/跳跃/等待等）：先松开行走 hold，
                 # 避免方向键/Z 残留。
-                if decision.key not in ("left", "right"):
+                is_stair_jump = bool(
+                    isinstance(decision.key, str)
+                    and decision.key.startswith("stair_jump_")
+                )
+                if decision.key not in ("left", "right") and not is_stair_jump:
                     self._release_walk_hold()
                 if decision.key and now - self._last_send >= self.movement_cooldown:
                     if decision.key in (
@@ -5982,14 +6135,39 @@ class MovementWorker(threading.Thread):
                         self._run_climb_step(
                             observation, route_target_x, preferred_direction
                         )
-                    elif decision.key.startswith("stair_jump_"):
-                        # Stuck at a recorded stair trigger: hold the travel
-                        # direction and tap Alt (jump) mid-hold to clear it.
-                        # Clear any game-side stuck keys first (lost key-ups
-                        # during a knock-down) so the held jump direction
-                        # really applies.
-                        self._release_stuck_keys()
-                        self._send_stair_jump(decision)
+                    elif is_stair_jump:
+                        # The worker waits independently for the *current*
+                        # fixed attack to end.  Keep walking in the patrol
+                        # direction during that wait; do not release Left /
+                        # Right and turn a confirmed stair recovery into a
+                        # visible freeze.
+                        direction = decision.key.removeprefix("stair_jump_")
+                        walking = self._send_walk_hold(MovementDecision(
+                            direction,
+                            "keep patrol walk while stair jump waits for attack",
+                            self.movement_hold_seconds,
+                        ))
+                        request_stair_jump = getattr(
+                            self.stair_jump_worker, "request", None
+                        )
+                        queued = False
+                        if walking and callable(request_stair_jump):
+                            try:
+                                queued = bool(request_stair_jump(
+                                    direction,
+                                    on_complete=self._on_stair_jump_complete,
+                                ))
+                            except TypeError:
+                                queued = bool(request_stair_jump(direction))
+                        if not queued:
+                            self._on_stair_jump_complete(False)
+                            LOG.warning("stair jump could not enter dedicated worker")
+                        else:
+                            self._stair_jump_skip_frames = 5
+                            LOG.info(
+                                "STAIR JUMP registered; skipping the next 5 "
+                                "stair-detection frames"
+                            )
                     elif decision.key in ("left", "right"):
                         # 陈旧爬绳输入刹车：决策是普通左右走，但爬绳状态仍认为
                         # Up 被按住（中途失败的抓绳尝试后焦点抖动松开了按键，状态机
