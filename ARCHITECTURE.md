@@ -36,6 +36,9 @@ assistant.py (primary process)
     ShutdownWorker     preserved but temporarily not constructed
     CountdownWorker    independent repeating MP3 reminder
     LieDetectorWorker  1-second full-client pure-white-square alarm
+    AutoLieWorker      optional fade-tracker (自动过测谎): 4 s after the alarm
+                      it seeds Cutie inside the lie-popup crop, follows the
+                      fading target and moves the real mouse onto it (no click)
     ScreenBlinker       optional two-flash red visual alarm
     supervisor-worker  stops the process if a core worker dies
 
@@ -69,8 +72,20 @@ game client
      -> status_frames    -> StatusWorker
      -> character_frames -> CharacterWorker -> character_positions
      -> lie frames       -> LieDetectorWorker (one in-memory scan per second)
+     -> auto-lie frames  -> AutoLieWorker (only while armed)
      -> ui_frames        -> UiWorker
 ```
+
+An extra bounded `auto_lie_frames` subscription feeds `AutoLieWorker`.
+`LieDetectorWorker` gained an optional `lie_seen_callback` (set in
+`assistant.py`): every newly detected #c9ced0 square (with its bbox and the
+originating frame) is forwarded to the auto-lie worker; the slice is only the
+alarm and disappears when the real popup opens, so the clear signal is
+informational and never stops a sequence. Enabling 自动过测谎 in the UI
+force-enables the 测谎 detection so the event chain always has a source;
+deselecting 测谎 clears 自动过测谎 as well. `AutoLieWorker` preloads Cutie
+during UI startup and the status label reports preloading, ready, or failure
+without blocking Tk.
 
 `MinimapDetector` uses OpenCV to locate the resizable minimap, inner canvas,
 map-name crop, and analysis box. The game HUD is FIXED pixel: only the
@@ -609,7 +624,7 @@ shipped, runtime-read-only `system_config.json`.
 | `rope_calibration` | system/update | assistant.py -> MovementWorker tuning |
 | `drug` | user | UiWorker, StatusWorker, MovementWorker |
 | `fixed_attack` | user | UiWorker and AttackWorker |
-| `additional_functions` | user | UiWorker and optional-function workers |
+| `additional_functions` | user | UiWorker and optional-function workers (incl. `auto_lie_pass_enabled` for 自动过测谎) |
 | `yolo_detection` | user | UiWorker and YOLO launch settings |
 | `ui_window` | user | Tk window geometry helpers |
 
@@ -699,10 +714,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
    to `work/release_gate.log`; abort on nonzero exit.
 2. Ensure `build_release.ps1` has its required UTF-8 BOM.
 3. The release script advances the four-digit `VERSION` counter (`0000` to
-   `9999`) and runs `build_release.ps1 -Version NNNN -Zip`, which recreates
-   `release/MapleAssistant`, copies runtime files/assets/model weights, removes
-   old ZIPs, and creates `release/MapleAssistant-vNNNN.zip`. A failed build
-   restores the prior counter; `9999` never wraps.
+   `9999`) and runs `build_release.ps1 -Version NNNN -Variant cpu -Zip` and
+   the corresponding `cuda` build. It recreates
+   `release/MapleAssistant-CPU` and `release/MapleAssistant-CUDA`, writes a
+   BOM-free `release_variant.json` declaring the runtime and environment,
+   copies runtime files/assets/model weights, and creates
+   `MapleAssistant-CPU-vNNNN.zip` plus `MapleAssistant-CUDA-vNNNN.zip`.
+   Cleanup of prior paired ZIPs happens only after both builds succeed. A
+   failed build restores the prior counter; `9999` never wraps.
 4. Inspect `git diff --check` and `git status`, stage only intended source,
    tests, and docs, commit, and verify a clean worktree.
 
@@ -737,6 +756,10 @@ git -c core.quotepath=false ls-files
 | `config_store.py` | User/system section router and legacy user migration |
 | `capture_worker.py` | Client capture, frame bus, region mapping |
 | `movement_worker.py` | Patrol and movement state machines |
+| `auto_lie_worker.py` | Optional 自动过测谎 fade-square tracker (AutoLieWorker, environment probe, process-wide Cutie model cache) |
+| `lie_demo_player.py` | 测试测谎 demo: replays `detect_video/try_detect.mp4` in the ROI tracker window (separate process) |
+| `lie_screenshot_recorder.py` | Alert-triggered full-client recorder (decoupled); composes the finished run into one mp4 |
+| `lie_video_tools.py` | Frames -> mp4 (H.264 via ffmpeg when present) and the in-game replay test (`simulate_in_game_run`) |
 | `motion_arbiter.py` | FIFO serialization, action windows, and completion callbacks for random-jump/buff/small-step motions |
 | `stair_jump_worker.py` | Dedicated one-action stair recovery: waits for attack tail while patrol walk continues |
 | `small_step_worker.py` | Optional timed small-step scheduler; requests, but does not emit, the atomic movement action |
@@ -762,6 +785,7 @@ git -c core.quotepath=false ls-files
 | `marker_detector.py` | Yellow/red diamond detection and size stabilization |
 | `map_structure_tracker.py` | Scroll/world-Y tracking and re-anchoring |
 | `map_identity.py` | Map-name visual reference storage/matching |
+| `diagnose.bat` | Environment diagnostic for torch/WinError-1114 reports (OS/CPU/VC DLLs/import) |
 | `ui_worker.py` | Tk dashboard, recording controls, settings, YOLO subprocess |
 | `update_manager.py` | Desktop release discovery, tagged user-config preservation, hidden restart helper |
 | `versioning.py` | Four-digit release version read/format helpers |
@@ -779,18 +803,46 @@ git -c core.quotepath=false ls-files
 | `sound/success.mp3`, `sound/fail.mp3` | Recording and patrol action feedback |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
-| `install.ps1`, `安装.bat` | Request UAC up front, silently bootstrap Python 3.10 in a hidden installer process, then create `.venv`, dependencies, and launchers |
-| `start_assistant.bat`, `启动助手.bat`, `launch_assistant.vbs` | Portable launcher chain; VBS requests UAC and starts `pythonw` hidden without recursive BAT elevation |
+| `install.ps1`, `安装.bat` | Package-aware installer: the short unelevated UAC helper exits immediately; the visible elevated installer creates `.venv-cpu` or `.venv-cuda`, installs/verifies Cutie, and writes matching launchers |
+| `start_assistant.bat`, `启动助手.bat`, `launch_assistant.vbs` | Package-specific launcher chain written by the builder/installer; reuses the existing `.venv-cpu` or `.venv-cuda` after an overlay update |
 | `launch_assistant_elevated.vbs` | Development elevation helper; excluded from release |
 | `restart_assistant.ps1` | Development restart helper; excluded from release |
-| `build_release.ps1` | Minimal distributable folder and ZIP builder |
-| `release_now.ps1`, `发布.bat` | Canonical gated release workflow |
+| `build_release.ps1` | CPU/CUDA distributable builder; emits runtime manifest and matching launcher into each package |
+| `release_now.ps1`, `发布.bat` | Canonical paired CPU/CUDA release workflow and post-success old-pair cleanup |
 | `release_no_trade.ps1` | Staged no-trade `MapleAssistant-vnt-0001` publisher; leaves normal source intact |
 | `README.md` | User/developer overview and operating workflow |
 | `ARCHITECTURE.md` | Technical handoff and full inventory |
 | `INSTALL.md` | Installation guide |
 | `COMMIT_MSG.txt` | Historical/local commit-message material; excluded from release |
 | `.gitignore` | Generated/runtime exclusion rules |
+
+### Bundled `target_tracker/` component and demo assets
+
+`target_tracker/` is the self-contained Realtime Fade Tracker (Cutie VOS +
+dense optical-flow residual tracking of fading white targets; own docs and
+`.cmd` launchers inside).  It is imported from source - both
+`target_tracker/` and `target_tracker/src` are prepended to `sys.path` when
+the auto-lie feature runs - and is never pip-installed.  Its core gained a
+`device` parameter. A normal development checkout chooses automatically, but
+each published `release_variant.json` locks the worker and UI to CPU or CUDA.
+The release package ships a
+stripped copy: model weights, the pure-Python cutie wheel, vc_redist.x64.exe
+and sources only (no Python installer, no other wheels).
+
+`detect_video/try_detect.mp4` is the demo footage for the 测试测谎 button.
+`lie_demo_player.py` (separate process, its own Tk window) replays it with a
+demo-specific white-popup seed rule; output lands in
+`work/lie_demo_console.log` and early crashes are surfaced in a popup and
+appended to `error.log`.
+
+### Logging and diagnostics
+
+All levels (INFO+) go to the single rotating root `error.log`; the former
+`work/assistant.log` split was removed.  Every startup clears previous
+`*.log` files (after the single-instance check; `.venv*`, `release`,
+`recording-assets`, `detect_video`, `sound` are skipped).  The 运行日志
+panel has a ❗ icon button that copies `error.log` to the clipboard.
+Feature log lines are prefixed `auto-lie:` / `lie-detect:` for easy tracing.
 
 ### Separate `boss_tracker/` application
 
@@ -879,10 +931,10 @@ These exist locally but are not guaranteed in a clone or commit:
 
 | Path | Contents/handling |
 |---|---|
-| `.venv/`, `yolo-detection/venv313/` | Local Python environments; never commit |
+| `.venv/`, `.venv-cpu/`, `.venv-cuda/`, `yolo-detection/venv313/` | Local Python environments; never commit |
 | `work/` | Logs, state JSON, debug captures, ad-hoc diagnostics, and release gate log |
 | `VERSION`, `versioning.py` | Four-digit release counter and UI version label |
-| `release/` | Rebuilt distributable directory and `MapleAssistant-vNNNN.zip` |
+| `release/` | Rebuilt CPU/CUDA package folders and their paired versioned ZIPs |
 | `recording-assets/` | Map-name index/reference images and map-structure reference; packaged when present |
 | `outputs/` | Generated detection outputs |
 | `map_profiles/` | Currently local/empty profile directory |

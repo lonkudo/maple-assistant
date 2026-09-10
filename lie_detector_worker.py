@@ -109,6 +109,9 @@ class LieDetectorWorker(threading.Thread):
         play_alert_sound: Optional[Callable[[Path], None]] = None,
         flash_callback: Optional[Callable[[], None]] = None,
         alert_callback: Optional[Callable[[str], None]] = None,
+        lie_seen_callback: Optional[
+            Callable[[Optional[tuple[int, int, int, int]], Any], None]
+        ] = None,
     ) -> None:
         super().__init__(name="lie-detector-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -122,6 +125,14 @@ class LieDetectorWorker(threading.Thread):
         self._play_alert_sound = play_alert_sound or play_mp3
         self._flash_callback = flash_callback
         self._alert_callback = alert_callback
+        # Optional consumers for the raw square event (e.g. the auto
+        # lie-pass GPU tracker and the diagnostic screenshot recorder): each
+        # receives (match, frame) on a NEW event and (None, frame) when a
+        # previously alerted square clears.  set_lie_seen_callback replaces
+        # the whole list; add_lie_seen_callback appends one listener.
+        self._lie_seen_callbacks: list = []
+        if lie_seen_callback is not None:
+            self._lie_seen_callbacks.append(lie_seen_callback)
         self._lock = threading.Lock()
         self._enabled = bool(enabled)
         self._sound_enabled = True
@@ -152,6 +163,28 @@ class LieDetectorWorker(threading.Thread):
 
         with self._lock:
             self._sound_enabled = bool(enabled)
+
+    def set_lie_seen_callback(
+        self,
+        callback: Optional[
+            Callable[[Optional[tuple[int, int, int, int]], Any], None]
+        ],
+    ) -> None:
+        """Replace all raw square-event consumers with a single one (or none)."""
+
+        with self._lock:
+            self._lie_seen_callbacks = (
+                [callback] if callback is not None else []
+            )
+
+    def add_lie_seen_callback(
+        self,
+        callback: Callable[[Optional[tuple[int, int, int, int]], Any], None],
+    ) -> None:
+        """Append one more raw square-event consumer (e.g. a recorder)."""
+
+        with self._lock:
+            self._lie_seen_callbacks.append(callback)
 
     def _take_due_scan(self, now: float) -> bool:
         with self._lock:
@@ -184,7 +217,11 @@ class LieDetectorWorker(threading.Thread):
             except Exception:
                 LOG.warning("lie detector alert sound failed", exc_info=True)
 
-    def _update_alert(self, match: Optional[tuple[int, int, int, int]]) -> None:
+    def _update_alert(
+        self,
+        match: Optional[tuple[int, int, int, int]],
+        frame: Any = None,
+    ) -> None:
         should_alert = False
         with self._lock:
             if not self._enabled:
@@ -194,6 +231,24 @@ class LieDetectorWorker(threading.Thread):
             elif not self._alerted_for_current_event:
                 self._alerted_for_current_event = True
                 should_alert = True
+            callbacks = list(self._lie_seen_callbacks)
+        # Every listener runs isolated: one broken consumer (or a slow
+        # recorder) must never break the alert loop or other listeners.
+        for callback in callbacks:
+            try:
+                # New event -> (match, frame); cleared -> (None, frame).
+                callback(match, frame)
+            except Exception:
+                LOG.warning(
+                    "lie-detect: a lie-seen callback failed", exc_info=True
+                )
+        if callbacks and match is not None:
+            LOG.info(
+                "lie-detect: square event forwarded to %d callback(s) "
+                "bbox=%s",
+                len(callbacks),
+                match,
+            )
         if should_alert:
             LOG.warning(
                 "LIE DETECTOR ALERT: #c9ced0 block detected at "
@@ -221,7 +276,7 @@ class LieDetectorWorker(threading.Thread):
                 # Work directly on the shared in-memory full-client image.
                 # No screenshot file is created, retained, or deleted.
                 match = detect_lie_square(frame.image)
-                self._update_alert(match)
+                self._update_alert(match, frame)
             except Exception:
                 LOG.exception("lie detector failed on a frame")
         LOG.info("lie detector worker stopped")

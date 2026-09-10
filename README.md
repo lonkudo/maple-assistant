@@ -12,15 +12,24 @@ independent and does not share Maple Assistant workers or configuration.
 
 ## Install and run
 
+Every normal release has two ZIPs. Choose **CPU** for a machine without an
+NVIDIA GPU, or **CUDA** for a machine with a working NVIDIA driver. Do not mix
+the two packages in one folder.
+
 For a release ZIP on a new Windows machine:
 
 1. Extract the complete ZIP to a writable folder.
-2. Double-click `安装.bat` and accept its one UAC prompt. It finds or silently
-   installs Python 3.10, creates `.venv`, and installs core packages through
-   the Alibaba Cloud mirror with an official-PyPI fallback. YOLO dependencies
-   are intentionally skipped.
+2. Double-click `安装.bat` and accept its one UAC prompt. The short UAC helper
+   window closes immediately; only the elevated installer window remains.
+   It finds or silently installs Python 3.10 and creates the package-specific
+   environment: `.venv-cpu` or `.venv-cuda`. The CUDA package stops clearly
+   if its NVIDIA/CUDA check fails; it never silently installs CPU tracking.
 3. Double-click `启动助手.bat`.
 4. Record a route, choose the patrol range, then click **开始巡逻**.
+
+To update an existing installation, cover its files with the **same** package
+type. Its launcher keeps using the existing package environment, so rerunning
+`安装.bat` is unnecessary unless `.venv-cpu` / `.venv-cuda` is actually absent.
 
 The launcher is hidden. Input is disarmed on startup; foreground monitoring,
 window selection, and live game capture start only after **开始巡逻**. Manual
@@ -204,6 +213,90 @@ sends Telegram with machine name, event type, and time.
   remain unselected.
 - Telegram failures only change UI/log status and never stop the assistant.
 
+## Auto lie pass (自动过测谎, optional fade-target tracker)
+
+A bottom row of the **附加功能** panel hosts the automation checkbox and one
+package-matched replay tester:
+
+- **自动过测谎** checkbox: when armed, the assistant does not only *alert* on
+  a lie square - it also drives the real mouse onto the fading target.  The
+  #c9ced0 slice is only the **alarm** (the assistant plays `dingdong.mp3`);
+  four seconds later Cutie takes over inside the lie popup, follows the
+  target while it dims and moves the cursor onto it.  **No click is ever
+  sent** - the server passes on cursor presence - and the game window
+  regains focus by itself.  A lost track is never recovered (the cursor is
+  left in place).  Lie events are rare and single-shot by design.
+- CPU releases show only **测试 CPU**; CUDA releases show only **测试 CUDA**.
+  A development checkout without a release manifest may show both comparison
+  buttons. The published button reuses the already-preloaded package model,
+  so it does not wait for another Cutie load.
+
+How it works:
+
+1. The bundled `target_tracker/` component (Realtime Fade Tracker: Cutie VOS
+   + dense optical-flow residual path) is imported from source
+   (`target_tracker/src`). `release_variant.json` locks a published package to
+   its CPU or CUDA device; only a development checkout uses automatic choice.
+2. `LieDetectorWorker` forwards each newly detected #c9ced0 square through
+   an optional `lie_seen_callback` (the diagnostic recorder subscribes the
+   same way).  The slice is the event *alarm*: it disappears as soon as the
+   real popup opens, so its absence never stops the tracking.
+3. `AutoLieWorker` preloads the package's Cutie weights as soon as the UI
+   opens. The status line reports preloading, ready, or failure.  Four
+   seconds after the alarm it crops live frames to the lie popup only - the
+   tracker never sees the rest of the game client - finds the bright-white
+   target inside it (the `_MIN_LIE_TARGET_SIZE` guard rejects the popup's own
+   white countdown digits) and seeds Cutie.  It then follows the target while
+   it dims, maps popup pixels onto the popup's screen rectangle and moves the
+   mouse; **no click is sent**.  A sequence ends when the checkbox is turned
+   off, the tracker loses the target, or the 45 s safety cap is reached.
+   Cutie models are loaded once per process and reused, because Cutie's Hydra
+   init cannot run twice in one process.  Popup geometry is measured on the
+   1366x768 preset and recalculated for other presets through
+   `lie_ui_scale()` (1920x1080 renders the same preset shrunk).
+4. Enabling 自动过测谎 automatically enables the 测谎 detection (its event
+   source). Turning 测谎 off also turns 自动过测谎 off.
+5. `lie_screenshot_recorder.py` records the whole client for
+   `RECORD_SECONDS` after any alert (lie / 掉线 / 循环), then turns the run
+   into a single mp4 with `lie_video_tools.compose_frames_to_video` and
+   deletes the frames unless `keep_frames=True`.  The same module can replay
+   such a recording through the real engine in-game-style
+   (`simulate_in_game_run`: annotated video + per-frame text log, mouse
+   replaced by a recorder), so a lie event can be validated without the game.
+
+Availability probing happens at UI build (`probe_auto_lie_environment`):
+missing torch/cutie/weights or a missing `target_tracker` folder disables
+nothing - the status text under the row explains the exact reason, and the
+测试测谎 button always reports missing components in a popup instead of
+failing silently.  Related log lines start with `auto-lie:` / `lie-detect:`
+so the whole event chain is traceable in `error.log`.
+
+Installation behavior (see `install.ps1`):
+
+- pip mirrors fall back TUNA - Aliyun - Tencent - official PyPI; the venv is
+  self-healed when pip is missing (ensurepip, recreate, get-pip.py).
+- The VC++ 2015-2022 runtime is auto-detected (6 DLLs) and installed from
+  the bundled `target_tracker/offline_bundle/installers/vc_redist.x64.exe`
+  (offline) with an aka.ms fallback.
+- Windows 10 (build < 22000) uses the compatible legacy CPU Torch/NumPy pair;
+  NumPy is corrected before Torch first imports. CPU installs resolve a
+  compatible Torch/Torchvision pair and verify both Cutie installation and
+  `import cutie`. A published CPU/CUDA installer fails clearly if its required
+  tracker environment cannot be completed.
+- The initial UAC helper closes at once. The elevated installer window remains
+  open only to show progress and the final success/failure result.
+- On startup the assistant clears every previous `*.log` (single-instance
+  check happens first), and all levels (INFO+) are written to the single
+  `error.log` file; `work/assistant.log` no longer exists.
+
+Diagnostics:
+
+- The **运行日志** panel gained an alert-triangle (❗) icon button that
+  copies the whole root `error.log` to the clipboard.
+- `diagnose.bat` prints OS build, CPU, VC DLL presence, registry version,
+  Python and the full torch import error - the standard first response for
+  WinError 1114 reports.
+
 ## Configuration and updates
 
 | File | Ownership | Purpose |
@@ -245,9 +338,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 Testing is not a default ritual. Run only the smallest targeted check that is
 necessary to validate the code being changed; do not run duplicate or broad
 test suites merely as a routine step. Documentation-only edits do not require
-tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds
-`release/MapleAssistant`, and produces `MapleAssistant-vNNNN.zip`. Version
-`9999` never wraps.
+tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds both
+`release/MapleAssistant-CPU` and `release/MapleAssistant-CUDA`, then produces
+`MapleAssistant-CPU-vNNNN.zip` and `MapleAssistant-CUDA-vNNNN.zip`. Once both
+are successful, prior CPU/CUDA release ZIPs are removed. Version `9999` never
+wraps.
 
 ### Machine-specific diagnosis
 
@@ -268,6 +363,10 @@ version.
 | File | Responsibility |
 |---|---|
 | `assistant.py` | application wiring and lifecycle |
+| `auto_lie_worker.py` | optional GPU/CPU fade-square tracker for 自动过测谎 (AutoLieWorker + environment probe) |
+| `lie_demo_player.py` | 测试测谎 demo window replaying `detect_video/try_detect.mp4` |
+| `lie_screenshot_recorder.py` | alert-triggered full-client diagnostic recorder; composes its run into one mp4 |
+| `lie_video_tools.py` | frames -> mp4 + in-game replay test (H.264 via ffmpeg when available; decoupled, never moves the mouse) |
 | `ui_worker.py` | Tk UI, recording, settings, update/export actions |
 | `movement_worker.py` | patrol, rope, fall/recovery, directional ownership |
 | `motion_arbiter.py` | serialized random-jump/buff/small-step actions |
@@ -281,6 +380,9 @@ version.
 | `minimap_detector.py`, `marker_detector.py`, `map_structure_tracker.py` | minimap geometry, marker detection, world-Y tracking |
 | `config_store.py`, `update_manager.py` | configuration ownership, import/export, and self-update |
 | `error.log` | rotating fatal-error log, generated beside the application |
+| `diagnose.bat` | one-shot environment diagnostic (OS/CPU/VC DLLs/torch import) for WinError 1114 reports |
+| `target_tracker/` | bundled Realtime Fade Tracker component (own docs inside; src imported via sys.path) |
+| `detect_video/` | demo footage for 测试测谎 (`try_detect.mp4`) |
 | `ARCHITECTURE.md` | detailed worker wiring and complete repository inventory |
 
 ## Future-agent checklist

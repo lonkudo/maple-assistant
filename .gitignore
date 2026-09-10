@@ -27,3 +27,11 @@ venv*/
 *.pid
 *.out
 *.err
+
+# Local CUDA venv junction for target_tracker (auto lie pass).
+.venv-win/
+
+# local lie-event captures / analysis artefacts
+lie_windows/
+lie_20260910_155856/
+screenshots/
