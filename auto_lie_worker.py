@@ -94,24 +94,25 @@ _CANDIDATE_STABLE_FRAMES = 2
 # provide the centred fallback and the reference every popup-derived number is
 # recalculated from (64px countdown guard off the 767px reference width).
 #
-# The popup is a game-UI preset, not a fixed pixel box: 1920x1080 shares the
-# 1366x768 preset but the game renders that preset SHRUNK (its 1075-wide UI
-# reference), so the whole popup geometry/hud numbers have to be recalculated
-# for it from the 1366 preset.  Preset factors live here - verify/adjust them
-# against a real capture when a new preset shows up.
+# 1366x768 and 1920x1080 use the SAME game-UI preset, so every popup number
+# is the same pixel value on both: popup 767x598, countdown guard 64px,
+# accepted popup size 537-1035 x 419-807 px (:func:`_lie_window_size_bounds`).
+# The whole set only scales - by the width ratio - below the 1366px reference,
+# e.g. the 1075x768 client.  The preset table below stays for a preset whose
+# UI is rendered at a genuinely different size; it is empty today.
 _HUD_REFERENCE_WIDTH = 1366
 LIE_WINDOW_REFERENCE_CLIENT = (1366, 768)
 LIE_WINDOW_REFERENCE_SIZE = (767, 598)
-LIE_PRESET_UI_WIDTHS = {1920: 1075.0}
+LIE_PRESET_UI_WIDTHS: dict = {}
 LIE_PRESET_MATCH_TOLERANCE = 8
 
 
 def lie_ui_scale(client_width: int) -> float:
     """Popup/HUD scale for a client width (the 1366x768 preset is 1.0).
 
-    Presets listed in :data:`LIE_PRESET_UI_WIDTHS` render the same UI preset
-    at their own (smaller) UI width; everything else follows the HUD curve
-    (shrinking below the 1366px reference, fixed above it).
+    Presets listed in :data:`LIE_PRESET_UI_WIDTHS` render the UI at their own
+    (different) UI width; everything else follows the HUD curve (shrinking
+    below the 1366px reference, fixed at/above it).
     """
 
     try:
@@ -374,12 +375,38 @@ def _min_lie_target_size(client_width: int) -> int:
     return max(_MIN_TARGET_SIZE, scaled)
 
 
+def _lie_window_size_bounds(
+    width: int, height: int
+) -> Tuple[int, int, int, int]:
+    """Accepted popup SIZE in pixels: (min_w, max_w, min_h, max_h).
+
+    Everything is derived from the 1366x768 preset's measured popup
+    (767x598) and scaled by the width-based preset ratio
+    (:func:`lie_ui_scale`), so the numbers are identical on any client that
+    shares that preset - 1366x768 and 1920x1080 give exactly the same bounds -
+    and shrink in the same fixed ratio as the UI on a smaller client such as
+    1075x768.  No bounds depend on the current frame size.
+    """
+
+    scale = lie_ui_scale(width)
+    popup_width = LIE_WINDOW_REFERENCE_SIZE[0] * scale
+    popup_height = LIE_WINDOW_REFERENCE_SIZE[1] * scale
+    # No clamping to the client: a connected component cannot be larger than
+    # the frame anyway, and staying unclamped keeps the bounds identical
+    # across every client that shares the preset.
+    minimum_width = max(16, int(round(popup_width * 0.70)))
+    maximum_width = max(minimum_width, int(round(popup_width * 1.35)))
+    minimum_height = max(16, int(round(popup_height * 0.70)))
+    maximum_height = max(minimum_height, int(round(popup_height * 1.35)))
+    return minimum_width, maximum_width, minimum_height, maximum_height
+
+
 def lie_window_box(width: int, height: int) -> Tuple[int, int, int, int]:
     """Centred fallback box of the lie popup in client pixels.
 
-    Recalculated from the measured 1366x768 preset (767x598) through
-    :func:`lie_ui_scale`, so other presets - including the shrunk 1920x1080
-    one - get their own popup size instead of the reference box.
+    The popup is a game-UI preset: 1366x768 and 1920x1080 share it, so the
+    measured 767x598 holds on both (:func:`lie_ui_scale` only changes it for a
+    genuinely different preset or a smaller client).
     """
 
     width = max(1, int(width))
@@ -423,15 +450,16 @@ def _find_lie_window_box(bgr: Any) -> Optional[Tuple[int, int, int, int]]:
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
     )
     count, _labels, stats, _centers = cv2.connectedComponentsWithStats(mask, 8)
+    minimum_width, maximum_width, minimum_height, maximum_height = (
+        _lie_window_size_bounds(width, height)
+    )
     best: Optional[Tuple[int, int, int, int]] = None
     best_score = 0.0
     for label in range(1, count):
         x, y, box_w, box_h, _area = (int(value) for value in stats[label])
-        # Wide bounds on purpose: a preset like 1920x1080 renders the popup
-        # shrunk, and the detection must still lock onto it.
-        if box_w < width * 0.24 or box_w > width * 0.92:
+        if box_w < minimum_width or box_w > maximum_width:
             continue
-        if box_h < height * 0.34 or box_h > height * 0.95:
+        if box_h < minimum_height or box_h > maximum_height:
             continue
         center_x, center_y = x + box_w / 2.0, y + box_h / 2.0
         if abs(center_x - width / 2.0) > width * 0.12:

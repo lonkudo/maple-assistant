@@ -252,8 +252,10 @@ How it works:
    off, the tracker loses the target, or the 45 s safety cap is reached.
    Cutie models are loaded once per process and reused, because Cutie's Hydra
    init cannot run twice in one process.  Popup geometry is measured on the
-   1366x768 preset and recalculated for other presets through
-   `lie_ui_scale()` (1920x1080 renders the same preset shrunk).
+   1366x768 preset: 1920x1080 uses the **same preset**, so the popup pixels,
+   the countdown guard and the detector's accepted popup SIZE in pixels are
+   identical there (`_lie_window_size_bounds()`); the whole set is scaled by
+   the fixed width ratio only on a smaller client such as 1075x768.
 4. Enabling 自动过测谎 automatically enables the 测谎 detection (its event
    source). Turning 测谎 off also turns 自动过测谎 off.
 5. `lie_screenshot_recorder.py` records the whole client for

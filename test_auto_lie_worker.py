@@ -25,6 +25,7 @@ from auto_lie_worker import (
     _bgr_from_pil,
     _find_lie_window_box,
     _find_target_box,
+    _lie_window_size_bounds,
     _min_lie_target_size,
     _novelty_next_state,
     lie_ui_scale,
@@ -123,28 +124,60 @@ class LieWindowGeometryTests(unittest.TestCase):
         self.assertLess(_min_lie_target_size(1366), 89)
         self.assertGreaterEqual(_min_lie_target_size(320), 16)
 
-    def test_1366_and_1920_presets_are_recalculated(self):
-        # 1920x1080 shares the 1366x768 preset but renders it shrunk (the
-        # game's 1075-wide UI reference), so every popup number is recomputed.
+    def test_1366_and_1920_share_the_same_preset(self):
+        # 1920x1080 uses the SAME game-UI preset as 1366x768, so the popup
+        # keeps its measured pixel size and the countdown guard stays 64px.
         self.assertAlmostEqual(lie_ui_scale(1366), 1.0, places=3)
-        shrink = 1075.0 / 1366.0
-        self.assertAlmostEqual(lie_ui_scale(1920), shrink, places=3)
-        # The same UI is drawn at 1075 wide -> same scale as the raw HUD curve.
-        self.assertAlmostEqual(lie_ui_scale(1075), shrink, places=3)
-        # Above the reference the HUD curve is flat unless a preset says so.
-        self.assertAlmostEqual(lie_ui_scale(2560), 1.0, places=3)
+        self.assertAlmostEqual(lie_ui_scale(1920), 1.0, places=3)
 
         left, top, width, height = lie_window_box(1920, 1080)
-        self.assertEqual((width, height),
-                         (round(767 * shrink), round(598 * shrink)))
+        self.assertEqual((width, height), (767, 598))
         self.assertEqual(left, (1920 - width) // 2)
         self.assertEqual(top, (1080 - height) // 2)
-        # The countdown (~41x37 shrunk) is still rejected, the target
-        # (~70x78 shrunk) still accepted.
         self.assertEqual(_min_lie_target_size(1920),
-                         int(round(64 * shrink)))
-        self.assertGreater(_min_lie_target_size(1920), 41)
-        self.assertLess(_min_lie_target_size(1920), 70)
+                         _min_lie_target_size(1366))
+        self.assertEqual(_min_lie_target_size(1920), 64)
+
+    def test_size_bounds_are_identical_for_the_same_preset(self):
+        # 1366x768 and 1920x1080 share the UI preset, so the accepted popup
+        # SIZE is exactly the same; it is not a share of the frame.
+        self.assertEqual(_lie_window_size_bounds(1366, 768),
+                         _lie_window_size_bounds(1920, 1080))
+        minimum_width, maximum_width, minimum_height, maximum_height = (
+            _lie_window_size_bounds(1920, 1080)
+        )
+        self.assertLessEqual(minimum_width, 767)
+        self.assertGreaterEqual(maximum_width, 767)
+        self.assertLessEqual(minimum_height, 598)
+        self.assertGreaterEqual(maximum_height, 598)
+
+    def test_size_bounds_shrink_at_the_same_fixed_ratio_below_the_reference(self):
+        # A smaller client (1075x768) scales the whole UI down by width.
+        shrink = 1075.0 / 1366.0
+        reference = _lie_window_size_bounds(1366, 768)
+        smaller = _lie_window_size_bounds(1075, 768)
+        for wide, small in zip(reference, smaller):
+            self.assertAlmostEqual(small / wide, shrink, delta=0.01)
+
+    def test_fixed_pixel_popup_is_found_on_a_1080p_client(self):
+        import cv2
+
+        frame = _bgr_frame(1920, 1080)
+        # Same UI preset as the 1366 capture: a centred 767x598 popup.
+        left = (1920 - 767) // 2
+        top = (1080 - 598) // 2
+        cv2.rectangle(frame, (left, top), (left + 766, top + 597),
+                      (255, 255, 255), 8)
+        cv2.rectangle(frame, (left + 12, top + 10), (left + 754, top + 40),
+                      (255, 255, 255), -1)
+        box = _find_lie_window_box(frame)
+        self.assertIsNotNone(box)
+        self.assertAlmostEqual(box[0] + box[2] / 2.0, 960, delta=25)
+        self.assertAlmostEqual(box[1] + box[3] / 2.0, 540, delta=25)
+        # ... the popup size AND the countdown guard are unchanged there
+        # (same preset as the 1366x768 capture).
+        self.assertEqual(_min_lie_target_size(1920), 64)
+        self.assertEqual(lie_window_box(1920, 1080)[2:], (767, 598))
 
     def test_finds_centred_popup(self):
         import cv2

@@ -85,7 +85,11 @@ informational and never stops a sequence. Enabling 自动过测谎 in the UI
 force-enables the 测谎 detection so the event chain always has a source;
 deselecting 测谎 clears 自动过测谎 as well. `AutoLieWorker` preloads Cutie
 during UI startup and the status label reports preloading, ready, or failure
-without blocking Tk.
+without blocking Tk.  The lie popup follows the same fixed 1366x768 HUD basis
+as the trade coordinates (line "1. Trade coordinates..." above): the measured
+767x598 popup, its 64px countdown guard and the detector's accepted popup size
+in pixels are identical on 1920x1080, and all of them scale by the fixed width
+ratio only at the smaller 1075x768 client.
 
 `MinimapDetector` uses OpenCV to locate the resizable minimap, inner canvas,
 map-name crop, and analysis box. The game HUD is FIXED pixel: only the
