@@ -20,7 +20,7 @@ from typing import Any, Callable, Optional
 import cv2
 import numpy as np
 
-from countdown_worker import play_mp3
+from countdown_worker import play_mp3, run_sound_async
 from minimap_detector import hud_scale_for
 
 
@@ -140,6 +140,8 @@ class LieDetectorWorker(threading.Thread):
             time.monotonic() + self.scan_interval if enabled else None
         )
         self._alerted_for_current_event = False
+        # Rate limit for the "almost #c9ced0" diagnostic (see _log_near_miss).
+        self._last_near_miss_log = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -213,7 +215,13 @@ class LieDetectorWorker(threading.Thread):
             sound_enabled = self._sound_enabled
         if sound_enabled:
             try:
-                self._play_alert_sound(self.sound_path)
+                # Never play inline: a wedged audio device would freeze this
+                # detector worker along with the rest of its loop.
+                run_sound_async(
+                    self._play_alert_sound,
+                    self.sound_path,
+                    name="lie-alert-sound",
+                )
             except Exception:
                 LOG.warning("lie detector alert sound failed", exc_info=True)
 
@@ -276,10 +284,64 @@ class LieDetectorWorker(threading.Thread):
                 # Work directly on the shared in-memory full-client image.
                 # No screenshot file is created, retained, or deleted.
                 match = detect_lie_square(frame.image)
+                if match is None:
+                    self._log_near_miss(frame.image, now)
                 self._update_alert(match, frame)
             except Exception:
                 LOG.exception("lie detector failed on a frame")
         LOG.info("lie detector worker stopped")
+
+    def _log_near_miss(self, image: Any, now: float) -> None:
+        """Diagnostic: describe an almost-#c9ced0 square, at most every 5s.
+
+        A lie test that never rings leaves no evidence at all - the operator
+        sees nothing happen.  This probes with a relaxed colour tolerance and a
+        half-size kernel; when that matches, the log states the square's real
+        size and colour, which is exactly what is needed to calibrate
+        ``LIE_SQUARE_COLOR`` / ``REFERENCE_LIE_SQUARE_SIZE`` for that client.
+        It never alerts and never triggers anything.
+        """
+
+        if now - self._last_near_miss_log < 5.0:
+            return
+        self._last_near_miss_log = now
+        try:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            width = int(rgb.shape[1])
+            target_width, target_height = scaled_lie_square_size(
+                width, int(rgb.shape[0])
+            )
+            relaxed_width = max(4, target_width // 2)
+            relaxed_height = max(4, target_height // 2)
+            colour = np.asarray(LIE_SQUARE_COLOR, dtype=np.int16)
+            tolerance = int(LIE_COLOR_TOLERANCE) * 3
+            lower = np.asarray(
+                [max(0, int(c) - tolerance) for c in colour], dtype=np.uint8
+            )
+            upper = np.asarray(
+                [min(255, int(c) + tolerance) for c in colour], dtype=np.uint8
+            )
+            mask = cv2.inRange(rgb[:, :, :3], lower, upper)
+            kernel = np.ones((relaxed_height, relaxed_width), dtype=np.uint8)
+            matches = cv2.erode(
+                mask, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0
+            )
+            locations = np.argwhere(matches == 255)
+            if locations.size == 0:
+                return
+            center_y, center_x = (int(v) for v in locations[0])
+            sample = rgb[center_y, center_x]
+            LOG.info(
+                "lie-detect: near miss - a %dx%d uniform block near "
+                "RGB%s sits at (%d,%d); the exact rule wants %dx%d of RGB%s "
+                "(+-%d).  Nothing was triggered.",
+                relaxed_width, relaxed_height, tuple(int(v) for v in sample),
+                center_x, center_y, target_width, target_height,
+                tuple(int(v) for v in LIE_SQUARE_COLOR),
+                int(LIE_COLOR_TOLERANCE),
+            )
+        except Exception:
+            LOG.debug("lie-detect: near-miss probe failed", exc_info=True)
 
 
 __all__ = [

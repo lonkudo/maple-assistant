@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tests for the decoupled lie video tooling.
 
-No GPU, no game window, no mouse: the replay test uses a blank recording, so
-it exercises the wiring (bell search, writer, text log, recorder aim) without
-touching Cutie.  The real tracking path is validated on the operator machine
-with the recorded lie-event folder (see lie_video_tools CLI).
+The folder -> mp4 composition (how the operator's 测试api test clips are produced) and the frame
+loader it uses.  The in-game replay through the local Cutie pass was removed with that pass.
 """
 
 import tempfile
@@ -20,8 +18,9 @@ import lie_video_tools as tools
 def _write_frames(folder: Path, count: int = 5, size=(64, 48), colour=(20, 20, 20)) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     for index in range(1, count + 1):
+        # JPG, the project format: image_io.frame_files lists nothing else
         Image.new("RGB", size, colour).save(
-            folder / ("frame_%06d.png" % index)
+            folder / ("frame_%06d.jpg" % index), quality=95
         )
     return folder
 
@@ -64,8 +63,8 @@ class LoadFramesTests(unittest.TestCase):
             images, paths = tools.load_frames(folder)
             self.assertEqual(len(images), 3)
             self.assertEqual([p.name for p in paths],
-                             ["frame_000001.png", "frame_000002.png",
-                              "frame_000003.png"])
+                             ["frame_000001.jpg", "frame_000002.jpg",
+                              "frame_000003.jpg"])
             self.assertEqual(images[0].size, (64, 48))
 
     def test_composed_video_reloads_frame_for_frame(self):
@@ -80,45 +79,16 @@ class LoadFramesTests(unittest.TestCase):
             tools.load_frames("does-not-exist-anywhere")
 
 
-class RecordingAimTests(unittest.TestCase):
-    def test_maps_crop_point_onto_the_region(self):
-        aim = tools.RecordingAim(100, 50)
-        aim.set_region(300, 100, 500, 200)
-        self.assertEqual(aim.map_to_screen(0, 0), (300.0, 100.0))
-        self.assertEqual(aim.map_to_screen(100, 50), (500.0, 200.0))
-        self.assertEqual(aim.map_to_screen(50, 25), (400.0, 150.0))
+class NoLocalEngineTests(unittest.TestCase):
+    """The module must not pull the removed Cutie pass back in."""
 
-    def test_without_region_nothing_is_mapped(self):
-        aim = tools.RecordingAim(100, 50)
-        self.assertIsNone(aim.map_to_screen(10, 10))
-        aim.push_target(1, 2, 0.5, "CUTIE")
-        self.assertEqual(aim.last, (1.0, 2.0, 0.5, "CUTIE"))
-        self.assertEqual(len(aim.samples), 1)
-
-    def test_degenerate_region_is_ignored(self):
-        aim = tools.RecordingAim(10, 10)
-        aim.set_region(5, 5, 5, 5)
-        self.assertIsNone(aim.region)
-
-
-class ReplayWiringTests(unittest.TestCase):
-    def test_blank_recording_reports_no_bell(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = _write_frames(Path(tmp) / "lie_blank", count=3)
-            summary = tools.simulate_in_game_run(
-                folder,
-                fps=50.0,
-                realtime=False,
-                output_video=folder / "out.mp4",
-                output_text=folder / "out.txt",
-            )
-            self.assertIsNone(summary["bell_frame"])
-            self.assertIsNone(summary["seed_frame"])
-            self.assertEqual(summary["tracked_frames"], 0)
-            self.assertEqual(summary["frames"], 3)
-            text = (folder / "out.txt").read_text(encoding="utf-8")
-            self.assertIn("no bell detected", text)
-            self.assertIn("# summary", text)
+    def test_the_replay_half_is_gone(self):
+        source = Path(tools.__file__).read_text(encoding="utf-8")
+        for gone in ("import auto_lie_worker", "from auto_lie_worker", "simulate_in_game_run",
+                     "RecordingAim", "lie_feed_box", "lie_demo_player"):
+            self.assertNotIn(gone, source, gone)
+        for kept in ("compose_frames_to_video", "load_frames", "VideoSink"):
+            self.assertIn(kept, source, kept)
 
 
 if __name__ == "__main__":

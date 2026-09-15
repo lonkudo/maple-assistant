@@ -68,6 +68,13 @@ class QuickPickupWorker(threading.Thread):
             if not self.key_sender.is_game_foreground():
                 self._report("failed", "game window is not foreground")
                 return
+        except OSError as exc:
+            # The expected case: the game window is not on screen (for example while
+            # the operator is running the 测试测谎 test video instead of the game).
+            # A full traceback in the log says nothing extra here.
+            LOG.warning("quick pickup: game window not selected: %s", exc)
+            self._report("failed", str(exc))
+            return
         except Exception as exc:
             LOG.exception("quick pickup game window selection failed")
             self._report("failed", str(exc))

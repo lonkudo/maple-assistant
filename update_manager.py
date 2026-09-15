@@ -1,4 +1,4 @@
-"""Find and apply a newer Maple Assistant package from the Windows Desktop."""
+"""Find and apply a newer Maple Assistant package from safe nearby locations."""
 
 from __future__ import annotations
 
@@ -123,14 +123,51 @@ def _iter_desktop_entries(roots: Iterable[Path]) -> Iterable[Path]:
                 yield folder
 
 
+def _iter_local_update_entries(roots: Iterable[Path]) -> Iterable[Path]:
+    """Yield direct release packages beside the running installation.
+
+    The parent can be a drive root (for example ``E:\\``), so it must not be
+    recursively walked like Desktop.  Check only the folder itself and its
+    conventional ``release`` child; that covers copied ZIPs without turning
+    the update icon into a slow whole-drive scan.
+    """
+
+    seen: set[str] = set()
+    for root in roots:
+        for folder in (Path(root), Path(root) / "release"):
+            try:
+                resolved = folder.resolve()
+            except OSError:
+                continue
+            marker = str(resolved).casefold()
+            if marker in seen or not resolved.is_dir():
+                continue
+            seen.add(marker)
+            try:
+                entries = list(resolved.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.is_file() and entry.name.casefold().endswith(".zip"):
+                    yield entry
+                elif (entry.is_dir() and (entry / "assistant.py").is_file()
+                      and (entry / "VERSION").is_file()):
+                    yield entry
+
+
 def find_newer_desktop_update(
     current_version: str, roots: Optional[Iterable[Path]] = None,
+    local_roots: Optional[Iterable[Path]] = None,
 ) -> DesktopUpdate:
-    """Find the highest valid Desktop package newer than ``current_version``."""
+    """Find the highest newer package on Desktop or beside this installation."""
 
     current = int(_valid_version(current_version) or "0000")
     candidates: list[DesktopUpdate] = []
-    for entry in _iter_desktop_entries(desktop_roots() if roots is None else roots):
+    desktop_search_roots = list(desktop_roots() if roots is None else roots)
+    nearby_roots = list(local_roots or ())
+    entries = list(_iter_desktop_entries(desktop_search_roots))
+    entries.extend(_iter_local_update_entries(nearby_roots))
+    for entry in entries:
         kind = "zip" if entry.is_file() else "directory"
         # For a directory, content validation is authoritative.  ZIP names
         # are cheaply filtered first, then their internal VERSION is checked.
@@ -140,10 +177,12 @@ def find_newer_desktop_update(
         if version is not None and int(version) > current:
             candidates.append(DesktopUpdate(entry, version, kind))
     if not candidates:
-        roots_text = ", ".join(str(root) for root in (roots or desktop_roots()))
+        roots_text = ", ".join(
+            str(root) for root in (desktop_search_roots + nearby_roots)
+        )
         raise UpdateError(
-            f"未在桌面找到比 v{current_version} 更新的 Maple 助手安装包。"
-            f"已检查: {roots_text or '桌面文件夹不存在'}"
+            f"未找到比 v{current_version} 更新的 Maple 助手安装包。"
+            f"已检查: {roots_text or '桌面和安装目录不存在'}"
         )
     return max(candidates, key=lambda item: (int(item.version), item.path.stat().st_mtime))
 
@@ -244,6 +283,28 @@ def apply_desktop_update(
         raise UpdateError(f"复制更新文件失败: {exc}") from exc
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def remove_consumed_update_package(package: DesktopUpdate) -> bool:
+    """Remove the ZIP consumed by a successful in-app update.
+
+    Public releases are ZIP files.  An extracted directory may be a user's
+    working copy, so it is deliberately never removed by the update icon.
+    The caller invokes this only after the files have been copied and the
+    restart handoff has been scheduled successfully.
+    """
+
+    if package.kind != "zip":
+        return False
+    try:
+        package.path.unlink()
+    except FileNotFoundError:
+        # Another cleanup action may have won the race; the desired final
+        # state (no stale package) has still been reached.
+        return True
+    except OSError as exc:
+        raise UpdateError(f"更新已完成，但无法删除已使用的安装包: {exc}") from exc
+    return True
 
 
 def export_user_config(source: Path, roots: Optional[Iterable[Path]] = None) -> Path:
@@ -348,6 +409,6 @@ def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
 __all__ = [
     "DesktopUpdate", "UpdateError", "UpdateResult", "apply_desktop_update",
     "desktop_roots", "export_user_config", "find_newer_desktop_update",
-    "import_user_config",
+    "import_user_config", "remove_consumed_update_package",
     "schedule_hidden_restart",
 ]

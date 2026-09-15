@@ -10,6 +10,7 @@ from unittest import mock
 
 from PIL import Image
 
+from image_io import frame_files
 from capture_worker import (
     CaptureWorker,
     CapturedFrame,
@@ -160,6 +161,26 @@ class CaptureWorkerTests(unittest.TestCase):
         fast.set()
         self.assertEqual(worker.active_interval(), .10)
 
+    def test_lie_action_selects_30fps_and_outranks_the_drop_cadence(self) -> None:
+        stop = threading.Event()
+        fast = threading.Event()
+        lie = threading.Event()
+        worker = CaptureWorker(
+            "game", .25, FrameBus(), stop,
+            capture_fn=lambda _title: (Image.new("RGB", (2, 2)), (0, 0, 2, 2)),
+            fast_capture_event=fast,
+            fast_interval=.10,
+            lie_capture_event=lie,
+            lie_interval=1.0 / 30.0,
+        )
+        self.assertEqual(worker.active_interval(), .25)
+        fast.set()
+        self.assertEqual(worker.active_interval(), .10)
+        lie.set()
+        self.assertAlmostEqual(worker.active_interval(), 1.0 / 30.0)
+        fast.clear()
+        self.assertAlmostEqual(worker.active_interval(), 1.0 / 30.0)
+
     def test_transient_capture_failure_does_not_kill_worker(self) -> None:
         attempts = 0
 
@@ -191,6 +212,7 @@ class CaptureWorkerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             debug_dir = Path(directory)
+            # a PNG left behind by an earlier release must still be cleaned up
             (debug_dir / "frame-999999-stale.png").write_bytes(b"stale")
             stop = threading.Event()
             bus = FrameBus()
@@ -201,12 +223,28 @@ class CaptureWorkerTests(unittest.TestCase):
             try:
                 worker.start()
                 self.assertIsNotNone(bus.wait_for_new(after_sequence=0, timeout=.5))
-                time.sleep(.03)
-                self.assertLessEqual(len(list(debug_dir.glob("frame-*.png"))), 1)
+                # The worker deletes the previous dump and writes the next one every
+                # iteration, so read the bytes the moment a file is there.
+                deadline = time.monotonic() + 1.0
+                name, payload = "", b""
+                while time.monotonic() < deadline and not payload:
+                    for candidate in sorted(debug_dir.glob("frame-*.jpg")):
+                        try:
+                            payload = candidate.read_bytes()
+                        except OSError:
+                            continue
+                        name = candidate.name
+                        break
+                    if not payload:
+                        time.sleep(0.005)
+                self.assertTrue(name.endswith(".jpg"), "debug frames are JPG since image_io")
+                self.assertEqual(payload[:2], b"\xff\xd8", "a real JPEG")
+                self.assertEqual(list(debug_dir.glob("frame-*.png")), [],
+                                 "a legacy PNG dump is swept up, not kept")
             finally:
                 stop.set()
                 worker.join(timeout=.5)
-            self.assertEqual(list(debug_dir.glob("frame-*.png")), [])
+            self.assertEqual(frame_files(debug_dir), [])
 
     def test_capture_window_pixel_region_resolves_bottom_anchor(self) -> None:
         """Bottom-anchored pixel regions must not crash capture_window.

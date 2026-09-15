@@ -24,7 +24,7 @@ NormalizedBox = tuple[float, float, float, float]
 # real client the minimap and the status bars keep the same absolute size at
 # 1920x1080 and 1366x768.  BELOW that width the game scales the whole HUD
 # down (at 1024x768 everything measures ~0.75x: minimap 250x127 -> 187x95,
-# status 370x57 -> 276x33).  All fixed-pixel HUD regions must be scaled by
+# status 538x40 -> 403x30).  All fixed-pixel HUD regions must be scaled by
 # this factor before use.
 HUD_REFERENCE_WIDTH = 1366
 

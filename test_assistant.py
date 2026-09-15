@@ -63,26 +63,42 @@ class StartLiveInputTests(unittest.TestCase):
 
     def test_status_box_is_fixed_pixel_at_or_above_reference_width(self) -> None:
         # 1366px is the HUD reference width; 1920px is above it.  The capture
-        # stays 370x57, bottom-anchored and horizontally centered.
+        # stays 538x40, bottom-anchored, and its centre sits 37px right of the
+        # client centre (the new UI's info bar), so 1366x768 and 1920x1080
+        # (the same UI preset) return the same box.
         self.assertEqual(
             status_capture_pixel_box((1366, 768)),
-            (1366 // 2 - 185, 768 - 57, 1366 // 2 + 185, 768),
+            (1366 // 2 - 269 + 37, 768 - 40, 1366 // 2 + 269 + 37, 768),
         )
         self.assertEqual(
             status_capture_pixel_box((1920, 1080)),
-            (1920 // 2 - 185, 1080 - 57, 1920 // 2 + 185, 1080),
+            (1920 // 2 - 269 + 37, 1080 - 40, 1920 // 2 + 269 + 37, 1080),
+        )
+
+    def test_status_box_is_425x32_on_the_1080x768_preset(self) -> None:
+        # The updated UI measures the info bar at 425x32 on the 1080x768
+        # preset, bottom-anchored and 29px right of the client centre.
+        box = status_capture_pixel_box((1080, 768))
+        self.assertEqual(box[2] - box[0], 425)
+        self.assertEqual(box[3] - box[1], 32)
+        self.assertEqual(box[1], 768 - 32)
+        self.assertEqual(box[3], 768)
+        self.assertAlmostEqual(
+            (box[0] + box[2]) / 2.0, 1080 / 2.0 + 29, delta=1
         )
 
     def test_status_box_scales_below_reference_width(self) -> None:
-        # 1024x768: the whole HUD measures ~0.75x (user-measured status
-        # region 276x33).  The capture scales to round(370*.75)=277 wide and
-        # round(57*.75)=43 tall, still bottom-anchored and centered.
+        # 1024x768: the whole HUD measures ~0.75x.  The capture scales to
+        # round(538*.75)=403 wide and round(40*.75)=30 tall, still
+        # bottom-anchored with the proportional centre offset.
         box = status_capture_pixel_box((1024, 768))
-        self.assertEqual(box[2] - box[0], 277)
-        self.assertEqual(box[3] - box[1], 43)
-        self.assertEqual(box[1], 768 - 43)
+        self.assertEqual(box[2] - box[0], 403)
+        self.assertEqual(box[3] - box[1], 30)
+        self.assertEqual(box[1], 768 - 30)
         self.assertEqual(box[3], 768)
-        self.assertAlmostEqual((box[0] + box[2]) / 2.0, 1024 / 2.0, delta=1)
+        self.assertAlmostEqual(
+            (box[0] + box[2]) / 2.0, 1024 / 2.0 + 28, delta=1
+        )
 
     def test_default_config_path_is_user_owned_file(self) -> None:
         with patch("sys.argv", ["assistant.py"]):
@@ -170,6 +186,55 @@ class StartLiveInputTests(unittest.TestCase):
             _start_live_input(sender, active)
         self.assertEqual(sender.calls, ["select", "verify"])
         self.assertFalse(active.is_set())
+
+    def test_start_reports_success_when_input_is_armed(self) -> None:
+        sender = FakeSender()
+        active = threading.Event()
+        self.assertTrue(_start_live_input(sender, active))
+        self.assertEqual(sender.calls, ["select", "verify", "enable"])
+        self.assertTrue(active.is_set())
+
+    def test_lie_takeover_veto_never_calibrates_or_arms(self) -> None:
+        # 自动过测谎 owns the machine while its sequence runs: a manual Start
+        # Patrol must not even calibrate (that draws a layer-band overlay over
+        # the lie popup and asks the capture thread for extra frames).
+        sender = FakeSender()
+        active = threading.Event()
+        taken_over = threading.Event()
+        taken_over.set()
+        prepared = []
+
+        self.assertFalse(_start_live_input(
+            sender, active,
+            lambda: prepared.append(True),
+            veto_event=taken_over,
+            veto_reason="自动过测谎 takeover is driving the lie pass",
+        ))
+        self.assertEqual(sender.calls, ["select", "verify"])
+        self.assertEqual(prepared, [])
+        self.assertFalse(active.is_set())
+
+    def test_lie_takeover_started_during_calibration_still_arms_nothing(self) -> None:
+        # The alarm can arrive while the Start Patrol capture/calibration runs
+        # on Tk's thread; arming input afterwards is what let the movement
+        # worker walk (and attack) in the middle of a lie pass.
+        sender = FakeSender()
+        active = threading.Event()
+        taken_over = threading.Event()
+        preparing = threading.Event()
+
+        def prepare() -> None:
+            sender.calls.append("prepare-map")
+            taken_over.set()
+
+        self.assertFalse(_start_live_input(
+            sender, active, prepare, preparing,
+            veto_event=taken_over,
+            veto_reason="自动过测谎 takeover is driving the lie pass",
+        ))
+        self.assertEqual(sender.calls, ["select", "verify", "prepare-map"])
+        self.assertFalse(active.is_set())
+        self.assertFalse(preparing.is_set())
 
     def test_stop_disarms_and_requests_game_refocus_for_ui_stop(self) -> None:
         sender = FakeSender()

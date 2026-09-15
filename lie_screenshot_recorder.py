@@ -26,7 +26,7 @@ Decoupling
 
 Output
 ------
-    screenshots/<kind>_YYYYmmdd_HHMMSS/frame_%06d.png   (kind: lie|offline|countdown)
+    screenshots/<kind>_YYYYmmdd_HHMMSS/frame_%06d.jpg   (kind: lie|offline|countdown)
     screenshots/<kind>_YYYYmmdd_HHMMSS/<run>.mp4       (composed when it ends)
 
 When a run finishes, its frames are turned into an mp4 by
@@ -47,6 +47,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+from image_io import frame_files, save_frame, screenshot_name
 
 LOG = logging.getLogger(__name__)
 
@@ -194,9 +196,13 @@ class LieScreenshotRecorder:
                     time.sleep(0.1)
                     continue
                 errors = 0
-                path = run_dir / ("frame_%06d.png" % (saved + 1))
+                path = run_dir / screenshot_name("frame_%06d" % (saved + 1))
                 try:
-                    image.save(path, "PNG")
+                    # JPG q95 instead of PNG: the frames are only ever composed into the
+                    # diagnostic video and then deleted, and one 30s recording wrote 213 PNG
+                    # frames (measured 1033 KB / 28.75 ms each) versus 379 KB / 4.55 ms.
+                    if save_frame(run_dir, "frame_%06d" % (saved + 1), image) is None:
+                        raise OSError("frame could not be written")
                 except Exception as exc:  # pragma: no cover - IO issues
                     LOG.warning("lie-shot: saving %s failed: %s", path, exc)
                 saved += 1
@@ -264,14 +270,14 @@ class LieScreenshotRecorder:
         if self.keep_frames:
             return
         removed = 0
-        for frame_path in run_dir.glob("frame_*.png"):
+        for frame_path in frame_files(run_dir):
             try:
                 frame_path.unlink()
                 removed += 1
             except OSError:
                 pass
         LOG.info(
-            "lie-shot: removed %d png frames (video kept); set keep_frames "
+            "lie-shot: removed %d frame files (video kept); set keep_frames "
             "to keep them",
             removed,
         )

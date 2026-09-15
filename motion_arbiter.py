@@ -40,6 +40,17 @@ JUMP = "jump"
 MICRO_STEP = "micro_step"
 STAIR_JUMP = "stair_jump"
 
+# A tap can be refused by the input layer (game window not foreground, input
+# disarmed, focus stolen mid-tap).  A jump/micro-step is stale by then and is
+# drained, but a periodic buff must NOT be lost: its timer will not ask again
+# for minutes, so the token stays queued and is retried for this long.
+_DELIVERY_RETRY_SECONDS = 6.0
+_DELIVERY_RETRY_DELAY = 0.15
+# A buff that waits for the safe-stage gate logs after this long, so "nothing
+# happened" is never silent (the gate shuts whenever the character is not
+# making a left/right walk decision).
+_GATE_WAIT_WARN_SECONDS = 4.0
+
 
 class MotionArbiter(threading.Thread):
     """One-at-a-time executor for jump/buff motion keys."""
@@ -55,6 +66,7 @@ class MotionArbiter(threading.Thread):
         buff_motion_seconds: float = 0.6,
         micro_step_motion_seconds: float = 0.25,
         attack_grace_seconds: float = 0.73,
+        delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:
         super().__init__(name="motion-arbiter", daemon=True)
         self.key_sender = key_sender
@@ -67,6 +79,9 @@ class MotionArbiter(threading.Thread):
             0.0, float(micro_step_motion_seconds)
         )
         self.attack_grace_seconds = max(0.0, float(attack_grace_seconds))
+        self.delivery_retry_seconds = max(0.0, float(delivery_retry_seconds))
+        # How long a buff may wait for the safe-stage gate before it says so.
+        self.gate_wait_warn_seconds = _GATE_WAIT_WARN_SECONDS
         # Installed after MovementWorker exists.  The arbiter serializes the
         # timing, while movement owns the directional key handoff itself.
         self._micro_step_callback: Any = None
@@ -102,6 +117,11 @@ class MotionArbiter(threading.Thread):
         # pressed Alt.  A failed/aborted queue entry is not a completed stair
         # recovery and must be eligible for a later retry.
         self._stair_jump_completion_callbacks: dict[str, list[Any]] = {}
+        # Delivery retry bookkeeping for taps that were refused by the input
+        # layer (see _DELIVERY_RETRY_SECONDS).
+        self._delivery_deadline: dict[str, float] = {}
+        # Why the last request/execution was refused, for the callers' logs.
+        self._last_refusal = ""
 
     # ------------------------------------------------------------------ #
     # Registration (any thread)                                          #
@@ -111,9 +131,14 @@ class MotionArbiter(threading.Thread):
         """Queue one jump (Alt tap). Duplicate pending jumps collapse."""
 
         with self._cv:
-            if (not self._automation_allowed_locked()
-                    or not self._motion_gate_allows_locked()
-                    or self._stair_recovery_locked):
+            if not self._automation_allowed_locked():
+                self._set_refusal_locked("automation inactive (stop or patrol off)")
+                return False
+            if not self._motion_gate_allows_locked():
+                self._set_refusal_locked("movement is not in a walkable stage")
+                return False
+            if self._stair_recovery_locked:
+                self._set_refusal_locked("stair recovery owns Alt")
                 return False
             if JUMP in self._queued:
                 return True
@@ -166,8 +191,11 @@ class MotionArbiter(threading.Thread):
         """Queue one Left/Right micro-step; duplicate requests collapse."""
 
         with self._cv:
-            if (not self._automation_allowed_locked()
-                    or not self._motion_gate_allows_locked()):
+            if not self._automation_allowed_locked():
+                self._set_refusal_locked("automation inactive (stop or patrol off)")
+                return False
+            if not self._motion_gate_allows_locked():
+                self._set_refusal_locked("movement is not in a walkable stage")
                 return False
             if MICRO_STEP in self._queued:
                 return True
@@ -233,6 +261,17 @@ class MotionArbiter(threading.Thread):
 
         with self._cv:
             self._motion_gate_callback = callback
+
+    def _set_refusal_locked(self, reason: str) -> None:
+        """Record why the arbiter refused (so caller logs can name it)."""
+
+        self._last_refusal = reason
+
+    def last_refusal(self) -> str:
+        """Why the most recent request/execution was refused ('' when none)."""
+
+        with self._cv:
+            return self._last_refusal
 
     def _automation_allowed_locked(self) -> bool:
         return bool(
@@ -372,6 +411,8 @@ class MotionArbiter(threading.Thread):
         # here as well as at registration because it may have been queued just
         # before the automation gate was cleared.
         is_stair_jump = token.startswith(f"{STAIR_JUMP}:")
+        waiting_since = time.monotonic()
+        wait_warned_at = 0.0
         with self._cv:
             while not self.stop_event.is_set():
                 if not self._automation_allowed_locked():
@@ -383,6 +424,22 @@ class MotionArbiter(threading.Thread):
                     if token.startswith("buff:"):
                         # A buff stays registered through climb/drop/landing
                         # and wakes itself as soon as ordinary travel returns.
+                        # It must never wait silently: this is the one state
+                        # where the log shows nothing at all while a buff that
+                        # was due minutes ago never fires.
+                        now = time.monotonic()
+                        if (now - waiting_since >= self.gate_wait_warn_seconds
+                                and now - wait_warned_at
+                                >= self.gate_wait_warn_seconds):
+                            wait_warned_at = now
+                            LOG.warning(
+                                "motion arbiter waiting %.1fs to emit %s: "
+                                "movement reports no safe walking stage "
+                                "(the gate stays shut while the character is "
+                                "not making a left/right walk decision)",
+                                now - waiting_since,
+                                token,
+                            )
                         self._cv.wait(0.10)
                         continue
                     callbacks = self._pop_locked(token)
@@ -510,7 +567,9 @@ class MotionArbiter(threading.Thread):
                          self._duration_for(token))
                 self.stop_event.wait(self._duration_for(token))
             else:
-                LOG.warning("motion arbiter micro-step blocked; event drained")
+                LOG.warning(
+                    "motion arbiter micro-step NOT delivered; event drained"
+                )
             return
         else:
             key = token.partition(":")[2]
@@ -527,13 +586,13 @@ class MotionArbiter(threading.Thread):
                 tap_ok = self.key_sender.tap(key) is not False
         except Exception:
             LOG.exception("motion arbiter tap failed key=%s", key)
-        with self._cv:
-            callbacks = self._pop_locked(token)
-            self._executing_token = None
-            if tap_ok:
-                self._busy_until = time.monotonic() + self._duration_for(token)
-            self._cv.notify_all()
         if tap_ok:
+            with self._cv:
+                callbacks = self._pop_locked(token)
+                self._delivery_deadline.pop(token, None)
+                self._executing_token = None
+                self._busy_until = time.monotonic() + self._duration_for(token)
+                self._cv.notify_all()
             duration = self._duration_for(token)
             LOG.info("motion arbiter executed %s (lock %.2fs)", token, duration)
             if duration > 0:
@@ -542,11 +601,43 @@ class MotionArbiter(threading.Thread):
             self._notify_buff_completion(
                 callbacks, not self.stop_event.is_set()
             )
-        else:
-            # Input disabled / window not foreground: drain fast, no window.
-            LOG.warning("motion arbiter tap blocked key=%s; event drained",
-                        key)
-            self._notify_buff_completion(callbacks, False)
+            return
+        # The input layer refused the tap (game window not foreground, input
+        # disarmed, or the focus was stolen mid-tap).  Measured in the field:
+        # a tap can be "sent" and still do nothing, so it must be retried - and
+        # a periodic buff in particular must not be lost, because its timer
+        # will not ask again for minutes.
+        now = time.monotonic()
+        deadline = self._delivery_deadline.setdefault(
+            token, now + self.delivery_retry_seconds
+        )
+        keep_queued = (
+            token.startswith("buff:")
+            and now < deadline
+            and not self.stop_event.is_set()
+        )
+        with self._cv:
+            self._executing_token = None
+            if keep_queued:
+                self._cv.notify_all()
+                callbacks = []
+            else:
+                callbacks = self._pop_locked(token)
+                self._delivery_deadline.pop(token, None)
+                self._cv.notify_all()
+        if keep_queued:
+            LOG.warning(
+                "motion arbiter could NOT deliver %s; kept queued and retried "
+                "(%.1fs left)",
+                token, max(0.0, deadline - now),
+            )
+            self.stop_event.wait(_DELIVERY_RETRY_DELAY)
+            return
+        LOG.warning(
+            "motion arbiter NOT delivered %s (key=%s); event drained",
+            token, key,
+        )
+        self._notify_buff_completion(callbacks, False)
 
 
 __all__ = ["MotionArbiter"]

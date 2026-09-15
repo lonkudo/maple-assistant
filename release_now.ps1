@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     One-command full checkpoint: optionally run tests, then rebuild the
-    distributable folder and four-digit versioned zip.
+    CPU and CUDA distributable folders and four-digit versioned zips.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File release_now.ps1
@@ -90,22 +90,45 @@ if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes
     )
     Write-Host "build_release.ps1 BOM re-added (UTF-8 with BOM)" -ForegroundColor Yellow
 }
-& powershell -NoProfile -ExecutionPolicy Bypass `
-    -File $buildScript -Version $version -Zip 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Restore-VersionFile
-    Write-Host "build_release.ps1 FAILED" -ForegroundColor Red
-    exit 1
+$zips = @()
+foreach ($variant in @("cpu", "cuda")) {
+    Write-Host "building $($variant.ToUpperInvariant()) package..." -ForegroundColor Cyan
+    & powershell -NoProfile -ExecutionPolicy Bypass `
+        -File $buildScript -Version $version -Variant $variant -Zip 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Restore-VersionFile
+        Write-Host "build_release.ps1 FAILED for $variant" -ForegroundColor Red
+        exit 1
+    }
+
+    $tag = $variant.ToUpperInvariant()
+    $zip = Get-Item -LiteralPath (
+        Join-Path $root "release\MapleAssistant-$tag-v$version.zip"
+    ) -ErrorAction SilentlyContinue
+    if ($null -eq $zip) {
+        Restore-VersionFile
+        Write-Host "no $tag zip was produced under release\" -ForegroundColor Red
+        exit 1
+    }
+    $zips += $zip
 }
 
-$zip = Get-Item -LiteralPath (
-    Join-Path $root "release\MapleAssistant-v$version.zip"
-) -ErrorAction SilentlyContinue
-if ($null -eq $zip) {
-    Restore-VersionFile
-    Write-Host "no zip was produced under release\" -ForegroundColor Red
-    exit 1
+$zips | ForEach-Object {
+    Write-Host ("release ready: " + $_.FullName) -ForegroundColor Green
 }
 
-Write-Host ("release ready: " + $zip.FullName) -ForegroundColor Green
+# Keep only the just-created CPU/CUDA packages.  Cleanup happens after both
+# builds succeed, so a failed release never destroys the last usable pair.
+$keep = @{}
+$zips | ForEach-Object { $keep[$_.FullName] = $true }
+Get-ChildItem (Join-Path $root "release") -File -Filter "MapleAssistant-*-v*.zip" |
+    Where-Object { -not $keep.ContainsKey($_.FullName) } |
+    ForEach-Object {
+        try {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+            Write-Host ("removed previous package: " + $_.Name) -ForegroundColor DarkGray
+        } catch {
+            Write-Warning ("could not remove previous package (it may be open): " + $_.Name)
+        }
+    }
 exit 0

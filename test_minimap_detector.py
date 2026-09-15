@@ -112,6 +112,17 @@ class MinimapDetectorTests(unittest.TestCase):
         self.assertGreater(large.pixel_size[0], small.pixel_size[0])
         self.assertGreater(large.pixel_size[1], small.pixel_size[1])
 
+    def test_diamond_detector_accepts_compact_three_by_three_core(self) -> None:
+        """Current minimap rendering may reduce the marker to a 3x3 core."""
+        import numpy as np
+
+        image = np.zeros((90, 120, 3), dtype=np.uint8)
+        image[44:47, 59:62] = (255, 255, 136)
+        marker = detect_yellow_diamond(image)
+        self.assertIsNotNone(marker)
+        self.assertAlmostEqual(marker.x, .5, places=2)
+        self.assertAlmostEqual(marker.y, .5, places=2)
+
     def test_diamond_detector_accepts_pure_and_bright_yellow(self) -> None:
         """The live marker is a RANGE of yellows, not one exact color.
 

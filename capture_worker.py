@@ -17,6 +17,7 @@ from typing import Callable, Iterable, Optional, Tuple
 
 from PIL import Image, ImageDraw
 
+from image_io import frame_files, save_screenshot, screenshot_name
 from minimap_detector import hud_scale_for
 
 
@@ -251,6 +252,11 @@ class CaptureWorker(threading.Thread):
         capture_enabled_event: Optional[threading.Event] = None,
         fast_capture_event: Optional[threading.Event] = None,
         fast_interval: float = 0.10,
+        # Lie-pass ultra-fast cadence: while its event is set the capture runs at
+        # this interval, so a lie pass is fed at ~30 fps (the removed local pass
+        # used it; the API pass raises the same event for its bursts).
+        lie_capture_event: Optional[threading.Event] = None,
+        lie_interval: float = 1.0 / 30.0,
         # === ADDED DEBUG FLAG ===
         debug_draw_regions: bool = False,
         # Reference-size ABSOLUTE client pixels of the minimap search ROI
@@ -278,6 +284,8 @@ class CaptureWorker(threading.Thread):
         self.capture_enabled_event = capture_enabled_event
         self.fast_capture_event = fast_capture_event
         self.fast_interval = max(0.02, min(float(fast_interval), self.interval))
+        self.lie_capture_event = lie_capture_event
+        self.lie_interval = max(0.02, min(float(lie_interval), self.interval))
         self._uses_default_capture = capture_fn is None
         self.log = logging.getLogger(__name__)
         self._last_debug_path: Optional[Path] = None
@@ -287,6 +295,11 @@ class CaptureWorker(threading.Thread):
         self.debug_minimap_fallback = debug_minimap_fallback
 
     def active_interval(self) -> float:
+        # The lie-pass cadence has the highest priority: a pass
+        # needs ~30 fps while it drives the cursor.
+        if (self.lie_capture_event is not None
+                and self.lie_capture_event.is_set()):
+            return self.lie_interval
         if self.fast_capture_event is not None and self.fast_capture_event.is_set():
             return self.fast_interval
         return self.interval
@@ -485,7 +498,7 @@ class CaptureWorker(threading.Thread):
     def _save_debug_frame(self, frame: CapturedFrame) -> None:
         assert self.debug_dir is not None
         stamp = frame.captured_at.strftime("%Y%m%dT%H%M%S.%fZ")
-        path = self.debug_dir / f"frame-{frame.sequence:06d}-{stamp}.png"
+        path = self.debug_dir / screenshot_name(f"frame-{frame.sequence:06d}-{stamp}")
         previous = self._last_debug_path
         self._last_debug_path = None
         if previous is not None and previous != path:
@@ -494,11 +507,11 @@ class CaptureWorker(threading.Thread):
             except OSError:
                 self.log.warning("could not remove used debug frame %s", previous,
                                  exc_info=True)
-        try:
-            frame.image.save(path, format="PNG")
-            self._last_debug_path = path
-        except Exception:
-            self.log.exception("could not save debug frame %s", path)
+        # JPG, not PNG: measured 4.55 ms vs 28.75 ms per 1366x768 frame and 379 KB vs
+        # 1033 KB (see image_io).  Nothing matches against a debug dump.
+        saved = save_screenshot(path, frame.image)
+        if saved is not None:
+            self._last_debug_path = saved
 
     def _remove_last_debug_frame(self) -> None:
         path = self._last_debug_path
@@ -512,10 +525,16 @@ class CaptureWorker(threading.Thread):
                              exc_info=True)
 
     def _remove_stale_debug_frames(self) -> None:
-        """Remove only screenshots created by an earlier interrupted run."""
+        """Remove screenshots left by an earlier interrupted run.
+
+        JPG is the project format, and a PNG dump from a release before the switch is
+        swept up too so it does not linger forever.
+        """
 
         assert self.debug_dir is not None
-        for path in self.debug_dir.glob("frame-*.png"):
+        stale = list(frame_files(self.debug_dir))
+        stale.extend(self.debug_dir.glob("frame-*.png"))
+        for path in stale:
             try:
                 if path.is_file() and not path.is_symlink():
                     path.unlink()

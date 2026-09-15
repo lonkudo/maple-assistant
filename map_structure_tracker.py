@@ -25,7 +25,9 @@ def _write_image_unicode_safe(path: Path, image: np.ndarray) -> None:
     ``Path.write_bytes`` keeps the path in Python's Unicode-aware layer.
     """
 
-    ok, encoded = cv2.imencode(".png", image)
+    # JPG (q95): the project is JPG only; the reference is matched by correlation.
+    ok, encoded = cv2.imencode(".jpg", image,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not ok:
         raise OSError(f"could not encode image for {path}")
     path.write_bytes(encoded.tobytes())

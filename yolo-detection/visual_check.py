@@ -27,7 +27,7 @@ import mss
 
 from auto import OptimizedMapleBot
 
-OUTPUT = "detection_visual.png"
+OUTPUT = "detection_visual.jpg"
 
 
 def find_game_window() -> dict:
@@ -137,7 +137,7 @@ def main() -> int:
         print(f"  mob conf={d.confidence:.2f} box={d.bbox}")
 
     preview = bot._draw_detections(img.copy(), detections)
-    cv2.imwrite(OUTPUT, preview)
+    cv2.imwrite(OUTPUT, preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
     print(f"Saved visual result: {OUTPUT}")
 
     # Show the window briefly and auto-close so no stale windows pile up.

@@ -32,11 +32,20 @@ from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
 from countdown_worker import play_mp3
+from reconnect_worker import (
+    CALIBRATION_STEPS,
+    CHANNEL_DEFAULT,
+    CHANNEL_MAX,
+    CHANNEL_MIN,
+    WORLD_NAMES,
+    valid_channel,
+)
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
 from update_manager import (
     UpdateError, apply_desktop_update, export_user_config, import_user_config,
     find_newer_desktop_update,
+    remove_consumed_update_package,
     schedule_hidden_restart,
 )
 
@@ -58,6 +67,15 @@ _INITIAL_WINDOW_HEIGHT = 560
 # (keeping the OS resize borders and taskbar entry) and draws its own title
 # row: app title on the left, then ？/－/□/× on the right at the same level.
 _CAPTION_HEIGHT = 34
+
+# Time between pressing 标定选择窗口 and reading the mouse position: the operator needs to
+# move the cursor from the panel onto the game.
+RECONNECT_CALIBRATION_DELAY_SECONDS = 3.0
+
+# 测试api on a video: the operator's measured run length is ~30s at the API's 5 fps, and the panel
+# no longer offers a box for it (the 密钥 button is gone too: the product key ships inside the
+# application, see autolie_api/key_store.py).
+API_TEST_VIDEO_SECONDS = 30.0
 
 
 def tooltip_cursor_top_right_position(
@@ -387,7 +405,8 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
     """16x16 monochrome glyph for the running-log action buttons.
 
     ``archive`` = a document sheet (copy the running log); ``user`` = a
-    person silhouette (copy the user settings).  Drawn with PIL so the
+    person silhouette (copy the user settings); ``error`` = an alert
+    triangle with "!" (copy the root error.log).  Drawn with PIL so the
     glyphs render identically on every Windows theme/font set.
     """
 
@@ -406,6 +425,11 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
         # Head + shoulders silhouette.
         draw.ellipse((4, 1, 12, 9), outline=ink)
         draw.arc((1, 8, 15, 20), start=180, end=360, fill=ink)
+    elif kind == "error":
+        # Alert triangle with an exclamation mark (copy error.log).
+        draw.polygon(((8, 1), (15, 14), (1, 14)), fill=paper, outline=ink)
+        draw.line((8, 5, 8, 10), fill=ink)
+        draw.point((8, 12), fill=ink)
     else:
         raise ValueError(f"unknown log icon kind: {kind!r}")
     # The UI is built on an explicit Tk root.  Letting ImageTk choose the
@@ -663,6 +687,14 @@ class UiWorker(threading.Thread):
     _SHOW_SHUTDOWN_PANEL = False
     _FIXED_RANDOM_GAP_STEP = 0.1
     _FIXED_RANDOM_GAP_MAX = 30.0
+    # A DOUBLE click on a 随机 −/+ button moves the gap by this much in one go
+    # (five seconds instead of 0.1), while a single click keeps the precise fine
+    # step and holding keeps repeating it.
+    _RANDOM_GAP_COARSE_STEP = 5.0
+    # Two presses closer together than this belong to one click sequence, so a
+    # double click measures its 5 s from the value the sequence started at and
+    # the fine step of the first press cannot leave 5.1 s behind.
+    _RANDOM_GAP_CLICK_SEQUENCE_SECONDS = 0.35
 
     def __init__(
         self,
@@ -684,6 +716,10 @@ class UiWorker(threading.Thread):
         hotkey_worker: Any = None,
         quick_pickup_worker: Any = None,
         quick_pickup_results: Optional["queue.Queue[tuple[str, str]]"] = None,
+        reconnect_worker: Any = None,
+        reconnect_results: Optional["queue.Queue[tuple[str, str]]"] = None,
+        api_test_video_factory: Optional[Callable[..., Any]] = None,
+        api_test_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         trade_worker: Any = None,
         movement_worker: Any = None,
         character_worker: Any = None,
@@ -730,6 +766,25 @@ class UiWorker(threading.Thread):
         # cannot arm the normal patrol automation workers.
         self.quick_pickup_worker = quick_pickup_worker
         self.quick_pickup_results = quick_pickup_results
+        # 自动重连: armed from the Additional Functions panel, triggered by the 掉线
+        # event and confirmed by the login-page template check.
+        self.reconnect_worker = reconnect_worker
+        self.reconnect_results = reconnect_results
+        # 测试api: one factory that builds a drill thread per press (a thread cannot restart), plus
+        # the queue its progress lines arrive on.  The only drill is the video one: the button picks
+        # a video file and plays it in its own focused window, so the mouse stays inside the picture
+        # and never touches the game.
+        self.api_test_video_factory = api_test_video_factory
+        self.api_test_results = api_test_results
+        self.api_test_worker: Any = None
+        self.api_test_window: Any = None            # the video window (Tk Toplevel)
+        self.api_test_video: str = ""              # the file the current drill plays
+        self._api_test_video_dir = ""              # last folder, remembered for the picker
+        self._api_test_display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
+        self._api_test_keep_focus_at = 0.0
+        # No panel key: the product key ships with the application, so this stays empty and
+        # load_product_key falls back to LIE_PRODUCT_KEY then autolie_api/key_secret.txt.
+        self._api_test_key = ""
         # Isolated Ctrl+Q/Ctrl+W trade workflow.  It uses the existing game
         # capture worker only while checking for a trader.
         self.trade_worker = trade_worker
@@ -747,7 +802,9 @@ class UiWorker(threading.Thread):
         # this reference only exposes its interval/deadline to the UI.
         self.countdown_worker = countdown_worker
         # Five-second white-square detector fed by the existing full-client
-        # capture bus. It never creates screenshot files.
+        # capture bus. It never creates screenshot files.  The local lie pass it
+        # used to feed is gone (lie detection is remote now), so it drives only
+        # the 测谎 alarm and the screenshot recorder.
         self.lie_detector_worker = lie_detector_worker
         # Shared visual counterpart to every optional beep alert.
         self.screen_blinker = screen_blinker
@@ -821,7 +878,7 @@ class UiWorker(threading.Thread):
             root.withdraw()
             self._root = root
             app_version = version_label()
-            root.title(f"Maple 助手 ({app_version})")
+            root.title(f"todo_helper ({app_version})")
             screen_width = root.winfo_screenwidth()
             screen_height = root.winfo_screenheight()
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
@@ -1225,11 +1282,12 @@ class UiWorker(threading.Thread):
                 command=self._fixed_on_mode_change,
             ).pack(side="left")
             ttk.Radiobutton(
-                mode_row, text="跳跃攻击", value="jump_attack",
+                mode_row, text="站桩攻击", value="stationary",
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(0, 8))
             fixed_key_row = ttk.Frame(fixed_panel)
+            self._fixed_key_row = fixed_key_row
             fixed_key_row.pack(fill="x", pady=(6, 0))
             # Keep the original left-to-right gadget sequence together, then
             # right-align that complete sequence in every attack row.
@@ -1243,7 +1301,13 @@ class UiWorker(threading.Thread):
                 fixed_random_group, text="−", width=2,
             )
             self._bind_repeat_step_button(
-                fixed_gap_minus, lambda: self._fixed_adjust_random_gap(-0.1)
+                fixed_gap_minus,
+                lambda: self._fixed_adjust_random_gap(-0.1),
+                current=self._fixed_random_gap_seconds,
+                coarse=lambda anchor: self._set_fixed_random_gap(
+                    (self._fixed_random_gap_seconds() if anchor is None
+                     else anchor) - self._RANDOM_GAP_COARSE_STEP
+                ),
             )
             fixed_gap_minus.pack(side="left", padx=(3, 2))
             self._fixed_random_gap_label = ttk.Label(
@@ -1252,7 +1316,13 @@ class UiWorker(threading.Thread):
             self._fixed_random_gap_label.pack(side="left")
             fixed_gap_plus = ttk.Button(fixed_random_group, text="+", width=2)
             self._bind_repeat_step_button(
-                fixed_gap_plus, lambda: self._fixed_adjust_random_gap(0.1)
+                fixed_gap_plus,
+                lambda: self._fixed_adjust_random_gap(0.1),
+                current=self._fixed_random_gap_seconds,
+                coarse=lambda anchor: self._set_fixed_random_gap(
+                    (self._fixed_random_gap_seconds() if anchor is None
+                     else anchor) + self._RANDOM_GAP_COARSE_STEP
+                ),
             )
             fixed_gap_plus.pack(side="left", padx=(2, 0))
 
@@ -1297,6 +1367,18 @@ class UiWorker(threading.Thread):
             self._fixed_interval_group = fixed_interval_group
             fixed_random_group.pack(side="left", padx=(4, 0))
 
+            # Former 跳跃攻击 is a 站桩攻击 child option, not a peer mode.
+            # It belongs directly below the 按键 row and starts at the panel's
+            # left edge, matching the other optional controls.
+            stationary_jump_row = ttk.Frame(fixed_panel)
+            self._stationary_jump_row = stationary_jump_row
+            self._stationary_jump_enabled_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                stationary_jump_row, text="跳打",
+                variable=self._stationary_jump_enabled_var,
+                command=self._fixed_on_change,
+            ).pack(side="left")
+
             jump_row = ttk.Frame(fixed_panel)
             jump_row.pack(fill="x", pady=(6, 0))
             self._jump_row = jump_row
@@ -1307,7 +1389,13 @@ class UiWorker(threading.Thread):
             self._random_jump_gap_var = tk.DoubleVar(value=0.1)
             jump_gap_minus = ttk.Button(jump_random_group, text="−", width=2)
             self._bind_repeat_step_button(
-                jump_gap_minus, lambda: self._random_jump_adjust_gap(-0.1)
+                jump_gap_minus,
+                lambda: self._random_jump_adjust_gap(-0.1),
+                current=self._random_jump_gap_seconds,
+                coarse=lambda anchor: self._set_random_jump_gap(
+                    (self._random_jump_gap_seconds() if anchor is None
+                     else anchor) - self._RANDOM_GAP_COARSE_STEP
+                ),
             )
             jump_gap_minus.pack(side="left", padx=(3, 2))
             self._random_jump_gap_label = ttk.Label(
@@ -1316,7 +1404,13 @@ class UiWorker(threading.Thread):
             self._random_jump_gap_label.pack(side="left")
             jump_gap_plus = ttk.Button(jump_random_group, text="+", width=2)
             self._bind_repeat_step_button(
-                jump_gap_plus, lambda: self._random_jump_adjust_gap(0.1)
+                jump_gap_plus,
+                lambda: self._random_jump_adjust_gap(0.1),
+                current=self._random_jump_gap_seconds,
+                coarse=lambda anchor: self._set_random_jump_gap(
+                    (self._random_jump_gap_seconds() if anchor is None
+                     else anchor) + self._RANDOM_GAP_COARSE_STEP
+                ),
             )
             jump_gap_plus.pack(side="left", padx=(2, 0))
 
@@ -1328,7 +1422,7 @@ class UiWorker(threading.Thread):
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 2))
             ttk.Checkbutton(
-                jump_row, text="跳跃", width=5,
+                jump_row, text="随机跳", width=6,
                 variable=self._random_jump_enabled_var,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 4))
@@ -1337,9 +1431,11 @@ class UiWorker(threading.Thread):
             ttk.Label(jump_interval_group, text="每").pack(side="left")
             self._random_jump_interval_var = tk.DoubleVar(value=3.0)
             # Jump motion occupies 0.9s, so the minimum trigger interval is
-            # 1.0s (a faster repeat would pile up stale jump events).
+            # 1.0s (a faster repeat would pile up stale jump events).  The base
+            # range reaches 30 s like the 小碎步 row, matching the 随机 ceiling.
             ttk.Scale(
-                jump_interval_group, from_=1.0, to=10.0, orient="horizontal",
+                jump_interval_group, from_=1.0, to=self._FIXED_RANDOM_GAP_MAX,
+                orient="horizontal",
                 variable=self._random_jump_interval_var, length=82,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 2))
@@ -1362,7 +1458,13 @@ class UiWorker(threading.Thread):
             self._small_step_gap_var = tk.DoubleVar(value=0.1)
             step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
             self._bind_repeat_step_button(
-                step_gap_minus, lambda: self._small_step_adjust_gap(-0.1)
+                step_gap_minus,
+                lambda: self._small_step_adjust_gap(-0.1),
+                current=self._small_step_gap_seconds,
+                coarse=lambda anchor: self._set_small_step_gap(
+                    (self._small_step_gap_seconds() if anchor is None
+                     else anchor) - self._RANDOM_GAP_COARSE_STEP
+                ),
             )
             step_gap_minus.pack(side="left", padx=(3, 2))
             self._small_step_gap_label = ttk.Label(
@@ -1371,7 +1473,13 @@ class UiWorker(threading.Thread):
             self._small_step_gap_label.pack(side="left")
             step_gap_plus = ttk.Button(step_random_group, text="+", width=2)
             self._bind_repeat_step_button(
-                step_gap_plus, lambda: self._small_step_adjust_gap(0.1)
+                step_gap_plus,
+                lambda: self._small_step_adjust_gap(0.1),
+                current=self._small_step_gap_seconds,
+                coarse=lambda anchor: self._set_small_step_gap(
+                    (self._small_step_gap_seconds() if anchor is None
+                     else anchor) + self._RANDOM_GAP_COARSE_STEP
+                ),
             )
             step_gap_plus.pack(side="left", padx=(2, 0))
             self._small_step_enabled_var = tk.BooleanVar(value=False)
@@ -1392,7 +1500,8 @@ class UiWorker(threading.Thread):
             ttk.Label(step_interval_group, text="每").pack(side="left")
             self._small_step_interval_var = tk.DoubleVar(value=5.0)
             ttk.Scale(
-                step_interval_group, from_=3.0, to=30.0, orient="horizontal",
+                step_interval_group, from_=3.0, to=self._FIXED_RANDOM_GAP_MAX,
+                orient="horizontal",
                 variable=self._small_step_interval_var, length=82,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 2))
@@ -1698,7 +1807,7 @@ class UiWorker(threading.Thread):
                 alarm_row,
                 text="测谎",
                 variable=self._lie_alert_var,
-                command=self._shutdown_on_change,
+                command=self._on_lie_alert_change,
             ).pack(side="left", padx=(0, 6))
 
             self._countdown_enabled_var = tk.BooleanVar(value=False)
@@ -1812,6 +1921,113 @@ class UiWorker(threading.Thread):
             )
             self._telegram_status.pack(anchor="w", pady=(4, 0))
 
+            # 自动重连: a selection plus its two settings (which world, which channel).
+            # 掉线 (the character detector's event) is only the FIRST sign; the worker
+            # confirms it by the login page's BASE COLOUR (screenshots/login_page_target.jpg
+            # is the colour reference).  Ticking the box only arms the worker - the drill
+            # starts on a 掉线 event or on the temporary 测试重连 button below.
+            saved_reconnect_enabled, saved_world, saved_channel = (
+                self._load_reconnect_settings()
+            )
+            reconnect_row = ttk.Frame(extra_panel)
+            reconnect_row.pack(fill="x", pady=(4, 0))
+            self._reconnect_var = tk.BooleanVar(value=saved_reconnect_enabled)
+            ttk.Checkbutton(
+                reconnect_row,
+                text="自动重连",
+                variable=self._reconnect_var,
+                command=self._reconnect_on_change,
+            ).pack(side="left")
+            self._reconnect_world_var = tk.StringVar(value=saved_world)
+            self._reconnect_world_box = ttk.Combobox(
+                reconnect_row,
+                textvariable=self._reconnect_world_var,
+                values=list(WORLD_NAMES),
+                state="readonly",
+                width=7,
+            )
+            self._reconnect_world_box.pack(side="left", padx=(6, 4))
+            self._reconnect_world_box.bind(
+                "<<ComboboxSelected>>", lambda _event: self._reconnect_on_change()
+            )
+            ttk.Label(reconnect_row, text="频道").pack(side="left")
+            # Only an integer 1-60 may be typed (validated again on every change).
+            channel_check = self._register_validator(
+                reconnect_row, self._validate_reconnect_channel
+            )
+            self._reconnect_channel_var = tk.StringVar(value=str(saved_channel))
+            self._reconnect_channel_box = ttk.Spinbox(
+                reconnect_row,
+                from_=CHANNEL_MIN,
+                to=CHANNEL_MAX,
+                width=4,
+                textvariable=self._reconnect_channel_var,
+                validate="key",
+                validatecommand=channel_check,
+                command=self._reconnect_on_change,
+            )
+            self._reconnect_channel_box.pack(side="left", padx=(4, 0))
+            self._reconnect_channel_box.bind(
+                "<FocusOut>", lambda _event: self._reconnect_on_change()
+            )
+            self._reconnect_status = ttk.Label(
+                extra_panel,
+                text=("自动重连: 已启用 - %s %d频道。" % (saved_world, saved_channel)
+                      if saved_reconnect_enabled else "自动重连: 未启用。"),
+                justify="left",
+                wraplength=440,
+            )
+            self._reconnect_status.pack(anchor="w", pady=(2, 0))
+            # TEMPORARY (testing aid): run the whole reconnect sequence immediately, so the
+            # operator can check Enter -> 3s -> world -> channel -> Enter -> 2s -> Enter
+            # without waiting for a real 掉线.  The second button saves one frame of the game
+            # window: the select-window geometry has to be measured from a real frame, and the
+            # game (and therefore the frame) only exists on the operator's machine.
+            reconnect_buttons = ttk.Frame(extra_panel)
+            reconnect_buttons.pack(anchor="w", pady=(2, 0))
+            self._reconnect_test_button = ttk.Button(
+                reconnect_buttons,
+                text="测试自动重连（临时）",
+                command=self._reconnect_test_clicked,
+            )
+            self._reconnect_test_button.pack(side="left")
+            self._reconnect_capture_button = ttk.Button(
+                reconnect_buttons,
+                text="截取游戏窗口",
+                command=self._reconnect_capture_clicked,
+            )
+            self._reconnect_capture_button.pack(side="left", padx=(6, 0))
+            # 测试api: pick a video file, play it in its own focused window and send each frame's
+            # ROI (372x248 jpeg90 base64) to the RoiTrack backend at the API's 5 fps, showing every
+            # answer.  The mouse is confined to the picture rectangle, so it never touches the game.
+            # One button only: the run length is the measured ~30s and the product key travels with
+            # the application (autolie_api/key_secret.txt, or LIE_PRODUCT_KEY), so there is nothing
+            # for the operator to configure here.
+            api_row = ttk.Frame(extra_panel)
+            api_row.pack(fill="x", pady=(4, 0))
+            self._api_test_button = ttk.Button(
+                api_row, text="测试api", command=self._api_test_clicked,
+            )
+            self._api_test_button.pack(side="left")
+            self._api_test_status = ttk.Label(
+                extra_panel, text=self._api_test_status_text(),
+                justify="left", wraplength=440,
+            )
+            self._api_test_status.pack(anchor="w", pady=(2, 0))
+            # 标定: record where the world rows and channel circles really are.  Five presses,
+            # each with a 3s countdown so the mouse can be moved onto the game; the worker
+            # writes reconnect_layout.json and the drill can then click for real.
+            self._reconnect_calibrate_button = ttk.Button(
+                reconnect_buttons,
+                text="标定选择窗口",
+                command=self._reconnect_calibrate_clicked,
+            )
+            self._reconnect_calibrate_button.pack(side="left", padx=(6, 0))
+            if saved_reconnect_enabled:
+                # apply the saved values to the worker once it exists (Tk's own timer:
+                # the UiWorker is not a Tk object)
+                self._root.after(200, self._reconnect_on_change)
+
             # Other-player safety net is intentionally the final row. It is
             # a selection (enable/disable), not a manual trigger button.
             player_row = ttk.Frame(extra_panel)
@@ -1823,6 +2039,10 @@ class UiWorker(threading.Thread):
                 variable=self._player_check_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
+
+            # 自动过测谎 (the local Cutie/YOLO lie pass) is gone: lie detection is done by the
+            # remote RoiTrack service through 测试api (see api_lie_video.py), so neither the
+            # checkbox, the CPU/CUDA testers nor the demo player exist any more.
             self._shutdown_load_settings()
 
             # Minimap / map-name preview widgets: built but hidden by default
@@ -1867,6 +2087,14 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._copy_log_button.pack(side="left", padx=(0, 3))
+            self._log_error_photo = _make_log_icon("error", root)
+            self._copy_error_button = ttk.Button(
+                log_actions,
+                image=self._log_error_photo,
+                command=self._copy_error_log,
+                takefocus=False,
+            )
+            self._copy_error_button.pack(side="left", padx=(0, 3))
             self._import_config_button.pack(side="left", padx=(0, 3))
             self._export_config_button.pack(side="left")
             self._log_display_lines: list[str] = []
@@ -1963,7 +2191,7 @@ class UiWorker(threading.Thread):
         self._caption_separator = separator
 
         title = tk.Label(
-            bar, text=f"Maple 助手 ({app_version})", bg="#f0f0f0",
+            bar, text=f"todo_helper ({app_version})", bg="#f0f0f0",
             anchor="w",
         )
         title.pack(side="left", padx=(10, 0))
@@ -2008,14 +2236,43 @@ class UiWorker(threading.Thread):
             widget.bind("<B1-Motion>", _motion)
             widget.bind("<ButtonRelease-1>", _release)
 
+    def _schedule_restart(self) -> bool:
+        """Start the hidden restart helper; False when it could not start.
+
+        Shared by 更新 (a new package was applied) and 导入配置 (the imported
+        settings are only read at startup).  The helper waits for this process
+        to exit and then relaunches through the package launcher.
+        """
+
+        try:
+            schedule_hidden_restart(Path(__file__).resolve().parent)
+        except UpdateError as exc:
+            LOG.warning("自动重启失败：%s", exc)
+            return False
+        return True
+
+    def _close_for_restart(self) -> None:
+        """Stop live input and close this instance for the scheduled restart."""
+
+        # Stop live input before the helper starts a clean elevated instance.
+        self._stop_patrol()
+        root = getattr(self, "_root", None)
+        if root is not None:
+            root.after(250, self._on_debug_window_close)
+
     def _check_desktop_update(self) -> None:
-        """Find and apply the highest newer Desktop release on user request."""
+        """Find and apply the highest newer nearby/Desktop release on request."""
 
         install_root = Path(__file__).resolve().parent
         current = read_version(install_root / "VERSION")
-        LOG.info("更新：正在桌面查找比 v%s 更新的 Maple 助手安装包。", current)
+        LOG.info(
+            "更新：正在桌面、当前目录及上级目录查找比 v%s 更新的 Maple 助手安装包。",
+            current,
+        )
         try:
-            package = find_newer_desktop_update(current)
+            package = find_newer_desktop_update(
+                current, local_roots=(install_root, install_root.parent)
+            )
             LOG.info("更新：找到 v%s，来源 %s", package.version, package.path)
             result = apply_desktop_update(package, install_root)
         except UpdateError as exc:
@@ -2030,23 +2287,26 @@ class UiWorker(threading.Thread):
             config_text = "Desktop user_config.json 版本未变化，未覆盖当前配置"
         else:
             config_text = "安装包未提供 user_config.json，已保留当前配置"
-        try:
-            schedule_hidden_restart(install_root)
-        except UpdateError as exc:
+        if not self._schedule_restart():
             LOG.warning(
-                "更新完成：v%s，已覆盖 %d 个文件；%s。自动重启失败：%s。请手动关闭并重新启动助手。",
-                result.package.version, result.copied_files, config_text, exc,
+                "更新完成：v%s，已覆盖 %d 个文件；%s。自动重启失败：请手动关闭并重新启动助手。",
+                result.package.version, result.copied_files, config_text,
             )
             return
+        try:
+            package_removed = remove_consumed_update_package(result.package)
+        except UpdateError as exc:
+            # The program files are already updated and restart is safely
+            # scheduled.  A locked Desktop ZIP must not turn cleanup into a
+            # failed update or keep the old instance running.
+            LOG.warning("更新完成，但清理安装包失败：%s", exc)
+            package_removed = False
         LOG.info(
-            "更新完成：v%s，已覆盖 %d 个文件；%s。助手将在关闭后自动重新启动。",
+            "更新完成：v%s，已覆盖 %d 个文件；%s%s。助手将在关闭后自动重新启动。",
             result.package.version, result.copied_files, config_text,
+            "；已删除已使用的安装包" if package_removed else "",
         )
-        # Stop live input before the helper starts a clean elevated instance.
-        self._stop_patrol()
-        root = getattr(self, "_root", None)
-        if root is not None:
-            root.after(250, self._on_debug_window_close)
+        self._close_for_restart()
 
     def _caption_drag_begin(self, event: Any) -> None:
         """Start an outline-only caption drag (no live window moves)."""
@@ -2360,6 +2620,7 @@ class UiWorker(threading.Thread):
         self._refresh_telegram_status()
         self._poll_yolo_exit()
         self._drain_hotkey_actions()
+        self._drain_api_test_results()
         root.after(self.refresh_ms, self._poll)
 
     def _sync_patrol_ui_state(self) -> None:
@@ -2401,6 +2662,7 @@ class UiWorker(threading.Thread):
         """Run physical hotkey actions safely on Tk's owning thread."""
 
         self._drain_quick_pickup_results()
+        self._drain_reconnect_results()
         actions = self.hotkey_queue
         if actions is None:
             return
@@ -2449,6 +2711,39 @@ class UiWorker(threading.Thread):
                             text="交易：正在接受邀请。"
                         )
                 elif action == "quick_pickup:toggle":
+                    root = getattr(self, "_root", None)
+                    if (getattr(self, "_native_dialog_open", False)
+                            or (root is not None and root.grab_current() is not None)):
+                        # A dialog of this app is open in front (for example the
+                        # 测试测谎 video picker).  Ctrl+Z there is the dialog's own
+                        # key, not a request to select the game window and start
+                        # tapping Z.
+                        self._control_status.configure(
+                            text="快速拾取：对话框打开时忽略（请先关闭对话窗口）。"
+                        )
+                        continue
+                    sender = getattr(self.quick_pickup_worker, "key_sender", None)
+                    probe = getattr(sender, "game_window_present", None)
+                    if callable(probe):
+                        try:
+                            present = bool(probe())
+                        except Exception:
+                            present = True
+                        if not present:
+                            # The operator is not in the game (testing a 测试测谎
+                            # video, for example): there is nothing to pick up, and
+                            # hunting for the game window here only produced an
+                            # error in the log.  Say so once, move no window, send
+                            # no key.
+                            LOG.info(
+                                "quick pickup ignored: no game window on screen "
+                                "(testing a video?)"
+                            )
+                            self._control_status.configure(
+                                text="快速拾取：没有找到游戏窗口（正在测试视频？）。"
+                            )
+                            self._play_action_sound(False)
+                            continue
                     patrol_running = bool(
                         self.patrol_controller is not None
                         and self.patrol_controller.is_enabled()
@@ -2516,6 +2811,596 @@ class UiWorker(threading.Thread):
                 elif state == "stopped":
                     suffix = f"（{detail}）" if detail else ""
                     self._control_status.configure(text=f"快速拾取已关闭{suffix}。")
+            finally:
+                try:
+                    results.task_done()
+                except (AttributeError, ValueError):
+                    pass
+
+    def _validate_reconnect_channel(self, proposed: str) -> bool:
+        """Tk validator: the 自动重连 channel box accepts only 1-60 (or an empty edit)."""
+
+        text = str(proposed).strip()
+        if text == "":
+            return True                      # mid-edit: the value is checked on change
+        if not text.isdigit():
+            return False
+        return CHANNEL_MIN <= int(text) <= CHANNEL_MAX
+
+    def _reconnect_on_change(self) -> None:
+        """Apply the 自动重连 selection (enable + world + channel) to its worker."""
+
+        worker = self.reconnect_worker
+        enabled = bool(self._reconnect_var.get()) if hasattr(
+            self, "_reconnect_var") else False
+        world = self._reconnect_world_var.get() if hasattr(
+            self, "_reconnect_world_var") else WORLD_NAMES[0]
+        channel_text = self._reconnect_channel_var.get() if hasattr(
+            self, "_reconnect_channel_var") else str(CHANNEL_DEFAULT)
+        channel = valid_channel(channel_text)
+        if channel is None:
+            channel = CHANNEL_DEFAULT
+            if hasattr(self, "_reconnect_channel_var"):
+                self._reconnect_channel_var.set(str(channel))
+        if worker is None:
+            if hasattr(self, "_reconnect_status"):
+                self._reconnect_status.configure(
+                    text="自动重连: 本机助手未启用该工作线程。"
+                )
+            return
+        worker.set_world(world)
+        worker.set_channel(channel)
+        worker.set_enabled(enabled)
+        self._save_reconnect_settings(enabled, world, channel)
+        # toggling the selection also re-arms the temporary test button
+        self._reconnect_test_idle()
+        if hasattr(self, "_reconnect_status"):
+            if enabled:
+                self._reconnect_status.configure(
+                    text=f"自动重连: 已启用 - {world} {channel}频道；"
+                         f"掉线后确认登录页即自动进入。"
+                )
+            else:
+                self._reconnect_status.configure(text="自动重连: 未启用。")
+
+    def _register_validator(self, widget, callback):
+        """A Tk entry validator for ``callback``, registered on ``widget``.
+
+        A validator must be registered on the Tk interpreter, which only the widget
+        (or the root) owns - ``self`` is the UiWorker, not a Tk object.  Registering it
+        on the worker is what once stopped the whole assistant from starting:
+        ``AttributeError: 'UiWorker' object has no attribute 'register'``.
+        """
+
+        return (widget.register(callback), "%P")
+
+    def _reconnect_test_clicked(self) -> None:
+        """TEMPORARY: run the 自动重连 sequence once, right now, for the operator's test.
+
+        The enable checkbox is deliberately not required (that is the point of the test
+        button); the world and channel boxes are applied to the worker first, so the run
+        uses what is on screen.
+        """
+
+        worker = self.reconnect_worker
+        if worker is None:
+            if hasattr(self, "_reconnect_status"):
+                self._reconnect_status.configure(
+                    text="自动重连: 本机助手未启用该工作线程。"
+                )
+            return
+        self._reconnect_on_change()          # push world/channel (+enabled) to the worker
+        if not worker.trigger_test():
+            if hasattr(self, "_reconnect_status"):
+                self._reconnect_status.configure(text="自动重连: 已有一次重连正在执行。")
+            return
+        LOG.info("auto reconnect: manual test started from the panel")
+        if hasattr(self, "_reconnect_test_button"):
+            try:
+                self._reconnect_test_button.configure(state="disabled")
+            except Exception:
+                LOG.debug("test button could not be disabled", exc_info=True)
+        if hasattr(self, "_reconnect_status"):
+            self._reconnect_status.configure(
+                text="自动重连: 手动测试已开始（请勿移动鼠标/键盘）。"
+            )
+
+    def _reconnect_capture_clicked(self) -> None:
+        """Save one frame of the game window (calibration / diagnosis).
+
+        Two of these are what the select-window geometry is measured from: one with the world
+        list on screen, one with the channel list on screen.  The file lands in the app's own
+        screenshots folder next to the install.
+        """
+
+        worker = self.reconnect_worker
+        if worker is None:
+            if hasattr(self, "_reconnect_status"):
+                self._reconnect_status.configure(
+                    text="自动重连: 本机助手未启用该工作线程。"
+                )
+            return
+        self._reconnect_on_change()          # keep the worker's world/channel in sync
+        capture = getattr(worker, "save_diagnostic_capture", None)
+        if not callable(capture):
+            return
+        if hasattr(self, "_reconnect_capture_button"):
+            try:
+                self._reconnect_capture_button.configure(state="disabled")
+            except Exception:
+                LOG.debug("capture button could not be disabled", exc_info=True)
+        try:
+            path = capture()
+        except Exception:
+            LOG.exception("auto reconnect: diagnostic capture failed")
+            path = None
+        finally:
+            if hasattr(self, "_reconnect_capture_button"):
+                try:
+                    self._reconnect_capture_button.configure(state="normal")
+                except Exception:
+                    LOG.debug("capture button could not be re-armed", exc_info=True)
+        if hasattr(self, "_reconnect_status"):
+            if path is None:
+                self._reconnect_status.configure(text="截取游戏窗口失败：找不到游戏窗口。")
+            else:
+                self._reconnect_status.configure(
+                    text=f"已截取游戏窗口: {Path(path).name}（{Path(path).parent}）"
+                )
+
+    def _reconnect_calibrate_clicked(self) -> None:
+        """Record the next click-calibration point from the mouse position.
+
+        Five points in total (world rows 1 and 2, channels 1, 2 and 6).  Each press waits 3
+        seconds before reading the cursor, so the mouse can be moved onto the game; the worker
+        writes reconnect_layout.json when the last point is in.  Pressing it again after a
+        finished calibration starts over, which is what a different client size needs.
+        """
+
+        worker = self.reconnect_worker
+        if worker is None:
+            self._set_reconnect_status("自动重连: 本机助手未启用该工作线程。")
+            return
+        next_step = getattr(worker, "calibration_next_step", None)
+        if not callable(next_step):
+            return
+        step = next_step()
+        restarted = False
+        if step is None:                      # already complete -> start a fresh one
+            reset = getattr(worker, "reset_calibration", None)
+            if callable(reset):
+                reset()
+            step, restarted = next_step(), True
+        if step is None:
+            return
+        key, label = step
+        if hasattr(self, "_reconnect_calibrate_button"):
+            try:
+                self._reconnect_calibrate_button.configure(state="disabled")
+            except Exception:
+                LOG.debug("calibrate button could not be disabled", exc_info=True)
+        verb = "重新标定" if restarted else "标定"
+        self._set_reconnect_status(
+            f"{verb}: 3 秒后记录鼠标位置 → {label}（请把鼠标移到游戏里的该位置）"
+        )
+        LOG.info("auto reconnect: %s step %s (%s) starts in %.1fs", verb, key, label,
+                 RECONNECT_CALIBRATION_DELAY_SECONDS)
+
+        def record() -> None:
+            try:
+                ok, message = worker.record_layout_point(key)
+            except Exception:
+                LOG.exception("auto reconnect: calibration point failed")
+                ok, message = False, "标定取点失败（详见 error.log）"
+            if ok:
+                following = next_step()
+                if following is not None:
+                    message = f"{message}；下一步：{following[1]}（再按一次「标定选择窗口」）"
+            self._set_reconnect_status(message)
+            if hasattr(self, "_reconnect_calibrate_button"):
+                try:
+                    self._reconnect_calibrate_button.configure(state="normal")
+                except Exception:
+                    LOG.debug("calibrate button could not be re-armed", exc_info=True)
+
+        self._root.after(int(RECONNECT_CALIBRATION_DELAY_SECONDS * 1000), record)
+
+    def _set_reconnect_status(self, text: str) -> None:
+        if hasattr(self, "_reconnect_status"):
+            try:
+                self._reconnect_status.configure(text=text)
+            except Exception:
+                LOG.debug("reconnect status could not be updated", exc_info=True)
+
+    def _reconnect_test_idle(self) -> None:
+        """Re-arm the temporary 测试重连 button after a run finished."""
+
+        if hasattr(self, "_reconnect_test_button"):
+            try:
+                self._reconnect_test_button.configure(state="normal")
+            except Exception:
+                LOG.debug("test button could not be re-armed", exc_info=True)
+
+    # ------------------------------------------------------------------ 测试api
+
+    def _api_test_backend_text(self) -> str:
+        """Which backend 测试api will use, with the key's *source* (never the key itself).
+
+        The key is not configured in the panel: it travels with the application
+        (``autolie_api/key_secret.txt``), and ``LIE_PRODUCT_KEY`` overrides it for a future
+        release.  With neither, the local mimic is used so the button still works.
+        """
+
+        try:
+            from autolie_api.key_store import load_product_key
+
+            key, source = load_product_key(getattr(self, "_api_test_key", ""))
+        except Exception:
+            LOG.debug("api test: the key source could not be resolved", exc_info=True)
+            key, source = "", "无"
+        if not str(key or "").strip():
+            return "本地模拟后端（不需要密钥）"
+        return f"真实后端（密钥来源：{source}）"
+
+    def _api_test_status_text(self) -> str:
+        video = getattr(self, "api_test_video", "")
+        chosen = f"上次视频：{Path(video).name}；" if video else ""
+        return (f"测试api: {self._api_test_backend_text()}；{chosen}"
+                f"按 测试api 选择视频，{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，"
+                "开始上传前先等第二个窗口（鼠标只在视频画面内）。")
+
+    def _api_test_clicked(self) -> None:
+        """测试api: pick a video file and run the drill on it (5 fps, mouse inside the picture)."""
+
+        factory = getattr(self, "api_test_video_factory", None)
+        if not callable(factory):
+            self._set_api_test_status("测试api: 本机助手未启用视频测试工作线程。")
+            return
+        if self._api_test_busy():
+            return
+        video = self._ask_api_test_video()
+        if video is None:
+            return
+        seconds = self._api_test_video_seconds()
+        self._save_api_test_settings()
+        window_factory = getattr(self, "api_test_window_factory", None)
+        if window_factory is None:
+            try:
+                from api_lie_video import VideoDrillWindow as window_factory
+            except Exception:
+                LOG.exception("api test: the video window could not be imported")
+                self._set_api_test_status("测试api: 无法载入视频窗口（详见 error.log）。")
+                return
+        try:
+            window = window_factory(
+                self._root, f"测试api — {video.name}",
+                on_close=self._api_test_window_closed,
+                on_toggle_mouse=self._api_test_toggle_mouse,
+                on_toggle_pause=self._api_test_toggle_pause,
+            )
+        except Exception:
+            LOG.exception("api test: the video window could not be created")
+            self._set_api_test_status("测试api: 无法创建视频窗口（详见 error.log）。")
+            return
+        display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
+        key = getattr(self, "_api_test_key", "")
+        try:
+            worker = factory(video=video, results=self.api_test_results, display=display,
+                             seconds=seconds, key=key)
+        except Exception:
+            LOG.exception("api test: the video worker could not be created")
+            try:
+                window.close()
+            except Exception:
+                LOG.debug("video window close failed", exc_info=True)
+            self._set_api_test_status("测试api: 工作线程创建失败（详见 error.log）。")
+            return
+        self.api_test_worker = worker
+        self.api_test_window = window
+        self.api_test_video = str(video)
+        self._api_test_display = display
+        worker.image_rect = window.image_region()
+        self._api_test_set_buttons("disabled")
+        LOG.info("api test (video): %s for %.0fs at 5 fps (key=%s)", video.name, seconds,
+                 "set" if key else "none -> mimic")
+        worker.start()
+        self._set_api_test_status(
+            f"测试api: 正在播放 {video.name} - {seconds:.0f} 秒 @ 5 fps"
+            f"（{self._api_test_backend_text()}，鼠标只在视频画面内；Esc 或关闭窗口即停止）……")
+        self._api_test_keep_focus()
+
+    def _api_test_busy(self) -> bool:
+        """True when a drill is already running (the button says so instead of starting another)."""
+
+        worker = getattr(self, "api_test_worker", None)
+        if worker is not None and getattr(worker, "running", False):
+            self._set_api_test_status("测试api: 已有一次测试在运行，请等它结束。")
+            return True
+        return False
+
+    def _ask_api_test_video(self):
+        """Ask for the video to test.  Any file the operator likes; the folder is remembered."""
+
+        try:
+            from tkinter import filedialog
+
+            start = getattr(self, "_api_test_video_dir", "") or str(
+                Path(__file__).resolve().parent / "detect_video")
+            chosen = filedialog.askopenfilename(
+                parent=self._root,
+                title="选择要测试的视频（测试api 会按 5 fps 播放并上传）",
+                initialdir=start,
+                filetypes=[("视频", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.m4v"),
+                           ("所有文件", "*.*")],
+            )
+        except Exception as exc:
+            LOG.exception("api test: the video picker failed")
+            self._set_api_test_status(f"测试api: 无法打开视频选择窗口 - {exc}")
+            return None
+        text = str(chosen or "").strip()
+        if not text:
+            self._set_api_test_status("测试api: 已取消（没有选择视频）。")
+            return None
+        video = Path(text)
+        if not video.is_file():
+            self._set_api_test_status(f"测试api: 找不到视频文件 {video.name}。")
+            return None
+        self._api_test_video_dir = str(video.parent)
+        return video
+
+    def _api_test_set_buttons(self, state: str) -> None:
+        button = getattr(self, "_api_test_button", None)
+        if button is None:
+            return
+        try:
+            button.configure(state=state)
+        except Exception:
+            LOG.debug("api test button state could not be set", exc_info=True)
+
+    def _api_test_window_closed(self) -> None:
+        """The operator closed the video window: stop the drill."""
+
+        worker = getattr(self, "api_test_worker", None)
+        if worker is not None:
+            try:
+                worker.request_stop()
+            except Exception:
+                LOG.debug("video drill stop request failed", exc_info=True)
+            self._set_api_test_status("测试api: 视频窗口已关闭 - 正在停止……")
+        else:
+            self._api_test_idle()
+
+    def _api_test_toggle_mouse(self, enabled: bool) -> None:
+        worker = getattr(self, "api_test_worker", None)
+        if worker is None or not hasattr(worker, "set_mouse_enabled"):
+            return
+        try:
+            worker.set_mouse_enabled(bool(enabled))
+        except Exception:
+            LOG.debug("video drill mouse toggle failed", exc_info=True)
+        self._set_api_test_status(
+            f"测试api: 鼠标跟随已{'开启' if enabled else '关闭'}"
+            f"（{'只在视频画面内移动' if enabled else '不再移动鼠标'}）。")
+
+    def _api_test_toggle_pause(self, paused: bool) -> None:
+        worker = getattr(self, "api_test_worker", None)
+        if worker is None or not hasattr(worker, "set_paused"):
+            return
+        try:
+            worker.set_paused(bool(paused))
+        except Exception:
+            LOG.debug("video drill pause toggle failed", exc_info=True)
+        self._set_api_test_status(f"测试api: 已{'暂停' if paused else '继续'}。")
+
+    def _api_test_keep_focus(self) -> None:
+        """Keep the video window focused (throttled), so mouse input belongs to the video."""
+
+        window = getattr(self, "api_test_window", None)
+        worker = getattr(self, "api_test_worker", None)
+        if window is None or worker is None or not getattr(worker, "running", False):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_api_test_keep_focus_at", 0.0) < 1.0:
+            return
+        self._api_test_keep_focus_at = now
+        try:
+            if not window.is_focused():
+                window.focus()
+        except Exception:
+            LOG.debug("video window refocus failed", exc_info=True)
+
+    def _api_test_video_seconds(self) -> float:
+        """The video test's run length: the measured ~30s, with no panel setting.
+
+        The 时长 box is gone on purpose: the operator's locked decision is a ~30s run at the API's
+        5 fps, and a shorter run only covers the frozen screen before the lie window appears.
+        ``api_lie_video.DEFAULT_SECONDS`` is the same number, so the worker never disagrees.
+        """
+
+        return API_TEST_VIDEO_SECONDS
+
+    def _set_api_test_status(self, text: str) -> None:
+        if hasattr(self, "_api_test_status"):
+            try:
+                self._api_test_status.configure(text=text)
+            except Exception:
+                LOG.debug("api test status could not be updated", exc_info=True)
+
+    def _drain_api_test_results(self) -> None:
+        """Show the 测试api drill's progress on Tk's owning thread."""
+
+        self._drain_api_test_display()
+        results = getattr(self, "api_test_results", None)
+        if results is None:
+            return
+        while True:
+            try:
+                state, detail = results.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if state == "frame":
+                    self._set_api_test_status(f"测试api 帧 {detail}")
+                elif state == "backend":
+                    self._set_api_test_status(f"测试api 后端: {detail}")
+                elif state == "capture":
+                    self._set_api_test_status(f"测试api 已保存标注帧: {detail}")
+                elif state == "done":
+                    self._set_api_test_status(f"测试api 完成: {detail}")
+                    self._play_action_sound(True)
+                    self._api_test_idle()
+                elif state == "stopped":
+                    self._set_api_test_status(f"测试api 已停止: {detail}")
+                    self._api_test_idle()
+                elif state == "failed":
+                    self._set_api_test_status(f"测试api 失败: {detail}")
+                    self._play_action_sound(False)
+                    self._api_test_idle()
+                    self._append_error_log(f"测试api失败: {detail}", "api test")
+                else:
+                    suffix = f": {detail}" if detail else ""
+                    self._set_api_test_status(f"测试api - {state}{suffix}")
+            finally:
+                try:
+                    results.task_done()
+                except (AttributeError, ValueError):
+                    pass
+
+    def _drain_api_test_display(self) -> None:
+        """Draw the newest video frame in the drill window and hand its rect back to the worker.
+
+        The worker only moves the mouse inside ``image_rect``, and only the UI thread knows where
+        Tk actually placed the picture, so every displayed frame re-publishes it.
+        """
+
+        window = getattr(self, "api_test_window", None)
+        worker = getattr(self, "api_test_worker", None)
+        if window is None or worker is None:
+            return
+        frame = hud = None
+        while True:
+            try:
+                frame, hud = self._api_test_display.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                LOG.debug("api test display queue error", exc_info=True)
+                break
+        if frame is None:
+            return
+        try:
+            window.update_frame(frame, hud or "")
+        except Exception:
+            LOG.debug("video frame could not be shown", exc_info=True)
+            return
+        try:
+            rect = window.image_region()
+        except Exception:
+            rect = None
+        if rect:
+            worker.image_rect = rect
+        self._api_test_keep_focus()
+
+    def _api_test_idle(self) -> None:
+        """The drill ended (or was stopped): close the video window and re-arm the buttons."""
+
+        self._api_test_set_buttons("normal")
+        window = getattr(self, "api_test_window", None)
+        self.api_test_window = None
+        if window is not None:
+            try:
+                window.close()
+            except Exception:
+                LOG.debug("api test window could not be closed", exc_info=True)
+        try:
+            while True:
+                self._api_test_display.get_nowait()
+        except queue.Empty:
+            pass
+        except Exception:
+            LOG.debug("api test display drain failed", exc_info=True)
+
+    def _save_api_test_settings(self) -> None:
+        try:
+            self._shutdown_save_settings(self._shutdown_collect_data())
+        except Exception:
+            LOG.warning("api test settings could not be saved", exc_info=True)
+
+    def _save_reconnect_settings(self, enabled: bool, world: str, channel: int) -> None:
+        """Persist 自动重连 with the rest of the panel's settings."""
+
+        try:
+            self._shutdown_save_settings(self._shutdown_collect_data())
+        except Exception:
+            LOG.warning("auto reconnect settings could not be saved", exc_info=True)
+
+    def _load_reconnect_settings(self) -> tuple[bool, str, int]:
+        """The saved 自动重连 settings (defaults when there are none)."""
+
+        try:
+            data = json.loads(
+                self._shutdown_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return False, WORLD_NAMES[0], CHANNEL_DEFAULT
+        world = str(data.get("auto_reconnect_world", WORLD_NAMES[0]))
+        if world not in WORLD_NAMES:
+            world = WORLD_NAMES[0]
+        channel = valid_channel(data.get("auto_reconnect_channel", CHANNEL_DEFAULT))
+        if channel is None:
+            channel = CHANNEL_DEFAULT
+        return bool(data.get("auto_reconnect_enabled", False)), world, channel
+
+    def _drain_reconnect_results(self) -> None:
+        """Show the 自动重连 worker's progress on Tk's owning thread."""
+
+        results = self.reconnect_results
+        if results is None:
+            return
+        while True:
+            try:
+                state, detail = results.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if not hasattr(self, "_reconnect_status"):
+                    continue
+                if state == "failed":
+                    self._reconnect_status.configure(
+                        text=f"自动重连失败: {detail}。"
+                    )
+                    self._play_action_sound(False)
+                    self._reconnect_test_idle()
+                    # Every failure must be readable from error.log: the worker already logs
+                    # its reason at ERROR level, and this block adds what the panel knows
+                    # (which world/channel the run was for).
+                    self._append_error_log(
+                        f"自动重连失败: {detail}\n"
+                        f"世界={self._reconnect_world_var.get() if hasattr(self, '_reconnect_world_var') else '?'}"
+                        f" 频道={self._reconnect_channel_var.get() if hasattr(self, '_reconnect_channel_var') else '?'}"
+                        f" 已启用={self._reconnect_var.get() if hasattr(self, '_reconnect_var') else '?'}",
+                        "auto reconnect",
+                    )
+                elif state == "done":
+                    self._reconnect_status.configure(
+                        text=f"自动重连完成: {detail}。"
+                    )
+                    self._play_action_sound(True)
+                    self._reconnect_test_idle()
+                elif state == "colour":
+                    # the temporary 测试重连 button's login-page colour measurement
+                    self._reconnect_status.configure(text=f"登录页颜色检测: {detail}")
+                elif state == "input":
+                    self._reconnect_status.configure(text=f"自动重连: {detail}")
+                elif state == "capture":
+                    self._reconnect_status.configure(
+                        text=f"已截取游戏窗口: {Path(detail).name}（{Path(detail).parent}）"
+                    )
+                else:
+                    suffix = f": {detail}" if detail else ""
+                    self._reconnect_status.configure(
+                        text=f"自动重连进行中 - {state}{suffix}"
+                    )
             finally:
                 try:
                     results.task_done()
@@ -2677,8 +3562,33 @@ class UiWorker(threading.Thread):
         self._copy_to_clipboard(text)
         LOG.info("运行日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
+    def _copy_error_log(self) -> None:
+        """Exclamation button: copy the root error.log to the clipboard."""
+
+        error_path = Path(__file__).resolve().parent / "error.log"
+        try:
+            raw = error_path.read_bytes()
+        except OSError:
+            text = ""
+        else:
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("gbk", errors="replace")
+        if not text.strip():
+            text = "(error.log 为空或不存在)"
+        self._copy_to_clipboard(text)
+        LOG.info("error.log 已复制到剪贴板（%d 行）", text.count("\n") + 1)
+
     def _import_user_config(self) -> None:
-        """Choose a saved user_config.json and load it for the next launch."""
+        """Choose a saved user_config.json, load it, and restart to apply it.
+
+        The imported file is only read at startup, and the running instance
+        would otherwise write its own in-memory settings back over it while
+        still patrolling the old route.  A successful import therefore
+        restarts the assistant at once (the same hidden-helper handoff the
+        update button uses) instead of asking the operator to do it.
+        """
 
         if not self.user_config_path:
             LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_IMPORT)
@@ -2703,7 +3613,17 @@ class UiWorker(threading.Thread):
         except UpdateError as exc:
             LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, exc)
             return
-        LOG.info("%s成功：已载入 %s；重启助手后生效。", LOG_CONFIG_IMPORT, source)
+        if not self._schedule_restart():
+            LOG.warning(
+                "%s成功：已载入 %s；自动重启失败，请手动关闭并重新启动助手后生效。",
+                LOG_CONFIG_IMPORT, source,
+            )
+            return
+        LOG.info(
+            "%s成功：已载入 %s；正在关闭当前助手，重启后生效。",
+            LOG_CONFIG_IMPORT, source,
+        )
+        self._close_for_restart()
 
     def _export_user_config(self) -> None:
         """Overwrite the Desktop copy used by the in-app updater."""
@@ -2894,8 +3814,10 @@ class UiWorker(threading.Thread):
         }
         label = labels[boundary]
         self._unlocked_points.discard((recorded.layer, boundary))
-        LOG.info("record locked: layer=%s point=%s x=%.6f y=%.6f frame=%s",
-                 recorded.layer, boundary, recorded.x, recorded.y, snapshot.sequence)
+        LOG.info("record locked: layer=%s point=%s x=%.6f y=%.6f frame=%s "
+                 "marker=%s conf=%.2f",
+                 recorded.layer, boundary, recorded.x, recorded.y, snapshot.sequence,
+                 snapshot.marker_pixel_size, snapshot.marker_confidence)
         self._control_status.configure(
             text=(f"已录制 {recorded.layer} {label}: "
                   f"x={recorded.x:.6f}, y={recorded.y:.6f}")
@@ -2973,6 +3895,10 @@ class UiWorker(threading.Thread):
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
+            "stationary_jump_enabled": bool(
+                getattr(self, "_stationary_jump_enabled_var", None).get()
+                if hasattr(self, "_stationary_jump_enabled_var") else False
+            ),
             "stair_jump_enabled": bool(
                 getattr(self, "_stair_jump_enabled_var", None).get()
                 if hasattr(self, "_stair_jump_enabled_var") else True
@@ -3013,19 +3939,35 @@ class UiWorker(threading.Thread):
         raw = 0.1 if var is None else float(var.get())
         return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
 
-    def _bind_repeat_step_button(self, button: Any, callback: Any) -> None:
+    def _bind_repeat_step_button(
+        self,
+        button: Any,
+        callback: Any,
+        *,
+        coarse: Any = None,
+        current: Any = None,
+    ) -> None:
         """Give a ± random-gap button click-and-hold acceleration.
 
         A press applies one precise 0.1 s adjustment immediately.  Keeping
         the mouse down for 0.25 s then repeats every 100 ms, so reaching a
         useful multi-second random range does not require dozens of clicks.
         Release cancels the repeat without a trailing adjustment.
+
+        A DOUBLE click applies one coarse step instead (``coarse``, wired to
+        ``_RANDOM_GAP_COARSE_STEP`` = 5 s), measured from the value the click
+        sequence started at (``current``), so the fine steps of its own presses
+        cannot turn 5 s into 5.1 s.
         """
 
         jobs = getattr(self, "_repeat_step_jobs", None)
         if jobs is None:
             jobs = {}
             self._repeat_step_jobs = jobs
+        anchors = getattr(self, "_repeat_step_anchors", None)
+        if anchors is None:
+            anchors = {}
+            self._repeat_step_anchors = anchors
         key = id(button)
 
         def stop_repeat(_event: Any = None) -> None:
@@ -3050,6 +3992,15 @@ class UiWorker(threading.Thread):
 
         def start_repeat(_event: Any = None) -> None:
             stop_repeat()
+            now = time.monotonic()
+            anchor = anchors.get(key)
+            if (anchor is None
+                    or now - anchor[0]
+                    > self._RANDOM_GAP_CLICK_SEQUENCE_SECONDS):
+                anchors[key] = (
+                    now,
+                    float(current()) if callable(current) else None,
+                )
             callback()
             try:
                 jobs[key] = button.after(250, repeat)
@@ -3071,27 +4022,46 @@ class UiWorker(threading.Thread):
             except Exception:
                 pass
 
+        def coarse_step(_event: Any = None) -> None:
+            """Double click: one coarse step from where the sequence started."""
+
+            stop_repeat()
+            anchor = anchors.pop(key, None)
+            if not callable(coarse):
+                return
+            try:
+                coarse(None if anchor is None else anchor[1])
+            except Exception:
+                LOG.exception("random-gap coarse step failed")
+
         button.bind("<ButtonPress-1>", start_repeat)
         button.bind("<ButtonRelease-1>", stop_repeat)
+        button.bind("<Double-Button-1>", coarse_step)
         # ttk.Button takes a pointer grab while clicked, so its release event
         # still arrives even if the pointer is moved outside.  Do not cancel
         # on <Leave>: refreshing a packed row can synthesize Leave and used
         # to silently stop the repeat after its first adjustment.
 
-    def _fixed_adjust_random_gap(self, delta: float) -> None:
-        """Adjust the random delay ceiling using fixed 0.1-second steps."""
+    def _set_fixed_random_gap(self, value: Optional[float]) -> None:
+        """Apply an absolute random-delay ceiling, clamped and rounded."""
 
-        current = self._fixed_random_gap_seconds()
-        value = round(
-            max(0.0, min(
-                self._FIXED_RANDOM_GAP_MAX,
-                current + (self._FIXED_RANDOM_GAP_STEP if delta > 0
-                           else -self._FIXED_RANDOM_GAP_STEP),
-            )),
-            1,
-        )
-        self._fixed_random_gap_var.set(value)
+        base = self._fixed_random_gap_seconds() if value is None else value
+        self._fixed_random_gap_var.set(round(
+            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
+        ))
         self._fixed_on_change()
+
+    def _fixed_adjust_random_gap(self, delta: float) -> None:
+        """Adjust the random delay ceiling.
+
+        ``delta``'s sign picks the direction and its magnitude the step, so the
+        fine button passes ±0.1 while the double click passes ±5.
+        """
+
+        step = abs(delta) or self._FIXED_RANDOM_GAP_STEP
+        self._set_fixed_random_gap(
+            self._fixed_random_gap_seconds() + (step if delta > 0 else -step)
+        )
 
     def _random_jump_gap_seconds(self) -> float:
         """Return the clamped random-jump delay ceiling."""
@@ -3100,36 +4070,40 @@ class UiWorker(threading.Thread):
         raw = 0.1 if var is None else float(var.get())
         return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
 
-    def _random_jump_adjust_gap(self, delta: float) -> None:
-        current = self._random_jump_gap_seconds()
-        value = round(
-            max(0.0, min(
-                self._FIXED_RANDOM_GAP_MAX,
-                current + (self._FIXED_RANDOM_GAP_STEP if delta > 0
-                           else -self._FIXED_RANDOM_GAP_STEP),
-            )),
-            1,
-        )
-        self._random_jump_gap_var.set(value)
+    def _set_random_jump_gap(self, value: Optional[float]) -> None:
+        """Apply an absolute random-jump delay ceiling, clamped and rounded."""
+
+        base = self._random_jump_gap_seconds() if value is None else value
+        self._random_jump_gap_var.set(round(
+            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
+        ))
         self._fixed_on_change()
+
+    def _random_jump_adjust_gap(self, delta: float) -> None:
+        step = abs(delta) or self._FIXED_RANDOM_GAP_STEP
+        self._set_random_jump_gap(
+            self._random_jump_gap_seconds() + (step if delta > 0 else -step)
+        )
 
     def _small_step_gap_seconds(self) -> float:
         var = getattr(self, "_small_step_gap_var", None)
         raw = 0.1 if var is None else float(var.get())
         return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
 
-    def _small_step_adjust_gap(self, delta: float) -> None:
-        current = self._small_step_gap_seconds()
-        value = round(
-            max(0.0, min(
-                self._FIXED_RANDOM_GAP_MAX,
-                current + (self._FIXED_RANDOM_GAP_STEP if delta > 0
-                           else -self._FIXED_RANDOM_GAP_STEP),
-            )),
-            1,
-        )
-        self._small_step_gap_var.set(value)
+    def _set_small_step_gap(self, value: Optional[float]) -> None:
+        """Apply an absolute small-step delay ceiling, clamped and rounded."""
+
+        base = self._small_step_gap_seconds() if value is None else value
+        self._small_step_gap_var.set(round(
+            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
+        ))
         self._fixed_on_change()
+
+    def _small_step_adjust_gap(self, delta: float) -> None:
+        step = abs(delta) or self._FIXED_RANDOM_GAP_STEP
+        self._set_small_step_gap(
+            self._small_step_gap_seconds() + (step if delta > 0 else -step)
+        )
 
     def _hotkey_adjust_fixed_interval(self, delta: float) -> bool:
         """Apply one held Ctrl+[ / Ctrl+] fixed-attack interval step."""
@@ -3164,9 +4138,9 @@ class UiWorker(threading.Thread):
     def _fixed_refresh_rows(self) -> None:
         """Render the 随机跳跃 row for the active attack mode.
 
-        固定攻击: the independent random-jump row stays visible (behavior
-        unchanged).  跳跃攻击: the jump is bundled into every attack beat, so
-        the row hides; the 按键 + interval + random-gap config stays visible.
+        固定攻击: the independent random-jump row stays visible. 站桩攻击
+        owns position recovery and optionally bundles a jump into each attack
+        beat, so independent movement rows stay hidden.
         The row is unconditionally re-packed on every call so mode switches
         always re-render it dynamically.
         """
@@ -3175,13 +4149,20 @@ class UiWorker(threading.Thread):
                    if hasattr(self, "_attack_mode_var") else "fixed")
         jump_row = getattr(self, "_jump_row", None)
         step_row = getattr(self, "_small_step_row", None)
+        stationary_jump_row = getattr(self, "_stationary_jump_row", None)
+        fixed_key_row = getattr(self, "_fixed_key_row", None)
         status = getattr(self, "_fixed_status", None)
         if jump_row is None:
             return
-        for row in (jump_row, step_row):
+        for row in (jump_row, step_row, stationary_jump_row):
             if row is not None and row.winfo_manager():
                 row.pack_forget()
-        if mode != "jump_attack":
+        if mode == "stationary" and stationary_jump_row is not None:
+            pack_options = {"fill": "x", "pady": (2, 0)}
+            if fixed_key_row is not None:
+                pack_options["after"] = fixed_key_row
+            stationary_jump_row.pack(**pack_options)
+        if mode == "fixed":
             if status is not None and status.winfo_manager():
                 jump_row.pack(fill="x", pady=(6, 0), before=status)
             else:
@@ -3199,7 +4180,7 @@ class UiWorker(threading.Thread):
             return
         mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "jump_attack")):
+                and mode not in ("fixed", "stationary")):
             mode = "fixed"
             self._attack_mode_var.set("fixed")
         # Layout is intentionally not refreshed here.  Sliders and long-hold
@@ -3219,8 +4200,11 @@ class UiWorker(threading.Thread):
                 text=f"({interval:.1f}s, {interval + random_gap:.1f}s)"
             )
         if hasattr(self, "_random_jump_interval_var"):
-            jump_interval = max(
-                1.0, float(self._random_jump_interval_var.get())
+            # 1.0s .. 30s base range, matching the 小碎步 row and the 随机
+            # ceiling; a saved value outside it is clamped into range.
+            jump_interval = min(
+                self._FIXED_RANDOM_GAP_MAX,
+                max(1.0, float(self._random_jump_interval_var.get())),
             )
             self._random_jump_interval_var.set(jump_interval)
             jump_gap = self._random_jump_gap_seconds()
@@ -3234,8 +4218,10 @@ class UiWorker(threading.Thread):
                       f"{jump_interval + jump_gap:.1f}s)")
             )
         if hasattr(self, "_small_step_interval_var"):
-            step_interval = max(
-                3.0, float(self._small_step_interval_var.get())
+            # 3.0s .. 30s base range (same ceiling as the 随机 jump/step gaps).
+            step_interval = min(
+                self._FIXED_RANDOM_GAP_MAX,
+                max(3.0, float(self._small_step_interval_var.get())),
             )
             self._small_step_interval_var.set(step_interval)
             step_gap = self._small_step_gap_seconds()
@@ -3284,10 +4270,13 @@ class UiWorker(threading.Thread):
             return
         mode = str(data.get("attack_mode", "fixed"))
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "jump_attack")):
+                and mode not in ("fixed", "stationary")):
             mode = "fixed"
-        worker.jump_attack = bool(mode == "jump_attack")
-        worker.enabled = bool(mode in ("fixed", "jump_attack"))
+        worker.jump_attack = bool(
+            mode == "stationary"
+            and data.get("stationary_jump_enabled", False)
+        )
+        worker.enabled = bool(mode in ("fixed", "stationary"))
         worker.attack_interval = max(
             0.2, float(data.get("interval_seconds", 3.0))
         )
@@ -3300,6 +4289,11 @@ class UiWorker(threading.Thread):
                         key, worker.attack_key)
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
+            stationary_setter = getattr(
+                mover, "set_stationary_attack_enabled", None
+            )
+            if callable(stationary_setter):
+                stationary_setter(mode == "stationary")
             # 台阶跳 only taps Alt while retaining the already-active travel
             # direction; it is not queued as a separate left/right motion.
             mover.stair_jump_enabled = bool(
@@ -3311,11 +4305,11 @@ class UiWorker(threading.Thread):
             mover.stair_jump_attempts_max = 1
         jump_worker = getattr(self, "random_jump_worker", None)
         if jump_worker is not None:
-            # 跳跃攻击 owns the jump inside its bundle, so the independent
-            # random-jump worker is switched off in that mode.
+            # 站桩攻击 owns its anchor correction (and optional bundled jump),
+            # so independent random movement is switched off in that mode.
             jump_worker.enabled = bool(
                 data.get("random_jump_enabled", False)
-            ) and mode != "jump_attack"
+            ) and mode == "fixed"
             jump_worker.jump_interval = max(
                 1.0,
                 float(data.get("random_jump_interval_seconds", 3.0)),
@@ -3325,8 +4319,8 @@ class UiWorker(threading.Thread):
             )
         step_worker = getattr(self, "small_step_worker", None)
         if step_worker is not None:
-            # 小碎步 deliberately belongs only to fixed-rate attack: jump
-            # attack already owns its movement beat, while YOLO owns a
+            # 小碎步 deliberately belongs only to fixed-rate attack: stationary
+            # mode already owns position correction, while YOLO owns a
             # separate combat/movement strategy.
             step_worker.enabled = bool(
                 data.get("small_step_enabled", False)
@@ -3349,7 +4343,7 @@ class UiWorker(threading.Thread):
         mode = str(self._attack_mode_var.get())
         fixed_mode = (
             not self._YOLO_MONSTER_DETECTION_ENABLED
-            or mode in ("fixed", "jump_attack")
+            or mode in ("fixed", "stationary")
         )
         if fixed_mode:
             # Only one attack engine at a time: selecting Fixed Attack stops
@@ -3372,11 +4366,12 @@ class UiWorker(threading.Thread):
             if fixed_mode:
                 interval = float(self._fixed_interval_var.get())
                 random_gap = self._fixed_random_gap_seconds()
-                if mode == "jump_attack":
+                if mode == "stationary":
                     self._fixed_status.configure(
-                        text=(f"跳跃攻击已启用 - 按键 "
+                        text=(f"站桩攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；"
-                              f"先跳跃、0.3s 后攻击；每 "
+                              f"开始巡逻时记录临时位置；"
+                              f"{'先跳跃、0.3s 后攻击；' if self._stationary_jump_enabled_var.get() else ''}每 "
                               f"{interval:.1f}s (+随机 {random_gap:.1f}s)。"
                               "YOLO 怪物检测暂时停用。")
                     )
@@ -3434,10 +4429,15 @@ class UiWorker(threading.Thread):
         try:
             if "attack_mode" in data:
                 mode = str(data["attack_mode"])
-                if mode in ("yolo", "fixed", "jump_attack"):
+                if mode == "jump_attack":
+                    # One-time migration from the former dedicated mode.
+                    self._attack_mode_var.set("stationary")
+                    if hasattr(self, "_stationary_jump_enabled_var"):
+                        self._stationary_jump_enabled_var.set(True)
+                elif mode in ("yolo", "fixed", "stationary"):
                     self._attack_mode_var.set(mode)
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
-                if self._attack_mode_var.get() not in ("fixed", "jump_attack"):
+                if self._attack_mode_var.get() not in ("fixed", "stationary"):
                     self._attack_mode_var.set("fixed")
             if "interval_seconds" in data:
                 self._fixed_interval_var.set(
@@ -3452,6 +4452,11 @@ class UiWorker(threading.Thread):
                 key = str(data["attack_key"]).strip()
                 if key in BINDABLE_KEYS:
                     self._fixed_attack_key_var.set(key)
+            if ("stationary_jump_enabled" in data
+                    and hasattr(self, "_stationary_jump_enabled_var")):
+                self._stationary_jump_enabled_var.set(bool(
+                    data["stationary_jump_enabled"]
+                ))
             if ("stair_jump_enabled" in data
                     and hasattr(self, "_stair_jump_enabled_var")):
                 self._stair_jump_enabled_var.set(bool(
@@ -3690,6 +4695,16 @@ class UiWorker(threading.Thread):
 
         return config_section_file("additional_functions")
 
+    def _append_error_log(self, text: str, tag: str) -> None:
+        """Append a diagnostic block to the root error.log."""
+
+        try:
+            path = Path(__file__).resolve().parent / "error.log"
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(f"[{tag}]\n{text}\n")
+        except Exception:
+            pass
+
     def _shutdown_collect_data(self) -> dict:
         """Current Additional Functions panel values as a settings dict."""
 
@@ -3723,7 +4738,19 @@ class UiWorker(threading.Thread):
             data["countdown_interval_hours"] = round(
                 float(self._countdown_interval_var.get()), 1
             )
+        if hasattr(self, "_reconnect_var"):
+            data["auto_reconnect_enabled"] = bool(self._reconnect_var.get())
+            data["auto_reconnect_world"] = self._reconnect_world_var.get()
+            data["auto_reconnect_channel"] = int(
+                valid_channel(self._reconnect_channel_var.get()) or CHANNEL_DEFAULT
+            )
+        # 测试api needs no settings any more: the run length is fixed and the key ships with the app.
         return data
+
+    def _on_lie_alert_change(self) -> None:
+        """Turning off lie detection also disarms its dependent automation."""
+
+        self._shutdown_on_change()
 
     def _shutdown_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the shutdown settings live."""
@@ -4687,6 +5714,22 @@ class UiWorker(threading.Thread):
                 self._sound_alert_var.set(bool(
                     data.get("sound_alert_enabled", True)
                 ))
+            if hasattr(self, "_reconnect_var"):
+                # 自动重连 is a safety feature the operator arms on purpose: restore it
+                # together with its world/channel so a restart keeps working.
+                saved_enabled = bool(data.get("auto_reconnect_enabled", False))
+                saved_world = str(data.get("auto_reconnect_world", WORLD_NAMES[0]))
+                if saved_world not in WORLD_NAMES:
+                    saved_world = WORLD_NAMES[0]
+                saved_channel = valid_channel(
+                    data.get("auto_reconnect_channel", CHANNEL_DEFAULT)
+                ) or CHANNEL_DEFAULT
+                self._reconnect_var.set(saved_enabled)
+                self._reconnect_world_var.set(saved_world)
+                self._reconnect_channel_var.set(str(saved_channel))
+            if hasattr(self, "_api_test_status"):
+                # 测试api has no panel settings; the line only states the backend it will reach.
+                self._set_api_test_status(self._api_test_status_text())
             if "screen_blink_enabled" in data and hasattr(
                     self, "_screen_blink_var"
             ):
@@ -5190,14 +6233,25 @@ class UiWorker(threading.Thread):
         self._control_status.configure(text="正在选择游戏窗口…")
         if self._root is not None:
             self._root.update_idletasks()
+        armed = True
         if self.on_patrol_start is not None:
             try:
-                self.on_patrol_start()
+                result = self.on_patrol_start()
             except OSError as exc:
                 self._control_status.configure(
                     text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
                 return False
+            # The hook returns False when it deliberately did not arm input (the
+            # game window could not be prepared).  Nothing re-arms it later, so
+            # this is a failure the operator has to retry, not a deferred start.
+            armed = result is not False
+        if not armed:
+            self._control_status.configure(
+                text="无法开始: 输入未武装（游戏窗口未就绪或焦点丢失），请重试。"
+            )
+            LOG.info(LOG_RUN_START + "（未武装输入，未开始）。")
+            return False
         self.patrol_controller.set_enabled(True)
         # 攻击模式为「YOLO 检测」时，开始巡逻自动启动 YOLO 检测
         # （已在运行则跳过；缺依赖/模型会在状态栏给出提示）。

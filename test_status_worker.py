@@ -15,31 +15,34 @@ from status_worker import (
 )
 
 
-# Measured on the real client (370x57 bottom-middle capture): HP red
-# x 7-91, MP blue x 96-230, EXP yellow x 237-363, all in the same
-# vertical band (rows ~33-53).  Full fills: HP 85px, MP 135px, EXP 127px.
-HP_BAR = (7, 92)
-MP_BAR = (96, 231)
-EXP_BAR = (237, 364)
-BAND_TOP, BAND_BOTTOM = 33, 53
+# Measured on the current real client (new UI; reference capture 538x40):
+# every bar is ~130 px wide at the 1080x768 preset, i.e. 164 px inside this
+# capture.  HP red, MP blue and EXP yellow sit side by side in one vertical
+# band (rows 20-38).
+CAP_W, CAP_H = 538, 40
+FULL_W = 164
+HP_BAR = (11, 11 + FULL_W - 1)
+MP_BAR = (183, 183 + FULL_W - 1)
+EXP_BAR = (360, 360 + FULL_W - 1)
+BAND_TOP, BAND_BOTTOM = 20, 38
 
 
 def status_image(hp_ratio: float, mp_ratio: float,
                  exp_ratio: float = 1.0) -> Image.Image:
-    image = Image.new("RGB", (370, 57), "black")
+    image = Image.new("RGB", (CAP_W, CAP_H), "black")
     draw = ImageDraw.Draw(image)
     # Gray tracks behind the three bars.
     for left, right in (HP_BAR, MP_BAR, EXP_BAR):
         draw.rectangle((left, BAND_TOP, right, BAND_BOTTOM),
                        fill=(204, 204, 204))
     # Fills: HP red, MP blue, EXP yellow.
-    hp_width = round(85 * hp_ratio)
+    hp_width = round(FULL_W * hp_ratio)
     draw.rectangle((HP_BAR[0], BAND_TOP, HP_BAR[0] + hp_width, BAND_BOTTOM),
                    fill=(220, 20, 20))
-    mp_width = round(135 * mp_ratio)
+    mp_width = round(FULL_W * mp_ratio)
     draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[0] + mp_width, BAND_BOTTOM),
                    fill=(20, 40, 220))
-    exp_width = round(127 * exp_ratio)
+    exp_width = round(FULL_W * exp_ratio)
     draw.rectangle((EXP_BAR[0], BAND_TOP, EXP_BAR[0] + exp_width, BAND_BOTTOM),
                    fill=(238, 255, 0))
     return image
@@ -95,6 +98,62 @@ class StatusTests(unittest.TestCase):
         with patch.dict(sys.modules, {"win32gui": FakeWin32Gui}):
             self.assertEqual(sender._find_target_window(), 42)
 
+    def test_the_presence_probe_never_raises_without_the_game(self) -> None:
+        # The quick pickup hotkey asks whether the game is there at all - while the
+        # operator tests a 测试测谎 video it is not, and that must not become an error.
+        # No keyword guessing either: a window titled "MapleStory wiki" in a browser
+        # must never be mistaken for the game.
+        class FakeWin32Gui:
+            @staticmethod
+            def FindWindow(_class, _title):
+                return 0
+
+            @staticmethod
+            def IsWindowVisible(_hwnd):
+                return True
+
+            @staticmethod
+            def GetWindowText(hwnd):
+                return {7: "MapleStory wiki - 浏览器",
+                        9: "冒险岛：怀旧服（新区）攻略"}.get(hwnd, "")
+
+            @staticmethod
+            def EnumWindows(callback, extra):
+                for hwnd in (7, 9):
+                    callback(hwnd, extra)
+
+        sender = WindowKeySender("冒险岛怀旧服", dry_run=True)
+        with patch.dict(sys.modules, {"win32gui": FakeWin32Gui}):
+            self.assertFalse(sender.game_window_present())
+
+    def test_a_missing_game_window_lists_what_is_on_screen(self) -> None:
+        class FakeWin32Gui:
+            @staticmethod
+            def FindWindow(_class, _title):
+                return 0
+
+            @staticmethod
+            def IsWindowVisible(_hwnd):
+                return True
+
+            @staticmethod
+            def GetWindowText(hwnd):
+                return {3: "记事本", 4: "浏览器"}.get(hwnd, "")
+
+            @staticmethod
+            def EnumWindows(callback, extra):
+                for hwnd in (3, 4):
+                    callback(hwnd, extra)
+
+        sender = WindowKeySender("冒险岛怀旧服", dry_run=True)
+        with patch.dict(sys.modules, {"win32gui": FakeWin32Gui}):
+            with self.assertRaises(OSError) as caught:
+                sender._find_target_window()
+        message = str(caught.exception)
+        self.assertIn("found 0", message)
+        self.assertIn("记事本", message, "the operator must see what IS on screen")
+        self.assertIn("set its window title", message)
+
     def test_bar_ratios_are_converted_to_values(self) -> None:
         reading = BarStatusDetector().detect(status_image(0.5, 0.2, 0.75))
         self.assertAlmostEqual(reading.hp, 328, delta=5)
@@ -102,35 +161,35 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.exp, 75, delta=3)
 
     def test_adaptive_full_bar_reference_handles_fixed_pixel_hud(self) -> None:
-        # Fixed-pixel HUD: the bars are fixed pixels (HP 85, MP 135, EXP
-        # 127) inside the 370px-wide capture while a stale estimate says
+        # Fixed-pixel HUD: the bars are fixed pixels (164 in the reference
+        # capture) while a stale estimate says
         # otherwise.  Once the full bar is observed the reference adapts and
         # ratios are correct - previously every ratio clipped to 1.0 and
         # potions never fired on such machines.
         def frame(hp_px: int, mp_px: int) -> Image.Image:
-            image = Image.new("RGB", (370, 57), "black")
+            image = Image.new("RGB", (CAP_W, CAP_H), "black")
             draw = ImageDraw.Draw(image)
-            draw.rectangle((7, 33, 7 + hp_px - 1, 53), fill=(220, 20, 20))
-            draw.rectangle((96, 33, 96 + mp_px - 1, 53), fill=(20, 40, 220))
+            draw.rectangle((HP_BAR[0], BAND_TOP, HP_BAR[0] + hp_px - 1, BAND_BOTTOM), fill=(220, 20, 20))
+            draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[0] + mp_px - 1, BAND_BOTTOM), fill=(20, 40, 220))
             return image
 
         detector = BarStatusDetector()
-        first = detector.detect(frame(85, 135))  # both full: adapts refs
+        first = detector.detect(frame(FULL_W, FULL_W))  # both full: adapts refs
         self.assertAlmostEqual(first.hp, 656, delta=5)
         self.assertAlmostEqual(first.mp, 371, delta=5)
-        half = detector.detect(frame(42, 135))   # HP at ~50% of the real bar
+        half = detector.detect(frame(round(FULL_W / 2), FULL_W))   # HP at ~50%
         self.assertAlmostEqual(half.hp, 328, delta=10)
         self.assertAlmostEqual(half.mp, 371, delta=5)
 
     def test_partial_bar_never_becomes_the_full_reference(self) -> None:
         # A 60px MP fill is only 75% of the conservative 80px reference.  It
         # must remain 75%, not be learned as "full" and reported as 100%.
-        image = Image.new("RGB", (370, 57), "black")
-        ImageDraw.Draw(image).rectangle((96, 33, 155, 53), fill=(20, 40, 220))
+        image = Image.new("RGB", (CAP_W, CAP_H), "black")
+        ImageDraw.Draw(image).rectangle((MP_BAR[0], BAND_TOP, MP_BAR[0] + 59, BAND_BOTTOM), fill=(20, 40, 220))
         detector = BarStatusDetector(replace(
             StatusConfig(status_roi=(0.0, 0.0, 1.0, 1.0)),
             full_bar_width_fractions={
-                "hp": 0.224, "mp": 80.0 / 370.0, "exp": 0.224,
+                "hp": 0.224, "mp": 80.0 / CAP_W, "exp": 0.224,
             },
         ))
 
@@ -143,13 +202,13 @@ class StatusTests(unittest.TestCase):
         # A wide blue element (HUD frame / bar-track glow) inside the ROI
         # must NOT be measured as the MP bar - it would lock the ratio at
         # 1.0 and MP potions would never fire.  The real fill is used.
-        image = Image.new("RGB", (370, 57), "black")
+        image = Image.new("RGB", (CAP_W, CAP_H), "black")
         draw = ImageDraw.Draw(image)
         # Wide blue artifact, passes the MP mask, sits in its own row band
         # (above the bars) and spans beyond the MP zone.
-        draw.rectangle((0, 10, 369, 14), fill=(60, 120, 220))
-        # Real MP fill at roughly half length (~68px of the 135px estimate).
-        draw.rectangle((96, 33, 163, 53), fill=(20, 40, 220))
+        draw.rectangle((0, 10, CAP_W - 1, 14), fill=(60, 120, 220))
+        # Real MP fill at roughly half length (~82px of the 164px estimate).
+        draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[0] + 81, BAND_BOTTOM), fill=(20, 40, 220))
         reading = BarStatusDetector().detect(image)
         self.assertIsNotNone(reading.mp_ratio)
         self.assertLess(reading.mp_ratio, 0.7)
@@ -160,7 +219,7 @@ class StatusTests(unittest.TestCase):
         # EXP yellow fill must never be measured as HP red, and a saturated
         # yellow-green EXP never as MP blue - each bar is measured only in
         # its own horizontal zone.
-        image = Image.new("RGB", (370, 57), "black")
+        image = Image.new("RGB", (CAP_W, CAP_H), "black")
         draw = ImageDraw.Draw(image)
         # Only EXP is filled (full yellow); HP/MP zones stay empty.
         draw.rectangle((EXP_BAR[0], BAND_TOP, EXP_BAR[1], BAND_BOTTOM),
@@ -171,7 +230,7 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.exp_ratio, 1.0, delta=0.05)
 
         # Only HP is filled (full red); EXP/MP zones stay empty.
-        image = Image.new("RGB", (370, 57), "black")
+        image = Image.new("RGB", (CAP_W, CAP_H), "black")
         draw = ImageDraw.Draw(image)
         draw.rectangle((HP_BAR[0], BAND_TOP, HP_BAR[1], BAND_BOTTOM),
                        fill=(220, 20, 20))
@@ -181,7 +240,7 @@ class StatusTests(unittest.TestCase):
         self.assertIsNone(reading.exp_ratio)
 
         # Only MP is filled (full blue); HP/EXP zones stay empty.
-        image = Image.new("RGB", (370, 57), "black")
+        image = Image.new("RGB", (CAP_W, CAP_H), "black")
         draw = ImageDraw.Draw(image)
         draw.rectangle((MP_BAR[0], BAND_TOP, MP_BAR[1], BAND_BOTTOM),
                        fill=(20, 40, 220))
@@ -191,11 +250,11 @@ class StatusTests(unittest.TestCase):
         self.assertIsNone(reading.exp_ratio)
 
     def test_bar_calibration_survives_left_sixty_percent_capture_crop(self) -> None:
-        # The status-only capture (370x57 bottom-middle crop) is the image
+        # The status-only capture (the 538x40 bottom-middle crop) is the image
         # the detector receives; the full bar fractions are fixed-pixel
         # values measured inside that crop.
         full = status_image(0.5, 0.2, 0.75)
-        cropped = full.crop((0, 0, 370, 57))
+        cropped = full.crop((0, 0, CAP_W, CAP_H))
         defaults = StatusConfig()
         config = replace(
             defaults,
@@ -207,11 +266,11 @@ class StatusTests(unittest.TestCase):
         self.assertAlmostEqual(reading.exp, 75, delta=3)
 
     def test_bar_calibration_uses_status_only_capture(self) -> None:
-        # The status-only capture (370x57 bottom-middle crop) is the image
+        # The status-only capture (the 538x40 bottom-middle crop) is the image
         # the detector receives; the full bar fractions are fixed-pixel
         # values measured inside that crop.
         full = status_image(0.5, 0.2, 0.75)
-        cropped = full.crop((0, 0, 370, 57))
+        cropped = full.crop((0, 0, CAP_W, CAP_H))
         defaults = StatusConfig()
         config = replace(
             defaults,
@@ -311,6 +370,85 @@ class StatusTests(unittest.TestCase):
         )
         worker._process_frame(status_image(0.4, 0.1))
         self.assertEqual(sender.keys, ["delete", "end"])
+
+    def test_buff_cast_is_verified_by_the_hud(self) -> None:
+        # The sender can only prove the key was emitted; the HUD proves the game
+        # consumed it.  A buff that moved HP/MP must be reported as cast.
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event())
+        worker._last_hp, worker._last_mp = 552, 349
+        worker._arm_buff_verification("buff2", "pagedown")
+        with self.assertLogs("status_worker", level="INFO") as captured:
+            worker._verify_buff_effects(
+                StatusReading(hp=552, mp=330, hp_ratio=1.0, mp_ratio=0.9,
+                              confidence=1.0),
+                time.monotonic(),
+            )
+        self.assertIsNone(worker._buff_verification["buff2"])
+        self.assertTrue(
+            any("cast detected" in line for line in captured.output),
+            captured.output,
+        )
+
+    def test_buff_that_the_game_ignores_is_reported(self) -> None:
+        # The exact field symptom: the log says "executed", the game does
+        # nothing.  After the grace window the worker must say so, because the
+        # next buff attempt is a whole interval away.
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event())
+        worker._last_hp, worker._last_mp = 552, 349
+        worker._arm_buff_verification("buff2", "pagedown")
+        with self.assertLogs("status_worker", level="WARNING") as captured:
+            worker._verify_buff_effects(
+                StatusReading(hp=552, mp=349, hp_ratio=1.0, mp_ratio=0.9,
+                              confidence=1.0),
+                time.monotonic() + 10.0,
+            )
+        self.assertIsNone(worker._buff_verification["buff2"])
+        self.assertTrue(
+            any("did not cast anything" in line for line in captured.output),
+            captured.output,
+        )
+
+    def test_buff_verification_without_hud_values_says_so(self) -> None:
+        sender = FakeSender()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event())
+        worker._arm_buff_verification("buff3", "insert")
+        with self.assertLogs("status_worker", level="WARNING") as captured:
+            worker._verify_buff_effects(
+                StatusReading(hp=None, mp=None, hp_ratio=None, mp_ratio=None,
+                              confidence=0.0),
+                time.monotonic() + 10.0,
+            )
+        self.assertTrue(
+            any("could not verify" in line for line in captured.output),
+            captured.output,
+        )
+
+    def test_arbiter_buff_completion_arms_the_verification(self) -> None:
+        class QueuedArbiter:
+            def __init__(self) -> None:
+                self.requests: list[tuple[str, object]] = []
+
+            def request_buff(self, key, on_complete=None):
+                self.requests.append((key, on_complete))
+                return True
+
+        sender = FakeSender()
+        arbiter = QueuedArbiter()
+        worker = StatusWorker(queue.Queue(), sender, threading.Event(),
+                              motion_arbiter=arbiter)
+        worker.detector.config = replace(
+            worker.detector.config,
+            buff2_key="pagedown", buff2_interval=1.0, buff2_enabled=True,
+            buff1_enabled=False, buff3_enabled=False,
+        )
+        worker._last_buff["buff2"] = time.monotonic() - 10.0
+        worker._last_hp, worker._last_mp = 552, 349
+        worker._process_frame(status_image(1.0, 1.0))
+        self.assertEqual([key for key, _ in arbiter.requests], ["pagedown"])
+        arbiter.requests[0][1](True)
+        self.assertIsNotNone(worker._buff_verification["buff2"])
 
     def test_potion_effect_is_verified_and_retried_once_when_bar_stays_low(self) -> None:
         sender = FakeSender()
@@ -469,6 +607,63 @@ class StatusTests(unittest.TestCase):
         sender = WindowKeySender("game")
         self.assertTrue(sender.dry_run)
         self.assertTrue(sender.tap("ctrl"))
+
+    def test_action_tap_retries_after_a_focus_dip_and_delivers(self) -> None:
+        # A tap is the shortest event the bot emits, so a window that steals
+        # the foreground for a moment used to swallow it silently while the log
+        # still said "executed".
+        sender = WindowKeySender("game", dry_run=False)
+        focus = [False, True]
+        events = []
+        sender._foreground_matches = lambda: focus.pop(0) if focus else True
+        sender._send_scan_code = lambda code, key_up, extended: events.append(key_up)
+        with patch("status_worker.time.sleep") as sleep:
+            self.assertTrue(sender.tap("pagedown"))
+        self.assertEqual(events, [False, True])          # exactly one tap
+        self.assertTrue(sleep.called)                    # the dip was waited out
+
+    def test_action_tap_force_releases_the_key_when_focus_is_stolen_mid_tap(
+        self,
+    ) -> None:
+        # The key-up is global too: if it lands in another window the GAME keeps
+        # the key held, and every later tap of that key becomes a no-op.
+        sender = WindowKeySender("game", dry_run=False)
+        # Focus is fine for the key-down and gone by the end of the hold.
+        sender._foreground_matches = lambda: False if sender._used_keys else True
+        events = []
+        sender._send_scan_code = lambda code, key_up, extended: events.append(key_up)
+        with patch("status_worker.time.sleep"):
+            self.assertFalse(sender.tap("pagedown"))
+        # down + up (the lost release) + the forced release, then retries.
+        self.assertGreaterEqual(events.count(True), 2)
+        self.assertIn("pagedown", sender._used_keys)
+
+    def test_action_tap_never_waits_when_input_is_disarmed(self) -> None:
+        sender = WindowKeySender("game", dry_run=False, input_enabled=False)
+        sender._send_scan_code = lambda *args, **kwargs: self.fail(
+            "no input may be injected while disarmed"
+        )
+        with patch("status_worker.time.sleep") as sleep:
+            self.assertFalse(sender.tap("pagedown"))
+        sleep.assert_not_called()
+
+    def test_input_reset_releases_every_key_the_bot_ever_pressed(self) -> None:
+        # Movement keys are not the only ones that can stay stuck in the game:
+        # a buff key whose key-up was lost makes every later buff a no-op, so a
+        # lifecycle scrub must release the whole used-key superset.
+        sender = WindowKeySender("game", dry_run=False)
+        sender._foreground_matches = lambda: True
+        events = []
+        sender._send_scan_code = lambda code, key_up, extended: events.append(
+            (code, key_up)
+        )
+        page_down = sender._SCAN["pagedown"][0]
+        with patch("status_worker.time.sleep"):
+            self.assertTrue(sender.tap("pagedown"))
+        events.clear()
+        sender.reset_input_session("focus dip")
+        self.assertIn((page_down, True), events)
+        self.assertEqual(sender._key_owners, {})
 
     def test_disabled_input_does_not_select_window_or_send_keys(self) -> None:
         sender = WindowKeySender("game", dry_run=False, input_enabled=False)

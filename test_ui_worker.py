@@ -26,6 +26,170 @@ from ui_worker import (
 )
 
 
+class _GapButton:
+    """Minimal ttk.Button stand-in: records bindings and after() jobs."""
+
+    def __init__(self) -> None:
+        self.bindings: dict = {}
+        self.jobs: list = []
+        self.cancelled: list = []
+
+    def bind(self, sequence, handler):
+        self.bindings[sequence] = handler
+
+    def after(self, delay, callback):
+        job = ("job", delay, len(self.jobs))
+        self.jobs.append((delay, callback))
+        return job
+
+    def after_idle(self, callback):
+        callback()
+
+    def after_cancel(self, job):
+        self.cancelled.append(job)
+
+    def state(self, _spec):
+        pass
+
+    def press(self):
+        self.bindings["<ButtonPress-1>"]()
+
+    def release(self):
+        self.bindings["<ButtonRelease-1>"]()
+
+    def double_click(self):
+        self.bindings["<Double-Button-1>"]()
+
+
+class _Var:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class RandomGapStepButtonTests(unittest.TestCase):
+    """单机 = ±0.1s 精调, 长按连发, 双击 = ±5s 粗调."""
+
+    @staticmethod
+    def _worker(gap=2.0):
+        worker = UiWorker.__new__(UiWorker)
+        worker._fixed_on_change = lambda: None      # no Tk panel in this test
+        worker._fixed_random_gap_var = _Var(gap)
+        worker._random_jump_gap_var = _Var(gap)
+        worker._small_step_gap_var = _Var(gap)
+        return worker
+
+    @staticmethod
+    def _wire(worker, button, reader, setter, direction):
+        worker._bind_repeat_step_button(
+            button,
+            lambda: setter(reader() + 0.1 * direction),
+            current=reader,
+            coarse=lambda anchor: setter(
+                (reader() if anchor is None else anchor)
+                + direction * worker._RANDOM_GAP_COARSE_STEP
+            ),
+        )
+
+    def test_double_click_steps_exactly_five_seconds(self):
+        worker = self._worker(2.0)
+        button = _GapButton()
+        self._wire(
+            worker, button,
+            worker._fixed_random_gap_seconds, worker._set_fixed_random_gap, +1,
+        )
+        # A real double click also emits both presses, each applying one fine
+        # step: the coarse step is measured from the sequence's anchor, so the
+        # result is exactly 2.0 + 5.0 and not 7.2.
+        button.press()
+        button.release()
+        button.press()
+        button.double_click()
+        self.assertEqual(worker._fixed_random_gap_seconds(), 7.0)
+
+    def test_single_click_still_steps_a_tenth(self):
+        worker = self._worker(2.0)
+        button = _GapButton()
+        self._wire(
+            worker, button,
+            worker._fixed_random_gap_seconds, worker._set_fixed_random_gap, +1,
+        )
+        button.press()
+        button.release()
+        self.assertEqual(worker._fixed_random_gap_seconds(), 2.1)
+
+    def test_decrease_double_click_and_floor(self):
+        worker = self._worker(3.0)
+        button = _GapButton()
+        self._wire(
+            worker, button,
+            worker._fixed_random_gap_seconds, worker._set_fixed_random_gap, -1,
+        )
+        button.press()
+        button.double_click()
+        self.assertEqual(worker._fixed_random_gap_seconds(), 0.0)  # clamped
+
+    def test_coarse_step_respects_the_thirty_second_ceiling(self):
+        worker = self._worker(28.0)
+        button = _GapButton()
+        self._wire(
+            worker, button,
+            worker._fixed_random_gap_seconds, worker._set_fixed_random_gap, +1,
+        )
+        button.press()
+        button.double_click()
+        self.assertEqual(worker._fixed_random_gap_seconds(), 30.0)
+
+    def test_jump_and_step_gaps_use_the_same_coarse_step(self):
+        worker = self._worker(1.0)
+        for reader, setter, var in (
+            (worker._random_jump_gap_seconds, worker._set_random_jump_gap,
+             worker._random_jump_gap_var),
+            (worker._small_step_gap_seconds, worker._set_small_step_gap,
+             worker._small_step_gap_var),
+        ):
+            button = _GapButton()
+            self._wire(worker, button, reader, setter, +1)
+            button.press()
+            button.double_click()
+            self.assertEqual(var.get(), 6.0)
+
+    def test_saved_intervals_are_clamped_into_the_thirty_second_range(self):
+        worker = self._worker()
+        worker._random_jump_interval_var = _Var(45.0)
+        worker._small_step_interval_var = _Var(45.0)
+        worker._random_jump_gap_var = _Var(0.1)
+        worker._small_step_gap_var = _Var(0.1)
+        for name in (
+            "_fixed_interval_label", "_fixed_random_gap_label",
+            "_fixed_range_label", "_random_jump_interval_label",
+            "_random_jump_gap_label", "_random_jump_range_label",
+            "_small_step_interval_label", "_small_step_gap_label",
+            "_small_step_range_label", "_fixed_key_button",
+        ):
+            setattr(worker, name, type(
+                "Widget", (), {"configure": lambda self, **_kw: None}
+            )())
+        worker._fixed_interval_var = _Var(3.0)
+        worker._fixed_attack_key_var = _Var("ctrl")
+        worker._attack_mode_var = _Var("fixed")
+        worker._fixed_collect_data = lambda: {}
+        worker._fixed_save_settings = lambda _data: None
+        worker._fixed_apply_to_worker = lambda _data: None
+        worker._fixed_refresh_grey = lambda: None
+        worker._fixed_on_change = UiWorker._fixed_on_change.__get__(worker)
+
+        worker._fixed_on_change()
+
+        self.assertEqual(worker._random_jump_interval_var.get(), 30.0)
+        self.assertEqual(worker._small_step_interval_var.get(), 30.0)
+
+
 class UiLogHandlerTests(unittest.TestCase):
     def test_yolo_panel_is_temporarily_hidden_behind_restore_flag(self) -> None:
         self.assertFalse(UiWorker._SHOW_YOLO_PANEL)
@@ -1483,6 +1647,117 @@ class UiLogHandlerTests(unittest.TestCase):
             self.assertEqual(loader.character_worker.sound_calls, [False])
             self.assertEqual(loader.lie_detector_worker.sound_calls, [False])
 
+    def test_import_config_restarts_the_assistant_to_apply_it(self):
+        # The imported file is only read at startup, and the running instance
+        # would write its own in-memory settings back over it (while still
+        # patrolling the old route), so a successful import restarts at once.
+        from pathlib import Path
+
+        class Root:
+            def __init__(self):
+                self.scheduled = []
+
+            def after(self, delay, callback):
+                self.scheduled.append((delay, callback))
+
+        events = []
+        worker = UiWorker.__new__(UiWorker)
+        worker.user_config_path = "C:/install/user_config.json"
+        worker._root = Root()
+        worker._stop_patrol = lambda: events.append("stop-patrol")
+        imported = []
+        restarts = []
+
+        with mock.patch(
+            "tkinter.filedialog.askopenfilename",
+            return_value="C:/desktop/user_config.json",
+        ), mock.patch(
+            "ui_worker.import_user_config",
+            side_effect=lambda source, destination: (
+                imported.append((source, destination)) or destination
+            ),
+        ), mock.patch(
+            "ui_worker.schedule_hidden_restart",
+            side_effect=lambda root: restarts.append(root),
+        ), mock.patch.object(
+            worker, "_on_debug_window_close",
+            lambda: events.append("close-window"),
+        ):
+            worker._import_user_config()
+
+        self.assertEqual(
+            imported,
+            [(Path("C:/desktop/user_config.json"),
+              Path("C:/install/user_config.json"))],
+        )
+        self.assertEqual(len(restarts), 1)          # hidden helper started
+        self.assertEqual(events, ["stop-patrol"])   # input released first
+        self.assertEqual([delay for delay, _cb in worker._root.scheduled], [250])
+        # The scheduled callback is the one that closes this instance.
+        worker._root.scheduled[0][1]()
+        self.assertEqual(events, ["stop-patrol", "close-window"])
+
+    def test_import_config_keeps_running_when_the_restart_helper_fails(self):
+        from update_manager import UpdateError
+
+        class Root:
+            def __init__(self):
+                self.scheduled = []
+
+            def after(self, delay, callback):
+                self.scheduled.append((delay, callback))
+
+        events = []
+        worker = UiWorker.__new__(UiWorker)
+        worker.user_config_path = "C:/install/user_config.json"
+        worker._root = Root()
+        worker._stop_patrol = lambda: events.append("stop-patrol")
+
+        with mock.patch(
+            "tkinter.filedialog.askopenfilename",
+            return_value="C:/desktop/user_config.json",
+        ), mock.patch("ui_worker.import_user_config"), mock.patch(
+            "ui_worker.schedule_hidden_restart",
+            side_effect=UpdateError("找不到 launch_assistant.vbs"),
+        ):
+            worker._import_user_config()
+
+        # No restart helper means no shutdown: the operator keeps a working
+        # dashboard and is told to restart manually.
+        self.assertEqual(events, [])
+        self.assertEqual(worker._root.scheduled, [])
+
+    def test_import_config_cancel_changes_nothing(self):
+        class Root:
+            def __init__(self):
+                self.scheduled = []
+
+            def after(self, delay, callback):
+                self.scheduled.append((delay, callback))
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.user_config_path = "C:/install/user_config.json"
+        worker._root = Root()
+
+        with mock.patch(
+            "tkinter.filedialog.askopenfilename", return_value=""
+        ), mock.patch("ui_worker.import_user_config") as imported, mock.patch(
+            "ui_worker.schedule_hidden_restart"
+        ) as restarted:
+            worker._import_user_config()
+
+        imported.assert_not_called()
+        restarted.assert_not_called()
+        self.assertEqual(worker._root.scheduled, [])
+
+    def test_import_config_without_a_user_config_path_does_nothing(self):
+        worker = UiWorker.__new__(UiWorker)
+        worker.user_config_path = ""
+        worker._root = None
+        with mock.patch("ui_worker.schedule_hidden_restart") as restarted:
+            worker._import_user_config()
+        restarted.assert_not_called()
+
     def test_poll_syncs_patrol_buttons_after_external_stop(self) -> None:
         # Disconnect alerts / focus loss stop patrol directly on the
         # controller without a UI action.  The poll sync must refresh the
@@ -1533,6 +1808,108 @@ class UiLogHandlerTests(unittest.TestCase):
         worker._sync_patrol_ui_state()
 
         self.assertEqual(refreshes, [])
+
+    def test_start_patrol_reports_when_input_could_not_be_armed(self):
+        # The lie takeover that used to own the machine is gone.  A start hook
+        # that arms nothing now means a real failure (game window not ready),
+        # so patrol stays disabled, the reason is shown, and the caller gets
+        # False for its failure sound instead of a "deferred" success.
+        class Controller:
+            def __init__(self):
+                self.enabled = False
+
+            def is_enabled(self):
+                return self.enabled
+
+            def can_start(self):
+                return True
+
+            def set_enabled(self, value):
+                self.enabled = bool(value)
+
+        class Label:
+            def __init__(self):
+                self.text = ""
+
+            def configure(self, **kwargs):
+                if "text" in kwargs:
+                    self.text = kwargs["text"]
+
+        refreshes = []
+        worker = UiWorker.__new__(UiWorker)
+        worker.patrol_controller = Controller()
+        worker._control_status = Label()
+        worker._root = None
+        worker.on_patrol_start = lambda: False    # nothing was armed
+        worker._refresh_patrol_controls = lambda: refreshes.append(True)
+
+        self.assertFalse(worker._start_patrol())
+        self.assertFalse(worker.patrol_controller.enabled)
+        self.assertIn("输入未武装", worker._control_status.text)
+        self.assertEqual(refreshes, [])
+
+    def test_start_patrol_enables_patrol_when_input_is_armed(self):
+        class Controller:
+            def __init__(self):
+                self.enabled = False
+
+            def is_enabled(self):
+                return self.enabled
+
+            def can_start(self):
+                return True
+
+            def set_enabled(self, value):
+                self.enabled = bool(value)
+
+        class Label:
+            def __init__(self):
+                self.text = ""
+
+            def configure(self, **kwargs):
+                if "text" in kwargs:
+                    self.text = kwargs["text"]
+
+        refreshes = []
+        worker = UiWorker.__new__(UiWorker)
+        worker.patrol_controller = Controller()
+        worker._control_status = Label()
+        worker._root = None
+        worker.on_patrol_start = lambda: True
+        worker._refresh_patrol_controls = lambda: refreshes.append(True)
+
+        self.assertTrue(worker._start_patrol())
+        self.assertTrue(worker.patrol_controller.enabled)
+        self.assertEqual(worker._control_status.text, "巡逻已开始。")
+        self.assertEqual(refreshes, [True])
+
+    def test_start_patrol_tolerates_a_legacy_hook_returning_none(self):
+        class Controller:
+            def __init__(self):
+                self.enabled = False
+
+            def is_enabled(self):
+                return self.enabled
+
+            def can_start(self):
+                return True
+
+            def set_enabled(self, value):
+                self.enabled = bool(value)
+
+        class Label:
+            def configure(self, **_kwargs):
+                pass
+
+        worker = UiWorker.__new__(UiWorker)
+        worker.patrol_controller = Controller()
+        worker._control_status = Label()
+        worker._root = None
+        worker.on_patrol_start = lambda: None
+        worker._refresh_patrol_controls = lambda: None
+
+        self.assertTrue(worker._start_patrol())
+        self.assertTrue(worker.patrol_controller.enabled)
 
     def test_alerts_still_apply_when_shutdown_worker_is_none(self) -> None:
         import tempfile

@@ -31,12 +31,18 @@ class FocusWorker(threading.Thread):
         focus_lost_grace_seconds: float = 2.5,
         refocus_interval_seconds: float = 1.0,
         on_focus_lost: Optional[Callable[[], None]] = None,
+        lie_pass_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="focus-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
         self.automation_active_event = automation_active_event
         self.game_focused_event = game_focused_event
+        # Set while a lie pass owns the machine.  Such a pass runs with input
+        # DISARMED, but its own capture (the ~30 fps lie cadence) still needs the
+        # foreground gate open - so the real foreground state keeps being probed
+        # for the whole pass instead of being inferred from keyboard ownership.
+        self.lie_pass_event = lie_pass_event
         self.poll_interval = max(0.05, float(poll_interval))
         self.focus_lost_grace_seconds = max(0.0, float(focus_lost_grace_seconds))
         self.refocus_interval_seconds = max(0.25, float(refocus_interval_seconds))
@@ -78,7 +84,21 @@ class FocusWorker(threading.Thread):
                          daemon=True).start()
 
     def _log_foreground_snapshot(self) -> None:
-        """Best-effort log of what window currently holds the foreground."""
+        """Best-effort log of what window currently holds the foreground.
+
+        A stolen foreground is the usual reason a short action tap (jump/buff)
+        dies silently: ``SendInput`` is global, so the keystroke lands in that
+        window instead of the game.  The snapshot therefore names the process
+        as well as the window class, so the operator can close the offender.
+        """
+
+        describe = getattr(self.key_sender, "describe_foreground", None)
+        if callable(describe):
+            try:
+                LOG.warning("game lost focus; foreground now: %s", describe())
+                return
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                LOG.debug("could not describe foreground window: %s", exc)
         try:
             import win32gui
 
@@ -103,9 +123,17 @@ class FocusWorker(threading.Thread):
                 # Stay completely idle while patrol is stopped.  The old
                 # unconditional probe searched for the game every 0.2s and
                 # also kept the capture pipeline running before Start Patrol.
+                # A lie pass is the one exception: it owns the machine with
+                # input disabled, yet the pass itself is fed by that same
+                # capture, so the foreground state is still probed then (keys
+                # stay disarmed - ``active`` below is unchanged).
+                lie_pass = bool(
+                    self.lie_pass_event is not None
+                    and self.lie_pass_event.is_set()
+                )
                 game_focused = (
                     bool(self.key_sender.is_game_foreground())
-                    if input_enabled else False
+                    if (input_enabled or lie_pass) else False
                 )
                 if game_focused:
                     self.game_focused_event.set()

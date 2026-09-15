@@ -36,9 +36,9 @@ assistant.py (primary process)
     ShutdownWorker     preserved but temporarily not constructed
     CountdownWorker    independent repeating MP3 reminder
     LieDetectorWorker  1-second full-client pure-white-square alarm
-    AutoLieWorker      optional fade-tracker (自动过测谎): 4 s after the alarm
-                      it seeds Cutie inside the lie-popup crop, follows the
-                      fading target and moves the real mouse onto it (no click)
+    VideoDrillWorker   测试api: plays a chosen video at 5 fps in its own Tk
+                       window, uploads the lie ROI to the remote RoiTrack
+                       service, moves the cursor inside the picture (no click)
     ScreenBlinker       optional two-flash red visual alarm
     supervisor-worker  stops the process if a core worker dies
 
@@ -72,24 +72,21 @@ game client
      -> status_frames    -> StatusWorker
      -> character_frames -> CharacterWorker -> character_positions
      -> lie frames       -> LieDetectorWorker (one in-memory scan per second)
-     -> auto-lie frames  -> AutoLieWorker (only while armed)
      -> ui_frames        -> UiWorker
 ```
 
-An extra bounded `auto_lie_frames` subscription feeds `AutoLieWorker`.
-`LieDetectorWorker` gained an optional `lie_seen_callback` (set in
+`LieDetectorWorker` owns an optional `lie_seen_callback` list (wired in
 `assistant.py`): every newly detected #c9ced0 square (with its bbox and the
-originating frame) is forwarded to the auto-lie worker; the slice is only the
-alarm and disappears when the real popup opens, so the clear signal is
-informational and never stops a sequence. Enabling 自动过测谎 in the UI
-force-enables the 测谎 detection so the event chain always has a source;
-deselecting 测谎 clears 自动过测谎 as well. `AutoLieWorker` preloads Cutie
-during UI startup and the status label reports preloading, ready, or failure
-without blocking Tk.  The lie popup follows the same fixed 1366x768 HUD basis
-as the trade coordinates (line "1. Trade coordinates..." above): the measured
-767x598 popup, its 64px countdown guard and the detector's accepted popup size
-in pixels are identical on 1920x1080, and all of them scale by the fixed width
-ratio only at the smaller 1075x768 client.
+originating frame) is forwarded to its subscribers - the 测谎 alert and the
+screenshot recorder.  The slice is only the alarm: it disappears when the real
+popup opens, so its clear signal is informational and never stops anything.
+The local pass that used to consume those events (AutoLieWorker, a bundled
+Cutie fade-tracker) is gone; lie detection is now a call to the remote
+RoiTrack service.  The measured lie-window geometry it owned survives in
+`lie_geometry.py`, on the same fixed 1366x768 HUD basis as the trade
+coordinates (line "1. Trade coordinates..." above): the measured 767x598
+popup is identical on 1920x1080 and scales by the fixed width ratio only at
+the smaller 1075x768 client.
 
 `MinimapDetector` uses OpenCV to locate the resizable minimap, inner canvas,
 map-name crop, and analysis box. The game HUD is FIXED pixel: only the
@@ -144,7 +141,13 @@ The UI starts with input disarmed. **Start Patrol** prepares the map session,
 selects the game window, and arms input. **Stop Patrol** disables input and
 releases keys.
 
-`HotkeyWorker` installs `WH_KEYBOARD_LL` on its own thread. It ignores keyboard
+`HotkeyWorker` claims the fixed Ctrl chords through native `RegisterHotKey`
+first (Windows consumes the chord and `MOD_NOREPEAT` stops hold repeats) and
+installs a `WH_KEYBOARD_LL` hook for exactly the chords Windows would not let
+it register - Ctrl+` when another application already owns it, for example -
+so a partially rejected set never leaves a chord silently dead. It runs only
+in the interactive UI instance; a headless `--no-ui` run must never claim the
+chords. It ignores keyboard
 events injected by itself (every assistant SendInput key carries the
 `SELF_INPUT_EXTRA_INFO` `dwExtraInfo` stamp) or from a lower integrity level
 (`LLKHF_LOWER_IL_INJECTED`), and never calls Tk directly. Same-integrity
@@ -154,7 +157,16 @@ short action names into a bounded queue; `UiWorker._poll()` drains that queue
 on Tk's owning thread. Quick-message indices always address the live insertion
 order, so deletion automatically compacts `Ctrl+1` through `Ctrl+0`. Recording
 hotkeys refuse to run while patrol is enabled. Action feedback MP3 playback is
-launched on a daemon thread and does not block the hook or Tk.
+launched on a daemon thread and does not block the hook or Tk. Every MCI play
+(`countdown_worker.play_mp3`, shared by the countdown, disconnect/lie alerts,
+trade, and action feedback) is started WITHOUT MCI's `wait` flag and its mode
+is polled against a 30 s budget, then the alias is always closed: `wait`
+blocks the calling thread until the device reports the clip finished, which
+never happens when the audio endpoint disappears or the MPEG driver wedges -
+observed as a permanently stuck `action-sound-*` thread inside
+`mciSendStringW` with a leaked alias, which then blocks later MCI calls in the
+same process (the alert sound is played inline by the character and lie
+detector workers, so that used to freeze those detection threads too).
 
 `TradeWorker` is independent of patrol movement and does not create a Tk
 overlay. Its `Ctrl+Q` flow uses the physical cursor only as the player target:
@@ -417,7 +429,22 @@ floor at a time, and final-layer completion drops back to layer3.
 
 Far movement uses a bounded continuous hold; final correction duration is
 computed from minimap X distance. Passing an endpoint line counts as reaching
-it, avoiding an exact-pixel problem.
+it, avoiding an exact-pixel problem. Both endpoints use the same arrival band
+(`horizontal_tolerance`, or `horizontal_tolerance_diamonds` scaled by the
+measured diamond width). The former quarter-width band on the left endpoint is
+gone: a saved left-most point that renders just outside the walkable platform
+could never satisfy it, so the character kept walking into the edge until the
+self-rescue restarted the whole patrol. A near-but-unreachable endpoint - still
+within four times the band after fifteen frames, attack pauses excluded - is
+treated as reached, and the route turns with an `endpoint unreachable on ...`
+warning instead of stalling. A far endpoint beyond a wall is covered by a
+second bound: thirty frames without the distance to the target closing
+(`_endpoint_no_progress`) also turns the phase, so a saved point outside the
+walkable platform can never mean endless edge walking.
+
+A movement stall watchdog (five-second poll) warns when patrol input is armed
+but no frame has been consumed for twenty seconds, logging the route state and
+every thread's stack, so a wedged worker is diagnosable from the log.
 
 Left/Right walking holds Z simultaneously for pickup. Hold management is
 non-blocking so frame analysis and coordination continue during long movement.
@@ -529,9 +556,14 @@ rope/character geometry. The UI prefers a local
 `yolo-detection/venv313`, then falls back to the assistant's current Python
 environment.
 
-`StatusWorker` analyzes the independent fixed-pixel status capture. HP (red),
-MP (blue), and EXP (yellow) occupy separate horizontal zones of one vertical
-band, each with its own full-width reference; their readings therefore cannot
+`StatusWorker` analyzes the independent fixed-pixel status capture. The box
+is bottom-anchored and resolution-relative (`assistant.py`'s
+`status_capture_pixel_box`): 425x32 on the 1080x768 preset and 538x40 on the
+shared 1366x768 / 1920x1080 preset, its centre offset onto the info bar
+(which the updated UI draws right of the client centre). Every bar - HP
+(red), MP (blue) and EXP (yellow) - is ~130 px wide at the 1080x768 preset
+(164 px at the reference) and gets its own horizontal zone of one vertical
+band, so the readings cannot
 be mixed. HP/MP use confirmed low readings, retry blocked sends, and verify
 the bar response.
 
@@ -628,7 +660,7 @@ shipped, runtime-read-only `system_config.json`.
 | `rope_calibration` | system/update | assistant.py -> MovementWorker tuning |
 | `drug` | user | UiWorker, StatusWorker, MovementWorker |
 | `fixed_attack` | user | UiWorker and AttackWorker |
-| `additional_functions` | user | UiWorker and optional-function workers (incl. `auto_lie_pass_enabled` for 自动过测谎) |
+| `additional_functions` | user | UiWorker and optional-function workers (alerts, 自动重连, shutdown hours) |
 | `yolo_detection` | user | UiWorker and YOLO launch settings |
 | `ui_window` | user | Tk window geometry helpers |
 
@@ -721,7 +753,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
    `9999`) and runs `build_release.ps1 -Version NNNN -Variant cpu -Zip` and
    the corresponding `cuda` build. It recreates
    `release/MapleAssistant-CPU` and `release/MapleAssistant-CUDA`, writes a
-   BOM-free `release_variant.json` declaring the runtime and environment,
+   BOM-free `release_variant.json` declaring the runtime and environment (it now
+   only selects the launcher and the `.venv-cpu` / `.venv-cuda` name - no local
+   tracker is installed any more),
    copies runtime files/assets/model weights, and creates
    `MapleAssistant-CPU-vNNNN.zip` plus `MapleAssistant-CUDA-vNNNN.zip`.
    Cleanup of prior paired ZIPs happens only after both builds succeed. A
@@ -760,10 +794,12 @@ git -c core.quotepath=false ls-files
 | `config_store.py` | User/system section router and legacy user migration |
 | `capture_worker.py` | Client capture, frame bus, region mapping |
 | `movement_worker.py` | Patrol and movement state machines |
-| `auto_lie_worker.py` | Optional 自动过测谎 fade-square tracker (AutoLieWorker, environment probe, process-wide Cutie model cache) |
-| `lie_demo_player.py` | 测试测谎 demo: replays `detect_video/try_detect.mp4` in the ROI tracker window (separate process) |
+| `api_lie_video.py` | 测试api video drill: own focused Tk window, 5 fps, ROI upload to the remote service, cursor inside the picture, per-run logs |
+| `api_lie_test.py` | Offline single-frame API drill (no panel button; `work/` scripts and tests) |
+| `lie_geometry.py` | Measured lie-popup geometry (preset box, feed insets) - pure geometry, no capture, no model |
+| `autolie_api/` | Our RoiTrack client (endpoints, WS transport, key store, run logs, local mimic) + the vendor's read-only reference material |
 | `lie_screenshot_recorder.py` | Alert-triggered full-client recorder (decoupled); composes the finished run into one mp4 |
-| `lie_video_tools.py` | Frames -> mp4 (H.264 via ffmpeg when present) and the in-game replay test (`simulate_in_game_run`) |
+| `lie_video_tools.py` | Frames -> mp4 (H.264 via ffmpeg when present); the in-game replay was removed with the local pass |
 | `motion_arbiter.py` | FIFO serialization, action windows, and completion callbacks for random-jump/buff/small-step motions |
 | `stair_jump_worker.py` | Dedicated one-action stair recovery: waits for attack tail while patrol walk continues |
 | `small_step_worker.py` | Optional timed small-step scheduler; requests, but does not emit, the atomic movement action |
@@ -789,7 +825,7 @@ git -c core.quotepath=false ls-files
 | `marker_detector.py` | Yellow/red diamond detection and size stabilization |
 | `map_structure_tracker.py` | Scroll/world-Y tracking and re-anchoring |
 | `map_identity.py` | Map-name visual reference storage/matching |
-| `diagnose.bat` | Environment diagnostic for torch/WinError-1114 reports (OS/CPU/VC DLLs/import) |
+| `diagnose.bat` | Environment diagnostic (OS/CPU/VC DLLs/Python) |
 | `ui_worker.py` | Tk dashboard, recording controls, settings, YOLO subprocess |
 | `update_manager.py` | Desktop release discovery, tagged user-config preservation, hidden restart helper |
 | `versioning.py` | Four-digit release version read/format helpers |
@@ -807,8 +843,8 @@ git -c core.quotepath=false ls-files
 | `sound/success.mp3`, `sound/fail.mp3` | Recording and patrol action feedback |
 | `yolo_detection_settings.json` | Saved YOLO UI settings |
 | `requirements.txt` | Primary Python dependencies |
-| `install.ps1`, `安装.bat` | Package-aware installer: the short unelevated UAC helper exits immediately; the visible elevated installer creates `.venv-cpu` or `.venv-cuda`, installs/verifies Cutie, and writes matching launchers |
-| `start_assistant.bat`, `启动助手.bat`, `launch_assistant.vbs` | Package-specific launcher chain written by the builder/installer; reuses the existing `.venv-cpu` or `.venv-cuda` after an overlay update |
+| `install.ps1`, `安装.bat` | Package-aware installer: the short unelevated UAC helper exits immediately; the visible elevated installer creates `.venv-cpu` or `.venv-cuda` and writes matching launchers.  The local tracker step (torch/Cutie/weights) is off: `$InstallLocalTracker = $false` |
+| `start_assistant.bat`, `启动助手.bat`, `launch_assistant.vbs` | Package-specific launcher chain written by the builder/installer; creates/uses a renamed `todo_helper.exe` copy of the package interpreter and reuses the existing `.venv-cpu` or `.venv-cuda` after an overlay update |
 | `launch_assistant_elevated.vbs` | Development elevation helper; excluded from release |
 | `restart_assistant.ps1` | Development restart helper; excluded from release |
 | `build_release.ps1` | CPU/CUDA distributable builder; emits runtime manifest and matching launcher into each package |
@@ -820,24 +856,32 @@ git -c core.quotepath=false ls-files
 | `COMMIT_MSG.txt` | Historical/local commit-message material; excluded from release |
 | `.gitignore` | Generated/runtime exclusion rules |
 
-### Bundled `target_tracker/` component and demo assets
+### The remote lie service, `target_tracker/` and the demo clips
 
-`target_tracker/` is the self-contained Realtime Fade Tracker (Cutie VOS +
-dense optical-flow residual tracking of fading white targets; own docs and
-`.cmd` launchers inside).  It is imported from source - both
-`target_tracker/` and `target_tracker/src` are prepended to `sys.path` when
-the auto-lie feature runs - and is never pip-installed.  Its core gained a
-`device` parameter. A normal development checkout chooses automatically, but
-each published `release_variant.json` locks the worker and UI to CPU or CUDA.
-The release package ships a
-stripped copy: model weights, the pure-Python cutie wheel, vc_redist.x64.exe
-and sources only (no Python installer, no other wheels).
+Lie detection is a **remote call**, not local inference.  `api_lie_video.py` (the 测试api
+button) plays a chosen clip at the API's 5 fps in its own focused Tk window, converts each
+frame's lie ROI to 372x248 BGR JPEG q90 -> base64, sends it through the WebSocket client in
+`autolie_api/`, and moves the real cursor onto the answer - only inside the picture
+rectangle, and never a click.  The order is fixed and deliberate: connect at once
+(probe -> handshake), play the `AWAIT_SECOND_WINDOW` wait (3 s) without feeding, then feed
+for the rest of the 时长 (~27 s of a 30 s run), then `round_end` and close.  Waiting before
+the first frame matters because a session is kicked after 10 s without a valid frame
+(2.7.0 §4.1), so a longer wait is clamped to 8 s; `frame_id` restarts at 1 per round, and a
+mid-round server reset is survived by opening a new session and restarting the sequence.
+Every run logs to `work/api_test/api_lie_video_<stamp>/` (`connection.log`,
+`detection.jsonl`, `summary.json`, `frames/`), and the panel prints that folder.
 
-`detect_video/try_detect.mp4` is the demo footage for the 测试测谎 button.
-`lie_demo_player.py` (separate process, its own Tk window) replays it with a
-demo-specific white-popup seed rule; output lands in
-`work/lie_demo_console.log` and early crashes are surfaced in a popup and
-appended to `error.log`.
+`target_tracker/` now holds only `mouse_aim_controller.py` (stdlib-only; the aim controller
+the drill adds to `sys.path`) and its README.  The engine it used to carry -
+`realtime_fade_tracker`, `adaptive_target_tracker.py`, `roi_video_tracker.py`,
+`video_player_tracker.py` and `offline_bundle/` with the Cutie weights, wheelhouse and
+python/vc_redist installers - is deleted, together with `auto_lie_worker.py`,
+`lie_demo_player.py`, `auto_lie_overlay.py` and their tests.  The package therefore installs
+no torch/Cutie and ships ~62 MB instead of ~379 MB.
+
+`detect_video/` holds the operator's own lie-event clips and frame dumps; they are the
+natural inputs for 测试api.  The old demo footage and its separate-process replay window are
+gone with the local pass.
 
 ### Logging and diagnostics
 
@@ -846,7 +890,7 @@ All levels (INFO+) go to the single rotating root `error.log`; the former
 `*.log` files (after the single-instance check; `.venv*`, `release`,
 `recording-assets`, `detect_video`, `sound` are skipped).  The 运行日志
 panel has a ❗ icon button that copies `error.log` to the clipboard.
-Feature log lines are prefixed `auto-lie:` / `lie-detect:` for easy tracing.
+Feature log lines are prefixed `lie-detect:` / `reconnect:` / `api-lie:` for easy tracing.
 
 ### Separate `boss_tracker/` application
 
@@ -867,31 +911,44 @@ Feature log lines are prefixed `auto-lie:` / `lie-detect:` for easy tracing.
 ### Root tests
 
 ```text
+test_api_lie_test.py
+test_api_lie_video.py
 test_assistant.py
 test_attack_worker.py
+test_autolie_api_reference.py
 test_capture_worker.py
 test_channel_switch.py
-test_combat_coordination.py
 test_character_worker.py
+test_combat_coordination.py
 test_config_store.py
 test_countdown_worker.py
-test_lie_detector_worker.py
-test_motion_arbiter.py
-test_screen_blinker.py
 test_focus_worker.py
 test_hotkey_worker.py
+test_image_io.py
+test_installer_scripts.py
+test_intergration.py
+test_lie_detector_worker.py
+test_lie_screenshot_recorder.py
+test_lie_video_tools.py
 test_map_identity.py
 test_map_structure_tracker.py
+test_marker_detector.py
 test_minimap_detector.py
+test_motion_arbiter.py
+test_mouse_aim_controller.py
 test_movement_worker.py
 test_patrol_control.py
 test_pickup_worker.py
+test_quick_pickup_worker.py
 test_random_jump_worker.py
+test_reconnect_worker.py
+test_screen_blinker.py
 test_shutdown_worker.py
 test_single_instance.py
-test_status_worker.py
 test_small_step_worker.py
+test_status_worker.py
 test_telegram_notifier.py
+test_timer_state.py
 test_ui_worker.py
 test_update_manager.py
 test_versioning.py
@@ -937,6 +994,8 @@ These exist locally but are not guaranteed in a clone or commit:
 |---|---|
 | `.venv/`, `.venv-cpu/`, `.venv-cuda/`, `yolo-detection/venv313/` | Local Python environments; never commit |
 | `work/` | Logs, state JSON, debug captures, ad-hoc diagnostics, and release gate log |
+| `work/api_test/` | Per-run API drill logs: `connection.log`, `detection.jsonl`, `summary.json`, `frames/` |
+| `work/reconnect_calibration/` | 自动重连 calibration captures and the layout JSON it writes |
 | `VERSION`, `versioning.py` | Four-digit release counter and UI version label |
 | `release/` | Rebuilt CPU/CUDA package folders and their paired versioned ZIPs |
 | `recording-assets/` | Map-name index/reference images and map-structure reference; packaged when present |

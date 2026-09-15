@@ -54,38 +54,49 @@ MINIMAP_ANALYSIS_SIZE = (400, 400)
 # every fixed-pixel region is scaled per frame by ``hud_scale_for``.
 MINIMAP_REGION_TOP = 50
 MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
-# HP/MP/EXP bars: measured 370x57 px at the BOTTOM MIDDLE of the window
-# (the info bar is exactly bottom-centered).  Inside the capture the three
-# bars sit SIDE BY SIDE in one vertical band: HP red left, MP blue middle,
-# EXP yellow right.  The box is anchored to the window bottom and centered
-# horizontally, so it follows the window size; the HUD itself is fixed
-# pixel above 1366px and scales down below it (see hud_scale_for).
-STATUS_CAPTURE_WIDTH = 370
-STATUS_CAPTURE_HEIGHT = 57
-STATUS_CAPTURE_CENTER_SHIFT = 0  # exactly bottom-centered
+# HP/MP/EXP bars: with the updated game UI the info bar measures 425x32 px
+# at the BOTTOM MIDDLE of the window on the 1080x768 preset, and its centre
+# sits 29 px right of the client centre there (confirmed against a live
+# client-rect screenshot).  Inside the capture the three bars sit SIDE BY
+# SIDE in one vertical band: HP red left, MP blue middle, EXP yellow right.
+# The box is anchored to the window bottom and tracks the info bar
+# horizontally, so it follows the window size.  The HUD is FIXED PIXEL
+# at/above the 1366px reference width - 1366x768 and 1920x1080 share the same
+# preset, so they get the identical box - and the whole HUD scales down by
+# width below it, so the 1080x768 preset measures 425x32 again (see
+# hud_scale_for).  Reference box (1366x768 / 1920x1080): 425 * 1366/1080 =
+# 538 px wide, 32 * 1366/1080 = 40 px tall, centre 37 px right of the client
+# centre.
+STATUS_CAPTURE_WIDTH = 538
+STATUS_CAPTURE_HEIGHT = 40
+STATUS_CAPTURE_CENTER_OFFSET = 37  # info-bar centre, ref px right of centre
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
-# Status-bar widths are FIXED PIXEL values measured on the real client
-# inside the 370px-wide capture: full HP bar ~85px, MP ~135px, EXP ~127px;
-# minimum meaningful run ~5px.  The fractions stay relative to the 370px
-# reference capture: the capture box is scaled by ``hud_scale_for`` and the
-# bars scale by the same factor, so the ratios hold at any resolution.
-FULL_BAR_CLIENT_FRACTIONS = {"hp": 85.0, "mp": 135.0, "exp": 127.0}
+# Status-bar widths are FIXED PIXEL values measured on the real client:
+# with the updated UI every bar (HP/MP/EXP) is ~130 px wide at the 1080x768
+# preset, i.e. 164 px inside the 538px reference capture; minimum meaningful
+# run ~5px.  The fractions stay relative to the reference capture: the
+# capture box is scaled by ``hud_scale_for`` and the bars scale by the same
+# factor, so the ratios hold at any resolution.
+FULL_BAR_CLIENT_FRACTIONS = {"hp": 164.0, "mp": 164.0, "exp": 164.0}
 MIN_BAR_CLIENT_FRACTION = 5.0
 
 
 def status_capture_pixel_box(client_size: tuple[int, int]) -> Box:
     """Return the bottom-anchored, horizontally centered status box.
 
-    The box is the reference 370x57 HUD capture scaled by
-    ``hud_scale_for`` (fixed pixel above 1366px client width; the game
-    shrinks the whole HUD below that, e.g. ~0.75x at 1024x768).
+    The box is the reference status capture (538x40 at the 1366px HUD
+    reference; 425x32 on the 1080x768 preset) scaled by ``hud_scale_for``
+    (fixed pixel at/above 1366px client width - so 1366x768 and 1920x1080
+    return the same box - and shrunk proportionally below that), with its
+    centre offset onto the info bar (the new UI draws it right of the client
+    centre).
     """
 
     width, height = client_size
     scale = hud_scale_for(width)
     box_width = max(1, round(STATUS_CAPTURE_WIDTH * scale))
     box_height = max(1, round(STATUS_CAPTURE_HEIGHT * scale))
-    center = width // 2 - STATUS_CAPTURE_CENTER_SHIFT
+    center = width // 2 + round(STATUS_CAPTURE_CENTER_OFFSET * scale)
     left = max(0, center - box_width // 2)
     top = max(0, height - box_height)
     return (left, top, left + box_width, top + box_height)
@@ -152,8 +163,8 @@ def _show_already_running_notice() -> None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.MessageBoxW(
             None,
-            "Maple 助手已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
-            "Maple 助手",
+            "todo_helper 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
+            "todo_helper",
             0x00000040,  # MB_ICONINFORMATION
         )
     except Exception:
@@ -167,8 +178,16 @@ def _start_live_input(
     automation_active_event: threading.Event,
     before_enable: Optional[Callable[[], None]] = None,
     capture_preparing_event: Optional[threading.Event] = None,
-) -> None:
-    """Focus game, capture/calibrate, then arm keyboard-producing workers."""
+    veto_event: Optional[threading.Event] = None,
+    veto_reason: str = "",
+) -> bool:
+    """Focus game, capture/calibrate, then arm keyboard-producing workers.
+
+    Returns False when nothing could be armed (``veto_event`` was set, if one is
+    given, or the window/calibration step failed).  The veto is checked before
+    calibration and again immediately before arming, because calibration runs on
+    Tk's thread for a couple of seconds while the veto can be raised.
+    """
 
     logging.info("START PATROL: selecting game window")
     if key_sender.select_window() is False:
@@ -176,6 +195,13 @@ def _start_live_input(
     if not key_sender.is_game_foreground():
         raise OSError("game window did not become foreground")
     logging.info("START PATROL: game window verified foreground")
+    veto_text = veto_reason or "patrol input is owned elsewhere"
+    if veto_event is not None and veto_event.is_set():
+        logging.warning(
+            "START PATROL vetoed before calibration (%s); input stays disarmed",
+            veto_text,
+        )
+        return False
     if capture_preparing_event is not None:
         # Stable minimap samples must begin only after foreground verification,
         # but before keyboard input is armed. This temporary capture-only gate
@@ -185,12 +211,19 @@ def _start_live_input(
     try:
         if before_enable is not None:
             before_enable()
+        if veto_event is not None and veto_event.is_set():
+            logging.warning(
+                "START PATROL vetoed after calibration (%s); input stays disarmed",
+                veto_text,
+            )
+            return False
         key_sender.enable_input()
         automation_active_event.set()
     finally:
         if capture_preparing_event is not None:
             capture_preparing_event.clear()
     logging.info("START PATROL: automation input armed")
+    return True
 
 
 def _stop_live_input(
@@ -267,39 +300,83 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _clear_previous_log_files() -> None:
+    """Startup: wipe every log file from previous runs.
+
+    Runs after the single-instance check so a second instance never clears
+    a live session's logs.  error.log, work/assistant.log, yolo logs, demo
+    console logs and target_tracker logs all start fresh each launch, which
+    keeps any pasted diagnostic output attributable to the current run.
+    """
+
+    root = Path(__file__).resolve().parent
+    skipped_dirs = {
+        ".venv", ".venv-win", "release", ".git",
+        "recording-assets", "detect_video", "sound",
+    }
+    bases = [root]
+    try:
+        for child in root.iterdir():
+            if child.is_dir() and child.name not in skipped_dirs:
+                bases.append(child)
+    except OSError:
+        pass
+    removed = 0
+    for base in bases:
+        try:
+            for path in base.rglob("*.log"):
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    print(f"[startup] cleared {removed} previous log file(s)")
+
+
 def main() -> int:
     singleton_handle = _acquire_single_instance_mutex()
     if singleton_handle is None:
         _show_already_running_notice()
         return 0
     args = parse_args()
+    _clear_previous_log_files()
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(_compact_log_formatter())
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         handlers=[console_handler],
     )
-    log_path = Path(__file__).with_name("work") / "assistant.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    file_log_handler = RotatingFileHandler(
-        log_path,
-        maxBytes=1_000_000,
-        backupCount=2,
-        encoding="utf-8",
-    )
-    file_log_handler.setFormatter(_compact_log_formatter())
-    logging.getLogger().addHandler(file_log_handler)
-    # Keep critical failures separate from the high-frequency diagnostic log.
-    # The hidden launcher appends any fatal startup traceback here too.
+    # error.log 只记录错误：文件接收 ERROR 及以上（含 LOG.exception 与
+    # 线程 excepthook 的 logging.critical）。日常 INFO 事件只进运行日志面板
+    # 内存与开发控制台，不再全部落盘。
     error_log_handler = RotatingFileHandler(
         Path(__file__).with_name("error.log"),
-        maxBytes=1_000_000,
+        maxBytes=2_000_000,
         backupCount=2,
         encoding="utf-8",
     )
     error_log_handler.setLevel(logging.ERROR)
     error_log_handler.setFormatter(_compact_log_formatter())
     logging.getLogger().addHandler(error_log_handler)
+
+    # INFO 追踪单独落盘 work/assistant.log（error.log 保持只含错误）：
+    # auto-lie:/lie-detect: 等日常事件仍可离线排查（UI 运行日志只是内存副本）。
+    trace_log_path = Path(__file__).resolve().parent / "work" / "assistant.log"
+    try:
+        trace_log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    trace_log_handler = RotatingFileHandler(
+        trace_log_path,
+        maxBytes=2_000_000,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    trace_log_handler.setLevel(logging.INFO)
+    trace_log_handler.setFormatter(_compact_log_formatter())
+    logging.getLogger().addHandler(trace_log_handler)
 
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
         logging.critical(
@@ -327,12 +404,14 @@ def main() -> int:
     from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
     from quick_pickup_worker import QuickPickupWorker
+    from reconnect_worker import ReconnectWorker
     from trade_worker import TradeWorker
     from motion_arbiter import MotionArbiter
     # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
     # from shutdown_worker import ShutdownWorker
     from countdown_worker import CountdownWorker
     from lie_detector_worker import LieDetectorWorker
+    from lie_screenshot_recorder import LieScreenshotRecorder
     from screen_blinker import ScreenBlinker
     from telegram_notifier import TelegramNotifier
     from config_store import get_config_store
@@ -353,13 +432,23 @@ def main() -> int:
     stop_event = threading.Event()
     climb_attack_lock = threading.Lock()
     climbing_active = threading.Event()
+    # A confirmed stair hop briefly excludes conflicting action input, but it
+    # is not a rope climb/return.  Keep its lifetime independent so a parked
+    # no-route patrol (action=wait) can still attack and use 小碎步.
+    stair_jump_active = threading.Event()
+    action_motion_active = _AnyEvent(climbing_active, stair_jump_active)
     dropping_active = threading.Event()
+    # Capture cadence event the API lie pass raises for its ~30 fps bursts.
+    lie_active = threading.Event()
     moving_active = threading.Event()
     pickup_active = threading.Event()
     automation_active = threading.Event()
     game_focused = threading.Event()
     patrol_preparing = threading.Event()
     trade_capture_active = threading.Event()
+    # Briefly owns Left/Right endpoint reversals so fixed attacks cannot
+    # swallow the newly pressed opposite direction.
+    direction_transition_active = threading.Event()
     movement_frames: queue.Queue = queue.Queue(maxsize=1)
     status_frames: queue.Queue = queue.Queue(maxsize=1)
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
@@ -369,7 +458,6 @@ def main() -> int:
     character_positions: queue.Queue = queue.Queue(maxsize=1)
     subscribers = [
         movement_frames, status_frames, character_frames, lie_detector_frames,
-        trade_frames,
     ]
     if not args.no_ui:
         subscribers.append(ui_frames)
@@ -410,7 +498,7 @@ def main() -> int:
     structure_reference = (
         configuration_root
         / "recording-assets"
-        / "map-structure-reference.png"
+        / "map-structure-reference.jpg"
     )
     structure_tracker = MapStructureTracker(
         structure_reference, tracking_size=OPENCV_ANALYSIS_SIZE[0]
@@ -478,13 +566,30 @@ def main() -> int:
         ),
         fast_capture_event=dropping_active,
         fast_interval=0.10,
+        # Lie pass: ~30 fps while a pass is running, so a pass is fed at the same
+        # rate the game shows.  Nothing raises it today (the local pass is gone);
+        # the API pass keeps the wiring for its bursts.
+        lie_capture_event=lie_active,
+        lie_interval=1.0 / 30.0,
         # ==== ADDED pass debug flag into capture worker ====
         debug_draw_regions=args.debug_capture_regions,
         debug_minimap_fallback=MINIMAP_FALLBACK_REGION, # <------ ADD THIS LINE
     )
 
-    def prepare_map_session() -> None:
-        """Verify the recorded map name and re-anchor transient world Y."""
+    def prepare_map_session(*, stationary_reanchor: bool = True) -> None:
+        """Verify the recorded map name and re-anchor transient world Y.
+
+        ``stationary_reanchor`` is False for an AUTOMATIC patrol resume: 站桩攻击
+        then keeps the standing position that the user's own manual Start Patrol
+        recorded instead of re-recording the current (possibly displaced) marker.
+
+        The old ``abort_event`` hook (a lie takeover abandoning this session) is
+        gone with the local lie pass.
+        """
+
+        stationary_attack = bool(
+            getattr(movement_worker, "stationary_attack_enabled", False)
+        )
 
         # Read the live profile, not the startup snapshot: a reset or map
         # re-identification updates the shared file while the app runs.
@@ -579,6 +684,38 @@ def main() -> int:
             detection.window_size[1],
             detection.confidence,
         )
+        if stationary_attack:
+            # Stationary Attack keeps one *temporary* anchor per standing spot.
+            # A MANUAL Start Patrol (按钮 or Ctrl+`) records the character's
+            # current position; an AUTOMATIC resume (the auto-lie pass calls
+            # this with ``stationary_reanchor=False``) never re-records it, so
+            # a knock-down during a pause cannot move the spot.  Recorded map
+            # layers, map identity and world-Y anchors are never read here;
+            # those recordings stay untouched for normal patrol mode.
+            stationary_anchor = getattr(
+                movement_worker, "prepare_stationary_attack_anchor", None
+            )
+            if not callable(stationary_anchor):
+                raise OSError(
+                    "stationary attack is not supported by this movement worker"
+                )
+            marker = None
+            if stationary_reanchor:
+                analysis_rgb = np.asarray(
+                    fresh_frame.image.crop(detection.analysis_box).convert("RGB")
+                )
+                marker = detect_yellow_diamond(analysis_rgb)
+            if not stationary_anchor(marker, allow_reanchor=stationary_reanchor):
+                raise OSError(
+                    "yellow character marker was not detected for stationary attack"
+                )
+            logging.info(
+                "STATIONARY ATTACK startup: %s; recorded layers were not checked",
+                "temporary current-position anchor saved"
+                if stationary_reanchor
+                else "automatic resume kept the recorded standing position",
+            )
+            return
         title_image = fresh_frame.image.crop(detection.map_name_box)
         if configured_name and map_identity_store.has_reference(configured_name):
             matched, score = map_identity_store.matches(configured_name, title_image)
@@ -714,6 +851,19 @@ def main() -> int:
             f"{marker.y:.6f}" if marker is not None else "unknown",
             float(anchor_world_y),
         )
+
+    def start_patrol_input() -> bool:
+        """Manual Start Patrol (按钮 / Ctrl+`): focus, calibrate, arm input.
+
+        """
+
+        armed = _start_live_input(
+            key_sender, automation_active,
+            prepare_map_session,
+            patrol_preparing,
+        )
+        return armed
+
     attack_workers = []
     # Jump/buff motion keys are executed one at a time by the motion arbiter
     # (0.9s jump window / 0.6s buff window).  Fixed attack defers while the
@@ -722,7 +872,7 @@ def main() -> int:
     motion_arbiter = MotionArbiter(
         key_sender,
         stop_event,
-        climbing_active_event=climbing_active,
+        climbing_active_event=action_motion_active,
         automation_active_event=automation_active,
     )
     # The fixed-rate attack worker always exists so the UI can toggle it
@@ -732,16 +882,17 @@ def main() -> int:
         key_sender,
         stop_event,
         args.attack_interval,
-        climbing_active_event=climbing_active,
+        climbing_active_event=action_motion_active,
         automation_active_event=automation_active,
         motion_arbiter=motion_arbiter,
+        direction_transition_event=direction_transition_active,
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
     random_jump_worker = RandomJumpWorker(
         key_sender,
         stop_event,
-        climbing_active_event=climbing_active,
+        climbing_active_event=action_motion_active,
         automation_active_event=automation_active,
         motion_arbiter=motion_arbiter,
     )
@@ -749,7 +900,15 @@ def main() -> int:
     # shutdown_worker = ShutdownWorker(...)
     shutdown_worker = None
     hotkey_actions: "queue.Queue[str]" = queue.Queue(maxsize=32)
-    hotkey_worker = HotkeyWorker(stop_event, hotkey_actions)
+    # Global hotkeys are UI actions: they are only useful (and only safe) when
+    # the interactive UI drains the action queue.  A headless/--no-ui instance
+    # (a dry-run smoke test, or a leftover process) must NOT claim the Ctrl
+    # chords, otherwise it registers them OS-wide and silently swallows them
+    # with nothing to consume the queue - exactly how a stale --no-ui run made
+    # Ctrl+` appear dead.
+    hotkey_worker = None if args.no_ui else HotkeyWorker(
+        stop_event, hotkey_actions
+    )
     quick_pickup_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=8)
     quick_pickup_worker = QuickPickupWorker(
         key_sender,
@@ -757,6 +916,61 @@ def main() -> int:
         quick_pickup_results,
         patrol_running=patrol_controller.is_enabled,
     )
+
+    # 自动重连: armed from the Additional Functions panel; the 掉线 event is its trigger and
+    # the login page's base colour (screenshots/login_page_target.jpg) its confirmation
+    # (see reconnect_worker.py).
+    reconnect_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=16)
+    reconnect_worker = ReconnectWorker(
+        key_sender,
+        stop_event,
+        reconnect_results,
+        window_title=args.window_title,
+        dry_run=args.dry_run,
+    )
+
+    # 测试api (附加功能 panel): pick a video, play it at the API's 5 fps and upload each frame's ROI
+    # to the RoiTrack backend (see api_lie_video.py).  A new worker per press, because a thread can
+    # only be started once.  api_lie_test.py (the older single-frame screen drill) has no panel
+    # button any more; it stays as an offline tool for work/ scripts and the test suite.
+    api_test_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=256)
+
+    def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
+                                   fps=5.0):
+        """The 测试api drill on a chosen video: play it at 5 fps and aim inside the picture only.
+
+        A new worker per press (a thread cannot restart).  ``display`` carries the frames the UI
+        thread must draw; the worker reads back ``worker.image_rect`` (the picture rectangle) to
+        confine the mouse to the video area.  The key is not a panel setting any more: it ships
+        with the application (LIE_PRODUCT_KEY -> autolie_api/key_secret.txt), and with no key at all
+        the local mimic is used, so the button is always safe to press.
+        """
+
+        from api_lie_video import VideoDrillWorker
+
+        return VideoDrillWorker(
+            video=video,
+            results=results,
+            display=display,
+            stop_event=stop_event,
+            key=key,
+            seconds=seconds,
+            fps=fps,
+            aim_enabled=True,
+            window_title=args.window_title,
+        )
+
+    def _on_disconnect_event() -> None:
+        """掉线: the recorder grabs its diagnostic frames, then 自动重连 checks/login."""
+
+        try:
+            screenshot_recorder.on_disconnect()
+        except Exception:
+            logging.warning("disconnect screenshot recorder failed", exc_info=True)
+        try:
+            reconnect_worker.notify_disconnect()
+        except Exception:
+            logging.warning("auto reconnect notify failed", exc_info=True)
 
     def save_recording_minimap_calibration(snapshot: object) -> None:
         """Publish recording's verified border for independent patrol use."""
@@ -781,6 +995,9 @@ def main() -> int:
         )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
     telegram_notifier = TelegramNotifier(stop_event)
+    # 独立的多事件截图录制器（诊断用，与测谎流程解耦）：测谎 / 掉线 / 循环
+    # 事件触发后连续抓取完整游戏窗口约 20 秒，按帧存入 screenshots/<kind>_*/。
+    screenshot_recorder = LieScreenshotRecorder(args.window_title)
     countdown_worker = CountdownWorker(
         stop_event,
         sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
@@ -788,6 +1005,7 @@ def main() -> int:
         interval_hours=1.0,
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
+        event_callback=screenshot_recorder.on_countdown,
     )
     lie_detector_worker = LieDetectorWorker(
         lie_detector_frames,
@@ -797,6 +1015,9 @@ def main() -> int:
         sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
+    )
+    lie_detector_worker.add_lie_seen_callback(
+        screenshot_recorder.on_lie_seen
     )
     # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。
     status_worker = StatusWorker(
@@ -891,6 +1112,7 @@ def main() -> int:
             ),
             near_rope_diamonds=calibration.get("near_rope_diamonds"),
             climb_attack_lock=climb_attack_lock,
+            direction_transition_event=direction_transition_active,
             climbing_active_event=climbing_active,
             dropping_active_event=dropping_active,
             important_positions=map_profile.get("layers", {}),
@@ -1018,7 +1240,7 @@ def main() -> int:
     stair_jump_worker = StairJumpWorker(
         stop_event,
         automation_active_event=automation_active,
-        action_active_event=climbing_active,
+        action_active_event=stair_jump_active,
         motion_arbiter=motion_arbiter,
         execute_callback=movement_worker.perform_stair_jump,
     )
@@ -1030,7 +1252,7 @@ def main() -> int:
     small_step_worker = SmallStepWorker(
         stop_event,
         automation_active_event=automation_active,
-        climbing_active_event=climbing_active,
+        climbing_active_event=action_motion_active,
         motion_arbiter=motion_arbiter,
     )
     character_worker = CharacterWorker(
@@ -1046,6 +1268,7 @@ def main() -> int:
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
         on_disconnect=stop_patrol_for_disconnect,
+        disconnect_event_callback=_on_disconnect_event,
     )
     focus_worker = FocusWorker(
         key_sender,
@@ -1053,6 +1276,9 @@ def main() -> int:
         automation_active,
         game_focused,
         on_focus_lost=stop_patrol_after_focus_loss,
+        # A lie pass disarms input but is fed by the same capture: keep the
+        # foreground gate honest for the whole pass.
+        lie_pass_event=lie_active,
     )
     core_workers = [
         capture_worker,
@@ -1064,8 +1290,9 @@ def main() -> int:
         random_jump_worker,
         small_step_worker,
         stair_jump_worker,
-        hotkey_worker,
+        *([hotkey_worker] if hotkey_worker is not None else []),
         quick_pickup_worker,
+        reconnect_worker,
         trade_worker,
         screen_blinker,
         countdown_worker,
@@ -1092,6 +1319,10 @@ def main() -> int:
             hotkey_worker=hotkey_worker,
             quick_pickup_worker=quick_pickup_worker,
             quick_pickup_results=quick_pickup_results,
+            reconnect_worker=reconnect_worker,
+            reconnect_results=reconnect_results,
+            api_test_video_factory=make_api_test_video_worker,
+            api_test_results=api_test_results,
             trade_worker=trade_worker,
             movement_worker=movement_worker,
             character_worker=character_worker,
@@ -1100,10 +1331,7 @@ def main() -> int:
             lie_detector_worker=lie_detector_worker,
             screen_blinker=screen_blinker,
             telegram_notifier=telegram_notifier,
-            on_patrol_start=lambda: _start_live_input(
-                key_sender, automation_active, prepare_map_session,
-                patrol_preparing,
-            ),
+            on_patrol_start=start_patrol_input,
             on_patrol_stop=lambda: _stop_live_input(
                 key_sender, automation_active, refocus_before_release=True,
             ),
@@ -1163,10 +1391,10 @@ def main() -> int:
         supervisor.join(timeout=1)
         if ui_log_handler is not None:
             logging.getLogger().removeHandler(ui_log_handler)
-        logging.getLogger().removeHandler(file_log_handler)
-        file_log_handler.close()
         logging.getLogger().removeHandler(error_log_handler)
         error_log_handler.close()
+        logging.getLogger().removeHandler(trace_log_handler)
+        trace_log_handler.close()
         _release_single_instance_mutex(singleton_handle)
     return 0
 

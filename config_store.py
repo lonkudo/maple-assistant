@@ -24,6 +24,7 @@ SECTION_FILES = {
     "additional_functions": "additional_functions_settings.json",
     "yolo_detection": "yolo_detection_settings.json",
     "ui_window": "ui_window_settings.json",
+    "tracking_test": "tracking_test_settings.json",
 }
 
 DEFAULT_USER_CONFIG: dict[str, Any] = {
@@ -73,13 +74,17 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "attack_key": "shift",
     },
     "ui_window": {},
+    # 测试测谎 (tracking test): the recording the operator last replayed, so the
+    # picker opens in the right folder instead of always falling back to the
+    # bundled demo clip.
+    "tracking_test": {"video": ""},
 }
 
 DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
     "rope_calibration": {
         "map": "", "minimap_region": [0.0, .075, .12, .24],
         "rope_x": .4926, "calibrated_player_y": .65625,
-        "horizontal_tolerance": .01, "horizontal_tolerance_diamonds": .293,
+        "horizontal_tolerance": .01, "horizontal_tolerance_diamonds": .12,
         "aligned_frames_required": 2, "climb_layer_confirm_frames": 3,
         "climb_layer_confirm_seconds": .3,
         "climb_arrival_world_tolerance": .2,

@@ -10,6 +10,8 @@ from PIL import Image
 
 from capture_worker import CapturedFrame
 from movement_worker import (
+    ENDPOINT_ARRIVAL_TIMEOUT_FRAMES,
+    ENDPOINT_NO_PROGRESS_FRAMES,
     MinimapObservation,
     MovementDecision,
     ClimbState,
@@ -370,6 +372,364 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(sender.events.count(("down", "right")), 2)
         self.assertEqual(sender.events.count(("down", "z")), 2)
         self.assertTrue(pickup_active.is_set())
+
+    def test_motion_gate_does_not_block_on_direction_handoff_lock(self):
+        """Arbiter gate reads the published patrol snapshot without lock AB-BA."""
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.patrol_enabled = True
+        worker._motion_arbiter_stage = "patrol"
+        worker.last_decision = MovementDecision("left", "patrol", 1.0)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_direction_lock():
+            with worker._direction_lock:
+                held.set()
+                release.wait(1.0)
+
+        blocker = threading.Thread(target=hold_direction_lock)
+        blocker.start()
+        self.assertTrue(held.wait(0.5))
+        try:
+            started = time.monotonic()
+            self.assertTrue(worker.motion_arbiter_motion_allowed())
+            self.assertLess(time.monotonic() - started, 0.05)
+        finally:
+            release.set()
+            blocker.join(0.5)
+
+    def test_stationary_attack_uses_a_temporary_start_position(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        # Start Patrol creates a fresh in-memory anchor, unrelated to the
+        # recorded map/layers. A later manual start replaces it.
+        self.assertTrue(worker.prepare_stationary_attack_anchor(Point(.50, .60)))
+        self.assertEqual(worker.stationary_attack_anchor_position(), Point(.50, .60))
+        displaced_x = MinimapObservation(Point(.47, .63), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._stationary_attack_decision(displaced_x).key, "right")
+        self.assertTrue(worker.prepare_stationary_attack_anchor(Point(.12, .91)))
+        at_new_start = MinimapObservation(Point(.12, .91), None, .9, (0, 0, 1, 1))
+        self.assertIsNone(worker._stationary_attack_decision(at_new_start).key)
+
+    def test_stationary_attack_automatic_resume_keeps_the_start_position(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        # A MANUAL Start Patrol records the standing spot.
+        self.assertTrue(worker.prepare_stationary_attack_anchor(Point(.50, .60)))
+        # An AUTOMATIC resume (auto-lie pass) may not move it: the character is
+        # often displaced while the pause runs, and that position must never
+        # become the new standing spot.
+        self.assertTrue(worker.prepare_stationary_attack_anchor(
+            Point(.21, .88), allow_reanchor=False,
+        ))
+        self.assertEqual(worker.stationary_attack_anchor_position(), Point(.50, .60))
+        displaced = MinimapObservation(Point(.21, .88), None, .9, (0, 0, 1, 1))
+        self.assertEqual(worker._stationary_attack_decision(displaced).key, "right")
+
+    def test_stationary_attack_automatic_resume_without_anchor_records_nothing(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        # The mode was selected while patrol was already running, so no manual
+        # start recorded a spot yet: an automatic resume must not invent one
+        # from the resumed position.
+        self.assertTrue(worker.prepare_stationary_attack_anchor(
+            Point(.30, .40), allow_reanchor=False,
+        ))
+        self.assertIsNone(worker.stationary_attack_anchor_position())
+        resumed = MinimapObservation(Point(.30, .40), None, .9, (0, 0, 1, 1))
+        self.assertIn(
+            "awaiting start position",
+            worker._stationary_attack_decision(resumed).reason,
+        )
+
+    def test_stationary_attack_anchor_requires_a_manual_marker(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        # A manual start is rejected without a marker (the assistant turns this
+        # into a failed Start Patrol instead of anchoring a stale position).
+        self.assertFalse(worker.prepare_stationary_attack_anchor(None))
+        self.assertIsNone(worker.stationary_attack_anchor_position())
+        # Outside the mode both paths are no-ops.
+        worker.set_stationary_attack_enabled(False)
+        self.assertTrue(worker.prepare_stationary_attack_anchor(None))
+        self.assertTrue(worker.prepare_stationary_attack_anchor(
+            Point(.10, .10), allow_reanchor=False,
+        ))
+        self.assertIsNone(worker.stationary_attack_anchor_position())
+
+    def test_stationary_attack_disables_the_route_self_rescue(self):
+        from unittest import mock
+
+        # 站桩攻击 stands still by design, so every frame is "stuck" for the
+        # route rescue: it would probe-walk the character right/left and, when
+        # the probe cannot move it at a platform edge, drop it a floor -
+        # destroying the standing spot the mode exists to protect.
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions={"layer1": {
+                "left_most_pos": {"x": .2, "y": .7},
+                "right_most_pos": {"x": .8, "y": .7},
+            }},
+            route_order=["layer1"],
+            rescue_check_interval_seconds=300.0,
+            rescue_stuck_frames=20,
+        )
+        worker.patrol_enabled = True
+        worker.set_stationary_attack_enabled(True)
+        worker._rescue_last_check = 0.0
+        worker._rescue_last_pos = None
+        stuck = MinimapObservation(Point(.5, .5), None, .9, (0, 0, 1, 1))
+        with mock.patch.object(worker, "_trigger_rescue") as rescue:
+            for _ in range(40):
+                worker._rescue_stuck_check(stuck, 100.0)
+            rescue.assert_not_called()
+        self.assertEqual(worker._rescue_stuck_frames, 0)
+        self.assertEqual(worker._rescue_max_stuck, 0)
+
+    def test_stationary_y_jitter_never_spends_a_recovery_jump(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        self.assertTrue(worker.prepare_stationary_attack_anchor(Point(.50, .60)))
+        # One minimap pixel of marker jitter is not a displaced character: the
+        # observed field failure was a jump spent on that jitter, which walked
+        # the character off its platform.
+        jittered = MinimapObservation(Point(.501, .605), None, .9, (0, 0, 1, 1))
+        self.assertIsNone(worker._stationary_attack_decision(jittered).key)
+        self.assertEqual(worker._stationary_y_jumps, 0)
+
+    def test_stationary_y_recovery_keeps_jumping_until_y_matches(self):
+        from unittest import mock
+
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        self.assertTrue(worker.prepare_stationary_attack_anchor(Point(.50, .60)))
+        displaced = MinimapObservation(Point(.50, .64), None, .9, (0, 0, 1, 1))
+        with mock.patch("movement_worker.time") as fake_time:
+            fake_time.monotonic.return_value = 100.0
+            first = worker._stationary_attack_decision(displaced)
+            self.assertEqual(first.key, "stationary_jump")
+            self.assertEqual(worker._stationary_y_jumps, 1)
+            # Inside the jump window: wait, but never forget the mismatch.
+            fake_time.monotonic.return_value = 100.5
+            self.assertIsNone(
+                worker._stationary_attack_decision(displaced).key
+            )
+            self.assertEqual(worker._stationary_y_jumps, 1)
+            # The retry re-arms: a second jump is sent, unlike the old
+            # single-shot latch that gave up after one attempt.
+            fake_time.monotonic.return_value = 102.0
+            self.assertEqual(
+                worker._stationary_attack_decision(displaced).key,
+                "stationary_jump",
+            )
+            self.assertEqual(worker._stationary_y_jumps, 2)
+        # Back on the launch position: the next displacement starts a fresh
+        # burst instead of inheriting this one.
+        restored = MinimapObservation(Point(.50, .602), None, .9, (0, 0, 1, 1))
+        self.assertIsNone(worker._stationary_attack_decision(restored).key)
+        self.assertEqual(worker._stationary_y_jumps, 0)
+
+    def test_stationary_y_recovery_backs_off_after_the_burst(self):
+        from unittest import mock
+
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        self.assertTrue(worker.prepare_stationary_attack_anchor(Point(.50, .60)))
+        displaced = MinimapObservation(Point(.50, .70), None, .9, (0, 0, 1, 1))
+        jump_times = []
+        with mock.patch("movement_worker.time") as fake_time:
+            now = 100.0
+            for _ in range(40):
+                fake_time.monotonic.return_value = now
+                if worker._stationary_attack_decision(displaced).key:
+                    jump_times.append(now)
+                now += 0.6
+        # Four quick attempts in the burst, then the slower retry cadence: a
+        # spot a jump cannot reach never becomes an endless jump loop.
+        self.assertEqual(len(jump_times), 5)
+        for earlier, later in zip(jump_times[:3], jump_times[1:4]):
+            self.assertGreaterEqual(later - earlier, 1.5)
+        self.assertGreaterEqual(jump_times[4] - jump_times[3], 10.0)
+        self.assertEqual(worker._stationary_y_jumps, 5)
+
+    def test_stationary_attack_clears_latched_route_state(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        worker.set_stationary_attack_enabled(True)
+        # A knock-down fall used to latch this route state, which then blocked
+        # every attack beat ("attack skipped: climb/return input is active").
+        worker._return_mode = "climb-to-route"
+        worker._return_from_floor = "layer1"
+        worker._return_arrival_floor = "layer1"
+        worker._descending_to_first = True
+        worker._climb_state = ClimbState(phase="climbing-up", up_held=True)
+        released = []
+        worker._release_climb_up = lambda: released.append(True)
+
+        worker._clear_stationary_route_state()
+
+        self.assertIsNone(worker._return_mode)
+        self.assertIsNone(worker._return_from_floor)
+        self.assertIsNone(worker._return_arrival_floor)
+        self.assertFalse(worker._descending_to_first)
+        self.assertEqual(worker._climb_state.phase, "idle")
+        self.assertFalse(worker._climb_state.up_held)
+        self.assertEqual(released, [True])
+
+    def test_stationary_fall_never_latches_a_route_return(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(),
+            important_positions={"layer1": {
+                "layer_y": .70, "y_tolerance": .02,
+                "left_most_pos": {"x": .2, "y": .70},
+                "right_most_pos": {"x": .8, "y": .70},
+            }},
+            route_order=["layer1"],
+            fall_detect_frames=2,
+            fall_marker_y_gain=0.01,
+        )
+        worker.patrol_enabled = True
+        worker.set_stationary_attack_enabled(True)
+
+        def at(y):
+            return MinimapObservation(Point(.5, y), None, .9, (0, 0, 1, 1))
+
+        # A knock-down: Y drops fast for two frames, then stops.  In 站桩攻击
+        # there is no route floor to resolve, so nothing may be latched.
+        worker._track_fall(at(.60))
+        worker._track_fall(at(.66))
+        worker._track_fall(at(.72))
+        worker._track_fall(at(.72))
+        self.assertIsNone(worker._return_mode)
+        self.assertEqual(worker._fall_frames, 0)
+        self.assertFalse(worker._fall_pending)
+
+    def test_rope_target_lock_absorbs_the_projection_jitter(self):
+        # The stored rope X is diamond-relative: re-projecting it each frame
+        # through a half-pixel different diamond swings it by ~0.02 (measured
+        # 0.747619 vs the 0.763218 raw sample of the same rope), which used to
+        # walk the character onto a moving target and flip its climb side.
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        raw = (.747619, .763218, .747619, .763218)
+        self.assertGreater(max(raw) - min(raw), .015)   # the jitter itself
+        locked = [
+            worker._stabilize_rope_target(sample, True, "layer2.rope")
+            for sample in raw
+        ]
+        self.assertLess(max(locked) - min(locked), .005, locked)
+        # A real move (beyond the jitter band) re-locks at once.
+        self.assertAlmostEqual(
+            worker._stabilize_rope_target(.79, True, "layer2.rope"), .79,
+            places=6,
+        )
+        # Leaving the rope phase forgets the lock; a non-rope target passes
+        # through untouched.
+        self.assertEqual(
+            worker._stabilize_rope_target(.40, False, "layer2.left-most"), .40
+        )
+        self.assertIsNone(worker._held_rope_target)
+
+    def test_climb_direction_never_follows_the_target_past_the_character(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+
+        def at(x):
+            return MinimapObservation(Point(x, .495455), None, .9, (0, 0, 1, 1))
+
+        # The reported case: rope_x 0.747619, character 0.755411 (overshot to
+        # the right) -> the jump must go left, not right.
+        self.assertEqual(
+            worker._climb_preferred_direction("jump_climb_right", at(.755411), .747619),
+            "left",
+        )
+        self.assertEqual(
+            worker._climb_preferred_direction("jump_climb_left", at(.741883), .747619),
+            "right",
+        )
+        # Aligned inside the dead band: no side is forced, so the caller keeps
+        # the side the approach came from instead of flipping on noise.
+        self.assertIsNone(
+            worker._climb_preferred_direction("jump_climb_left", at(.747700), .747619)
+        )
+        # A straight-up decision is never turned into a lateral chord.
+        self.assertEqual(
+            worker._climb_preferred_direction("jump_climb_up", at(.755411), .747619),
+            "up",
+        )
+
+    def test_climb_direction_is_logged_with_its_inputs(self):
+        class Sender:
+            dry_run = True
+
+        worker = MovementWorker(
+            queue.Queue(), Sender(), threading.Event(), important_positions={},
+        )
+        observation = MinimapObservation(
+            Point(.755411, .495455), None, .9, (0, 0, 1, 1)
+        )
+        with self.assertLogs("movement_worker", level="INFO") as captured:
+            worker._log_climb_direction("left", observation, .747619)
+        line = "\n".join(captured.output)
+        self.assertIn("CLIMB direction:", line)
+        self.assertIn("rope_x=0.747619", line)
+        self.assertIn("player_x=0.755411", line)
+        self.assertIn("Alt+left", line)
 
     def test_small_step_interrupts_walk_and_leaves_no_direction_held(self):
         class Sender:
@@ -875,7 +1235,7 @@ class MovementTests(unittest.TestCase):
         self.assertEqual(worker._climb_state.phase, "idle")
         self.assertEqual(worker._rope_approach_stall_frames, 0)
 
-    def test_self_rescue_triggers_after_20_stuck_frames_in_window(self):
+    def test_self_rescue_triggers_immediately_after_20_normal_stuck_frames(self):
         from unittest import mock
 
         # 5 分钟窗口内角色连续 20 帧位置不变（卡住）→ 触发自救；位置有
@@ -895,17 +1255,18 @@ class MovementTests(unittest.TestCase):
         worker._rescue_last_pos = None
         stuck = MinimapObservation(Point(.5, .5), None, .9, (0, 0, 1, 1))
         with mock.patch.object(worker, "_trigger_rescue") as rescue:
-            # 前 19 帧位置不变（首帧为初始化）：窗口未结束，不触发。
-            for _ in range(19):
+            # The first frame establishes the stationary anchor.  The next
+            # 19 unchanged frames remain below the configured threshold.
+            for _ in range(20):
                 worker._rescue_stuck_check(stuck, 100.0)
-            self.assertEqual(worker._rescue_max_stuck, 18)
+            self.assertEqual(worker._rescue_max_stuck, 19)
             rescue.assert_not_called()
-            # 连续无进展累计达到 20 帧 → 窗口结束时触发。
+            # The 20th unchanged transition rescues immediately.  This must
+            # not wait for the five-minute bookkeeping window.
             worker._rescue_stuck_check(stuck, 100.0)
-            worker._rescue_stuck_check(stuck, 100.0)
-            self.assertEqual(worker._rescue_max_stuck, 20)
-            worker._rescue_stuck_check(stuck, 400.0)  # 下一个 5 分钟窗口
             rescue.assert_called_once()
+            self.assertEqual(worker._rescue_stuck_frames, 0)
+            self.assertEqual(worker._rescue_max_stuck, 0)
             # 窗口重置后：位置变化 → 计数清零。
             moved = MinimapObservation(Point(.6, .5), None, .9, (0, 0, 1, 1))
             worker._rescue_stuck_check(moved, 401.0)
@@ -3040,6 +3401,219 @@ class MovementTests(unittest.TestCase):
             self.assertEqual(worker._resync_route_layer(observation), "layer2")
             self.assertEqual(worker._route_layer_index, 1)
 
+    def test_direction_handoff_reservation_is_released_on_send_failure(self):
+        """A raising key send must not leave the handoff reservation set.
+
+        The event blocks the attack worker ("patrol direction handoff is
+        active"); leaking it skipped every attack until a restart.
+        """
+
+        class ExplodingSender:
+            dry_run = True
+            window_title = "game"
+
+            def __init__(self):
+                self.held = set()
+
+            def key_down(self, key):
+                if key == "right":
+                    raise OSError("SendInput injected 0/1 events")
+                self.held.add(key)
+                return True
+
+            def key_up(self, key):
+                self.held.discard(key)
+                return True
+
+            def force_key_up(self, key, *, reason=""):
+                self.held.discard(key)
+                return True
+
+            def is_key_down(self, key):
+                return key in self.held
+
+        transition = threading.Event()
+        worker = MovementWorker(
+            queue.Queue(), ExplodingSender(), threading.Event(),
+            fixed_target_x=.5,
+            direction_transition_event=transition,
+        )
+        worker.patrol_enabled = True
+        worker._walk_hold_key = "left"
+        with self.assertRaises(OSError):
+            worker._send_walk_hold(MovementDecision("right", "switch", 0.2))
+        self.assertFalse(transition.is_set())
+
+    def test_stall_report_logs_state_without_marking_idle_workers_failed(self):
+        """The movement stack is actionable; normal worker waits are not."""
+
+        class QuietSender:
+            dry_run = True
+            window_title = "game"
+
+            def key_down(self, key):
+                return True
+
+            def key_up(self, key):
+                return True
+
+        transition = threading.Event()
+        transition.set()
+        worker = MovementWorker(
+            queue.Queue(), QuietSender(), threading.Event(),
+            fixed_target_x=.5,
+            direction_transition_event=transition,
+        )
+        worker.patrol_enabled = True
+        worker._return_mode = "climb-to-route"
+        worker._route_phase = "left"
+        worker._walk_hold_key = "left"
+        with self.assertLogs("movement_worker", level="ERROR") as logs:
+            worker._report_stall(30.0)
+        text = "\n".join(logs.output)
+        self.assertIn("movement worker silent for 30.0s", text)
+        self.assertIn("return_mode=climb-to-route", text)
+        self.assertIn("handoff_reserved=True", text)
+        self.assertIn("capturing movement stack", text)
+        self.assertNotIn("thread focus-worker stack:", text)
+        self.assertNotIn("thread supervisor-worker stack:", text)
+
+    def test_route_state_is_logged_when_patrol_is_paused(self):
+        """The no-key route state must be visible in the log."""
+
+        class QuietSender:
+            dry_run = True
+            window_title = "game"
+
+        worker = MovementWorker(
+            queue.Queue(), QuietSender(), threading.Event(), fixed_target_x=.5,
+        )
+        worker.patrol_enabled = False
+        observation = MinimapObservation(Point(.5, .5), None, .9, (0, 0, 1, 1))
+        with self.assertLogs("movement_worker", level="INFO") as logs:
+            target, near, label = worker._route_target(observation)
+        self.assertEqual(label, "patrol-paused")
+        self.assertIsNone(target)
+        self.assertFalse(near)
+        self.assertIn("route state: patrol-paused", "\n".join(logs.output))
+
+    def test_unreachable_left_endpoint_forces_the_turn(self):
+        """A saved left-most a hair outside the walkable edge must turn.
+
+        Otherwise the walk holds Left into the edge, the marker freezes and
+        the self-rescue restarts the whole patrol (character visibly gets
+        stuck at left-most, then the patrol restarts and it moves again).
+        """
+
+        positions = {
+            "layer2": {
+                "layer_y": .489474,
+                "left_most_pos": {"x": .2, "y": .489474},
+                "right_most_pos": {"x": .8, "y": .489474},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+        )
+        worker._route_layers = ["layer2"]
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        worker.patrol_enabled = True
+        target = .2
+        # Outside the 0.010 arrival band, inside the 0.040 near zone.
+        stuck = MinimapObservation(
+            Point(target + .020, .489474), None, .9, (0, 0, 1, 1)
+        )
+        with self.assertLogs("movement_worker", level="WARNING") as logs:
+            for _ in range(ENDPOINT_ARRIVAL_TIMEOUT_FRAMES - 1):
+                self.assertFalse(
+                    worker._advance_route_endpoint(stuck, target)
+                )
+            self.assertTrue(worker._advance_route_endpoint(stuck, target))
+        self.assertEqual(worker._route_phase, "right")
+        self.assertIn("endpoint unreachable", "\n".join(logs.output))
+
+    def test_endpoint_timeout_does_not_fire_while_the_walk_progresses(self):
+        """A character still far from the endpoint is not forced to turn."""
+
+        positions = {
+            "layer2": {
+                "layer_y": .489474,
+                "left_most_pos": {"x": .2, "y": .489474},
+                "right_most_pos": {"x": .8, "y": .489474},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+        )
+        worker._route_layers = ["layer2"]
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        worker.patrol_enabled = True
+        far = MinimapObservation(Point(.30, .489474), None, .9, (0, 0, 1, 1))
+        for _ in range(ENDPOINT_ARRIVAL_TIMEOUT_FRAMES + 3):
+            self.assertFalse(worker._advance_route_endpoint(far, .2))
+        self.assertEqual(worker._route_phase, "left")
+
+    def test_far_unreachable_endpoint_forces_the_turn(self):
+        """A saved endpoint beyond a wall must not mean endless edge walking."""
+
+        positions = {
+            "layer2": {
+                "layer_y": .489474,
+                "left_most_pos": {"x": .2, "y": .489474},
+                "right_most_pos": {"x": .8, "y": .489474},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+        )
+        worker._route_layers = ["layer2"]
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        worker.patrol_enabled = True
+        target = .2
+        # Far outside the near zone: the band timeout cannot see this one.
+        stuck = MinimapObservation(Point(.26, .489474), None, .9, (0, 0, 1, 1))
+        with self.assertLogs("movement_worker", level="WARNING") as logs:
+            for _ in range(ENDPOINT_NO_PROGRESS_FRAMES):
+                self.assertFalse(
+                    worker._advance_route_endpoint(stuck, target)
+                )
+            self.assertTrue(worker._advance_route_endpoint(stuck, target))
+        self.assertEqual(worker._route_phase, "right")
+        self.assertIn("no progress toward", "\n".join(logs.output))
+
+    def test_endpoint_no_progress_resets_while_closing_in(self):
+        """A long but real approach is never forced to turn."""
+
+        positions = {
+            "layer2": {
+                "layer_y": .489474,
+                "left_most_pos": {"x": .2, "y": .489474},
+                "right_most_pos": {"x": .8, "y": .489474},
+            }
+        }
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+        )
+        worker._route_layers = ["layer2"]
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        worker.patrol_enabled = True
+        x = .7
+        for _ in range(ENDPOINT_NO_PROGRESS_FRAMES + 5):
+            x -= .005
+            observation = MinimapObservation(
+                Point(x, .489474), None, .9, (0, 0, 1, 1)
+            )
+            self.assertFalse(worker._advance_route_endpoint(observation, .2))
+        self.assertEqual(worker._route_phase, "left")
+
     def test_left_and_right_boundary_movement_are_independent(self):
         observation = MinimapObservation(Point(.5, .7), None, .9, (0, 0, 1, 1))
         left = move_to_left_most(observation, Point(.2, .7))
@@ -3284,17 +3858,25 @@ class MovementTests(unittest.TestCase):
         sender, state = Sender(), ClimbState()
         start = MinimapObservation(Point(.48, .70), None, .9, (0, 0, 1, 1))
         moving = MinimapObservation(Point(.49, .66), None, .9, (0, 0, 1, 1))
+        still = MinimapObservation(Point(.49, .66), None, .9, (0, 0, 1, 1))
+        moving_again = MinimapObservation(
+            Point(.49, .62), None, .9, (0, 0, 1, 1)
+        )
         with patch("movement_worker.time.sleep"):
             self.assertEqual(climb(sender, start, state,
                                    preferred_direction="right", persistent_up=True),
                              "right-toward-rope")
             self.assertIn("up", sender.owned)
-            # Attach needs 2 consecutive rising frames (marker Y up + X
-            # aligned): first frame confirms, second commits.
+            # Attach needs two distinct upward advances (not two reads of
+            # one jump apex): first frame confirms; the identical snapshot
+            # cannot commit; the next rise does.
             self.assertEqual(climb(sender, moving, state,
                                    preferred_direction="right", persistent_up=True),
                              "holding-up-awaiting-progress")
-            self.assertEqual(climb(sender, moving, state,
+            self.assertEqual(climb(sender, still, state,
+                                   preferred_direction="right", persistent_up=True),
+                             "holding-up-awaiting-progress")
+            self.assertEqual(climb(sender, moving_again, state,
                                    preferred_direction="right", persistent_up=True),
                              "climbing-up")
             self.assertIn("up", sender.owned)
@@ -3317,16 +3899,20 @@ class MovementTests(unittest.TestCase):
             Point(.48, .467647), None, .9, (0, 0, 1, 1),
             world_y_diamonds=-1.00, structure_confidence=.9,
         )
+        scrolling_again = MinimapObservation(
+            Point(.48, .467647), None, .9, (0, 0, 1, 1),
+            world_y_diamonds=-1.30, structure_confidence=.9,
+        )
         with patch("movement_worker.time.sleep"):
             self.assertEqual(climb(sender, start, state,
                                    preferred_direction="right", persistent_up=True),
                              "right-toward-rope")
-            # Marker stays centered; world Y advances.  Confirmation needs
-            # 2 consecutive frames.
+            # Marker stays centered; two distinct world-Y advances verify
+            # the grab even without a marker-Y shift.
             self.assertEqual(climb(sender, scrolling, state,
                                    preferred_direction="right", persistent_up=True),
                              "holding-up-awaiting-progress")
-            self.assertEqual(climb(sender, scrolling, state,
+            self.assertEqual(climb(sender, scrolling_again, state,
                                    preferred_direction="right", persistent_up=True),
                              "climbing-up")
         self.assertEqual(state.phase, "climbing-up")
@@ -4178,6 +4764,29 @@ class MovementTests(unittest.TestCase):
         self.assertTrue(worker._advance_route_endpoint(crossed_right, .8))
         # No rope recorded on this single layer: it repeats at left.
         self.assertEqual(worker._route_phase, "left")
+
+    def test_left_endpoint_uses_the_same_band_as_the_right(self):
+        positions = {"layer1": {
+            "left_most_pos": {"x": .2, "y": .7},
+            "right_most_pos": {"x": .8, "y": .7},
+        }}
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=positions,
+        )
+        worker._route_layer_index = 0
+        worker._route_phase = "left"
+        worker._current_horizontal_tolerance = .02
+        # Inside the general band, still short of the saved left-most point.
+        # The former 0.25x left band rejected this and walked into the edge
+        # until the self-rescue restarted the patrol.
+        near = MinimapObservation(Point(.215, .7), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(near, .2))
+        self.assertEqual(worker._route_phase, "right")
+        # The right endpoint mirrors it: same band, mirrored side.
+        worker._route_patrol_cycle = 1
+        mirrored = MinimapObservation(Point(.785, .7), None, .9, (0, 0, 1, 1))
+        self.assertTrue(worker._advance_route_endpoint(mirrored, .8))
 
     def test_saved_rope_position_overrides_connector_detection(self):
         observation = MinimapObservation(Point(.70, .70), None, .90, (0, 0, 1, 1))

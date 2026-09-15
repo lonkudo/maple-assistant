@@ -6,7 +6,7 @@ import zipfile
 
 from update_manager import (
     UpdateError, apply_desktop_update, export_user_config, find_newer_desktop_update,
-    schedule_hidden_restart,
+    remove_consumed_update_package, schedule_hidden_restart,
 )
 
 
@@ -30,6 +30,21 @@ class DesktopUpdateTests(unittest.TestCase):
                 find_newer_desktop_update("0128", [desktop]).path, newest
             )
 
+    def test_finds_newer_zip_in_install_parent_without_recursive_drive_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            desktop = root / "Desktop"
+            desktop.mkdir()
+            install = root / "running"
+            install.mkdir()
+            package = self._zip_release(root, "0131")
+            self.assertEqual(
+                find_newer_desktop_update(
+                    "0128", [desktop], local_roots=[install, root]
+                ).path,
+                package,
+            )
+
     def test_update_copies_package_and_user_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -47,6 +62,14 @@ class DesktopUpdateTests(unittest.TestCase):
             self.assertTrue(result.config_copied)
             self.assertEqual((install / "VERSION").read_text(encoding="ascii").strip(), "0130")
             self.assertEqual((install / "user_config.json").read_text(encoding="utf-8"), '{"from": "update"}')
+
+    def test_successful_update_zip_can_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            desktop = Path(temp)
+            package_path = self._zip_release(desktop, "0130")
+            package = find_newer_desktop_update("0128", [desktop])
+            self.assertTrue(remove_consumed_update_package(package))
+            self.assertFalse(package_path.exists())
 
     def test_no_newer_package_reports_a_clear_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

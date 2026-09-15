@@ -23,7 +23,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from marker_detector import detect_yellow_diamond
-from countdown_worker import play_mp3
+from countdown_worker import play_mp3, run_sound_async
 
 LOG = logging.getLogger(__name__)
 
@@ -98,6 +98,7 @@ class CharacterWorker(Thread):
         flash_callback: Optional[Callable[[], None]] = None,
         alert_callback: Optional[Callable[[str], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
+        disconnect_event_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(name="character-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -121,6 +122,9 @@ class CharacterWorker(Thread):
         self._flash_callback = flash_callback
         self._alert_callback = alert_callback
         self._on_disconnect = on_disconnect
+        # Optional independent listener fired at the same confirmed disconnect
+        # (e.g. the diagnostic screenshot recorder); never breaks the flow.
+        self._disconnect_event_callback = disconnect_event_callback
 
     def set_disconnect_alert(self, enabled: bool) -> None:
         """Enable/disable the missing-yellow-marker alarm live from the UI."""
@@ -157,7 +161,13 @@ class CharacterWorker(Thread):
             sound_enabled = self._sound_enabled
         if sound_enabled:
             try:
-                self._play_alert_sound(self._alert_sound_path)
+                # Never play inline: a wedged audio device would freeze this
+                # detection worker (and with it the marker feed).
+                run_sound_async(
+                    self._play_alert_sound,
+                    self._alert_sound_path,
+                    name="disconnect-alert-sound",
+                )
             except Exception:
                 LOG.warning("disconnect alert sound failed", exc_info=True)
 
@@ -191,6 +201,13 @@ class CharacterWorker(Thread):
                 except Exception:
                     LOG.warning("disconnect alert could not stop patrol",
                                 exc_info=True)
+            if self._disconnect_event_callback is not None:
+                try:
+                    self._disconnect_event_callback()
+                except Exception:
+                    LOG.warning(
+                        "disconnect event callback failed", exc_info=True
+                    )
             # MCI playback waits until the MP3 ends. Keep marker detection at
             # full cadence by moving only audio playback to a tiny daemon.
             threading.Thread(

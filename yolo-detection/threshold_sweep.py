@@ -108,8 +108,8 @@ def main() -> int:
         cv2.putText(preview, f"bright={gray.mean():.0f}",
                     (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        out = f"threshold_sweep_{threshold:.2f}.png"
-        cv2.imwrite(out, preview)
+        out = f"threshold_sweep_{threshold:.2f}.jpg"
+        cv2.imwrite(out, preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
         print(f"[{threshold:.2f}] mobs={mob_count} bright={gray.mean():.0f} "
               f"saved={out}")
 

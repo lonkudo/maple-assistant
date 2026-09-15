@@ -9,7 +9,7 @@
   "rope_x": 0.4926,
   "calibrated_player_y": 0.65625,
   "horizontal_tolerance": 0.01,
-  "horizontal_tolerance_diamonds": 0.293,
+  "horizontal_tolerance_diamonds": 0.12,
   "aligned_frames_required": 2,
   "climb_layer_confirm_frames": 3,
   "climb_layer_confirm_seconds": 0.3,

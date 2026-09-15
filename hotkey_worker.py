@@ -195,73 +195,16 @@ class HotkeyWorker(threading.Thread):
         except queue.Full:
             LOG.warning("hotkey action queue full; ignored %s", action)
 
-    def _run_registered_hotkeys(self) -> bool:
-        """Run native global Ctrl registrations when Windows accepts them.
+    def _install_hook(self, active_vks: set[int]) -> bool:
+        """Install the low-level ``WH_KEYBOARD_LL`` hook.
 
-        A low-level hook can be installed successfully yet not receive keys
-        from particular game/overlay integrity contexts. ``RegisterHotKey``
-        is delivered by Windows to this worker's message queue and is more
-        reliable for this fixed set of global Ctrl chords. It also naturally
-        consumes the chord and uses ``MOD_NOREPEAT`` to prevent hold repeats.
+        ``active_vks`` limits which chords this hook reacts to.  The hook is
+        the fallback for chords Windows would not let the process claim
+        natively (for example Ctrl+` when another application already owns
+        that chord); chords native registration already delivered are excluded
+        so one press can never fire twice.  When native registration is
+        unavailable for every chord, ``active_vks`` is the whole binding set.
         """
-
-        user32 = ctypes.windll.user32
-        user32.RegisterHotKey.argtypes = (
-            wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT,
-        )
-        user32.RegisterHotKey.restype = wintypes.BOOL
-        user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
-        user32.UnregisterHotKey.restype = wintypes.BOOL
-
-        registered: dict[int, str] = {}
-        for hotkey_id, (vk, binding) in enumerate(
-            sorted(self._bindings.items()), start=1
-        ):
-            action, _block_original = binding
-            if user32.RegisterHotKey(
-                None, hotkey_id, MOD_CONTROL | MOD_NOREPEAT, vk
-            ):
-                registered[hotkey_id] = action
-            else:
-                LOG.warning("could not register hotkey Ctrl+VK_%02X", vk)
-
-        # The hook below remains a compatibility fallback for machines where
-        # native global registration is disabled by policy or another app.
-        if not registered:
-            return False
-
-        LOG.info(
-            "hotkey worker started native registrations=%d/%d",
-            len(registered), len(self._bindings),
-        )
-        message = wintypes.MSG()
-        try:
-            while not self.stop_event.is_set():
-                while user32.PeekMessageW(
-                    ctypes.byref(message), None, 0, 0, PM_REMOVE
-                ):
-                    if message.message == WM_HOTKEY:
-                        action = registered.get(int(message.wParam))
-                        if (action is not None and self.enabled
-                                and self._binding_allowed(action)):
-                            self._queue_action(action)
-                    user32.TranslateMessage(ctypes.byref(message))
-                    user32.DispatchMessageW(ctypes.byref(message))
-                self.stop_event.wait(0.01)
-        finally:
-            for hotkey_id in registered:
-                user32.UnregisterHotKey(None, hotkey_id)
-            LOG.info("hotkey worker stopped")
-        return True
-
-    def run(self) -> None:
-        if sys.platform != "win32":
-            LOG.warning("global hotkeys require Windows")
-            self.stop_event.wait()
-            return
-
-        if self._run_registered_hotkeys():
-            return
 
         ULONG_PTR = wintypes.WPARAM
 
@@ -310,6 +253,11 @@ class HotkeyWorker(threading.Thread):
                     self._ctrl_down = False
                 return user32.CallNextHookEx(self._hook, code, message, l_param)
 
+            if vk not in active_vks:
+                # Claimed natively (or unbound): leave it to the native
+                # message queue / other applications untouched.
+                return user32.CallNextHookEx(self._hook, code, message, l_param)
+
             binding = self._bindings.get(vk)
             if binding is not None:
                 action, block_original = binding
@@ -340,26 +288,105 @@ class HotkeyWorker(threading.Thread):
         self._hook = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, self._hook_proc, None, 0
         )
-        if not self._hook:
-            LOG.warning("could not install global hotkey hook")
+        return bool(self._hook)
+
+    def _uninstall_hook(self) -> None:
+        if self._hook:
+            ctypes.windll.user32.UnhookWindowsHookEx(self._hook)
+        self._hook = None
+        self._hook_proc = None
+
+    def run(self) -> None:
+        if sys.platform != "win32":
+            LOG.warning("global hotkeys require Windows")
+            self.stop_event.wait()
+            return
+
+        self._run_hotkeys()
+
+    def _run_hotkeys(self) -> None:
+        """Deliver every binding: native registration where Windows allows it,
+        and the low-level hook for every chord it would not claim.
+
+        ``RegisterHotKey`` is preferred for this fixed set of Ctrl chords (it
+        consumes the chord before the game sees it and uses ``MOD_NOREPEAT``),
+        but a chord another application already owns - Ctrl+` is the common
+        case - fails to register.  The process used to fall back to the hook
+        only when *no* chord registered, so a partially rejected set left
+        those chords silently dead.  The hook now covers exactly the chords
+        native registration could not claim, so Ctrl+` always works.
+        """
+
+        if not self._bindings:
+            LOG.info("hotkey worker: no bindings configured")
+            self.stop_event.wait()
+            return
+
+        user32 = ctypes.windll.user32
+        user32.RegisterHotKey.argtypes = (
+            wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT,
+        )
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+
+        registered: dict[int, int] = {}  # hotkey id -> virtual key
+        for hotkey_id, (vk, _binding) in enumerate(
+            sorted(self._bindings.items()), start=1
+        ):
+            if user32.RegisterHotKey(
+                None, hotkey_id, MOD_CONTROL | MOD_NOREPEAT, vk
+            ):
+                registered[hotkey_id] = vk
+            else:
+                LOG.warning(
+                    "could not register hotkey Ctrl+VK_%02X natively; "
+                    "using the low-level hook for it", vk,
+                )
+
+        native_vks = set(registered.values())
+        hook_vks = set(self._bindings) - native_vks
+        LOG.info(
+            "hotkey worker started native=%d/%d hook-fallback=%d",
+            len(registered), len(self._bindings), len(hook_vks),
+        )
+
+        # The hook is installed only when a chord actually needs it.  A fully
+        # native set stays hook-free (its chords are consumed by Windows and
+        # never reach the hook); an all-native failure leaves hook_vks holding
+        # every binding, exactly like the old full fallback.
+        hook_ok = True
+        if hook_vks:
+            hook_ok = self._install_hook(hook_vks)
+            if not hook_ok:
+                LOG.warning("could not install global hotkey hook")
+        if not registered and not hook_ok:
             # Hotkeys are optional. A hook permission failure must not make
             # the core-worker supervisor shut down normal gameplay.
             self.stop_event.wait()
             return
-        LOG.info("hotkey worker started bindings=%d", len(self._bindings))
+
         message = wintypes.MSG()
         try:
             while not self.stop_event.is_set():
                 while user32.PeekMessageW(
                     ctypes.byref(message), None, 0, 0, PM_REMOVE
                 ):
+                    if message.message == WM_HOTKEY:
+                        vk = registered.get(int(message.wParam))
+                        action = (
+                            self._bindings[vk][0] if vk is not None else None
+                        )
+                        if (action is not None and self.enabled
+                                and self._binding_allowed(action)):
+                            self._queue_action(action)
                     user32.TranslateMessage(ctypes.byref(message))
                     user32.DispatchMessageW(ctypes.byref(message))
                 self.stop_event.wait(0.01)
         finally:
-            if self._hook:
-                user32.UnhookWindowsHookEx(self._hook)
-                self._hook = None
+            self._uninstall_hook()
+            for hotkey_id in registered:
+                user32.UnregisterHotKey(None, hotkey_id)
             LOG.info("hotkey worker stopped")
 
 

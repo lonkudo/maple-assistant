@@ -86,7 +86,17 @@ class RandomJumpWorker(threading.Thread):
                 if self.motion_arbiter.request_jump():
                     LOG.info("random jump queued: alt")
                 else:
-                    LOG.info("random jump skip: arbiter stopping")
+                    refusal = ""
+                    probe = getattr(self.motion_arbiter, "last_refusal", None)
+                    if callable(probe):
+                        try:
+                            refusal = str(probe() or "")
+                        except Exception:
+                            refusal = ""
+                    LOG.info(
+                        "random jump skipped: motion arbiter refused%s",
+                        f" ({refusal})" if refusal else "",
+                    )
             else:
                 LOG.info("random jump repetition: alt")
                 self.jump_once()

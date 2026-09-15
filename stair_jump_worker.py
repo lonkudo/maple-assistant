@@ -99,9 +99,11 @@ class StairJumpWorker(threading.Thread):
             self._completion_callbacks = []
             self._requested_direction = None
             self._active = False
-            # MovementWorker recomputes this shared climb/return gate on its
-            # next minimap frame.  Do not clear it here: a rope transition
-            # may have begun while the stair tap was completing.
+            if self.action_active_event is not None:
+                # This is the stair worker's own exclusion event, not the
+                # shared climb/return state. Clear it immediately so an empty
+                # route can continue fixed attack and 小碎步 after the one tap.
+                self.action_active_event.clear()
             self._cv.notify_all()
         for callback in callbacks:
             try:

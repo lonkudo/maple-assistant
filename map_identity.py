@@ -23,7 +23,10 @@ def _write_image_unicode_safe(path: Path, image: np.ndarray) -> None:
     ``Path.write_bytes`` keeps the path in Python's Unicode-aware layer.
     """
 
-    ok, encoded = cv2.imencode(".png", image)
+    # JPG (q95) like every other image in the project; the signature is compared by
+    # normalised correlation, and q95 keeps the pixel shift under ~1 level.
+    ok, encoded = cv2.imencode(".jpg", image,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not ok:
         raise OSError(f"could not encode image for {path}")
     path.write_bytes(encoded.tobytes())
@@ -53,7 +56,7 @@ class MapIdentityStore:
     @staticmethod
     def _filename(map_name: str) -> str:
         digest = hashlib.sha256(map_name.strip().encode("utf-8")).hexdigest()[:20]
-        return f"map-name-{digest}.png"
+        return f"map-name-{digest}.jpg"
 
     @staticmethod
     def _normalize(image: Image.Image) -> np.ndarray:
@@ -117,7 +120,7 @@ class MapIdentityStore:
         with self._lock:
             if not self.root.is_dir():
                 return
-            for path in self.root.glob("map-name-*.png"):
+            for path in self.root.glob("map-name-*.jpg"):
                 path.unlink(missing_ok=True)
             self.index_path.unlink(missing_ok=True)
 

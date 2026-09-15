@@ -41,6 +41,7 @@ class AttackWorker(threading.Thread):
         initial_offset: Optional[float] = None,
         attack_jitter_seconds: float = 0.1,
         motion_arbiter: Any = None,
+        direction_transition_event: Optional[threading.Event] = None,
         jump_attack: bool = False,
         jump_attack_delay: float = 0.3,
     ) -> None:
@@ -63,6 +64,10 @@ class AttackWorker(threading.Thread):
         # executing (their action motion is playing) the attack is deferred
         # until the arbiter is idle, so attack motion cannot swallow them.
         self.motion_arbiter = motion_arbiter
+        # A patrol endpoint reversal reserves a brief neutral/settle window.
+        # Fixed attacks inside that window can make Maple ignore the newly
+        # pressed opposite direction.
+        self.direction_transition_event = direction_transition_event
         # 跳跃攻击 mode: every cadence beat emits a bundle - jump (Alt) first,
         # then the attack key ``jump_attack_delay`` (default 0.3s) later.  The
         # jump belongs to the attack bundle in this mode, so NO jump event is
@@ -143,6 +148,10 @@ class AttackWorker(threading.Thread):
             if can_fire and (self.climbing_active_event is not None
                     and self.climbing_active_event.is_set()):
                 LOG.info("attack skipped: climb/return input is active")
+                can_fire = False
+            if (can_fire and self.direction_transition_event is not None
+                    and self.direction_transition_event.is_set()):
+                LOG.info("attack skipped: patrol direction handoff is active")
                 can_fire = False
             if can_fire and self.motion_arbiter is not None:
                 # Reservation is deliberately atomic.  Checking idle and

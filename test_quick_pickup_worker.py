@@ -50,14 +50,26 @@ class QuickPickupWorkerTests(unittest.TestCase):
         sender = FakeSender()
         worker, stop, results = self._worker(sender, patrol_running=lambda: True)
         worker.start()
+        self.addCleanup(worker.join, 1)
+        self.addCleanup(stop.set)
         self.assertTrue(worker.request_toggle())
-        time.sleep(0.06)
-        self.assertFalse(worker.is_active())
-        state, detail = results.get_nowait()
+        # Wait for the worker's verdict instead of trusting one fixed sleep: a
+        # busy machine (other suites' threads) could miss a 60 ms window and
+        # turn this into a flaky failure.
+        deadline = time.monotonic() + 2.0
+        outcome = None
+        while time.monotonic() < deadline:
+            try:
+                outcome = results.get_nowait()
+                break
+            except queue.Empty:
+                time.sleep(0.005)
+        self.assertIsNotNone(outcome, "the worker never reported a result")
+        state, detail = outcome
         self.assertEqual(state, "failed")
         self.assertIn("patrol", detail)
+        self.assertFalse(worker.is_active())
         self.assertEqual(sender.sent, [])
-        stop.set()
         worker.join(1)
 
     def test_failed_z_send_stops_worker(self):

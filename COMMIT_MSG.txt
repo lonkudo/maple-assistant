@@ -1,37 +1,47 @@
-fix: character position becomes a per-frame dispatch worker + stale-climb brake + return.climb stall recovery
+feat: remote lie API replaces the local pass; 测试api plays a video
 
-The 16:27 log shows the freeze mechanism clearly: the character is on
-layer1 doing "MOVE TO ROPE | pos=(0.335106, 0.567708) ... action=right"
-every frame but NEVER moves - no keys are sent and no suppression warning
-fires, while the attack worker reports "jump-climb input is active" every
-frame.  The climb state machine got stuck with Up-hold active from an
-earlier failed grab attempt; that stale climb input silently swallowed
-every left/right floor walk (the direction key is gated while climb input
-is active), freezing the character on layer1 forever.  The dispatcher
-architecture also means the marker is now detected on EVERY frame
-independently of the movement loop, so a freeze can never hide the real
-position.
+Lie detection is now a call to the remote RoiTrack service, so the local Cutie
+pass is gone: auto_lie_worker.py, lie_demo_player.py, auto_lie_overlay.py, the
+whole target_tracker engine (realtime_fade_tracker, adaptive/roi/video players,
+offline_bundle with the Cutie+ResNet weights, wheelhouse and python/vc_redist
+installers, tracking_results), lie_video_tools' in-game replay and four test
+modules.  target_tracker/ keeps only mouse_aim_controller.py (stdlib-only aim
+controller) and install.ps1 stops installing torch/Cutie/VC++ for a tracker
+($InstallLocalTracker = $false), so the CPU/CUDA package drops 379 MB -> 62 MB.
 
-- NEW character_worker.py: CharacterWorker(thread) detects the yellow
-  player diamond on every dispatched frame (never gated by focus /
-  movement state) and publishes CharacterPosition(x, y, confidence) to a
-  positions queue.  minimap region comes from a provider (the movement
-  worker's latest stabilised region) so both workers crop the same box.
-- movement_worker: new optional character_positions queue - when wired,
-  the dispatched position overrides the worker's own per-frame marker read
-  (per-frame layer detection continues via the same observation chain).
-- movement_worker floor-walk branch: stale-climb brake - if the decision
-  is a plain left/right floor walk while the climb state still reports
-  Up held (stuck from a failed grab + focus dip that released the OS key
-  but not the state machine) and the marker Y still sits inside the
-  current route layer's band (on the floor, not on the rope arc), release
-  Up and reset the climb state before walking.
-- movement_worker rope-walk branch: the existing rope-approach stall
-  recovery now ALSO covers the return climb (route label "return.climb",
-  which is not ".rope") - a bench/fence mid-return otherwise freezes the
-  return-to-route walk forever.
-- assistant.py: character_frames added to the frame-bus subscribers;
-  CharacterWorker created (wired to movement_worker._last_minimap_region)
-  and added to core_workers; character_positions passed into
-  MovementWorker.
-- tests: 158 OK (movement + patrol + assistant suites), compile clean.
+The 附加功能 row is now a single 测试api button.  It asks for a video file, plays
+it at the API's 5 fps in its own focused, always-on-top window, uploads each
+frame's lie ROI (372x248 BGR jpeg90 base64) and moves the real cursor onto the
+answer - only inside the picture rectangle, never a click.  The 时长 box, the
+密钥 button and the 测试api（抓屏）button are removed: the run is the measured
+~30 s and the product key ships in autolie_api/key_secret.txt (LIE_PRODUCT_KEY
+overrides it; with neither, the local mimic answers so the button always works).
+
+Order, from the operator's own workflow: connect at once (probe -> chosen port
+-> handshake), wait AWAIT_SECOND_WINDOW (3 s) while displaying but not feeding,
+then feed for the rest of the run (~27 s of 30 s), then round_end and close
+everything when the clip ends.  The wait is clamped to 8 s because 2.7.0 §4.1
+kicks a session that goes 10 s without a valid frame.  A server-side reset
+mid-round (observed once: WinError 10054 after 69 frames, no close frame) is
+survived by opening a new session and restarting frame_id at 1, and a closed
+socket is no longer mistaken for "no answer" - that bug cost two frames and a
+1.5 s stall per reset.  The wait itself is justified by measurement: the test
+clip's first 16 frames are one frozen image and the service answered
+abandon_frame_hold for every one of them.
+
+The measured lie-popup geometry moved out of the deleted worker into
+lie_geometry.py, so autolie_api/intergration.py still derives the exact
+(310, 118, 745, 496) ROI at 1366x768 (verified identical over five client
+sizes).
+
+Also in this tree: the RoiTrack client itself (autolie_api: endpoints, WS
+transport, key store, per-run logs, local mimic), 自动重连 (login-page colour
+gate, world/channel entry, 5-point calibration, temporary test button), the
+JPG-only image policy (image_io.py), and MovementWorker's far "no progress"
+endpoint bound.
+
+Docs: README.md and ARCHITECTURE.md rewritten for the remote design - worker
+list, frame flow, event chain, module inventory, test list, ignored paths and
+the handoff state at 0390.  Tests: 757 collected, 9 known unrelated failures.
+
+Release: MapleAssistant-CPU-v0390.zip / MapleAssistant-CUDA-v0390.zip.

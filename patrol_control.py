@@ -87,6 +87,27 @@ PointKind = Literal["left_most_pos", "rope_pos", "right_most_pos"]
 Boundary = Literal["left_most_pos", "right_most_pos"]
 
 
+def _diamond_geometry_matches(recorded_layout: Any, layout: Any) -> bool:
+    """True when the recorded yellow-diamond size is the live one.
+
+    The pixel size of the yellow player diamond can fluctuate by about one
+    pixel between OpenCV frames, so a small difference stays "same geometry"
+    (re-projecting through that noise previously shifted a saved rope).  But
+    a recorded diamond far from the live one - for example the 15x7 blob a
+    merged map-art run produced while the real diamond is 6x6 - is a
+    genuinely different geometry: the stored normalized x/y was computed with
+    the wrong divisor, so the point must be re-projected through its stable
+    diamond coordinate instead of being trusted.
+    """
+
+    try:
+        recorded = float(recorded_layout["diamond_width"])
+        live = max(1.0, float(layout.diamond_width))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return True
+    return abs(recorded - live) <= max(1.5, live * 0.35)
+
+
 def _layer_number(name: str) -> int:
     """Trailing floor number of a layer name (``layer12`` -> 12)."""
     match = re.search(r"(\d+)$", name)
@@ -767,6 +788,7 @@ class PatrolController:
                                     - layout.canvas_width) <= 1.0
                             and abs(float(recorded_layout["canvas_height"])
                                     - layout.canvas_height) <= 1.0
+                            and _diamond_geometry_matches(recorded_layout, layout)
                         )
                     except (KeyError, TypeError, ValueError):
                         same_canvas_geometry = False

@@ -64,6 +64,54 @@ class LieDetectorImageTests(unittest.TestCase):
         self.assertIsNone(detect_lie_square(image))
 
 
+class NearMissDiagnosticTests(unittest.TestCase):
+    """A lie test that never rings must at least leave evidence in the log."""
+
+    @staticmethod
+    def _worker():
+        return LieDetectorWorker(
+            queue.Queue(), threading.Event(), enabled=True,
+        )
+
+    def test_half_size_uniform_block_is_reported_with_its_real_geometry(self):
+        image = Image.new("RGB", (1366, 768), "black")
+        # A 38x38 near-#c9ced0 block: exactly half the 76x76 the rule wants, so
+        # the exact erosion rejects it and nothing would be logged without the
+        # diagnostic.
+        for y in range(300, 338):
+            for x in range(400, 438):
+                image.putpixel((x, y), LIE_COLOR)
+        self.assertIsNone(detect_lie_square(image))
+        worker = self._worker()
+        with self.assertLogs("lie_detector_worker", level="INFO") as captured:
+            worker._log_near_miss(image, time.monotonic())
+        line = "\n".join(captured.output)
+        self.assertIn("near miss", line)
+        self.assertIn("38x38", line)
+        self.assertIn("Nothing was triggered.", line)
+
+    def test_diagnostic_is_rate_limited(self):
+        image = Image.new("RGB", (1366, 768), "black")
+        for y in range(300, 338):
+            for x in range(400, 438):
+                image.putpixel((x, y), LIE_COLOR)
+        worker = self._worker()
+        now = time.monotonic()
+        with self.assertLogs("lie_detector_worker", level="INFO") as captured:
+            worker._log_near_miss(image, now)
+            worker._log_near_miss(image, now + 1.0)     # too soon: silent
+        self.assertEqual(
+            sum("near miss" in line for line in captured.output), 1
+        )
+
+    def test_a_frame_without_any_block_stays_silent(self):
+        worker = self._worker()
+        with self.assertNoLogs("lie_detector_worker", level="INFO"):
+            worker._log_near_miss(
+                Image.new("RGB", (1366, 768), "black"), time.monotonic()
+            )
+
+
 class LieDetectorWorkerTests(unittest.TestCase):
     def test_scans_only_when_one_second_deadline_is_due(self):
         worker = LieDetectorWorker(

@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional, Protocol, Sequence
+from typing import Any, Optional, Protocol, Sequence
 
 import numpy as np
 from PIL import Image
@@ -23,6 +23,25 @@ from PIL import Image
 from hotkey_worker import SELF_INPUT_EXTRA_INFO
 
 LOG = logging.getLogger(__name__)
+
+# Action taps (jump / buff / periodic skill keys) are the shortest events the
+# assistant emits, and ``SendInput`` is global: the keystroke lands in whichever
+# window owns the keyboard at that instant.  Measured in the field log, a tap is
+# also the only event that can be "sent" and still do nothing in the game, so it
+# is verified at both ends of the hold and retried a bounded number of times.
+_ACTION_TAP_HOLD_SECONDS = 0.045
+_ACTION_TAP_ATTEMPTS = 3
+_ACTION_TAP_RETRY_SECONDS = 0.06
+# One delivery warning per interval, so a stolen focus cannot flood the log.
+_DELIVERY_WARN_INTERVAL = 2.0
+
+# A periodic buff is tapped every interval, so a swallowed tap costs minutes.
+# Nothing in the sender can prove the GAME consumed the key, but the HUD can:
+# a cast almost always moves HP/MP.  After a buff tap the worker therefore
+# watches the next reading and reports what actually happened - the missing
+# evidence that made "the log says executed, the game does nothing"
+# undiagnosable.
+_BUFF_VERIFY_SECONDS = 2.5
 
 # Keys the UI bind buttons may capture.  The ordinary Q--M letter keys and
 # slash are useful skill bindings; Z remains reserved for pickup/movement.
@@ -44,9 +63,38 @@ class KeySender(Protocol):
         """Tap *key*, returning True only when it was sent (or dry-run logged)."""
 
 
+def _process_name(pid: int) -> str:
+    """Executable name for ``pid`` ('' when it cannot be queried).
+
+    Used only for diagnostics: a window that steals the foreground is the usual
+    reason an action tap dies, and naming the process is what lets the operator
+    close it.  Uses kernel32 directly so it does not depend on pywin32 helpers.
+    """
+
+    if pid <= 0:
+        return ""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ""
+        try:
+            size = ctypes.c_uint(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(
+                handle, 0, buffer, ctypes.byref(size)
+            ):
+                return ""
+            return str(buffer.value).rsplit("\\", 1)[-1]
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
 class WindowKeySender:
     """Send scan-code input only while the dynamically found game window is active."""
-
     # Set-1 keyboard scan codes. Extended keys require the E0 flag.
     _SCAN = {
         "ctrl": (0x1D, False), "alt": (0x38, False),
@@ -130,7 +178,15 @@ class WindowKeySender:
         # lifecycle scrub can re-send key-up even after the logical owner
         # table was cleared by Stop Patrol or a focus dip.
         self._physical_keys: set[str] = set()
+        # Every key this process has EVER injected a key-down for.  A key-up
+        # can be delivered to another window when focus is stolen between the
+        # two events (SendInput is global), and the game then keeps that key
+        # held - after which every later tap of the same key is swallowed,
+        # because the game sees a repeat instead of a new press.  A lifecycle
+        # scrub therefore releases this superset, not just the movement keys.
+        self._used_keys: set[str] = set()
         self._input_session = 0
+        self._delivery_warned_at = float("-inf")
         self._input_enabled = threading.Event()
         if input_enabled:
             self._input_enabled.set()
@@ -183,6 +239,7 @@ class WindowKeySender:
             self._physical_keys.discard(key)
         else:
             self._physical_keys.add(key)
+            self._used_keys.add(key)
 
     def force_key_up(self, key: str, *, reason: str = "recovery") -> bool:
         """Unconditionally inject key-up and forget every claim for ``key``.
@@ -210,6 +267,12 @@ class WindowKeySender:
             # key-up is precisely the situation where neither local table
             # can prove the key remains down.
             keys.update(self._MOVEMENT_KEYS)
+            # ... and every key this process has ever pressed: the action keys
+            # (alt/ctrl and the periodic buffs) are exactly the ones whose
+            # key-up is lost when focus is stolen mid-tap, and a buff key the
+            # game still holds makes every later buff tap a repeat the game
+            # ignores.
+            keys.update(self._used_keys)
             self._key_owners.clear()
             for key in sorted(keys):
                 self._emit_locked(key, key_up=True)
@@ -235,9 +298,14 @@ class WindowKeySender:
     def input_is_enabled(self) -> bool:
         return self._input_enabled.is_set()
 
-    def _find_target_window(self) -> int:
-        """Find the configured game window without blocking the UI forever."""
+    def _find_target_window(self, *, required: bool = True) -> int:
+        """Find the configured game window without blocking the UI forever.
 
+        ``required=False`` answers 0 instead of raising when the game is not on
+        screen: callers that only want to know whether the game is there (the quick
+        pickup hotkey while the operator tests a video, for example) must not turn
+        that into an error.
+        """
         import win32gui
 
         # The configured MapleStory title is normally exact. FindWindowW reads
@@ -256,7 +324,7 @@ class WindowKeySender:
         # title, but never allow that fallback enumeration to freeze Tk's
         # Start Patrol callback. If a foreign window blocks enumeration, the
         # temporary daemon may finish later but it cannot hold this selection.
-        matches: list[int] = []
+        visible: "list[tuple[int, str]]" = []
         scan_error: list[BaseException] = []
         scan_done = threading.Event()
 
@@ -269,8 +337,7 @@ class WindowKeySender:
                 LOG.debug("WINDOW SELECT: skipped unreadable hwnd=%s", hwnd,
                           exc_info=True)
                 return
-            if self.window_title.casefold() in title.casefold():
-                matches.append(hwnd)
+            visible.append((hwnd, title))
 
         def scan() -> None:
             try:
@@ -288,15 +355,42 @@ class WindowKeySender:
             )
         if scan_error:
             raise OSError("could not enumerate visible Windows windows") from scan_error[0]
+        wanted = self.window_title.casefold()
+        matches = [hwnd for hwnd, title in visible if wanted in title.casefold()]
         LOG.info("WINDOW SELECT: fallback title scan found %d matching window(s)",
                  len(matches))
-        if len(matches) != 1:
-            raise OSError(
-                f"expected exactly one visible game window containing "
-                f"{self.window_title!r}; found {len(matches)}"
-            )
-        self.hwnd = matches[0]
-        return matches[0]
+        if len(matches) == 1:
+            self.hwnd = matches[0]
+            return matches[0]
+        if not required:
+            return 0
+        raise OSError(
+            (f"expected exactly one visible game window containing "
+             f"{self.window_title!r}; found {len(matches)}")
+            + (": " + ", ".join(
+                f"{hwnd}:{title!r}" for hwnd, title in visible
+                if wanted in title.casefold()
+            ) if matches else "")
+            + " - visible window titles: "
+            + ", ".join(f"{title!r}" for _hwnd, title in visible if title.strip())[:400]
+            + f"; start the game, or set its window title in the assistant (it is "
+            f"currently {self.window_title!r})"
+        )
+
+    def game_window_present(self) -> bool:
+        """True when the configured game window is on screen - never raises.
+
+        Callers that only want to know whether game input is possible at all (the
+        quick pickup hotkey while the operator tests a 测试测谎 video, say) must be
+        able to ask without turning "the game is not running" into an error.  The
+        answer is about the screen, so it is answered even in a dry run.
+        """
+
+        try:
+            return self._find_target_window(required=False) != 0
+        except Exception:
+            LOG.debug("game window probe failed", exc_info=True)
+            return False
 
     def select_window(self) -> bool:
         """Restore and foreground the configured game window automatically."""
@@ -536,7 +630,120 @@ class WindowKeySender:
             return self._key_owners.get(key.casefold(), 0) > 0
 
     def tap(self, key: str) -> bool:
-        return self.press(key, duration=0.025)
+        """Tap an ACTION key (jump/buff) and verify the game got it.
+
+        A tap is the shortest event this process emits (25-45 ms), so it is the
+        one that loses the race with a window that steals the foreground:
+        ``SendInput`` is global, so the keystroke is delivered to whatever owns
+        the keyboard at that instant.  The old implementation called
+        ``press()`` once and reported success whenever ``SendInput`` returned,
+        which is why the log showed ``motion arbiter executed …`` while nothing
+        happened in the game.
+
+        This tap instead:
+        - refuses/retries while the game is not foreground,
+        - re-checks focus at the END of the hold (a key-up delivered to another
+          window leaves the key stuck down in the game, which makes every later
+          tap of that key a no-op),
+        - force-releases the key when that happens,
+        - logs a rate-limited WARNING naming the window that stole the focus.
+
+        Returns True only when the game owned the keyboard for the whole tap.
+        """
+
+        key = key.casefold()
+        if key not in self._SCAN:
+            raise ValueError(f"unsupported key: {key}")
+        for attempt in range(1, _ACTION_TAP_ATTEMPTS + 1):
+            if not self.input_is_enabled():
+                # Not a transient condition: no retry, no delay.
+                LOG.debug("action tap %s refused: live input is not enabled", key)
+                return False
+            if not (self.dry_run or self._foreground_matches()):
+                self._warn_delivery(
+                    "action tap %s refused: game window is not foreground (%s)",
+                    key, self.describe_foreground(),
+                )
+                if attempt < _ACTION_TAP_ATTEMPTS:
+                    time.sleep(_ACTION_TAP_RETRY_SECONDS)
+                continue
+            if self._tap_verified(key):
+                return True
+            if attempt < _ACTION_TAP_ATTEMPTS:
+                time.sleep(_ACTION_TAP_RETRY_SECONDS)
+        LOG.warning(
+            "action tap %s NOT delivered after %d attempts (foreground=%s)",
+            key, _ACTION_TAP_ATTEMPTS, self.describe_foreground(),
+        )
+        return False
+
+    def _tap_verified(self, key: str) -> bool:
+        """One down/hold/up with a focus check at both ends (see :meth:`tap`)."""
+
+        started = time.monotonic()
+        if not self.key_down(key):
+            return False
+        owned_at_release = True
+        try:
+            time.sleep(_ACTION_TAP_HOLD_SECONDS)
+            # The release must land in the game too: a key-up that goes to a
+            # window which stole the focus leaves the game holding the key.
+            owned_at_release = bool(self.dry_run or self._foreground_matches())
+        finally:
+            self.key_up(key)
+            LOG.info("key hold complete=%s actual_hold=%.3fs", key,
+                     time.monotonic() - started)
+        if not owned_at_release:
+            self.force_key_up(key, reason="action tap lost focus")
+            self._warn_delivery(
+                "action tap %s lost the game window mid-tap (%s); key "
+                "force-released and retried",
+                key, self.describe_foreground(),
+            )
+            return False
+        return True
+
+    def _warn_delivery(self, message: str, *args: Any) -> None:
+        """Rate-limited delivery warning (one line per 2 s, never per attempt)."""
+
+        now = time.monotonic()
+        if now - self._delivery_warned_at < _DELIVERY_WARN_INTERVAL:
+            LOG.debug(message, *args)
+            return
+        self._delivery_warned_at = now
+        LOG.warning(message, *args)
+
+    @staticmethod
+    def describe_foreground() -> str:
+        """Human-readable description of the current foreground window.
+
+        A stolen focus is the usual reason an action tap dies silently, so the
+        warning has to name the thief: title, class, hwnd, pid and, when the
+        process can be queried, its executable name.
+        """
+
+        try:
+            import win32gui
+
+            hwnd = int(win32gui.GetForegroundWindow() or 0)
+            if not hwnd:
+                return "foreground=<none>"
+            title = win32gui.GetWindowText(hwnd)
+            class_name = win32gui.GetClassName(hwnd)
+            pid = 0
+            try:
+                import win32process
+
+                _thread, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                pid = 0
+            exe = _process_name(int(pid))
+            return (
+                f"hwnd={hwnd} title={title[:40]!r} class={class_name!r} "
+                f"pid={pid}{f' exe={exe}' if exe else ''}"
+            )
+        except Exception as exc:
+            return f"foreground=<unavailable: {exc}>"
 
     def send_clipboard_message(self) -> bool:
         """Explicit UI action: focus game and send Enter, Ctrl+V, Enter.
@@ -710,11 +917,12 @@ class StatusConfig:
     """Calibration values for the classic bottom-centre HP/MP/EXP bars.
 
     ``status_roi`` is (left, top, right, bottom) in normalized frame units.
-    The capture region is the FIXED-PIXEL 370x57 bottom-middle info bar;
-    inside it three bars sit SIDE BY SIDE in the same vertical band - HP
-    (red) left, MP (blue) middle, EXP (yellow) right.  Each bar is measured
-    ONLY inside its own horizontal zone (``bar_zones``, fractions of the ROI
-    width) so the three can never be mixed up.
+    The capture region is the FIXED-PIXEL bottom-middle info bar defined in
+    ``assistant.py`` (``status_capture_pixel_box``); the three bars sit SIDE
+    BY SIDE in the same vertical band - HP (red) left, MP (blue) middle, EXP
+    (yellow) right.  Each bar is measured ONLY inside its own horizontal zone
+    (``bar_zones``, fractions of the ROI width) so the three can never be
+    mixed up.
     """
 
     status_roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
@@ -744,30 +952,32 @@ class StatusConfig:
     buff1_enabled: bool = False
     buff2_enabled: bool = False
     buff3_enabled: bool = False
-    # Three side-by-side bars in the fixed-pixel 370x57 info bar (measured
-    # on the real client: HP red x ~7-91, MP blue x ~96-230, EXP yellow
-    # x ~237-363, all in the same vertical band).  Zones are (name, left,
-    # right) fractions of the ROI width so the bars can never be mixed.
+    # Three side-by-side bars in the fixed-pixel info bar.  Measured on the
+    # current real client at the 1080x768 preset (425x32 capture): HP red
+    # x 367-499, MP blue x 502-631, EXP yellow x 641-771 - each bar is ~130 px
+    # wide.  Zones are (name, left, right) fractions of the ROI width so the
+    # bars can never be mixed.
     bar_zones: tuple[tuple[str, float, float], ...] = (
-        ("hp", 0.02, 0.25),
-        ("mp", 0.26, 0.63),
-        ("exp", 0.64, 1.00),
+        ("hp", 0.02, 0.34),
+        ("mp", 0.34, 0.65),
+        ("exp", 0.66, 0.98),
     )
     # Vertical band (top, bottom) as fractions of the ROI height: the bars
-    # occupy rows ~33-53 of the 57px capture; the band excludes the blue
-    # UI text/decoration above them (rows 7-9).
+    # occupy the middle rows of the 32px capture; the band excludes the panel
+    # chrome above and below them.
     bar_band: tuple[float, float] = (0.50, 0.96)
     # Full bar length per bar as a fraction of the ROI width (FIXED PIXEL
-    # HUD - measured on the real client: HP ~85px, MP ~135px, EXP ~127px
-    # inside the 370px-wide capture).  Accepted candidates may vary.
+    # HUD - measured on the current real client: ~130 px per bar at the
+    # 1080x768 preset, i.e. 164 px inside the 538px reference capture).
+    # Accepted candidates may vary.
     full_bar_width_fractions: dict[str, float] = field(
         default_factory=lambda: {
-            "hp": 85.0 / 370.0,
-            "mp": 135.0 / 370.0,
-            "exp": 127.0 / 370.0,
+            "hp": 164.0 / 538.0,
+            "mp": 164.0 / 538.0,
+            "exp": 164.0 / 538.0,
         }
     )
-    min_bar_width_fraction: float = 5.0 / 370.0
+    min_bar_width_fraction: float = 5.0 / 538.0
     minimum_action_confidence: float = 0.55
 
 
@@ -1012,6 +1222,13 @@ class StatusWorker(threading.Thread):
         # clears only when the arbiter reports success/failure.
         self._buff_pending = {"buff2": False, "buff3": False}
         self._buff_timer_lock = threading.Lock()
+        # Buff landing verification: the HUD readings before a buff tap, so the
+        # next frames can prove whether the game cast anything at all.
+        self._buff_verification: dict[str, Optional[dict[str, Any]]] = {
+            "buff1": None, "buff2": None, "buff3": None,
+        }
+        self._last_hp: Optional[int] = None
+        self._last_mp: Optional[int] = None
 
     def _tap_potion(self, key: str) -> bool:
         """Tap the potion key, retrying briefly if the first attempt is blocked.
@@ -1093,6 +1310,64 @@ class StatusWorker(threading.Thread):
         self._potion_verification[name] = None
         return False
 
+    def _arm_buff_verification(self, name: str, key: str) -> None:
+        """Remember the HUD resources so the next frames can prove a cast.
+
+        Called right after a buff key reported "sent".  The comparison baseline
+        is the most recent HUD reading, so the very next reading decides it.
+        """
+
+        self._buff_verification[name] = {
+            "key": str(key),
+            "hp_before": self._last_hp,
+            "mp_before": self._last_mp,
+            "deadline": time.monotonic() + _BUFF_VERIFY_SECONDS,
+        }
+
+    def _verify_buff_effects(self, reading: Any, now: float) -> None:
+        """Report whether each pending buff tap actually changed the HUD.
+
+        A "cast detected" line means the game consumed the key; the warning
+        means it did not, which is the case an operator must know about (an
+        in-game key binding that no longer matches the configured buff key, or
+        a key the client refuses to consume).
+        """
+
+        for name, pending in self._buff_verification.items():
+            if pending is None:
+                continue
+            hp_now, mp_now = getattr(reading, "hp", None), getattr(reading, "mp", None)
+            hp_before, mp_before = pending["hp_before"], pending["mp_before"]
+            readable = hp_now is not None or mp_now is not None
+            changed = (
+                (hp_before is not None and hp_now is not None and hp_now != hp_before)
+                or (mp_before is not None and mp_now is not None and mp_now != mp_before)
+            )
+            if changed:
+                LOG.info(
+                    "%s %s: cast detected (HP %s -> %s, MP %s -> %s)",
+                    name.upper(), pending["key"], hp_before, hp_now,
+                    mp_before, mp_now,
+                )
+                self._buff_verification[name] = None
+                continue
+            if now < float(pending["deadline"]):
+                continue
+            self._buff_verification[name] = None
+            if not readable:
+                LOG.warning(
+                    "%s %s: could not verify the cast (HP/MP unreadable)",
+                    name.upper(), pending["key"],
+                )
+                continue
+            LOG.warning(
+                "%s %s: no HP/MP change within %.1fs after the tap - the game "
+                "did not cast anything (check that the in-game skill is bound "
+                "to %s, and that the window really had focus)",
+                name.upper(), pending["key"], _BUFF_VERIFY_SECONDS,
+                pending["key"],
+            )
+
     def _check_buffs(self, now: float) -> None:
         """Tap the periodic buff keys when their timer elapses.
 
@@ -1127,6 +1402,7 @@ class StatusWorker(threading.Thread):
                         self._last_buff[name] = time.monotonic()
                     LOG.warning("宠物食品 refresh: used %s (every %.0fs)",
                                 key, interval)
+                    self._arm_buff_verification(name, key)
                 continue
             if self.motion_arbiter is not None:
                 # The timer is deliberately NOT restarted when queued.  It
@@ -1141,6 +1417,7 @@ class StatusWorker(threading.Thread):
                     if ok:
                         LOG.warning("%s refresh: completed %s (every %.0fs)",
                                     _name.upper(), _key, _interval)
+                        self._arm_buff_verification(_name, _key)
                     else:
                         LOG.warning("%s refresh: not sent; timer remains due",
                                     _name.upper())
@@ -1163,6 +1440,7 @@ class StatusWorker(threading.Thread):
                     self._last_buff[name] = time.monotonic()
                 LOG.warning("%s refresh: tapped %s (every %.0fs)",
                             name.upper(), key, interval)
+                self._arm_buff_verification(name, key)
 
     def _process_frame(self, frame: object) -> None:
         self._check_buffs(time.monotonic())
@@ -1229,6 +1507,11 @@ class StatusWorker(threading.Thread):
         else:
             self._low_count["mp"] = 0
             self._potion_verification["mp"] = None
+        # Did each buff tap actually reach the game?  Reported from the HUD,
+        # because the sender can only prove the key was emitted.
+        self._verify_buff_effects(reading, now)
+        self._last_hp = reading.hp
+        self._last_mp = reading.mp
 
     def _write_status_state(self, reading: "StatusReading") -> None:
         """Publish the latest HP/MP ratios for other workers (JSON file)."""

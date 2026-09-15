@@ -66,7 +66,17 @@ class SmallStepWorker(threading.Thread):
                 if self.motion_arbiter.request_micro_step():
                     LOG.info("small-step queued")
                 else:
-                    LOG.info("small-step skip: arbiter stopping")
+                    refusal = ""
+                    probe = getattr(self.motion_arbiter, "last_refusal", None)
+                    if callable(probe):
+                        try:
+                            refusal = str(probe() or "")
+                        except Exception:
+                            refusal = ""
+                    LOG.info(
+                        "small-step skipped: motion arbiter refused%s",
+                        f" ({refusal})" if refusal else "",
+                    )
             else:
                 LOG.warning("small-step skipped: motion arbiter unavailable")
             next_step = time.monotonic() + self.next_delay()

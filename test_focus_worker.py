@@ -142,6 +142,47 @@ class FocusWorkerTests(unittest.TestCase):
             worker.join(0.5)
         self.assertFalse(worker.is_alive())
         self.assertFalse(active.is_set())
+
+    def test_lie_pass_keeps_the_foreground_gate_open_without_input(self) -> None:
+        # A 自动过测谎 pass takes the machine over with input DISARMED, yet the
+        # pass is fed by the same capture: the foreground gate must stay open
+        # for it (otherwise the capture stops and the pass starves - the field
+        # log's "sequence ended (capture stalled) after 2.2s").
+        sender = FakeSender()
+        sender.enabled = False          # input disarmed by the takeover
+        stop = threading.Event()
+        active = threading.Event()
+        game_focused = threading.Event()
+        lie_pass = threading.Event()
+        worker = FocusWorker(
+            sender, stop, active, game_focused, poll_interval=0.01,
+            lie_pass_event=lie_pass,
+        )
+        worker.start()
+        try:
+            time.sleep(0.08)
+            # Disarmed and no pass: idle, gate closed, nothing probed.
+            self.assertFalse(game_focused.is_set())
+            self.assertEqual(sender.focus_calls, 0)
+
+            lie_pass.set()
+            deadline = time.monotonic() + 0.5
+            while not game_focused.is_set() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(game_focused.is_set())
+            self.assertGreaterEqual(sender.focus_calls, 1)
+            # Frames keep flowing, but the keyboard stays blocked: automation
+            # must NOT be re-armed by this probe.
+            self.assertFalse(active.is_set())
+
+            lie_pass.clear()
+            deadline = time.monotonic() + 0.5
+            while game_focused.is_set() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(game_focused.is_set())
+        finally:
+            stop.set()
+            worker.join(0.5)
         self.assertFalse(game_focused.is_set())
 
 if __name__ == "__main__":

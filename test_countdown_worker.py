@@ -2,9 +2,122 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from countdown_worker import CountdownWorker
+import ctypes
+
+import countdown_worker
+from countdown_worker import CountdownWorker, play_mp3, run_sound_async
+
+
+class _FakeWinmm:
+    """Records MCI commands and reports a controllable playback mode."""
+
+    def __init__(self, polls_before_stop: int = 1, open_error: int = 0):
+        self.commands: list[str] = []
+        self.polls = 0
+        self.polls_before_stop = polls_before_stop
+        self.open_error = open_error
+        self.mode = "playing"
+
+    def mciSendStringW(self, command, buffer, size, handle):
+        self.commands.append(command)
+        if self.open_error and command.startswith("open "):
+            return self.open_error
+        if command.startswith("status "):
+            self.polls += 1
+            if (self.polls_before_stop is not None
+                    and self.polls > self.polls_before_stop):
+                self.mode = "stopped"
+            if buffer is not None:
+                buffer.value = self.mode
+        return 0
+
+
+class PlayMp3Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        countdown_worker._mci_cooldown_until = 0.0
+
+    def tearDown(self) -> None:
+        countdown_worker._mci_cooldown_until = 0.0
+
+    def _sound(self) -> Path:
+        path = Path(__file__).with_name("work") / "ma_play_mp3_test.mp3"
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"ID3\x00")
+        return path
+
+    def test_play_never_waits_and_always_closes_the_alias(self) -> None:
+        """MCI ``wait`` blocks forever when the sound never finishes."""
+
+        fake = _FakeWinmm(polls_before_stop=1)
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(winmm=fake)):
+            play_mp3(self._sound())
+        joined = " | ".join(fake.commands)
+        self.assertNotIn(" wait", joined)
+        self.assertTrue(fake.commands[0].startswith("open "))
+        self.assertTrue(fake.commands[1].startswith("play "))
+        self.assertTrue(fake.commands[-1].startswith("close "))
+
+    def test_play_gives_up_after_the_budget_and_closes(self) -> None:
+        """A clip that never reports a stop must not hang the thread."""
+
+        fake = _FakeWinmm(polls_before_stop=None)
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(winmm=fake)):
+            with self.assertLogs("countdown_worker", level="WARNING") as logs:
+                play_mp3(self._sound(), max_seconds=0.05)
+        self.assertIn("exceeded", "\n".join(logs.output))
+        self.assertTrue(fake.commands[-1].startswith("close "))
+
+    def test_play_stops_immediately_when_the_stop_event_is_set(self) -> None:
+        fake = _FakeWinmm(polls_before_stop=None)
+        stop_event = threading.Event()
+        stop_event.set()
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(winmm=fake)):
+            started = time.monotonic()
+            play_mp3(self._sound(), stop_event=stop_event)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(fake.commands[-1].startswith("close "))
+
+    def test_play_skips_a_missing_file_without_touching_mci(self) -> None:
+        fake = _FakeWinmm()
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(winmm=fake)):
+            play_mp3(Path(__file__).with_name("work") / "ma_missing.mp3")
+        self.assertEqual(fake.commands, [])
+
+    def test_open_failure_still_raises_no_error(self) -> None:
+        fake = _FakeWinmm(open_error=258)
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(winmm=fake)):
+            with self.assertLogs("countdown_worker", level="WARNING"):
+                play_mp3(self._sound())
+        self.assertEqual(len(fake.commands), 1)
+        self.assertTrue(fake.commands[0].startswith("open "))
+
+
+    def test_play_skips_while_the_device_is_in_cooldown(self) -> None:
+        """One wedged clip must not pull every later sound into the hang."""
+
+        fake = _FakeWinmm(polls_before_stop=None)
+        with mock.patch.object(ctypes, "windll", SimpleNamespace(winmm=fake)):
+            play_mp3(self._sound(), max_seconds=0.05)
+            before = len(fake.commands)
+            with self.assertLogs("countdown_worker", level="WARNING") as logs:
+                play_mp3(self._sound())
+        self.assertIn("audio device is unavailable", "\n".join(logs.output))
+        self.assertEqual(len(fake.commands), before)
+
+    def test_run_sound_async_plays_on_a_daemon_thread(self) -> None:
+        played: list[Path] = []
+        done = threading.Event()
+
+        def play(path: Path) -> None:
+            played.append(path)
+            done.set()
+
+        run_sound_async(play, Path("sound/dingdong.mp3"), name="t-sound")
+        self.assertTrue(done.wait(1.0))
+        self.assertEqual(played, [Path("sound/dingdong.mp3")])
 
 
 class CountdownWorkerTests(unittest.TestCase):
