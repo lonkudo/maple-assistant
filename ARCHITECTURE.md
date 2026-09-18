@@ -651,20 +651,23 @@ only suppresses unsafe stair jumps during settling.
   obsolete climb/drop state and enter the same return path; it adds no capture
   or duplicate image scan.
 - Final-layer descent (``_descending_to_first``) owns the route until the first
-  active layer is reached, and **the layer resync is suppressed for its whole
-  duration** - the same suppression the fall detector already had, and what the
-  flag's own comment always claimed.  Alt+Down drops one platform per chord, so
-  the marker passes through the floors in between and the character even stands
-  on the next floor up between chords; the normal resync confirmed that as
+  active layer is reached, and **everything that could take the machine away is
+  suppressed for its whole duration**: the layer resync, ``_track_fall``,
+  ``_verify_out_of_range_floor`` and the self-rescue.  That is the operator's rule
+  ("the back to base patrol layer should block the hit down by monster function,
+  don't trigger back to patrol route") - two recoveries must never fight over the
+  same character.  Alt+Down drops one platform per chord, so without the resync
+  suppression the marker passing through the floors in between is confirmed as
   "LAYER CHANGED: layer3 -> layer2; restarting layer2 patrol", which ended the
-  descent one floor short and never returned the loop to its first floor.  The
-  descent logs `DROP TO FIRST: the marker is on layer2 during the planned descent;
-  keeping the route on layer3 until layer1 is reached` once per floor it sees, and
-  hands the state back to the resync after ``DROP_TO_FIRST_MAX_SECONDS`` (25 s) so
-  a character that cannot drop further cannot send Alt+Down forever.  Arrival is
-  the descent's own test (``_final_drop_arrived`` -> ``_on_first_layer``), which
-  compares the marker's unambiguous nearest floor with the route's first floor and
-  only falls back to world Y when two floors' bands tie.
+  descent one floor short and never returned the loop to its first floor; and
+  without the recovery suppressions a knock-down reading mid-descent would start a
+  return climb instead.  The descent logs `DROP TO FIRST: the marker is on layer2
+  during the planned descent; keeping the route on layer3 until layer1 is reached`
+  once per floor it sees, and it is bounded by ``DROP_TO_FIRST_MAX_SECONDS`` (10 s)
+  - so suppressing the recoveries cannot deadlock: the bound hands the state back.
+  Arrival is the descent's own test (``_final_drop_arrived`` -> ``_on_first_layer``),
+  which compares the marker's unambiguous nearest floor with the route's first floor
+  and only falls back to world Y when two floors' bands tie.
 - The loop restart after that arrival (``_reset_route_loop``) initializes the
   same state as any fresh Start Patrol: fall tracking (``_reset_fall_tracking``,
   so a fall pending before the descent cannot resolve against a settle window

@@ -154,7 +154,7 @@ not required.
 #### Loop descent to the first route layer
 
 After the final layer's cycles the character Alt+Down drops back to the loop's
-first floor. **The descent owns the route until it gets there**: Alt+Down drops
+first floor. **The descent owns the machine until it gets there**: Alt+Down drops
 one platform per chord, so the marker passes through the floors in between (and
 the character even stands on the next floor up between chords), which the normal
 layer tracker used to confirm as `LAYER CHANGED: layer3 -> layer2; restarting
@@ -164,14 +164,20 @@ route and logs
 
 ```text
 DROP TO FIRST: the marker is on layer2 during the planned descent; keeping the route on layer3
-until layer1 is reached (the descent owns the floors in between)
+until layer1 is reached (the descent owns the floors in between, and no
+knock-down/return logic may interrupt it)
 ```
 
-and after `DROP_TO_FIRST_MAX_SECONDS` (25 s) without reaching it, the layer state
-is handed back to the normal tracker instead of sending Alt+Down forever.
-Arrival itself is the descent's own test (`_final_drop_arrived`), and the loop
-restart initializes the same state as any fresh Start Patrol - fall tracking,
-return state, resync candidate, rope lock, events.
+For the same reason the descent **blocks the knock-down and return-to-route
+recoveries** (the operator: "the back to base patrol layer should block the hit
+down by monster function, don't trigger back to patrol route"): the layer resync,
+`_track_fall`, `_verify_out_of_range_floor` and the self-rescue all stand down
+while it runs, so two recoveries never fight over the same character. The descent
+is bounded - after `DROP_TO_FIRST_MAX_SECONDS` (10 s) without reaching the first
+floor the state is handed back - so suppressing them cannot deadlock. Arrival
+itself is the descent's own test (`_final_drop_arrived`), and the loop restart
+initializes the same state as any fresh Start Patrol - fall tracking, return
+state, resync candidate, rope lock, events.
 
 #### Endpoint arrival and turning
 
@@ -716,7 +722,7 @@ state the worker was in.
 
 ### Handoff state
 
-- `VERSION` is **1.0.50** and the single package `release/MapleAssistant-1.0.50.zip` is the current
+- `VERSION` is **1.0.51** and the single package `release/MapleAssistant-1.0.51.zip` is the current
   distributable (the previous ZIP is removed automatically). `release_now.ps1 -SkipTests` is the normal
   release command; one release per behaviour change, none for documentation-only edits.
 - The 1.0.18 - 1.0.48 line (all shipped during this session, each one behaviour change):

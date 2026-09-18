@@ -363,11 +363,12 @@ def _layer_world_anchor_at_x(layer: Any, player_x: Optional[float]) -> Optional[
 LAYER_CURRENT_Y_GRACE = 0.012
 
 # How long the planned descent to the route's first floor may keep the layer state before the normal
-# resync takes over again.  The descent owns every vertical move (see ``_resync_route_layer``), so a
-# character that cannot drop any further (no platform edge under it) must not sit there sending Alt+Down
-# forever: after this long the layer state is handed back, the resync follows the marker again and the
-# patrol continues from wherever the character is.
-DROP_TO_FIRST_MAX_SECONDS = 25.0
+# recovery takes over again.  The descent owns every vertical move (see ``_resync_route_layer``), so it
+# must yield as soon as it is not making progress: a character that cannot drop any further (no platform
+# edge under it), or one a monster knocked around, must not sit there sending Alt+Down forever while the
+# knock-down and return-to-route logic wait.  A healthy descent needs one chord per floor (about 1-2 s
+# each), so this is generous.
+DROP_TO_FIRST_MAX_SECONDS = 10.0
 
 
 def _layer_y_distance(layer: Any, player_y: float) -> Optional[float]:
@@ -1834,8 +1835,20 @@ class MovementWorker(threading.Thread):
 
         站桩攻击 is exempt entirely: it stands still on purpose, and its own
         temporary anchor owns displacement recovery.
+
+        The planned descent to the route's first layer is exempt as well: it stands
+        ON a platform between Alt+Down chords, which is not "stuck", and a rescue
+        there would restart the patrol on an intermediate floor - exactly the
+        mingling the operator rejected ("the back to base patrol layer should block
+        the hit down by monster function, don't trigger back to patrol route").
+        The descent is bounded, so it hands the machine back by itself.
         """
         if not self.patrol_enabled or not self._route_layers:
+            return
+        if self._descending_to_first:
+            self._rescue_stuck_frames = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_last_pos = None
             return
         if self.stationary_attack_enabled:
             # 站桩攻击 stands still BY DESIGN: every frame is "stuck" for this
@@ -4219,14 +4232,19 @@ class MovementWorker(threading.Thread):
             self._clear_layer_resync_candidate()
             return None
         if self._descending_to_first:
-            # The planned descent to the patrol route's FIRST floor owns every vertical move until the
-            # character arrives there (``_final_drop_arrived`` -> ``_reset_route_loop``).  Alt+Down drops
-            # one platform per chord, so the marker sweeps through the floors in between and the character
-            # even STANDS on the next floor up between chords - the normal resync confirmed exactly that as
-            # "LAYER CHANGED: layer3 -> layer2; restarting layer2 patrol", which ended the descent on
-            # layer2: the loop never returned to its first floor ("the character finished patrol on layer3
-            # then he drop to layer2 and continue the work - he should drop to layer1").  The fall detector
-            # is suppressed for the same reason; this is the layer-state half of it.
+            # The planned descent to the patrol route's FIRST floor owns the machine until the character
+            # arrives there (``_final_drop_arrived`` -> ``_reset_route_loop``, or the
+            # ``DROP_TO_FIRST_MAX_SECONDS`` bound).  Alt+Down drops one platform per chord, so the marker
+            # sweeps through the floors in between and the character even STANDS on the next floor up
+            # between chords - the normal resync confirmed exactly that as "LAYER CHANGED: layer3 ->
+            # layer2; restarting layer2 patrol", which ended the descent on layer2 and never returned the
+            # loop to its first floor.
+            #
+            # It also blocks the knock-down and return-to-route recoveries (the operator: "the back to
+            # base patrol layer should block the hit down by monster function, don't trigger back to
+            # patrol route").  Everything that could take the machine away mid-descent is suppressed for
+            # that reason: this resync, ``_track_fall``, ``_verify_out_of_range_floor`` and the
+            # self-rescue.  The descent itself is bounded, so suppressing them cannot deadlock.
             current = (
                 self._route_layers[self._route_layer_index]
                 if (self._route_layer_index is not None
@@ -4242,7 +4260,8 @@ class MovementWorker(threading.Thread):
                     self._drop_descent_saw = seen_route[0]
                     LOG.info(
                         "DROP TO FIRST: the marker is on %s during the planned descent; keeping the route "
-                        "on %s until %s is reached (the descent owns the floors in between)",
+                        "on %s until %s is reached (the descent owns the floors in between, and no "
+                        "knock-down/return logic may interrupt it)",
                         seen_route[0], current, self.first_layer,
                     )
             self._clear_layer_resync_candidate()
@@ -5205,9 +5224,21 @@ class MovementWorker(threading.Thread):
         or planned-drop state still describes the old floor; those guards are
         useful during animation but must not suppress two stable readings on
         a recorded floor outside the patrol range.
+
+        The planned descent to the route's first layer is the one exception, on
+        purpose: it clears "stale vertical state" itself and would otherwise end the
+        descent in the middle of a knock-down and start a return climb - the two
+        recoveries fighting over the same character ("the back to base patrol layer
+        should block the hit down by monster function, don't trigger back to patrol
+        route").  It is bounded (``DROP_TO_FIRST_MAX_SECONDS``), so skipping the
+        verifier for its duration cannot strand the character.
         """
 
         checked_at = time.monotonic() if now is None else float(now)
+        if self._descending_to_first:
+            self._floor_verify_candidate = None
+            self._floor_verify_frames = 0
+            return False
         if (checked_at - self._last_floor_verify_at
                 < self._floor_verify_interval_seconds):
             return False
@@ -5777,6 +5808,14 @@ class MovementWorker(threading.Thread):
         paths. During normal patrol this helper is called only by the
         two-sample marker verifier; a single ambiguous marker/world-Y reading
         must never start a rope climb near a route endpoint.
+
+        The planned descent to the route's first layer BLOCKS this on purpose
+        (the operator: "the back to base patrol layer should block the hit down by
+        monster function, don't trigger back to patrol route"): while the loop is
+        walking itself back down to its first floor, a knock-down reading must not
+        start a return climb, or the two recoveries fight over the same character.
+        The descent ends at its own arrival test (``_final_drop_arrived``) or at
+        ``DROP_TO_FIRST_MAX_SECONDS``, and only then can this run.
         """
         if (self._return_mode is not None
                 or self._descending_to_first
