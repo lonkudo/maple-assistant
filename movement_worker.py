@@ -4008,6 +4008,44 @@ class MovementWorker(threading.Thread):
             return name
         return None
 
+    def _nearest_floor_by_marker_y(
+        self, marker_y: float, layers: Optional[dict[str, Any]] = None
+    ) -> Optional[str]:
+        """The recorded floor whose own positions are closest to the marker Y.
+
+        The operator's rule for a reading that matches no band at all: "if the character can't find a
+        layer he should anchor to the nearest layer".  It is the right answer for a stair/bench floor
+        whose recorded points do not cover its whole vertical extent (his layer1 is one: its points were
+        saved at 0.676829 while the character stands at 0.713415 further down the same platform), for a
+        character that walked a step down, and for a marker just above the top floor's band (on a rope).
+        Only floors the patrol range uses are considered - a floor outside it is the out-of-range return
+        logic's business.
+
+        The distance is ``_layer_y_distance`` (to the nearest RECORDED position), the same measure the
+        candidate ranking uses, so the two never disagree.
+        """
+
+        source = layers if layers is not None else {
+            name: self.important_positions.get(name) for name in self._route_layers
+        }
+        best: Optional[tuple[float, str]] = None
+        for name, layer in source.items():
+            if not isinstance(layer, dict):
+                continue
+            distance = _layer_y_distance(layer, marker_y)
+            if distance is None:
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, name)
+        if best is None:
+            return None
+        LOG.info(
+            "LAYER nearest-floor fallback: marker y=%.6f matches no band; the nearest recorded floor is "
+            "%s (%.4f normalised away)",
+            marker_y, best[1], best[0],
+        )
+        return best[1]
+
     def _bottom_floor_for_marker_y(self, marker_y: float) -> Optional[str]:
         """The recorded bottom floor when the marker reads at or below its band.
 
@@ -4070,6 +4108,9 @@ class MovementWorker(threading.Thread):
                         observation.player.y, bottom, bottom,
                     )
                     return bottom
+                nearest = self._nearest_floor_by_marker_y(observation.player.y, layers)
+                if nearest is not None:
+                    return nearest
             return self._current_route_layer_with_grace(observation)
         if observation.player is None:
             return None
@@ -4084,6 +4125,9 @@ class MovementWorker(threading.Thread):
                 observation.player.y, bottom, bottom,
             )
             return bottom
+        nearest = self._nearest_floor_by_marker_y(observation.player.y, layers)
+        if nearest is not None:
+            return nearest
         return self._current_route_layer_with_grace(observation)
 
     def _select_route_layer(self, observation: MinimapObservation | Point) -> None:
@@ -4395,6 +4439,18 @@ class MovementWorker(threading.Thread):
                     observation.world_y_diamonds,
                     observation.structure_confidence,
                 )
+            elif detected_name is None and observation.player is not None:
+                # Nothing matched at all (no band, no world answer): anchor to the NEAREST recorded floor
+                # - the operator's rule for exactly this case ("if the character can't find a layer he
+                # should anchor to the nearest layer").  The three-frame candidate confirmation below
+                # still applies, and the route's own floor is what the patrol keeps whenever the nearest
+                # floor IS the current one.
+                nearest_name = self._nearest_floor_by_marker_y(
+                    observation.player.y,
+                    {name: self.important_positions[name] for name in self._route_layers},
+                )
+                if nearest_name is not None:
+                    detected_name = nearest_name
             # Overlapping-band flicker guard: adjacent floors' recorded
             # Y bands can overlap (span +- tolerance), so a Y-only reading
             # can hit BOTH the current floor and a neighbour (observed:

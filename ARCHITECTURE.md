@@ -448,11 +448,26 @@ Which floor a marker reading names is decided in a fixed order:
    reported as `LAYER EXTRA RECORDED FLOOR:` instead.  An out-of-route match is
    still honoured - the resync returns None so the fall/return recovery owns it.
 3. World Y is consulted only for a genuinely ambiguous reading (two ROUTE bands
-   overlap) and only inside a calibrated world band.  Every decision prints its
-   evidence: `LAYER transition candidate: ... (marker_y=..., matches ..., world_y=...,
+   overlap) and only inside a calibrated world band, and its answer is CAPPED by
+   the marker position (``_cap_landing_floor``) so it can never name a floor the
+   marker draws the character below.  Every decision prints its evidence:
+   `LAYER transition candidate: ... (marker_y=..., matches ..., world_y=...,
    confidence=...)`, `LAYER CHANGED: ... (marker_y matches ...)`, and
    `LAYER world override: marker_y=... matches ... (out of range), world=...` when
    the world signal overrules the marker.
+4. A reading that matches NOTHING anchors to the **nearest recorded floor** (the
+   operator's rule: "if the character can't find a layer he should anchor to the
+   nearest layer").  In order: the bottom-floor rule when the marker reads
+   at/below the lowest recorded band (nothing is recorded lower, so a marker there
+   IS the bottom floor), then ``_nearest_floor_by_marker_y`` - the route floor with
+   the smallest ``_layer_y_distance``, the same measure the candidate ranking uses.
+   This is what recognises a character standing on a stair/step of a floor whose
+   recorded points do not span its whole height (his layer1 renders at 0.713415
+   while its three points were saved at 0.676829 - and the fixture is a step in the
+   platform, not a scrolling minimap), a marker in the gap between two floors, and
+   a marker above the top floor's band.  The resync still requires its three-frame
+   confirmation, and the route's own floor is kept whenever the nearest floor IS the
+   current one.
 
 World-space detection uses the corresponding scroll-compensated world-Y band.
 The recorder retains both the canonical layer world Y and each point's raw
