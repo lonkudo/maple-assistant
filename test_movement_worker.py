@@ -45,7 +45,13 @@ def diamond(image, cx, cy, radius=4):
 
 
 class MovementTests(unittest.TestCase):
-    def test_layer_y_band_uses_full_upper_and_one_third_lower_tolerance(self):
+    def test_layer_y_band_uses_the_upper_factor_and_one_third_lower_tolerance(self):
+        """The upper edge is ``tolerance * LAYER_UP_REACH_FACTOR`` (the operator: "make it 0.7"),
+        the lower edge keeps the one-third margin that must not reach the floor below."""
+
+        from movement_worker import LAYER_UP_REACH_FACTOR
+
+        self.assertAlmostEqual(LAYER_UP_REACH_FACTOR, 0.7)
         layer = {
             "y_tolerance": .02,
             "layer_y": .636842,
@@ -55,10 +61,11 @@ class MovementTests(unittest.TestCase):
         }
 
         band = _layer_y_band(layer, .02)
-        self.assertAlmostEqual(band[0], .574737)
+        upper = .594737 - .02 * LAYER_UP_REACH_FACTOR
+        self.assertAlmostEqual(band[0], upper)
         self.assertAlmostEqual(band[1], .6856136666666667)
-        self.assertEqual(detect_layer_by_y(.574737, {"layer1": layer}), "layer1")
-        self.assertIsNone(detect_layer_by_y(.574736, {"layer1": layer}))
+        self.assertEqual(detect_layer_by_y(upper, {"layer1": layer}), "layer1")
+        self.assertIsNone(detect_layer_by_y(upper - 1e-6, {"layer1": layer}))
         self.assertEqual(
             detect_layer_by_y(.685613, {"layer1": layer}), "layer1"
         )
@@ -5346,6 +5353,174 @@ class StairJumpTests(unittest.TestCase):
         )
         self.assertEqual(
             worker._patrol_facing_for_key("jump_climb_left"), "left"
+        )
+
+
+class ReconnectRouteCheckTests(unittest.TestCase):
+    """自动重连: the first thing patrol does afterwards is check the route."""
+
+    @staticmethod
+    def _floors(count: int) -> dict:
+        """Recorded floors layer1..layerN, each with its action points at a distinct Y."""
+
+        positions: dict[str, dict[str, Any]] = {}
+        for number in range(1, count + 1):
+            y = 0.8 - (number - 1) * 0.1
+            positions[f"layer{number}"] = {
+                "y_tolerance": 0.02,
+                "layer_y": round(y, 6),
+                "left_most_pos": {"x": 0.3, "y": round(y, 6)},
+                "rope_pos": {"x": 0.5, "y": round(y, 6)},
+                "right_most_pos": {"x": 0.7, "y": round(y, 6)},
+            }
+        return positions
+
+    def _reconnect_worker(self, count: int, start: str, end: str):
+        event = threading.Event()
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=self._floors(count),
+            route_order=[f"layer{i}" for i in range(1, count + 1)],
+            patrol_start_layer=start,
+            patrol_end_layer=end,
+            reconnect_active_event=event,
+        )
+        return worker, event
+
+    @staticmethod
+    def _marker_on(layer_number: int) -> MinimapObservation:
+        # _floors(): layerN sits at 0.8 - (N-1)*0.1.
+        y = round(0.8 - (layer_number - 1) * 0.1, 6)
+        return MinimapObservation(Point(.5, y), None, .9, (0, 0, 1, 1))
+
+    @staticmethod
+    def _finish_reconnect(worker, event, *, armed: float = 10.0,
+                          cleared: float = 10.1) -> None:
+        event.set()
+        worker._track_reconnect_window(armed)
+        event.clear()
+        worker._track_reconnect_window(cleared)
+
+    def test_no_route_check_without_a_reconnect(self) -> None:
+        worker, _event = self._reconnect_worker(5, "layer2", "layer4")
+        worker._track_reconnect_window(10.0)
+        self.assertFalse(worker._route_check_pending)
+        self.assertFalse(worker._run_pending_route_check(self._marker_on(5), 10.1))
+        self.assertIsNone(worker._return_mode)
+
+    def test_reconnect_above_the_range_drops_back_immediately(self) -> None:
+        # layer5 is ABOVE the patrol range [layer2..layer4]: the return must DROP (Alt+Down), and
+        # it must be decided on the first frame - not after the 0.75s two-reading verifier.
+        worker, event = self._reconnect_worker(5, "layer2", "layer4")
+        self._finish_reconnect(worker, event)
+        self.assertTrue(worker._route_check_pending)
+        self.assertTrue(worker._run_pending_route_check(self._marker_on(5), 10.2))
+        self.assertEqual(worker._return_mode, "drop-to-route")
+        self.assertEqual(worker._return_from_floor, "layer5")
+        self.assertFalse(worker._route_check_pending)
+
+    def test_reconnect_below_the_range_climbs_back(self) -> None:
+        worker, event = self._reconnect_worker(5, "layer2", "layer4")
+        self._finish_reconnect(worker, event)
+        self.assertTrue(worker._run_pending_route_check(self._marker_on(1), 10.2))
+        self.assertEqual(worker._return_mode, "climb-to-route")
+        self.assertEqual(worker._return_from_floor, "layer1")
+
+    def test_reconnect_on_a_route_floor_keeps_patrolling(self) -> None:
+        worker, event = self._reconnect_worker(5, "layer2", "layer4")
+        self._finish_reconnect(worker, event)
+        self.assertTrue(worker._run_pending_route_check(self._marker_on(3), 10.2))
+        self.assertIsNone(worker._return_mode)
+        self.assertFalse(worker._route_check_pending)
+
+    def test_reconnect_check_is_skipped_for_stationary_attack(self) -> None:
+        worker, event = self._reconnect_worker(5, "layer2", "layer4")
+        worker.stationary_attack_enabled = True
+        self._finish_reconnect(worker, event)
+        worker._run_pending_route_check(self._marker_on(5), 10.2)
+        self.assertIsNone(worker._return_mode)
+        self.assertFalse(worker._route_check_pending)
+
+    def test_reconnect_check_waits_for_the_marker_then_gives_up(self) -> None:
+        from movement_worker import ROUTE_CHECK_AFTER_RECONNECT_SECONDS
+
+        worker, event = self._reconnect_worker(5, "layer2", "layer4")
+        self._finish_reconnect(worker, event)
+        missing = MinimapObservation(None, None, 0.0, (0, 0, 1, 1))
+        self.assertFalse(worker._run_pending_route_check(missing, 10.2))
+        self.assertTrue(worker._route_check_pending)
+        late = 10.1 + ROUTE_CHECK_AFTER_RECONNECT_SECONDS + 0.1
+        self.assertFalse(worker._run_pending_route_check(missing, late))
+        self.assertFalse(worker._route_check_pending)
+        self.assertIsNone(worker._return_mode)
+
+    def test_reconnect_check_steps_aside_for_an_active_return(self) -> None:
+        worker, event = self._reconnect_worker(5, "layer2", "layer4")
+        worker._return_mode = "climb-to-route"
+        worker._return_from_floor = "layer1"
+        self._finish_reconnect(worker, event)
+        self.assertTrue(worker._run_pending_route_check(self._marker_on(1), 10.2))
+        self.assertEqual(worker._return_mode, "climb-to-route")
+
+
+class PatrolRangeOrderTests(unittest.TestCase):
+    """A patrol range stored top-first must still patrol (field log 22:30: ``layer2 -> layer1``)."""
+
+    @staticmethod
+    def _floors() -> dict:
+        positions: dict[str, Any] = {}
+        for number in (1, 2):
+            y = 0.8 - (number - 1) * 0.1
+            positions[f"layer{number}"] = {
+                "y_tolerance": 0.02,
+                "layer_y": round(y, 6),
+                "left_most_pos": {"x": 0.3, "y": round(y, 6)},
+                "rope_pos": {"x": 0.5, "y": round(y, 6)},
+                "right_most_pos": {"x": 0.7, "y": round(y, 6)},
+            }
+        return positions
+
+    def test_canonical_range_swaps_an_inverted_pair(self) -> None:
+        from movement_worker import _canonical_patrol_range
+
+        self.assertEqual(
+            _canonical_patrol_range("layer2", "layer1"), ("layer1", "layer2")
+        )
+        self.assertEqual(
+            _canonical_patrol_range("layer1", "layer2"), ("layer1", "layer2")
+        )
+        # An unset bound is left alone: the slice helpers apply their own bottom/top default.
+        self.assertEqual(_canonical_patrol_range(None, "layer2"), (None, "layer2"))
+
+    def test_inverted_range_patrols_instead_of_standing_still(self) -> None:
+        worker = MovementWorker(
+            queue.Queue(), object(), threading.Event(),
+            important_positions=self._floors(),
+            route_order=["layer1", "layer2"],
+            patrol_start_layer="layer2",
+            patrol_end_layer="layer1",
+        )
+        self.assertEqual(worker._route_layers, ["layer1", "layer2"])
+        self.assertEqual(
+            (worker._patrol_range_min, worker._patrol_range_max), (1, 2)
+        )
+        observation = MinimapObservation(Point(.5, .8), None, .9, (0, 0, 1, 1))
+        worker.prepare_patrol_start("layer1")
+        worker._apply_pending_patrol_start(observation)
+        # Before the fix this was (None, False, "stand-still") with an empty route list, which is
+        # what made Start Patrol look broken.
+        self.assertEqual(worker._route_target(observation)[2], "layer1.left-most")
+
+    def test_range_slice_keeps_only_the_selected_floors(self) -> None:
+        from movement_worker import _slice_patrol_range
+
+        self.assertEqual(
+            _slice_patrol_range(["layer1", "layer2", "layer3"], "layer1", "layer2"),
+            ["layer1", "layer2"],
+        )
+        self.assertEqual(
+            _slice_patrol_range(["layer1", "layer2", "layer3"], "layer3", "layer2"),
+            ["layer2", "layer3"],
         )
 
 

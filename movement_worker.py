@@ -74,6 +74,15 @@ ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
 STALL_WATCHDOG_INTERVAL_SECONDS = 5.0
 STALL_WATCHDOG_SECONDS = 20.0
 
+# 自动重连: the reconnect owns the keyboard for its whole sequence and the login screens hide the
+# minimap, so the character can be anywhere when patrol input comes back.  The falling edge of
+# ``reconnect_active_event`` arms ONE route check, which then waits up to this long for a usable
+# marker reading before leaving the decision to the normal per-frame floor verifier.
+ROUTE_CHECK_AFTER_RECONNECT_SECONDS = 8.0
+# Same structure-confidence gate the floor detection itself uses before it trusts the
+# scroll-compensated world Y (see ``_detect_floor_all`` / ``_on_first_layer``).
+ROUTE_CHECK_MIN_STRUCTURE_CONFIDENCE = 0.12
+
 # 站桩攻击 records the player's current marker only for the active session.
 # It is never persisted and is independent of the recorded route/layer data.
 STATIONARY_ATTACK_X_TOLERANCE = 0.012
@@ -207,10 +216,24 @@ def _layer_point_ys(layer: Any) -> list[float]:
     return values
 
 
+# How much of a layer's Y tolerance is allowed ABOVE its topmost recorded point ("the upper band").
+#
+# The operator asked for a narrower upper edge (2026-09-18: "narrow down layer upper band a little bit,
+# make it 0.7"): a band that reaches far above a floor makes a character that is still above it (on the
+# rope, dropping in) read as standing on that floor.  On his two floors 0.02 x 0.7 = 0.014 = 1.2 px of
+# the 86 px minimap (before: 0.02 = 1.7 px), still above the marker's own 1 px quantisation, so a stand
+# at the TOP end of a platform is not lost.
+#
+# The down side (``tolerance / 3``) and the current-floor grace (``LAYER_CURRENT_Y_GRACE``) are
+# unchanged, and so is the CLIMB arrival test - it asks about the floor ABOVE and enters that band
+# through its LOWER edge.
+LAYER_UP_REACH_FACTOR = 0.7
+
+
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     """Layer band from its recorded point Ys.
 
-    band = (uppermost point Y - tolerance,
+    band = (uppermost point Y - tolerance * ``LAYER_UP_REACH_FACTOR``,
             lowermost point Y + tolerance / 3).
     A layer whose points span a Y range (wide platform / minimap
     perspective) is fully detected while standing anywhere on the
@@ -228,13 +251,14 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    # The full tolerance above the visually highest point covers climb/drop
-    # arrival movement. Only one third is allowed below the confirmed layer
-    # base: enough for OpenCV/marker quantization noise without making the
-    # band unnecessarily reach toward the layer below.
+    # The tolerance above the visually highest point covers climb/drop arrival
+    # movement, scaled by the operator's upper-band factor.  Only one third is
+    # allowed below the confirmed layer base: enough for OpenCV/marker
+    # quantization noise without making the band unnecessarily reach toward the
+    # layer below.
     effective_tolerance = max(0.0, float(tolerance))
     return (
-        min(values) - effective_tolerance,
+        min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
         max(values) + effective_tolerance / 3.0,
     )
 
@@ -319,19 +343,78 @@ def _layer_world_anchor_at_x(layer: Any, player_x: Optional[float]) -> Optional[
     return None
 
 
+# The marker's own pixel quantisation, expressed in normalised minimap Y.
+#
+# Measured on the operator's layer3_error frame (his 105x86 minimap): the diamond was found cleanly
+# (pixel box 75,28-81,34) but its centre Y 0.3547 sat 0.0050 BELOW the band of the floor it was
+# standing on (0.3114..0.3497) - 0.43 px - and the frame was reported as "no layer".  One pixel of that
+# minimap is 1/86 = 0.0116, which is larger than the whole downward side of a band (_layer_y_band adds
+# only ``tolerance / 3`` = 0.0067 below the lowermost recorded point), so a character standing at the
+# low end of the floor it is already patrolling reads as "none": "LAYER DEBUG: now on none
+# (player_y=0.180233)" alternating with "now on layer2 (0.168605)" in the operator's log is the same
+# 0.0050 miss.  That "none" then feeds ``on_rope`` and the route resync.
+#
+# The grace below is applied ONLY to the question "am I still on the floor the route is on"
+# (``_detected_layer``).  The band lookup used for CLIMB ARRIVAL stays strictly zero-below on purpose:
+# a band that reaches down toward the floor below makes a climb look arrived while the character is
+# still on the rope, and releasing Up there is what pulled the character off the rope ("the old
+# nearest-anchor rule switched at the midpoint between floors, released Up while the character was
+# still on the rope, and then horizontal patrol pulled it off").
+LAYER_CURRENT_Y_GRACE = 0.012
+
+# How long the planned descent to the route's first floor may keep the layer state before the normal
+# resync takes over again.  The descent owns every vertical move (see ``_resync_route_layer``), so a
+# character that cannot drop any further (no platform edge under it) must not sit there sending Alt+Down
+# forever: after this long the layer state is handed back, the resync follows the marker again and the
+# patrol continues from wherever the character is.
+DROP_TO_FIRST_MAX_SECONDS = 25.0
+
+
+def _layer_y_distance(layer: Any, player_y: float) -> Optional[float]:
+    """Distance from the marker Y to the floor's nearest RECORDED position.
+
+    The one measure that answers "which floor is the character standing on" when two bands overlap: how
+    far the marker is from a spot that floor was recorded at.  ``layer_y`` (the marker Y of whichever spot
+    was recorded first) is NOT that measure - on a stair/bench floor it is one end of the range.
+    """
+
+    values = _layer_point_ys(layer)
+    if not values and isinstance(layer, dict) and "layer_y" in layer:
+        values = [float(layer["layer_y"])]
+    if not values:
+        return None
+    return min(abs(player_y - value) for value in values)
+
+
 def _layer_y_candidates(player_y: float, layers: dict[str, Any]) -> list[str]:
-    """All marker-Y matches ordered from nearest recorded layer center."""
+    """All marker-Y matches ordered from the nearest recorded floor position.
+
+    Two floors' bands can overlap (their recorded points are close, or one floor's platform reaches the
+    other's height), and then the ORDER decides.  It used to be the distance to the layer's legacy
+    single ``layer_y`` - the marker Y of whatever spot was recorded first - which says nothing about the
+    positions a floor actually patrols: on a stair/bench floor the base is one end of the range, so a
+    marker sitting exactly on ANOTHER floor's recorded point could still rank that other floor first.
+    The operator's 13:26 log is that case: the character started on layer1 at player_y=0.676829 (= layer1's
+    own recorded position, distance 0) and the worker answered layer2, anchored the session to layer2's
+    world Y and patrolled layer2's points.
+
+    Ranking by the nearest RECORDED POSITION measures what the question is really about - which floor's
+    recorded stance is closest to where the marker is drawn.  Ties keep the old alphabetical order, so
+    ``layer1`` still wins over ``layer2``.
+    """
 
     candidates: list[tuple[float, str]] = []
     for name, layer in layers.items():
-        if not isinstance(layer, dict) or "layer_y" not in layer:
+        if not isinstance(layer, dict):
             continue
         tolerance = float(layer.get("y_tolerance", 0.020000))
         band = _layer_y_band(layer, tolerance)
         if band is None or not band[0] - 1e-9 <= player_y <= band[1] + 1e-9:
             continue
-        reference_y = float(layer.get("layer_y", (band[0] + band[1]) / 2.0))
-        candidates.append((abs(player_y - reference_y), name))
+        distance = _layer_y_distance(layer, player_y)
+        if distance is None:
+            continue
+        candidates.append((distance, name))
     return [name for _, name in sorted(candidates)]
 
 
@@ -374,6 +457,41 @@ def _layer_number(name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+# Patrol ranges already reported as inverted, so the warning is said once per pair instead of on
+# every frame (``_sync_patrol_controller`` re-slices continuously).
+_INVERTED_RANGES_REPORTED: set[tuple[str, str]] = set()
+
+# (floor the world-Y tracker answered, lower floor the minimap marker allows) pairs already reported.
+# A landing resolution runs on every frame while the fall is pending, so the same disagreement must be
+# said once instead of flooding the log.
+_LANDING_CAP_REPORTED: set[tuple[str, str]] = set()
+
+
+def _canonical_patrol_range(
+    patrol_start_layer: Optional[str], patrol_end_layer: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the patrol range in this code's order: lowest floor -> highest floor.
+
+    A recording profile can hold the pair the other way round (observed from the operator's log:
+    ``route=layer2 -> layer1``).  Both names describe the SAME set of floors, but the numeric slice
+    then matches nothing, ``_route_layers`` comes out empty and patrol stands still with no
+    explanation at all.  Swap it and say so loudly, once per pair.
+    """
+
+    if not patrol_start_layer or not patrol_end_layer:
+        return patrol_start_layer, patrol_end_layer
+    if _layer_number(patrol_start_layer) <= _layer_number(patrol_end_layer):
+        return patrol_start_layer, patrol_end_layer
+    if (patrol_start_layer, patrol_end_layer) not in _INVERTED_RANGES_REPORTED:
+        _INVERTED_RANGES_REPORTED.add((patrol_start_layer, patrol_end_layer))
+        LOG.warning(
+            "巡逻范围 %s -> %s 方向相反（起点在终点上方，切片结果为空，巡逻会原地站立）；"
+            "已按 %s -> %s 处理，请在界面上重新确认范围",
+            patrol_start_layer, patrol_end_layer, patrol_end_layer, patrol_start_layer,
+        )
+    return patrol_end_layer, patrol_start_layer
+
+
 def _slice_patrol_range(
     layers: list[str],
     patrol_start_layer: Optional[str],
@@ -388,6 +506,9 @@ def _slice_patrol_range(
     """
     if not layers:
         return layers
+    patrol_start_layer, patrol_end_layer = _canonical_patrol_range(
+        patrol_start_layer, patrol_end_layer
+    )
     numbers = [_layer_number(name) for name in layers]
     start_number = (
         _layer_number(patrol_start_layer)
@@ -409,6 +530,10 @@ def _patrol_range_numbers(
     patrol_end_layer: Optional[str],
 ) -> tuple[int, int]:
     """Floor-number bounds of the patrol range (defaults: bottom/top)."""
+
+    patrol_start_layer, patrol_end_layer = _canonical_patrol_range(
+        patrol_start_layer, patrol_end_layer
+    )
     numbers = [_layer_number(name) for name in layers]
     start = (
         _layer_number(patrol_start_layer)
@@ -2564,6 +2689,11 @@ class MovementWorker(threading.Thread):
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Any = None,
         automation_active_event: Optional[threading.Event] = None,
+        # 自动重连 sets this while it owns the keyboard.  Only the falling edge is used: the first
+        # frame after patrol input is re-armed checks whether the character is still on the patrol
+        # route and, when he is not, starts the return-to-route instead of waiting for the
+        # throttled verifier.
+        reconnect_active_event: Optional[threading.Event] = None,
         motion_arbiter: Any = None,
         attack_state_path: Optional[str] = None,
         attack_block_max_seconds: float = 4.0,
@@ -2782,6 +2912,13 @@ class MovementWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
+        # 自动重连 window tracking (see ROUTE_CHECK_AFTER_RECONNECT_SECONDS).  The event being SET
+        # is only remembered; its falling edge arms ``_route_check_pending``, which then waits
+        # (bounded by ``_route_check_deadline``) for one usable marker reading.
+        self.reconnect_active_event = reconnect_active_event
+        self._reconnect_was_active = False
+        self._route_check_pending = False
+        self._route_check_deadline = 0.0
         # Optional in tests/headless integrations.  The normal assistant
         # injects the shared arbiter so confirmed stair jumps can queue
         # behind attack motions.
@@ -3016,6 +3153,11 @@ class MovementWorker(threading.Thread):
         # suppressed so an intermediate platform cannot hijack the descent
         # and restart patrol on a middle layer.
         self._descending_to_first = False
+        # The floor the descent last saw the marker on while it kept the route (the log evidence, once
+        # per floor instead of every frame).
+        self._drop_descent_saw: Optional[str] = None
+        # When the planned descent started, for DROP_TO_FIRST_MAX_SECONDS.
+        self._descending_since: Optional[float] = None
         # ---------- FALLING RECOVERY + RETURN TO ROUTE ----------
         # ``_track_fall`` counts consecutive frames where the diamond Y drops
         # fast (an unexpected fall - knocked down, missed a stair, walked off
@@ -3830,6 +3972,42 @@ class MovementWorker(threading.Thread):
                  gap, direction, climbing)
         return decision
 
+    def _current_route_layer_with_grace(
+        self, observation: MinimapObservation
+    ) -> Optional[str]:
+        """The floor the route is on, when the marker reads just BELOW its band.
+
+        The marker centre carries a one-pixel quantisation (``LAYER_CURRENT_Y_GRACE``), larger than the
+        band's own downward side, so a character standing at the low end of the floor it is already
+        patrolling reads as "no layer" and is then treated as being on a rope / off the route.  This
+        answers only that question: the strict ``_layer_y_band`` (and therefore the CLIMB arrival test)
+        is unchanged.
+        """
+
+        if observation.player is None or not self._route_layers:
+            return None
+        index = self._route_layer_index
+        if index is None or not 0 <= index < len(self._route_layers):
+            return None
+        name = self._route_layers[index]
+        layer = self.important_positions.get(name)
+        if not isinstance(layer, dict):
+            return None
+        band = _layer_y_band(layer, float(layer.get("y_tolerance", 0.020000)))
+        if band is None:
+            return None
+        if band[1] <= observation.player.y <= band[1] + LAYER_CURRENT_Y_GRACE:
+            LOG.info(
+                "LAYER grace: marker Y=%.4f is %.4f below %s's band (<= %.4f); keeping %s",
+                observation.player.y,
+                observation.player.y - band[1],
+                name,
+                LAYER_CURRENT_Y_GRACE,
+                name,
+            )
+            return name
+        return None
+
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
         marker_candidates = (
@@ -3859,11 +4037,16 @@ class MovementWorker(threading.Thread):
                 if isinstance(layer, dict) and "layer_world_y" not in layer
             }
             if observation.player is not None and legacy_layers:
-                return detect_layer_by_y(observation.player.y, legacy_layers)
-            return None
+                legacy = detect_layer_by_y(observation.player.y, legacy_layers)
+                if legacy is not None:
+                    return legacy
+            return self._current_route_layer_with_grace(observation)
         if observation.player is None:
             return None
-        return detect_layer_by_y(observation.player.y, layers)
+        detected = detect_layer_by_y(observation.player.y, layers)
+        if detected is not None:
+            return detected
+        return self._current_route_layer_with_grace(observation)
 
     def _select_route_layer(self, observation: MinimapObservation | Point) -> None:
         if isinstance(observation, Point):
@@ -3953,6 +4136,35 @@ class MovementWorker(threading.Thread):
         if observation.player is None or not self._route_layers:
             self._clear_layer_resync_candidate()
             return None
+        if self._descending_to_first:
+            # The planned descent to the patrol route's FIRST floor owns every vertical move until the
+            # character arrives there (``_final_drop_arrived`` -> ``_reset_route_loop``).  Alt+Down drops
+            # one platform per chord, so the marker sweeps through the floors in between and the character
+            # even STANDS on the next floor up between chords - the normal resync confirmed exactly that as
+            # "LAYER CHANGED: layer3 -> layer2; restarting layer2 patrol", which ended the descent on
+            # layer2: the loop never returned to its first floor ("the character finished patrol on layer3
+            # then he drop to layer2 and continue the work - he should drop to layer1").  The fall detector
+            # is suppressed for the same reason; this is the layer-state half of it.
+            current = (
+                self._route_layers[self._route_layer_index]
+                if (self._route_layer_index is not None
+                    and 0 <= self._route_layer_index < len(self._route_layers))
+                else None
+            )
+            seen = _layer_y_candidates(
+                observation.player.y, self.important_positions
+            )
+            seen_route = [name for name in seen if name in self._route_layers]
+            if seen_route and current is not None and seen_route[0] != current:
+                if self._drop_descent_saw != seen_route[0]:
+                    self._drop_descent_saw = seen_route[0]
+                    LOG.info(
+                        "DROP TO FIRST: the marker is on %s during the planned descent; keeping the route "
+                        "on %s until %s is reached (the descent owns the floors in between)",
+                        seen_route[0], current, self.first_layer,
+                    )
+            self._clear_layer_resync_candidate()
+            return current
         if self._return_mode is not None:
             # Return-to-route owns the route state until it explicitly hands
             # patrol back to an in-range floor in ``_finish_return``.  The
@@ -3967,6 +4179,10 @@ class MovementWorker(threading.Thread):
             self._climb_state.up_held
             or self._climb_state.phase == "climbing-up"
         )
+        # Evidence for the transition logs, filled by the non-climb path below; empty while climbing so
+        # the tail can always name what the marker matched.
+        marker_candidates_all: list[str] = []
+        marker_candidates_route: list[str] = []
         expected_next_index = (
             self._route_layer_index + 1
             if self._route_layer_index is not None else -1
@@ -4080,12 +4296,20 @@ class MovementWorker(threading.Thread):
             marker_candidates_all = _layer_y_candidates(
                 observation.player.y, self.important_positions
             )
-            marker_is_unambiguous = len(marker_candidates_all) == 1
+            # Only the floors the PATROL RANGE uses may make the marker reading "ambiguous".  A recorded
+            # floor the range does not use (a leftover/stale layer in the profile, or another map's
+            # recording) used to count here, and one overlapping band was then enough to hand the floor
+            # decision to the world-Y tracker - the operator's 13:16 log is exactly that: the character
+            # was started on layer1, player_y 0.676829 sat inside layer1's band, and the worker answered
+            # "LAYER CHANGED: layer1 -> layer2 at y=0.676829" from the world signal.  An out-of-route
+            # match is still honoured below (it returns None so the fall/return recovery owns it).
+            marker_candidates_route = [
+                name for name in marker_candidates_all
+                if name in self._route_layers
+            ]
+            marker_is_unambiguous = len(marker_candidates_route) == 1
             if marker_is_unambiguous:
-                # This may deliberately be outside the active patrol range;
-                # the guard below returns None so fall/return recovery owns
-                # the transition instead of indexing a non-route layer.
-                detected_name = marker_candidates_all[0]
+                detected_name = marker_candidates_route[0]
             # World-nearest override: every frame, over EVERY recorded
             # floor.  After a fall the tracker re-anchors to the new floor
             # (even layer1, outside the patrol range), so the world read
@@ -4101,6 +4325,17 @@ class MovementWorker(threading.Thread):
             if (not marker_is_unambiguous
                     and world_name is not None
                     and world_name != detected_name):
+                # The evidence is logged with the decision: "why did it change floor?" must be
+                # answerable from the log alone (his 13:16 report could not be).
+                LOG.info(
+                    "LAYER world override: marker_y=%.6f matches %s (out of range), world=%s "
+                    "world_y=%.6f confidence=%.3f; following the world signal",
+                    observation.player.y,
+                    ",".join(marker_candidates_all) or "no floor",
+                    world_name,
+                    observation.world_y_diamonds,
+                    observation.structure_confidence,
+                )
                 detected_name = world_name
             elif (marker_is_unambiguous
                     and world_name is not None
@@ -4108,7 +4343,7 @@ class MovementWorker(threading.Thread):
                 LOG.info(
                     "LAYER signal disagreement: marker=%s world=%s "
                     "world_y=%.6f confidence=%.3f; marker wins",
-                    marker_candidates_all[0], world_name,
+                    marker_candidates_route[0], world_name,
                     observation.world_y_diamonds,
                     observation.structure_confidence,
                 )
@@ -4238,11 +4473,18 @@ class MovementWorker(threading.Thread):
             if self._layer_resync_candidate_frames < self._normal_layer_resync_frames:
                 LOG.info(
                     "LAYER transition candidate: %s -> %s %d/%d; keeping "
-                    "current patrol",
+                    "current patrol (marker_y=%.6f matches %s, world_y=%s "
+                    "confidence=%.3f)",
                     current_name,
                     detected_name,
                     self._layer_resync_candidate_frames,
                     self._normal_layer_resync_frames,
+                    (observation.player.y if observation.player is not None
+                     else float("nan")),
+                    ",".join(marker_candidates_all) or "no floor",
+                    (f"{observation.world_y_diamonds:.6f}"
+                     if observation.world_y_diamonds is not None else "n/a"),
+                    observation.structure_confidence,
                 )
                 return current_name
             self._clear_layer_resync_candidate()
@@ -4301,8 +4543,13 @@ class MovementWorker(threading.Thread):
                      detected_name, observation.player.y)
         else:
             LOG.warning(
-                "LAYER CHANGED: %s -> %s at y=%.6f; restarting %s patrol",
+                "LAYER CHANGED: %s -> %s at y=%.6f; restarting %s patrol "
+                "(marker_y matches %s, world_y=%s confidence=%.3f)",
                 previous_name, detected_name, observation.player.y, detected_name,
+                ",".join(marker_candidates_all) or "no floor",
+                (f"{observation.world_y_diamonds:.6f}"
+                 if observation.world_y_diamonds is not None else "n/a"),
+                observation.structure_confidence,
             )
         return detected_name
 
@@ -4725,6 +4972,71 @@ class MovementWorker(threading.Thread):
             self.direction_transition_event.clear()
         self._reanchor_tracker_to_current_layer(observation)
 
+    def _landing_floor_cap(self, marker_y: float) -> Optional[str]:
+        """Highest recorded floor the minimap marker can still place the character on.
+
+        A fall or a drop only ever moves the character DOWN, so a landing can never be a floor that the
+        marker draws the character BELOW: the floor whose band lies entirely above the marker (band lower
+        edge < marker Y) is out of reach for a character that is visibly under it.  This is the check that
+        stops the world-Y tracker from answering with the floor the character fell FROM - the tracker
+        lags a fast knock-down and then sits still at the old floor's anchor, which also satisfies the
+        "settled" test in ``_reconcile_landed_floor`` (stable but wrong).  Operator report: the character
+        dropped down but the patrol restarted on layer2 instead of the floor it was really standing on.
+
+        When even the lowest floor's band lies above the marker (a landing in the pit under the map's
+        last floor) the bottom floor is the cap: nothing is recorded below it.
+        """
+
+        floors = [
+            name for name, layer in self.important_positions.items()
+            if isinstance(layer, dict) and "layer_y" in layer
+        ]
+        if not floors:
+            return None
+        highest: Optional[str] = None
+        for name in floors:
+            layer = self.important_positions[name]
+            band = _layer_y_band(layer, float(layer.get("y_tolerance", 0.020000)))
+            if band is None or band[1] < marker_y - 1e-9:
+                # The whole band sits above the marker position: the character cannot be standing here.
+                continue
+            if highest is None or _layer_number(name) > _layer_number(highest):
+                highest = name
+        if highest is None:
+            return self._bottom_recorded_layer()
+        return highest
+
+    def _cap_landing_floor(
+        self,
+        floor: Optional[str],
+        observation: Optional[MinimapObservation],
+        *,
+        source: str,
+    ) -> Optional[str]:
+        """Lower a resolved landing floor to what the marker allows (see ``_landing_floor_cap``).
+
+        Only ever moves the answer DOWN a floor.  A floor that comes out one step too low is
+        self-correcting (the return-to-route climb carries the character back up), while a floor one step
+        too high leaves the patrol walking into empty space on a floor the character is not standing on -
+        which is the failure the operator reported.  Returns ``floor`` unchanged when the two agree or
+        when nothing is known.
+        """
+
+        if floor is None or observation is None or observation.player is None:
+            return floor
+        cap = self._landing_floor_cap(observation.player.y)
+        if cap is None or _layer_number(floor) <= _layer_number(cap):
+            return floor
+        pair = (floor, cap)
+        if pair not in _LANDING_CAP_REPORTED:
+            _LANDING_CAP_REPORTED.add(pair)
+            LOG.warning(
+                "LANDING FLOOR CAP: %s reported %s, but the minimap marker at y=%.6f is at/below %s "
+                "- a fall only goes down, so the landing floor is %s",
+                source, floor, observation.player.y, cap, cap,
+            )
+        return cap
+
     def _detect_floor_all(self, observation: MinimapObservation) -> Optional[str]:
         """Detect the floor over ALL recorded layers (not just the patrol
         range), so an out-of-range landing is recognized for the return."""
@@ -4746,7 +5058,12 @@ class MovementWorker(threading.Thread):
                 observation.world_y_diamonds, world_layers
             )
             if world_name is not None:
-                return world_name
+                # A lagging world-Y tracker reports the floor the character came FROM.  The marker
+                # position is the physical limit: the answer may not be a floor the character is
+                # visibly standing below.
+                return self._cap_landing_floor(
+                    world_name, observation, source="the world-Y tracker"
+                )
         # At/below the lowest recorded band: the character is on (or under)
         # the bottom floor - nothing lower exists.  This guarantees the
         # bottom floor is recognized even when its recorded band does not
@@ -4849,6 +5166,100 @@ class MovementWorker(threading.Thread):
         self._maybe_begin_return_if_out_of_range(observation)
         return self._return_mode is not None
 
+    def _track_reconnect_window(self, now: float) -> None:
+        """Arm one route check on the falling edge of 自动重连.
+
+        While the reconnect runs, the automation gate stands this worker down, so no route decision
+        is taken at all during the sequence (the login screens also hide the minimap, so there is
+        nothing to measure).  The moment patrol input comes back, the character may have been put
+        somewhere else - this makes the route check the first thing that happens.
+        """
+
+        event = self.reconnect_active_event
+        if event is None:
+            return
+        if event.is_set():
+            self._reconnect_was_active = True
+            self._route_check_pending = False
+            return
+        if not self._reconnect_was_active:
+            return
+        self._reconnect_was_active = False
+        self._route_check_pending = True
+        self._route_check_deadline = float(now) + ROUTE_CHECK_AFTER_RECONNECT_SECONDS
+        LOG.info("RECONNECT: input returned; checking the patrol route")
+
+    def _run_pending_route_check(
+        self, observation: MinimapObservation, now: float
+    ) -> bool:
+        """One bounded post-reconnect route check; True once it is decided.
+
+        Returns False while it is still waiting for a usable reading - the caller runs every frame,
+        and the deadline hands the decision back to the normal verifier so a character standing on
+        an unrecorded platform cannot keep this waiting forever.
+        """
+
+        if not self._route_check_pending:
+            return False
+        if (self.stationary_attack_enabled
+                or not self.patrol_enabled
+                or not self._route_layers):
+            # 站桩攻击 has no route to return to, and with no recorded range there is nothing to
+            # compare against.  Both cases simply leave the previous behaviour in place.
+            self._route_check_pending = False
+            return True
+        if (self._return_mode is not None
+                or self._climb_state.up_held
+                or self._climb_state.phase != "idle"):
+            # A return/climb already owns the vertical state and re-checks the floor itself.
+            self._route_check_pending = False
+            return True
+        if observation.player is None:
+            if now >= self._route_check_deadline:
+                self._route_check_pending = False
+                LOG.warning(
+                    "RECONNECT: no character marker for %.1fs after the reconnect; "
+                    "the normal floor verifier keeps watching",
+                    ROUTE_CHECK_AFTER_RECONNECT_SECONDS,
+                )
+            return False
+        floor = self._detect_floor_all(observation)
+        if floor is None:
+            if now >= self._route_check_deadline:
+                self._route_check_pending = False
+                LOG.warning(
+                    "RECONNECT: the marker matches no recorded floor; "
+                    "keeping the current route state"
+                )
+            return False
+        # The world-Y origin was anchored before the disconnect; the login screens hid the minimap
+        # for the whole sequence, so re-anchor it to the floor the marker shows now BEFORE any
+        # layer decision is taken from world Y.
+        self._reanchor_tracker_to_layer(floor, observation)
+        if floor in self._route_layers:
+            self._route_check_pending = False
+            LOG.info(
+                "RECONNECT: on %s inside the patrol route; patrol continues", floor
+            )
+            return True
+        self._maybe_begin_return_if_out_of_range(observation)
+        if self._return_mode is None:
+            if now >= self._route_check_deadline:
+                self._route_check_pending = False
+                LOG.warning(
+                    "RECONNECT: %s is outside the patrol route but the return "
+                    "could not start; leaving it to the normal verifier",
+                    floor,
+                )
+            return False
+        self._route_check_pending = False
+        LOG.warning(
+            "RECONNECT: on %s outside the patrol route; %s",
+            floor,
+            "climbing back" if self._return_mode == "climb-to-route" else "dropping back",
+        )
+        return True
+
     def _finish_return(
         self,
         floor: str,
@@ -4947,6 +5358,28 @@ class MovementWorker(threading.Thread):
         self._fall_settle_started = None
         self._fall_settle_world = []
 
+    def _reset_fall_tracking(self) -> None:
+        """Forget every fall-detection state, so a new vertical phase starts clean.
+
+        ``_track_fall`` is suppressed while the planned descent to the first floor runs, and the
+        suppression clears only the frame counters - a ``_fall_pending`` flag and its settle window from
+        before the descent survive it.  When the descent then handed the loop back to patrol, the flag
+        was still set and the settle window had been "stable" for seconds (the tracker had not moved at
+        all), so ``_reconcile_landed_floor`` answered with the world-Y captured BEFORE the descent and the
+        worker printed "FALL RECOVERY: landed on <the floor it came from>; restarting patrol" - the
+        operator's report: the character dropped back to the route's first layer and the patrol restarted
+        on layer2 instead.
+
+        Called when the planned descent starts and when the loop restarts on the first layer (see
+        ``_reset_route_loop``), so no stale fall can ever resolve across those two boundaries.
+        """
+
+        self._fall_pending = False
+        self._fall_frames = 0
+        self._fall_last_y = None
+        self._fall_keys_released = False
+        self._reset_fall_settle()
+
     def _reconcile_landed_floor(
         self, observation: MinimapObservation
     ) -> Optional[str]:
@@ -5042,6 +5475,13 @@ class MovementWorker(threading.Thread):
                     "(bottom %.6f); resolving to the bottom floor",
                     observation.player.y, bottom_floor, band[1],
                 )
+        if floor is not None:
+            # Physical limit before acting on it: the landing may not be a floor the marker draws the
+            # character below.  The world-Y tracker lags a fast knock-down and then sits still at the
+            # floor the character fell FROM, and "still" is exactly what the settle test above accepts.
+            floor = self._cap_landing_floor(
+                floor, observation, source="FALL RECONCILE"
+            )
         if floor is None and not timed_out:
             # Still absorbing the tracker lag: keep the fall pending.
             return None
@@ -5441,7 +5881,10 @@ class MovementWorker(threading.Thread):
         # TOP floor drops back to its FIRST floor after the patrol finishes
         # there, looping the range instead of repeating the top floor forever.
         self._patrol_range_configured = bool(snapshot.patrol_range_set)
-        self.first_layer = snapshot.patrol_start_layer or (
+        canonical_start, _canonical_end = _canonical_patrol_range(
+            snapshot.patrol_start_layer or None, snapshot.patrol_end_layer or None
+        )
+        self.first_layer = canonical_start or (
             new_route[0] if new_route else self.first_layer
         )
         route_changed = new_route != self._route_layers
@@ -5647,11 +6090,17 @@ class MovementWorker(threading.Thread):
             observation.player.y, self.important_positions
         )
         if marker_candidates:
+            # The distance is measured the same way as the ordering in ``_layer_y_candidates`` (nearest
+            # RECORDED position), never from the legacy ``layer_y``: two rankings of the same question
+            # must not disagree, or the drop ends on a floor the rest of the worker calls another one.
             distances = []
             for name in marker_candidates:
                 candidate = self.important_positions.get(name, {})
-                reference = float(candidate.get("layer_y", observation.player.y))
-                distances.append((abs(observation.player.y - reference), name))
+                distance = _layer_y_distance(candidate, observation.player.y)
+                if distance is not None:
+                    distances.append((distance, name))
+            if not distances:
+                return marker_arrived
             nearest_distance = min(distance for distance, _name in distances)
             nearest = [
                 name for distance, name in distances
@@ -5689,6 +6138,19 @@ class MovementWorker(threading.Thread):
         return self._on_first_layer(observation)
 
     def _reset_route_loop(self) -> None:
+        """Start a fresh loop on the first layer after the planned descent landed.
+
+        This is a fresh patrol start exactly like ``_apply_pending_patrol_start``, but it used to
+        initialize far less than that path did: the fall-detection state, the return-to-route state and
+        the layer-resync candidate all survived the descent.  The stale fall then resolved on the next
+        frames and restarted the patrol on the floor the character had come FROM (his report: the
+        character dropped back to the route's first layer but the patrol restarted on layer2), and a
+        stale return mode would have kept the new loop out of the route.  Operator report on the
+        "back to layer 1 (the patrol route's first layer)" procedure: it never initialized the fall-down
+        logic nor the back-to-patrol-route logic.
+        """
+
+        self._release_climb_up()
         self._route_layer_index = self._route_layers.index(self.first_layer)
         # The final drop landed back on the (in-range) loop floor: a below-
         # range rescue streak is over.
@@ -5700,6 +6162,30 @@ class MovementWorker(threading.Thread):
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
         self._descending_to_first = False
+        self._descending_since = None
+        self._drop_descent_saw = None
+        # The new loop owns the vertical movement again: no fall, no return, no half-finished resync may
+        # cross this boundary (see ``_reset_fall_tracking``).
+        self._reset_fall_tracking()
+        self._return_mode = None
+        self._return_from_floor = None
+        self._return_arrival_floor = None
+        self._clear_layer_resync_candidate()
+        self._aligned_frames = 0
+        self._rope_approach_direction = None
+        self._rope_attempted = False
+        # A fresh loop re-locks the rope target: the previous loop's locked X belongs to a route state
+        # that no longer exists (same reason as in ``_apply_pending_patrol_start``).
+        self._held_rope_target = None
+        self._climb_direction_log = None
+        for event in (
+            self.climbing_active_event,
+            self.near_rope_event,
+            self.moving_active_event,
+            self.direction_transition_event,
+        ):
+            if event is not None:
+                event.clear()
         if self.dropping_active_event is not None:
             # The drop phase is OVER (layer1 reached, new loop starts): the
             # dropping flag must clear, otherwise the patrol reports busy
@@ -6273,6 +6759,9 @@ class MovementWorker(threading.Thread):
                 continue
             try:
                 self._sync_input_session()
+                # 自动重连 arms one route check; it must be observed even while the automation
+                # gate below keeps this worker stood down for the whole reconnect sequence.
+                self._track_reconnect_window(time.monotonic())
                 if (self.automation_active_event is not None
                         and not self.automation_active_event.is_set()):
                     if self._automation_was_active:
@@ -6489,6 +6978,9 @@ class MovementWorker(threading.Thread):
                 self._sync_patrol_controller(coordinate_layout)
                 self._apply_pending_patrol_start(observation)
                 self._consume_stair_jump_completion()
+                # 自动重连: the first frame after the reconnect gave the input back decides
+                # whether the character is on the patrol route, before the walk resumes.
+                self._run_pending_route_check(observation, time.monotonic())
                 # Cheap periodic sanity check over the marker already found
                 # above. It can recover from a monster knock-down even when a
                 # stale climb/drop phase would reject normal reconciliation.
@@ -6542,9 +7034,33 @@ class MovementWorker(threading.Thread):
                             )
                 elif route_label.endswith(".drop-to-first"):
                     if not self._descending_to_first:
+                        # The planned descent owns every vertical move from here: a fall tracked before it
+                        # must be forgotten, otherwise it survives the whole descent (``_track_fall`` only
+                        # clears its frame counters while suppressed) and resolves right after the loop
+                        # restart against a settle window that "settled" seconds ago - restarting the
+                        # patrol on the floor the character came FROM instead of the first layer.
+                        self._reset_fall_tracking()
+                        # The descent owns the floors in between: this is where the resync guard (see
+                        # _resync_route_layer) starts, and the per-floor log evidence is reset with it.
+                        self._drop_descent_saw = None
                         LOG.info("final layer patrol done; descending to %s",
                                  self.first_layer)
                         self._descending_to_first = True
+                        self._descending_since = time.monotonic()
+                    elif (self._descending_since is not None
+                          and time.monotonic() - self._descending_since
+                          >= DROP_TO_FIRST_MAX_SECONDS):
+                        # The descent owns the layer state, so a character that cannot drop any further
+                        # must not sit here sending Alt+Down forever: hand the state back and let the
+                        # resync follow the marker again.
+                        LOG.warning(
+                            "DROP TO FIRST: %.0fs without reaching %s; handing the layer state back to the "
+                            "normal resync (the descent was not interrupted by a resync switch)",
+                            DROP_TO_FIRST_MAX_SECONDS, self.first_layer,
+                        )
+                        self._descending_to_first = False
+                        self._descending_since = None
+                        self._drop_descent_saw = None
                     if self._final_drop_arrived(observation):
                         self._reset_route_loop()
                         self._reanchor_tracker_to_current_layer(observation)

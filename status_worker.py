@@ -24,6 +24,15 @@ from hotkey_worker import SELF_INPUT_EXTRA_INFO
 
 LOG = logging.getLogger(__name__)
 
+# A refused key used to be a DEBUG line, so a disarmed input looked like a dead hotkey with nothing
+# in the log at all (the operator's 自动重连 report).  The first refusal of a burst is logged at INFO
+# and then at most one line every few seconds, carrying the number of refusals in between.
+INPUT_REFUSAL_LOG_SECONDS = 5.0
+INPUT_NOT_ENABLED_REASON = (
+    "live input is not enabled - press 开始巡逻/Start Patrol to arm it "
+    "(typing hotkeys re-arm it themselves)"
+)
+
 # Action taps (jump / buff / periodic skill keys) are the shortest events the
 # assistant emits, and ``SendInput`` is global: the keystroke lands in whichever
 # window owns the keyboard at that instant.  Measured in the field log, a tap is
@@ -91,6 +100,37 @@ def _process_name(pid: int) -> str:
             kernel32.CloseHandle(handle)
     except Exception:
         return ""
+
+
+# The game's login UI is a separate window of a second process of the same executable (measured on
+# the operator's machine: `igwUserLoginDialog`, pid 5644, over the game `冒险岛怀旧服`, pid 4288, both
+# Maplestory_Classic.exe).  It is the game's own input surface, so it counts as "the game is focused".
+_LOGIN_UI_TITLE_HINTS = ("igwuserlogindialog",)
+
+
+def _process_image_name(pid: int) -> str:
+    """The executable name of a process, or "" when it cannot be read."""
+
+    if not pid:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(1024)
+            buffer = ctypes.create_unicode_buffer(1024)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return str(buffer.value).rsplit("\\", 1)[-1].casefold()
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        LOG.debug("could not read the image name of pid %s", pid, exc_info=True)
+    return ""
 
 
 class WindowKeySender:
@@ -173,6 +213,9 @@ class WindowKeySender:
         self._selection_lock = threading.Lock()
         self._key_state_lock = threading.Lock()
         self._key_owners: dict[str, int] = {}
+        # v0411: the name of the caller that owns the keyboard exclusively (the auto-reconnect takes
+        # it while it runs, so the attack/jump/channel-switch workers cannot type into the game).
+        self._exclusive_owner: str = ""
         # SendInput can be accepted by Windows while the game misses one
         # transition.  Keep a separate best-effort physical ledger so a
         # lifecycle scrub can re-send key-up even after the logical owner
@@ -188,6 +231,10 @@ class WindowKeySender:
         self._input_session = 0
         self._delivery_warned_at = float("-inf")
         self._input_enabled = threading.Event()
+        # Refusal-burst bookkeeping for ``_note_input_refused``.
+        self._input_refusal_reason = ""
+        self._input_refusal_logged_at = float("-inf")
+        self._input_refusal_count = 0
         if input_enabled:
             self._input_enabled.set()
         self.hwnd: Optional[int] = None
@@ -200,6 +247,11 @@ class WindowKeySender:
         # release into the new patrol session.
         self.reset_input_session("start patrol")
         self._input_enabled.set()
+        # A fresh session reports its first refusal again instead of staying silent inside the burst
+        # window of the previous one.
+        self._input_refusal_reason = ""
+        self._input_refusal_count = 0
+        self._input_refusal_logged_at = float("-inf")
         LOG.info("live keyboard input enabled")
 
     def disable_input(self, *, refocus_before_release: bool = False) -> None:
@@ -297,6 +349,75 @@ class WindowKeySender:
 
     def input_is_enabled(self) -> bool:
         return self._input_enabled.is_set()
+
+    # ---------------------------------------------------------------- ownership (v0411)
+    # Keys that must never stay down: Alt is the game's JUMP key here, and a held Alt turns a later
+    # key into a Windows shell chord (Alt+Esc switches window - "a folder steals the focus" - and
+    # Alt+F4 closes it).
+    _MODIFIER_KEYS = ("alt", "ctrl", "shift")
+    _MODIFIER_VK = ((0x12, "alt"), (0x11, "ctrl"), (0x10, "shift"))
+
+    def begin_exclusive(self, owner: str) -> bool:
+        """Give ``owner`` the keyboard: every other caller is refused until ``end_exclusive``.
+
+        The reconnect has to arm live input for its own keys, and that same switch wakes the attack,
+        random-jump and channel-switch workers - which then typed into the login and select pages
+        (measured 19:07: `attack repetition: a` through the whole sequence).
+        """
+
+        with self._key_state_lock:
+            previous = self._exclusive_owner
+            self._exclusive_owner = str(owner or "")
+        LOG.info("keyboard ownership: %r takes the keyboard (was %r)", owner, previous)
+        return previous in (None, "")
+
+    def end_exclusive(self, owner: str) -> None:
+        """Release the keyboard ownership taken by ``begin_exclusive``."""
+
+        with self._key_state_lock:
+            if self._exclusive_owner == str(owner or ""):
+                self._exclusive_owner = None
+        LOG.info("keyboard ownership: %r released the keyboard", owner)
+
+    def _exclusive_blocks(self, owner: str) -> bool:
+        """Whether a caller must be refused because somebody else owns the keyboard."""
+
+        current = self._exclusive_owner
+        return bool(current) and str(owner or "") != current
+
+    def release_modifiers(self, *, owner: str = "", reason: str = "auto reconnect") -> list:
+        """Force Alt/Ctrl/Shift up - both our own ledger and what Windows reports.
+
+        Returns the keys that were released.  This is what stops a stuck jump-Alt from turning the
+        next Escape into Alt+Esc or the next F4 into Alt+F4.
+        """
+
+        released = []
+        with self._key_state_lock:
+            for key in self._MODIFIER_KEYS:
+                if key in self._physical_keys or key in self._key_owners:
+                    self._key_owners.pop(key, None)
+                    try:
+                        self._emit_locked(key, key_up=True)
+                    except Exception:
+                        LOG.debug("could not release %s", key, exc_info=True)
+                    released.append(key)
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            for vk, key in self._MODIFIER_VK:
+                if user32.GetAsyncKeyState(vk) & 0x8000:
+                    scan_code, extended = self._SCAN[key]
+                    self._send_scan_code(scan_code, key_up=True, extended=extended)
+                    if key not in released:
+                        released.append(key)
+        except Exception:
+            LOG.debug("could not read the live modifier state", exc_info=True)
+        if released:
+            LOG.warning("modifiers released by %s (%s): %s", reason, owner or "automation",
+                        ", ".join(sorted(set(released))))
+        return sorted(set(released))
 
     def _find_target_window(self, *, required: bool = True) -> int:
         """Find the configured game window without blocking the UI forever.
@@ -516,19 +637,48 @@ class WindowKeySender:
             return True
         return self._foreground_matches()
 
-    def press(self, key: str, duration: float = 0.025) -> bool:
-        """Press a key using native SendInput scan-code keyboard events only."""
+    def _note_input_refused(self, key: str, reason: str) -> None:
+        """Say out loud why a key was refused, once per burst.
+
+        ``key_down``/``tap`` refuse a key while live input is disarmed.  That refusal was a DEBUG
+        line, so the operator saw a hotkey that "did nothing" and a log that said nothing.
+        """
+
+        now = time.monotonic()
+        if (reason == self._input_refusal_reason
+                and now - self._input_refusal_logged_at < INPUT_REFUSAL_LOG_SECONDS):
+            self._input_refusal_count += 1
+            return
+        extra = ""
+        if reason == self._input_refusal_reason and self._input_refusal_count:
+            extra = f" ({self._input_refusal_count} more refused meanwhile)"
+        self._input_refusal_reason = reason
+        self._input_refusal_count = 0
+        self._input_refusal_logged_at = now
+        LOG.info("key send refused: key=%s - %s%s", key, reason, extra)
+
+    def press(self, key: str, duration: float = 0.025, *, owner: str = "") -> bool:
+        """Press a key using native SendInput scan-code keyboard events only.
+
+        ``owner`` is the caller's name: while another owner holds the keyboard exclusively (the
+        auto-reconnect), a call from anyone else is refused.
+        """
 
         key = key.casefold()
         if key not in self._SCAN:
             raise ValueError(f"unsupported key: {key}")
+        if self._exclusive_blocks(owner):
+            LOG.info("blocked key=%s: the keyboard is owned by %r", key, self._exclusive_owner)
+            return False
         # Movement holds may intentionally last multiple seconds.  The former
         # 0.5-second upper clamp silently shortened a requested 2-second hold.
         duration = float(np.clip(duration, 0.01, 10.0))
         started = time.monotonic()
         claimed = False
         try:
-            claimed = self.key_down(key)
+            # The owner MUST be carried through: press() already passed the ownership check, and a
+            # bare key_down() here would be refused by the very rule press() just satisfied.
+            claimed = self.key_down(key, owner=owner)
             if not claimed:
                 return False
             # One uninterrupted hold. Repeated direction transitions make the
@@ -540,18 +690,22 @@ class WindowKeySender:
             return False
         finally:
             if claimed:
-                self.key_up(key)
+                self.key_up(key, owner=owner)
                 LOG.info("key hold complete=%s actual_hold=%.3fs", key,
                          time.monotonic() - started)
 
-    def key_down(self, key: str) -> bool:
+    def key_down(self, key: str, *, owner: str = "") -> bool:
         """Claim a key; inject key-down only for the first concurrent owner."""
 
         key = key.casefold()
         if key not in self._SCAN:
             raise ValueError(f"unsupported key: {key}")
+        if self._exclusive_blocks(owner):
+            LOG.info("blocked key-down=%s: the keyboard is owned by %r", key,
+                     self._exclusive_owner)
+            return False
         if not self.input_is_enabled():
-            LOG.debug("blocked key-down=%s: live input is not enabled", key)
+            self._note_input_refused(key, INPUT_NOT_ENABLED_REASON)
             return False
         if self.dry_run:
             LOG.info("DRY-RUN key-down=%s target=%r", key, self.window_title)
@@ -582,8 +736,12 @@ class WindowKeySender:
         LOG.info("key-down=%s owners=%d", key, owners + 1)
         return True
 
-    def key_up(self, key: str) -> bool:
-        """Release one claim; inject key-up only after the final owner exits."""
+    def key_up(self, key: str, *, owner: str = "") -> bool:
+        """Release one claim; inject key-up only after the final owner exits.
+
+        A key-up is NEVER blocked by ownership: releasing is always safe, and blocking it would leave
+        a key stuck down.
+        """
 
         key = key.casefold()
         with self._key_state_lock:
@@ -629,8 +787,11 @@ class WindowKeySender:
         with self._key_state_lock:
             return self._key_owners.get(key.casefold(), 0) > 0
 
-    def tap(self, key: str) -> bool:
+    def tap(self, key: str, *, owner: str = "") -> bool:
         """Tap an ACTION key (jump/buff) and verify the game got it.
+
+        ``owner`` follows the same rule as :meth:`press`: while another owner holds the keyboard
+        exclusively (the auto-reconnect), a tap from anyone else is refused.
 
         A tap is the shortest event this process emits (25-45 ms), so it is the
         one that loses the race with a window that steals the foreground:
@@ -654,10 +815,13 @@ class WindowKeySender:
         key = key.casefold()
         if key not in self._SCAN:
             raise ValueError(f"unsupported key: {key}")
+        if self._exclusive_blocks(owner):
+            LOG.info("blocked tap=%s: the keyboard is owned by %r", key, self._exclusive_owner)
+            return False
         for attempt in range(1, _ACTION_TAP_ATTEMPTS + 1):
             if not self.input_is_enabled():
                 # Not a transient condition: no retry, no delay.
-                LOG.debug("action tap %s refused: live input is not enabled", key)
+                self._note_input_refused(key, INPUT_NOT_ENABLED_REASON)
                 return False
             if not (self.dry_run or self._foreground_matches()):
                 self._warn_delivery(
@@ -667,7 +831,7 @@ class WindowKeySender:
                 if attempt < _ACTION_TAP_ATTEMPTS:
                     time.sleep(_ACTION_TAP_RETRY_SECONDS)
                 continue
-            if self._tap_verified(key):
+            if self._tap_verified(key, owner=owner):
                 return True
             if attempt < _ACTION_TAP_ATTEMPTS:
                 time.sleep(_ACTION_TAP_RETRY_SECONDS)
@@ -677,11 +841,11 @@ class WindowKeySender:
         )
         return False
 
-    def _tap_verified(self, key: str) -> bool:
+    def _tap_verified(self, key: str, *, owner: str = "") -> bool:
         """One down/hold/up with a focus check at both ends (see :meth:`tap`)."""
 
         started = time.monotonic()
-        if not self.key_down(key):
+        if not self.key_down(key, owner=owner):
             return False
         owned_at_release = True
         try:
@@ -690,7 +854,7 @@ class WindowKeySender:
             # window which stole the focus leaves the game holding the key.
             owned_at_release = bool(self.dry_run or self._foreground_matches())
         finally:
-            self.key_up(key)
+            self.key_up(key, owner=owner)
             LOG.info("key hold complete=%s actual_hold=%.3fs", key,
                      time.monotonic() - started)
         if not owned_at_release:

@@ -14,7 +14,7 @@ import zipfile
 from typing import Iterable, Optional
 
 from config_store import user_config_version
-from versioning import read_version
+from versioning import read_version, version_key
 
 
 _SKIP_DIRECTORIES = {
@@ -82,7 +82,7 @@ def desktop_roots() -> list[Path]:
 
 def _valid_version(text: str) -> Optional[str]:
     value = text.strip()
-    return value if re.fullmatch(r"\d{4}", value) else None
+    return value if re.fullmatch(r"\d+\.\d+\.\d+", value) else None
 
 
 def _zip_version(path: Path) -> Optional[str]:
@@ -161,7 +161,7 @@ def find_newer_desktop_update(
 ) -> DesktopUpdate:
     """Find the highest newer package on Desktop or beside this installation."""
 
-    current = int(_valid_version(current_version) or "0000")
+    current = version_key(_valid_version(current_version) or "")
     candidates: list[DesktopUpdate] = []
     desktop_search_roots = list(desktop_roots() if roots is None else roots)
     nearby_roots = list(local_roots or ())
@@ -174,7 +174,7 @@ def find_newer_desktop_update(
         if kind == "zip" and not _PACKAGE_NAME.search(entry.name):
             continue
         version = _zip_version(entry) if kind == "zip" else _directory_version(entry)
-        if version is not None and int(version) > current:
+        if version is not None and version_key(version) > current:
             candidates.append(DesktopUpdate(entry, version, kind))
     if not candidates:
         roots_text = ", ".join(
@@ -184,7 +184,10 @@ def find_newer_desktop_update(
             f"未找到比 v{current_version} 更新的 Maple 助手安装包。"
             f"已检查: {roots_text or '桌面和安装目录不存在'}"
         )
-    return max(candidates, key=lambda item: (int(item.version), item.path.stat().st_mtime))
+    return max(
+        candidates,
+        key=lambda item: (version_key(item.version), item.path.stat().st_mtime),
+    )
 
 
 def _extract_zip_source(package: DesktopUpdate, staging: Path) -> Path:

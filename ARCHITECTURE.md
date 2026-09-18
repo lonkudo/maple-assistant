@@ -75,6 +75,32 @@ game client
      -> ui_frames        -> UiWorker
 ```
 
+`CaptureWorker` runs only while its enable gate is set -
+`_AnyEvent(game_focused, patrol_preparing, trade_capture_active)` - and
+`game_focused` comes from `FocusWorker`, which is idle until live input is
+armed.  So before Start Patrol the bus carries nothing, and the two EVENT
+workflows (自动过测谎, 自动重连) would starve: that is what
+`ParkedWatchCapture` (`capture_worker.py`) exists for.
+
+`ParkedWatchCapture` is a small supervised thread that grabs the game window on
+its own and publishes ONLY into the queues it was given, each behind its own
+panel selection (`WatchFeed`):
+
+```text
+测谎 armed   -> lie_detector_frames   every 0.5 s   (the detector scans 1/s)
+掉线 armed   -> character_frames      every 0.25 s  (its alert threshold is a FRAME COUNT)
+```
+
+Both feeds carry their own interval for that reason - the disconnect alert is
+"120 missing frames", which must stay 30 s.  The watch stands down whenever the
+shared capture runs (same gate object, so there is never a double capture), it
+never foregrounds the game, and the 掉线 feed additionally requires the game
+window to be in the FOREGROUND: a capture of the game window while this panel
+covers it is not the game, and the character worker would count it as "marker
+missing" and fire a false 掉线 (and a reconnect that clicks and types into the
+game).  Nothing else consumes the watch's frames, so movement / attack / status
+state stays exactly as idle as it is while parked.
+
 `LieDetectorWorker` owns an optional `lie_seen_callback` list (wired in
 `assistant.py`): every newly detected #c9ced0 square (with its bbox and the
 originating frame) is forwarded to its subscribers - the 测谎 alert and the
@@ -135,7 +161,15 @@ implementation. It:
 - tracks per-key owners and physical down/up state;
 - refuses live input while disarmed or unsafe;
 - serializes sensitive input sequences;
-- releases all owned keys during stop or focus loss.
+- releases all owned keys during stop or focus loss;
+- **honours keyboard ownership** (`begin_exclusive(owner)` / `end_exclusive`):
+  while the 自动重连 owns the keyboard, a key from any other caller is refused
+  (`blocked key=a: the keyboard is owned by 'auto-reconnect'`).  Key-ups are
+  never blocked, because releasing is always safe;
+- offers `release_modifiers()`, which forces Alt/Ctrl/Shift up - both the keys it
+  believes are down and the ones Windows reports down (`GetAsyncKeyState`).  Alt
+  is this game's JUMP key, and a held Alt turns a later Escape into Alt+Esc (a
+  window switch) and a later F4 into Alt+F4 (`shutdown_worker` sends that chord).
 
 The UI starts with input disarmed. **Start Patrol** prepares the map session,
 selects the game window, and arms input. **Stop Patrol** disables input and
@@ -272,6 +306,43 @@ Control ownership rules:
   longer starts it; pickup is integrated into movement so Z and direction are
   pressed and released together.
 
+### 3.1 自动重连: what it clicks, and why every click is provably safe
+
+`reconnect_worker.py` runs the login -> world -> channel sequence on a 掉线.  It is the only place that
+clicks inside the game, so its rules are stated here as a contract.
+
+**One window owns the coordinates.**  The picture comes from `capture_window()` (the client area of the
+game window); the click points are measured in that same 1366x768 client space, so
+`screen = client_origin + client_point` with no scaling.  Measured on a 150 % display with a DPI-unaware
+process: client origin (170, 161), client and captured frame both 1366x768, and the cursor round-trip
+(`SetCursorPos` then `GetCursorPos`) exact.  `find_game_windows()` lists every window with the configured
+title and the run adopts the one whose **client size equals the captured frame**, so the picture and the
+clicks can never come from two different windows.
+
+**A point is clicked only when** the window there belongs to the game's family (the game window, its
+process, its executable, its window class, its title, or the game's own login UI
+`igwUserLoginDialog` - a second process of the same executable), the point lies inside the game's client
+rectangle (never on a title bar or a border), and the window is not ours.  A window of our own process is
+refused first and needs no game handle at all (`_lower_own_windows()` then pushes the panel to the bottom
+of the Z order and the point is re-checked); any other window is refused and named with the whole stack
+over that point.  Every refusal carries the geometry (`client (773, 324) -> screen (1341, 751); game hwnd
+...; window_rect ...; client_origin ...; cursor ...`).
+
+**Acts are calculated; pictures are evidence.**  The channel list is paged (1-20 / 21-40 / 41-60, four per
+row, five visible), so the number of wheel notches is arithmetic (8 for channel 51) and the target cell is
+computed from the same constants.  The page verifier (two crops per page, minimum score, threshold 0.60,
+plus the shipped cream colour as a second login-page signal) and the region measurements are logged - with
+every signature's score and a saved frame when they miss - but they do not gate the intermediate steps,
+because a stale capture once reported "unchanged" twelve times for a list that had scrolled.  The hard rule
+is the selection: **Enter is never sent to confirm a selection that did not move** (that is how 蘑菇仔
+was chosen and 蓝蜗牛 logged in), and the channel Enter is verified by the page leaving the channel state.
+
+**The run owns the machine.**  It takes the keyboard exclusively, releases modifiers before every key,
+clears the automation switch (`reconnect_active` makes the focus gate keep it cleared, so patrol cannot
+re-arm itself mid-run), watches the foreground window (`_FocusWatch`, 100 ms, naming every change and
+whether the thief is our own process), and after a failed login leaves live input **disarmed** so patrol
+cannot run on the login page.  A successful login restores input and automation exactly as they were.
+
 ## 4. Patrol data model
 
 `PatrolController` is the thread-safe owner of the `recording` section in
@@ -289,13 +360,35 @@ by their numeric suffix, not recording order. The active range is the
 contiguous slice from `patrol_start_layer` through `patrol_end_layer`.
 
 Recorded points contain normalized X/Y. New recordings also store
-`coordinate_v2` diamond-relative coordinates and recorded canvas geometry.
-`PatrolController.snapshot(layout)` projects these stable coordinates into the
-current minimap layout and scales layer tolerance. When the current canvas is
-the recorded canvas within one capture-rounding pixel, it instead retains the
-raw saved normalized point. Diamond-size noise must not move a rope target on
-an otherwise unchanged minimap; a material canvas change still selects the
-adaptive projection path.
+`coordinate_v2` diamond-relative coordinates and the `recorded_layout` they were
+taken in. `PatrolController.snapshot(layout)` re-projects those stable
+coordinates into the current minimap layout and scales layer tolerance.
+
+The re-projection is all-or-nothing per point and its criterion is the
+**analysis box + diamond size**, never the canvas sub-region:
+
+- the saved normalized X/Y are expressed INSIDE THE ANALYSIS BOX - the same
+  frame the marker Y, the layer bands and the tolerances live in - so a point is
+  already correct whenever the analysis box matches and the diamond size (a real
+  minimap zoom) has not changed;
+- `canvas_left/top/width/height` are ignored for that decision.  The canvas
+  detection flips between "the whole analysis box (0/82)" and "the detected
+  drawable area (21/61)" inside one recording, and the operator's profile
+  contains points saved in three such frames (layer1 0/82, layer2's left/rope
+  21/61, layer2's right 0/82, layer3 21/61).  Projecting through the live canvas
+  moved correct points by ~10 px - layer1's stance from 0.676829 to 0.804878 and
+  layer2's to 0.591463/0.719512 - which made a marker standing on layer1 match
+  layer2 and drew layer2's band 12 px tall instead of a line;
+- a genuinely different client size or HUD scale still re-projects, and a
+  recorded layout that looks like the top-left SEARCH REGION is refused
+  (`incompatible_layout`) and keeps the raw saved point.
+
+`assistant.py` reports the recording's own consistency at Start Patrol:
+`LAYER WORLD BAND` per floor, `LAYER WORLD BAND OVERLAP` when one floor's world
+band contains another floor's anchor, `LAYER EXTRA RECORDED FLOOR` for a layer
+outside `route_order` (it cannot be patrolled but still counts in the marker
+match), and `LAYER RECORDING` when one floor's points were saved in different
+canvas frames or one of them is an outlier recorded with a weak marker reading.
 
 Map identity is handled separately by `MapIdentityStore`, using ignored
 reference images below `recording-assets/map-names/`. Starting patrol verifies
@@ -332,11 +425,35 @@ horizontal cycles.
 ### 5.2 Layer detection
 
 Screen-space floor detection uses a band from the minimum to maximum Y of all
-recorded points on a layer: `(min(recorded Y) - y_tolerance,
-max(recorded Y) + y_tolerance / 3)`. The full margin above covers vertical
-arrival movement; the smaller margin below absorbs OpenCV marker quantization
-at the confirmed layer base without excessive adjacent-floor overlap. The
-recorded vertical span of a stair-shaped layer remains intact.
+recorded points on a layer:
+`(min(recorded Y) - y_tolerance * LAYER_UP_REACH_FACTOR,
+max(recorded Y) + y_tolerance / 3)`.  `LAYER_UP_REACH_FACTOR` is **0.7** (the
+operator narrowed the upper band on 2026-09-18): the band reaches 1.15 px above
+the topmost recorded point and 0.55 px below the lowest, both above the marker's
+own 1 px quantisation on an 82 px minimap.  The recorded vertical span of a
+stair-shaped layer remains intact - which is why such a floor is drawn (and
+matched) as a band while a single-height floor is a line.
+
+Which floor a marker reading names is decided in a fixed order:
+
+1. `_layer_y_candidates` collects the floors whose band contains the marker Y and
+   ranks them by `_layer_y_distance` = the distance to the floor's nearest
+   RECORDED POSITION.  The legacy single `layer_y` (the marker Y of whichever
+   spot was recorded first) is not that measure: on a stair/bench floor it is one
+   end of the range, and with it a marker sitting exactly on layer1's recorded
+   position ranked layer2 first.
+2. Ambiguity is judged over the floors the PATROL RANGE uses
+   (`marker_candidates_route`).  A recorded floor outside `route_order` cannot be
+   patrolled, so it may not make a good marker reading look ambiguous; those are
+   reported as `LAYER EXTRA RECORDED FLOOR:` instead.  An out-of-route match is
+   still honoured - the resync returns None so the fall/return recovery owns it.
+3. World Y is consulted only for a genuinely ambiguous reading (two ROUTE bands
+   overlap) and only inside a calibrated world band.  Every decision prints its
+   evidence: `LAYER transition candidate: ... (marker_y=..., matches ..., world_y=...,
+   confidence=...)`, `LAYER CHANGED: ... (marker_y matches ...)`, and
+   `LAYER world override: marker_y=... matches ... (out of range), world=...` when
+   the world signal overrules the marker.
+
 World-space detection uses the corresponding scroll-compensated world-Y band.
 The recorder retains both the canonical layer world Y and each point's raw
 `observed_world_y`. Coherent point readings describe stairs or benches. A
@@ -346,19 +463,21 @@ re-anchors only after its landing floor has passed confirmation.
 
 At Start Patrol, `assistant.py` converts every recorded marker-Y band through
 the current analysis box and client rectangle. `ScreenBlinker` displays the
-results as distinct translucent native Win32 gradient rectangles without
-activating a window. The overlay runs while input is disarmed, is removed after
-2.2 seconds, and a clean capture is published before automation is enabled.
-Final-drop completion separately requires one dispatched drop chord and rejects
-an overlapping lower-floor bench band when the marker is closer to the final
-layer's recorded base.
+results as native Win32 rectangles - one solid translucent strip per floor, with
+brighter 1 px edge lines only when the band is >= 4 px tall (eight gradient
+stripes collapsed onto shared rows for bands this short and blended two floors
+into one colour: "the drawing on minimap tells me that it mixed").  The overlay
+runs while input is disarmed, is removed after 2.2 seconds, and a clean capture is
+published before automation is enabled.  Final-drop completion separately
+requires one dispatched drop chord and rejects an overlapping lower-floor bench
+band when the marker is closer to the final layer's recorded base.
 
 The two signals have explicit priority. A marker Y that matches exactly one
-recorded layer is direct visible-floor evidence and wins over world Y. World Y
-is used to disambiguate overlapping marker bands and is accepted only inside a
-calibrated layer world band; the old unconditional "nearest anchor" snap was
-removed because a phase-correlation alias could identify layer2 while the
-marker visibly occupied layer3.
+recorded route layer is direct visible-floor evidence and wins over world Y.
+World Y is used to disambiguate overlapping marker bands and is accepted only
+inside a calibrated layer world band; the old unconditional "nearest anchor"
+snap was removed because a phase-correlation alias could identify layer2 while
+the marker visibly occupied layer3.
 
 On a scrolling minimap the raw marker Y is screen-relative, so it cannot name
 a floor on its own and can read OFF every recorded band at a landing spot that
@@ -376,6 +495,15 @@ it:
 - ``_detect_floor_all`` resolves a marker at/below the LOWEST recorded band to
   the bottom floor - nothing lower exists, so the bottom floor is recognized
   even when its recorded band does not cover the exact landing spot.
+- A resolved landing is CAPPED by the marker position
+  (``_landing_floor_cap`` / ``_cap_landing_floor``): a fall or drop only ever
+  moves the character down, so the landing can never be a floor whose band lies
+  entirely ABOVE the marker - that is the floor the world-Y tracker reports when
+  it lags a fast knock-down and then sits still at the anchor it fell from (and
+  "still" is exactly what the settle test accepts).  The cap only ever lowers the
+  answer, and a lower answer is the self-correcting one: the return-to-route
+  climb carries the character back up, while a floor too high leaves the patrol
+  walking into empty space.
 - A world-Y drift watchdog (``_world_drift_check``) re-anchors silently while
   cruising: the tracker prefers incremental phase correlation, whose per-frame
   error accumulates, so every few seconds the raw world Y is compared with the
@@ -507,7 +635,27 @@ only suppresses unsafe stair jumps during settling.
   yellow marker. Two matching readings on a recorded out-of-range floor clear
   obsolete climb/drop state and enter the same return path; it adds no capture
   or duplicate image scan.
-- Final-layer descent owns the route until the first active layer is reached.
+- Final-layer descent (``_descending_to_first``) owns the route until the first
+  active layer is reached, and **the layer resync is suppressed for its whole
+  duration** - the same suppression the fall detector already had, and what the
+  flag's own comment always claimed.  Alt+Down drops one platform per chord, so
+  the marker passes through the floors in between and the character even stands
+  on the next floor up between chords; the normal resync confirmed that as
+  "LAYER CHANGED: layer3 -> layer2; restarting layer2 patrol", which ended the
+  descent one floor short and never returned the loop to its first floor.  The
+  descent logs `DROP TO FIRST: the marker is on layer2 during the planned descent;
+  keeping the route on layer3 until layer1 is reached` once per floor it sees, and
+  hands the state back to the resync after ``DROP_TO_FIRST_MAX_SECONDS`` (25 s) so
+  a character that cannot drop further cannot send Alt+Down forever.  Arrival is
+  the descent's own test (``_final_drop_arrived`` -> ``_on_first_layer``), which
+  compares the marker's unambiguous nearest floor with the route's first floor and
+  only falls back to world Y when two floors' bands tie.
+- The loop restart after that arrival (``_reset_route_loop``) initializes the
+  same state as any fresh Start Patrol: fall tracking (``_reset_fall_tracking``,
+  so a fall pending before the descent cannot resolve against a settle window
+  that "settled" long ago and restart the patrol on the floor the character came
+  FROM), the return-to-route state, the layer-resync candidate, the climb state,
+  the rope lock and the climbing/dropping/near-rope/moving/direction events.
 - Return-to-route blocks attacks for the entire recovery.
 
 Self-rescue is a last resort for a missing marker or a stationary character.
@@ -741,27 +889,25 @@ Avoid overwriting them during unrelated code changes.
 The canonical release command is:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
-`发布.bat` is the double-click wrapper. A full checkpoint workflow is:
+`发布.bat` is the double-click wrapper.  A full checkpoint workflow is:
 
-1. Optionally run the exact release-gate suite defined in `release_now.ps1`; save output
-   to `work/release_gate.log`; abort on nonzero exit.
-2. Ensure `build_release.ps1` has its required UTF-8 BOM.
-3. The release script advances the four-digit `VERSION` counter (`0000` to
-   `9999`) and runs `build_release.ps1 -Version NNNN -Variant cpu -Zip` and
-   the corresponding `cuda` build. It recreates
-   `release/MapleAssistant-CPU` and `release/MapleAssistant-CUDA`, writes a
-   BOM-free `release_variant.json` declaring the runtime and environment (it now
-   only selects the launcher and the `.venv-cpu` / `.venv-cuda` name - no local
-   tracker is installed any more),
-   copies runtime files/assets/model weights, and creates
-   `MapleAssistant-CPU-vNNNN.zip` plus `MapleAssistant-CUDA-vNNNN.zip`.
-   Cleanup of prior paired ZIPs happens only after both builds succeed. A
-   failed build restores the prior counter; `9999` never wraps.
+1. `release_now.ps1` advances the semantic `VERSION` (`X.Y.Z`, patch by default;
+   `-Minor` / `-Major` / `-Version X.Y.Z` for the others), runs
+   `build_release.ps1 -Version <v> -Zip`, recreates `release/MapleAssistant`,
+   writes `release/MapleAssistant-<version>.zip` and removes the previous ZIP.
+   One single package - there is no CPU/CUDA pair any more.
+2. Without `-SkipTests` the release-gate suite runs first (the exact list lives in
+   `release_now.ps1`).  Per `AGENTS.md` the tests are **not** the gate - the
+   operator's field run is - so `-SkipTests` is the normal mode, and a change is
+   verified with a targeted probe (`work/probe_*.py`) rather than a suite sweep.
+3. Every behaviour change ships as a new release; documentation-only edits ship
+   nothing.
 4. Inspect `git diff --check` and `git status`, stage only intended source,
-   tests, and docs, commit, and verify a clean worktree.
+   tests, and docs, commit, and verify a clean worktree.  Release ZIPs remain
+   ignored and are not committed.
 
 For the separately named no-trade distribution, run
 `release_no_trade.ps1`. It stages the current normal build under
@@ -770,10 +916,14 @@ hotkeys, and wiring, verifies the staged Python files contain no trade wiring,
 then writes `release/MapleAssistant-vnt-0001.zip`. It does not alter the normal
 working source or branch: `main` is always the normal trade-enabled version.
 
-Every project change requires a new release package, but docs, full tests,
-verification work, and Git commits are checkpoint operations only: perform
-them when the user explicitly says **update**, or just before context
-compaction. The redundant ignored `work/verify_zip.py` procedure is removed.
+Every project change requires a new release package, but docs and Git commits
+are checkpoint operations only: perform them when the user explicitly says
+**update**, or just before context compaction.  Targeted probes under `work/`
+(`probe_layer_ambiguity.py`, `probe_layer_ranking.py`, `probe_projection_frames.py`,
+`probe_drop_to_first.py`, `probe_parked_watch.py`, `probe_autolie_workflow.py`,
+`probe_landing_cap.py`, `probe_api_connect_timing.py`) are the routine
+verification: each one drives the real class on the operator's own numbers and
+prints the before/after, so a change is proven without a test sweep.
 Release ZIPs remain ignored and are not committed.
 
 ## 10. Repository file inventory
@@ -995,7 +1145,6 @@ These exist locally but are not guaranteed in a clone or commit:
 | `.venv/`, `.venv-cpu/`, `.venv-cuda/`, `yolo-detection/venv313/` | Local Python environments; never commit |
 | `work/` | Logs, state JSON, debug captures, ad-hoc diagnostics, and release gate log |
 | `work/api_test/` | Per-run API drill logs: `connection.log`, `detection.jsonl`, `summary.json`, `frames/` |
-| `work/reconnect_calibration/` | 自动重连 calibration captures and the layout JSON it writes |
 | `VERSION`, `versioning.py` | Four-digit release counter and UI version label |
 | `release/` | Rebuilt CPU/CUDA package folders and their paired versioned ZIPs |
 | `recording-assets/` | Map-name index/reference images and map-structure reference; packaged when present |
@@ -1010,12 +1159,17 @@ These exist locally but are not guaranteed in a clone or commit:
 
 1. Read `README.md` and this file before modifying behavior.
 2. Inspect `git status --short`; preserve unrelated user changes.
-3. Use logs to identify the state transition that actually fired.
-4. Always build a newly numbered release package for every behavior change.
-5. Only when the user says **update**, or before context compaction: add/run
-   relevant tests, update both handoff documents, run `git diff --check`, and
-   review/stage/commit intended tracked changes.
+3. Use logs to identify the state transition that actually fired.  Layer/floor
+   decisions now print their own evidence (`LAYER transition candidate`,
+   `LAYER CHANGED`, `LAYER world override`, `LANDING FLOOR CAP`, `DROP TO FIRST`,
+   `LAYER RECORDING`), so a report can be answered from the log instead of a
+   guess.
+4. Always build a newly numbered release package for every behavior change, and
+   do **not** run redundant unit tests: `AGENTS.md` makes the operator's field
+   run the gate.  Verify with a targeted probe under `work/` instead.
+5. Only when the user says **update**, or before context compaction: update both
+   handoff documents, run `git diff --check`, and review/stage/commit intended
+   tracked changes.
 6. Update this inventory at those checkpoints when files, ownership, or data
    flow changed.
-7. Hand off the ZIP path every time; include test count and commit hash for a
-   checkpoint.
+7. Hand off the ZIP path every time; include the commit hash for a checkpoint.

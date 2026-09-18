@@ -826,5 +826,39 @@ class StatusTests(unittest.TestCase):
             )
 
 
+class InputRefusalVisibilityTests(unittest.TestCase):
+    """A refused key must not be a DEBUG-only secret (the 自动重连 "lost hotkey" report)."""
+
+    def test_a_disarmed_refusal_is_logged_once_per_burst(self) -> None:
+        sender = WindowKeySender("game", dry_run=True, input_enabled=False)
+        with self.assertLogs("status_worker", level="INFO") as captured:
+            self.assertFalse(sender.key_down("left"))
+            self.assertFalse(sender.key_down("right"))
+            self.assertFalse(sender.tap("pagedown"))
+        lines = [line for line in captured.output if "key send refused" in line]
+        self.assertEqual(len(lines), 1, captured.output)
+        self.assertIn("live input is not enabled", lines[0])
+        self.assertIn("key=left", lines[0])
+
+    def test_the_next_burst_after_arming_reports_again(self) -> None:
+        sender = WindowKeySender("game", dry_run=True, input_enabled=False)
+        sender._note_input_refused("left", "live input is not enabled")
+        sender.enable_input()
+        sender.disable_input()
+        with self.assertLogs("status_worker", level="INFO") as captured:
+            sender.key_down("left")
+        self.assertTrue(
+            any("key send refused" in line for line in captured.output), captured.output
+        )
+
+    def test_a_disarmed_refusal_never_injects_a_key(self) -> None:
+        sender = WindowKeySender("game", dry_run=False, input_enabled=False)
+        sender._send_scan_code = lambda *args, **kwargs: self.fail(
+            "no key may be injected while disarmed"
+        )
+        self.assertFalse(sender.key_down("left"))
+        self.assertFalse(sender.tap("pagedown"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,18 +21,24 @@ def _layer_point_ys(layer: Any) -> list[float]:
     return values
 
 
+# The same upper-band factor as ``movement_worker.LAYER_UP_REACH_FACTOR`` (the operator, 2026-09-18:
+# "narrow down layer upper band a little bit, make it 0.7").  The bands must mean the same thing in both
+# modules: this one answers the panel's "is the marker on a recorded layer" question.
+LAYER_UP_REACH_FACTOR = 0.7
+
+
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    # The full margin above covers climb/drop arrival movement. A smaller
-    # one-third margin below the confirmed layer base absorbs OpenCV marker
-    # precision noise without excessive overlap with the layer below.
+    # The margin above covers climb/drop arrival movement, scaled by the upper-band factor. A smaller
+    # one-third margin below the confirmed layer base absorbs OpenCV marker precision noise without
+    # excessive overlap with the layer below.
     effective_tolerance = max(0.0, float(tolerance))
     return (
-        min(values) - effective_tolerance,
+        min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
         max(values) + effective_tolerance / 3.0,
     )
 
@@ -219,6 +225,9 @@ class PatrolController:
         # (``patrol_start_layer`` / ``patrol_end_layer``) so recordings, the
         # UI and the movement worker all see the same persisted selection.
         self._lock = threading.RLock()
+        # The last inverted range this profile reported, so the warning below is said once per
+        # distinct pair instead of on every frame.
+        self._inverted_range_reported: tuple[str, str] = ("", "")
 
     def _sorted_layer_names_locked(self) -> list[str]:
         """Bottom-up layer order by numeric suffix, never recording order.
@@ -413,6 +422,19 @@ class PatrolController:
             start = layers[0]
         if not end or end not in layers:
             end = layers[-1]
+        # The range is stored lowest floor -> highest floor.  A profile written while the layers
+        # were numbered differently can hold the pair the other way round (observed: "layer2 ->
+        # layer1" together with a completely silent stand-still patrol).  Both names describe the
+        # SAME set of floors, so use the canonical order and say so once, loudly.
+        if _layer_number(start) > _layer_number(end):
+            if self._inverted_range_reported != (start, end):
+                self._inverted_range_reported = (start, end)
+                LOG.warning(
+                    "巡逻范围 %s -> %s 方向相反（起点在终点上方，切片结果为空，"
+                    "巡逻会原地站立）；已按 %s -> %s 处理，请在界面上重新确认范围",
+                    start, end, end, start,
+                )
+            start, end = end, start
         return start, end
 
     def patrol_range(self) -> tuple[str, str]:
@@ -733,7 +755,7 @@ class PatrolController:
                     continue
                 adaptive_points += 1
                 recorded_layout = coordinate.get("recorded_layout")
-                same_canvas_geometry = False
+                same_analysis_frame = False
                 if isinstance(recorded_layout, dict):
                     try:
                         width_ratio = (
@@ -769,31 +791,29 @@ class PatrolController:
                         # corrupts layer Y.  Preserve the recorded raw point.
                         incompatible_layout = True
                         continue
-                    # If the minimap canvas itself has not changed, retain
-                    # the original normalized point. Yellow-diamond pixel
-                    # size can fluctuate by a pixel between OpenCV frames;
-                    # re-projecting through that noise shifted a saved rope
-                    # (for example 0.609649 -> 0.584649) on the same map.
+                    # The stored x/y are normalised INSIDE THE ANALYSIS BOX - the very frame the marker Y,
+                    # the layer bands and the tolerances live in.  A recorded point is therefore already
+                    # valid as long as the analysis box and the diamond size (a real minimap zoom) have
+                    # not changed; the CANVAS sub-region must not decide it.  On the operator's profile
+                    # (13:37) layer1's three points were recorded with canvas (0, 82), layer2's left/rope
+                    # with (21, 61) and layer2's RIGHT point with (0, 82) again - one recording, three
+                    # frames, because the canvas detection flips inside the same minimap box.  Projecting
+                    # each point through the live canvas frame moved points that were perfectly correct:
+                    # layer1's stance went from 0.676829 to 0.804878 and layer2's points to
+                    # 0.591463/0.719512, so a marker standing on layer1 matched LAYER2 and layer2's band
+                    # was drawn 12 px tall instead of a line.
                     try:
-                        same_canvas_geometry = (
+                        same_analysis_frame = (
                             abs(float(recorded_layout["analysis_width"])
                                 - layout.analysis_width) <= 1.0
                             and abs(float(recorded_layout["analysis_height"])
                                     - layout.analysis_height) <= 1.0
-                            and abs(float(recorded_layout["canvas_left"])
-                                    - layout.canvas_left) <= 1.0
-                            and abs(float(recorded_layout["canvas_top"])
-                                    - layout.canvas_top) <= 1.0
-                            and abs(float(recorded_layout["canvas_width"])
-                                    - layout.canvas_width) <= 1.0
-                            and abs(float(recorded_layout["canvas_height"])
-                                    - layout.canvas_height) <= 1.0
                             and _diamond_geometry_matches(recorded_layout, layout)
                         )
                     except (KeyError, TypeError, ValueError):
-                        same_canvas_geometry = False
+                        same_analysis_frame = False
                 try:
-                    if same_canvas_geometry:
+                    if same_analysis_frame:
                         x, y = float(point["x"]), float(point["y"])
                     else:
                         x, y = layout.project(

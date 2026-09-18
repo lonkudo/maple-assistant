@@ -1,14 +1,21 @@
 <#
 .SYNOPSIS
     One-command full checkpoint: optionally run tests, then rebuild the
-    CPU and CUDA distributable folders and four-digit versioned zips.
+    the distributable folder and its versioned zip (1.0.0 style).
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File release_now.ps1
     powershell -ExecutionPolicy Bypass -File release_now.ps1 -SkipTests
+    powershell -ExecutionPolicy Bypass -File release_now.ps1 -SkipTests -Version 1.0.0
+    powershell -ExecutionPolicy Bypass -File release_now.ps1 -SkipTests -Minor
 #>
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    # 默认只增加最后一段（补丁号）；只有明确要求时才用这两个开关移动第二段或第一段。
+    [switch]$Minor,
+    [switch]$Major,
+    # 明确指定要发布的版本号（例如第一次改用 1.0.0 时），此时不自动加一。
+    [string]$Version = ""
 )
 
 # Continue: the game workers log to stderr during tests, and Windows
@@ -54,14 +61,19 @@ $hadVersion = Test-Path -LiteralPath $versionPath
 $previousVersion = if ($hadVersion) {
     Get-Content -LiteralPath $versionPath -Raw
 } else { $null }
-$versionOutput = @(& $python -u (Join-Path $root "versioning.py") `
-    next $versionPath 2>&1)
-if ($LASTEXITCODE -ne 0 -or $versionOutput.Count -eq 0) {
-    $versionOutput | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-    exit 1
+$versionPart = if ($Major) { "--major" } elseif ($Minor) { "--minor" } else { "--patch" }
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $versionOutput = @(& $python -u (Join-Path $root "versioning.py") `
+        next $versionPath $versionPart 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $versionOutput.Count -eq 0) {
+        $versionOutput | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+        exit 1
+    }
+    $version = $versionOutput[-1].ToString().Trim()
+} else {
+    $version = $Version.Trim()
 }
-$version = $versionOutput[-1].ToString().Trim()
-if ($version -notmatch '^\d{4}$') {
+if ($version -notmatch '^\d+\.\d+\.\d+$') {
     Write-Host "invalid next release version: $version" -ForegroundColor Red
     exit 1
 }
@@ -91,37 +103,34 @@ if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes
     Write-Host "build_release.ps1 BOM re-added (UTF-8 with BOM)" -ForegroundColor Yellow
 }
 $zips = @()
-foreach ($variant in @("cpu", "cuda")) {
-    Write-Host "building $($variant.ToUpperInvariant()) package..." -ForegroundColor Cyan
-    & powershell -NoProfile -ExecutionPolicy Bypass `
-        -File $buildScript -Version $version -Variant $variant -Zip 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Restore-VersionFile
-        Write-Host "build_release.ps1 FAILED for $variant" -ForegroundColor Red
-        exit 1
-    }
-
-    $tag = $variant.ToUpperInvariant()
-    $zip = Get-Item -LiteralPath (
-        Join-Path $root "release\MapleAssistant-$tag-v$version.zip"
-    ) -ErrorAction SilentlyContinue
-    if ($null -eq $zip) {
-        Restore-VersionFile
-        Write-Host "no $tag zip was produced under release\" -ForegroundColor Red
-        exit 1
-    }
-    $zips += $zip
+# One package only: no CPU/CUDA split (the API does the work, there is no local model).
+Write-Host "building the MapleAssistant package..." -ForegroundColor Cyan
+& powershell -NoProfile -ExecutionPolicy Bypass `
+    -File $buildScript -Version $version -Zip 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Restore-VersionFile
+    Write-Host "build_release.ps1 FAILED" -ForegroundColor Red
+    exit 1
 }
+$zip = Get-Item -LiteralPath (
+    Join-Path $root "release\MapleAssistant-$version.zip"
+) -ErrorAction SilentlyContinue
+if ($null -eq $zip) {
+    Restore-VersionFile
+    Write-Host "no zip was produced under release\" -ForegroundColor Red
+    exit 1
+}
+$zips += $zip
 
 $zips | ForEach-Object {
     Write-Host ("release ready: " + $_.FullName) -ForegroundColor Green
 }
 
-# Keep only the just-created CPU/CUDA packages.  Cleanup happens after both
-# builds succeed, so a failed release never destroys the last usable pair.
+# Keep only the just-created package.  Cleanup happens after the build succeeded, so a failed
+# release never destroys the last usable zip.
 $keep = @{}
 $zips | ForEach-Object { $keep[$_.FullName] = $true }
-Get-ChildItem (Join-Path $root "release") -File -Filter "MapleAssistant-*-v*.zip" |
+Get-ChildItem (Join-Path $root "release") -File -Filter "MapleAssistant-*.zip" |
     Where-Object { -not $keep.ContainsKey($_.FullName) } |
     ForEach-Object {
         try {

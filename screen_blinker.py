@@ -6,7 +6,8 @@ import ctypes
 from ctypes import wintypes
 import logging
 import threading
-from typing import Iterable, Sequence
+import time
+from typing import Iterable, Optional, Sequence
 
 
 LOG = logging.getLogger(__name__)
@@ -58,6 +59,12 @@ class ScreenBlinker(threading.Thread):
         self._enabled = bool(enabled)
         self._pending = 0
         self._wake_event = threading.Event()
+        # The live aim marker of 自动过测谎 (see show_aim_marker): one crosshair overlay that follows
+        # the point the api pass is driving the cursor to.
+        self._aim_lock = threading.Lock()
+        self._aim_point: Optional[tuple[int, int, float]] = None
+        self._aim_size = 46
+        self._aim_thread: Optional[threading.Thread] = None
 
     @property
     def enabled(self) -> bool:
@@ -187,12 +194,20 @@ class ScreenBlinker(threading.Thread):
             tuple[str, tuple[int, int, int, int], int, int]
         ],
     ) -> None:
-        """Render translucent gradient strips for about two seconds."""
+        """Render one solid translucent strip per band, plus a brighter 1 px edge line each side.
+
+        It used to draw every band as EIGHT gradient stripes.  The operator's bands are only ~1.6 px
+        tall (floors 5.3 px apart on the minimap), so most stripes rounded onto the same rows and their
+        translucent colours blended into a single smear - his report: "the drawing on minimap tells me
+        that it mixed".  A band that short is now a single solid line of its own colour, and a genuine
+        overlap between two floors shows as two distinct colours instead of one blend.  Taller bands
+        keep the translucent body with brighter top and bottom edges.
+        """
 
         if not hasattr(ctypes, "windll"):
             LOG.warning("layer-band overlay requires Windows")
             return
-        windows: list[tuple[int, int]] = []
+        windows: list[tuple[int, int, int]] = []
         user32 = None
         gdi32 = None
         try:
@@ -227,44 +242,50 @@ class ScreenBlinker(threading.Thread):
             gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
             gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
             instance = kernel32.GetModuleHandleW(None)
-            stripe_count = 8
             for name, (left, top, right, bottom), top_color, bottom_color in bands:
                 height = max(1, bottom - top)
                 LOG.info(
-                    "LAYER BAND OVERLAY: %s screen=(%d,%d,%d,%d)",
-                    name, left, top, right, bottom,
+                    "LAYER BAND OVERLAY: %s screen=(%d,%d,%d,%d) height=%dpx",
+                    name, left, top, right, bottom, height,
                 )
-                for stripe_index in range(stripe_count):
-                    stripe_top = top + round(height * stripe_index / stripe_count)
-                    stripe_bottom = top + round(
-                        height * (stripe_index + 1) / stripe_count
+                # Body (translucent tint) + one bright edge line per side.  The old 8-stripe gradient
+                # collapsed onto single rows for bands this short and blended the floors together.
+                body_color = 0
+                for shift in (0, 8, 16):
+                    start = (top_color >> shift) & 0xFF
+                    end = (bottom_color >> shift) & 0xFF
+                    body_color |= round((start + end) / 2.0) << shift
+                parts = [
+                    (left, top, max(1, right - left), max(1, height), body_color, 120),
+                ]
+                # The operator's bands are only ~2 px tall, so an edge line on each side would land on
+                # the same rows as the body and hide it completely.  Only bands tall enough to have
+                # spare rows get the bright edges; a thin band is simply its own solid line.
+                if height >= 4:
+                    parts.append((left, top, max(1, right - left), 1, top_color, 200))
+                    parts.append(
+                        (left, max(top, bottom - 1), max(1, right - left), 1, bottom_color, 200)
                     )
-                    if stripe_bottom <= stripe_top:
-                        continue
-                    ratio = stripe_index / max(1, stripe_count - 1)
-                    color = 0
-                    for shift in (0, 8, 16):
-                        start = (top_color >> shift) & 0xFF
-                        end = (bottom_color >> shift) & 0xFF
-                        channel = round(start + (end - start) * ratio)
-                        color |= channel << shift
+                parts = tuple(parts)
+                for x, y, width, part_height, color, alpha in parts:
                     brush = gdi32.CreateSolidBrush(color)
                     if not brush:
                         continue
                     hwnd = user32.CreateWindowExW(
-                        # topmost, tool, no-activate, layered
-                        0x00000008 | 0x00000080 | 0x08000000 | 0x00080000,
+                        # topmost, tool, no-activate, layered, CLICK-THROUGH (0x20):
+                        # without it the overlay swallows every click that lands on it, so the
+                        # auto-reconnect's clicks never reached the game while an alarm flashed.
+                        0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
                         "STATIC", None, 0x80000000,
-                        left, stripe_top, max(1, right - left),
-                        max(1, stripe_bottom - stripe_top),
+                        x, y, max(1, width), max(1, part_height),
                         None, None, instance, None,
                     )
                     if hwnd:
-                        windows.append((hwnd, brush))
+                        windows.append((hwnd, brush, alpha))
                     else:
                         gdi32.DeleteObject(brush)
-            for hwnd, brush in windows:
-                user32.SetLayeredWindowAttributes(hwnd, 0, 78, 0x00000002)
+            for hwnd, brush, alpha in windows:
+                user32.SetLayeredWindowAttributes(hwnd, 0, alpha, 0x00000002)
                 user32.SetWindowPos(
                     hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0,
                     0x0001 | 0x0002 | 0x0010 | 0x0040,
@@ -282,7 +303,7 @@ class ScreenBlinker(threading.Thread):
         except Exception:
             LOG.warning("layer-band overlay failed", exc_info=True)
         finally:
-            for hwnd, brush in windows:
+            for hwnd, brush, _alpha in windows:
                 try:
                     if user32 is not None:
                         user32.DestroyWindow(hwnd)
@@ -347,7 +368,9 @@ class ScreenBlinker(threading.Thread):
                     (right - border, top, border, bottom - top),
                 ):
                     hwnd = user32.CreateWindowExW(
-                        0x00000008 | 0x00000080 | 0x08000000,
+                        # topmost/tool/no-activate + CLICK-THROUGH: the outline is decoration and
+                        # must never take a click that belongs to the game.
+                        0x00000008 | 0x00000080 | 0x08000000 | 0x00000020,
                         "STATIC", None, 0x80000000,
                         x, y, max(1, width), max(1, height),
                         None, None, instance, None,
@@ -396,6 +419,133 @@ class ScreenBlinker(threading.Thread):
 
     def _wait(self, seconds: float) -> bool:
         return self.stop_event.wait(seconds)
+
+    # ------------------------------------------------------------------ the live aim marker
+    def show_aim_marker(self, screen_x: int, screen_y: int, *, ttl_seconds: float = 2.0,
+                        size: int = 46) -> None:
+        """Draw a crosshair on the game at a SCREEN point - the aim of the api pass.
+
+        The 测试api video drill draws the answer it aims at inside its own window ("draw the aim"); the
+        automatic pass runs against the live game, so the equivalent is a small click-through overlay
+        at the answered point.  It shows WHAT the pass is aiming at (and that it really takes control),
+        it never takes focus, and it disappears by itself when the pass stops updating it.
+        """
+
+        if not hasattr(ctypes, "windll"):
+            return
+        with self._aim_lock:
+            self._aim_point = (int(screen_x), int(screen_y),
+                               time.monotonic() + max(0.1, float(ttl_seconds)))
+            self._aim_size = max(16, int(size))
+        thread = self._aim_thread
+        if thread is None or not thread.is_alive():
+            self._aim_thread = threading.Thread(target=self._aim_marker_loop,
+                                                name="aim-marker-overlay", daemon=True)
+            self._aim_thread.start()
+
+    def _aim_marker_loop(self) -> None:
+        """Own the crosshair overlay window until the aim stops being updated."""
+
+        if not hasattr(ctypes, "windll"):
+            return
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        kernel32 = ctypes.windll.kernel32
+        user32.CreateWindowExW.argtypes = (
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        )
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.SetLayeredWindowAttributes.argtypes = (
+            wintypes.HWND, wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD,
+        )
+        user32.SetWindowPos.argtypes = (
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        )
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.DestroyWindow.argtypes = (wintypes.HWND,)
+        user32.GetDC.argtypes = (wintypes.HWND,)
+        user32.GetDC.restype = wintypes.HDC
+        user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+        user32.FillRect.argtypes = (wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH)
+        gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
+        gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+
+        key_colour = 0x00FF00FF                       # COLORREF magenta = the transparent colour key
+        key_brush = gdi32.CreateSolidBrush(key_colour)
+        bar_brush = gdi32.CreateSolidBrush(0x000000FF)     # red bars
+        dot_brush = gdi32.CreateSolidBrush(0x00FFFFFF)     # white centre
+        hwnd = 0
+        shown = False
+        last_seen = 0.0
+        try:
+            while not self.stop_event.is_set():
+                with self._aim_lock:
+                    aim = self._aim_point
+                    size = self._aim_size
+                now = time.monotonic()
+                if aim is None:
+                    break
+                x, y, expires = aim
+                if expires < now:
+                    if shown:
+                        user32.ShowWindow(hwnd, 0)
+                        shown = False
+                    if now - last_seen > 5.0:
+                        break                          # nothing new for a long time: give up the window
+                    time.sleep(0.05)
+                    continue
+                last_seen = now
+                if not hwnd:
+                    hwnd = user32.CreateWindowExW(
+                        # topmost, tool window, NO-ACTIVATE, layered, CLICK-THROUGH:
+                        # the marker must never take the keyboard or swallow a click.
+                        0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
+                        "STATIC", None, 0x80000000,
+                        x - size // 2, y - size // 2, size, size, None, None,
+                        kernel32.GetModuleHandleW(None), None,
+                    )
+                    if not hwnd:
+                        LOG.warning("aim marker overlay could not be created")
+                        break
+                    user32.SetLayeredWindowAttributes(hwnd, key_colour, 235, 0x00000001)
+                user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), x - size // 2, y - size // 2,
+                                    size, size, 0x0010 | 0x0040)
+                if not shown:
+                    user32.ShowWindow(hwnd, 4)          # SW_SHOWNOACTIVATE
+                    shown = True
+                hdc = user32.GetDC(hwnd)
+                if hdc:
+                    try:
+                        whole = wintypes.RECT(0, 0, size, size)
+                        user32.FillRect(hdc, ctypes.byref(whole), key_brush)
+                        middle = size // 2
+                        horizontal = wintypes.RECT(0, middle - 1, size, middle + 1)
+                        vertical = wintypes.RECT(middle - 1, 0, middle + 1, size)
+                        user32.FillRect(hdc, ctypes.byref(horizontal), bar_brush)
+                        user32.FillRect(hdc, ctypes.byref(vertical), bar_brush)
+                        centre = wintypes.RECT(middle - 2, middle - 2, middle + 2, middle + 2)
+                        user32.FillRect(hdc, ctypes.byref(centre), dot_brush)
+                    finally:
+                        user32.ReleaseDC(hwnd, hdc)
+                time.sleep(0.05)
+        except Exception:
+            LOG.warning("aim marker overlay failed", exc_info=True)
+        finally:
+            try:
+                if hwnd:
+                    user32.DestroyWindow(hwnd)
+            except Exception:
+                pass
+            for brush in (key_brush, bar_brush, dot_brush):
+                try:
+                    gdi32.DeleteObject(brush)
+                except Exception:
+                    pass
+            with self._aim_lock:
+                self._aim_point = None
 
     def _blink_twice(self) -> None:
         """Show a native, no-activation red overlay above the game window."""
@@ -449,7 +599,10 @@ class ScreenBlinker(threading.Thread):
             width = max(1, user32.GetSystemMetrics(78))
             height = max(1, user32.GetSystemMetrics(79))
             hwnd = user32.CreateWindowExW(
-                0x00000008 | 0x00000080 | 0x08000000,  # topmost/tool/no activate
+                # topmost/tool/no-activate + CLICK-THROUGH (0x20).  This one covers the WHOLE
+                # virtual desktop, so without 0x20 it swallowed every click during the flash -
+                # exactly the window in which the auto-reconnect starts clicking.
+                0x00000008 | 0x00000080 | 0x08000000 | 0x00000020,
                 "STATIC", None, 0x80000000,  # built-in class + WS_POPUP
                 left, top, width, height, None, None, instance, None,
             )

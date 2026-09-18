@@ -499,5 +499,31 @@ class PatrolControllerTests(unittest.TestCase):
             self.assertEqual(snapshot.route_order, ("layer1",))
 
 
+    def test_inverted_patrol_range_is_reported_lowest_first(self) -> None:
+        # The UI-facing range must never describe an empty slice: the profile may hold the pair the
+        # other way round, which made patrol stand still with no visible reason.
+        with tempfile.TemporaryDirectory() as directory:
+            data = profile()
+            data["layers"]["layer3"] = {
+                "layer_y": .400000,
+                "y_tolerance": .020000,
+                "left_most_pos": {"x": .2, "y": .4},
+                "right_most_pos": {"x": .8, "y": .4},
+            }
+            data["patrol_start_layer"] = "layer2"
+            data["patrol_end_layer"] = "layer1"
+            controller = PatrolController(Path(directory) / "map.json", data)
+            self.assertEqual(controller.patrol_range(), ("layer1", "layer2"))
+
+    def test_set_patrol_range_still_refuses_an_inverted_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = PatrolController(
+                Path(directory) / "map.json", profile()
+            )
+            with self.assertRaises(ValueError):
+                controller.set_patrol_range("layer2", "layer1")
+            controller.set_patrol_range("layer1", "layer2")
+            self.assertEqual(controller.patrol_range(), ("layer1", "layer2"))
+
 if __name__ == "__main__":
     unittest.main()

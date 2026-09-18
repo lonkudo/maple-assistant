@@ -45,6 +45,44 @@ LOG = logging.getLogger("api_auto_lie")
 ROOT = Path(__file__).resolve().parent
 
 
+def aim_module():
+    """The ``mouse_aim_controller`` module (公共入口: the automatic api pass uses it too).
+
+    The automatic 自动过测谎 pass executes the API's answer with the same controller the video drill
+    uses, so it needs the same import dance.
+    """
+
+    return _aim_module()
+
+
+def _aim_module():
+    """Import ``mouse_aim_controller`` in either layout -> the module.
+
+    The release copies ``target_tracker/mouse_aim_controller.py`` to the package root; the repository
+    keeps it inside ``target_tracker/``.  Importing it plainly therefore worked only in the built
+    package, and the video drill failed with `No module named 'mouse_aim_controller'` when it ran from
+    the repository (measured: the operator's local run - "it can't open video now").
+    """
+
+    import importlib
+    import sys
+
+    ensure_aim_path()
+    try:
+        return importlib.import_module("mouse_aim_controller")
+    except ImportError:
+        pass
+    try:
+        return importlib.import_module("target_tracker.mouse_aim_controller")
+    except ImportError:
+        tracker_package = ROOT / "target_tracker"
+        if (tracker_package / "__init__.py").is_file():
+            raise
+        # A plain folder without __init__.py: import it as a top-level module by path.
+        sys.path.insert(0, str(tracker_package))
+        return importlib.import_module("mouse_aim_controller")
+
+
 def ensure_aim_path() -> None:
     """Put the bundled ``target_tracker`` folder on sys.path for mouse_aim_controller.
 
@@ -178,7 +216,7 @@ class VideoDrillWindow:
     def image_region(self) -> Optional[tuple[int, int, int, int]]:
         """The screen rectangle the picture occupies (None while it is not displayed)."""
 
-        from mouse_aim_controller import widget_image_region
+        widget_image_region = _aim_module().widget_image_region
 
         width, height = self._image_size
         if width <= 0 or height <= 0:
@@ -322,7 +360,8 @@ class VideoDrillWorker(threading.Thread):
             return
         ensure_aim_path()
         try:
-            from mouse_aim_controller import MouseAimController, claim_cursor
+            _aim = _aim_module()
+            MouseAimController, claim_cursor = _aim.MouseAimController, _aim.claim_cursor
 
             self._aim = MouseAimController(ROI_CLIENT[0], ROI_CLIENT[1],
                                            dead_band_px=6.0, confidence_threshold=0.0,
@@ -343,7 +382,7 @@ class VideoDrillWorker(threading.Thread):
             LOG.debug("aim close failed", exc_info=True)
         ensure_aim_path()
         try:
-            from mouse_aim_controller import release_cursor
+            release_cursor = _aim_module().release_cursor
 
             release_cursor(self._suspended)
         except Exception:
@@ -382,7 +421,7 @@ class VideoDrillWorker(threading.Thread):
 
         ensure_aim_path()
         try:
-            from mouse_aim_controller import read_cursor
+            read_cursor = _aim_module().read_cursor
 
             return read_cursor()
         except Exception:

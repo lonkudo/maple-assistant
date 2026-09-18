@@ -2,13 +2,13 @@ $ErrorActionPreference = 'Stop'
 
 # Development restart helper (excluded from releases).  It restarts the local
 # checkout through the renamed interpreter the launcher uses, so the process
-# name stays "todo_helper.exe".
+# name stays "MapleAssistant.exe".
 $root = [IO.Path]::GetFullPath(
     'C:\Users\SOTTES\Documents\Codex\2026-08-12\skill-creator-c-users-sottes-codex-2'
 )
 $assistantPath = [IO.Path]::GetFullPath((Join-Path $root 'assistant.py'))
 $pythonwPath = [IO.Path]::GetFullPath((Join-Path $root '.venv\Scripts\pythonw.exe'))
-$exePath = [IO.Path]::GetFullPath((Join-Path $root '.venv\Scripts\todo_helper.exe'))
+$exePath = [IO.Path]::GetFullPath((Join-Path $root '.venv\Scripts\MapleAssistant.exe'))
 $workingDirectory = [IO.Path]::GetDirectoryName($assistantPath)
 
 if (-not (Test-Path -LiteralPath $assistantPath -PathType Leaf)) {
@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
 
 function Get-AssistantProcesses {
     Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq 'todo_helper.exe' -and
+        $_.Name -eq 'MapleAssistant.exe' -and
         $_.ExecutablePath -eq $exePath -and
         $_.CommandLine -like "*$workingDirectory*"
     }
@@ -44,7 +44,7 @@ while ($remaining.Count -ne 0 -and (Get-Date) -lt $deadline) {
 }
 
 if ($remaining.Count -ne 0) {
-    throw 'The previous todo_helper instance did not stop cleanly'
+    throw 'The previous MapleAssistant instance did not stop cleanly'
 }
 
 Start-Process -FilePath $exePath `

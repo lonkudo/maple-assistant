@@ -32,6 +32,7 @@ class FocusWorker(threading.Thread):
         refocus_interval_seconds: float = 1.0,
         on_focus_lost: Optional[Callable[[], None]] = None,
         lie_pass_event: Optional[threading.Event] = None,
+        reconnect_active_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="focus-worker", daemon=True)
         self.key_sender = key_sender
@@ -43,6 +44,9 @@ class FocusWorker(threading.Thread):
         # foreground gate open - so the real foreground state keeps being probed
         # for the whole pass instead of being inferred from keyboard ownership.
         self.lie_pass_event = lie_pass_event
+        # Set while the auto-reconnect owns the machine: the automation switch must stay CLEARED then,
+        # otherwise this worker sets it again 200 ms later and attack/jump start on the login page.
+        self.reconnect_active_event = reconnect_active_event
         self.poll_interval = max(0.05, float(poll_interval))
         self.focus_lost_grace_seconds = max(0.0, float(focus_lost_grace_seconds))
         self.refocus_interval_seconds = max(0.25, float(refocus_interval_seconds))
@@ -139,11 +143,17 @@ class FocusWorker(threading.Thread):
                     self.game_focused_event.set()
                 else:
                     self.game_focused_event.clear()
-                active = bool(input_enabled and game_focused)
+                reconnect_owns = bool(
+                    self.reconnect_active_event is not None
+                    and self.reconnect_active_event.is_set()
+                )
+                active = bool(input_enabled and game_focused and not reconnect_owns)
                 if active:
                     self.automation_active_event.set()
                 else:
                     self.automation_active_event.clear()
+                    if reconnect_owns:
+                        LOG.info("focus gate: automation stays paused for the auto-reconnect")
                     # One forced release at the active -> inactive edge is
                     # enough.  Repeating resets every poll could race a
                     # successful refocus/new input session.

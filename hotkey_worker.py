@@ -172,15 +172,34 @@ class HotkeyWorker(threading.Thread):
         self_marked = int(extra_info) == SELF_INPUT_EXTRA_INFO
         return lower_il or self_marked
 
-    def _queue_action(self, action: str) -> None:
-        # Ctrl+Q is a start/cancel toggle.  It must bypass the normal two-
-        # second action cooldown so a second physical press can immediately
-        # cancel a pending trade wait.  MOD_NOREPEAT/the hook key-up state
-        # still prevent a held chord from firing repeatedly.
-        repeatable = (
-            action.startswith("adjust_fixed_attack_interval:")
-            or action == "trade:invite"
+    # Actions that must never be rate limited.  These are the recording/selection steps the
+    # operator drives by hand while mapping a floor (Ctrl+arrows, Ctrl+Down, Ctrl+Home,
+    # Ctrl+Insert, Ctrl+Delete): the two-second cooldown silently swallowed fast presses and looked
+    # like a dead hotkey (observed: four "hotkey cooldown: record:right_most_pos" in a row right
+    # after the recordings stopped landing).  Both delivery paths already fire at most once per
+    # physical press - MOD_NOREPEAT natively and the hook's per-key latch - so the cooldown adds
+    # nothing for them.  Ctrl+Q (trade) and the fixed-attack interval keep their existing
+    # exemption.
+    _COOLDOWN_EXEMPT_PREFIXES = (
+        "record:",
+        "select_next_layer",
+        "select_next_patrol_start",
+        "add_highest_layer",
+        "delete_highest_layer",
+        "adjust_fixed_attack_interval:",
+    )
+    _COOLDOWN_EXEMPT_ACTIONS = ("trade:invite",)
+
+    def _cooldown_exempt(self, action: str) -> bool:
+        return (
+            action in self._COOLDOWN_EXEMPT_ACTIONS
+            or action.startswith(self._COOLDOWN_EXEMPT_PREFIXES)
         )
+
+    def _queue_action(self, action: str) -> None:
+        # Exempt actions bypass the two-second cooldown; MOD_NOREPEAT / the hook key-up state still
+        # prevent a held chord from firing repeatedly.
+        repeatable = self._cooldown_exempt(action)
         now = time.monotonic()
         last = self._last_action_at.get(action)
         if (not repeatable and last is not None

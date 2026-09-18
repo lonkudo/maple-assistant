@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import json
+
 import numpy as np
 
 from countdown_worker import play_mp3
@@ -22,7 +24,23 @@ LOG = logging.getLogger(__name__)
 
 TRADE_MENU_OFFSET = (60, 60)
 CONFIRM_BUTTON = (240, 110)
-ACCEPT_INVITATION = (885, 672)
+# 交易接受按钮：以游戏客户区**右下角**为基准的逻辑像素偏移（1366×768 预设实测值）。
+# 右下角 = 客户区原点 + 客户区宽高（GetClientRect），即 right = left + width, bottom = top + height。
+# 旧的绝对值 (885, 672) 只在 1366×768 下等于 (right-481, bottom-96)，其他尺寸必然点偏。
+ACCEPT_INVITATION_OFFSET = (206, 91)
+# 更窄的预设（例如 1080×768）里偏移量是否跟着界面缩小：
+#   "width" = 按宽度比例缩小（hud_scale_for，1080 时 0.7906）——1366×768 实测值的等比假设
+#   "none"  = 不缩小（界面固定像素、贴右下角）
+# 两种都可能，取决于这台机器上游戏如何渲染交易窗，所以留成可校准项：见下面的
+# ``trade_offsets.json`` 与 ``trade_offset_probe.py``。
+# 已用实测值验证：1080×768 客户区上实测偏移是 (165, 71)，而 0.7906×(206, 91) = (163, 72)，
+# 相差 2px（鼠标悬停精度）——即偏移量确实随宽度比例缩小。1366×768 下比例为 1.0，两种模式
+# 等价，所以这个默认值不会影响已经正常的那台机器。
+ACCEPT_INVITATION_SCALE = "width"
+# 每机校准文件（随包分发时被排除，用户自己生成）。内容示例：
+#   {"accept_offset": [206, 91], "accept_scale": "none"}
+ACCEPT_OFFSET_FILE = "trade_offsets.json"
+ACCEPT_SCALE_MODES = ("width", "none")
 TRADE_MESSAGE_BOX = (460, 200)
 # Small sample at the requested position inside the known trader-check area.
 PRESENCE_BOX = (145, 105, 20, 20)
@@ -182,21 +200,193 @@ class TradeWorker(threading.Thread):
         del client_height, y
         return round(value * hud_scale_for(client_width))
 
+    @staticmethod
+    def accept_invitation_offset(
+        width: int,
+        *,
+        offset: Optional[tuple[int, int]] = None,
+        scale: Optional[str] = None,
+    ) -> tuple[int, int]:
+        """The (right, bottom) pixel offsets to subtract from the client's bottom-right corner."""
+
+        offset_x, offset_y = ACCEPT_INVITATION_OFFSET if offset is None else offset
+        mode = ACCEPT_INVITATION_SCALE if scale is None else scale
+        if mode == "none":
+            return int(offset_x), int(offset_y)
+        factor = hud_scale_for(width)
+        return round(offset_x * factor), round(offset_y * factor)
+
+    @classmethod
+    def accept_invitation_point(
+        cls,
+        geometry: tuple[int, int, int, int],
+        *,
+        offset: Optional[tuple[int, int]] = None,
+        scale: Optional[str] = None,
+    ) -> tuple[int, int]:
+        """Screen point of the trade-accept button, measured from the client's bottom-right.
+
+        ``geometry`` is ``(left, top, width, height)`` of the game CLIENT in screen coordinates, as
+        returned by ``_client_geometry`` (``left/top`` is the client origin on the desktop, so
+        ``left + width`` and ``top + height`` are the client's right/bottom edges).
+        """
+
+        left, top, width, height = geometry
+        offset_x, offset_y = cls.accept_invitation_offset(
+            width, offset=offset, scale=scale
+        )
+        return left + width - offset_x, top + height - offset_y
+
+    @staticmethod
+    def load_accept_calibration(
+        path: Optional[Path] = None,
+    ) -> tuple[tuple[int, int], str]:
+        """Read the per-machine calibration; returns ``(offset, scale_mode)``.
+
+        ``trade_offsets.json`` is written by ``trade_offset_probe.py`` (never shipped): the operator
+        hovers the cursor over the accept button on the machine in question and the probe records
+        the real offset from the client's bottom-right corner, which is what tells us whether that
+        machine shrinks the offsets or not.
+        """
+
+        default = ((int(ACCEPT_INVITATION_OFFSET[0]), int(ACCEPT_INVITATION_OFFSET[1])),
+                   ACCEPT_INVITATION_SCALE)
+        config_path = Path(path) if path is not None else Path(__file__).with_name(
+            ACCEPT_OFFSET_FILE
+        )
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return default
+        if not isinstance(data, dict):
+            return default
+        raw = data.get("accept_offset")
+        offset = default[0]
+        if (isinstance(raw, (list, tuple)) and len(raw) == 2
+                and all(isinstance(value, (int, float)) for value in raw)):
+            offset = (int(round(float(raw[0]))), int(round(float(raw[1]))))
+        mode = str(data.get("accept_scale", default[1])).strip().lower()
+        if mode not in ACCEPT_SCALE_MODES:
+            mode = default[1]
+        return offset, mode
+
+    @staticmethod
+    def _describe_window(hwnd: int) -> str:
+        """Identity of a window for the log: class, pid, executable, client and window rects."""
+
+        try:
+            import win32gui
+            import win32process
+
+            _thread, pid = win32process.GetWindowThreadProcessId(hwnd)
+            class_name = win32gui.GetClassName(hwnd)
+            title = win32gui.GetWindowText(hwnd)
+            try:
+                import win32api
+                import win32con
+
+                handle = win32api.OpenProcess(
+                    win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+                    False, pid,
+                )
+                exe = win32process.GetModuleFileNameEx(handle, 0)
+                win32api.CloseHandle(handle)
+            except Exception:
+                exe = "?"
+            client_rect = win32gui.GetClientRect(hwnd)
+            window_rect = win32gui.GetWindowRect(hwnd)
+            return (
+                f"hwnd={hwnd} class={class_name!r} pid={pid} exe={exe!r} "
+                f"title={title.encode('ascii', 'backslashreplace').decode()!r} "
+                f"client={client_rect[2]}x{client_rect[3]} window_rect={window_rect}"
+            )
+        except Exception as exc:
+            return f"hwnd={hwnd} (could not describe: {exc!r})"
+
+    def _game_window_candidates(self, win32gui: Any) -> list[int]:
+        """Visible top-level windows of the game process, largest client area first.
+
+        ``key_sender.hwnd`` is normally the game view, but on some machines it can be another
+        window of the same process (a launcher/login dialog): its client rect would then place the
+        bottom-right corner somewhere else and a corner-anchored click misses.  This list lets the
+        caller fall back to the biggest client of that same process - the game view.
+        """
+
+        base = getattr(self.key_sender, "hwnd", None)
+        if not base:
+            return []
+        try:
+            import win32process
+
+            _thread, pid = win32process.GetWindowThreadProcessId(base)
+        except Exception:
+            return []
+        found: list[int] = []
+
+        def visit(hwnd: int, _extra: object) -> bool:
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                _thread, other_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if other_pid != pid:
+                    return True
+                rect = win32gui.GetClientRect(hwnd)
+                if rect[2] >= 640 and rect[3] >= 480:
+                    found.append(hwnd)
+            except Exception:
+                return True
+            return True
+
+        try:
+            win32gui.EnumWindows(visit, None)
+        except Exception:
+            return []
+
+        def area(hwnd: int) -> int:
+            rect = win32gui.GetClientRect(hwnd)
+            return int(rect[2]) * int(rect[3])
+
+        return sorted(found, key=area, reverse=True)
+
     def _client_geometry(self) -> Optional[tuple[int, int, int, int]]:
         try:
             import win32gui
+
             # Reuse the exact handle just selected by WindowKeySender.  Its
             # lookup already supports title variants; a second exact-title
             # FindWindow here would make trade fail on those clients.
             hwnd = getattr(self.key_sender, "hwnd", None)
-            if not hwnd or not win32gui.IsWindow(hwnd):
-                hwnd = win32gui.FindWindow(None, self.window_title)
-            if not hwnd or not win32gui.IsWindowVisible(hwnd):
+            candidates: list[int] = []
+            if hwnd and win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd):
+                candidates.append(int(hwnd))
+            # A window of the game process whose client is too small is not the game view (a
+            # launcher or dialog); prefer the process's largest visible client then.
+            usable = [
+                candidate for candidate in candidates
+                if min(win32gui.GetClientRect(candidate)[2],
+                       win32gui.GetClientRect(candidate)[3]) > 0
+            ]
+            for candidate in self._game_window_candidates(win32gui):
+                if candidate not in candidates:
+                    usable.append(candidate)
+            if not usable:
+                found = win32gui.FindWindow(None, self.window_title)
+                if found and win32gui.IsWindowVisible(found):
+                    usable.append(int(found))
+            if not usable:
+                LOG.warning("trade: no usable game window found for the click geometry")
                 return None
-            left, top = win32gui.ClientToScreen(hwnd, (0, 0))
-            client_rect = win32gui.GetClientRect(hwnd)
+            chosen = usable[0]
+            left, top = win32gui.ClientToScreen(chosen, (0, 0))
+            client_rect = win32gui.GetClientRect(chosen)
             right, bottom = win32gui.ClientToScreen(
-                hwnd, (client_rect[2], client_rect[3])
+                chosen, (client_rect[2], client_rect[3])
+            )
+            LOG.info(
+                "trade client geometry: %s -> origin=(%d, %d) size=%dx%d "
+                "bottom_right=(%d, %d)",
+                self._describe_window(chosen), left, top, right - left, bottom - top,
+                right, bottom,
             )
             return left, top, right - left, bottom - top
         except Exception:
@@ -451,8 +641,21 @@ class TradeWorker(threading.Thread):
         geometry = self._client_geometry()
         if geometry is None:
             return
-        point = self._point(geometry, ACCEPT_INVITATION)
-        LOG.info("trade accept click client=%s screen=%s", ACCEPT_INVITATION, point)
+        point = self.accept_invitation_point(geometry)
+        left, top, width, height = geometry
+        # Both hypotheses are logged: whichever point the operator sees the cursor land on tells us
+        # immediately whether this machine shrinks the offsets or keeps them fixed.
+        scaled = self.accept_invitation_point(geometry, scale="width")
+        fixed = self.accept_invitation_point(geometry, scale="none")
+        LOG.info(
+            "trade accept click: client=%dx%d origin=(%d, %d) bottom_right=(%d, %d) "
+            "offset=%s scale_mode=%s scale=%.4f applied=%s screen=%s "
+            "(scaled=%s fixed=%s)",
+            width, height, left, top, left + width, top + height,
+            ACCEPT_INVITATION_OFFSET, ACCEPT_INVITATION_SCALE,
+            hud_scale_for(width), self.accept_invitation_offset(width), point,
+            scaled, fixed,
+        )
         VirtualMouse.click(*point)
         time.sleep(0.20)
         confirmed = self._confirm_trade(geometry)

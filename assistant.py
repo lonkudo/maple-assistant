@@ -163,8 +163,8 @@ def _show_already_running_notice() -> None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.MessageBoxW(
             None,
-            "todo_helper 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
-            "todo_helper",
+            "MapleAssistant 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
+            "MapleAssistant",
             0x00000040,  # MB_ICONINFORMATION
         )
     except Exception:
@@ -389,9 +389,20 @@ def main() -> int:
 
     # Imports are delayed so `--help` works even before dependencies are installed.
     import numpy as np
-    from capture_worker import CaptureWorker, FrameBus
+    from capture_worker import (
+        LIE_WATCH_INTERVAL_SECONDS,
+        CaptureWorker,
+        FrameBus,
+        ParkedWatchCapture,
+        WatchFeed,
+    )
     from character_worker import CharacterWorker
-    from movement_worker import MovementWorker, _layer_y_band, detect_layer_by_y
+    from movement_worker import (
+        MovementWorker,
+        _layer_world_y_band,
+        _layer_y_band,
+        detect_layer_by_y,
+    )
     from status_worker import (
         BarStatusDetector,
         StatusConfig,
@@ -414,6 +425,7 @@ def main() -> int:
     from lie_screenshot_recorder import LieScreenshotRecorder
     from screen_blinker import ScreenBlinker
     from telegram_notifier import TelegramNotifier
+    from versioning import version_label
     from config_store import get_config_store
     from focus_worker import FocusWorker
     from minimap_detector import (
@@ -443,6 +455,9 @@ def main() -> int:
     moving_active = threading.Event()
     pickup_active = threading.Event()
     automation_active = threading.Event()
+    # Set while the 自动重连 owns the machine: the focus gate must not re-arm the automation then
+    # (otherwise attack/jump start on the login page - the character is not in game yet).
+    reconnect_active = threading.Event()
     game_focused = threading.Event()
     patrol_preparing = threading.Event()
     trade_capture_active = threading.Event()
@@ -511,7 +526,11 @@ def main() -> int:
         patrol_controller.set_enabled(False)
 
     def stop_patrol_for_disconnect() -> None:
-        """Immediately disarm patrol input after a confirmed disconnect."""
+        """Immediately disarm patrol input after a confirmed disconnect.
+
+        Nothing is remembered here: whether the patrol comes back after the reconnect is decided by
+        the operator's own patrol INTENT in the UI (开始巡逻 / 停止巡逻).  This function only stops.
+        """
 
         if not patrol_controller.is_enabled():
             return
@@ -549,6 +568,11 @@ def main() -> int:
                  map_profile.get("patrol_enabled", False),
                  " -> ".join(map_profile.get("route_order", [])))
 
+    # The gate the shared capture runs on.  It is ALSO what tells the parked 测谎 watch to stand down: if
+    # this is set, the detector is already being fed by the shared capture and a second one is waste.
+    shared_capture_gate = _AnyEvent(
+        game_focused, patrol_preparing, trade_capture_active
+    )
     capture_worker = CaptureWorker(
         args.window_title,
         args.interval,
@@ -561,9 +585,7 @@ def main() -> int:
         # viewport scales).
         status_capture_box_provider=status_capture_pixel_box,
         status_capture_interval=args.status_interval,
-        capture_enabled_event=_AnyEvent(
-            game_focused, patrol_preparing, trade_capture_active
-        ),
+        capture_enabled_event=shared_capture_gate,
         fast_capture_event=dropping_active,
         fast_interval=0.10,
         # Lie pass: ~30 fps while a pass is running, so a pass is fed at the same
@@ -576,12 +598,21 @@ def main() -> int:
         debug_minimap_fallback=MINIMAP_FALLBACK_REGION, # <------ ADD THIS LINE
     )
 
-    def prepare_map_session(*, stationary_reanchor: bool = True) -> None:
+    def prepare_map_session(*, stationary_reanchor: bool = True, show_overlays: bool = True,
+                            require_layer: bool = True) -> None:
         """Verify the recorded map name and re-anchor transient world Y.
 
         ``stationary_reanchor`` is False for an AUTOMATIC patrol resume: 站桩攻击
         then keeps the standing position that the user's own manual Start Patrol
         recorded instead of re-recording the current (possibly displaced) marker.
+
+        ``show_overlays`` is False for the AUTOMATIC restart after an auto-reconnect: the detection
+        and layer-band overlays are a calibration aid for the operator pressing 开始巡逻, and the
+        band overlay waits until it is hidden - a reconnect must not block on that.
+
+        ``require_layer`` is False for the same automatic restart: the character may be OFF the patrol
+        route after a reconnect, and then the patrol still has to start (from the route's base layer)
+        so the movement worker's out-of-route return logic can bring it back.
 
         The old ``abort_event`` hook (a lie takeover abandoning this session) is
         gone with the local lie pass.
@@ -742,19 +773,20 @@ def main() -> int:
         # The colours make the startup check easy to read: green is the
         # detected minimap frame, yellow is the marker/patrol analysis area,
         # and blue is the HP/MP status capture area.
-        screen_blinker.show_detection_regions(
-            fresh_frame.window_rect,
-            fresh_frame.image.size,
-            (
-                ("minimap", detection.window_box, 0x0000FF00),
-                ("marker/patrol", detection.analysis_box, 0x0000FFFF),
-                ("hp/mp", status_box, 0x00FF0000),
-            ),
-        )
-        logging.info(
-            "DETECTION OVERLAY: flashing minimap (green), marker/patrol "
-            "(yellow), and HP/MP (blue) regions"
-        )
+        if show_overlays:
+            screen_blinker.show_detection_regions(
+                fresh_frame.window_rect,
+                fresh_frame.image.size,
+                (
+                    ("minimap", detection.window_box, 0x0000FF00),
+                    ("marker/patrol", detection.analysis_box, 0x0000FFFF),
+                    ("hp/mp", status_box, 0x00FF0000),
+                ),
+            )
+            logging.info(
+                "DETECTION OVERLAY: flashing minimap (green), marker/patrol "
+                "(yellow), and HP/MP (blue) regions"
+            )
 
         # Detect the floor on the fresh frame BEFORE setting the transient
         # world-Y origin. Anchoring unconditionally to the configured patrol
@@ -805,13 +837,125 @@ def main() -> int:
                     "LAYER BAND: %s y=(%.6f, %.6f)",
                     layer_name, band[0], band[1],
                 )
-        screen_blinker.show_layer_bands(
-            fresh_frame.window_rect,
-            fresh_frame.image.size,
-            detection.analysis_box,
-            layer_bands,
-            wait_until_hidden=True,
-        )
+        # The world-Y bands are what decides a floor when the marker reading is ambiguous, so a recording
+        # whose floors disagree in world Y is a silent trap: his 13:16 log had the character standing on
+        # layer1 (marker_y 0.676829 inside layer1's band) and the worker answering layer2 from the world
+        # signal, because a freshly recorded floor carried the PREVIOUS floor's world origin.  Print every
+        # band and say it out loud when one floor's band reaches another floor's anchor.
+        world_anchors: dict[str, float] = {}
+        world_bands: dict[str, tuple[float, float]] = {}
+        for layer_name in snapshot.route_order:
+            layer = snapshot.layers.get(layer_name, {})
+            if not isinstance(layer, dict) or "layer_world_y" not in layer:
+                continue
+            anchor = float(layer["layer_world_y"])
+            world_anchors[layer_name] = anchor
+            band = _layer_world_y_band(
+                layer, float(layer.get("world_y_tolerance", 0.75))
+            )
+            if band is None:
+                continue
+            world_bands[layer_name] = band
+            logging.info(
+                "LAYER WORLD BAND: %s world=(%.6f, %.6f) anchor=%.6f",
+                layer_name, band[0], band[1], anchor,
+            )
+        for layer_name, (low, high) in world_bands.items():
+            for other_name, other_anchor in world_anchors.items():
+                if other_name == layer_name:
+                    continue
+                if low - 1e-9 <= other_anchor <= high + 1e-9:
+                    logging.warning(
+                        "LAYER WORLD BAND OVERLAP: %s's world band (%.6f, %.6f) contains %s's anchor "
+                        "%.6f - the recorded world Y values of these floors disagree, so the world "
+                        "signal cannot separate them; re-record %s or %s",
+                        layer_name, low, high, other_name, other_anchor,
+                        layer_name, other_name,
+                    )
+        # A recorded floor outside route_order cannot be patrolled, but it still takes part in the marker
+        # match: one overlapping band there is enough to make a good marker reading look "ambiguous" and
+        # hand the floor decision to the world signal.  Name them.
+        route_names = set(snapshot.route_order)
+        for layer_name, layer in snapshot.layers.items():
+            if layer_name in route_names or not isinstance(layer, dict):
+                continue
+            band = _layer_y_band(
+                layer, float(layer.get("y_tolerance", 0.020000))
+            )
+            logging.warning(
+                "LAYER EXTRA RECORDED FLOOR: %s y=%s is not in route_order=%s; it cannot be patrolled, "
+                "but a marker Y inside its band makes the reading ambiguous (this is how a stale or "
+                "duplicate recording steers the patrol onto another floor)",
+                layer_name,
+                (f"({band[0]:.6f}, {band[1]:.6f})" if band is not None else "n/a"),
+                list(snapshot.route_order),
+            )
+        # Sanity of the RECORDING itself: a point saved with a poor marker reading, or points of one
+        # floor saved in different minimap canvas frames, is what makes a floor's band wide and lets a
+        # marker on the floor below match it (his 13:37 report: "the layer2 should be a line but it is a
+        # band").  Both are named here so the floor can simply be re-recorded.
+        try:
+            raw_layers = patrol_controller.snapshot().layers
+        except Exception:
+            raw_layers = {}
+        for layer_name, layer in raw_layers.items():
+            if not isinstance(layer, dict):
+                continue
+            frames: dict[tuple[float, float], list[str]] = {}
+            heights: list[float] = []
+            weak: list[tuple[str, float, float]] = []
+            for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+                point = layer.get(point_name)
+                coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
+                if not isinstance(coordinate, dict):
+                    continue
+                recorded = coordinate.get("recorded_layout")
+                if isinstance(recorded, dict):
+                    try:
+                        frame = (round(float(recorded["canvas_top"]), 1),
+                                 round(float(recorded["canvas_height"]), 1))
+                    except (KeyError, TypeError, ValueError):
+                        frame = None
+                    if frame is not None:
+                        frames.setdefault(frame, []).append(point_name)
+                if isinstance(point.get("y"), (int, float)):
+                    heights.append(float(point["y"]))
+                confidence = point.get("tracking_confidence")
+                if isinstance(confidence, (int, float)) and isinstance(point.get("y"), (int, float)):
+                    weak.append((point_name, float(confidence), float(point["y"])))
+            if len(frames) > 1:
+                logging.warning(
+                    "LAYER RECORDING: %s's points were saved in %d different minimap canvas frames (%s) - "
+                    "the saved heights cannot be re-projected against each other, so a floor can end up "
+                    "drawn as a band (or matching another floor's marker) instead of a line; re-record "
+                    "this floor",
+                    layer_name, len(frames),
+                    "; ".join(
+                        f"{'/'.join(names)} canvas_top={frame[0]:.0f} height={frame[1]:.0f}"
+                        for frame, names in frames.items()
+                    ),
+                )
+            if len(heights) >= 2 and (max(heights) - min(heights)) >= 0.05:
+                # The floor's own recorded heights disagree by >= 4 px of the minimap: either a genuine
+                # stair/bench platform, or a point saved while the marker reading was weak.  The weak
+                # reading is named so a bogus point can be re-recorded instead of guessed at.
+                for point_name, confidence, y in weak:
+                    if confidence >= 0.30:
+                        continue
+                    logging.warning(
+                        "LAYER RECORDING: %s.%s sits %.1f px away from this floor's other points and was "
+                        "saved with a weak marker reading (tracking_confidence=%.3f) - re-record it if "
+                        "this floor is not a ramp",
+                        layer_name, point_name, abs(y - min(heights)) * 82.0, confidence,
+                    )
+        if show_overlays:
+            screen_blinker.show_layer_bands(
+                fresh_frame.window_rect,
+                fresh_frame.image.size,
+                detection.analysis_box,
+                layer_bands,
+                wait_until_hidden=True,
+            )
         # The overlay is deliberately gone before input is armed. Publish one
         # clean post-overlay frame for screen-capture-based machines so the
         # movement worker cannot consume a colour-tinted minimap.
@@ -830,10 +974,28 @@ def main() -> int:
                 "yellow character marker was not detected during patrol startup"
             )
         if detected_name is None:
-            raise OSError(
-                f"character marker Y={marker.y:.6f} does not match any "
-                "recorded layer; record the current map layers again"
+            if require_layer:
+                raise OSError(
+                    f"character marker Y={marker.y:.6f} does not match any "
+                    "recorded layer; record the current map layers again"
+                )
+            # The automatic restart after a reconnect (the operator: "you should first detect current
+            # layer, if it is out of patrol route then check how to go back"): the character is not on
+            # any recorded layer band, so the patrol starts from the route's BASE layer and the
+            # movement worker's out-of-route return logic (Alt+Down when the world Y is too high,
+            # climb/return when it is lower) brings it back.  Marker Y and the bands are logged above,
+            # so the decision is readable from the log.
+            fallback = next(iter(snapshot.route_order), None)
+            if fallback is None:
+                raise OSError("the patrol route has no layer to start from")
+            logging.warning(
+                "MAP SESSION: marker Y=%.6f is OUTSIDE every recorded layer band (the character is "
+                "off the patrol route) - starting the patrol from the base layer %s so the "
+                "out-of-route return logic can bring it back",
+                marker.y,
+                fallback,
             )
+            detected_name = fallback
         anchor_name = str(detected_name)
         anchor_layer = snapshot.layers.get(anchor_name, {})
         anchor_world_y = anchor_layer.get("layer_world_y")
@@ -863,6 +1025,42 @@ def main() -> int:
             patrol_preparing,
         )
         return armed
+
+    def restart_patrol_after_reconnect() -> bool:
+        """Start Patrol again after a reconnect - no manual start needed.
+
+        The operator's reports through v1.0.30: "it don't start patrol, it didn't go into detect layer
+        and check if back to patrol route logic ... what i want is that i don't need to manually
+        restart patrol".
+
+        Called by the UI (on Tk's thread) only when the operator's patrol INTENT is set, so this does
+        the work without asking again: the same preparation as a manual Start Patrol, with two
+        differences - the overlays are skipped, and a layer that is NOT on the patrol route does not
+        refuse the start (the patrol then begins from the route's base layer and the movement worker's
+        out-of-route return logic walks the character back: Alt+Down when the world Y is too high, the
+        return/climb logic when it is lower).
+        """
+
+        def prepare() -> None:
+            try:
+                prepare_map_session(show_overlays=False, require_layer=False)
+            except OSError as exc:
+                # The map session could not be prepared at all (no minimap, no marker, wrong map):
+                # still arm the patrol, so the workers can recover instead of staying dead.
+                logging.warning("RECONNECT PATROL RESTART: the map session could not be prepared "
+                                "(%s) - starting the patrol anyway", exc)
+
+        try:
+            armed = _start_live_input(key_sender, automation_active, prepare, patrol_preparing)
+        except OSError as exc:
+            logging.warning("RECONNECT PATROL RESTART refused at the window/calibration step: %s", exc)
+            return False
+        if armed:
+            patrol_controller.set_enabled(True)
+            logging.warning("RECONNECT PATROL RESTART: patrol resumed automatically after the "
+                            "reconnect (layer detection ran; off-route characters are walked back by "
+                            "the out-of-route return logic)")
+        return bool(armed)
 
     attack_workers = []
     # Jump/buff motion keys are executed one at a time by the motion arbiter
@@ -927,6 +1125,11 @@ def main() -> int:
         reconnect_results,
         window_title=args.window_title,
         dry_run=args.dry_run,
+        # The reconnect stands the automation down while it runs: arming live input for its own keys
+        # otherwise wakes the attack worker too (measured 19:07: `attack repetition: a` every second
+        # through the whole sequence).
+        automation_event=automation_active,
+        reconnect_active_event=reconnect_active,
     )
 
     # 测试api (附加功能 panel): pick a video, play it at the API's 5 fps and upload each frame's ROI
@@ -934,6 +1137,8 @@ def main() -> int:
     # only be started once.  api_lie_test.py (the older single-frame screen drill) has no panel
     # button any more; it stays as an offline tool for work/ scripts and the test suite.
     api_test_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=256)
+    # How long one automatic 自动过测谎 pass keeps feeding the backend after a lie window appears.
+    AUTO_LIE_PASS_SECONDS = 8.0
 
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
                                    fps=5.0):
@@ -958,6 +1163,43 @@ def main() -> int:
             fps=fps,
             aim_enabled=True,
             window_title=args.window_title,
+        )
+
+    # 自动过测谎 (附加功能 panel): a selection that runs the api pass by itself when the game's lie
+    # window appears.  It reuses the shipped single-frame drill (`api_lie_test`), which captures the
+    # game window, uploads the ROI to the RoiTrack backend and aims at the answer - the same workflow as
+    # 测试api, triggered by the lie event instead of the button.  One worker per event, because a thread
+    # cannot restart.
+    api_auto_lie_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=64)
+
+    def make_api_auto_lie_worker():
+        """One automatic pass for one lie window - the SAME workflow as 测试api (the video drill)."""
+
+        from api_lie_test import ApiLieTestWorker
+        # The drill's measured AWAIT_SECOND_WINDOW wait, so the automatic pass runs the drill's workflow
+        # in the live game: the lie window's HUD square is detected the moment the window opens, its real
+        # content needs ~3 s (his clip: the first 16 frames were one frozen image and the service answered
+        # abandon_frame_hold for every one of them), so we connect FIRST, wait that long WITHOUT sending a
+        # single frame, and only then start the picture push.  The wait is part of the pass length, exactly
+        # like the drill's 时长.
+        from api_lie_video import AWAIT_SECOND_WINDOW_SEC
+
+        logging.info("自动过测谎: starting a pass for the lie window")
+        return ApiLieTestWorker(
+            results=api_auto_lie_results,
+            stop_event=stop_event,
+            window_title=args.window_title,
+            key="",
+            key_sender=key_sender,
+            duration=AUTO_LIE_PASS_SECONDS,
+            await_seconds=AWAIT_SECOND_WINDOW_SEC,
+            # The answer must be EXECUTED, not just measured: the pass drives the cursor to the point
+            # the API returns (the vendor doc: "鼠标/执行层一般用 x / y（372×248 协议 ROI）"), exactly like
+            # the 测试api video drill.  Without it the lie window was never answered.
+            aim_enabled=True,
+            # ... and it is DRAWN: a click-through crosshair overlay on the game at the answered point,
+            # the live equivalent of the crosshair the video drill shows in its own window.
+            aim_overlay=screen_blinker.show_aim_marker,
         )
 
     def _on_disconnect_event() -> None:
@@ -1018,6 +1260,36 @@ def main() -> int:
     )
     lie_detector_worker.add_lie_seen_callback(
         screenshot_recorder.on_lie_seen
+    )
+    # 自动过测谎 and 自动重连 are EVENT workflows, not patrol workflows: while the patrol capture is parked
+    # this watch keeps their detectors fed, so a lie window or a 掉线 still fires with no Start Patrol.
+    # Each feed is armed by its own panel selection (测谎 / 掉线).
+    lie_detection_armed = threading.Event()
+    disconnect_watch_armed = threading.Event()
+    parked_watch = ParkedWatchCapture(
+        args.window_title,
+        (
+            WatchFeed(
+                lie_detector_frames,
+                "测谎 (lie detector)",
+                armed_event=lie_detection_armed,
+                interval=LIE_WATCH_INTERVAL_SECONDS,
+            ),
+            WatchFeed(
+                character_frames,
+                "掉线/自动重连 (disconnect detection)",
+                armed_event=disconnect_watch_armed,
+                # The alert threshold is 120 missing FRAMES (= 30s at the normal capture interval), so the
+                # disconnect feed keeps the normal cadence instead of the slower lie one.
+                interval=float(args.interval),
+                # A frame of the game window while the assistant's own panel covers it is not the game:
+                # counting it would fire a false 掉线 alert and a reconnect that clicks the game.
+                requires_game_foreground=True,
+            ),
+        ),
+        stop_event,
+        patrol_capture_event=shared_capture_gate,
+        foreground_check=key_sender.is_game_foreground,
     )
     # 拾取 (Z) 已并入移动线程：仅在三个移动阶段与方向键同按同放。
     status_worker = StatusWorker(
@@ -1168,6 +1440,9 @@ def main() -> int:
             diamond_size_tracker=movement_diamond_tracker,
             structure_tracker=structure_tracker,
             automation_active_event=automation_active,
+            # 自动重连: the falling edge of this event makes patrol re-check the route as its very
+            # first act after the reconnect gives the input back.
+            reconnect_active_event=reconnect_active,
             motion_arbiter=motion_arbiter,
             moving_active_event=moving_active,
             pickup_active_event=pickup_active,
@@ -1269,6 +1544,8 @@ def main() -> int:
         alert_callback=telegram_notifier.notify,
         on_disconnect=stop_patrol_for_disconnect,
         disconnect_event_callback=_on_disconnect_event,
+        # No disconnect alert while 自动重连 is running: its login screens have no yellow marker.
+        reconnect_active_event=reconnect_active,
     )
     focus_worker = FocusWorker(
         key_sender,
@@ -1279,6 +1556,7 @@ def main() -> int:
         # A lie pass disarms input but is fed by the same capture: keep the
         # foreground gate honest for the whole pass.
         lie_pass_event=lie_active,
+        reconnect_active_event=reconnect_active,
     )
     core_workers = [
         capture_worker,
@@ -1297,6 +1575,7 @@ def main() -> int:
         screen_blinker,
         countdown_worker,
         lie_detector_worker,
+        parked_watch,
         telegram_notifier,
         focus_worker,
     ]
@@ -1323,6 +1602,8 @@ def main() -> int:
             reconnect_results=reconnect_results,
             api_test_video_factory=make_api_test_video_worker,
             api_test_results=api_test_results,
+            # 自动过测谎: the api pass that runs by itself when a lie window appears.
+            api_auto_lie_factory=make_api_auto_lie_worker,
             trade_worker=trade_worker,
             movement_worker=movement_worker,
             character_worker=character_worker,
@@ -1332,6 +1613,9 @@ def main() -> int:
             screen_blinker=screen_blinker,
             telegram_notifier=telegram_notifier,
             on_patrol_start=start_patrol_input,
+            # 自动重连 brought the character back into the game: prepare the map session again (layer
+            # detection) and resume the patrol without the operator pressing 开始巡逻.
+            on_patrol_restart=restart_patrol_after_reconnect,
             on_patrol_stop=lambda: _stop_live_input(
                 key_sender, automation_active, refocus_before_release=True,
             ),
@@ -1343,8 +1627,22 @@ def main() -> int:
             ui_log_handler=ui_log_handler,
             user_config_path=str(config_store.user_path),
             automation_active_event=automation_active,
+            # 测谎 armed: the parked watch may grab the game window so a lie window is still caught
+            # (and 自动过测谎 can take over) without Start Patrol.
+            lie_watch_armed_event=lie_detection_armed,
+            # 掉线 armed: the same watch feeds the character worker, so a disconnect is noticed (and
+            # 自动重连 can run) without Start Patrol.
+            disconnect_watch_armed_event=disconnect_watch_armed,
         )
     )
+
+    if ui_worker is not None:
+        # 自动过测谎: the lie detector's own event drives the automatic api pass (the callback
+        # only raises a flag; the panel's Tk thread services it, so nothing Tk is touched
+        # from the detector's thread).
+        lie_detector_worker.add_lie_seen_callback(
+            lambda match, _frame: ui_worker.on_lie_event_for_api(match)
+        )
 
     def request_stop(*_unused: object) -> None:
         stop_event.set()
@@ -1368,6 +1666,11 @@ def main() -> int:
     )
     supervisor.start()
 
+    logging.info(
+        "MapleAssistant %s starting from %s",
+        version_label(),
+        Path(__file__).resolve().parent,
+    )
     logging.info(
         "assistant running (%s); click Start Patrol to enable input; Ctrl+C stops",
         "DRY‑RUN" if args.dry_run else "LIVE INPUT DISARMED",

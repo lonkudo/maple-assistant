@@ -16,6 +16,9 @@ ui_window_settings.json
 trade_config.json
 tradePicture/
 COMMIT_MSG.zip
+# The RoiTrack product key is machine-bound: it ships inside the release package
+# (autolie_api/key_secret.txt) but must never be committed.
+autolie_api/key_secret.txt
 
 # local virtual environments
 .venv/

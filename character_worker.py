@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import time
 import queue
 import threading
 from threading import Thread
@@ -26,6 +27,15 @@ from marker_detector import detect_yellow_diamond
 from countdown_worker import play_mp3, run_sound_async
 
 LOG = logging.getLogger(__name__)
+
+# 掉线判定：黄点连续缺失这么多帧（操作员 2026-09-17：恢复按帧计数，阈值 120）。
+#
+# 换算成时间是「帧数 × 截图间隔」，而截图间隔不是固定的：
+#   * 默认 --interval 0.25s  -> 120 帧 = 30 秒（40 秒需要 160 帧）
+#   * 掉落加速 0.10s          -> 120 帧 = 12 秒
+#   * 过测谎时 30fps (1/30s)  -> 120 帧 = 4 秒
+# 日志里同时打印帧数和秒数，所以到底等了多久永远能从日志读出来。
+DISCONNECT_ALERT_FRAMES = 120
 
 # Fallback minimap region in ABSOLUTE client pixels (the HUD is fixed
 # pixel; only the viewport scales).  The movement worker overrides this with
@@ -92,13 +102,14 @@ class CharacterWorker(Thread):
         stop_event: Any,
         minimap_region_provider: Optional[Callable[[], tuple[float, float, float, float]]] = None,
         disconnect_alert_enabled: bool = False,
-        disconnect_alert_misses: int = 3,
+        disconnect_alert_misses: int = DISCONNECT_ALERT_FRAMES,
         alert_sound_path: Optional[Path] = None,
         play_alert_sound: Optional[Callable[[Path], None]] = None,
         flash_callback: Optional[Callable[[], None]] = None,
         alert_callback: Optional[Callable[[str], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
         disconnect_event_callback: Optional[Callable[[], None]] = None,
+        reconnect_active_event: Any = None,
     ) -> None:
         super().__init__(name="character-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -112,6 +123,8 @@ class CharacterWorker(Thread):
         self._sound_enabled = True
         self._disconnect_alert_misses = max(1, int(disconnect_alert_misses))
         self._disconnect_missing_frames = 0
+        # When the current missing streak started - only used to print the elapsed time.
+        self._disconnect_missing_since: Optional[float] = None
         self._disconnect_alerted = False
         self._alert_sound_path = Path(
             alert_sound_path
@@ -125,6 +138,23 @@ class CharacterWorker(Thread):
         # Optional independent listener fired at the same confirmed disconnect
         # (e.g. the diagnostic screenshot recorder); never breaks the flow.
         self._disconnect_event_callback = disconnect_event_callback
+        # While 自动重连 owns the machine, the character is on a login page - the yellow marker is
+        # SUPPOSED to be missing, so no disconnect alert may be raised (v1.0.28: a 120-frame streak
+        # inside the reconnect fired a second alert, which stopped the patrol and started a SECOND
+        # reconnect run that then failed on the in-game window - the whole reason the patrol stayed
+        # stopped after an otherwise successful reconnect).
+        self._reconnect_active_event = reconnect_active_event
+
+    def _reconnect_owns_the_machine(self) -> bool:
+        """Whether 自动重连 is running right now (its marker-less screens are expected)."""
+
+        event = self._reconnect_active_event
+        if event is None:
+            return False
+        try:
+            return bool(event.is_set())
+        except Exception:
+            return False
 
     def set_disconnect_alert(self, enabled: bool) -> None:
         """Enable/disable the missing-yellow-marker alarm live from the UI."""
@@ -132,6 +162,7 @@ class CharacterWorker(Thread):
         with self._disconnect_alert_lock:
             self._disconnect_alert_enabled = bool(enabled)
             self._disconnect_missing_frames = 0
+            self._disconnect_missing_since = None
             self._disconnect_alerted = False
         LOG.info("disconnect alert %s", "enabled" if enabled else "disabled")
 
@@ -171,29 +202,55 @@ class CharacterWorker(Thread):
             except Exception:
                 LOG.warning("disconnect alert sound failed", exc_info=True)
 
-    def _update_disconnect_alert(self, detected: bool) -> None:
-        """Consume the existing marker result; never runs another detector."""
+    def _update_disconnect_alert(
+        self, detected: bool, *, now: Optional[float] = None
+    ) -> None:
+        """Consume the existing marker result; never runs another detector.
 
+        The operator's rule (2026-09-17): the yellow marker missing for 120 consecutive FRAMES.
+        A detected marker resets the counter, and one streak produces one alert; the elapsed time is
+        logged next to the frame count so the frame threshold can always be read as seconds (see
+        DISCONNECT_ALERT_FRAMES for how the cadence converts it).
+        """
+
+        checked_at = time.monotonic() if now is None else float(now)
         should_alert = False
+        frames = 0
+        elapsed = 0.0
         with self._disconnect_alert_lock:
             if not self._disconnect_alert_enabled:
                 self._disconnect_missing_frames = 0
+                self._disconnect_missing_since = None
+                self._disconnect_alerted = False
+                return
+            if self._reconnect_owns_the_machine():
+                # The login/world/channel screens have no minimap and no marker: the streak is
+                # meaningless there, so it is reset instead of counting towards an alert.
+                self._disconnect_missing_frames = 0
+                self._disconnect_missing_since = None
                 self._disconnect_alerted = False
                 return
             if detected:
                 self._disconnect_missing_frames = 0
+                self._disconnect_missing_since = None
                 self._disconnect_alerted = False
                 return
+            if self._disconnect_missing_frames == 0:
+                self._disconnect_missing_since = checked_at
             self._disconnect_missing_frames += 1
-            if (self._disconnect_missing_frames >= self._disconnect_alert_misses
+            frames = self._disconnect_missing_frames
+            since = self._disconnect_missing_since
+            elapsed = 0.0 if since is None else checked_at - since
+            if (frames >= self._disconnect_alert_misses
                     and not self._disconnect_alerted):
                 self._disconnect_alerted = True
                 should_alert = True
         if should_alert:
             LOG.warning(
-                "DISCONNECT ALERT: yellow character marker missing for %d "
-                "consecutive frames; stopping patrol and triggering reminders",
-                self._disconnect_missing_frames,
+                "DISCONNECT ALERT: yellow character marker missing for %d consecutive frames "
+                "(%.1fs at the current capture cadence; threshold %d frames); "
+                "stopping patrol and triggering reminders",
+                frames, elapsed, self._disconnect_alert_misses,
             )
             if self._on_disconnect is not None:
                 try:
@@ -217,6 +274,12 @@ class CharacterWorker(Thread):
             ).start()
 
     def run(self) -> None:
+        LOG.info(
+            "character worker started; disconnect alert after %d missing frames "
+            "(= frames x the capture interval; enabled=%s)",
+            self._disconnect_alert_misses,
+            self._disconnect_alert_enabled,
+        )
         while not self.stop_event.is_set():
             try:
                 frame = self.frame_queue.get(timeout=0.05)

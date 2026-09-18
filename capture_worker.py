@@ -13,12 +13,16 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw
 
 from image_io import frame_files, save_screenshot, screenshot_name
 from minimap_detector import hud_scale_for
+
+LOG = logging.getLogger(__name__)
+# A repeating capture failure logs a full traceback this often; the ones in between are DEBUG.
+CAPTURE_FAILURE_LOG_SECONDS = 10.0
 
 
 WindowRect = Tuple[int, int, int, int]
@@ -196,39 +200,123 @@ def capture_window(
     width = max(1, source_right - source_x)
     height = max(1, source_bottom - source_y)
 
+    def _grab(source: Callable[[], tuple[Any, int, int]]) -> Image.Image:
+        """One BitBlt attempt from ``source()``; releases EVERYTHING it took, without raising.
+
+        ``source()`` returns ``(source_dc, dc_handle, dc_hwnd)``: the DC handle and its owner window
+        are what ``ReleaseDC`` needs, and both are released here even when the bitmap could not be
+        created at all.  The old code took ``GetDC(hwnd)`` outside the try block and called
+        ``DeleteObject(bitmap.GetHandle())`` unconditionally, so a failed attempt leaked a DC AND
+        turned the real error into ``pywintypes.error: (0, 'DeleteObject', ...)``.
+        """
+
+        source_dc = None
+        memory_dc = None
+        bitmap = None
+        dc_handle = 0
+        dc_hwnd = 0
+        try:
+            source_dc, dc_handle, dc_hwnd = source()
+            memory_dc = source_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(source_dc, width, height)
+            memory_dc.SelectObject(bitmap)
+            memory_dc.BitBlt(
+                (0, 0),
+                (width, height),
+                source_dc,
+                (source_x, source_y),
+                win32con.SRCCOPY,
+            )
+            raw_bgra = bitmap.GetBitmapBits(True)
+            return Image.frombuffer(
+                "RGB", (width, height), raw_bgra, "raw", "BGRX", 0, 1
+            ).copy()
+        finally:
+            try:
+                handle = bitmap.GetHandle() if bitmap is not None else 0
+            except Exception:
+                LOG.debug("capture: bitmap handle could not be read", exc_info=True)
+                handle = 0
+            if handle:
+                try:
+                    win32gui.DeleteObject(handle)
+                except Exception:
+                    LOG.debug("capture: bitmap could not be released", exc_info=True)
+            for dc, label in ((memory_dc, "memory DC"), (source_dc, "source DC")):
+                if dc is None:
+                    continue
+                try:
+                    dc.DeleteDC()
+                except Exception:
+                    LOG.debug("capture: %s could not be released", label, exc_info=True)
+            if dc_handle:
+                try:
+                    win32gui.ReleaseDC(dc_hwnd, dc_handle)
+                except Exception:
+                    LOG.debug("capture: window DC could not be released", exc_info=True)
+
     # GetDC(hwnd) has its origin at the client area's upper-left. GetWindowDC
     # would include borders/title bar and offset the pixels from window_rect.
-    window_dc = win32gui.GetDC(hwnd)
-    source_dc = win32ui.CreateDCFromHandle(window_dc)
-    memory_dc = source_dc.CreateCompatibleDC()
-    bitmap = win32ui.CreateBitmap()
-    try:
-        bitmap.CreateCompatibleBitmap(source_dc, width, height)
-        memory_dc.SelectObject(bitmap)
-        memory_dc.BitBlt(
-            (0, 0),
-            (width, height),
-            source_dc,
-            (source_x, source_y),
-            win32con.SRCCOPY,
-        )
-        raw_bgra = bitmap.GetBitmapBits(True)
-        image = Image.frombuffer(
-            "RGB", (width, height), raw_bgra, "raw", "BGRX", 0, 1
-        ).copy()
-    except Exception as exc:
-        raise WindowCaptureError(f"capture failed for {window_title!r}: {exc}") from exc
-    finally:
-        win32gui.DeleteObject(bitmap.GetHandle())
-        memory_dc.DeleteDC()
-        source_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, window_dc)
+    def _window_source() -> tuple[Any, int, int]:
+        handle = win32gui.GetDC(hwnd)
+        return win32ui.CreateDCFromHandle(handle), handle, hwnd
 
-    return image, (
-        screen_left + source_x,
-        screen_top + source_y,
-        screen_left + source_right,
-        screen_top + source_bottom,
+    def _screen_source() -> tuple[Any, int, int]:
+        # Desktop DC: the BitBlt source point must be in SCREEN pixels then.
+        handle = win32gui.GetDC(0)
+        return win32ui.CreateDCFromHandle(handle), handle, 0
+
+    errors: list[str] = []
+    # Attempt 1 and a single retry: GDI/DC exhaustion is transient far more often than it is fatal.
+    for attempt in (1, 2):
+        try:
+            image = _grab(_window_source)
+        except Exception as exc:
+            errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+            LOG.debug("capture: attempt %d for %r failed", attempt, window_title,
+                      exc_info=True)
+            if attempt == 1:
+                time.sleep(0.02)
+            continue
+        return image, (
+            screen_left + source_x,
+            screen_top + source_y,
+            screen_left + source_right,
+            screen_top + source_bottom,
+        )
+
+    # Last resort: read the same client rectangle off the desktop DC.  Only while the game window
+    # is foreground - otherwise the frame would show whatever covers it (our own panel).
+    try:
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+    except Exception:
+        foreground = 0
+    if foreground == hwnd:
+        screen_x = screen_left + source_x
+        screen_y = screen_top + source_y
+        source_x, source_y = screen_x, screen_y
+        try:
+            image = _grab(_screen_source)
+        except Exception as exc:
+            errors.append(f"screen fallback: {type(exc).__name__}: {exc}")
+        else:
+            LOG.warning(
+                "capture: window DC failed for %r, used the desktop DC for the same client "
+                "rectangle (%s)",
+                window_title, "; ".join(errors),
+            )
+            return image, (
+                screen_left + screen_x,
+                screen_top + screen_y,
+                screen_left + source_right,
+                screen_top + source_bottom,
+            )
+    else:
+        errors.append("screen fallback skipped: the game window is not foreground")
+
+    raise WindowCaptureError(
+        f"capture failed for {window_title!r}: " + "; ".join(errors)
     )
 
 
@@ -332,6 +420,8 @@ class CaptureWorker(threading.Thread):
             self._remove_stale_debug_frames()
 
         sequence = 0
+        self._capture_failures = 0
+        self._last_capture_failure_log = float("-inf")
         next_capture = time.monotonic()
         next_status_capture = 0.0
         while not self.stop_event.is_set():
@@ -479,11 +569,25 @@ class CaptureWorker(threading.Thread):
                         self._save_debug_frame(frame)
 
                 sequence += 1
-            except Exception:
+            except Exception as exc:
                 # A temporarily obscured/minimized/restarting game should not
                 # silently kill all three workers. The orchestrator can still
                 # stop this thread immediately through stop_event.
-                self.log.exception("could not capture game window")
+                # Rate-limited: a persistent failure (GDI exhaustion, a locked session) otherwise
+                # writes a full traceback on every tick and buries everything else in the log.
+                now_fail = time.monotonic()
+                self._capture_failures += 1
+                if (now_fail - self._last_capture_failure_log
+                        >= CAPTURE_FAILURE_LOG_SECONDS):
+                    suppressed = self._capture_failures - 1
+                    self._last_capture_failure_log = now_fail
+                    self.log.exception(
+                        "could not capture game window (failure #%d%s)",
+                        self._capture_failures,
+                        f", {suppressed} identical since the last report" if suppressed else "",
+                    )
+                else:
+                    self.log.debug("could not capture game window: %s", exc)
 
             next_capture += capture_interval
             now = time.monotonic()
@@ -541,3 +645,181 @@ class CaptureWorker(threading.Thread):
             except OSError:
                 self.log.warning("could not remove stale debug frame %s", path,
                                  exc_info=True)
+
+
+# How often the parked watch grabs the game window for the 测谎 detector.  The detector scans at most
+# once per second, so two chances per scan window keep the detection latency at ~1s even when a tick is
+# missed.  A feed may ask for a faster cadence (see ``WatchFeed.interval``).
+LIE_WATCH_INTERVAL_SECONDS = 0.5
+
+
+@dataclass(frozen=True)
+class WatchFeed:
+    """One consumer the parked watch feeds, plus the settings that arm and bound it."""
+
+    queue: "queue.Queue[CapturedFrame]"
+    label: str
+    # The selection that arms this feed (None = always armed while the watch runs).
+    armed_event: Optional[threading.Event] = None
+    # The capture cadence this consumer's logic was calibrated for.  The disconnect detector's threshold
+    # is a FRAME COUNT (120 frames at the normal 0.25s capture = 30s), so feeding it at half the normal
+    # rate would silently double the detection time - each feed carries its own interval instead.
+    interval: float = LIE_WATCH_INTERVAL_SECONDS
+    # Some consumers may only judge a frame when the game window really is in front.  A capture of the
+    # game window while the assistant's own panel covers it is not the game: the character worker would
+    # count that as "the marker is missing" and fire a false 掉线 alert (and a reconnect that clicks and
+    # types into the game).  The lie detector needs no such guard - only its exact HUD square can match.
+    requires_game_foreground: bool = False
+
+
+class ParkedWatchCapture(threading.Thread):
+    """Keep the event-driven detectors fed while the shared capture is parked.
+
+    The operator's requirement: 自动重连 and 自动过测谎 are NOT patrol workflows - "even if the patrol is
+    not started they should normally work".  Both hang off the shared capture, and that capture is
+    deliberately idle before Start Patrol (``game_focused`` needs armed keyboard input).  So while parked
+    the lie detector starved (no lie window was ever caught) and the disconnect detector - which lives in
+    the character worker and is fed from the same bus - never saw a frame (a 掉线 was never noticed, so
+    the reconnect could not run either).
+
+    This thread grabs the game window on its own and publishes ONLY into the queues it was given
+    (``WatchFeed``), each behind its own arming setting, so the movement / attack / status workers stay
+    exactly as idle as they are while parked.  It stands down whenever the shared capture runs
+    (``patrol_capture_event`` is the same gate the capture uses), so there is never a double capture.
+
+    It never foregrounds the game: while parked the operator may be using another window, and stealing
+    focus to look for a lie square or a 掉线 prompt would be far worse than a missed scan.
+    """
+
+    def __init__(
+        self,
+        window_title: str,
+        feeds: "Sequence[WatchFeed]",
+        stop_event: threading.Event,
+        *,
+        patrol_capture_event: Optional[threading.Event] = None,
+        foreground_check: Optional[Callable[[], bool]] = None,
+        capture_fn: Optional[CaptureFunction] = None,
+    ) -> None:
+        super().__init__(name="parked-watch-capture", daemon=True)
+        self.window_title = window_title
+        self.feeds = tuple(feeds)
+        self.stop_event = stop_event
+        self.patrol_capture_event = patrol_capture_event
+        self.foreground_check = foreground_check
+        self.capture_fn = capture_fn or (lambda title: capture_window(title))
+        self._sequence = 0
+        self._last_state: Optional[str] = None
+
+    # ------------------------------------------------------------------ state
+    def _shared_capture_running(self) -> bool:
+        return bool(
+            self.patrol_capture_event is not None
+            and self.patrol_capture_event.is_set()
+        )
+
+    def _game_foreground(self) -> bool:
+        if self.foreground_check is None:
+            return True
+        try:
+            return bool(self.foreground_check())
+        except Exception:
+            return False
+
+    def _armed_feeds(self) -> list[WatchFeed]:
+        return [
+            feed for feed in self.feeds
+            if feed.armed_event is None or feed.armed_event.is_set()
+        ]
+
+    def _active_feeds(self) -> list[WatchFeed]:
+        return [
+            feed for feed in self._armed_feeds()
+            if not feed.requires_game_foreground or self._game_foreground()
+        ]
+
+    def _idle_reason(self) -> str:
+        armed = self._armed_feeds()
+        if not armed:
+            return "no selection is armed (" + ", ".join(f.label for f in self.feeds) + ")"
+        if self._shared_capture_running():
+            return "the shared patrol capture is running"
+        waiting = [f.label for f in armed if f.requires_game_foreground]
+        return ("waiting for the game window to come to the foreground ("
+                + ", ".join(waiting) + ")")
+
+    def _active_interval(self, active: "Sequence[WatchFeed]") -> float:
+        if not active:
+            return LIE_WATCH_INTERVAL_SECONDS
+        return max(0.05, min(float(feed.interval) for feed in active))
+
+    def _publish_latest(self, target: "queue.Queue[CapturedFrame]",
+                        frame: CapturedFrame) -> None:
+        """Keep only the newest frame, exactly like :class:`FrameBus` does."""
+
+        while True:
+            try:
+                target.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+        try:
+            target.put_nowait(frame)
+        except queue.Full:
+            pass
+
+    # --------------------------------------------------------------------- run
+    def run(self) -> None:
+        LOG.info(
+            "parked watch started (window=%s, feeds=%s); it feeds them only while the patrol capture "
+            "is parked",
+            self.window_title, ", ".join(feed.label for feed in self.feeds),
+        )
+        next_capture = time.monotonic() + LIE_WATCH_INTERVAL_SECONDS
+        while not self.stop_event.is_set():
+            active = self._active_feeds()
+            state = "watching" if active else f"idle: {self._idle_reason()}"
+            interval = self._active_interval(active)
+            if state != self._last_state:
+                self._last_state = state
+                if active:
+                    LOG.warning(
+                        "PARKED WATCH: the patrol capture is parked - grabbing %s every %.2fs for %s "
+                        "(the patrol does not have to be started)",
+                        self.window_title, interval,
+                        ", ".join(feed.label for feed in active),
+                    )
+                else:
+                    LOG.info("PARKED WATCH: %s", state)
+                next_capture = time.monotonic() + interval
+            if not active:
+                next_capture = time.monotonic() + interval
+                if self.stop_event.wait(0.2):
+                    break
+                continue
+            delay = next_capture - time.monotonic()
+            if delay > 0.0:
+                if self.stop_event.wait(min(delay, 0.2)):
+                    break
+                continue
+            next_capture = time.monotonic() + interval
+            try:
+                image, window_rect = self.capture_fn(self.window_title)
+                if image is None:
+                    continue
+                self._sequence += 1
+                frame = CapturedFrame(
+                    sequence=self._sequence,
+                    captured_at=datetime.now(timezone.utc),
+                    captured_monotonic=time.monotonic(),
+                    image=image,
+                    window_rect=window_rect,
+                )
+                for feed in active:
+                    self._publish_latest(feed.queue, frame)
+            except Exception:
+                # A minimised/restarting/hidden game must not spam, and a failure here must never kill
+                # this thread: it is supervised like every other core worker.
+                LOG.debug("parked watch: capture/publish failed", exc_info=True)
+        LOG.info("parked watch stopped")

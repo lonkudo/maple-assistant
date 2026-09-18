@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    打包 Maple 助手的最小发布文件夹。
+    打包 MapleAssistant 的最小发布文件夹。
 
 .DESCRIPTION
     只复制运行所需的文件（不含虚拟环境、日志、测试、work 数据、git 元数据）。
@@ -13,8 +13,6 @@
 #>
 param(
     [string]$Version = "",
-    [ValidateSet("cpu", "cuda")]
-    [string]$Variant = "cpu",
     [string]$OutDir = "",
     [switch]$Zip
 )
@@ -28,12 +26,11 @@ if (-not $Version) {
     }
     $Version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
 }
-if ($Version -notmatch '^\d{4}$') {
-    throw "版本号必须是 0000 到 9999 的四位数字: $Version"
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "版本号必须是 1.0.0 这样的三段数字（主.次.补丁）: $Version"
 }
-$variantTag = $Variant.ToUpperInvariant()
 if (-not $OutDir) {
-    $OutDir = "release\MapleAssistant-$variantTag"
+    $OutDir = "release\MapleAssistant"
 }
 $out = Join-Path $root $OutDir
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
@@ -55,33 +52,24 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
                    # application update. system_config.json is intentionally
                    # included so internal calibration follows each version.
                    "config.json", "user_config.json",
-                   "release_variant.json",
+                   "release_no_trade.ps1",
                    "trade_config.json",
                    "recording-configuration.json",
+                   # 每机校准文件（trade_offset_probe.py 生成），不随包分发。
+                   "trade_offsets.json",
                    "rope_calibration.json", "drug_settings.json",
                    "fixed_attack_settings.json",
                    "additional_functions_settings.json",
-                   "yolo_detection_settings.json")
+                   "yolo_detection_settings.json",
+                   # 文档只留在仓库里：发布版不显示 README.md / ARCHITECTURE.md。
+                   "README.md", "ARCHITECTURE.md")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 Copy-Item -LiteralPath $versionFile -Destination (Join-Path $out "VERSION")
-$manifest = [ordered]@{
-    tracker_runtime = $Variant
-    environment_dir = if ($Variant -eq "cuda") { ".venv-cuda" } else { ".venv-cpu" }
-    package_name = "MapleAssistant-$variantTag"
-    version = $Version
-}
-$manifestJson = $manifest | ConvertTo-Json
-[System.IO.File]::WriteAllText(
-    (Join-Path $out "release_variant.json"), $manifestJson,
-    (New-Object System.Text.UTF8Encoding $false)
-)
-
-# A version overlay must not replace a package-specific launcher with the
-# development launcher (which points at .venv).  Write CPU/CUDA launchers
-# directly into each package so updating files over an existing installation
-# keeps using the already-installed .venv-cpu or .venv-cuda environment.
-$environmentDir = [string]$manifest.environment_dir
+# A version overlay must not replace the package launcher with the development launcher: write the
+# launcher into the package so an update keeps using the installed .venv.  There is one environment
+# only — the remote API means no local model, so no CPU/CUDA choice.
+$environmentDir = ".venv"
 $packageBat = @"
 @echo off
 cd /d "%~dp0"
@@ -100,9 +88,9 @@ Set files = CreateObject("Scripting.FileSystemObject")
 root = files.GetParentFolderName(WScript.ScriptFullName)
 pythonwPath = root & "\$environmentDir\Scripts\pythonw.exe"
 ' Launch through a renamed interpreter so the running process is
-' "todo_helper.exe" (and the game sees that name) instead of "pythonw.exe".
+' "MapleAssistant.exe" (and the game sees that name) instead of "pythonw.exe".
 ' The copy is created on first use and self-heals after an overlay update.
-exePath = root & "\$environmentDir\Scripts\todo_helper.exe"
+exePath = root & "\$environmentDir\Scripts\MapleAssistant.exe"
 On Error Resume Next
 If Not files.FileExists(exePath) Then files.CopyFile pythonwPath, exePath, True
 If Not files.FileExists(exePath) Then exePath = pythonwPath
@@ -120,7 +108,7 @@ On Error Resume Next
 shellApp.ShellExecute exePath, arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
-    MsgBox "todo_helper could not start. Open assistant-launch-status.log in this folder.", 16, "todo_helper"
+    MsgBox "MapleAssistant could not start. Open assistant-launch-status.log in this folder.", 16, "MapleAssistant"
 End If
 On Error GoTo 0
 
@@ -154,26 +142,9 @@ if (Test-Path $soundIn) {
     Copy-Item $soundIn (Join-Path $out "sound") -Recurse
 }
 
-# --- detect_video (测试测谎 demo footage) ---------------------------------------
-# Only the playable clips are shipped: the operator's capture folders also hold
-# their raw frame dumps (lie_*/frame_000001.png ...), which are ~150MB of
-# nothing the release needs.
-$demoIn = Join-Path $root "detect_video"
-if (Test-Path $demoIn) {
-    $demoOut = Join-Path $out "detect_video"
-    New-Item -ItemType Directory -Path $demoOut -Force | Out-Null
-    Get-ChildItem $demoIn -Recurse -File | Where-Object {
-        $_.Extension -in ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".m4v"
-    } | ForEach-Object {
-        $relative = $_.FullName.Substring($demoIn.Length).TrimStart("\")
-        $target = Join-Path $demoOut $relative
-        $targetDir = Split-Path -Parent $target
-        if (-not (Test-Path $targetDir)) {
-            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-        }
-        Copy-Item $_.FullName $target -Force
-    }
-}
+# --- detect_video：不再随包分发 ---------------------------------------------------
+# 测试测谎用的演示视频留在仓库里（"don't package up test video"）。测试api 由用户自己
+# 选择视频文件，运行期不需要这个目录，发布包因此保持精简。
 
 # --- yolo-detection -----------------------------------------------------------
 $yoloOut = Join-Path $out "yolo-detection"
@@ -201,10 +172,10 @@ if (Test-Path $assetsIn) {
 }
 # 自动重连 的登录页颜色参考图：screenshots 是本机个人目录，不随包分发，所以参考图
 # 也放进 recording-assets，安装后的副本才有颜色参考（reconnect_worker 会依次查找
-# screenshots\login_page_target.png 和 recording-assets\login_page_target.png）。
-$loginReferenceIn = Join-Path $root "screenshots\login_page_target.png"
+# screenshots\login_page_target.jpg 和 recording-assets\login_page_target.jpg）。
+$loginReferenceIn = Join-Path $root "screenshots\login_page_target.jpg"
 if (Test-Path $loginReferenceIn) {
-    Copy-Item $loginReferenceIn (Join-Path $out "recording-assets\login_page_target.png") -Force
+    Copy-Item $loginReferenceIn (Join-Path $out "recording-assets\login_page_target.jpg") -Force
 }
 
 # --- autolie_api（自动过测谎 API 集成：图像转换 + 坐标换算）------------------------
@@ -250,13 +221,13 @@ Write-Host "已复制 $($files.Count) 个文件 ($totalMB MB)。" -ForegroundCol
 Write-Host ""
 Write-Host "发布方法:"
 Write-Host "  1. 将 $OutDir 文件夹压缩为 zip"
-Write-Host "  2. 接收方解压后双击 安装.bat 即可安装 $variantTag 追踪环境（YOLO 暂停）"
+Write-Host "  2. 接收方解压后双击 安装.bat 即可安装运行环境（YOLO 暂停）"
 Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundColor Cyan
 Write-Host ""
 
 if ($Zip) {
-    $zipPath = Join-Path $root "release\MapleAssistant-$variantTag-v$Version.zip"
-    # 仅替换本变体的同版本压缩包；不能删除另一变体或保留的历史发布包。
+    $zipPath = Join-Path $root "release\MapleAssistant-$Version.zip"
+    # 仅替换同版本的压缩包；历史发布包保留。
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
     }

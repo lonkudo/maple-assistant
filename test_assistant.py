@@ -1,6 +1,7 @@
 import logging
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from assistant import (
@@ -259,6 +260,21 @@ class StartLiveInputTests(unittest.TestCase):
         self.assertEqual(sender.calls, ["select", "verify"])
         sleep.assert_called_once_with(0.08)
         self.assertEqual(calls, ["capture"])
+
+
+class VersionBannerTests(unittest.TestCase):
+    """The log must state which build is running (an old install cost two debugging rounds)."""
+
+    def test_the_startup_banner_names_the_version_and_the_folder(self) -> None:
+        source = (Path(__file__).with_name("assistant.py")).read_text(encoding="utf-8")
+        self.assertIn("MapleAssistant %s starting from %s", source)
+        self.assertIn("from versioning import version_label", source)
+
+    def test_the_version_label_is_read_from_the_version_file(self) -> None:
+        from versioning import read_version, version_label
+
+        self.assertEqual(version_label(), f"v{read_version()}")
+        self.assertRegex(read_version(), r"^\d+\.\d+\.\d+$")
 
 
 if __name__ == "__main__":

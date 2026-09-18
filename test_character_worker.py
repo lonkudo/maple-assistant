@@ -1,3 +1,10 @@
+"""Character worker tests: the disconnect alert counts missing FRAMES (operator's rule: 120).
+
+The threshold is a frame count, so the equivalent time depends on the capture interval (0.25 s by
+default, 0.10 s while dropping, 1/30 s during an API lie pass).  ``now`` is injected wherever the
+test cares about the elapsed time that the log prints.
+"""
+
 import queue
 import threading
 import unittest
@@ -7,20 +14,27 @@ from unittest import mock
 
 from PIL import Image
 
-from character_worker import CharacterWorker
+from character_worker import DISCONNECT_ALERT_FRAMES, CharacterWorker
 
 
 class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
-    def make_worker(self, callback, *, enabled=True, misses=3):
+    def make_worker(self, callback, *, enabled=True, misses=DISCONNECT_ALERT_FRAMES,
+                    **kwargs):
         return CharacterWorker(
             queue.Queue(), queue.Queue(), threading.Event(),
             disconnect_alert_enabled=enabled,
             disconnect_alert_misses=misses,
             alert_sound_path=Path("sound/dingdong.mp3"),
             play_alert_sound=callback,
+            **kwargs,
         )
 
-    def test_alerts_once_after_confirmed_loss_and_rearms_on_detection(self):
+    def test_the_default_threshold_is_120_frames(self):
+        self.assertEqual(DISCONNECT_ALERT_FRAMES, 120)
+        worker = self.make_worker(lambda _path: None)
+        self.assertEqual(worker._disconnect_alert_misses, 120)
+
+    def test_alerts_on_the_last_frame_only_and_rearms_on_detection(self):
         played = []
         played_event = threading.Event()
 
@@ -28,36 +42,56 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             played.append(path)
             played_event.set()
 
-        worker = self.make_worker(play, misses=3)
-        worker._update_disconnect_alert(False)
-        worker._update_disconnect_alert(False)
-        self.assertFalse(played_event.wait(.05))
-        worker._update_disconnect_alert(False)
+        worker = self.make_worker(play, misses=120)
+        for frame in range(119):                       # 119 misses is not a disconnect yet
+            worker._update_disconnect_alert(False, now=frame * 0.25)
+        self.assertEqual(played, [])
+        worker._update_disconnect_alert(False, now=119 * 0.25)
         self.assertTrue(played_event.wait(.5))
         self.assertEqual(played, [Path("sound/dingdong.mp3")])
 
-        # A sustained loss plays only once. Seeing the marker again re-arms
-        # the next independently confirmed loss episode.
-        worker._update_disconnect_alert(False)
-        worker._update_disconnect_alert(False)
+        # A sustained loss plays only once.  Seeing the marker again re-arms the next episode.
+        for frame in range(200, 400):
+            worker._update_disconnect_alert(False, now=frame * 0.25)
         self.assertEqual(len(played), 1)
-        worker._update_disconnect_alert(True)
+        worker._update_disconnect_alert(True, now=200.0)
         played_event.clear()
-        for _ in range(3):
-            worker._update_disconnect_alert(False)
+        for frame in range(120):
+            worker._update_disconnect_alert(False, now=300.0 + frame * 0.25)
         self.assertTrue(played_event.wait(.5))
         self.assertEqual(len(played), 2)
+
+    def test_a_single_detected_frame_resets_the_counter(self):
+        played = []
+        worker = self.make_worker(played.append, misses=120)
+        for frame in range(119):
+            worker._update_disconnect_alert(False, now=frame * 0.25)
+        worker._update_disconnect_alert(True, now=100.0)     # the marker is back
+        self.assertEqual(worker._disconnect_missing_frames, 0)
+        for frame in range(119):
+            worker._update_disconnect_alert(False, now=200.0 + frame * 0.25)
+        for _ in range(20):
+            threading.Event().wait(.01)
+        self.assertEqual(played, [], "the counter must start over after a detection")
+
+    def test_the_log_prints_frames_and_seconds(self):
+        worker = self.make_worker(lambda _path: None, misses=2)
+        worker._update_disconnect_alert(False, now=0.0)
+        with self.assertLogs("character_worker", level="WARNING") as captured:
+            worker._update_disconnect_alert(False, now=0.25)
+        line = "\n".join(captured.output)
+        self.assertIn("2 consecutive frames", line)
+        self.assertIn("0.2s", line)
+        self.assertIn("threshold 2 frames", line)
 
     def test_disabled_alert_never_plays(self):
         played = []
         worker = self.make_worker(played.append, enabled=False, misses=1)
-        for _ in range(5):
-            worker._update_disconnect_alert(False)
+        for frame in range(5):
+            worker._update_disconnect_alert(False, now=float(frame))
         self.assertEqual(played, [])
         worker.set_disconnect_alert(True)
-        worker._update_disconnect_alert(False)
-        deadline = threading.Event()
-        self.assertTrue(deadline.wait(.05) is False)
+        worker._update_disconnect_alert(False, now=10.0)
         # The callback thread is short; polling the list avoids timing races.
         for _ in range(20):
             if played:
@@ -67,10 +101,8 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
 
     def test_disconnect_alert_requests_visual_alert_with_the_sound(self):
         flashed = threading.Event()
-        worker = CharacterWorker(
-            queue.Queue(), queue.Queue(), threading.Event(),
-            disconnect_alert_enabled=True, disconnect_alert_misses=1,
-            play_alert_sound=lambda _path: None, flash_callback=flashed.set,
+        worker = self.make_worker(
+            lambda _path: None, misses=1, flash_callback=flashed.set,
         )
         worker._update_disconnect_alert(False)
         self.assertTrue(flashed.wait(.5))
@@ -83,10 +115,8 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             events.append(event_type)
             alerted.set()
 
-        worker = CharacterWorker(
-            queue.Queue(), queue.Queue(), threading.Event(),
-            disconnect_alert_enabled=True, disconnect_alert_misses=1,
-            play_alert_sound=lambda _path: None, alert_callback=notify,
+        worker = self.make_worker(
+            lambda _path: None, misses=1, alert_callback=notify,
         )
         worker._update_disconnect_alert(False)
         self.assertTrue(alerted.wait(.5))
@@ -101,10 +131,8 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             events.append(event_type)
             alerted.set()
 
-        worker = CharacterWorker(
-            queue.Queue(), queue.Queue(), threading.Event(),
-            disconnect_alert_enabled=True, disconnect_alert_misses=1,
-            play_alert_sound=played.append, alert_callback=notify,
+        worker = self.make_worker(
+            played.append, misses=1, alert_callback=notify,
         )
         worker.set_sound_enabled(False)
         worker._update_disconnect_alert(False)

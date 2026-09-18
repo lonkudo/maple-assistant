@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Build the separately named MapleAssistant-vnt-0001 package.
+    Build the separately named MapleAssistant-vnt-1.0.0 package.
 
 .DESCRIPTION
     This script never edits the normal working source. It first builds a
@@ -18,8 +18,8 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     # always clearly identifies the exact source it was built from.
     $Version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
 }
-if ($Version -notmatch '^\d{4}$') {
-    throw "Version must be a four-digit normal release number."
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Version must be a normal release number like 1.0.0."
 }
 $releaseRoot = Join-Path $root "release"
 $packageName = "MapleAssistant-vnt-$Version"

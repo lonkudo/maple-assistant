@@ -33,7 +33,6 @@ from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
 from countdown_worker import play_mp3
 from reconnect_worker import (
-    CALIBRATION_STEPS,
     CHANNEL_DEFAULT,
     CHANNEL_MAX,
     CHANNEL_MIN,
@@ -52,6 +51,29 @@ from update_manager import (
 
 LOG = logging.getLogger(__name__)
 
+# Hotkey actions that TYPE into the game: they need live input armed, so they re-arm it themselves
+# when the auto-reconnect (or a failed run) left it off.  Recording/selection chords do not type and
+# are deliberately absent.
+TYPING_HOTKEY_PREFIXES = ("quick_message:", "trade:", "quick_pickup:")
+
+# 自动过测谎 debouncing.  The lie detector reports a NEW event when it sees the square again after it
+# was gone (and None when it clears), but its detection can flicker frame to frame, so the consumer
+# must decide what counts as ONE lie window:
+#   * one pass per WINDOW: while a pass is running, further events of the same window (the square
+#     flickers) are ignored - the first alarm is accepted, the repeats are not,
+#   * and after a pass, the next one is never closer than AUTO_LIE_MIN_PASS_GAP_SECONDS.
+#
+# The "the square must be gone for 3 s before a window counts as new" rule is GONE (v1.0.27): it made
+# the automatic pass silently never run when the square flickered back inside those 3 s - the field
+# report was "the lie event happened, but the autolie_api is not taking over", with no line in the log
+# saying why.  Quota is protected by the minimum gap between passes instead, and every skip is logged.
+AUTO_LIE_MIN_PASS_GAP_SECONDS = 10.0
+# A repeating debug-UI poll failure logs a full traceback this often; the ones in between are DEBUG.
+POLL_FAILURE_LOG_SECONDS = 10.0
+# A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
+# never keep the pending flag set (and this method retrying) for the rest of the session.
+AUTO_LIE_PENDING_MAX_SECONDS = 90.0
+
 # The debug UI uses two columns (controls + debug/YOLO); the initial
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
@@ -67,10 +89,6 @@ _INITIAL_WINDOW_HEIGHT = 560
 # (keeping the OS resize borders and taskbar entry) and draws its own title
 # row: app title on the left, then ？/－/□/× on the right at the same level.
 _CAPTION_HEIGHT = 34
-
-# Time between pressing 标定选择窗口 and reading the mouse position: the operator needs to
-# move the cursor from the panel onto the game.
-RECONNECT_CALIBRATION_DELAY_SECONDS = 3.0
 
 # 测试api on a video: the operator's measured run length is ~30s at the API's 5 fps, and the panel
 # no longer offers a box for it (the 密钥 button is gone too: the product key ships inside the
@@ -720,6 +738,8 @@ class UiWorker(threading.Thread):
         reconnect_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         api_test_video_factory: Optional[Callable[..., Any]] = None,
         api_test_results: Optional["queue.Queue[tuple[str, str]]"] = None,
+        # 自动过测谎: builds one api pass for one lie window (the assistant owns the worker classes).
+        api_auto_lie_factory: Optional[Callable[..., Any]] = None,
         trade_worker: Any = None,
         movement_worker: Any = None,
         character_worker: Any = None,
@@ -729,6 +749,7 @@ class UiWorker(threading.Thread):
         screen_blinker: Any = None,
         telegram_notifier: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
+        on_patrol_restart: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
         on_recording_verified: Optional[Callable[[DebugSnapshot], None]] = None,
@@ -736,6 +757,12 @@ class UiWorker(threading.Thread):
         ui_log_handler: Any = None,
         user_config_path: Optional[str] = None,
         automation_active_event: Optional[threading.Event] = None,
+        # 测谎 armed: the assistant's parked lie watch may grab the game window so a lie window is
+        # caught (and 自动过测谎 can take over) even without Start Patrol.
+        lie_watch_armed_event: Optional[threading.Event] = None,
+        # 掉线 armed: the same parked watch feeds the character worker, so a disconnect is noticed (and
+        # 自动重连 can run) even without Start Patrol.
+        disconnect_watch_armed_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -776,6 +803,7 @@ class UiWorker(threading.Thread):
         # and never touches the game.
         self.api_test_video_factory = api_test_video_factory
         self.api_test_results = api_test_results
+        self.api_auto_lie_factory = api_auto_lie_factory
         self.api_test_worker: Any = None
         self.api_test_window: Any = None            # the video window (Tk Toplevel)
         self.api_test_video: str = ""              # the file the current drill plays
@@ -785,6 +813,26 @@ class UiWorker(threading.Thread):
         # No panel key: the product key ships with the application, so this stays empty and
         # load_product_key falls back to LIE_PRODUCT_KEY then autolie_api/key_secret.txt.
         self._api_test_key = ""
+        # v0423: 自动过测谎 - the api pass runs by itself when the game's lie window appears.  The lie
+        # detector calls `on_lie_event_for_api()` from its own thread, which only raises a flag; the Tk
+        # thread services it in `_poll` (nothing Tk is touched off-thread).
+        self._api_auto_lie_pending = False
+        self._api_auto_lie_pending_since = 0.0
+        self._api_auto_lie_wait_logged = False
+        # Debounce state: whether the window currently on screen has already been handled, when
+        # the square was last seen to be gone, and when the last pass started.
+        self._api_auto_lie_event_active = False
+        self._api_auto_lie_clear_since = 0.0
+        self._api_auto_lie_last_pass_started = 0.0
+        # True while an automatic pass has the patrol stood down (see _pause_patrol_for_api_pass).
+        self._api_auto_lie_patrol_paused = False
+        # The operator's patrol INTENT: set by 开始巡逻, cleared by 停止巡逻 (buttons and the Ctrl+`
+        # toggle).  A reconnect restarts the patrol only when this is set - the patrol STATE is useless
+        # for that decision, because a disconnect (and the focus gate) stop the patrol, and a Start
+        # Patrol attempted while the character is still on a login page is refused.
+        self._patrol_intent = False
+        self._api_lie_pass_worker: Any = None
+        self._api_auto_lie_runs = 0
         # Isolated Ctrl+Q/Ctrl+W trade workflow.  It uses the existing game
         # capture worker only while checking for a trader.
         self.trade_worker = trade_worker
@@ -825,6 +873,7 @@ class UiWorker(threading.Thread):
         self._quick_delete_hold_fired = False
         self._quick_edit_entry: Any = None
         self.on_patrol_start = on_patrol_start
+        self.on_patrol_restart = on_patrol_restart
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
         self.on_recording_verified = on_recording_verified
@@ -832,6 +881,8 @@ class UiWorker(threading.Thread):
         self.ui_log_handler = ui_log_handler
         self.user_config_path = user_config_path
         self.automation_active_event = automation_active_event
+        self.lie_watch_armed_event = lie_watch_armed_event
+        self.disconnect_watch_armed_event = disconnect_watch_armed_event
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -878,7 +929,7 @@ class UiWorker(threading.Thread):
             root.withdraw()
             self._root = root
             app_version = version_label()
-            root.title(f"todo_helper ({app_version})")
+            root.title(f"MapleAssistant {app_version}")
             screen_width = root.winfo_screenwidth()
             screen_height = root.winfo_screenheight()
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
@@ -1929,15 +1980,39 @@ class UiWorker(threading.Thread):
             saved_reconnect_enabled, saved_world, saved_channel = (
                 self._load_reconnect_settings()
             )
+            saved_api_auto_lie = self._load_api_auto_lie_setting()
+            LOG.info(
+                "自动过测谎: selection loaded as %s",
+                "ON" if saved_api_auto_lie else "OFF",
+            )
+            # ONE compact line: 自动过测谎 and 自动重连 first (the operator's order), then the world and
+            # the channel they apply to.
             reconnect_row = ttk.Frame(extra_panel)
             reconnect_row.pack(fill="x", pady=(4, 0))
+            self._api_auto_lie_var = tk.BooleanVar(value=saved_api_auto_lie)
+            self._api_auto_lie_check = ttk.Checkbutton(
+                reconnect_row,
+                text="自动过测谎",
+                variable=self._api_auto_lie_var,
+                command=self._api_auto_lie_on_change,
+            )
+            self._api_auto_lie_check.pack(side="left")
+            self._api_auto_lie_check.bind(
+                "<FocusOut>", lambda _event: self._api_auto_lie_on_change()
+            )
             self._reconnect_var = tk.BooleanVar(value=saved_reconnect_enabled)
-            ttk.Checkbutton(
+            self._reconnect_check = ttk.Checkbutton(
                 reconnect_row,
                 text="自动重连",
                 variable=self._reconnect_var,
                 command=self._reconnect_on_change,
-            ).pack(side="left")
+            )
+            self._reconnect_check.pack(side="left")
+            # The selection is part of user_config: it is persisted the moment the operator leaves the
+            # widget, not only when the whole panel writes its configuration (his request).
+            self._reconnect_check.bind(
+                "<FocusOut>", lambda _event: self._reconnect_on_change()
+            )
             self._reconnect_world_var = tk.StringVar(value=saved_world)
             self._reconnect_world_box = ttk.Combobox(
                 reconnect_row,
@@ -1949,6 +2024,11 @@ class UiWorker(threading.Thread):
             self._reconnect_world_box.pack(side="left", padx=(6, 4))
             self._reconnect_world_box.bind(
                 "<<ComboboxSelected>>", lambda _event: self._reconnect_on_change()
+            )
+            # A value changed with the keyboard fires no selection event, so leaving the box must save
+            # it as well - this is the operator's "saved when the widget blur" for the world.
+            self._reconnect_world_box.bind(
+                "<FocusOut>", lambda _event: self._reconnect_on_change()
             )
             ttk.Label(reconnect_row, text="频道").pack(side="left")
             # Only an integer 1-60 may be typed (validated again on every change).
@@ -1970,6 +2050,8 @@ class UiWorker(threading.Thread):
             self._reconnect_channel_box.bind(
                 "<FocusOut>", lambda _event: self._reconnect_on_change()
             )
+            # The shared hint area lives at the BOTTOM of the panel (see below); its two lines are
+            # created here so the rows above stay a single compact line each.
             self._reconnect_status = ttk.Label(
                 extra_panel,
                 text=("自动重连: 已启用 - %s %d频道。" % (saved_world, saved_channel)
@@ -1977,52 +2059,43 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            self._reconnect_status.pack(anchor="w", pady=(2, 0))
             # TEMPORARY (testing aid): run the whole reconnect sequence immediately, so the
             # operator can check Enter -> 3s -> world -> channel -> Enter -> 2s -> Enter
-            # without waiting for a real 掉线.  The second button saves one frame of the game
-            # window: the select-window geometry has to be measured from a real frame, and the
-            # game (and therefore the frame) only exists on the operator's machine.
+            # without waiting for a real 掉线.  It is the only button here: the sequence is
+            # keyboard only, so there is no window capture and no calibration to do.
+            # ONE row for both test buttons (the operator's layout), the hint area below them.
             reconnect_buttons = ttk.Frame(extra_panel)
-            reconnect_buttons.pack(anchor="w", pady=(2, 0))
+            reconnect_buttons.pack(fill="x", pady=(2, 0))
             self._reconnect_test_button = ttk.Button(
                 reconnect_buttons,
                 text="测试自动重连（临时）",
                 command=self._reconnect_test_clicked,
             )
             self._reconnect_test_button.pack(side="left")
-            self._reconnect_capture_button = ttk.Button(
-                reconnect_buttons,
-                text="截取游戏窗口",
-                command=self._reconnect_capture_clicked,
-            )
-            self._reconnect_capture_button.pack(side="left", padx=(6, 0))
             # 测试api: pick a video file, play it in its own focused window and send each frame's
             # ROI (372x248 jpeg90 base64) to the RoiTrack backend at the API's 5 fps, showing every
             # answer.  The mouse is confined to the picture rectangle, so it never touches the game.
             # One button only: the run length is the measured ~30s and the product key travels with
             # the application (autolie_api/key_secret.txt, or LIE_PRODUCT_KEY), so there is nothing
             # for the operator to configure here.
-            api_row = ttk.Frame(extra_panel)
-            api_row.pack(fill="x", pady=(4, 0))
             self._api_test_button = ttk.Button(
-                api_row, text="测试api", command=self._api_test_clicked,
+                reconnect_buttons, text="测试api", command=self._api_test_clicked,
             )
-            self._api_test_button.pack(side="left")
+            self._api_test_button.pack(side="left", padx=(6, 0))
+            # The shared HINT area at the bottom of the panel: 自动过测谎 and 自动重连 report into it.
+            hint_row = ttk.Frame(extra_panel)
+            hint_row.pack(fill="x", pady=(2, 0))
             self._api_test_status = ttk.Label(
-                extra_panel, text=self._api_test_status_text(),
+                hint_row, text=self._api_test_status_text(),
                 justify="left", wraplength=440,
             )
-            self._api_test_status.pack(anchor="w", pady=(2, 0))
-            # 标定: record where the world rows and channel circles really are.  Five presses,
-            # each with a 3s countdown so the mouse can be moved onto the game; the worker
-            # writes reconnect_layout.json and the drill can then click for real.
-            self._reconnect_calibrate_button = ttk.Button(
-                reconnect_buttons,
-                text="标定选择窗口",
-                command=self._reconnect_calibrate_clicked,
-            )
-            self._reconnect_calibrate_button.pack(side="left", padx=(6, 0))
+            self._api_test_status.pack(anchor="w")
+            self._reconnect_status.pack(anchor="w")
+            if saved_api_auto_lie and hasattr(self, "_api_test_status"):
+                # 自动过测谎 was armed last time: say so in the shared hint area straight away.
+                self._api_test_status.configure(
+                    text="自动过测谎: 已启用 - 测谎窗口出现时自动过测谎（未开始巡逻也会检测并接管）。"
+                )
             if saved_reconnect_enabled:
                 # apply the saved values to the worker once it exists (Tk's own timer:
                 # the UiWorker is not a Tk object)
@@ -2191,7 +2264,7 @@ class UiWorker(threading.Thread):
         self._caption_separator = separator
 
         title = tk.Label(
-            bar, text=f"todo_helper ({app_version})", bg="#f0f0f0",
+            bar, text=f"MapleAssistant {app_version}", bg="#f0f0f0",
             anchor="w",
         )
         title.pack(side="left", padx=(10, 0))
@@ -2574,12 +2647,55 @@ class UiWorker(threading.Thread):
             pass
 
     def _poll(self) -> None:
+        """Run one tick of the periodic UI work and ALWAYS schedule the next one.
+
+        The re-arm used to be the last statement of this method, so a single exception in any step
+        (log drain, patrol sync, hotkey dispatch, api drains) silently ended every periodic task for
+        the rest of the session: hotkeys stopped doing anything because their actions are dispatched
+        here, and no action sound played any more - while widget callbacks (buttons, focus bindings)
+        kept working.  That is exactly the operator's "the hotkey binding is lost and the sound is
+        gone" report, with the movement/attack workers still logging normally.
+        """
+
         root = self._root
         if root is None:
             return
         if self.stop_event.is_set():
             root.destroy()
             return
+        try:
+            self._poll_body(root)
+        except Exception as exc:
+            # Rate limited: a persistent failure used to write a full traceback on every tick
+            # (about five per second), which buries every other line in the log.
+            now = time.monotonic()
+            signature = f"{type(exc).__name__}: {exc}"
+            logged_at = getattr(self, "_poll_failure_log_at", float("-inf"))
+            if (signature != getattr(self, "_poll_failure_signature", "")
+                    or now - logged_at >= POLL_FAILURE_LOG_SECONDS):
+                self._poll_failure_signature = signature
+                self._poll_failure_log_at = now
+                self._poll_failure_count = 0
+                LOG.exception(
+                    "debug UI poll failed; the periodic refresh continues (hotkeys and sounds stay "
+                    "alive)"
+                )
+            else:
+                self._poll_failure_count = getattr(self, "_poll_failure_count", 0) + 1
+                LOG.debug(
+                    "debug UI poll failed again (%d times): %s",
+                    self._poll_failure_count, signature,
+                )
+        finally:
+            try:
+                if not self.stop_event.is_set() and root.winfo_exists():
+                    root.after(self.refresh_ms, self._poll)
+            except Exception:
+                LOG.debug("could not re-arm the debug UI poll", exc_info=True)
+
+    def _poll_body(self, root: Any) -> None:
+        """One tick's work, without the re-arm (see :meth:`_poll`)."""
+
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
         # so the resize stays light, but keep the poll cadence alive.
@@ -2587,7 +2703,6 @@ class UiWorker(threading.Thread):
             getattr(self, "_resize_freeze_state", {}).get("active", False)
         )
         if frozen:
-            root.after(self.refresh_ms, self._poll)
             return
         latest = None
         while True:
@@ -2621,7 +2736,8 @@ class UiWorker(threading.Thread):
         self._poll_yolo_exit()
         self._drain_hotkey_actions()
         self._drain_api_test_results()
-        root.after(self.refresh_ms, self._poll)
+        self._service_api_auto_lie()
+        self._drain_api_auto_lie_results()
 
     def _sync_patrol_ui_state(self) -> None:
         """Refresh patrol buttons when patrol stopped outside the UI.
@@ -2671,6 +2787,21 @@ class UiWorker(threading.Thread):
                 action = actions.get_nowait()
             except queue.Empty:
                 return
+            except Exception:
+                LOG.debug("hotkey queue read failed", exc_info=True)
+                return
+            if not isinstance(action, str):
+                # A malformed item must never take the whole poll chain (and with it every hotkey
+                # action) down.
+                LOG.warning("hotkey action ignored: unexpected item %r", action)
+                try:
+                    actions.task_done()
+                except (AttributeError, ValueError):
+                    pass
+                continue
+            LOG.info("hotkey action run: %s", action)
+            if action.startswith(TYPING_HOTKEY_PREFIXES):
+                self._arm_input_for_hotkey(action)
             try:
                 if action.startswith("quick_message:"):
                     if not self._send_quick_message(
@@ -2858,10 +2989,21 @@ class UiWorker(threading.Thread):
             if enabled:
                 self._reconnect_status.configure(
                     text=f"自动重连: 已启用 - {world} {channel}频道；"
-                         f"掉线后确认登录页即自动进入。"
+                         f"掉线后确认登录页即自动进入（未开始巡逻也生效）。"
                 )
             else:
                 self._reconnect_status.configure(text="自动重连: 未启用。")
+        if enabled and not self._disconnect_detection_armed():
+            # 掉线 is the detector the reconnect waits for: without it no disconnect is ever noticed, so
+            # say it here instead of leaving the operator with a reconnect that can never fire.
+            LOG.warning(
+                "自动重连 is armed but 掉线 (disconnect alert) is OFF: nothing detects the disconnect, so "
+                "the reconnect can never start - tick 掉线 as well"
+            )
+            if hasattr(self, "_reconnect_status"):
+                self._reconnect_status.configure(
+                    text="自动重连: 已启用，但「掉线」未勾选 - 检测不到掉线，不会自动重连。"
+                )
 
     def _register_validator(self, widget, callback):
         """A Tk entry validator for ``callback``, registered on ``widget``.
@@ -2904,106 +3046,6 @@ class UiWorker(threading.Thread):
             self._reconnect_status.configure(
                 text="自动重连: 手动测试已开始（请勿移动鼠标/键盘）。"
             )
-
-    def _reconnect_capture_clicked(self) -> None:
-        """Save one frame of the game window (calibration / diagnosis).
-
-        Two of these are what the select-window geometry is measured from: one with the world
-        list on screen, one with the channel list on screen.  The file lands in the app's own
-        screenshots folder next to the install.
-        """
-
-        worker = self.reconnect_worker
-        if worker is None:
-            if hasattr(self, "_reconnect_status"):
-                self._reconnect_status.configure(
-                    text="自动重连: 本机助手未启用该工作线程。"
-                )
-            return
-        self._reconnect_on_change()          # keep the worker's world/channel in sync
-        capture = getattr(worker, "save_diagnostic_capture", None)
-        if not callable(capture):
-            return
-        if hasattr(self, "_reconnect_capture_button"):
-            try:
-                self._reconnect_capture_button.configure(state="disabled")
-            except Exception:
-                LOG.debug("capture button could not be disabled", exc_info=True)
-        try:
-            path = capture()
-        except Exception:
-            LOG.exception("auto reconnect: diagnostic capture failed")
-            path = None
-        finally:
-            if hasattr(self, "_reconnect_capture_button"):
-                try:
-                    self._reconnect_capture_button.configure(state="normal")
-                except Exception:
-                    LOG.debug("capture button could not be re-armed", exc_info=True)
-        if hasattr(self, "_reconnect_status"):
-            if path is None:
-                self._reconnect_status.configure(text="截取游戏窗口失败：找不到游戏窗口。")
-            else:
-                self._reconnect_status.configure(
-                    text=f"已截取游戏窗口: {Path(path).name}（{Path(path).parent}）"
-                )
-
-    def _reconnect_calibrate_clicked(self) -> None:
-        """Record the next click-calibration point from the mouse position.
-
-        Five points in total (world rows 1 and 2, channels 1, 2 and 6).  Each press waits 3
-        seconds before reading the cursor, so the mouse can be moved onto the game; the worker
-        writes reconnect_layout.json when the last point is in.  Pressing it again after a
-        finished calibration starts over, which is what a different client size needs.
-        """
-
-        worker = self.reconnect_worker
-        if worker is None:
-            self._set_reconnect_status("自动重连: 本机助手未启用该工作线程。")
-            return
-        next_step = getattr(worker, "calibration_next_step", None)
-        if not callable(next_step):
-            return
-        step = next_step()
-        restarted = False
-        if step is None:                      # already complete -> start a fresh one
-            reset = getattr(worker, "reset_calibration", None)
-            if callable(reset):
-                reset()
-            step, restarted = next_step(), True
-        if step is None:
-            return
-        key, label = step
-        if hasattr(self, "_reconnect_calibrate_button"):
-            try:
-                self._reconnect_calibrate_button.configure(state="disabled")
-            except Exception:
-                LOG.debug("calibrate button could not be disabled", exc_info=True)
-        verb = "重新标定" if restarted else "标定"
-        self._set_reconnect_status(
-            f"{verb}: 3 秒后记录鼠标位置 → {label}（请把鼠标移到游戏里的该位置）"
-        )
-        LOG.info("auto reconnect: %s step %s (%s) starts in %.1fs", verb, key, label,
-                 RECONNECT_CALIBRATION_DELAY_SECONDS)
-
-        def record() -> None:
-            try:
-                ok, message = worker.record_layout_point(key)
-            except Exception:
-                LOG.exception("auto reconnect: calibration point failed")
-                ok, message = False, "标定取点失败（详见 error.log）"
-            if ok:
-                following = next_step()
-                if following is not None:
-                    message = f"{message}；下一步：{following[1]}（再按一次「标定选择窗口」）"
-            self._set_reconnect_status(message)
-            if hasattr(self, "_reconnect_calibrate_button"):
-                try:
-                    self._reconnect_calibrate_button.configure(state="normal")
-                except Exception:
-                    LOG.debug("calibrate button could not be re-armed", exc_info=True)
-
-        self._root.after(int(RECONNECT_CALIBRATION_DELAY_SECONDS * 1000), record)
 
     def _set_reconnect_status(self, text: str) -> None:
         if hasattr(self, "_reconnect_status"):
@@ -3235,9 +3277,20 @@ class UiWorker(threading.Thread):
             return
         while True:
             try:
-                state, detail = results.get_nowait()
+                item = results.get_nowait()
             except queue.Empty:
                 return
+            except Exception:
+                LOG.debug("api test result read failed", exc_info=True)
+                return
+            if not (isinstance(item, tuple) and len(item) == 2):
+                LOG.warning("api test result ignored: unexpected item %r", item)
+                try:
+                    results.task_done()
+                except (AttributeError, ValueError):
+                    pass
+                continue
+            state, detail = item
             try:
                 if state == "frame":
                     self._set_api_test_status(f"测试api 帧 {detail}")
@@ -3299,7 +3352,10 @@ class UiWorker(threading.Thread):
             rect = None
         if rect:
             worker.image_rect = rect
-        self._api_test_keep_focus()
+        try:
+            self._api_test_keep_focus()
+        except Exception:
+            LOG.debug("api test window could not be kept focused", exc_info=True)
 
     def _api_test_idle(self) -> None:
         """The drill ended (or was stopped): close the video window and re-arm the buttons."""
@@ -3326,6 +3382,304 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.warning("api test settings could not be saved", exc_info=True)
 
+    def _load_api_auto_lie_setting(self) -> bool:
+        """Whether 自动过测谎 was armed last time (part of user_config, like the reconnect)."""
+
+        try:
+            data = json.loads(
+                self._shutdown_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return False
+        return bool(data.get("auto_lie_api_enabled", False))
+
+    def _api_auto_lie_on_change(self) -> None:
+        """Arm or disarm the automatic api pass, and persist it immediately."""
+
+        armed = bool(self._api_auto_lie_var.get()) if hasattr(
+            self, "_api_auto_lie_var") else False
+        try:
+            self._shutdown_save_settings(self._shutdown_collect_data())
+        except Exception:
+            LOG.warning("自动过测谎 setting could not be saved", exc_info=True)
+        if hasattr(self, "_api_test_status"):
+            if not armed:
+                self._api_test_status.configure(text="自动过测谎: 未启用。")
+            elif not self._lie_detection_armed():
+                # 自动过测谎 is driven by the lie detector: without 测谎 no lie window can be seen, so the
+                # pass would never start.  Say it here instead of leaving the operator with silence.
+                self._api_test_status.configure(
+                    text="自动过测谎: 已启用，但「测谎」未勾选 - 检测不到测谎窗口，不会自动过测谎。"
+                )
+            else:
+                self._api_test_status.configure(
+                    text="自动过测谎: 已启用 - 未开始巡逻时也会自动抓取窗口检测并接管。"
+                )
+        if armed and not self._lie_detection_armed():
+            LOG.warning(
+                "自动过测谎 is armed but 测谎 (lie detection) is OFF: no lie window can be detected, so "
+                "the automatic pass can never start - tick 测谎 as well"
+            )
+        LOG.info("自动过测谎 %s", "armed" if armed else "disarmed")
+
+    def _lie_detection_armed(self) -> bool:
+        """Whether the 测谎 checkbox is ticked (it is what enables the detector)."""
+
+        var = getattr(self, "_lie_alert_var", None)
+        try:
+            return bool(var.get()) if var is not None else False
+        except Exception:
+            return False
+
+    def _disconnect_detection_armed(self) -> bool:
+        """Whether the 掉线 checkbox is ticked (it is what enables the disconnect detector).
+
+        自动重连 reacts to that alert (``CharacterWorker`` -> ``_on_disconnect_event`` ->
+        ``notify_disconnect``), so without 掉线 nothing would ever notice the disconnect and the
+        reconnect could never run - not before the patrol and not during it.
+        """
+
+        var = getattr(self, "_disconnect_alert_var", None)
+        try:
+            return bool(var.get()) if var is not None else False
+        except Exception:
+            return False
+
+    def on_lie_event_for_api(self, match: object = None) -> None:
+        """One detector frame: ``match`` is the square bbox, or None when the square is gone.
+
+        Called from the lie detector's thread - only flags are raised here, the Tk thread services
+        them in ``_poll``, so nothing Tk is touched from another thread.
+
+        The detector calls this with a bbox only for a NEW event (after the previous one cleared), so
+        a new window arms a pass at once; only the minimum gap between passes can refuse it, and that
+        refusal is LOGGED.  Nothing here may return silently for a new window - the v1.0.26 field
+        report was "the lie event happened, but the autolie_api is not taking over" with no line in the
+        log explaining it (the old 3 s "square was absent" debounce swallowed the event).
+        """
+
+        if not hasattr(self, "_api_auto_lie_var"):
+            LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
+            return
+        if not self._api_auto_lie_var.get():
+            LOG.warning(
+                "自动过测谎: lie event ignored - the 自动过测谎 selection is OFF "
+                "(tick it to pass automatically)"
+            )
+            return
+        now = time.monotonic()
+        if match is None:
+            # The square is gone: the window is over and the next bbox is a new event.
+            self._api_auto_lie_clear_since = now
+            self._api_auto_lie_event_active = False
+            return
+        if getattr(self, "_api_auto_lie_event_active", False):
+            return                                   # this window is already being handled
+        self._api_auto_lie_event_active = True
+        if self._worker_is_running(getattr(self, "_api_lie_pass_worker", None)):
+            # ONE pass per window: the pass that is running was started for this very window (the
+            # square only flickers, the window is still on screen), so a second pass would spend a
+            # second api round for the same test.  The operator's rule: "the first alarm will be
+            # accepted, then the autolie_api takes over, the second one will be ignored".
+            LOG.warning("自动过测谎: a pass is ALREADY handling this lie window - this event is "
+                        "ignored (one pass per window; a pass is running)")
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(
+                    text="自动过测谎: 正在处理本测谎窗口，重复事件已忽略。"
+                )
+            return
+        since_last = now - getattr(self, "_api_auto_lie_last_pass_started", 0.0)
+        if since_last < AUTO_LIE_MIN_PASS_GAP_SECONDS:
+            LOG.warning(
+                "自动过测谎: a lie window appeared %.0fs after the previous pass started (minimum "
+                "%.0fs apart) - NO pass is started for it (the quota is protected this way, not by "
+                "silently ignoring windows)", since_last, AUTO_LIE_MIN_PASS_GAP_SECONDS,
+            )
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(
+                    text=f"自动过测谎: 测谎窗口出现，但距上次通行仅 {since_last:.0f}s（最小 "
+                         f"{AUTO_LIE_MIN_PASS_GAP_SECONDS:.0f}s），本次不通行。"
+                )
+            return
+        self._api_auto_lie_pending = True
+        self._api_auto_lie_pending_since = now
+        self._api_auto_lie_wait_logged = False
+        LOG.warning(
+            "自动过测谎: a new lie window armed a pass (bbox %s, previous pass %.0fs ago)",
+            match, since_last,
+        )
+
+    @staticmethod
+    def _worker_is_running(worker: Any) -> bool:
+        """Whether a pass worker is busy - ``running`` is a property on some, a method on others.
+
+        ``ApiLieTestWorker.running`` and ``VideoDrillWorker.running`` are ``@property`` bools;
+        treating one as a callable raised ``TypeError: 'bool' object is not callable`` on EVERY poll
+        tick, and because the pending flag is cleared only after this check it could never clear.
+        An unreadable state counts as "busy": a second pass must never be started blindly.
+        """
+
+        if worker is None:
+            return False
+        state = getattr(worker, "running", False)
+        if callable(state):
+            try:
+                return bool(state())
+            except Exception:
+                LOG.warning("自动过测谎: worker.running() failed", exc_info=True)
+                return True
+        return bool(state)
+
+    def _service_api_auto_lie(self) -> None:
+        """Start the api pass for a pending lie event (Tk thread)."""
+
+        # A pass that WE started for a lie window pauses the patrol (the lie test freezes the
+        # character, so the movement worker otherwise counts it as stuck and fires its self-rescue
+        # mid-test - the operator's v1.0.26 log: "SELF-RESCUE: character stationary on patrol route
+        # for 20 frames" twice inside one lie window, restarting the patrol and walking the character
+        # while the api pass was supposed to have the machine).  Resume it as soon as the pass is done.
+        if getattr(self, "_api_auto_lie_patrol_paused", False) \
+                and not self._worker_is_running(self._api_lie_pass_worker):
+            self._resume_patrol_after_api_pass()
+        if not self._api_auto_lie_pending:
+            return
+        # One pass at a time.  A pending event waits for the running one, but not forever: a worker
+        # that never comes back must not keep the flag set and this method retrying every tick.
+        if self._worker_is_running(self._api_lie_pass_worker):
+            if not getattr(self, "_api_auto_lie_wait_logged", False):
+                self._api_auto_lie_wait_logged = True
+                LOG.info("自动过测谎: a pass is still running; this lie event waits for it")
+            waited = time.monotonic() - getattr(
+                self, "_api_auto_lie_pending_since", time.monotonic()
+            )
+            if waited >= AUTO_LIE_PENDING_MAX_SECONDS:
+                self._api_auto_lie_pending = False
+                LOG.warning(
+                    "自动过测谎: dropping a lie event that waited %.0fs for the running pass",
+                    waited,
+                )
+            return
+        factory = getattr(self, "api_auto_lie_factory", None)
+        if factory is None:
+            self._api_auto_lie_pending = False
+            LOG.warning(
+                "自动过测谎: this build has no api pass factory - the lie event is dropped"
+            )
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(
+                    text="自动过测谎: 本机助手未启用该工作线程。")
+            return
+        since_last = time.monotonic() - getattr(
+            self, "_api_auto_lie_last_pass_started", 0.0
+        )
+        if since_last < AUTO_LIE_MIN_PASS_GAP_SECONDS:
+            self._api_auto_lie_pending = False
+            LOG.info(
+                "自动过测谎: pass skipped - the previous pass started %.0fs ago "
+                "(minimum %.0fs apart)",
+                since_last, AUTO_LIE_MIN_PASS_GAP_SECONDS,
+            )
+            return
+        self._api_auto_lie_pending = False
+        try:
+            worker = factory()
+        except Exception as exc:
+            LOG.warning("自动过测谎 could not start", exc_info=True)
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
+            return
+        self._pause_patrol_for_api_pass()
+        self._api_lie_pass_worker = worker
+        self._api_auto_lie_last_pass_started = time.monotonic()
+        self._api_auto_lie_wait_logged = False
+        self._api_auto_lie_runs += 1
+        try:
+            worker.start()
+        except Exception as exc:
+            LOG.warning("自动过测谎 worker could not be started", exc_info=True)
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
+            return
+        LOG.info("自动过测谎: pass %d started for a lie window", self._api_auto_lie_runs)
+        if hasattr(self, "_api_test_status"):
+            self._api_test_status.configure(
+                text=f"自动过测谎: 测谎窗口出现，正在处理（第 {self._api_auto_lie_runs} 次）…"
+            )
+
+    def _pause_patrol_for_api_pass(self) -> None:
+        """Stand the patrol down while the automatic api pass answers the lie test.
+
+        The lie test freezes the character, and a frozen character on the patrol route is exactly what
+        the movement worker's self-rescue reacts to - it restarted the patrol and walked the character
+        in the middle of the test.  The patrol is only resumed when it was running before, so a pass
+        never starts a patrol the operator did not start.
+        """
+
+        self._api_auto_lie_patrol_paused = False
+        controller = getattr(self, "patrol_controller", None)
+        if controller is not None and controller.is_enabled():
+            try:
+                controller.set_enabled(False)
+                self._api_auto_lie_patrol_paused = True
+                LOG.warning("自动过测谎: patrol paused for the api pass (it resumes when the pass "
+                            "finishes)")
+            except Exception:
+                LOG.warning("自动过测谎: the patrol could not be paused for the pass", exc_info=True)
+        event = getattr(self, "automation_active_event", None)
+        if event is not None:
+            try:
+                event.clear()
+            except Exception:
+                LOG.debug("自动过测谎: the automation switch could not be cleared", exc_info=True)
+
+    def _resume_patrol_after_api_pass(self) -> None:
+        """Put the patrol back after the automatic api pass finished."""
+
+        was_paused = getattr(self, "_api_auto_lie_patrol_paused", False)
+        self._api_auto_lie_patrol_paused = False
+        if not was_paused:
+            return
+        controller = getattr(self, "patrol_controller", None)
+        if controller is not None:
+            try:
+                controller.set_enabled(True)
+                self._refresh_patrol_controls()
+            except Exception:
+                LOG.warning("自动过测谎: the patrol could not be resumed", exc_info=True)
+        event = getattr(self, "automation_active_event", None)
+        if event is not None:
+            try:
+                event.set()
+            except Exception:
+                LOG.debug("自动过测谎: the automation switch could not be set", exc_info=True)
+        LOG.warning("自动过测谎: the api pass is done - the patrol resumes where it was")
+
+    def _drain_api_auto_lie_results(self) -> None:
+        """Report the automatic pass into the shared hint area."""
+
+        worker = self._api_lie_pass_worker
+        if worker is None:
+            return
+        results = getattr(worker, "results", None)
+        if results is None:
+            return
+        latest = None
+        while True:
+            try:
+                latest = results.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+        if not (isinstance(latest, tuple) and len(latest) == 2):
+            if latest is not None:
+                LOG.warning("自动过测谎 result ignored: unexpected item %r", latest)
+            return
+        state, detail = latest
+        text = f"{state}: {detail}" if detail else str(state)
+        if hasattr(self, "_api_test_status"):
+            self._api_test_status.configure(text=f"自动过测谎: {text}")
+
     def _save_reconnect_settings(self, enabled: bool, world: str, channel: int) -> None:
         """Persist 自动重连 with the rest of the panel's settings."""
 
@@ -3350,6 +3704,62 @@ class UiWorker(threading.Thread):
         if channel is None:
             channel = CHANNEL_DEFAULT
         return bool(data.get("auto_reconnect_enabled", False)), world, channel
+
+    def _restart_patrol_after_reconnect(self, detail: str) -> None:
+        """Put the patrol back the way 开始巡逻 does, after the reconnect brought the character in.
+
+        ``_start_patrol`` cannot be reused directly: it returns early when the patrol controller is
+        already enabled, which is exactly the state a reconnect leaves behind - and the missing part is
+        the SESSION preparation (marker -> layer detection -> ``prepare_patrol_start``), not the switch.
+        ``on_patrol_restart`` is the dedicated hook for this (the assistant's
+        ``restart_patrol_after_reconnect``): it runs the same preparation without the calibration
+        overlays and without refusing when the character is off the patrol route.
+        """
+
+        if not hasattr(self, "_reconnect_status"):
+            return
+        # 自动重连 is NOT a patrol workflow: it reconnects because the character dropped, whether or not
+        # the operator was patrolling.  It may only put back a patrol that was interrupted, never start
+        # one that was never there ("the assistant resumes only a patrol that the disconnect actually
+        # interrupted" - see reconnect_worker._finish_automation).  The reliable signal is the operator's
+        # own last 开始巡逻/停止巡逻 choice: the disconnect alert and the focus gate stop the patrol by
+        # themselves WITHOUT touching this flag, which is exactly why v1.0.31's "character logined but
+        # patrol did not start" case still restarts (intent was ON) while a parked assistant stays parked.
+        if not bool(getattr(self, "_patrol_intent", False)):
+            LOG.warning(
+                "auto reconnect: the run succeeded, but the operator never started the patrol (停止巡逻/"
+                "未按过) - leaving it stopped; 自动重连 does not depend on the patrol"
+            )
+            self._reconnect_status.configure(
+                text=f"自动重连完成: {detail}，未开始巡逻（之前未按开始巡逻）。"
+            )
+            return
+        self._reconnect_status.configure(
+            text=f"自动重连完成: {detail}，正在检测层数并恢复巡逻…"
+        )
+        # The patrol INTENT is ON, so the patrol is restored whatever the switch reads right now: the
+        # disconnect alert and the focus gate stop the patrol by themselves, so any "is it enabled?"
+        # test is unreliable and was exactly what left the patrol stopped in v1.0.31.
+        LOG.info("auto reconnect: restarting the patrol after the reconnect (the operator's last "
+                 "开始巡逻/停止巡逻 choice was: %s)", "开始巡逻" if getattr(
+                     self, "_patrol_intent", False) else "停止巡逻/未按过")
+        hook = self.on_patrol_restart or self.on_patrol_start
+        armed = True
+        if hook is not None:
+            try:
+                armed = hook() is not False
+            except OSError as exc:
+                LOG.warning("auto reconnect: patrol restart refused at the window/calibration step "
+                            "(layer detection): %s", exc)
+                armed = False
+        if armed and self.patrol_controller is not None:
+            self.patrol_controller.set_enabled(True)
+            self._refresh_patrol_controls()
+        LOG.info("auto reconnect: patrol restart after the run -> armed=%s", armed)
+        self._reconnect_status.configure(
+            text=(f"自动重连完成: {detail}，已重新检测层数并恢复巡逻" if armed
+                  else f"自动重连完成: {detail}，未自动开始巡逻（详见日志）")
+        )
 
     def _drain_reconnect_results(self) -> None:
         """Show the 自动重连 worker's progress on Tk's owning thread."""
@@ -3390,11 +3800,18 @@ class UiWorker(threading.Thread):
                 elif state == "colour":
                     # the temporary 测试重连 button's login-page colour measurement
                     self._reconnect_status.configure(text=f"登录页颜色检测: {detail}")
+                elif state == "patrol-restart":
+                    # The reconnect came back with the character in game and asks for the patrol to be
+                    # prepared again: re-detecting the layer and re-anchoring the map session is what
+                    # 开始巡逻 does, and it is what makes the movement worker resync onto the patrol
+                    # route after a reconnect (the operator's v1.0.24 report: "it don't start patrol,
+                    # it didn't go into detect layer and check if back to patrol route logic").
+                    self._restart_patrol_after_reconnect(detail)
                 elif state == "input":
                     self._reconnect_status.configure(text=f"自动重连: {detail}")
                 elif state == "capture":
                     self._reconnect_status.configure(
-                        text=f"已截取游戏窗口: {Path(detail).name}（{Path(detail).parent}）"
+                        text=f"已保存诊断截图: {Path(detail).name}（{Path(detail).parent}）"
                     )
                 else:
                     suffix = f": {detail}" if detail else ""
@@ -3406,6 +3823,51 @@ class UiWorker(threading.Thread):
                     results.task_done()
                 except (AttributeError, ValueError):
                     pass
+
+    def _arm_input_for_hotkey(self, action: str) -> None:
+        """Re-arm live input for a TYPING hotkey (Ctrl+1..0 / trade / pickup).
+
+        The auto-reconnect leaves live input OFF when a run fails (it must not type on the login
+        page), and a run that succeeds leaves it exactly as it found it - which, before Start Patrol,
+        is also OFF.  Every key the assistant then sends is refused, so the hotkeys looked dead.
+        Arming here is a deliberate operator action on a typing chord, and it is skipped while the
+        game is not focused, while patrol runs, or while the reconnect owns the machine.
+        """
+
+        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        if sender is None:
+            return
+        is_enabled = getattr(sender, "input_is_enabled", None)
+        if not callable(is_enabled) or is_enabled():
+            return
+        reconnect = getattr(self, "reconnect_worker", None)
+        owner = getattr(reconnect, "reconnect_active_event", None)
+        if owner is not None and owner.is_set():
+            LOG.info("hotkey %s: 自动重连 owns the machine; live input left off", action)
+            return
+        if (self.patrol_controller is not None
+                and self.patrol_controller.is_enabled()):
+            LOG.info("hotkey %s: patrol is running; live input state left alone", action)
+            return
+        foreground = getattr(sender, "is_game_foreground", None)
+        if callable(foreground) and not foreground():
+            LOG.info(
+                "hotkey %s: live input is off and the game window is not foreground; "
+                "not re-arming", action,
+            )
+            return
+        enable = getattr(sender, "enable_input", None)
+        if not callable(enable):
+            return
+        try:
+            enable()
+        except Exception:
+            LOG.warning("hotkey %s: live input could not be re-armed", action, exc_info=True)
+            return
+        LOG.info(
+            "hotkey %s: live input re-armed (patrol is stopped) - typing hotkeys work again",
+            action,
+        )
 
     def _play_action_sound(self, success: bool) -> None:
         """Play UI action feedback without blocking Tk."""
@@ -4738,6 +5200,9 @@ class UiWorker(threading.Thread):
             data["countdown_interval_hours"] = round(
                 float(self._countdown_interval_var.get()), 1
             )
+        if hasattr(self, "_api_auto_lie_var"):
+            # 自动过测谎 is part of user_config, like the reconnect selection.
+            data["auto_lie_api_enabled"] = bool(self._api_auto_lie_var.get())
         if hasattr(self, "_reconnect_var"):
             data["auto_reconnect_enabled"] = bool(self._reconnect_var.get())
             data["auto_reconnect_world"] = self._reconnect_world_var.get()
@@ -4803,10 +5268,29 @@ class UiWorker(threading.Thread):
             if setter is not None:
                 setter(bool(data.get("disconnect_alert_enabled", False)))
         lie_detector = getattr(self, "lie_detector_worker", None)
+        lie_detection_armed = bool(data.get("lie_alert_enabled", False))
         if lie_detector is not None:
             setter = getattr(lie_detector, "set_enabled", None)
             if setter is not None:
-                setter(bool(data.get("lie_alert_enabled", False)))
+                setter(lie_detection_armed)
+        # 测谎 / 掉线 are what feed 自动过测谎 and 自动重连: while they are armed and the shared capture is
+        # parked (no Start Patrol), the assistant's parked watch grabs the game window on its own, so a
+        # lie window is still detected and a 掉线 is still noticed - both workflows are independent of
+        # the patrol.
+        disconnect_armed = bool(data.get("disconnect_alert_enabled", False))
+        for watch_event, armed in (
+            (getattr(self, "lie_watch_armed_event", None), lie_detection_armed),
+            (getattr(self, "disconnect_watch_armed_event", None), disconnect_armed),
+        ):
+            if watch_event is None:
+                continue
+            try:
+                if armed:
+                    watch_event.set()
+                else:
+                    watch_event.clear()
+            except Exception:
+                LOG.debug("the parked watch could not be armed", exc_info=True)
         sound_enabled = bool(data.get("sound_alert_enabled", True))
         for alert_worker in (
             getattr(self, "countdown_worker", None),
@@ -6219,12 +6703,28 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
 
     def _start_patrol(self) -> bool:
+        # The operator WANTS to patrol: remembered even when this attempt is refused (the attempt
+        # usually fails because the character is still on a login page, which is exactly the state a
+        # reconnect ends), so a later successful 自动重连 can start the patrol on its own.  The
+        # operator's v1.0.30 report: he pressed 开始巡逻 at 18:08:01 ("yellow character marker was not
+        # detected during patrol startup"), the reconnect then succeeded - and the patrol stayed
+        # stopped because no patrol had ever been RUNNING for the reconnect to resume.
+        self._patrol_intent = True
         if self.patrol_controller is None:
+            LOG.warning("START PATROL refused: the patrol controller is unavailable")
             self._control_status.configure(text="巡逻控制器不可用。")
             return False
         if self.patrol_controller.is_enabled():
             return True
         if not self.patrol_controller.can_start():
+            # Logged, not only shown: this refusal used to leave no trace in the log the operator
+            # sends, so "the patrol toggle does nothing" was undiagnosable.
+            LOG.warning(
+                "START PATROL refused: a floor in the patrol range has no recorded action "
+                "point (range=%s, layers=%s)",
+                self.patrol_controller.patrol_range(),
+                sorted(self.patrol_controller.snapshot_layers()),
+            )
             self._control_status.configure(
                 text=("无法开始: 每层至少录制一个巡逻点 (最左 / 绳索 / 最右)。"
                       "不录制任何点时将原地站立只进行攻击。")
@@ -6238,6 +6738,7 @@ class UiWorker(threading.Thread):
             try:
                 result = self.on_patrol_start()
             except OSError as exc:
+                LOG.warning("START PATROL refused: game window/calibration step failed: %s", exc)
                 self._control_status.configure(
                     text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
@@ -6247,6 +6748,10 @@ class UiWorker(threading.Thread):
             # this is a failure the operator has to retry, not a deferred start.
             armed = result is not False
         if not armed:
+            LOG.warning(
+                "START PATROL refused: input was not armed (window not ready, focus lost, or "
+                "the calibration step vetoed it)"
+            )
             self._control_status.configure(
                 text="无法开始: 输入未武装（游戏窗口未就绪或焦点丢失），请重试。"
             )
@@ -6264,6 +6769,8 @@ class UiWorker(threading.Thread):
         return True
 
     def _stop_patrol(self) -> bool:
+        # The operator does NOT want to patrol any more: a later reconnect must not start one.
+        self._patrol_intent = False
         if self.patrol_controller is None:
             return False
         self.patrol_controller.set_enabled(False)

@@ -1,9 +1,13 @@
 import logging
+import queue
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from ui_worker import (
+    TYPING_HOTKEY_PREFIXES,
     UiLogHandler,
     UiWorker,
     bindable_keys_hint,
@@ -2164,6 +2168,465 @@ class WindowGeometryHelperTests(unittest.TestCase):
                     _load_window_geometry("1200x1000+40+40"),
                     "1200x1000+40+40",
                 )
+
+
+class HotkeyInputRearmTests(unittest.TestCase):
+    """A typing hotkey re-arms live input when the reconnect (or a failed run) left it off."""
+
+    class _Sender:
+        def __init__(self, *, enabled: bool, foreground: bool = True):
+            self.enabled = enabled
+            self.foreground = foreground
+            self.armed = 0
+
+        def input_is_enabled(self) -> bool:
+            return self.enabled
+
+        def is_game_foreground(self) -> bool:
+            return self.foreground
+
+        def enable_input(self) -> None:
+            self.armed += 1
+            self.enabled = True
+
+    def _ui(self, sender, *, patrol: bool = False, reconnect: bool = False):
+        ui = object.__new__(UiWorker)
+        ui.status_worker = SimpleNamespace(key_sender=sender)
+        ui.reconnect_worker = SimpleNamespace(
+            reconnect_active_event=SimpleNamespace(is_set=lambda: reconnect)
+        )
+        ui.patrol_controller = SimpleNamespace(is_enabled=lambda: patrol)
+        return ui
+
+    def test_a_typing_hotkey_arms_a_disarmed_input(self) -> None:
+        sender = self._Sender(enabled=False)
+        UiWorker._arm_input_for_hotkey(self._ui(sender), "quick_message:0")
+        self.assertEqual(sender.armed, 1)
+        self.assertTrue(sender.enabled)
+
+    def test_nothing_happens_when_input_is_already_armed(self) -> None:
+        sender = self._Sender(enabled=True)
+        UiWorker._arm_input_for_hotkey(self._ui(sender), "trade:invite")
+        self.assertEqual(sender.armed, 0)
+
+    def test_the_reconnect_owns_the_machine_so_input_is_left_off(self) -> None:
+        sender = self._Sender(enabled=False)
+        UiWorker._arm_input_for_hotkey(self._ui(sender, reconnect=True), "trade:accept")
+        self.assertEqual(sender.armed, 0)
+
+    def test_patrol_running_leaves_the_input_state_alone(self) -> None:
+        sender = self._Sender(enabled=False)
+        UiWorker._arm_input_for_hotkey(self._ui(sender, patrol=True), "quick_pickup:toggle")
+        self.assertEqual(sender.armed, 0)
+
+    def test_a_background_game_is_not_armed(self) -> None:
+        sender = self._Sender(enabled=False, foreground=False)
+        UiWorker._arm_input_for_hotkey(self._ui(sender), "quick_message:3")
+        self.assertEqual(sender.armed, 0)
+
+    def test_recording_chords_are_not_typing_hotkeys(self) -> None:
+        self.assertFalse("record:right_most_pos".startswith(TYPING_HOTKEY_PREFIXES))
+        self.assertFalse("select_next_layer".startswith(TYPING_HOTKEY_PREFIXES))
+
+
+class PollResilienceTests(unittest.TestCase):
+    """One exception must never end the periodic UI work (hotskeys/sounds live in it)."""
+
+    class _Root:
+        def __init__(self):
+            self.after_calls = []
+            self.destroyed = False
+            self.exists = True
+
+        def after(self, delay, callback):
+            self.after_calls.append((delay, callback))
+
+        def winfo_exists(self):
+            return self.exists
+
+        def destroy(self):
+            self.destroyed = True
+
+    def _ui(self, root):
+        ui = object.__new__(UiWorker)
+        ui._root = root
+        ui.stop_event = threading.Event()
+        ui.refresh_ms = 100
+        return ui
+
+    def test_the_next_tick_is_scheduled_when_the_body_raises(self) -> None:
+        root = self._Root()
+        ui = self._ui(root)
+
+        def boom(_root):
+            raise RuntimeError("a step failed")
+
+        ui._poll_body = boom
+        with self.assertLogs("ui_worker", level="ERROR"):
+            ui._poll()
+        self.assertEqual(len(root.after_calls), 1, "the poll chain must keep going")
+        self.assertEqual(root.after_calls[0][1], ui._poll)
+
+    def test_the_next_tick_is_scheduled_normally(self) -> None:
+        root = self._Root()
+        ui = self._ui(root)
+        ui._poll_body = lambda _root: None
+        ui._poll()
+        self.assertEqual(len(root.after_calls), 1)
+
+    def test_a_stopped_assistant_stops_the_chain(self) -> None:
+        root = self._Root()
+        ui = self._ui(root)
+        ui.stop_event.set()
+        ui._poll()
+        self.assertTrue(root.destroyed)
+        self.assertEqual(root.after_calls, [])
+
+    def test_a_malformed_hotkey_item_does_not_break_the_drain(self) -> None:
+        ui = object.__new__(UiWorker)
+        ui.hotkey_queue = queue.Queue()
+        ui._drain_quick_pickup_results = lambda: None
+        ui._drain_reconnect_results = lambda: None
+        ui.patrol_controller = None
+        ui._play_action_sound = lambda _success: None
+        ui._start_patrol = lambda: True
+        ui.hotkey_queue.put_nowait(("not", "an action"))
+        ui.hotkey_queue.put_nowait("toggle_patrol")
+        with self.assertLogs("ui_worker", level="WARNING") as captured:
+            ui._drain_hotkey_actions()
+        self.assertTrue(
+            any("unexpected item" in line for line in captured.output), captured.output
+        )
+        self.assertTrue(ui.hotkey_queue.empty())
+
+
+class AutoLieServiceTests(unittest.TestCase):
+    """_service_api_auto_lie must never raise (it runs on every poll tick).
+
+    Field failure (1.0.9): ``worker.running`` is a @property bool, but it was CALLED, so
+    ``TypeError: 'bool' object is not callable`` fired every tick - and because the pending flag is
+    cleared only after that check, a single lie event kept it set forever.
+    """
+
+    class _PropertyWorker:
+        """Exactly like ApiLieTestWorker: ``running`` is a property, not a method."""
+
+        def __init__(self, running: bool):
+            self._running = running
+            self.started = 0
+
+        @property
+        def running(self) -> bool:
+            return self._running
+
+        def start(self) -> None:
+            self.started += 1
+
+    class _MethodWorker:
+        """The other shape: ``running()`` is a method."""
+
+        def __init__(self, running: bool):
+            self._running = running
+            self.started = 0
+
+        def running(self) -> bool:
+            return self._running
+
+        def start(self) -> None:
+            self.started += 1
+
+    def _ui(self, worker, *, factory):
+        ui = object.__new__(UiWorker)
+        ui._api_auto_lie_pending = True
+        ui._api_auto_lie_pending_since = time.monotonic()
+        ui._api_lie_pass_worker = worker
+        ui.api_auto_lie_factory = factory
+        ui._api_auto_lie_runs = 0
+        return ui
+
+    def test_a_property_bool_is_not_called(self) -> None:
+        worker = self._PropertyWorker(running=True)
+        created = []
+        ui = self._ui(worker, factory=lambda: created.append(True))
+        ui._service_api_auto_lie()                      # must not raise
+        self.assertEqual(created, [])
+        # The event stays pending while a pass runs (it is served when that one finishes).
+        self.assertTrue(ui._api_auto_lie_pending)
+
+    def test_a_stopped_property_worker_starts_a_pass(self) -> None:
+        worker = self._PropertyWorker(running=False)
+        new_worker = self._PropertyWorker(running=False)
+        ui = self._ui(worker, factory=lambda: new_worker)
+        ui._service_api_auto_lie()
+        self.assertEqual(new_worker.started, 1)
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertIs(ui._api_lie_pass_worker, new_worker)
+
+    def test_a_method_worker_still_works(self) -> None:
+        worker = self._MethodWorker(running=False)
+        new_worker = self._MethodWorker(running=False)
+        ui = self._ui(worker, factory=lambda: new_worker)
+        ui._service_api_auto_lie()
+        self.assertEqual(new_worker.started, 1)
+
+    def test_a_worker_that_never_finishes_does_not_pin_the_event_forever(self) -> None:
+        worker = self._PropertyWorker(running=True)
+        created = []
+        ui = self._ui(worker, factory=lambda: created.append(True))
+        ui._api_auto_lie_pending_since = time.monotonic() - 10_000.0
+        with self.assertLogs("ui_worker", level="WARNING") as captured:
+            ui._service_api_auto_lie()
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertEqual(created, [])
+        self.assertTrue(any("dropping a lie event" in line for line in captured.output))
+
+    def test_no_pending_event_does_nothing(self) -> None:
+        worker = self._PropertyWorker(running=False)
+        created = []
+        ui = self._ui(worker, factory=lambda: created.append(True))
+        ui._api_auto_lie_pending = False
+        ui._service_api_auto_lie()
+        self.assertEqual(created, [])
+
+
+class PollFailureLogRateLimitTests(unittest.TestCase):
+    """A repeating poll failure must not write a traceback every tick."""
+
+    class _Root:
+        def __init__(self):
+            self.after_calls = []
+
+        def after(self, delay, callback):
+            self.after_calls.append(callback)
+
+        def winfo_exists(self):
+            return True
+
+        def destroy(self):
+            pass
+
+    def _ui(self, root):
+        ui = object.__new__(UiWorker)
+        ui._root = root
+        ui.stop_event = threading.Event()
+        ui.refresh_ms = 100
+        return ui
+
+    def test_repeated_failures_are_logged_once_per_window(self) -> None:
+        root = self._Root()
+        ui = self._ui(root)
+        ui._poll_body = lambda _root: (_ for _ in ()).throw(RuntimeError("same failure"))
+        with self.assertLogs("ui_worker", level="ERROR") as captured:
+            for _ in range(5):
+                ui._poll()
+        errors = [line for line in captured.output if "debug UI poll failed" in line]
+        self.assertEqual(len(errors), 1, captured.output)
+        # ...while the poll keeps being re-armed every time.
+        self.assertEqual(len(root.after_calls), 5)
+
+    def test_a_different_failure_is_logged_immediately(self) -> None:
+        root = self._Root()
+        ui = self._ui(root)
+        ui._poll_body = lambda _root: (_ for _ in ()).throw(RuntimeError("first"))
+        with self.assertLogs("ui_worker", level="ERROR"):
+            ui._poll()
+        ui._poll_body = lambda _root: (_ for _ in ()).throw(RuntimeError("second"))
+        with self.assertLogs("ui_worker", level="ERROR") as captured:
+            ui._poll()
+        self.assertTrue(
+            any("debug UI poll failed" in line for line in captured.output), captured.output
+        )
+
+
+class AutoLieTriggerGateTests(unittest.TestCase):
+    """The lie alarm fires but no pass starts: each gate must say what it did."""
+
+    class _Var:
+        def __init__(self, value: bool):
+            self.value = value
+
+        def get(self) -> bool:
+            return self.value
+
+    def _ui(self, *, selection=None, worker=None, factory=None):
+        ui = object.__new__(UiWorker)
+        if selection is not None:
+            ui._api_auto_lie_var = self._Var(selection)
+        ui._api_auto_lie_pending = False
+        ui._api_auto_lie_pending_since = 0.0
+        ui._api_lie_pass_worker = worker
+        ui.api_auto_lie_factory = factory
+        ui._api_auto_lie_runs = 0
+        return ui
+
+    def test_a_lie_event_with_the_selection_off_says_so(self) -> None:
+        ui = self._ui(selection=False)
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            ui.on_lie_event_for_api()
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertTrue(
+            any("selection is OFF" in line for line in captured.output), captured.output
+        )
+
+    def test_a_lie_event_with_the_selection_on_arms_a_pass(self) -> None:
+        ui = self._ui(selection=True)
+        ui._api_auto_lie_event_active = False
+        ui._api_auto_lie_clear_since = 1.0
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            ui.on_lie_event_for_api((10, 10, 60, 60))
+        self.assertTrue(ui._api_auto_lie_pending)
+        self.assertTrue(
+            any("new lie window armed a pass" in line for line in captured.output),
+            captured.output,
+        )
+
+    def test_a_panel_without_the_selection_says_so(self) -> None:
+        ui = self._ui(selection=None)
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            ui.on_lie_event_for_api()
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertTrue(
+            any("no 自动过测谎 selection" in line for line in captured.output),
+            captured.output,
+        )
+
+    def test_a_missing_factory_is_reported(self) -> None:
+        ui = self._ui(selection=True)
+        ui._api_auto_lie_pending = True
+        with self.assertLogs("ui_worker", level="WARNING") as captured:
+            ui._service_api_auto_lie()
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertTrue(
+            any("no api pass factory" in line for line in captured.output), captured.output
+        )
+
+    def test_waiting_for_a_running_pass_is_logged_once(self) -> None:
+        worker = AutoLieServiceTests._PropertyWorker(running=True)
+        ui = self._ui(selection=True, worker=worker, factory=lambda: None)
+        ui._api_auto_lie_pending = True
+        ui._api_auto_lie_pending_since = time.monotonic()
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            for _ in range(4):
+                ui._service_api_auto_lie()
+        self.assertEqual(
+            len([line for line in captured.output if "waits for it" in line]), 1,
+            captured.output,
+        )
+        self.assertTrue(ui._api_auto_lie_pending)
+
+
+class AutoLieDebounceTests(unittest.TestCase):
+    """One lie window must produce ONE pass (the detector reports every frame it is visible)."""
+
+    class _Var:
+        def __init__(self, value: bool = True):
+            self.value = value
+
+        def get(self) -> bool:
+            return self.value
+
+    def _ui(self, *, last_pass_started: float = 0.0):
+        ui = object.__new__(UiWorker)
+        ui._api_auto_lie_var = self._Var(True)
+        ui._api_auto_lie_pending = False
+        ui._api_auto_lie_pending_since = 0.0
+        ui._api_auto_lie_wait_logged = False
+        ui._api_auto_lie_event_active = False
+        ui._api_auto_lie_clear_since = 0.0
+        ui._api_auto_lie_last_pass_started = last_pass_started
+        ui._api_auto_lie_patrol_paused = False
+        ui._api_lie_pass_worker = None
+        ui.api_auto_lie_factory = None
+        ui._api_auto_lie_runs = 0
+        return ui
+
+    def test_the_same_window_only_arms_once(self) -> None:
+        ui = self._ui()
+        bbox = (10, 10, 60, 60)
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            for _ in range(8):                       # eight matching frames of one window
+                ui.on_lie_event_for_api(bbox)
+        self.assertTrue(ui._api_auto_lie_pending)
+        self.assertEqual(
+            len([line for line in captured.output if "armed a pass" in line]), 1,
+            captured.output,
+        )
+
+    def test_a_new_window_arms_a_pass_even_after_a_flicker(self) -> None:
+        """v1.0.27: the old "square must be gone for 3 s" rule swallowed real windows silently.
+
+        The operator's field report: "the lie event happened, but the autolie_api is not taking over" -
+        and nothing in the log said why.  A new window (the detector only reports one after the square
+        cleared) now arms at once; only the minimum gap between passes can refuse it, and it says so.
+        """
+
+        ui = self._ui()
+        bbox = (10, 10, 60, 60)
+        ui.on_lie_event_for_api(bbox)                # window 1 -> armed
+        ui._api_auto_lie_pending = False             # pretend that pass ran
+        ui.on_lie_event_for_api(None)                # one frame without the square
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            ui.on_lie_event_for_api(bbox)            # ...and it is back: a new window
+        self.assertTrue(ui._api_auto_lie_pending, captured.output)
+
+    def test_a_window_inside_the_minimum_gap_is_refused_loudly(self) -> None:
+        ui = self._ui(last_pass_started=time.monotonic() - 2.0)
+        with self.assertLogs("ui_worker", level="WARNING") as captured:
+            ui.on_lie_event_for_api((10, 10, 60, 60))
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertTrue(any("minimum" in line for line in captured.output), captured.output)
+
+    def test_a_second_alarm_while_a_pass_runs_is_ignored(self) -> None:
+        """The operator's rule: "the first alarm will be accepted, then the autolie_api takes over,
+        the second one will be ignored" - one pass per window (the square only flickers)."""
+
+        worker = AutoLieServiceTests._PropertyWorker(running=True)
+        ui = self._ui(last_pass_started=time.monotonic() - 60.0)
+        ui._api_lie_pass_worker = worker
+        with self.assertLogs("ui_worker", level="WARNING") as captured:
+            ui.on_lie_event_for_api((10, 10, 60, 60))
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertTrue(any("ALREADY handling" in line for line in captured.output), captured.output)
+
+    def test_a_window_after_a_real_gap_is_new_again(self) -> None:
+        ui = self._ui()
+        bbox = (10, 10, 60, 60)
+        ui.on_lie_event_for_api(bbox)
+        ui._api_auto_lie_pending = False
+        ui.on_lie_event_for_api(None)
+        # The square has been gone for longer than the re-arm window.
+        ui._api_auto_lie_clear_since = time.monotonic() - 10.0
+        ui.on_lie_event_for_api(bbox)
+        self.assertTrue(ui._api_auto_lie_pending)
+
+    def test_two_passes_are_never_closer_than_the_minimum_gap(self) -> None:
+        started = time.monotonic() - 2.0               # the previous pass just started
+        ui = self._ui(last_pass_started=started)
+        ui.api_auto_lie_factory = lambda: self.fail("a pass must not start that soon")
+        ui._api_auto_lie_pending = True
+        with self.assertLogs("ui_worker", level="INFO") as captured:
+            ui._service_api_auto_lie()
+        self.assertFalse(ui._api_auto_lie_pending)
+        self.assertTrue(
+            any("pass skipped" in line for line in captured.output), captured.output
+        )
+
+    def test_a_pass_starts_once_the_gap_has_elapsed(self) -> None:
+        class _Worker:
+            @property
+            def running(self) -> bool:
+                return False
+
+            def start(self) -> None:
+                pass
+
+        worker = _Worker()
+        ui = self._ui(last_pass_started=time.monotonic() - 60.0)
+        ui.api_auto_lie_factory = lambda: worker
+        ui._api_auto_lie_pending = True
+        ui._service_api_auto_lie()
+        self.assertIs(ui._api_lie_pass_worker, worker)
+        self.assertAlmostEqual(ui._api_auto_lie_last_pass_started, time.monotonic(), delta=5.0)
 
 
 if __name__ == "__main__":

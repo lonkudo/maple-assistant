@@ -355,5 +355,144 @@ class CaptureWorkerTests(unittest.TestCase):
         self.assertEqual(captured["origin"], (922, 736))
 
 
+class CaptureFailurePathTests(unittest.TestCase):
+    """The 11:29:59 field traceback: the cleanup must not replace the real error.
+
+    ``CreateCompatibleBitmap`` fails (GDI/DC exhaustion) -> ``bitmap.GetHandle()`` is 0 -> the old
+    ``finally`` called ``DeleteObject(0)`` and raised ``pywintypes.error: (0, 'DeleteObject', ...)``,
+    hiding "CreateCompatibleDC failed" and leaving the DC taken by ``GetDC`` leaked on every retry.
+    """
+
+    @staticmethod
+    def _modules(*, create_bitmap_ok: bool, calls: dict):
+        class FakeError(Exception):
+            pass
+
+        class FakeGui:
+            @staticmethod
+            def FindWindow(_class, _title):
+                return 1
+
+            @staticmethod
+            def IsIconic(_hwnd):
+                return False
+
+            @staticmethod
+            def GetClientRect(_hwnd):
+                return 0, 0, 200, 100
+
+            @staticmethod
+            def ClientToScreen(_hwnd, point):
+                return point
+
+            @staticmethod
+            def GetDC(hwnd):
+                calls.setdefault("getdc", []).append(hwnd)
+                return 5 if hwnd else 6
+
+            @staticmethod
+            def ReleaseDC(hwnd, _dc):
+                calls.setdefault("releasedc", []).append(hwnd)
+                return 0
+
+            @staticmethod
+            def DeleteObject(handle):
+                calls.setdefault("deleteobject", []).append(handle)
+                if not handle:
+                    raise FakeError("(0, 'DeleteObject', 'No error message is available')")
+                return 0
+
+            @staticmethod
+            def GetForegroundWindow():
+                return 1
+
+        class FakeDc:
+            def CreateCompatibleDC(self):
+                return FakeDc()
+
+            def SelectObject(self, _bitmap):
+                return 0
+
+            def BitBlt(self, *_args):
+                return None
+
+            def DeleteDC(self):
+                calls["deletedc"] = calls.get("deletedc", 0) + 1
+                return 0
+
+        class FakeBitmap:
+            def CreateCompatibleBitmap(self, _dc, _width, _height):
+                if not create_bitmap_ok:
+                    raise FakeError("CreateCompatibleDC failed")
+                return 0
+
+            def GetBitmapBits(self, _flags):
+                return b"\x00" * (200 * 100 * 4)
+
+            def GetHandle(self):
+                return 7 if create_bitmap_ok else 0
+
+        class FakeUi:
+            @staticmethod
+            def CreateDCFromHandle(_dc):
+                return FakeDc()
+
+            @staticmethod
+            def CreateBitmap():
+                return FakeBitmap()
+
+        return {
+            "win32gui": FakeGui,
+            "win32ui": FakeUi,
+            "win32con": mock.MagicMock(SRCCOPY=0x00CC0020),
+        }
+
+    def test_a_failed_bitmap_creation_keeps_the_original_error(self) -> None:
+        import sys
+
+        from capture_worker import WindowCaptureError, capture_window
+
+        calls: dict = {}
+        with mock.patch.dict(sys.modules, self._modules(create_bitmap_ok=False, calls=calls)):
+            with self.assertRaises(WindowCaptureError) as caught:
+                capture_window("game")
+        message = str(caught.exception)
+        self.assertIn("CreateCompatibleDC failed", message, message)
+        self.assertNotIn("DeleteObject", message, message)
+        # No DeleteObject(0) was attempted for the bitmap that never existed.
+        self.assertNotIn(0, calls.get("deleteobject", []))
+        # And the DCs were all released: two attempts (window path) + the desktop fallback.
+        self.assertEqual(calls.get("getdc"), [1, 1, 0], calls)
+        self.assertEqual(calls.get("releasedc"), [1, 1, 0], calls)
+
+    def test_a_successful_capture_releases_every_dc_once(self) -> None:
+        import sys
+
+        from capture_worker import capture_window
+
+        calls: dict = {}
+        with mock.patch.dict(sys.modules, self._modules(create_bitmap_ok=True, calls=calls)):
+            image, _rect = capture_window("game")
+        self.assertEqual(image.size, (200, 100))
+        self.assertEqual(calls.get("getdc"), [1])
+        self.assertEqual(calls.get("releasedc"), [1])
+        self.assertEqual(calls.get("deletedc"), 2)
+        self.assertEqual(calls.get("deleteobject"), [7])
+
+    def test_the_desktop_fallback_is_refused_while_the_game_is_not_foreground(self) -> None:
+        import sys
+
+        from capture_worker import WindowCaptureError, capture_window
+
+        calls: dict = {}
+        modules = self._modules(create_bitmap_ok=False, calls=calls)
+        modules["win32gui"].GetForegroundWindow = staticmethod(lambda: 99)
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(WindowCaptureError) as caught:
+                capture_window("game")
+        self.assertIn("not foreground", str(caught.exception))
+        self.assertEqual(calls.get("getdc"), [1, 1], calls)
+
+
 if __name__ == "__main__":
     unittest.main()

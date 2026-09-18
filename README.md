@@ -107,19 +107,71 @@ scroll-compensated world Y to resolve overlapping marker bands and settled
 falls. The marker-Y band for a layer is:
 
 ```text
-(highest recorded Y - y_tolerance,
+(highest recorded Y - y_tolerance * LAYER_UP_REACH_FACTOR,
  lowest recorded Y + y_tolerance / 3)
 ```
 
-The smaller lower allowance absorbs recognition noise without merging nearby
-layers. Recorded stair/bench points may have their own world-Y anchors. A
-normal bench/stair jump stays on the same logical layer; only a confirmed climb
-arrival or settled fall re-anchors world Y.
+`LAYER_UP_REACH_FACTOR` is **0.7** (the operator's 2026-09-18 request: "narrow
+down layer upper band a little bit"): a band that reaches far above a floor makes
+a character still above it (on the rope, dropping in) read as standing on it.
+With `y_tolerance` 0.02 that is 1.15 px above the topmost recorded point and
+0.55 px below the lowest - both above the marker's own 1 px quantisation on an
+82 px minimap. The recorded vertical span of a stair/bench layer stays intact,
+so such a floor is drawn (and matched) as a band instead of a line.
+
+Which floor a marker reading names is decided in this order:
+
+1. **Bands of the route's own floors.** Only floors inside the patrol range may
+   make a reading "ambiguous"; a leftover or duplicate recorded floor outside
+   `route_order` is reported as `LAYER EXTRA RECORDED FLOOR:` and can no longer
+   hand the decision to world Y.
+2. **The nearest recorded position** of the matching floors (`_layer_y_distance`),
+   not the legacy single `layer_y`. A floor whose points span a range (a
+   stair/bench platform) has a base at one end of it, so the base ranks the wrong
+   floor: standing exactly on layer1's recorded spot used to answer layer2.
+3. **World Y** only for a genuinely ambiguous reading (two route bands overlap),
+   and only inside a calibrated world band. The `LAYER transition candidate:`
+   and `LAYER CHANGED:` lines now print the evidence (`marker_y`, the floors it
+   matched, `world_y`, confidence), with `LAYER world override:` for the case
+   where world Y overrules the marker.
+
+Recording frames matter as much as the bands: each point stores
+`coordinate_v2` (diamond-relative) plus its `recorded_layout`. The canvas
+sub-detection can flip between "the whole analysis box" and "the detected
+drawable area" inside one recording, and re-projecting through the live canvas
+then moved correct points by ~10 px (layer1's stance to 0.8049, layer2's to
+0.5915/0.7195), which made a marker on layer1 match layer2 and drew layer2 as a
+12 px band. The projection therefore keeps the saved point whenever the
+**analysis box** and the **diamond size** (a real minimap zoom) still match, and
+`LAYER RECORDING:` warns when one floor's points were saved in different canvas
+frames.
 
 Movement owns directional keys and paired Z pickup. It releases and re-arms
 these holds around focus dips, recovery, and route changes to prevent stale
 directions freezing the character. Rope navigation is minimap-based; YOLO is
 not required.
+
+#### Loop descent to the first route layer
+
+After the final layer's cycles the character Alt+Down drops back to the loop's
+first floor. **The descent owns the route until it gets there**: Alt+Down drops
+one platform per chord, so the marker passes through the floors in between (and
+the character even stands on the next floor up between chords), which the normal
+layer tracker used to confirm as `LAYER CHANGED: layer3 -> layer2; restarting
+layer2 patrol` - the descent stopped one floor short and the loop never returned
+to its first floor. While `_descending_to_first` is set the tracker keeps the
+route and logs
+
+```text
+DROP TO FIRST: the marker is on layer2 during the planned descent; keeping the route on layer3
+until layer1 is reached (the descent owns the floors in between)
+```
+
+and after `DROP_TO_FIRST_MAX_SECONDS` (25 s) without reaching it, the layer state
+is handed back to the normal tracker instead of sending Alt+Down forever.
+Arrival itself is the descent's own test (`_final_drop_arrived`), and the loop
+restart initializes the same state as any fresh Start Patrol - fall tracking,
+return state, resync candidate, rope lock, events.
 
 #### Endpoint arrival and turning
 
@@ -238,10 +290,14 @@ minimize, and maximize behavior. Dragging shows a thin outline and uses a
 native final move, avoiding Tk redraw flashes.
 
 **附加功能** holds the safety and utility rows: 测谎 / 掉线 / 循环 alerts and
-their 声音 / 闪烁 / 消息 outputs, 自动重连 (armed by 掉线, confirmed by the login
-page's base colour, with a temporary **测试自动重连** button and the 5-point
-**标定选择窗口** wizard), and the single **测试api** button that runs a video
-through the remote RoiTrack service (see below).
+their 声音 / 闪烁 / 消息 outputs, then one compact line with the two selections -
+**自动过测谎** (the api pass runs by itself when the game's lie window appears) and
+**自动重连** (armed by 掉线, confirmed by the login page's base colour, then a
+measured login -> world -> channel sequence) with the world and 频道 they apply to -
+below them **测试自动重连（临时）** and the **测试api** drill on one row, and at the
+bottom the shared hint area where 自动过测谎 and 自动重连 report their progress.
+Both selections are saved in `user_config.json` (and written as soon as the widget
+loses focus).  See below for the RoiTrack service.
 
 **运行日志** shows significant events. Its controls copy the in-memory log,
 copy user configuration, and export `user_config.json` to Desktop. The `↻`
@@ -294,16 +350,104 @@ shares its fixed coordinates, while the 1075×768 layout scales them uniformly.
 The presence sample is intentionally invisible; trade does not create a Tk
 overlay or any visible target/range drawing.
 
+## 自动重连 (automatic reconnect)
+
+Armed by the **自动重连** checkbox and triggered by the 掉线 event (or right now by the temporary
+**测试自动重连** button).  The full design, with every measured number and every field log that shaped
+it, is in `RECONNECT_README.md`; this is the shipped behaviour.
+
+**It is not a patrol workflow.**  The 掉线 detector lives in `CharacterWorker`, fed by the same capture
+as everything else, and that capture is idle before Start Patrol - so the reconnect used to be
+impossible while parked.  `ParkedWatchCapture` (`capture_worker.py`) closes that hole: while **掉线** is
+ticked and the game window is in front, it grabs the window itself and feeds the character queue, so a
+掉线 is noticed and the reconnect can run with no patrol started.  The same watch feeds the lie detector
+for 自动过测谎.  `掉线` is the detector the reconnect waits for - arming 自动重连 without it logs a
+WARNING instead of staying silent.
+
+**The sequence** (client pixels, 1366x768 reference space - at another client width the LOGIN screens keep
+their size and are centred while the WINDOW screens scale, so every point goes through one of the two
+mapping families in `reconnect_worker.py`):
+
+1. bring the game forward, then **click (50, 50)** - the game ignores keys until it has seen a click;
+2. **click the login board**, then **click 连接**; 结束游戏 lies outside the clamped box and can never be
+   clicked; if the 连接 click does not take, **Enter** is tried instead;
+3. dismiss the 掉线提示 by clicking its close button and confirming with **Enter** (both verified, never
+   sent blind), and only continue once the prompt is gone;
+4. **click the chosen world row** at `(498 + (w-1)*104, 163)` - the five worlds are one horizontal
+   line - and only confirm with Enter **after the highlight moved**;
+5. **click channel 1**, **scroll the calculated number of rows** (the list is paged 1-20 / 21-40 /
+   41-60 with four channels per row and five rows visible, so channel 51 needs `13 - 5 = 8` notches,
+   one notch per row), then **double-click the calculated cell** (a single click and Enter land on
+   channel 1 - the field failure that shaped this step);
+6. **Enter**, 2 s, **Enter** - the login starts.
+
+Clicks go out through `SendInput`; the legacy `mouse_event` path is only a fallback, because this game
+ignores it.
+
+**What gates what.**  The login page is recognised by its base colour (`screenshots/login_page_target.jpg`)
+AND by two small crops of the page itself; the world and channel pages by two crops each
+(`page_*_target.jpg`, threshold 0.60, a page's own score being the minimum over its crops).  Those
+measurements are **evidence**: they are logged (including every signature's score and a saved frame when
+they miss) and they never abort a step whose clicks are arithmetic.  The one hard rule is that **Enter is
+never sent to confirm a selection that did not move** - that is how the wrong world used to be logged in.
+
+**After a successful login** the assistant re-detects the layer and prepares the patrol again
+(`restart_patrol_after_reconnect`), but only when the operator's own last choice was **开始巡逻**: a
+disconnect stops a running patrol by itself without touching that choice, so the v1.0.31 case
+("character logined but patrol did not start") still restarts while a parked assistant stays parked and
+says so in the panel.
+
+**Ownership and safety.**  A click is sent only when the window at that point belongs to the game's
+family (the game window, its process, its executable, its window class, its title, or its own login UI
+window `igwUserLoginDialog`), the point is inside the game's **client** rectangle, and the window is not
+one of ours - the panel is first pushed to the bottom of the Z order and the point re-checked.  Anything
+else is refused and named in the log together with the windows over that point.  While a run is active
+the reconnect owns the keyboard (`begin_exclusive`), Alt/Ctrl/Shift are force-released before every key,
+the automation switch is cleared (the focus gate honours `reconnect_active`, so patrol cannot re-arm
+itself), and after a **failed** login the live input stays disarmed - patrol must never run on the login
+page.
+
+### 自动过测谎 (the api pass on a lie window)
+
+**自动过测谎** is a selection, not a button: while it is armed, the lie detector's own event (the same
+one that plays the 测谎 alert) starts one api pass, and the pass follows the **same workflow as the
+video drill** (`api_lie_video.py`) because that is the workflow the service was measured with:
+
+1. **connect first** - probe, handshake and session while the lie window is still coming up;
+2. **wait `AWAIT_SECOND_WINDOW_SEC` (3 s)** - the window's HUD square is there the moment it opens, but
+   its real content needs ~3 s (measured on the operator's clip: the first 16 frames were one frozen
+   image and the service answered `abandon_frame_hold` for every one of them).  Nothing is built, sent
+   or billed during the wait, and the cursor is already claimed;
+3. **feed** - capture, upload the ROI, take the returned `(x, y)` and **execute** it with the vendor
+   `MouseAimController`, drawing the crosshair overlay on the game.
+
+The wait belongs to the pass length: `AUTO_LIE_PASS_SECONDS` (8 s) is the whole pass, i.e. 3 s wait +
+~5 s of feeding at 5 fps.  Only one pass runs at a time (`AUTO_LIE_MIN_PASS_GAP_SECONDS` 10 s between
+passes, one pass per lie window, a pending event waits at most `AUTO_LIE_PENDING_MAX_SECONDS` 90 s), the
+patrol is paused for the pass only if it was running and resumed afterwards, and the panel drains
+progress on Tk's own thread so the detector's thread never touches Tk.  The manual **测试api** drill (a
+chosen video, 5 fps) stays as the way to test the service without a real lie window.
+
+**Working without Start Patrol:** the lie detector is fed by the parked watch described above as soon as
+**测谎** is ticked, so a lie window is caught - and answered - while the patrol is stopped.  `测谎` is
+what enables the detector; arming 自动过测谎 without it logs a WARNING.
+
+
 ## Optional alerts
 
 Alert sources are **掉线**, **测谎**, and **循环**. Output choices are independent:
 **声音** plays `sound/dingdong.mp3`, **闪烁** flashes red twice, and **消息**
 sends Telegram with machine name, event type, and time.
 
-- 掉线 reuses the yellow marker result and alerts after three missing frames.
+- 掉线 reuses the yellow marker result and alerts after consecutive missing frames.
 - 测谎 scans the shared capture once per second for a resolution-scaled white
   square and saves no screenshots.
 - 循环 is an independent draggable countdown; it does not depend on patrol.
+
+测谎 and 掉线 are what feed the two event workflows (自动过测谎 / 自动重连).  Both are fed while parked by
+`ParkedWatchCapture`, which stands down the moment the normal patrol capture runs (no double capture) and
+never foregrounds the game: the 掉线 feed needs the game window in front (a frame of the game covered by
+this panel would look like "marker missing" and fire a false 掉线).
 - Its remaining deadline is saved to ignored `timer.json` when the UI closes.
   A future, unexpired deadline is restored at the next start; expired timers
   remain unselected.
@@ -474,12 +618,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 
 Testing is not a default ritual. Run only the smallest targeted check that is
 necessary to validate the code being changed; do not run duplicate or broad
-test suites merely as a routine step. Documentation-only edits do not require
-tests or a release ZIP. `release_now.ps1` advances `VERSION`, rebuilds both
-`release/MapleAssistant-CPU` and `release/MapleAssistant-CUDA`, then produces
-`MapleAssistant-CPU-vNNNN.zip` and `MapleAssistant-CUDA-vNNNN.zip`. Once both
-are successful, prior CPU/CUDA release ZIPs are removed. Version `9999` never
-wraps.
+test suites merely as a routine step. **Never re-run a suite that already
+passed in the same session, and never re-run tests for a second iteration of
+the same simple change** (a constant, a timing, a click order, a log line): the
+operator's rule is "don't do redundant unit testing unless I tell you to".
+When a change is simple, ship it and let the field run be the test. When a
+targeted check is genuinely needed, run the affected test cases only - not the
+whole file, and never the whole discovery set.
+
+Documentation-only edits do not require tests or a release ZIP.
+`release_now.ps1` advances the semantic `VERSION` (`X.Y.Z`, patch by default),
+builds the single `release/MapleAssistant` package, and produces
+`release/MapleAssistant-<version>.zip`, removing the previous ZIP. There is no
+CPU/CUDA split any more: one package for both, with the YOLO weights optional.
 
 ### Machine-specific diagnosis
 
@@ -532,6 +683,7 @@ state the worker was in.
 | `lie_screenshot_recorder.py` | alert-triggered full-client diagnostic recorder; composes its run into one mp4 |
 | `lie_video_tools.py` | frames -> mp4 (H.264 via ffmpeg when available; decoupled, never moves the mouse) |
 | `image_io.py` | JPG-only image policy (screenshot/recording/reference quality, frame listing) |
+| `capture_worker.py` | full-client capture + `FrameBus`, and `ParkedWatchCapture`/`WatchFeed` - the watch that keeps 测谎 and 掉线 (and therefore 自动过测谎 / 自动重连) alive with no Start Patrol |
 | `ui_worker.py` | Tk UI, recording, settings, update/export actions |
 | `movement_worker.py` | patrol, rope, fall/recovery, directional ownership, endpoint arrival bounds, stall watchdog |
 | `motion_arbiter.py` | serialized random-jump/buff/small-step actions |
@@ -539,7 +691,7 @@ state the worker was in.
 | `status_worker.py` | HP/MP bars, potions, timed drug/buff scheduling, shared key sender |
 | `attack_worker.py`, `random_jump_worker.py` | attack and optional jump timing |
 | `quick_pickup_worker.py` | Ctrl+Z manual-only rapid pickup when patrol is stopped |
-| `reconnect_worker.py` | 自动重连: login-page check, character select, channel entry, 5-point calibration |
+| `reconnect_worker.py` | 自动重连: login-page colour check, then the measured login/world/channel sequence (page verifier, calculated clicks, nothing to calibrate) |
 | `timer_state.py` | atomic persistence for the independent circular-alert deadline |
 | `trade_worker.py` | Ctrl+Q/Ctrl+W virtual-input trade flows and invisible presence check |
 | `patrol_control.py` | route model and persistence |
@@ -564,41 +716,44 @@ state the worker was in.
 
 ### Handoff state
 
-- `VERSION` is **0390** and both `release/MapleAssistant-CPU-v0390.zip` and
-  `release/MapleAssistant-CUDA-v0390.zip` exist (62.2 MB each); the previous
-  pair is removed automatically. Next build would be 0391.
-- 0390 carried: **自动过测谎 removed** (local Cutie/torch pass, its replay demo,
-  overlay, engine, offline weights, installer step) and **测试api rewired to a
-  video-only drill** against the remote RoiTrack service - one button, no 时长
-  box, no 密钥 button (the key ships in `autolie_api/key_secret.txt`), connect at
-  once -> wait for the second window (3 s) -> feed ~27 s -> close when the clip
-  ends, with mid-run server resets survived by reconnecting and restarting
-  `frame_id`. The measured lie-popup geometry moved to `lie_geometry.py`.
-- Earlier in the unreleased line: the RoiTrack client itself (`autolie_api/`:
-  endpoints, WS transport, key store, run logs, local mimic), 自动重连 (login
-  colour gate, world/channel entry, 5-point calibration, temporary 测试按钮),
-  the JPG-only image policy (`image_io.py`), and the far "no progress" endpoint
-  bound in `MovementWorker`.
-- Open investigation: an in-game character freeze that only an assistant
-  restart recovered. The next occurrence needs the `movement worker silent
-  for ...` header plus the stalled movement worker's own stack; everything
-  needed to capture those is already shipped.
-- Open item: 自动重连 clicks land at client (0,0) until the operator runs the
-  5-point **标定选择窗口** wizard once (the layout is deliberately uncalibrated
-  until then, and the worker refuses to click).
-- 9 pre-existing test failures are known and unrelated to these changes (757
-  tests total): `test_config_store` 1, `test_movement_worker` 6
-  (`centered_marker`, `descending_flag`, `off_route_marker`,
-  `return_climb_finishes`, `return_climb_targets`, `return_to_first_layer`),
-  `test_ui_worker` 2. `release_now.ps1 -SkipTests` is therefore the normal
-  release command.
-- Quota note: the real service bills one round per drill (`quota_left` is in
-  every `handshake_ack` and frame answer). Offline checks use the mimic
-  (`use_mimic=True` / `work/video_drill_check.py`) and cost nothing - verify
-  there before spending a round.
-- Pending feature: the **automatic** API lie pass (detect the lie event, then
-  hand the popup ROI to the service and react) - the video drill is its
-  prototype: same transport, same geometry, same wait/feeding order.
-- Data note: a layer's saved 最左 may still carry a bad `recorded_layout`
-  diamond (for example 15x7), which the diamond re-projection compensates for;
-  re-recording that endpoint is the permanent cure.
+- `VERSION` is **1.0.48** and the single package `release/MapleAssistant-1.0.48.zip` is the current
+  distributable (the previous ZIP is removed automatically). `release_now.ps1 -SkipTests` is the normal
+  release command; one release per behaviour change, none for documentation-only edits.
+- The 1.0.18 - 1.0.48 line (all shipped during this session, each one behaviour change):
+  - **1080 clients**: the reconnect's screens live in two resolution families - LOGIN keeps its size and
+    is centred (`x + (w-1366)/2`), WINDOW scales with the width - and every preset was re-measured from
+    the operator's 1080 screenshots (login page 0.994, world 0.980, channel 0.995 template scores).
+    Clicks go through `SendInput`, the 掉线提示 is closed by its anchor + Enter (verified), and the
+    channel cell needs a double-click.
+  - **Patrol resumes after a reconnect without 开始巡逻** (`on_patrol_restart`), and only when the
+    operator's own last choice was 开始巡逻.
+  - **自动过测谎 executes and draws the answer** (vendor `MouseAimController` + crosshair overlay) - the
+    v1.0.26 "it doesn't take control" report.
+  - **自动过测谎 and 自动重连 work with no Start Patrol** (`ParkedWatchCapture`: the lie detector and the
+    掉线 detector are fed while the shared capture is parked; the pass runs the video drill's
+    connect -> 3 s second window -> push workflow).
+  - **Layer recognition**: `LAYER_UP_REACH_FACTOR` 0.7, the landing floor cap (a fall can never be
+    resolved to a floor the marker draws the character above), the route-scoped marker-ambiguity test,
+    ranking by the nearest recorded position, the projection-frame fix, and the descent guard
+    (`DROP_TO_FIRST_MAX_SECONDS`). New evidence lines: `LAYER WORLD BAND` / `LAYER WORLD BAND OVERLAP`,
+    `LAYER EXTRA RECORDED FLOOR`, `LAYER RECORDING`, and the `LAYER transition candidate` / `LAYER CHANGED`
+    / `LAYER world override` lines now print `marker_y`, the matched floors, `world_y` and confidence.
+  - **Band overlay**: one solid strip per floor (edge lines only when the band is >= 4 px tall) instead of
+    eight gradient stripes - the operator's "the drawing on minimap tells me that it mixed".
+- Open investigations (all need the operator's next field run):
+  - the layer1/layer2 confusion.  1.0.45 - 1.0.47 removed three mechanisms (a stale extra recorded floor,
+    the legacy-base ranking, and the canvas-frame projection); his profile still mixes canvas frames, so
+    `LAYER RECORDING:` will name it and re-recording the floors is the permanent cure.
+  - an in-game character freeze that only an assistant restart recovered: needs the `movement worker
+    silent for ...` header plus that worker's stack (already shipped).
+- Test baseline: **9 pre-existing failures** are known and unrelated (757 tests): `test_config_store` 1,
+  `test_movement_worker` 6 (`centered_marker`, `descending_flag`, `off_route_marker`,
+  `return_climb_finishes`, `return_climb_targets`, `return_to_first_layer`), `test_ui_worker` 2.  Per
+  `AGENTS.md` unit tests are not the gate - the field run is - so `-SkipTests` is the normal mode and a
+  change ships with a targeted probe (`work/probe_*.py`) instead of a suite sweep.
+- Quota note: the real service bills one round per drill (`quota_left` is in every `handshake_ack` and
+  frame answer). Offline checks use the mimic (`use_mimic=True` / `work/video_drill_check.py`,
+  `work/probe_autolie_workflow.py`) and cost nothing - verify there before spending a round.
+- `lie_active` (`assistant.py`) is still never set: the focus gate's "keep the capture open during a
+  pass" exception and the 30 fps lie cadence are dormant wiring. It is harmless today (a pass captures
+  its own frames, and the parked watch keeps the detector fed) but it should be wired or removed.

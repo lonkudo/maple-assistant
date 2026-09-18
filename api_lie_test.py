@@ -47,6 +47,14 @@ ROOT = Path(__file__).resolve().parent
 
 DEFAULT_FPS = 5.0
 DEFAULT_SECONDS = 5.0
+# AWAIT_SECOND_WINDOW, shared with the video drill (``api_lie_video.AWAIT_SECOND_WINDOW_SEC``): the lie
+# event fires the moment the window's HUD square is on screen, but the window's real content needs a
+# moment before it is there - measured on the operator's clip, the first 16 frames were one frozen image
+# and the service answered ``abandon_frame_hold`` for every one of them, its content only appearing
+# ~3.2 s in.  The AUTOMATIC pass therefore runs the drill's workflow: connect first, wait this long
+# WITHOUT building or sending a frame, then start the picture push.  0.0 keeps the old immediate-feed
+# behaviour for the offline single-shot drill.
+DEFAULT_AWAIT_SECONDS = 0.0
 # How often an annotated frame is written while the drill runs (so it does not fill the disk).
 CAPTURE_EVERY_SECONDS = 1.0
 TEST_KEY = "LIE-LOCAL-TEST"
@@ -87,11 +95,16 @@ class ApiLieTestWorker(threading.Thread):
         transport: str = "base64",
         fps: float = DEFAULT_FPS,
         duration: float = DEFAULT_SECONDS,
+        # Ticks to run WITHOUT feeding, i.e. the AWAIT_SECOND_WINDOW wait for the real lie window (see
+        # DEFAULT_AWAIT_SECONDS).  It is part of ``duration``, exactly like the drill's 时长.
+        await_seconds: float = DEFAULT_AWAIT_SECONDS,
         key_sender: Any = None,
         capture_fn: Optional[Callable[[], Any]] = None,
         client_size_fn: Optional[Callable[[], Optional[tuple[int, int]]]] = None,
         out_dir: Optional[Path] = None,
         use_mimic: bool = False,
+        aim_enabled: bool = False,
+        aim_overlay: Optional[Callable[[int, int], None]] = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         super().__init__(name="api-lie-test", daemon=True)
@@ -104,12 +117,26 @@ class ApiLieTestWorker(threading.Thread):
         self.transport = str(transport or "base64").lower()
         self.fps = max(1.0, float(fps))
         self.duration = max(1.0, float(duration))
+        self.await_seconds = max(0.0, float(await_seconds))
         self.key_sender = key_sender
         self._capture_fn = capture_fn
         self._client_size_fn = client_size_fn
         self._out_dir = Path(out_dir) if out_dir is not None else ROOT / "work" / "api_test"
         # True = always the local mimic (tests, offline drills): never resolve a real key.
         self.use_mimic = bool(use_mimic)
+        # EXECUTE the answer with the mouse.  The vendor protocol doc: "鼠标/执行层一般用 x / y
+        # （372×248 协议 ROI）" - the returned point is meant to be driven into the client, which is what
+        # the video drill does with MouseAimController.  The automatic pass used to only MEASURE the
+        # answer (it logged screen=(x, y) and nothing else), so it never took control of the lie test -
+        # the operator's report through v1.0.32: "autolie_api failed again, it doesn't take control".
+        # Off by default so a test or an offline drill never grabs the real cursor; the assistant turns
+        # it on for the automatic pass.
+        self.aim_enabled = bool(aim_enabled)
+        # Draw the aim while the pass runs (the video drill draws it in its own window; here it is an
+        # overlay crosshair on the game at the answered SCREEN point).
+        self.aim_overlay = aim_overlay
+        self._aim: Any = None
+        self._aim_suspended: Any = None
         self._sleep = sleep
         self._stop_request = threading.Event()
         self._lock = threading.Lock()
@@ -130,6 +157,32 @@ class ApiLieTestWorker(threading.Thread):
 
     def set_seconds(self, seconds: float) -> None:
         self.duration = max(1.0, min(60.0, float(seconds)))
+
+    def _await_ticks(self, total_ticks: int, log: Optional[RunLog] = None) -> int:
+        """How many ticks to run WITHOUT feeding: the AWAIT_SECOND_WINDOW wait.
+
+        Identical rule to the video drill (``api_lie_video.VideoDrillWorker._await_ticks``): the session
+        is already open while we wait, and 2.7.0 §4.1 kicks a session that stays ``idle_no_frame_sec``
+        (10 s) without a valid frame, so a wait that big is clamped to just under that limit and the
+        clamp is recorded in the run log instead of failing silently.
+        """
+
+        wanted = max(0, int(round(self.await_seconds * self.fps)))
+        if wanted >= total_ticks:
+            wanted = max(0, total_ticks - 1)          # always leave at least one frame to feed
+        try:
+            from api_lie_video import IDLE_NO_FRAME_SEC, IDLE_SAFE_SECONDS
+        except Exception:                             # pragma: no cover - constants only
+            return wanted
+        limit = int(IDLE_SAFE_SECONDS * self.fps)
+        if wanted > limit:
+            if log is not None:
+                log.connection("await clamped to stay inside the idle rule",
+                               asked_seconds=self.await_seconds,
+                               used_seconds=round(limit / self.fps, 1),
+                               idle_no_frame_sec=IDLE_NO_FRAME_SEC)
+            wanted = limit
+        return wanted
 
     @property
     def running(self) -> bool:
@@ -179,6 +232,63 @@ class ApiLieTestWorker(threading.Thread):
             return False
         return True
 
+    # ------------------------------------------------------------------ the mouse execution
+    def _start_aim(self, image_width: int, image_height: int) -> None:
+        """Own the cursor for this pass, so the API's answer is EXECUTED in the client."""
+
+        if not self.aim_enabled or self._aim is not None:
+            return
+        try:
+            from api_lie_video import aim_module, ensure_aim_path
+
+            ensure_aim_path()
+            _aim = aim_module()
+            self._aim = _aim.MouseAimController(int(image_width), int(image_height),
+                                                dead_band_px=6.0, confidence_threshold=0.0,
+                                                target_stale_seconds=1.0)
+            self._aim_suspended = _aim.claim_cursor(self._aim)
+            self._aim.set_enabled(True, silent=True)
+            LOG.warning("api test: 鼠标执行已开启 - the API's answer is driven into the client "
+                        "(captured image %dx%d)", image_width, image_height)
+            self._report("aim", "鼠标执行已开启：按 API 返回的坐标移动鼠标")
+        except Exception:
+            LOG.exception("api test: the mouse aim could not be started")
+            self._aim = None
+
+    def _push_aim(self, rect, image_width: int, image_height: int,
+                  client_x: float, client_y: float) -> None:
+        """Move the cursor to one answer (client pixels -> the client rectangle on screen)."""
+
+        if not self.aim_enabled:
+            return
+        if self._aim is None:
+            self._start_aim(image_width, image_height)
+        if self._aim is None:
+            return
+        try:
+            if rect is not None and len(rect) == 4:
+                self._aim.set_region(int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+            self._aim.push_target(float(client_x), float(client_y), 1.0, "api")
+        except Exception:
+            LOG.debug("api test: the aim push failed", exc_info=True)
+
+    def _stop_aim(self) -> None:
+        if self._aim is None:
+            return
+        try:
+            self._aim.close()
+        except Exception:
+            LOG.debug("api test: aim close failed", exc_info=True)
+        try:
+            from api_lie_video import aim_module, ensure_aim_path
+
+            ensure_aim_path()
+            aim_module().release_cursor(self._aim_suspended)
+        except Exception:
+            LOG.debug("api test: cursor release failed", exc_info=True)
+        self._aim = None
+        self._aim_suspended = None
+
     def _open_backend(self, log=None):
         """Build the connection through the shared step (probe -> choose port -> handshake).
 
@@ -222,7 +332,11 @@ class ApiLieTestWorker(threading.Thread):
             box = lie_roi_box(image.shape[1], image.shape[0])
             self._report("backend", "正在连接后端…")
             log.connection("drill start", window=self.window_title or "(none)",
-                           fps=self.fps, seconds=self.duration, transport=self.transport)
+                           fps=self.fps, seconds=self.duration, transport=self.transport,
+                           await_seconds=self.await_seconds)
+            # Connect FIRST, exactly like the video drill: the handshake and the session are ready while
+            # the lie window is still coming up, so the picture push starts the instant its content is
+            # there.  The wait is clamped below the service's idle_no_frame_sec (see _await_ticks).
             try:
                 client, note, mimic = self._open_backend(log)
             except BackendError as exc:
@@ -236,18 +350,41 @@ class ApiLieTestWorker(threading.Thread):
 
             interval = 1.0 / self.fps
             total = max(1, int(round(self.duration * self.fps)))
-            self._report("start", f"{total} 帧 @ {self.fps:.0f} fps，ROI={box}")
+            await_ticks = self._await_ticks(total, log)
+            feed_frames = max(1, total - await_ticks)
+            if await_ticks:
+                plan = (f"连接已建立，先等 {self.await_seconds:.1f} 秒（第二个窗口，暂不上传）再上传 "
+                        f"{feed_frames} 帧 @ {self.fps:.0f} fps（{feed_frames / self.fps:.0f} 秒）")
+            else:
+                plan = f"连接已建立，{feed_frames} 帧 @ {self.fps:.0f} fps（{self.duration:.0f} 秒）"
+            self._report("start", f"{plan}，ROI={box}")
+            # The cursor is claimed as soon as the session exists (the drill does the same), so the pass
+            # owns the mouse before the window is even readable.
+            if self.aim_enabled and self._aim is None:
+                self._start_aim(image.shape[1], image.shape[0])
             started = time.perf_counter()
             next_at = started
             last_capture_saved = 0.0
-            for frame_id in range(1, total + 1):
+            frame_id = 0
+            for tick in range(1, total + 1):
                 if self._stop_request.is_set() or self.stop_event.is_set():
-                    self._report("stopped", f"第 {frame_id} 帧前收到停止请求")
+                    self._report("stopped", f"第 {tick} 帧前收到停止请求")
                     break
                 next_at += interval
                 delay = next_at - time.perf_counter()
                 if delay > 0:
                     self._sleep(delay)
+                if tick <= await_ticks:
+                    # AWAIT_SECOND_WINDOW: the second window is still coming up, so nothing is built and
+                    # nothing is billed yet - but the session is already open and waiting.
+                    left = max(0.0, self.await_seconds - (tick - 1) * interval)
+                    if tick == 1 or tick % max(1, int(round(self.fps))) == 1:
+                        self._report(
+                            "await",
+                            f"已连接 · 等待第二个窗口 {left:.1f}s（暂不上传 {feed_frames} 帧）",
+                        )
+                    continue
+                frame_id += 1
                 image, rect = self._capture()
                 if image is None:
                     self.stats.failures += 1
@@ -300,6 +437,18 @@ class ApiLieTestWorker(threading.Thread):
                 if point.x is not None and point.y is not None:
                     client_xy = point.to_client(frame.geometry)
                     screen_xy = point.to_screen(frame.geometry)
+                    # EXECUTE the answer: the cursor is driven to the point the API returned (the vendor
+                    # doc: the mouse/execution layer uses x/y in the 372x248 protocol ROI).  Without
+                    # this the pass only measured the answer and never took control of the lie test.
+                    self._push_aim(rect, image.shape[1], image.shape[0],
+                                   client_xy[0], client_xy[1])
+                    # ... and DRAW it: an overlay crosshair on the game where the pass is aiming, the
+                    # live equivalent of what the 测试api video drill shows in its window.
+                    if self.aim_overlay is not None:
+                        try:
+                            self.aim_overlay(int(round(screen_xy[0])), int(round(screen_xy[1])))
+                        except Exception:
+                            LOG.debug("api test: the aim overlay failed", exc_info=True)
                     self.stats.last_screen = screen_xy
                     self.stats.deltas_px.append(
                         ((client_xy[0] - (box[0] + point.x * frame.geometry.scale_x)) ** 2
@@ -315,7 +464,7 @@ class ApiLieTestWorker(threading.Thread):
                     line += f" quota={point.quota_left}"
                 self._report("frame", line)
                 now = time.perf_counter()
-                if now - last_capture_saved >= CAPTURE_EVERY_SECONDS or frame_id == total:
+                if now - last_capture_saved >= CAPTURE_EVERY_SECONDS or frame_id == feed_frames:
                     last_capture_saved = now
                     path = self._save_annotated(image, frame.geometry, point, frame_id,
                                                 log)
@@ -328,6 +477,8 @@ class ApiLieTestWorker(threading.Thread):
             except Exception:
                 LOG.debug("api test: round_end failed", exc_info=True)
             log.summary({"outcome": "done", "backend": self.backend_note,
+                         "await_seconds": self.await_seconds,
+                         "skipped_before_feeding": await_ticks,
                          "stats": self.stats.describe(),
                          "quota_left": self.stats.quota_left,
                          "last_screen": self.stats.last_screen})
@@ -347,6 +498,7 @@ class ApiLieTestWorker(threading.Thread):
                 log.close()
             except Exception:
                 LOG.debug("api test: log close failed", exc_info=True)
+            self._stop_aim()
             try:
                 if client is not None:
                     client.close()
