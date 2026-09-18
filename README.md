@@ -716,7 +716,7 @@ state the worker was in.
 
 ### Handoff state
 
-- `VERSION` is **1.0.48** and the single package `release/MapleAssistant-1.0.48.zip` is the current
+- `VERSION` is **1.0.49** and the single package `release/MapleAssistant-1.0.49.zip` is the current
   distributable (the previous ZIP is removed automatically). `release_now.ps1 -SkipTests` is the normal
   release command; one release per behaviour change, none for documentation-only edits.
 - The 1.0.18 - 1.0.48 line (all shipped during this session, each one behaviour change):
@@ -738,6 +738,10 @@ state the worker was in.
     (`DROP_TO_FIRST_MAX_SECONDS`). New evidence lines: `LAYER WORLD BAND` / `LAYER WORLD BAND OVERLAP`,
     `LAYER EXTRA RECORDED FLOOR`, `LAYER RECORDING`, and the `LAYER transition candidate` / `LAYER CHANGED`
     / `LAYER world override` lines now print `marker_y`, the matched floors, `world_y` and confidence.
+  - **1.0.49**: the bottom-floor rule in `_detected_layer` (a marker at/below the lowest recorded band IS
+    that floor - nothing is recorded lower, so a scrolling minimap that renders layer1 3 px below its
+    recorded band no longer reports "now on none"), and the landing cap applied to the world signal in the
+    layer resync too (it may not name a floor the marker draws the character below).
   - **Band overlay**: one solid strip per floor (edge lines only when the band is >= 4 px tall) instead of
     eight gradient stripes - the operator's "the drawing on minimap tells me that it mixed".
 - Open investigations (all need the operator's next field run):
