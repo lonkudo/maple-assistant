@@ -6259,8 +6259,20 @@ class MovementWorker(threading.Thread):
             # The bottom floor may render a few pixels below its recorded
             # band. With no recorded upper-floor candidate there, accept it.
             return True
+        else:
+            # The marker matches NO floor and is not at/below the first floor's band: the character is in
+            # the air on its way down (or standing on a spot no recording covers), so the descent is NOT
+            # finished.  This must not fall through to the world signal: his 14:38 log had the restart fire
+            # at marker_y 0.481707 while the character was still falling from layer3 (the marker ran
+            # 0.372 -> 0.397 -> 0.409 -> 0.445 -> 0.482), and the raw world tracker - which swings while
+            # falling - happened to sit inside layer1's recorded world band, so the drop was declared
+            # arrived and the patrol restarted; the character then landed on layer2.  His layer1 world
+            # anchors make that band span from 0.29 to 1.04 (canonical layer_world_y 2.416667, but the
+            # points' own observed_world_y are ~1.04), so a mid-air reading can easily land in it.
+            return False
         # Fall back to the world-Y signal only when marker bases are genuinely
-        # tied/aliased and the structure tracker is available and confident.
+        # tied/aliased and the structure tracker is available and confident (the
+        # branches above only fall through here with a real tie between floors).
         if (observation.world_y_diamonds is not None
                 and "layer_world_y" in layer
                 and observation.structure_confidence >= 0.12):

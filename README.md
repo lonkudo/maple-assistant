@@ -175,7 +175,13 @@ down by monster function, don't trigger back to patrol route"): the layer resync
 while it runs, so two recoveries never fight over the same character. The descent
 is bounded - after `DROP_TO_FIRST_MAX_SECONDS` (10 s) without reaching the first
 floor the state is handed back - so suppressing them cannot deadlock. Arrival
-itself is the descent's own test (`_final_drop_arrived`), and the loop restart
+itself is the descent's own test (`_final_drop_arrived`), and it requires the
+marker to actually be there: a reading that matches **no** floor and is not
+at/below the first floor's band is mid-air, so the descent keeps dropping (his
+14:38 log declared arrival at marker_y 0.481707 while the character was still
+falling and then landed on layer2, because the world fallback confirmed it from a
+world reading that sat inside layer1's recorded world band mid-air). The world
+signal is consulted only for a genuine tie between floors. The loop restart
 initializes the same state as any fresh Start Patrol - fall tracking, return
 state, resync candidate, rope lock, events.
 
@@ -722,7 +728,7 @@ state the worker was in.
 
 ### Handoff state
 
-- `VERSION` is **1.0.51** and the single package `release/MapleAssistant-1.0.51.zip` is the current
+- `VERSION` is **1.0.52** and the single package `release/MapleAssistant-1.0.52.zip` is the current
   distributable (the previous ZIP is removed automatically). `release_now.ps1 -SkipTests` is the normal
   release command; one release per behaviour change, none for documentation-only edits.
 - The 1.0.18 - 1.0.48 line (all shipped during this session, each one behaviour change):

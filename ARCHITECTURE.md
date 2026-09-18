@@ -666,8 +666,15 @@ only suppresses unsafe stair jumps during settling.
   once per floor it sees, and it is bounded by ``DROP_TO_FIRST_MAX_SECONDS`` (10 s)
   - so suppressing the recoveries cannot deadlock: the bound hands the state back.
   Arrival is the descent's own test (``_final_drop_arrived`` -> ``_on_first_layer``),
-  which compares the marker's unambiguous nearest floor with the route's first floor
-  and only falls back to world Y when two floors' bands tie.
+  which compares the marker's unambiguous nearest floor with the route's first floor.
+  A reading that matches NO floor and is not at/below the first floor's band is
+  MID-AIR, so the descent keeps dropping - the world fallback is only for a genuine
+  tie between floors.  His 14:38 log is why: the restart fired at marker_y 0.481707
+  while the character was still falling from layer3 (0.372 -> 0.397 -> 0.409 -> 0.445
+  -> 0.482), because the raw world tracker swings during a fall and happened to sit
+  inside layer1's recorded world band, whose observed values (~1.04) disagree with
+  its canonical anchor (2.416667) - a mismatch `LAYER RECORDING:` now reports at
+  Start Patrol.
 - The loop restart after that arrival (``_reset_route_loop``) initializes the
   same state as any fresh Start Patrol: fall tracking (``_reset_fall_tracking``,
   so a fall pending before the descent cannot resolve against a settle window

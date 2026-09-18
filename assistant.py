@@ -399,6 +399,7 @@ def main() -> int:
     from character_worker import CharacterWorker
     from movement_worker import (
         MovementWorker,
+        _coherent_observed_world_points,
         _layer_world_y_band,
         _layer_y_band,
         detect_layer_by_y,
@@ -947,6 +948,27 @@ def main() -> int:
                         "saved with a weak marker reading (tracking_confidence=%.3f) - re-record it if "
                         "this floor is not a ramp",
                         layer_name, point_name, abs(y - min(heights)) * 82.0, confidence,
+                    )
+            # The canonical world anchor and the points' own observed world Y must agree: the world-Y band
+            # is built from the observed values while the tracker and the re-anchors use the canonical one,
+            # so a disagreement makes the world signal meaningless for this floor.  His profile has exactly
+            # that (layer1 canonical 2.416667, its points observed ~1.04), and the raw tracker - which
+            # swings while falling - then landed inside layer1's band mid-air and the planned descent was
+            # declared arrived one floor too early.
+            canonical = layer.get("layer_world_y")
+            observed = [
+                float(point[1])
+                for point in _coherent_observed_world_points(layer)
+            ]
+            if isinstance(canonical, (int, float)) and observed:
+                mean_observed = sum(observed) / len(observed)
+                if abs(float(canonical) - mean_observed) >= 0.5:
+                    logging.warning(
+                        "LAYER RECORDING: %s's canonical world Y is %.6f but its points were recorded at "
+                        "%.6f (%.3f apart) - the world signal cannot separate the floors for this layer; "
+                        "re-record it",
+                        layer_name, float(canonical), mean_observed,
+                        abs(float(canonical) - mean_observed),
                     )
         if show_overlays:
             screen_blinker.show_layer_bands(
