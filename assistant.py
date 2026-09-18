@@ -1301,8 +1301,9 @@ def main() -> int:
                 character_frames,
                 "掉线/自动重连 (disconnect detection)",
                 armed_event=disconnect_watch_armed,
-                # The alert threshold is 120 missing FRAMES (= 30s at the normal capture interval), so the
-                # disconnect feed keeps the normal cadence instead of the slower lie one.
+                # The alert threshold is a FRAME COUNT (40 since 2026-09-18; it was 120 = 30 s at the
+                # normal capture interval, 40 frames = 10 s), so the disconnect feed keeps the normal
+                # cadence instead of the slower lie one.
                 interval=float(args.interval),
                 # A frame of the game window while the assistant's own panel covers it is not the game:
                 # counting it would fire a false 掉线 alert and a reconnect that clicks the game.

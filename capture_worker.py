@@ -662,7 +662,7 @@ class WatchFeed:
     # The selection that arms this feed (None = always armed while the watch runs).
     armed_event: Optional[threading.Event] = None
     # The capture cadence this consumer's logic was calibrated for.  The disconnect detector's threshold
-    # is a FRAME COUNT (120 frames at the normal 0.25s capture = 30s), so feeding it at half the normal
+    # is a FRAME COUNT (40 frames at the normal 0.25s capture = 10s), so feeding it at half the normal
     # rate would silently double the detection time - each feed carries its own interval instead.
     interval: float = LIE_WATCH_INTERVAL_SECONDS
     # Some consumers may only judge a frame when the game window really is in front.  A capture of the

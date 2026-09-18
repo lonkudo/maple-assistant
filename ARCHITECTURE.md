@@ -91,8 +91,9 @@ panel selection (`WatchFeed`):
 掉线 armed   -> character_frames      every 0.25 s  (its alert threshold is a FRAME COUNT)
 ```
 
-Both feeds carry their own interval for that reason - the disconnect alert is
-"120 missing frames", which must stay 30 s.  The watch stands down whenever the
+both feeds carry their own interval for that reason - the disconnect alert is a
+frame count (``DISCONNECT_ALERT_FRAMES``, 40 since 2026-09-18 = 10 s at 0.25 s;
+it was 120 = 30 s), which the watch must keep.  The watch stands down whenever the
 shared capture runs (same gate object, so there is never a double capture), it
 never foregrounds the game, and the 掉线 feed additionally requires the game
 window to be in the FOREGROUND: a capture of the game window while this panel

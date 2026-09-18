@@ -451,7 +451,9 @@ Alert sources are **掉线**, **测谎**, and **循环**. Output choices are ind
 **声音** plays `sound/dingdong.mp3`, **闪烁** flashes red twice, and **消息**
 sends Telegram with machine name, event type, and time.
 
-- 掉线 reuses the yellow marker result and alerts after consecutive missing frames.
+- 掉线 reuses the yellow marker result and alerts after `DISCONNECT_ALERT_FRAMES` consecutive missing
+  frames - **40** since 2026-09-18 (it was 120), i.e. 10 s at the default 0.25 s capture cadence.  The
+  threshold is a frame count, which is why the parked watch feeds this queue at the normal cadence.
 - 测谎 scans the shared capture once per second for a resolution-scaled white
   square and saves no screenshots.
 - 循环 is an independent draggable countdown; it does not depend on patrol.
@@ -728,7 +730,7 @@ state the worker was in.
 
 ### Handoff state
 
-- `VERSION` is **1.0.52** and the single package `release/MapleAssistant-1.0.52.zip` is the current
+- `VERSION` is **1.0.53** and the single package `release/MapleAssistant-1.0.53.zip` is the current
   distributable (the previous ZIP is removed automatically). `release_now.ps1 -SkipTests` is the normal
   release command; one release per behaviour change, none for documentation-only edits.
 - The 1.0.18 - 1.0.48 line (all shipped during this session, each one behaviour change):

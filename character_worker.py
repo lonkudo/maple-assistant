@@ -28,14 +28,14 @@ from countdown_worker import play_mp3, run_sound_async
 
 LOG = logging.getLogger(__name__)
 
-# 掉线判定：黄点连续缺失这么多帧（操作员 2026-09-17：恢复按帧计数，阈值 120）。
+# 掉线判定：黄点连续缺失这么多帧（操作员 2026-09-18：40 帧；此前为 120 帧）。
 #
 # 换算成时间是「帧数 × 截图间隔」，而截图间隔不是固定的：
-#   * 默认 --interval 0.25s  -> 120 帧 = 30 秒（40 秒需要 160 帧）
-#   * 掉落加速 0.10s          -> 120 帧 = 12 秒
-#   * 过测谎时 30fps (1/30s)  -> 120 帧 = 4 秒
+#   * 默认 --interval 0.25s  -> 40 帧 = 10 秒
+#   * 掉落加速 0.10s          -> 40 帧 = 4 秒
+#   * 测谎快照 30fps (1/30s)  -> 40 帧 ≈ 1.3 秒
 # 日志里同时打印帧数和秒数，所以到底等了多久永远能从日志读出来。
-DISCONNECT_ALERT_FRAMES = 120
+DISCONNECT_ALERT_FRAMES = 40
 
 # Fallback minimap region in ABSOLUTE client pixels (the HUD is fixed
 # pixel; only the viewport scales).  The movement worker overrides this with
@@ -207,10 +207,11 @@ class CharacterWorker(Thread):
     ) -> None:
         """Consume the existing marker result; never runs another detector.
 
-        The operator's rule (2026-09-17): the yellow marker missing for 120 consecutive FRAMES.
-        A detected marker resets the counter, and one streak produces one alert; the elapsed time is
-        logged next to the frame count so the frame threshold can always be read as seconds (see
-        DISCONNECT_ALERT_FRAMES for how the cadence converts it).
+        The operator's rule: the yellow marker missing for ``DISCONNECT_ALERT_FRAMES`` consecutive FRAMES
+        (40 since 2026-09-18; it was 120, i.e. 30 s at the default capture cadence, and the operator asked
+        for the shorter count).  A detected marker resets the counter, and one streak produces one alert;
+        the elapsed time is logged next to the frame count so the frame threshold can always be read as
+        seconds (see ``DISCONNECT_ALERT_FRAMES`` for how the cadence converts it).
         """
 
         checked_at = time.monotonic() if now is None else float(now)

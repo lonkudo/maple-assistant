@@ -29,10 +29,12 @@ class CharacterWorkerDisconnectAlertTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_the_default_threshold_is_120_frames(self):
-        self.assertEqual(DISCONNECT_ALERT_FRAMES, 120)
+    def test_the_default_threshold_is_40_frames(self):
+        # The operator asked for the shorter count on 2026-09-18: 40 frames = 10 s at the default 0.25 s
+        # capture cadence (it was 120 = 30 s).
+        self.assertEqual(DISCONNECT_ALERT_FRAMES, 40)
         worker = self.make_worker(lambda _path: None)
-        self.assertEqual(worker._disconnect_alert_misses, 120)
+        self.assertEqual(worker._disconnect_alert_misses, 40)
 
     def test_alerts_on_the_last_frame_only_and_rearms_on_detection(self):
         played = []
