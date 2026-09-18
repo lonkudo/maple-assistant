@@ -4008,6 +4008,27 @@ class MovementWorker(threading.Thread):
             return name
         return None
 
+    def _bottom_floor_for_marker_y(self, marker_y: float) -> Optional[str]:
+        """The recorded bottom floor when the marker reads at or below its band.
+
+        Nothing is recorded lower than the bottom floor, so a marker there IS the bottom floor - the same
+        rule the landing reconciliation and ``_detect_floor_all`` use.  It matters for the operator's
+        scrolling minimap: layer1's remembered stance is 0.676829, but the same floor renders at 0.713415
+        while the character walks along it, i.e. below layer1's band and outside every other band, so
+        recognition answered "now on none" while the character was plainly patrolling layer1.
+        """
+
+        bottom_floor = self._bottom_recorded_layer()
+        if bottom_floor is None:
+            return None
+        layer = self.important_positions.get(bottom_floor)
+        if not isinstance(layer, dict):
+            return None
+        band = _layer_y_band(layer, float(layer.get("y_tolerance", 0.020000)))
+        if band is None or marker_y < band[1] - 1e-9:
+            return None
+        return bottom_floor
+
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = {name: self.important_positions[name] for name in self._route_layers}
         marker_candidates = (
@@ -4040,12 +4061,29 @@ class MovementWorker(threading.Thread):
                 legacy = detect_layer_by_y(observation.player.y, legacy_layers)
                 if legacy is not None:
                     return legacy
+            if observation.player is not None:
+                bottom = self._bottom_floor_for_marker_y(observation.player.y)
+                if bottom is not None and bottom in layers:
+                    LOG.info(
+                        "LAYER bottom-floor rule: marker y=%.6f is at/below %s's band and matches no "
+                        "other band; reporting %s",
+                        observation.player.y, bottom, bottom,
+                    )
+                    return bottom
             return self._current_route_layer_with_grace(observation)
         if observation.player is None:
             return None
         detected = detect_layer_by_y(observation.player.y, layers)
         if detected is not None:
             return detected
+        bottom = self._bottom_floor_for_marker_y(observation.player.y)
+        if bottom is not None and bottom in layers:
+            LOG.info(
+                "LAYER bottom-floor rule: marker y=%.6f is at/below %s's band and matches no other "
+                "band; reporting %s",
+                observation.player.y, bottom, bottom,
+            )
+            return bottom
         return self._current_route_layer_with_grace(observation)
 
     def _select_route_layer(self, observation: MinimapObservation | Point) -> None:
@@ -4322,6 +4360,16 @@ class MovementWorker(threading.Thread):
                     and observation.structure_confidence >= 0.12)
                 else None
             )
+            if world_name is not None:
+                # The world signal may not name a floor the marker draws the character BELOW: that is the
+                # physical limit already used for fall landings (see ``_landing_floor_cap``).  The
+                # operator's 14:09 log is why it is needed here too: the character was walking on layer1
+                # with the marker at 0.713415 (below layer1's band, outside every band), and a poisoned
+                # world reading of 1.204824 named layer2 - one more matching frame and the patrol would
+                # have switched to a floor the character was visibly under.
+                world_name = self._cap_landing_floor(
+                    world_name, observation, source="the world-Y signal"
+                )
             if (not marker_is_unambiguous
                     and world_name is not None
                     and world_name != detected_name):
@@ -5032,7 +5080,8 @@ class MovementWorker(threading.Thread):
             _LANDING_CAP_REPORTED.add(pair)
             LOG.warning(
                 "LANDING FLOOR CAP: %s reported %s, but the minimap marker at y=%.6f is at/below %s "
-                "- a fall only goes down, so the landing floor is %s",
+                "- a floor whose band lies entirely above the marker cannot be where the character "
+                "stands, so the floor is %s",
                 source, floor, observation.player.y, cap, cap,
             )
         return cap
