@@ -105,6 +105,9 @@ class ApiLieTestWorker(threading.Thread):
         use_mimic: bool = False,
         aim_enabled: bool = False,
         aim_overlay: Optional[Callable[[int, int], None]] = None,
+        on_capture_start: Optional[Callable[[], None]] = None,
+        on_capture_stop: Optional[Callable[[], None]] = None,
+        backend_opener: Optional[Callable[[RunLog], tuple[Any, str, Any]]] = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         super().__init__(name="api-lie-test", daemon=True)
@@ -135,6 +138,11 @@ class ApiLieTestWorker(threading.Thread):
         # Draw the aim while the pass runs (the video drill draws it in its own window; here it is an
         # overlay crosshair on the game at the answered SCREEN point).
         self.aim_overlay = aim_overlay
+        self._on_capture_start = on_capture_start
+        self._on_capture_stop = on_capture_stop
+        # The automatic pass supplies a UI-start probe cache here.  Keeping
+        # this optional preserves the standalone drill's normal probe path.
+        self._backend_opener = backend_opener
         self._aim: Any = None
         self._aim_suspended: Any = None
         self._sleep = sleep
@@ -296,6 +304,8 @@ class ApiLieTestWorker(threading.Thread):
         message.  Everything attempted lands in the connection log.
         """
 
+        if self._backend_opener is not None:
+            return self._backend_opener(log)
         session = open_backend(
             key=self.key,
             host=self.host,
@@ -317,19 +327,23 @@ class ApiLieTestWorker(threading.Thread):
                 return
             self._running = True
         self._stop_request.clear()
+        if self._on_capture_start is not None:
+            try:
+                self._on_capture_start()
+            except Exception:
+                LOG.warning("api test: could not enable shared capture", exc_info=True)
         client = None
         mimic = None
         log = RunLog(name="apitest_drill")
         self.log_folder = log.folder
+        # This clock is the lie-event clock, not the time at which connection
+        # setup happened to finish.  It lets the network setup run inside the
+        # visual settle period instead of adding its duration after it.
+        pass_started = time.perf_counter()
         try:
             self.stats = TestStats()
             if not self._prepare_window():
                 return
-            image, rect = self._capture()
-            if image is None:
-                self._report("failed", "无法截取游戏窗口")
-                return
-            box = lie_roi_box(image.shape[1], image.shape[0])
             self._report("backend", "正在连接后端…")
             log.connection("drill start", window=self.window_title or "(none)",
                            fps=self.fps, seconds=self.duration, transport=self.transport,
@@ -348,25 +362,41 @@ class ApiLieTestWorker(threading.Thread):
             self.backend_note = str(note)
             self._report("backend", f"{note}")
 
+            # Open the socket before capturing the first image.  The shared
+            # capture is already enabled, so this leaves the full visual
+            # settle period available for endpoint connection/handshake.
+            image, rect = self._capture()
+            if image is None:
+                self._report("failed", "无法截取游戏窗口")
+                return
+            box = lie_roi_box(image.shape[1], image.shape[0])
+
             interval = 1.0 / self.fps
-            total = max(1, int(round(self.duration * self.fps)))
-            await_ticks = self._await_ticks(total, log)
-            feed_frames = max(1, total - await_ticks)
-            if await_ticks:
-                plan = (f"连接已建立，先等 {self.await_seconds:.1f} 秒（第二个窗口，暂不上传）再上传 "
-                        f"{feed_frames} 帧 @ {self.fps:.0f} fps（{feed_frames / self.fps:.0f} 秒）")
+            active_seconds = max(interval, self.duration - self.await_seconds)
+            feed_frames = max(1, int(round(active_seconds * self.fps)))
+            settle_deadline = pass_started + self.await_seconds
+            remaining_settle = settle_deadline - time.perf_counter()
+            if remaining_settle > 0:
+                plan = (f"连接已建立，等待第二个窗口剩余 {remaining_settle:.1f} 秒后立即上传 "
+                        f"{feed_frames} 帧 @ {self.fps:.0f} fps（{active_seconds:.0f} 秒）")
             else:
-                plan = f"连接已建立，{feed_frames} 帧 @ {self.fps:.0f} fps（{self.duration:.0f} 秒）"
+                late = -remaining_settle
+                plan = (f"连接在第二个窗口等待期后才完成（晚 {late:.1f} 秒）；现在立即上传 "
+                        f"{feed_frames} 帧 @ {self.fps:.0f} fps")
             self._report("start", f"{plan}，ROI={box}")
             # The cursor is claimed as soon as the session exists (the drill does the same), so the pass
             # owns the mouse before the window is even readable.
             if self.aim_enabled and self._aim is None:
                 self._start_aim(image.shape[1], image.shape[0])
+            if remaining_settle > 0:
+                self._sleep(remaining_settle)
             started = time.perf_counter()
-            next_at = started
+            # The first upload is due now.  Later frames use the normal 5-fps
+            # cadence; do not add an unnecessary first 200 ms tick.
+            next_at = started - interval
             last_capture_saved = 0.0
             frame_id = 0
-            for tick in range(1, total + 1):
+            for tick in range(1, feed_frames + 1):
                 if self._stop_request.is_set() or self.stop_event.is_set():
                     self._report("stopped", f"第 {tick} 帧前收到停止请求")
                     break
@@ -374,16 +404,6 @@ class ApiLieTestWorker(threading.Thread):
                 delay = next_at - time.perf_counter()
                 if delay > 0:
                     self._sleep(delay)
-                if tick <= await_ticks:
-                    # AWAIT_SECOND_WINDOW: the second window is still coming up, so nothing is built and
-                    # nothing is billed yet - but the session is already open and waiting.
-                    left = max(0.0, self.await_seconds - (tick - 1) * interval)
-                    if tick == 1 or tick % max(1, int(round(self.fps))) == 1:
-                        self._report(
-                            "await",
-                            f"已连接 · 等待第二个窗口 {left:.1f}s（暂不上传 {feed_frames} 帧）",
-                        )
-                    continue
                 frame_id += 1
                 image, rect = self._capture()
                 if image is None:
@@ -509,6 +529,11 @@ class ApiLieTestWorker(threading.Thread):
                     mimic.stop()
             except Exception:
                 LOG.debug("api test: mimic stop failed", exc_info=True)
+            if self._on_capture_stop is not None:
+                try:
+                    self._on_capture_stop()
+                except Exception:
+                    LOG.warning("api test: could not release shared capture", exc_info=True)
             with self._lock:
                 self._running = False
 

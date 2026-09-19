@@ -104,14 +104,11 @@ ACTIVATE_CLICK_WAIT_SECONDS = 3.0
 # over the client whose default button is 确定, and the login board behind it cannot be used until it
 # is closed.
 #
-# The CLOSE/CONFIRM BUTTON is anchored to the MIDDLE: "the base should be middle center".  The operator
-# then measured the exact point on his 1080x768 client (2026-09-17): **client (558, 328)** - 18 px right
-# of the client's horizontal middle (540), at y 328.
-#
-# The constant below is that same point expressed in the 1366x768 preset space, so the login mapping
-# family (``login_client_point``: centred, y unchanged) puts it back exactly where he clicked:
-# 558 + (1366-1080)/2 = 701, y unchanged -> (701, 328) -> (558, 328) on his client, (701, 328) on a
-# 1366x768 one.
+# The CLOSE/CONFIRM BUTTON is anchored from ``screenshots/faulty_disconnect.jpg``.  That reference is
+# an exact 1080x768 client capture and the centre of its visible ``确定`` button is client **(554, 333)**.
+# This is deliberately a prompt-specific anchor, not a login-board point: the prompt art has a different
+# layout from the login page.  Its background does not scale with the client; it is centred, so map this
+# point by its centre offset on other client widths/heights.
 #
 # The button is CLICKED first and Enter is only the fallback: "this is the close prompt window button,
 # you either click it or you press enter (press enter seem to fail)".  Measured earlier on the same
@@ -119,7 +116,8 @@ ACTIVATE_CLICK_WAIT_SECONDS = 3.0
 # the real login page), and both the board point (647, 326) and the 连接 point (721, 401) land on the
 # prompt - so the workflow must not start until the prompt is really gone.  The page still passes the
 # login-page COLOUR gate (9.2 % cream), so the page classifier is what tells them apart.
-LOGIN_PROMPT_CLOSE_CLIENT = (701, 328)
+OFFLINE_PROMPT_REFERENCE_CLIENT: tuple[int, int] = (1080, 768)
+OFFLINE_PROMPT_CLOSE_REFERENCE_POINT: tuple[int, int] = (554, 333)
 OFFLINE_PROMPT_CLICK = True
 OFFLINE_PROMPT_ENTER = True
 OFFLINE_PROMPT_WAIT_SECONDS = 0.80
@@ -315,6 +313,23 @@ def login_client_box(box, client_size=REFERENCE_CLIENT):
     left, top, width, height = (int(value) for value in box)
     left, top = login_client_point((left, top), client_size)
     return (left, top, width, height)
+
+
+def offline_prompt_close_client_point(client_size=REFERENCE_CLIENT) -> tuple[int, int]:
+    """Map the ``确定`` centre from ``faulty_disconnect.jpg`` into a live client.
+
+    The faulty-disconnect dialog is a fixed-size, centred game panel.  Keeping its own 1080x768
+    reference avoids accidentally inheriting a login-board measurement when the dialog must be
+    dismissed before reconnecting.
+    """
+
+    width, height = _client_size_tuple(client_size)
+    reference_width, reference_height = OFFLINE_PROMPT_REFERENCE_CLIENT
+    x, y = OFFLINE_PROMPT_CLOSE_REFERENCE_POINT
+    return (
+        int(round(x + (width - reference_width) / 2.0)),
+        int(round(y + (height - reference_height) / 2.0)),
+    )
 
 
 def window_client_scale(client_size=REFERENCE_CLIENT) -> float:
@@ -2689,8 +2704,8 @@ class ReconnectWorker(threading.Thread):
     def _dismiss_offline_prompt(self) -> bool:
         """Close the 掉线提示窗口 - the FIRST action of the reconnect (operator's rule).
 
-        Two ways, in the operator's order: **click the close button** at the middle-centred anchor
-        (``LOGIN_PROMPT_CLOSE_CLIENT`` = (middle, 424)) and, when that does not take, press Enter -
+        Two ways, in the operator's order: **click the close button** at the image-derived centred
+        anchor (``faulty_disconnect.jpg`` -> (554, 333) on 1080x768) and, when that does not take, press Enter -
         "this is the close prompt window button, you either click it or you press enter (press enter
         seem to fail)".  After each attempt the page classifier decides whether the prompt is really
         gone, and the whole thing is repeated up to ``OFFLINE_PROMPT_ATTEMPTS`` times: nothing may be
@@ -2712,11 +2727,12 @@ class ReconnectWorker(threading.Thread):
             return True
         for attempt in range(1, attempts + 1):
             if OFFLINE_PROMPT_CLICK:
-                point = login_client_point(LOGIN_PROMPT_CLOSE_CLIENT, self._click_size())
+                point = offline_prompt_close_client_point(self._click_size())
                 LOG.info("auto reconnect: clicking the 掉线提示 close button at client (%d, %d) "
-                         "(%d/%d)", point[0], point[1], attempt, attempts)
-                self._report("prompt", f"第 {attempt} 次 点击「关闭」（{point[0]}, {point[1]}）")
-                self._click_client(point[0], point[1], "prompt", "掉线提示关闭按钮")
+                         "from faulty_disconnect.jpg anchor (%d/%d)", point[0], point[1],
+                         attempt, attempts)
+                self._report("prompt", f"第 {attempt} 次 点击「确定」（{point[0]}, {point[1]}）")
+                self._click_client(point[0], point[1], "prompt", "掉线提示「确定」按钮")
                 if not self._sleep_checked(OFFLINE_PROMPT_WAIT_SECONDS):
                     return False
                 if self._prompt_is_gone(attempt, attempts, "点击关闭按钮"):
@@ -3065,6 +3081,37 @@ class ReconnectWorker(threading.Thread):
                   measured, LOGIN_PAGE_MIN_FRACTION * 100.0)
         self._report("failed", f"游戏窗口不是登录页（{measured}）")
         return False
+
+    def login_page_visible_in_frame(self, image: Any) -> bool:
+        """Confirm the login page from an already-captured game frame.
+
+        This is the cheap second condition for the disconnect watch.  It does
+        not focus the game, click, or start reconnecting; it only prevents a
+        minimap-less in-game zone from being treated as an offline page.
+        """
+
+        if image is None:
+            return False
+        reference = self._login_reference()
+        if reference is None:
+            LOG.warning("auto reconnect: login reference unavailable for disconnect confirmation")
+            return False
+        try:
+            import numpy as np
+
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+            frame = rgb[:, :, ::-1].copy()
+            evidence = find_login_page(frame, reference)
+            if evidence is not None:
+                LOG.info(
+                    "auto reconnect: disconnect confirmation matched login page (%s)",
+                    evidence.describe(),
+                )
+                return True
+            return False
+        except Exception:
+            LOG.warning("auto reconnect: disconnect login-page confirmation failed", exc_info=True)
+            return False
 
     def _select_world(self, world: str) -> bool:
         """Click the chosen world row and PROVE the channel page appears.

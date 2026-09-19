@@ -7,6 +7,7 @@ import ctypes
 from dataclasses import replace
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import queue
 import signal
@@ -265,10 +266,10 @@ def _capture_focused_game_frame(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Modular MapleStory screen assistant")
     parser.add_argument("--window-title", default="冒险岛怀旧服")
-    parser.add_argument("--interval", type=float, default=0.25,
-                        help="seconds between minimap captures (default: 0.25)")
-    parser.add_argument("--status-interval", type=float, default=0.25,
-                        help="seconds between HP/MP captures (default: 0.25)")
+    parser.add_argument("--interval", type=float, default=0.20,
+                        help="seconds between shared game captures (default: 0.20 / 5 fps)")
+    parser.add_argument("--status-interval", type=float, default=0.20,
+                        help="seconds between status analysis samples (default: 0.20 / 5 fps)")
     parser.add_argument("--attack-interval", type=float, default=2.0,
                         help="seconds between Ctrl attacks (default: 2)")
     parser.add_argument("--enable-attack", action="store_true",
@@ -451,7 +452,7 @@ def main() -> int:
     stair_jump_active = threading.Event()
     action_motion_active = _AnyEvent(climbing_active, stair_jump_active)
     dropping_active = threading.Event()
-    # Capture cadence event the API lie pass raises for its ~30 fps bursts.
+    # The API lie pass joins the normal shared 5 fps capture stream while it owns the cursor.
     lie_active = threading.Event()
     moving_active = threading.Event()
     pickup_active = threading.Event()
@@ -494,11 +495,123 @@ def main() -> int:
         alt_transition=False,
     )
     config_store = get_config_store(args.config)
+
+    # Select a WebSocket endpoint once while the dashboard is opening.  A
+    # probe does not authenticate or bill (protocol 2.7.0 §4.3), so the lie
+    # event can later connect straight to the cached endpoint instead of
+    # serially probing every port.  Do NOT pre-handshake here: the protocol
+    # drops an idle authenticated connection after 10 seconds without frames.
+    auto_lie_endpoint_lock = threading.Lock()
+    auto_lie_endpoint: dict[str, object] = {"value": None, "error": ""}
+
+    def warm_auto_lie_endpoint() -> None:
+        try:
+            from autolie_api.connect import choose_endpoint, probe_ws_endpoints
+
+            best = choose_endpoint(probe_ws_endpoints())
+            if best is None:
+                raise RuntimeError("no WebSocket endpoint answered the startup probe")
+            with auto_lie_endpoint_lock:
+                auto_lie_endpoint["value"] = best
+                auto_lie_endpoint["error"] = ""
+            logging.info(
+                "AUTO LIE preflight ready: cached WebSocket endpoint %s (%.0f ms)",
+                best.endpoint, best.rtt_ms,
+            )
+        except Exception as exc:
+            with auto_lie_endpoint_lock:
+                auto_lie_endpoint["error"] = f"{type(exc).__name__}: {exc}"
+            logging.warning("AUTO LIE preflight failed; event will retry discovery: %s", exc)
+
+    threading.Thread(
+        target=warm_auto_lie_endpoint,
+        name="auto-lie-preflight",
+        daemon=True,
+    ).start()
+
+    def open_prepared_auto_lie_backend(log):
+        """Open one fresh formal session against the UI-start cached endpoint.
+
+        The HTTP health check is intentionally excluded: it is diagnostic-only
+        in protocol 2.7.0 and must never delay a live lie event.
+        """
+
+        from autolie_api.connect import open_backend
+        from autolie_api.endpoints import ws_endpoints
+        from autolie_api.key_store import load_product_key, mask_key
+        from autolie_api.ws_client import RoiTrackWsClient
+
+        key, source = load_product_key("")
+        if not key:
+            # The local mimic is created directly by the normal helper and
+            # has no remote probe/health path to avoid.
+            session = open_backend(
+                key="", transport="base64", frame_standard=5.0,
+                health=False, client_info="maple_assistant_auto_lie",
+            )
+            return session.client, session.note, session.mimic
+        with auto_lie_endpoint_lock:
+            endpoint = auto_lie_endpoint.get("value")
+            preflight_error = str(auto_lie_endpoint.get("error") or "")
+        if endpoint is None:
+            choices = ws_endpoints()
+            if not choices:
+                raise RuntimeError("no configured WebSocket endpoint")
+            endpoint = choices[0]
+            logging.warning(
+                "AUTO LIE preflight is unavailable (%s); trying configured endpoint %s directly",
+                preflight_error or "still running", endpoint.url,
+            )
+        endpoint_url = str(getattr(endpoint, "endpoint", getattr(endpoint, "url", "")))
+        client = RoiTrackWsClient(endpoint.host, endpoint.port, timeout=5.0)
+        try:
+            started = time.perf_counter()
+            client.connect()
+            ack = client.handshake(
+                key, frame_standard=5, image_transport="bgr_jpeg90_base64",
+                client_info="maple_assistant_auto_lie",
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        except Exception as exc:
+            client.close()
+            if log is not None:
+                log.connection(
+                    "cached endpoint handshake failed; falling back to discovery",
+                    endpoint=endpoint_url, error=str(exc),
+                )
+            # A stale startup probe must not make the live pass unavailable.
+            # This fallback still omits the HTTP health check.
+            session = open_backend(
+                key=key, transport="base64", frame_standard=5.0,
+                health=False, client_info="maple_assistant_auto_lie",
+            )
+            return session.client, session.note, session.mimic
+        if log is not None:
+            log.connection(
+                "cached endpoint handshake_ack", endpoint=endpoint_url,
+                auth=ack.get("auth"), quota_left=ack.get("quota_left"),
+                connect_ms=round(elapsed_ms),
+            )
+        note = (
+            f"真实后端 {endpoint_url} 密钥来自{source} "
+            f"(quota_left={ack.get('quota_left')}；UI 启动预探测)"
+        )
+        logging.info(
+            "AUTO LIE ready: direct handshake %s in %.0f ms (key %s)",
+            endpoint_url, elapsed_ms, mask_key(key),
+        )
+        return client, note, None
+
     calibration = (
         json.loads(args.rope_calibration.read_text(encoding="utf-8"))
         if args.rope_calibration is not None
         else config_store.read_section("rope_calibration")
     )
+
+    def five_fps_frames(value: object, minimum: int = 1) -> int:
+        """Preserve a 4-fps frame-based delay after moving the shared stream to 5 fps."""
+
+        return max(int(minimum), int(math.ceil(float(value) * 1.25)))
     map_profile = (
         json.loads(args.recording_configuration.read_text(encoding="utf-8"))
         if args.recording_configuration is not None
@@ -572,7 +685,7 @@ def main() -> int:
     # The gate the shared capture runs on.  It is ALSO what tells the parked 测谎 watch to stand down: if
     # this is set, the detector is already being fed by the shared capture and a second one is waste.
     shared_capture_gate = _AnyEvent(
-        game_focused, patrol_preparing, trade_capture_active
+        game_focused, patrol_preparing, trade_capture_active, lie_active
     )
     capture_worker = CaptureWorker(
         args.window_title,
@@ -588,12 +701,10 @@ def main() -> int:
         status_capture_interval=args.status_interval,
         capture_enabled_event=shared_capture_gate,
         fast_capture_event=dropping_active,
-        fast_interval=0.10,
-        # Lie pass: ~30 fps while a pass is running, so a pass is fed at the same
-        # rate the game shows.  Nothing raises it today (the local pass is gone);
-        # the API pass keeps the wiring for its bursts.
+        # Every consumer stays on the same 5 fps source, including falls and auto-lie.
+        fast_interval=float(args.interval),
         lie_capture_event=lie_active,
-        lie_interval=1.0 / 30.0,
+        lie_interval=float(args.interval),
         # ==== ADDED pass debug flag into capture worker ====
         debug_draw_regions=args.debug_capture_regions,
         debug_minimap_fallback=MINIMAP_FALLBACK_REGION, # <------ ADD THIS LINE
@@ -648,10 +759,16 @@ def main() -> int:
                 fresh_frame.sequence,
             )
 
+        saved_calibration = config_store.read_section("minimap_calibration")
         saved_detection = minimap_calibration_from_dict(
-            config_store.read_section("minimap_calibration"),
+            saved_calibration,
             fresh_frame.image.size,
         )
+        if saved_calibration and saved_detection is None:
+            logging.warning(
+                "MINIMAP saved calibration ignored: it is not a measured minimap border; "
+                "a fresh OpenCV border is required"
+            )
         probes = [(fresh_frame, saved_detection)] if saved_detection else []
         if saved_detection is not None:
             # Recording owns border discovery. Patrol only consumes the saved,
@@ -681,22 +798,15 @@ def main() -> int:
                 )
                 candidate_detection = probe.detect(candidate_frame.image)
                 probes.append((candidate_frame, candidate_detection))
-                # Accept an OpenCV contour OR the fixed HUD region when the
-                # yellow marker is found inside the analysis box; the fixed
-                # region is marker-verified geometry on the fixed-pixel HUD.
+                # A marker confirms that a measured contour contains the
+                # player.  The broad fallback is only a search area and is
+                # never promoted to minimap geometry.
                 marker_rgb = np.asarray(
                     candidate_frame.image.crop(
                         candidate_detection.analysis_box
                     ).convert("RGB")
                 )
                 if detect_yellow_diamond(marker_rgb) is not None:
-                    if candidate_detection.source == "fallback":
-                        candidate_detection = replace(
-                            candidate_detection,
-                            source="fixed-region",
-                            confidence=1.0,
-                        )
-                        probes[-1] = (candidate_frame, candidate_detection)
                     marker_verified_indices.append(len(probes) - 1)
             chosen_index = choose_stable_minimap_index(
                 [candidate for _frame, candidate in probes],
@@ -1159,8 +1269,10 @@ def main() -> int:
     # only be started once.  api_lie_test.py (the older single-frame screen drill) has no panel
     # button any more; it stays as an offline tool for work/ scripts and the test suite.
     api_test_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=256)
-    # How long one automatic 自动过测谎 pass keeps feeding the backend after a lie window appears.
-    AUTO_LIE_PASS_SECONDS = 8.0
+    # The service expects one short live round: after the separate 3-second
+    # settle, send frames for no more than 13 seconds, then round_end and
+    # close the WebSocket.
+    AUTO_LIE_TRACK_SECONDS = 13.0
 
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
                                    fps=5.0):
@@ -1193,6 +1305,18 @@ def main() -> int:
     # 测试api, triggered by the lie event instead of the button.  One worker per event, because a thread
     # cannot restart.
     api_auto_lie_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=64)
+    auto_lie_capture_sequence = -1
+
+    def capture_shared_auto_lie_frame():
+        """Wait for the next shared 5 fps frame; auto-lie never captures the game itself."""
+
+        nonlocal auto_lie_capture_sequence
+        frame = bus.wait_for_new(auto_lie_capture_sequence, timeout=1.0)
+        if frame is None:
+            return None, (0, 0, 0, 0)
+        auto_lie_capture_sequence = frame.sequence
+        image = np.asarray(frame.image.convert("RGB"))[:, :, ::-1].copy()
+        return image, frame.window_rect
 
     def make_api_auto_lie_worker():
         """One automatic pass for one lie window - the SAME workflow as 测试api (the video drill)."""
@@ -1213,7 +1337,10 @@ def main() -> int:
             window_title=args.window_title,
             key="",
             key_sender=key_sender,
-            duration=AUTO_LIE_PASS_SECONDS,
+            fps=5.0,
+            # The worker sends its explicit round_end and closes after this
+            # 13-second active tracking window.
+            duration=AWAIT_SECOND_WINDOW_SEC + AUTO_LIE_TRACK_SECONDS,
             await_seconds=AWAIT_SECOND_WINDOW_SEC,
             # The answer must be EXECUTED, not just measured: the pass drives the cursor to the point
             # the API returns (the vendor doc: "鼠标/执行层一般用 x / y（372×248 协议 ROI）"), exactly like
@@ -1222,6 +1349,10 @@ def main() -> int:
             # ... and it is DRAWN: a click-through crosshair overlay on the game at the answered point,
             # the live equivalent of the crosshair the video drill shows in its own window.
             aim_overlay=screen_blinker.show_aim_marker,
+            capture_fn=capture_shared_auto_lie_frame,
+            on_capture_start=lie_active.set,
+            on_capture_stop=lie_active.clear,
+            backend_opener=open_prepared_auto_lie_backend,
         )
 
     def _on_disconnect_event() -> None:
@@ -1240,14 +1371,6 @@ def main() -> int:
         """Publish recording's verified border for independent patrol use."""
 
         detection = getattr(snapshot, "detection")
-        # When OpenCV could not close a border contour, the marker-verified
-        # fixed HUD region (map-name strip above the measured minimap area)
-        # is the calibration: the marker was found inside it, so its
-        # absolute-pixel geometry is correct for the fixed-pixel HUD.
-        if detection.source == "fallback":
-            detection = replace(
-                detection, source="fixed-region", confidence=1.0
-            )
         client_size = getattr(snapshot, "client_size")
         value = minimap_calibration_to_dict(detection, client_size)
         config_store.write_section("minimap_calibration", value)
@@ -1275,7 +1398,7 @@ def main() -> int:
         lie_detector_frames,
         stop_event,
         enabled=False,
-        scan_interval=1.0,
+        scan_interval=0.20,
         sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
@@ -1361,9 +1484,11 @@ def main() -> int:
             final_calculation_diamonds=calibration.get("final_calculation_diamonds"),
             estimated_final_speed=float(calibration.get("estimated_final_speed", 0.205)),
             final_move_safety_gain=float(calibration.get("final_move_safety_gain", 0.95)),
-            aligned_frames_required=int(calibration.get("aligned_frames_required", 2)),
-            climb_layer_confirm_frames=int(
-                calibration.get("climb_layer_confirm_frames", 3)
+            aligned_frames_required=five_fps_frames(
+                calibration.get("aligned_frames_required", 2), 2
+            ),
+            climb_layer_confirm_frames=five_fps_frames(
+                calibration.get("climb_layer_confirm_frames", 3), 2
             ),
             climb_layer_confirm_seconds=float(
                 calibration.get("climb_layer_confirm_seconds", 0.3)
@@ -1379,7 +1504,7 @@ def main() -> int:
             climb_world_y_stall_change_required=float(
                 calibration.get("climb_world_y_stall_change_required", 0.15)
             ),
-            climb_world_y_stall_frames=int(
+            climb_world_y_stall_frames=five_fps_frames(
                 calibration.get("climb_world_y_stall_frames", 2)
             ),
             climb_failed_shift_right_seconds=float(
@@ -1422,12 +1547,12 @@ def main() -> int:
             patrol_start_layer=map_profile.get("patrol_start_layer"),
             patrol_end_layer=map_profile.get("patrol_end_layer"),
             # Falling recovery knobs (see rope_calibration.json).
-            fall_detect_frames=int(calibration.get("fall_detect_frames", 3)),
+            fall_detect_frames=five_fps_frames(calibration.get("fall_detect_frames", 3), 2),
             fall_marker_y_gain=float(calibration.get("fall_marker_y_gain", 0.015)),
             # Landing reconciliation (world-Y settle + re-anchor to the true
             # layer after a knock-down) and the world-Y drift watchdog.
-            fall_settle_min_frames=int(
-                calibration.get("fall_settle_min_frames", 3)
+            fall_settle_min_frames=five_fps_frames(
+                calibration.get("fall_settle_min_frames", 3), 2
             ),
             fall_settle_epsilon=float(
                 calibration.get("fall_settle_epsilon", 0.15)
@@ -1503,7 +1628,7 @@ def main() -> int:
             stair_jump_stall_diamonds=float(
                 calibration.get("stair_jump_stall_diamonds", 0.25)
             ),
-            stair_jump_stall_frames=int(
+            stair_jump_stall_frames=five_fps_frames(
                 calibration.get("stair_jump_stall_frames", 7)
             ),
             patrol_start_grace_seconds=float(
@@ -1530,8 +1655,8 @@ def main() -> int:
             rescue_check_interval_seconds=float(
                 calibration.get("rescue_check_interval_seconds", 300.0)
             ),
-            rescue_stuck_frames=int(
-                calibration.get("rescue_stuck_frames", 20)
+            rescue_stuck_frames=five_fps_frames(
+                calibration.get("rescue_stuck_frames", 20), 5
             ),
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
@@ -1560,6 +1685,9 @@ def main() -> int:
         minimap_region_provider=lambda: getattr(
             movement_worker, "_last_minimap_region", None
         ),
+        # A disconnect needs 40 normal capture observations.  The capture worker may temporarily
+        # accelerate for other workflows, but those extra frames must not shorten this confirmation.
+        disconnect_alert_sample_seconds=float(args.interval),
         alert_sound_path=(
             Path(__file__).resolve().parent / "sound" / "dingdong.mp3"
         ),
@@ -1567,6 +1695,10 @@ def main() -> int:
         alert_callback=telegram_notifier.notify,
         on_disconnect=stop_patrol_for_disconnect,
         disconnect_event_callback=_on_disconnect_event,
+        # A missing marker alone is not an offline event: space zones can
+        # hide the minimap.  Reconnect starts only after this same frame also
+        # proves that the login page is visible.
+        disconnect_login_page_check=reconnect_worker.login_page_visible_in_frame,
         # No disconnect alert while 自动重连 is running: its login screens have no yellow marker.
         reconnect_active_event=reconnect_active,
     )

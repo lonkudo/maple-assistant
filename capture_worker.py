@@ -484,12 +484,17 @@ class CaptureWorker(threading.Thread):
                             pixel_box = self.status_capture_box_provider(
                                 image.size
                             )
-                        status_image, _status_rect = capture_window(
-                            self.window_title,
-                            self.status_capture_region
-                            if pixel_box is None else (0.0, 0.0, 1.0, 1.0),
-                            pixel_region=pixel_box,
-                        )
+                        # The status worker consumes a crop from THIS full-client frame.  A second
+                        # window capture would make status and minimap observe different moments and
+                        # violate the one shared 5 fps capture workflow.
+                        if pixel_box is None:
+                            left, top, right, bottom = self.status_capture_region or (0, 0, 1, 1)
+                            width, height = image.size
+                            pixel_box = (
+                                round(left * width), round(top * height),
+                                round(right * width), round(bottom * height),
+                            )
+                        status_image = image.crop(pixel_box)
                         if self.status_capture_interval is not None:
                             next_status_capture = (
                                 captured_monotonic + self.status_capture_interval
@@ -647,10 +652,8 @@ class CaptureWorker(threading.Thread):
                                  exc_info=True)
 
 
-# How often the parked watch grabs the game window for the 测谎 detector.  The detector scans at most
-# once per second, so two chances per scan window keep the detection latency at ~1s even when a tick is
-# missed.  A feed may ask for a faster cadence (see ``WatchFeed.interval``).
-LIE_WATCH_INTERVAL_SECONDS = 0.5
+# One shared game-capture cadence: 5 fps, whether patrol is running or the parked watch is active.
+LIE_WATCH_INTERVAL_SECONDS = 0.2
 
 
 @dataclass(frozen=True)

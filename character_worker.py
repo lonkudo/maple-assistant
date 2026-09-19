@@ -28,14 +28,15 @@ from countdown_worker import play_mp3, run_sound_async
 
 LOG = logging.getLogger(__name__)
 
-# 掉线判定：黄点连续缺失这么多帧（操作员 2026-09-18：40 帧；此前为 120 帧）。
+# 掉线判定：黄点连续缺失这么多帧（5 fps workflow: 50 frames preserves the old 10 seconds）。
 #
 # 换算成时间是「帧数 × 截图间隔」，而截图间隔不是固定的：
-#   * 默认 --interval 0.25s  -> 40 帧 = 10 秒
-#   * 掉落加速 0.10s          -> 40 帧 = 4 秒
-#   * 测谎快照 30fps (1/30s)  -> 40 帧 ≈ 1.3 秒
-# 日志里同时打印帧数和秒数，所以到底等了多久永远能从日志读出来。
-DISCONNECT_ALERT_FRAMES = 40
+#   * 默认 --interval 0.20s  -> 50 帧 = 10 秒
+# The disconnect counter itself is deliberately kept at the normal sampling
+# cadence below.  Other workflows may temporarily request 30fps capture, but
+# that must not turn a 40-frame disconnect confirmation into an instant alert.
+DISCONNECT_ALERT_FRAMES = 50
+DISCONNECT_ALERT_SAMPLE_SECONDS = 0.25
 
 # Fallback minimap region in ABSOLUTE client pixels (the HUD is fixed
 # pixel; only the viewport scales).  The movement worker overrides this with
@@ -103,12 +104,14 @@ class CharacterWorker(Thread):
         minimap_region_provider: Optional[Callable[[], tuple[float, float, float, float]]] = None,
         disconnect_alert_enabled: bool = False,
         disconnect_alert_misses: int = DISCONNECT_ALERT_FRAMES,
+        disconnect_alert_sample_seconds: float = DISCONNECT_ALERT_SAMPLE_SECONDS,
         alert_sound_path: Optional[Path] = None,
         play_alert_sound: Optional[Callable[[Path], None]] = None,
         flash_callback: Optional[Callable[[], None]] = None,
         alert_callback: Optional[Callable[[str], None]] = None,
         on_disconnect: Optional[Callable[[], None]] = None,
         disconnect_event_callback: Optional[Callable[[], None]] = None,
+        disconnect_login_page_check: Optional[Callable[[Any], bool]] = None,
         reconnect_active_event: Any = None,
     ) -> None:
         super().__init__(name="character-worker", daemon=True)
@@ -122,10 +125,21 @@ class CharacterWorker(Thread):
         self._disconnect_alert_enabled = bool(disconnect_alert_enabled)
         self._sound_enabled = True
         self._disconnect_alert_misses = max(1, int(disconnect_alert_misses))
+        self._disconnect_alert_sample_seconds = max(
+            0.01, float(disconnect_alert_sample_seconds)
+        )
         self._disconnect_missing_frames = 0
         # When the current missing streak started - only used to print the elapsed time.
         self._disconnect_missing_since: Optional[float] = None
+        # The marker feed can temporarily run at 30 fps for a lie/API pass.  Count only one
+        # missing observation per normal cadence, so the 40-frame offline confirmation remains
+        # roughly ten seconds rather than collapsing to ~1.3 seconds.
+        self._disconnect_last_counted_at: Optional[float] = None
         self._disconnect_alerted = False
+        # A map/space zone can legitimately omit the minimap.  Once that has
+        # been confirmed as NOT the login page, do not repeatedly raise an
+        # offline candidate until a real yellow marker returns.
+        self._disconnect_marker_unavailable = False
         self._alert_sound_path = Path(
             alert_sound_path
             if alert_sound_path is not None
@@ -138,6 +152,7 @@ class CharacterWorker(Thread):
         # Optional independent listener fired at the same confirmed disconnect
         # (e.g. the diagnostic screenshot recorder); never breaks the flow.
         self._disconnect_event_callback = disconnect_event_callback
+        self._disconnect_login_page_check = disconnect_login_page_check
         # While 自动重连 owns the machine, the character is on a login page - the yellow marker is
         # SUPPOSED to be missing, so no disconnect alert may be raised (v1.0.28: a 120-frame streak
         # inside the reconnect fired a second alert, which stopped the patrol and started a SECOND
@@ -163,7 +178,9 @@ class CharacterWorker(Thread):
             self._disconnect_alert_enabled = bool(enabled)
             self._disconnect_missing_frames = 0
             self._disconnect_missing_since = None
+            self._disconnect_last_counted_at = None
             self._disconnect_alerted = False
+            self._disconnect_marker_unavailable = False
         LOG.info("disconnect alert %s", "enabled" if enabled else "disabled")
 
     def set_sound_enabled(self, enabled: bool) -> None:
@@ -203,7 +220,7 @@ class CharacterWorker(Thread):
                 LOG.warning("disconnect alert sound failed", exc_info=True)
 
     def _update_disconnect_alert(
-        self, detected: bool, *, now: Optional[float] = None
+        self, detected: bool, frame: Any = None, *, now: Optional[float] = None
     ) -> None:
         """Consume the existing marker result; never runs another detector.
 
@@ -216,36 +233,80 @@ class CharacterWorker(Thread):
 
         checked_at = time.monotonic() if now is None else float(now)
         should_alert = False
+        login_check_needed = False
+        marker_recovered = False
         frames = 0
         elapsed = 0.0
         with self._disconnect_alert_lock:
             if not self._disconnect_alert_enabled:
                 self._disconnect_missing_frames = 0
                 self._disconnect_missing_since = None
+                self._disconnect_last_counted_at = None
                 self._disconnect_alerted = False
+                self._disconnect_marker_unavailable = False
                 return
             if self._reconnect_owns_the_machine():
                 # The login/world/channel screens have no minimap and no marker: the streak is
                 # meaningless there, so it is reset instead of counting towards an alert.
                 self._disconnect_missing_frames = 0
                 self._disconnect_missing_since = None
+                self._disconnect_last_counted_at = None
                 self._disconnect_alerted = False
+                self._disconnect_marker_unavailable = False
                 return
             if detected:
+                marker_recovered = self._disconnect_marker_unavailable
                 self._disconnect_missing_frames = 0
                 self._disconnect_missing_since = None
+                self._disconnect_last_counted_at = None
                 self._disconnect_alerted = False
+                self._disconnect_marker_unavailable = False
+            elif self._disconnect_marker_unavailable:
                 return
-            if self._disconnect_missing_frames == 0:
-                self._disconnect_missing_since = checked_at
-            self._disconnect_missing_frames += 1
-            frames = self._disconnect_missing_frames
-            since = self._disconnect_missing_since
-            elapsed = 0.0 if since is None else checked_at - since
-            if (frames >= self._disconnect_alert_misses
-                    and not self._disconnect_alerted):
-                self._disconnect_alerted = True
-                should_alert = True
+            else:
+                last_counted = self._disconnect_last_counted_at
+                if (last_counted is not None
+                        and checked_at - last_counted < self._disconnect_alert_sample_seconds):
+                    # A fast capture belongs to another workflow, not to the disconnect clock.
+                    return
+                if self._disconnect_missing_frames == 0:
+                    self._disconnect_missing_since = checked_at
+                self._disconnect_missing_frames += 1
+                self._disconnect_last_counted_at = checked_at
+                frames = self._disconnect_missing_frames
+                since = self._disconnect_missing_since
+                elapsed = 0.0 if since is None else checked_at - since
+                if (frames >= self._disconnect_alert_misses
+                        and not self._disconnect_alerted):
+                    login_check_needed = True
+        if detected:
+            if marker_recovered:
+                LOG.info("DISCONNECT WATCH: yellow marker returned; normal-map monitoring resumed")
+            return
+        if login_check_needed:
+            login_visible = True
+            if self._disconnect_login_page_check is not None:
+                try:
+                    login_visible = bool(self._disconnect_login_page_check(frame))
+                except Exception:
+                    LOG.warning("disconnect login-page confirmation failed", exc_info=True)
+                    login_visible = False
+            with self._disconnect_alert_lock:
+                if login_visible:
+                    self._disconnect_alerted = True
+                    should_alert = True
+                else:
+                    self._disconnect_missing_frames = 0
+                    self._disconnect_missing_since = None
+                    self._disconnect_last_counted_at = None
+                    self._disconnect_alerted = False
+                    self._disconnect_marker_unavailable = True
+            if not login_visible:
+                LOG.info(
+                    "DISCONNECT WATCH: yellow marker is absent but the login page is not visible; "
+                    "pausing offline checks until the marker returns"
+                )
+                return
         if should_alert:
             LOG.warning(
                 "DISCONNECT ALERT: yellow character marker missing for %d consecutive frames "
@@ -296,7 +357,7 @@ class CharacterWorker(Thread):
                 detection = detect_yellow_diamond(rgb)
                 # The disconnect alarm consumes this exact result. There is
                 # deliberately no second crop or yellow-marker detection.
-                self._update_disconnect_alert(detection is not None)
+                self._update_disconnect_alert(detection is not None, image)
                 if detection is not None:
                     position = CharacterPosition(
                         getattr(detection, "x", None),

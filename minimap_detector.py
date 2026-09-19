@@ -98,13 +98,34 @@ class MinimapDetection:
 def is_verified_border(detection: MinimapDetection) -> bool:
     """True when a detection can seed/calibrate minimap geometry.
 
-    An OpenCV contour is verified by construction.  The fixed fallback region
-    (the measured HUD minimap area) is also acceptable: it carries the same
-    absolute-pixel boxes and is only used when the yellow marker was found
-    inside it (the caller checks the marker before promoting it).
+    Only a measured OpenCV contour is a border.  The fallback rectangle is a
+    deliberately generous *search* area, not minimap geometry: accepting it
+    just because it contains the player marker makes the startup overlay much
+    larger than the minimap and poisons all normalized marker coordinates.
     """
 
-    return detection.source.startswith("opencv") or detection.source == "fixed-region"
+    return detection.source.startswith("opencv")
+
+
+def _is_fallback_search_geometry(box: Box, image_size: tuple[int, int]) -> bool:
+    """Return whether a saved box is the old broad fallback search region.
+
+    Earlier versions could serialize ``(0, 50, 400, 320)`` (HUD-scaled) as a
+    calibration after merely finding a yellow marker inside it.  Keep valid
+    old OpenCV recordings, but discard that known-invalid geometry so a new
+    patrol cannot reuse it forever.
+    """
+
+    width, _height = image_size
+    scale = hud_scale_for(width)
+    expected = (0, round(50 * scale), round(400 * scale), round(320 * scale))
+    tolerance = max(3, round(4 * scale))
+    return (
+        box[0] <= tolerance
+        and abs(box[1] - expected[1]) <= tolerance
+        and box[2] >= expected[2] - tolerance
+        and box[3] >= expected[3] - tolerance
+    )
 
 
 def minimap_calibration_to_dict(
@@ -123,6 +144,7 @@ def minimap_calibration_to_dict(
         raise ValueError("only a verified minimap border can be calibrated")
     return {
         "schema": 2,
+        "border_source": detection.source,
         "recorded_client_size": [int(image_size[0]), int(image_size[1])],
         "window_box": list(detection.window_box),
         "analysis_box": list(detection.analysis_box),
@@ -178,6 +200,9 @@ def minimap_calibration_from_dict(
         )
 
     try:
+        border_source = value.get("border_source")
+        if border_source is not None and not str(border_source).startswith("opencv"):
+            return None
         detection = MinimapDetection(
             window_box=load_box("window_box"),
             analysis_box=load_box("analysis_box"),
@@ -189,7 +214,11 @@ def minimap_calibration_from_dict(
     except (TypeError, ValueError, OverflowError):
         return None
     window_width, window_height = detection.window_size
-    return detection if window_width >= 20 and window_height >= 20 else None
+    if window_width < 20 or window_height < 20:
+        return None
+    if _is_fallback_search_geometry(detection.window_box, image_size):
+        return None
+    return detection
 
 
 class MapNameReader(Protocol):

@@ -103,14 +103,14 @@ STATIONARY_ATTACK_Y_RETRY_SECONDS = 10.0
 # never satisfy the arrival band, so the walk holds its key until the self-
 # rescue restarts the whole patrol.  Frames spent within a few times the band
 # count down to a forced turn instead.
-ENDPOINT_ARRIVAL_TIMEOUT_FRAMES = 15
+ENDPOINT_ARRIVAL_TIMEOUT_FRAMES = 19
 ENDPOINT_ARRIVAL_NEAR_MARGIN = 4.0
 # Far-away stalls need their own bound: a saved endpoint beyond a wall (or a
 # marker frozen by a movement-locking buff) never enters the near zone, so the
 # character walks into the edge forever ("patrol keeps walking left") until the
 # self-rescue restarts the whole patrol.  A real walk always CLOSES the
 # distance, so only a frame run without progress counts.
-ENDPOINT_NO_PROGRESS_FRAMES = 30
+ENDPOINT_NO_PROGRESS_FRAMES = 38
 
 
 class KeySender(Protocol):
@@ -927,7 +927,7 @@ def climb(
     y_change_required: float = 0.015,
     world_y_change_required: float = 0.75,
     world_y_stall_change_required: float = 0.15,
-    world_y_stall_frames: int = 2,
+    world_y_stall_frames: int = 3,
     action_lock: Optional[threading.Lock] = None,
     preferred_direction: Optional[str] = None,
     failed_cycle_right_seconds: float = 0.01,
@@ -935,7 +935,7 @@ def climb(
     rope_x: Optional[float] = None,
     rope_x_tolerance: float = 0.025,
     straight_up_tolerance: float = 0.008,
-    climb_attach_frames: int = 2,
+    climb_attach_frames: int = 3,
     arrival_y: Optional[float] = None,
     arrival_tolerance: float = 0.02,
     arrival_in_progress: bool = False,
@@ -1812,7 +1812,7 @@ class MovementWorker(threading.Thread):
         no position change.  Within each ``rescue_check_interval_seconds``
         window the run of consecutive unchanged minimap positions is tracked
         (2 minimap pixels tolerance absorbs marker jitter); if it ever
-        reaches ``rescue_stuck_frames`` (default 20) the character is stuck:
+        reaches ``rescue_stuck_frames`` (default 25 at 5 fps) the character is stuck:
         drop to layer1 and restart the patrol.  Frames where an attack is
         active are skipped - movement is intentionally paused then.
 
@@ -2632,15 +2632,15 @@ class MovementWorker(threading.Thread):
         final_calculation_diamonds: Optional[float] = None,
         estimated_final_speed: float = 0.205,
         final_move_safety_gain: float = 0.95,
-        aligned_frames_required: int = 2,
-        climb_layer_confirm_frames: int = 3,
+        aligned_frames_required: int = 3,
+        climb_layer_confirm_frames: int = 4,
         climb_layer_confirm_seconds: float = 0.3,
         climb_arrival_world_tolerance: float = 0.20,
         climb_nudge_seconds: float = 0.10,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
         climb_world_y_stall_change_required: float = 0.15,
-        climb_world_y_stall_frames: int = 2,
+        climb_world_y_stall_frames: int = 3,
         climb_failed_shift_right_seconds: float = 0.01,
         climb_attempt_interval_seconds: float = 1.0,
         climb_failed_cycles_reset: int = 3,
@@ -2679,14 +2679,14 @@ class MovementWorker(threading.Thread):
         # climb) counts as an unexpected fall; when it stops the floor is
         # re-detected and patrol restarts there (or the character returns to
         # the patrol range).
-        fall_detect_frames: int = 3,
+        fall_detect_frames: int = 4,
         fall_marker_y_gain: float = 0.015,
         # Landing reconciliation after a fall/knock-down: the raw marker Y is
         # screen-relative on a scrolling minimap and the OpenCV world-Y
         # tracker lags fast vertical motion, so the landing floor is resolved
         # from world-Y samples only after they stabilize, then the tracker is
         # re-anchored to the true layer (cancelling lag/drift).
-        fall_settle_min_frames: int = 3,
+        fall_settle_min_frames: int = 4,
         fall_settle_epsilon: float = 0.15,
         fall_settle_max_seconds: float = 1.2,
         # World-Y drift watchdog: while cruising on a believed floor the
@@ -2724,7 +2724,7 @@ class MovementWorker(threading.Thread):
         other_player_check_enabled: bool = False,
         other_player_check_interval_seconds: float = 60.0,
         rescue_check_interval_seconds: float = 300.0,
-        rescue_stuck_frames: int = 20,
+        rescue_stuck_frames: int = 25,
         # Consecutive self-rescue cycles that end below the patrol range
         # (return-to-route could not be restored): after this many the worker
         # stops patrol instead of dropping/retrying forever from a spot whose
@@ -2748,7 +2748,7 @@ class MovementWorker(threading.Thread):
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
         stair_jump_stall_diamonds: float = 0.25,
-        stair_jump_stall_frames: int = 7,
+        stair_jump_stall_frames: int = 9,
         patrol_start_grace_seconds: float = 3.0,
         stair_jump_attempts_max: int = 1,
         # 台阶/坑边尝试间隔 0.8s（原 2.5s）：地图坑多时角色卡在边缘会等
@@ -3231,7 +3231,7 @@ class MovementWorker(threading.Thread):
         # deliberately bypass this cruising-only debounce.
         self._layer_resync_candidate: Optional[str] = None
         self._layer_resync_candidate_frames = 0
-        self._normal_layer_resync_frames = 3
+        self._normal_layer_resync_frames = 4
         # Stair jump: during the left-most/right-most patrol walk the worker
         # detects when the marker stops advancing while a walk hold is being
         # issued (a stair blocks the walk) and jumps - holding the travel
@@ -4194,15 +4194,6 @@ class MovementWorker(threading.Thread):
             self._route_layers[self._route_layer_index], y
         )
 
-    def _on_route_floor(self, y: float) -> bool:
-        """True when the marker Y sits inside the CURRENT route layer's band."""
-        if (self._route_layer_index is None
-                or not 0 <= self._route_layer_index < len(self._route_layers)):
-            return False
-        return self._layer_band_contains(
-            self._route_layers[self._route_layer_index], y
-        )
-
     def _nearest_world_layer_all(self, world_y: float) -> Optional[str]:
         """World-band floor over EVERY recorded layer (patrol range or not).
 
@@ -4482,18 +4473,11 @@ class MovementWorker(threading.Thread):
             # world-Y read (structure confidence + calibrated world Y) is
             # still authoritative and switches floors.  Unambiguous marker
             # readings (clearly outside the current band) still switch.
-            route_layers = {
-                name: self.important_positions[name]
-                for name in self._route_layers
-            }
-            world_authoritative = bool(
-                observation.world_y_diamonds is not None
-                and observation.structure_confidence >= 0.12
-                and any(
-                    isinstance(layer, dict) and "layer_world_y" in layer
-                    for layer in route_layers.values()
-                )
-            )
+            # A present world-Y sample is not evidence by itself.  It may be
+            # between every recorded world band while the structure tracker
+            # is settling after a scroll/fall.  Only a resolved world floor
+            # may override the marker-band flicker guard.
+            world_authoritative = world_name is not None
             current_name = (
                 self._route_layers[self._route_layer_index]
                 if (self._route_layer_index is not None
