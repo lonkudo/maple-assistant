@@ -1061,17 +1061,35 @@ def main() -> int:
             )
             return
         layer_bands = []
-        jump_point_overlay: list[tuple[float, float]] = []
+        patrol_point_overlay: list[tuple[str, float, float]] = []
         for layer_name in snapshot.route_order:
             layer = snapshot.layers.get(layer_name, {})
             if not isinstance(layer, dict):
                 continue
+            for point_name, marker_kind in (
+                ("left_most_pos", "left_endpoint"),
+                ("rope_pos", "rope"),
+                ("right_most_pos", "right_endpoint"),
+            ):
+                point = layer.get(point_name)
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    patrol_point_overlay.append((
+                        marker_kind, float(point["x"]), float(point["y"])
+                    ))
+                except (KeyError, TypeError, ValueError):
+                    continue
             for point in layer.get("jump_points", []):
                 if not isinstance(point, dict):
                     continue
                 try:
-                    jump_point_overlay.append((
-                        float(point["x"]), float(point["y"])
+                    direction = str(point.get("direction", "")).casefold()
+                    marker_kind = (
+                        "jump_left" if direction == "left" else "jump_right"
+                    )
+                    patrol_point_overlay.append((
+                        marker_kind, float(point["x"]), float(point["y"])
                     ))
                 except (KeyError, TypeError, ValueError):
                     continue
@@ -1216,13 +1234,14 @@ def main() -> int:
                         layer_name, float(canonical), mean_observed,
                         abs(float(canonical) - mean_observed),
                     )
-        if show_overlays:
-            screen_blinker.show_jump_points(
+        if show_overlays or show_startup_marker:
+            screen_blinker.show_patrol_points(
                 fresh_frame.window_rect,
                 fresh_frame.image.size,
                 detection.analysis_box,
-                jump_point_overlay,
+                patrol_point_overlay,
             )
+        if show_overlays:
             screen_blinker.show_layer_bands(
                 fresh_frame.window_rect,
                 fresh_frame.image.size,

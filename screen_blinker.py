@@ -188,17 +188,18 @@ class ScreenBlinker(threading.Thread):
                 daemon=True,
             ).start()
 
-    def show_jump_points(
+    def show_patrol_points(
         self,
         window_rect: tuple[int, int, int, int],
         image_size: tuple[int, int],
         analysis_box: tuple[int, int, int, int],
-        points: Iterable[tuple[float, float]],
+        points: Iterable[tuple[str, float, float]],
     ) -> None:
-        """Show each recorded jump point as a small click-through up arrow.
+        """Show concise, click-through markers for recorded patrol points.
 
-        This is only start-of-patrol feedback.  It deliberately has no input
-        or capture role and disappears before the layer-band clean recapture.
+        ``jump_left`` and ``jump_right`` are 45-degree arrows in their travel
+        direction, ``rope`` is an up arrow, and endpoints are vertical bars.
+        This is start-of-patrol feedback only: it has no capture or input role.
         """
 
         image_width, image_height = image_size
@@ -211,8 +212,8 @@ class ScreenBlinker(threading.Thread):
         if (image_width <= 0 or image_height <= 0 or client_width <= 0
                 or client_height <= 0 or analysis_width <= 0 or analysis_height <= 0):
             return
-        screen_points: list[tuple[int, int]] = []
-        for x, y in points:
+        screen_points: list[tuple[str, int, int]] = []
+        for kind, x, y in points:
             try:
                 point_x = max(0.0, min(1.0, float(x)))
                 point_y = max(0.0, min(1.0, float(y)))
@@ -221,20 +222,21 @@ class ScreenBlinker(threading.Thread):
             pixel_x = analysis_left + round(point_x * analysis_width)
             pixel_y = analysis_top + round(point_y * analysis_height)
             screen_points.append((
+                str(kind),
                 client_left + round(pixel_x * client_width / image_width),
                 client_top + round(pixel_y * client_height / image_height),
             ))
         if not screen_points:
             return
         threading.Thread(
-            target=self._show_jump_point_arrows,
+            target=self._show_patrol_point_markers,
             args=(tuple(screen_points),),
-            name="jump-point-overlay",
+            name="patrol-point-overlay",
             daemon=True,
         ).start()
 
-    def _show_jump_point_arrows(self, points: Sequence[tuple[int, int]]) -> None:
-        """Render compact green upward arrows without taking game focus."""
+    def _show_patrol_point_markers(self, points: Sequence[tuple[str, int, int]]) -> None:
+        """Render compact patrol markers without taking game focus."""
 
         if not hasattr(ctypes, "windll"):
             return
@@ -265,41 +267,65 @@ class ScreenBlinker(threading.Thread):
             gdi32.Polygon.restype = wintypes.BOOL
             instance = kernel32.GetModuleHandleW(None)
             black = _colorref((0, 0, 0))
-            green = _colorref((50, 235, 120))
-            for x, y in points:
+            colours = {
+                "jump_left": _colorref((50, 235, 120)),
+                "jump_right": _colorref((50, 235, 120)),
+                "rope": _colorref((245, 205, 35)),
+                "left_endpoint": _colorref((45, 140, 245)),
+                "right_endpoint": _colorref((45, 140, 245)),
+            }
+            for kind, x, y in points:
                 hwnd = user32.CreateWindowExW(
                     0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
                     "STATIC", None, 0x80000000,
-                    x - 5, y - 12, 11, 12, None, None, instance, None,
+                    x - 7, y - 7, 15, 15, None, None, instance, None,
                 )
                 if not hwnd:
                     continue
                 background = gdi32.CreateSolidBrush(black)
-                arrow = gdi32.CreateSolidBrush(green)
-                windows.append((hwnd, background, arrow))
-                # Black is the transparent colour; the bright polygon is a
-                # 5px arrow head plus a 3px stem rooted at the recorded point.
+                marker = gdi32.CreateSolidBrush(colours.get(kind, colours["jump_right"]))
+                windows.append((hwnd, background, marker))
+                # Black is transparent. Green diagonal arrows show the jump
+                # direction, yellow means climb Up, and blue bars are ends.
                 user32.SetLayeredWindowAttributes(hwnd, black, 255, 0x00000001)
                 user32.ShowWindow(hwnd, 4)
                 hdc = user32.GetDC(hwnd)
                 if hdc:
                     try:
-                        rect = wintypes.RECT(0, 0, 11, 12)
+                        rect = wintypes.RECT(0, 0, 15, 15)
                         user32.FillRect(hdc, ctypes.byref(rect), background)
-                        old = gdi32.SelectObject(hdc, arrow)
-                        polygon = (wintypes.POINT * 7)(
-                            wintypes.POINT(5, 0), wintypes.POINT(10, 5),
-                            wintypes.POINT(7, 5), wintypes.POINT(7, 11),
-                            wintypes.POINT(3, 11), wintypes.POINT(3, 5),
-                            wintypes.POINT(0, 5),
-                        )
-                        gdi32.Polygon(hdc, polygon, 7)
-                        gdi32.SelectObject(hdc, old)
+                        if kind in ("left_endpoint", "right_endpoint"):
+                            bar = wintypes.RECT(6, 1, 9, 14)
+                            user32.FillRect(hdc, ctypes.byref(bar), marker)
+                        else:
+                            shapes = {
+                                "rope": (
+                                    (7, 0), (14, 7), (10, 7), (10, 14),
+                                    (4, 14), (4, 7), (0, 7),
+                                ),
+                                "jump_right": (
+                                    (14, 0), (14, 7), (11, 4), (5, 10),
+                                    (8, 13), (6, 15), (0, 9), (3, 6),
+                                    (5, 8), (11, 2), (8, 0),
+                                ),
+                                "jump_left": (
+                                    (0, 0), (0, 7), (3, 4), (9, 10),
+                                    (6, 13), (8, 15), (14, 9), (11, 6),
+                                    (9, 8), (3, 2), (6, 0),
+                                ),
+                            }
+                            coords = shapes.get(kind, shapes["rope"])
+                            polygon = (wintypes.POINT * len(coords))(
+                                *(wintypes.POINT(px, py) for px, py in coords)
+                            )
+                            old = gdi32.SelectObject(hdc, marker)
+                            gdi32.Polygon(hdc, polygon, len(coords))
+                            gdi32.SelectObject(hdc, old)
                     finally:
                         user32.ReleaseDC(hwnd, hdc)
             self._wait(1.8)
         except Exception:
-            LOG.warning("jump-point overlay failed", exc_info=True)
+            LOG.warning("patrol-point overlay failed", exc_info=True)
         finally:
             for hwnd, background, arrow in windows:
                 try:
