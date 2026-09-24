@@ -320,7 +320,7 @@ class ScreenBlinker(threading.Thread):
             }
             brushes.extend(marker_brushes.values())
             arrow_pens = {
-                kind: gdi32.CreatePen(0, 2, colour)
+                kind: gdi32.CreatePen(0, 1, colour)
                 for kind, colour in colours.items()
                 if kind not in ("left_endpoint", "right_endpoint")
             }
@@ -377,13 +377,13 @@ class ScreenBlinker(threading.Thread):
                             if kind == "jump_right":
                                 # Thin 45-degree arrow: shaft plus a two-stroke
                                 # chevron head, visually matching the crosshair.
-                                draw_line((2, 12), (13, 1))
-                                draw_line((13, 1), (7, 1))
-                                draw_line((13, 1), (13, 7))
+                                draw_line((5, 9), (12, 2))
+                                draw_line((12, 2), (8, 2))
+                                draw_line((12, 2), (12, 6))
                             elif kind == "jump_left":
-                                draw_line((12, 12), (1, 1))
-                                draw_line((1, 1), (7, 1))
-                                draw_line((1, 1), (1, 7))
+                                draw_line((10, 9), (3, 2))
+                                draw_line((3, 2), (7, 2))
+                                draw_line((3, 2), (3, 6))
                             else:  # rope: a conventional upward arrow
                                 draw_line((8, 14), (8, 1))
                                 draw_line((8, 1), (2, 7))

@@ -66,6 +66,11 @@ ROPE_TARGET_SMOOTHING_ALPHA = 0.15
 # aligned and keeps the side it approached from, instead of flipping on marker
 # quantization noise.
 ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
+# Jump records are X-precise, but the marker can be one or more vertical
+# minimap pixels away while grabbing/climbing a rope.  Keep X at its proven
+# one-pixel range and permit a slightly wider Y approach window.
+JUMP_POINT_X_TOLERANCE = 0.010
+JUMP_POINT_Y_TOLERANCE = 0.020
 
 # Movement-thread stall watchdog.  When patrol input is armed and this worker
 # has consumed no frame for STALL_WATCHDOG_SECONDS, its own stack is reported
@@ -819,6 +824,11 @@ def preserve_persistent_climb(
     """
 
     if not state.up_held:
+        return proposed
+    # A recorded point reached while climbing is an explicit Alt+direction
+    # request.  It must win over the ordinary "keep Up held" decision; the
+    # jump-point executor preserves Up itself through its landing check.
+    if isinstance(proposed.key, str) and proposed.key.startswith("jump_point_"):
         return proposed
     if proposed.key in ("left", "right"):
         return MovementDecision(
@@ -3748,13 +3758,32 @@ class MovementWorker(threading.Thread):
                 if added_direction_claim:
                     key_up(direction)
 
-    def _jump_point_decision(self, observation: MinimapObservation, layer: Optional[str],
-                             plan: Optional[PositionMovementPlan]) -> Optional[MovementDecision]:
-        if (observation.player is None or not layer or plan is None
-                or plan.decision.key not in ("left", "right")):
+    def _jump_point_decision(
+        self,
+        observation: MinimapObservation,
+        layer: Optional[str],
+        plan: Optional[PositionMovementPlan],
+        *,
+        climbing: bool = False,
+    ) -> Optional[MovementDecision]:
+        """Return a directional recorded-jump action at an exact point.
+
+        Horizontal patrol uses its current travel direction.  A rope climb
+        has no horizontal patrol plan, so it may use either recorded
+        directional point once the live marker is inside the X/Y window.
+        """
+
+        if observation.player is None or not layer:
             return None
-        if self._jump_point_direction != plan.decision.key:
-            self._jump_point_direction = plan.decision.key
+        travel_direction = (
+            plan.decision.key
+            if plan is not None and plan.decision.key in ("left", "right")
+            else None
+        )
+        if not climbing and travel_direction is None:
+            return None
+        if travel_direction is not None and self._jump_point_direction != travel_direction:
+            self._jump_point_direction = travel_direction
             self._jump_point_passed.clear()
             self._jump_point_candidate = None
         points = self.important_positions.get(layer, {}).get("jump_points", [])
@@ -3768,7 +3797,7 @@ class MovementWorker(threading.Thread):
             # visible so they can be deleted, but must never fire implicitly.
             if recorded_direction not in ("left", "right"):
                 continue
-            if recorded_direction != plan.decision.key:
+            if travel_direction is not None and recorded_direction != travel_direction:
                 continue
             try:
                 # The yellow marker is quantised by minimap pixels.  On a
@@ -3776,18 +3805,28 @@ class MovementWorker(threading.Thread):
                 # so a recorded point can lie exactly between two samples.
                 # A one-pixel ±0.010 window catches that normal sampling gap
                 # without reaching a neighbouring platform.
-                matched = (abs(observation.player.x - float(point["x"])) <= 0.010
-                           and abs(observation.player.y - float(point["y"])) <= 0.010)
+                matched = (
+                    abs(observation.player.x - float(point["x"])) <= JUMP_POINT_X_TOLERANCE
+                    and abs(observation.player.y - float(point["y"])) <= JUMP_POINT_Y_TOLERANCE
+                )
             except (KeyError, TypeError, ValueError):
                 continue
             token = (layer, index)
             if matched and token not in self._jump_point_passed:
-                direction = plan.decision.key
+                direction = recorded_direction if climbing else travel_direction
+                assert direction in ("left", "right")
                 self._jump_point_candidate = token
-                LOG.info("%s JUMP POINT %s[%d] matched x=%.6f y=%.6f; awaiting jump worker",
-                         "LEFT" if direction == "left" else "RIGHT", layer, index,
-                         observation.player.x, observation.player.y)
-                return MovementDecision(f"jump_point_{direction}", "recorded jump point", plan.decision.duration)
+                LOG.info(
+                    "%s JUMP POINT %s[%d] matched x=%.6f y=%.6f%s; awaiting jump worker",
+                    "LEFT" if direction == "left" else "RIGHT", layer, index,
+                    observation.player.x, observation.player.y,
+                    " during climb" if climbing else "",
+                )
+                return MovementDecision(
+                    f"jump_point_{direction}",
+                    "recorded jump point during climb" if climbing else "recorded jump point",
+                    (plan.decision.duration if plan is not None else self.minimum_final_hold_seconds),
+                )
         return None
 
     def _update_jump_point_landing(self, observation: MinimapObservation) -> None:
@@ -7943,6 +7982,24 @@ class MovementWorker(threading.Thread):
                     elif stair_decision is not None:
                         decision = stair_decision
                     active_target_x = route_target_x
+                if route_is_rope:
+                    climb_in_progress = bool(
+                        self._climb_state.up_held
+                        or decision.key in (
+                            "climb", "jump_climb_left", "jump_climb_right", "jump_climb_up",
+                        )
+                        or (self.climbing_active_event is not None
+                            and self.climbing_active_event.is_set())
+                    )
+                    if climb_in_progress:
+                        climb_jump_point = self._jump_point_decision(
+                            observation,
+                            route_label.partition(".")[0],
+                            None,
+                            climbing=True,
+                        )
+                        if climb_jump_point is not None:
+                            decision = climb_jump_point
                 # Other-player safety net: a per-frame scan (no cooldown)
                 # switches channel when other players appear.
                 self._maybe_check_other_players(
