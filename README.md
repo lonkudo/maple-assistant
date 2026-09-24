@@ -138,6 +138,7 @@ and must not be moved after publication.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.1.56` | `release/v1.1.56` | Jump-point capture-grid tolerance release. |
 | `1.1.55` | `release/v1.1.55` | Jump-point dispatch reliability release. |
 | `1.1.54` | `release/v1.1.54` | Routine-log cleanup release. |
 | `1.1.53` | `release/v1.1.53` | First durable release checkpoint. |

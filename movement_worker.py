@@ -3751,12 +3751,13 @@ class MovementWorker(threading.Thread):
             if recorded_direction != plan.decision.key:
                 continue
             try:
-                # The yellow marker is quantised by the minimap pixels and
-                # can wander a few thousandths between captures.  A ±0.005
-                # window keeps the recorded X/Y point responsive without
-                # allowing it to fire at a neighbouring platform.
-                matched = (abs(observation.player.x - float(point["x"])) <= 0.005
-                           and abs(observation.player.y - float(point["y"])) <= 0.005)
+                # The yellow marker is quantised by minimap pixels.  On a
+                # 133px-wide map, adjacent X readings differ by 0.007519,
+                # so a recorded point can lie exactly between two samples.
+                # A one-pixel ±0.010 window catches that normal sampling gap
+                # without reaching a neighbouring platform.
+                matched = (abs(observation.player.x - float(point["x"])) <= 0.010
+                           and abs(observation.player.y - float(point["y"])) <= 0.010)
             except (KeyError, TypeError, ValueError):
                 continue
             token = (layer, index)
