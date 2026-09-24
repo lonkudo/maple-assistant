@@ -266,12 +266,26 @@ class ScreenBlinker(threading.Thread):
             user32.SetLayeredWindowAttributes.argtypes = (
                 wintypes.HWND, wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD,
             )
+            user32.SetWindowPos.argtypes = (
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT,
+            )
+            user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
             user32.GetDC.argtypes = (wintypes.HWND,)
             user32.GetDC.restype = wintypes.HDC
             user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
             user32.DestroyWindow.argtypes = (wintypes.HWND,)
             gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
             gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+            gdi32.CreatePen.argtypes = (ctypes.c_int, ctypes.c_int, wintypes.COLORREF)
+            gdi32.CreatePen.restype = wintypes.HGDIOBJ
+            gdi32.SelectObject.argtypes = (wintypes.HDC, wintypes.HGDIOBJ)
+            gdi32.SelectObject.restype = wintypes.HGDIOBJ
+            gdi32.MoveToEx.argtypes = (
+                wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.POINTER(wintypes.POINT),
+            )
+            gdi32.LineTo.argtypes = (wintypes.HDC, ctypes.c_int, ctypes.c_int)
+            gdi32.LineTo.restype = wintypes.BOOL
             gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
             gdi32.Polygon.argtypes = (wintypes.HDC, ctypes.POINTER(wintypes.POINT), ctypes.c_int)
             gdi32.Polygon.restype = wintypes.BOOL
@@ -290,6 +304,17 @@ class ScreenBlinker(threading.Thread):
                 "left_endpoint": _colorref((45, 140, 245)),
                 "right_endpoint": _colorref((45, 140, 245)),
             }
+            marker_brushes = {
+                kind: gdi32.CreateSolidBrush(colour)
+                for kind, colour in colours.items()
+            }
+            brushes.extend(marker_brushes.values())
+            arrow_pens = {
+                kind: gdi32.CreatePen(0, 2, colour)
+                for kind, colour in colours.items()
+                if kind not in ("left_endpoint", "right_endpoint")
+            }
+            brushes.extend(arrow_pens.values())
             overlay = user32.CreateWindowExW(
                 # topmost, tool, no-activate, layered, click-through
                 0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
@@ -301,47 +326,62 @@ class ScreenBlinker(threading.Thread):
                 return
             background = gdi32.CreateSolidBrush(black)
             brushes.append(background)
-            # Black is transparent.  Render the complete collection before
-            # the window is shown, then reveal it exactly once.
+            # A STATIC window has no reliable drawable client surface until it
+            # is shown.  Make the transparent canvas visible first, then paint
+            # every marker during this same worker turn.  The previous
+            # pre-show draw was lost when Windows processed the first repaint.
             user32.SetLayeredWindowAttributes(overlay, black, 255, 0x00000001)
-            hdc = user32.GetDC(overlay)
-            if hdc:
-                try:
-                    rect = wintypes.RECT(0, 0, width, height)
-                    user32.FillRect(hdc, ctypes.byref(rect), background)
-                    for kind, screen_x, screen_y in points:
-                        marker = gdi32.CreateSolidBrush(
-                            colours.get(kind, colours["jump_right"])
-                        )
-                        brushes.append(marker)
-                        x = screen_x - left - 7
-                        y = screen_y - top - 7
-                        if kind in ("left_endpoint", "right_endpoint"):
-                            bar = wintypes.RECT(x + 6, y + 1, x + 9, y + 14)
-                            user32.FillRect(hdc, ctypes.byref(bar), marker)
-                            continue
-                        old = gdi32.SelectObject(hdc, marker)
-
-                        def draw_polygon(coords: tuple[tuple[int, int], ...]) -> None:
-                            polygon = (wintypes.POINT * len(coords))()
-                            for index, (px, py) in enumerate(coords):
-                                polygon[index] = wintypes.POINT(x + px, y + py)
-                            gdi32.Polygon(hdc, polygon, len(coords))
-
-                        if kind == "jump_right":
-                            draw_polygon(((14, 0), (14, 7), (8, 1)))
-                            draw_polygon(((8, 3), (11, 6), (5, 12), (2, 9)))
-                        elif kind == "jump_left":
-                            draw_polygon(((0, 0), (0, 7), (6, 1)))
-                            draw_polygon(((6, 3), (3, 6), (9, 12), (12, 9)))
-                        else:  # rope: a conventional upward arrow
-                            draw_polygon(((7, 0), (14, 7), (10, 7), (10, 14),
-                                          (4, 14), (4, 7), (0, 7)))
-                        gdi32.SelectObject(hdc, old)
-                finally:
-                    user32.ReleaseDC(overlay, hdc)
+            user32.SetWindowPos(
+                overlay, ctypes.c_void_p(-1), left, top, width, height,
+                0x0010 | 0x0040,
+            )
             user32.ShowWindow(overlay, 4)
-            self._wait(5.0)
+            # STATIC controls may repaint at any time.  Refresh this one
+            # shared canvas for its full lifetime, like the already reliable
+            # fixed/patrol crosshair overlay, so a later system repaint cannot
+            # clear arrows or endpoint bars.
+            expires = time.monotonic() + 5.0
+            while time.monotonic() < expires and not self.stop_event.is_set():
+                hdc = user32.GetDC(overlay)
+                if hdc:
+                    try:
+                        rect = wintypes.RECT(0, 0, width, height)
+                        user32.FillRect(hdc, ctypes.byref(rect), background)
+                        for kind, screen_x, screen_y in points:
+                            x = screen_x - left - 7
+                            y = screen_y - top - 7
+                            marker = marker_brushes.get(kind, marker_brushes["jump_right"])
+                            if kind in ("left_endpoint", "right_endpoint"):
+                                bar = wintypes.RECT(x + 7, y + 1, x + 9, y + 14)
+                                user32.FillRect(hdc, ctypes.byref(bar), marker)
+                                continue
+                            old = gdi32.SelectObject(
+                                hdc, arrow_pens.get(kind, arrow_pens["jump_right"])
+                            )
+
+                            def draw_line(start: tuple[int, int], end: tuple[int, int]) -> None:
+                                previous = wintypes.POINT()
+                                gdi32.MoveToEx(hdc, x + start[0], y + start[1], ctypes.byref(previous))
+                                gdi32.LineTo(hdc, x + end[0], y + end[1])
+
+                            if kind == "jump_right":
+                                # Thin 45-degree arrow: shaft plus a two-stroke
+                                # chevron head, visually matching the crosshair.
+                                draw_line((2, 12), (13, 1))
+                                draw_line((13, 1), (7, 1))
+                                draw_line((13, 1), (13, 7))
+                            elif kind == "jump_left":
+                                draw_line((12, 12), (1, 1))
+                                draw_line((1, 1), (7, 1))
+                                draw_line((1, 1), (1, 7))
+                            else:  # rope: a conventional upward arrow
+                                draw_line((8, 14), (8, 1))
+                                draw_line((8, 1), (2, 7))
+                                draw_line((8, 1), (14, 7))
+                            gdi32.SelectObject(hdc, old)
+                    finally:
+                        user32.ReleaseDC(overlay, hdc)
+                self.stop_event.wait(0.05)
         except Exception:
             LOG.warning("patrol-point overlay failed", exc_info=True)
         finally:
