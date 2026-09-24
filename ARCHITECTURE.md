@@ -81,6 +81,8 @@ A broad search region is never promoted to saved geometry. This protects patrol 
 
 Recorded points contain minimap-relative X/Y values. Layer recognition uses recorded Y anchors and asymmetric layer bands: the top of a layer is more tolerant than its confirmed base. World-Y tracking provides continuity between frames and is re-anchored only by explicit recovery logic, not by ordinary movement such as stepping onto a bench.
 
+Each layer may also own X-sorted, immutable directional jump points. A point records X, Y, and either left or right travel direction. During a horizontal leg, the direction must match the leg. During an active rope climb, either directional record may be selected if the marker matches its X/Y window. The jump-point matching policy is intentionally asymmetric: X is ±0.010, while Y is ±0.020 to accommodate vertical rope movement. A matched point is marked passed only after the dedicated jump worker accepts it.
+
 ### Patrol and movement
 
 `movement_worker.py` owns the patrol state machine. It reads the latest character/map state, resolves the current recorded layer, and emits decisions such as patrol left/right, move-to-rope, climb, return-to-route, recovery, or safe wait.
@@ -93,20 +95,20 @@ Patrol has these core rules:
 - A missing route produces a safe wait state rather than accidental movement.
 - Stand-still attack captures its temporary position at each manual patrol start and does not require recorded layer membership.
 
-Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the motion arbiter.
+Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
 
 ### Input, focus, and motion arbitration
 
 `status_worker.py` supplies the target-window selection and key-sending abstraction. It tracks key ownership so a key is released only when its final owner is finished.
 
-The movement direction keys — left, right, up, and down — are mutually exclusive. A direction switch follows this sequence:
+Horizontal directions are mutually exclusive with each other, as are vertical directions. A horizontal and vertical key may coexist for rope and jump-point chords. A horizontal direction switch follows this sequence:
 
 1. release the active walk direction;
 2. allow the brief handoff interval;
 3. arm the new direction;
 4. restore pickup ownership only when walking is active.
 
-`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, and stationary-facing taps. It force-releases conflicting directional keys at an action boundary and returns control to patrol after completion. It is deliberately not used for ordinary continuous walking.
+`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, and stationary-facing taps. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
 
 Attack and buff workers ask whether a conflicting motion is active before sending input. Movement does not wait while holding the arbiter’s internal lock; this avoids a stalled worker deadlock at a direction handoff.
 
@@ -116,7 +118,7 @@ Attack and buff workers ask whether a conflicting motion is active before sendin
 
 In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer. A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
 
-Stair jump observes sustained position stalls and submits one direction-preserving recovery jump. It uses a post-trigger frame cooldown and a movement-progress reset, preventing a single long stall from producing a burst of jumps.
+Stair jump observes sustained position stalls and submits one direction-preserving recovery jump. It uses a post-trigger frame cooldown and a movement-progress reset, preventing a single long stall from producing a burst of jumps. Recorded jump points are separate from this recovery rule: they are deliberate X/Y triggers, have their own once-per-leg pass record, and can fire while a rope climb is active.
 
 ### Alerts, disconnects, and reconnect
 
@@ -144,7 +146,7 @@ The live frame stream uses the shared capture cadence. The temporary detection r
 
 ### UI, configuration, and optional tools
 
-`ui_worker.py` presents the Chinese desktop interface. It reads and writes only through configuration callbacks supplied by the coordinator. UI redraw work is deferred during resize/drag operations to avoid black component flashes and expensive intermediate layouts.
+`ui_worker.py` presents the Chinese desktop interface. It reads and writes only through configuration callbacks supplied by the coordinator. UI redraw work is deferred during resize/drag operations to avoid black component flashes and expensive intermediate layouts. `screen_blinker.py` owns click-through diagnostic overlays: crosshairs and all patrol-point symbols are painted on persistent native canvases, never into capture input.
 
 Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`.
 

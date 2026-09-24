@@ -36,14 +36,23 @@ Record each map before enabling a route:
 1. Record the **left endpoint** of the lowest layer.
 2. Record its rope point when the layer has a rope.
 3. Record the **right endpoint**.
-4. Add the layer above it and repeat.
-5. Select the patrol start and end layers.
+4. Optionally record directional jump points with `Ctrl+D` (left) or `Ctrl+F` (right).
+5. Add the layer above it and repeat.
+6. Select the patrol start and end layers.
 
 Layers are stored from bottom to top. A patrol route can cover any contiguous range; a map does not need exactly three layers.
 
 The minimap detector first finds the actual map border and calculates marker coordinates relative to that border. A broad search rectangle may help locate a map, but it is never saved as map geometry. This matters when the minimap size changes between maps or when the UI temporarily covers part of the game window.
 
 At patrol start, the assistant focuses the game, uses the recorded minimap geometry, identifies the current layer, and either starts that layer’s route or begins the recorded return path. The selected layer is visible in the UI, and optional minimap overlays can show the recorded layer bands for inspection.
+
+### Directional jump points
+
+A jump point is a locked X/Y record on one layer. `Ctrl+D` records a **left jump** and `Ctrl+F` records a **right jump**; points are sorted by X and can be removed but not edited. During ordinary patrol, a point fires only while travelling in its recorded direction. During an active rope climb, either directional point can fire when the live marker matches it.
+
+Matching keeps the horizontal window tight (±0.010 minimap units) and allows a wider vertical window (±0.020) so a rope approach can still meet the point. The resulting motion holds the recorded horizontal direction, presses jump, and holds Up until three later marker samples show that Y has settled on a horizontal platform.
+
+At patrol start, all recorded points are displayed together for five seconds: blue bars for endpoints, a yellow up arrow for a rope, and thin green directional arrows for jump points. These overlays are diagnostic only and never participate in movement decisions.
 
 ## Patrol, movement, and combat
 
@@ -58,7 +67,7 @@ At patrol start, the assistant focuses the game, uses the recorded minimap geome
 
 **巡逻攻击** performs the configured attack key at its selected fixed interval. **小碎步** is an optional timed motion with its own interval.
 
-**小碎步** is an atomic left/right correction. Each direction is held for 220 ms with a 100 ms neutral gap; normal patrol resumes only after the sequence completes. **重置空打** performs a direction-preserving jump sequence with its own independent interval.
+**小碎步** is an atomic left/right correction. Each direction is held for 220 ms with a 100 ms neutral gap; normal patrol resumes only after the sequence completes.
 
 **站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
 
@@ -138,6 +147,10 @@ and must not be moved after publication.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.1.65` | `release/v1.1.65` | Climb-aware jump-point triggering and compact arrows. |
+| `1.1.64` | `release/v1.1.64` | 64-bit native marker-canvas handle repair. |
+| `1.1.63` | `release/v1.1.63` | Persistent patrol-marker shared-canvas repair. |
+| `1.1.62` | `release/v1.1.62` | Atomic patrol-marker canvas release. |
 | `1.1.61` | `release/v1.1.61` | Longer, reliable patrol-point marker overlay release. |
 | `1.1.60` | `release/v1.1.60` | Directional patrol-point marker release. |
 | `1.1.59` | `release/v1.1.59` | Patrol-attack naming and marker-overlay release. |
