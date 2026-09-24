@@ -185,10 +185,11 @@ class WindowKeySender:
         "kp_multiply": (0x37, False), "kp_divide": (0x35, True),
         "kp_enter": (0x1C, True), "kp_decimal": (0x53, True),
     }
-    # MapleStory treats these as mutually exclusive motion directions.  They
-    # must never be left down together: Left+Right (or Up+Down) pins the
-    # character in place.  Alt and Z deliberately stay outside this set so a
-    # jump chord and pickup can overlap their intended companion inputs.
+    # Only opposite directions conflict.  Left+Right or Up+Down pins the
+    # character in place, but Right+Up and Left+Up are valid MapleStory rope
+    # inputs and must stay held together after a directional jump point.
+    _HORIZONTAL_DIRECTION_KEYS = frozenset({"left", "right"})
+    _VERTICAL_DIRECTION_KEYS = frozenset({"up", "down"})
     _DIRECTION_KEYS = frozenset({"left", "right", "up", "down"})
     _MOVEMENT_KEYS = ("left", "right", "up", "down", "alt", "z")
 
@@ -928,10 +929,15 @@ class WindowKeySender:
                 LOG.debug("blocked key-down=%s: input disarmed during wait", key)
                 return False
             if key in self._DIRECTION_KEYS:
-                # Direction transitions are serialized centrally.  Release
-                # every conflicting direction BEFORE pressing this one; Z and
-                # Alt are intentionally unaffected and may still overlap.
-                for other in self._DIRECTION_KEYS - {key}:
+                # Release only the opposite axis direction. Horizontal and
+                # vertical movement can intentionally overlap for rope grabs
+                # (for example Right+Up immediately after a jump point).
+                conflicts = (
+                    self._HORIZONTAL_DIRECTION_KEYS - {key}
+                    if key in self._HORIZONTAL_DIRECTION_KEYS
+                    else self._VERTICAL_DIRECTION_KEYS - {key}
+                )
+                for other in conflicts:
                     if (other in self._key_owners
                             or other in self._physical_keys):
                         self._key_owners.pop(other, None)
