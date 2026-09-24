@@ -138,6 +138,7 @@ and must not be moved after publication.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.1.61` | `release/v1.1.61` | Longer, reliable patrol-point marker overlay release. |
 | `1.1.60` | `release/v1.1.60` | Directional patrol-point marker release. |
 | `1.1.59` | `release/v1.1.59` | Patrol-attack naming and marker-overlay release. |
 | `1.1.58` | `release/v1.1.58` | Directional jump-point rope-hold release. |

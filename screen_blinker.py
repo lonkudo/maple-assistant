@@ -228,6 +228,8 @@ class ScreenBlinker(threading.Thread):
             ))
         if not screen_points:
             return
+        kinds = ", ".join(kind for kind, _x, _y in screen_points)
+        LOG.info("patrol-point overlay: drawing %d marker(s): %s", len(screen_points), kinds)
         threading.Thread(
             target=self._show_patrol_point_markers,
             args=(tuple(screen_points),),
@@ -298,32 +300,29 @@ class ScreenBlinker(threading.Thread):
                             bar = wintypes.RECT(6, 1, 9, 14)
                             user32.FillRect(hdc, ctypes.byref(bar), marker)
                         else:
-                            shapes = {
-                                "rope": (
-                                    (7, 0), (14, 7), (10, 7), (10, 14),
-                                    (4, 14), (4, 7), (0, 7),
-                                ),
-                                "jump_right": (
-                                    (14, 0), (14, 7), (11, 4), (5, 10),
-                                    (8, 13), (6, 15), (0, 9), (3, 6),
-                                    (5, 8), (11, 2), (8, 0),
-                                ),
-                                "jump_left": (
-                                    (0, 0), (0, 7), (3, 4), (9, 10),
-                                    (6, 13), (8, 15), (14, 9), (11, 6),
-                                    (9, 8), (3, 2), (6, 0),
-                                ),
-                            }
-                            coords = shapes.get(kind, shapes["rope"])
-                            polygon = (wintypes.POINT * len(coords))(
-                                *(wintypes.POINT(px, py) for px, py in coords)
-                            )
                             old = gdi32.SelectObject(hdc, marker)
-                            gdi32.Polygon(hdc, polygon, len(coords))
+                            def draw_polygon(coords: tuple[tuple[int, int], ...]) -> None:
+                                polygon = (wintypes.POINT * len(coords))()
+                                for index, (px, py) in enumerate(coords):
+                                    polygon[index] = wintypes.POINT(px, py)
+                                gdi32.Polygon(hdc, polygon, len(coords))
+
+                            if kind == "jump_right":
+                                # Separate arrow head and diagonal stem are
+                                # intentionally non-overlapping polygons;
+                                # GDI can discard self-crossing polygons.
+                                draw_polygon(((14, 0), (14, 7), (8, 1)))
+                                draw_polygon(((8, 3), (11, 6), (5, 12), (2, 9)))
+                            elif kind == "jump_left":
+                                draw_polygon(((0, 0), (0, 7), (6, 1)))
+                                draw_polygon(((6, 3), (3, 6), (9, 12), (12, 9)))
+                            else:  # rope: a conventional upward arrow
+                                draw_polygon(((7, 0), (14, 7), (10, 7), (10, 14),
+                                              (4, 14), (4, 7), (0, 7)))
                             gdi32.SelectObject(hdc, old)
                     finally:
                         user32.ReleaseDC(hwnd, hdc)
-            self._wait(1.8)
+            self._wait(5.0)
         except Exception:
             LOG.warning("patrol-point overlay failed", exc_info=True)
         finally:
