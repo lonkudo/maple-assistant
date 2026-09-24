@@ -238,11 +238,19 @@ class ScreenBlinker(threading.Thread):
         ).start()
 
     def _show_patrol_point_markers(self, points: Sequence[tuple[str, int, int]]) -> None:
-        """Render compact patrol markers without taking game focus."""
+        """Render every patrol marker in one click-through overlay window.
+
+        A previous version created one native window for each marker.  Although
+        those windows were requested together, Windows may paint/re-stack them
+        independently; a later transparent marker could therefore hide an
+        earlier arrow or endpoint bar.  One shared transparent surface makes
+        the full recorded-point set a single atomic presentation.
+        """
 
         if not hasattr(ctypes, "windll"):
             return
-        windows: list[tuple[int, int, int]] = []
+        overlay: Optional[int] = None
+        brushes: list[int] = []
         user32 = gdi32 = None
         try:
             user32 = ctypes.windll.user32
@@ -269,6 +277,12 @@ class ScreenBlinker(threading.Thread):
             gdi32.Polygon.restype = wintypes.BOOL
             instance = kernel32.GetModuleHandleW(None)
             black = _colorref((0, 0, 0))
+            left = min(x - 7 for _kind, x, _y in points)
+            top = min(y - 7 for _kind, _x, y in points)
+            right = max(x + 8 for _kind, x, _y in points)
+            bottom = max(y + 8 for _kind, _x, y in points)
+            width = max(1, right - left)
+            height = max(1, bottom - top)
             colours = {
                 "jump_left": _colorref((50, 235, 120)),
                 "jump_right": _colorref((50, 235, 120)),
@@ -276,68 +290,73 @@ class ScreenBlinker(threading.Thread):
                 "left_endpoint": _colorref((45, 140, 245)),
                 "right_endpoint": _colorref((45, 140, 245)),
             }
-            for kind, x, y in points:
-                hwnd = user32.CreateWindowExW(
-                    0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
-                    "STATIC", None, 0x80000000,
-                    x - 7, y - 7, 15, 15, None, None, instance, None,
-                )
-                if not hwnd:
-                    continue
-                background = gdi32.CreateSolidBrush(black)
-                marker = gdi32.CreateSolidBrush(colours.get(kind, colours["jump_right"]))
-                windows.append((hwnd, background, marker))
-                # Black is transparent. Green diagonal arrows show the jump
-                # direction, yellow means climb Up, and blue bars are ends.
-                user32.SetLayeredWindowAttributes(hwnd, black, 255, 0x00000001)
-                user32.ShowWindow(hwnd, 4)
-                hdc = user32.GetDC(hwnd)
-                if hdc:
-                    try:
-                        rect = wintypes.RECT(0, 0, 15, 15)
-                        user32.FillRect(hdc, ctypes.byref(rect), background)
+            overlay = user32.CreateWindowExW(
+                # topmost, tool, no-activate, layered, click-through
+                0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
+                "STATIC", None, 0x80000000,
+                left, top, width, height, None, None, instance, None,
+            )
+            if not overlay:
+                LOG.warning("patrol-point overlay window creation failed")
+                return
+            background = gdi32.CreateSolidBrush(black)
+            brushes.append(background)
+            # Black is transparent.  Render the complete collection before
+            # the window is shown, then reveal it exactly once.
+            user32.SetLayeredWindowAttributes(overlay, black, 255, 0x00000001)
+            hdc = user32.GetDC(overlay)
+            if hdc:
+                try:
+                    rect = wintypes.RECT(0, 0, width, height)
+                    user32.FillRect(hdc, ctypes.byref(rect), background)
+                    for kind, screen_x, screen_y in points:
+                        marker = gdi32.CreateSolidBrush(
+                            colours.get(kind, colours["jump_right"])
+                        )
+                        brushes.append(marker)
+                        x = screen_x - left - 7
+                        y = screen_y - top - 7
                         if kind in ("left_endpoint", "right_endpoint"):
-                            bar = wintypes.RECT(6, 1, 9, 14)
+                            bar = wintypes.RECT(x + 6, y + 1, x + 9, y + 14)
                             user32.FillRect(hdc, ctypes.byref(bar), marker)
-                        else:
-                            old = gdi32.SelectObject(hdc, marker)
-                            def draw_polygon(coords: tuple[tuple[int, int], ...]) -> None:
-                                polygon = (wintypes.POINT * len(coords))()
-                                for index, (px, py) in enumerate(coords):
-                                    polygon[index] = wintypes.POINT(px, py)
-                                gdi32.Polygon(hdc, polygon, len(coords))
+                            continue
+                        old = gdi32.SelectObject(hdc, marker)
 
-                            if kind == "jump_right":
-                                # Separate arrow head and diagonal stem are
-                                # intentionally non-overlapping polygons;
-                                # GDI can discard self-crossing polygons.
-                                draw_polygon(((14, 0), (14, 7), (8, 1)))
-                                draw_polygon(((8, 3), (11, 6), (5, 12), (2, 9)))
-                            elif kind == "jump_left":
-                                draw_polygon(((0, 0), (0, 7), (6, 1)))
-                                draw_polygon(((6, 3), (3, 6), (9, 12), (12, 9)))
-                            else:  # rope: a conventional upward arrow
-                                draw_polygon(((7, 0), (14, 7), (10, 7), (10, 14),
-                                              (4, 14), (4, 7), (0, 7)))
-                            gdi32.SelectObject(hdc, old)
-                    finally:
-                        user32.ReleaseDC(hwnd, hdc)
+                        def draw_polygon(coords: tuple[tuple[int, int], ...]) -> None:
+                            polygon = (wintypes.POINT * len(coords))()
+                            for index, (px, py) in enumerate(coords):
+                                polygon[index] = wintypes.POINT(x + px, y + py)
+                            gdi32.Polygon(hdc, polygon, len(coords))
+
+                        if kind == "jump_right":
+                            draw_polygon(((14, 0), (14, 7), (8, 1)))
+                            draw_polygon(((8, 3), (11, 6), (5, 12), (2, 9)))
+                        elif kind == "jump_left":
+                            draw_polygon(((0, 0), (0, 7), (6, 1)))
+                            draw_polygon(((6, 3), (3, 6), (9, 12), (12, 9)))
+                        else:  # rope: a conventional upward arrow
+                            draw_polygon(((7, 0), (14, 7), (10, 7), (10, 14),
+                                          (4, 14), (4, 7), (0, 7)))
+                        gdi32.SelectObject(hdc, old)
+                finally:
+                    user32.ReleaseDC(overlay, hdc)
+            user32.ShowWindow(overlay, 4)
             self._wait(5.0)
         except Exception:
             LOG.warning("patrol-point overlay failed", exc_info=True)
         finally:
-            for hwnd, background, arrow in windows:
+            if overlay:
                 try:
                     if user32 is not None:
-                        user32.DestroyWindow(hwnd)
+                        user32.DestroyWindow(overlay)
                 except Exception:
                     pass
-                for brush in (background, arrow):
-                    try:
-                        if gdi32 is not None:
-                            gdi32.DeleteObject(brush)
-                    except Exception:
-                        pass
+            for brush in brushes:
+                try:
+                    if gdi32 is not None:
+                        gdi32.DeleteObject(brush)
+                except Exception:
+                    pass
 
     def _show_layer_band_regions(
         self,
