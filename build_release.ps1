@@ -44,14 +44,15 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
     $name -notlike "test_*" -and $name -ne "auto_system.log" -and
     # 以下为开发工具/本机私有文件（含本机绝对路径或不适合分发的个人设置），
     # 不随发布包分发。
-    $name -notin @("restart_assistant.ps1", "launch_assistant_elevated.vbs",
+    $name -notin @("launch_assistant_elevated.vbs",
                    "build_release.ps1", "ui_window_settings.json",
                    "COMMIT_MSG.txt", "release_now.ps1", "发布.bat",
+                   "build_protected_release.ps1",
                    # User configuration is generated/migrated as
                    # user_config.json and must never be overwritten by an
                    # application update. system_config.json is intentionally
                    # included so internal calibration follows each version.
-                   "config.json", "user_config.json",
+                   "config.json", "user_config.json", "license.json",
                    "release_no_trade.ps1",
                    "trade_config.json",
                    "recording-configuration.json",
@@ -83,29 +84,18 @@ wscript.exe //nologo "%~dp0launch_assistant.vbs" %*
 $packageVbs = @"
 Option Explicit
 
-Dim shellApp, files, root, pythonwPath, exePath, assistantPath, arguments, item, statusPath
+Dim shellApp, files, root, pythonwPath, restartScript, arguments, statusPath
 Set files = CreateObject("Scripting.FileSystemObject")
 root = files.GetParentFolderName(WScript.ScriptFullName)
 pythonwPath = root & "\$environmentDir\Scripts\pythonw.exe"
-' Launch through a renamed interpreter so the running process is
-' "MapleAssistant.exe" (and the game sees that name) instead of "pythonw.exe".
-' The copy is created on first use and self-heals after an overlay update.
-exePath = root & "\$environmentDir\Scripts\MapleAssistant.exe"
-On Error Resume Next
-If Not files.FileExists(exePath) Then files.CopyFile pythonwPath, exePath, True
-If Not files.FileExists(exePath) Then exePath = pythonwPath
-On Error GoTo 0
-assistantPath = root & "\startup_probe.py"
+restartScript = root & "\restart_assistant.ps1"
 statusPath = root & "\assistant-launch-status.log"
-arguments = QuoteArgument(assistantPath)
-For Each item In WScript.Arguments
-    arguments = arguments & " " & QuoteArgument(CStr(item))
-Next
+arguments = "-NoProfile -ExecutionPolicy Bypass -File " & QuoteArgument(restartScript) & " -Root " & QuoteArgument(root)
 
 Set shellApp = CreateObject("Shell.Application")
-WriteStatus "Launcher requested a hidden Python start."
+WriteStatus "Launcher requested a hidden assistant restart."
 On Error Resume Next
-shellApp.ShellExecute exePath, arguments, root, "runas", 0
+shellApp.ShellExecute "powershell.exe", arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
     MsgBox "MapleAssistant could not start. Open assistant-launch-status.log in this folder.", 16, "MapleAssistant"
@@ -176,6 +166,13 @@ if (Test-Path $assetsIn) {
 $loginReferenceIn = Join-Path $root "screenshots\login_page_target.jpg"
 if (Test-Path $loginReferenceIn) {
     Copy-Item $loginReferenceIn (Join-Path $out "recording-assets\login_page_target.jpg") -Force
+}
+# The auto-reconnect workflow identifies the offline dialog from this supplied
+# colour patch before clicking its 确定 button. Keep the original PNG because
+# its exact sampled colours are the detection reference.
+$offlinePromptSquareIn = Join-Path $root "screenshots\offline_prompt_square.png"
+if (Test-Path $offlinePromptSquareIn) {
+    Copy-Item $offlinePromptSquareIn (Join-Path $out "recording-assets\offline_prompt_square.png") -Force
 }
 
 # --- autolie_api（自动过测谎 API 集成：图像转换 + 坐标换算）------------------------

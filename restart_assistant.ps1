@@ -1,53 +1,51 @@
-$ErrorActionPreference = 'Stop'
-
-# Development restart helper (excluded from releases).  It restarts the local
-# checkout through the renamed interpreter the launcher uses, so the process
-# name stays "MapleAssistant.exe".
-$root = [IO.Path]::GetFullPath(
-    'C:\Users\SOTTES\Documents\Codex\2026-08-12\skill-creator-c-users-sottes-codex-2'
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root
 )
-$assistantPath = [IO.Path]::GetFullPath((Join-Path $root 'assistant.py'))
-$pythonwPath = [IO.Path]::GetFullPath((Join-Path $root '.venv\Scripts\pythonw.exe'))
-$exePath = [IO.Path]::GetFullPath((Join-Path $root '.venv\Scripts\MapleAssistant.exe'))
-$workingDirectory = [IO.Path]::GetDirectoryName($assistantPath)
 
-if (-not (Test-Path -LiteralPath $assistantPath -PathType Leaf)) {
-    throw "Assistant entry point is missing: $assistantPath"
-}
-if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-    if (-not (Test-Path -LiteralPath $pythonwPath -PathType Leaf)) {
-        throw "Python windowed executable is missing: $pythonwPath"
-    }
-    Copy-Item -LiteralPath $pythonwPath -Destination $exePath -Force
+$ErrorActionPreference = "Stop"
+$rootPath = [System.IO.Path]::GetFullPath($Root)
+$venvScripts = Join-Path $rootPath ".venv\Scripts"
+$pythonwPath = Join-Path $venvScripts "pythonw.exe"
+$assistantExePath = Join-Path $venvScripts "MapleAssistant.exe"
+$startupPath = Join-Path $rootPath "startup_probe.py"
+
+if (-not (Test-Path -LiteralPath $pythonwPath)) {
+    throw "Virtual environment missing. Run the setup first."
 }
 
-function Get-AssistantProcesses {
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq 'MapleAssistant.exe' -and
-        $_.ExecutablePath -eq $exePath -and
-        $_.CommandLine -like "*$workingDirectory*"
-    }
+# The launcher is deliberately a restart command: an old assistant is never
+# left holding the singleton mutex while the new one is starting.  The renamed
+# interpreter is the normal production process name; the Python fallback is
+# restricted to this installation directory so unrelated Python programs stay
+# untouched.
+$targets = Get-CimInstance Win32_Process | Where-Object {
+    $_.ProcessId -ne $PID -and (
+        $_.Name -ieq "MapleAssistant.exe" -or
+        (( $_.Name -ieq "pythonw.exe" -or $_.Name -ieq "python.exe" ) -and
+         $_.CommandLine -like "*startup_probe.py*" -and
+         $_.CommandLine -like "*$rootPath*")
+    )
+}
+foreach ($target in $targets) {
+    Stop-Process -Id $target.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-foreach ($target in @(Get-AssistantProcesses)) {
-    if ([string]::IsNullOrWhiteSpace($target.CommandLine)) {
-        throw "Refusing to stop process $($target.ProcessId) without a verified command line"
-    }
-    Stop-Process -Id ([int]$target.ProcessId) -ErrorAction Stop
-}
-
-$deadline = (Get-Date).AddSeconds(5)
-$remaining = @(Get-AssistantProcesses)
-while ($remaining.Count -ne 0 -and (Get-Date) -lt $deadline) {
+# Wait briefly for Windows to release the old mutex before launching its
+# replacement.  This remains hidden because this script is invoked by WSH.
+$deadline = [DateTime]::UtcNow.AddSeconds(3)
+do {
     Start-Sleep -Milliseconds 100
-    $remaining = @(Get-AssistantProcesses)
+    $remaining = Get-CimInstance Win32_Process | Where-Object {
+        $_.ProcessId -ne $PID -and $_.Name -ieq "MapleAssistant.exe"
+    }
+} while ($remaining -and [DateTime]::UtcNow -lt $deadline)
+
+if (-not (Test-Path -LiteralPath $assistantExePath)) {
+    Copy-Item -LiteralPath $pythonwPath -Destination $assistantExePath -Force
+}
+if (-not (Test-Path -LiteralPath $assistantExePath)) {
+    $assistantExePath = $pythonwPath
 }
 
-if ($remaining.Count -ne 0) {
-    throw 'The previous MapleAssistant instance did not stop cleanly'
-}
-
-Start-Process -FilePath $exePath `
-    -ArgumentList ('"' + $assistantPath + '"') `
-    -WorkingDirectory $workingDirectory `
-    -WindowStyle Hidden
+Start-Process -FilePath $assistantExePath -ArgumentList @($startupPath) -WorkingDirectory $rootPath -WindowStyle Hidden

@@ -1,6 +1,8 @@
 {
   "enabled": true,
   "ignore_injected": true,
+  "delivery": "native",
+  "release_ctrl_after_chord": true,
   "bindings": [
     {"keys": "ctrl+1", "action": "quick_message:0", "block_original": true},
     {"keys": "ctrl+2", "action": "quick_message:1", "block_original": true},
@@ -15,6 +17,8 @@
     {"keys": "ctrl+left", "action": "record:left_most_pos", "block_original": true},
     {"keys": "ctrl+up", "action": "record:rope_pos", "block_original": true},
     {"keys": "ctrl+right", "action": "record:right_most_pos", "block_original": true},
+    {"keys": "ctrl+d", "action": "record_jump_point:left", "block_original": true},
+    {"keys": "ctrl+f", "action": "record_jump_point:right", "block_original": true},
     {"keys": "ctrl+down", "action": "select_next_layer", "block_original": true},
     {"keys": "ctrl+home", "action": "select_next_patrol_start", "block_original": true},
     {"keys": "ctrl+bracketleft", "action": "adjust_fixed_attack_interval:-0.1", "block_original": true},

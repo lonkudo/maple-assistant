@@ -37,6 +37,7 @@ class StairJumpWorker(threading.Thread):
         self.execute_callback = execute_callback
         self._cv = threading.Condition()
         self._requested_direction: Optional[str] = None
+        self._hold_up = False
         self._active = False
         self._completion_callbacks: list[Any] = []
 
@@ -49,7 +50,7 @@ class StairJumpWorker(threading.Thread):
             )
         )
 
-    def request(self, direction: str, on_complete: Any = None) -> bool:
+    def request(self, direction: str, on_complete: Any = None, *, hold_up: bool = False) -> bool:
         """Register one jump and immediately reserve its attack-free window.
 
         A request while one is already waiting or executing intentionally
@@ -65,6 +66,7 @@ class StairJumpWorker(threading.Thread):
             if self._active:
                 return True
             self._requested_direction = direction
+            self._hold_up = bool(hold_up)
             self._active = True
             if callable(on_complete):
                 self._completion_callbacks = [on_complete]
@@ -83,6 +85,16 @@ class StairJumpWorker(threading.Thread):
         with self._cv:
             return self._active
 
+    def cancel_pending(self, reason: str = "patrol stopped") -> None:
+        """Drop a waiting stair recovery immediately at a patrol stop."""
+
+        with self._cv:
+            active = self._active
+        if not active:
+            return
+        self._finish(False)
+        LOG.info("stair jump worker cancelled pending recovery: %s", reason)
+
     def _attack_motion_active(self) -> bool:
         probe = getattr(self.motion_arbiter, "attack_motion_active", None)
         if not callable(probe):
@@ -98,6 +110,7 @@ class StairJumpWorker(threading.Thread):
             callbacks = self._completion_callbacks
             self._completion_callbacks = []
             self._requested_direction = None
+            self._hold_up = False
             self._active = False
             if self.action_active_event is not None:
                 # This is the stair worker's own exclusion event, not the
@@ -123,6 +136,7 @@ class StairJumpWorker(threading.Thread):
                 if self.stop_event.is_set():
                     break
                 direction = self._requested_direction
+                hold_up = self._hold_up
 
             # The old queue released the patrol direction while it waited
             # here.  This independent worker only waits for the tail of the
@@ -140,7 +154,10 @@ class StairJumpWorker(threading.Thread):
                     allowed = self._automation_allowed_locked()
                 if allowed:
                     try:
-                        succeeded = bool(self.execute_callback(direction))
+                        try:
+                            succeeded = bool(self.execute_callback(direction, hold_up))
+                        except TypeError:
+                            succeeded = bool(self.execute_callback(direction))
                     except Exception:
                         LOG.exception("stair jump action failed")
             self._finish(succeeded)

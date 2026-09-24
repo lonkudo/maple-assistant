@@ -339,7 +339,9 @@ def _clear_previous_log_files() -> None:
 def main() -> int:
     singleton_handle = _acquire_single_instance_mutex()
     if singleton_handle is None:
-        _show_already_running_notice()
+        # The launcher replaces an existing copy before starting a fresh one.
+        # A short process-exit race can still reach this guard; exit silently
+        # instead of showing a misleading "close the old instance" prompt.
         return 0
     args = parse_args()
     _clear_previous_log_files()
@@ -412,13 +414,13 @@ def main() -> int:
         WindowKeySender,
     )
     from attack_worker import AttackWorker
-    from random_jump_worker import RandomJumpWorker
     from small_step_worker import SmallStepWorker
     from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
     from quick_pickup_worker import QuickPickupWorker
     from reconnect_worker import ReconnectWorker
     from trade_worker import TradeWorker
+    from workflow_cancel_worker import WorkflowCancelWorker
     from motion_arbiter import MotionArbiter
     # TEMPORARILY DISABLED: scheduled shutdown is hidden from the UI.
     # from shutdown_worker import ShutdownWorker
@@ -475,6 +477,10 @@ def main() -> int:
     character_positions: queue.Queue = queue.Queue(maxsize=1)
     subscribers = [
         movement_frames, status_frames, character_frames, lie_detector_frames,
+        # Ctrl+Q waits for the trade dialog's small presence area to change.
+        # Its worker arms the shared capture only during that workflow, but it
+        # must still be a FrameBus subscriber or it will never receive a frame.
+        trade_frames,
     ]
     if not args.no_ui:
         subscribers.append(ui_frames)
@@ -638,6 +644,10 @@ def main() -> int:
 
     def stop_patrol_after_focus_loss() -> None:
         patrol_controller.set_enabled(False)
+        # Focus loss is also a real patrol stop. Merely clearing the route
+        # flag left attack/movement workers armed until some later UI action,
+        # which could preserve a held direction after the game returned.
+        disarm_patrol_runtime()
 
     def stop_patrol_for_disconnect() -> None:
         """Immediately disarm patrol input after a confirmed disconnect.
@@ -649,7 +659,7 @@ def main() -> int:
         if not patrol_controller.is_enabled():
             return
         patrol_controller.set_enabled(False)
-        _stop_live_input(key_sender, automation_active)
+        disarm_patrol_runtime()
         logging.warning("PATROL STOPPED: disconnect alert triggered")
 
     rope_profile = map_profile["rope"]
@@ -746,15 +756,21 @@ def main() -> int:
         # cannot seed that search crop as the coordinate frame.
         latest_frame = bus.latest
         try:
-            # Get a current game image for map/layer verification. Geometry no
-            # longer depends on this capture producing repeatable contours.
+            # A manual Start Patrol in 站桩攻击 must anchor to the marker at
+            # that exact moment.  ``bus.latest`` can be a parked/startup frame
+            # and would retain the first temporary position for the whole
+            # assistant session, so this one-shot capture is authoritative.
             fresh_frame = capture_worker.capture_now(timeout=5.0)
         except TimeoutError:
             if latest_frame is None:
                 raise
+            if (time.monotonic() - latest_frame.captured_at) > 1.0:
+                raise OSError(
+                    "could not capture a current minimap frame for stationary attack"
+                )
             fresh_frame = latest_frame
             logging.warning(
-                "MINIMAP startup capture timed out; using latest frame "
+                "MINIMAP startup capture timed out; using a recent frame "
                 "sequence=%d with saved recording border",
                 fresh_frame.sequence,
             )
@@ -764,6 +780,17 @@ def main() -> int:
             saved_calibration,
             fresh_frame.image.size,
         )
+        if stationary_attack and saved_detection is not None:
+            # 站桩攻击 has no route recording to preserve, so its temporary
+            # anchor must never inherit a previous map's persisted minimap
+            # rectangle.  A stale 67px box followed by the live 86px box
+            # changes normalized X and immediately creates a false recovery
+            # walk.  Probe the actual current minimap before anchoring.
+            logging.info(
+                "STATIONARY ATTACK: ignoring saved minimap calibration "
+                "and probing the current map border before recording anchor"
+            )
+            saved_detection = None
         if saved_calibration and saved_detection is None:
             logging.warning(
                 "MINIMAP saved calibration ignored: it is not a measured minimap border; "
@@ -826,6 +853,10 @@ def main() -> int:
             detection.window_size[1],
             detection.confidence,
         )
+        # Keep the stationary-start visual diagnosis identical to a normal
+        # patrol start: minimap, marker-analysis and HP/MP regions all show
+        # their actual current capture geometry.
+        status_box = status_capture_pixel_box(fresh_frame.image.size)
         if stationary_attack:
             # Stationary Attack keeps one *temporary* anchor per standing spot.
             # A MANUAL Start Patrol (按钮 or Ctrl+`) records the character's
@@ -843,14 +874,83 @@ def main() -> int:
                 )
             marker = None
             if stationary_reanchor:
-                analysis_rgb = np.asarray(
-                    fresh_frame.image.crop(detection.analysis_box).convert("RGB")
-                )
-                marker = detect_yellow_diamond(analysis_rgb)
+                # Match normal manual recording: use fresh verified captures,
+                # not the initial startup frame alone.  A one-frame OpenCV
+                # flicker at Start Patrol previously became the stationary
+                # anchor and immediately caused a correction walk.
+                marker_samples = []
+                for sample_index in range(3):
+                    candidate_frame = fresh_frame
+                    if sample_index:
+                        try:
+                            candidate_frame = capture_worker.capture_now(timeout=2.0)
+                        except TimeoutError:
+                            logging.warning(
+                                "STATIONARY ATTACK anchor sample %d timed out",
+                                sample_index + 1,
+                            )
+                            continue
+                    candidate_rgb = np.asarray(
+                        candidate_frame.image.crop(detection.analysis_box).convert("RGB")
+                    )
+                    candidate_marker = detect_yellow_diamond(candidate_rgb)
+                    if candidate_marker is not None:
+                        marker_samples.append((candidate_frame, candidate_marker))
+                if marker_samples:
+                    # Coordinate flicker is normally a one-frame outlier.
+                    # Median X/Y preserves the normal recording coordinate
+                    # system while rejecting that outlier.
+                    marker = marker_samples[len(marker_samples) // 2][1]
+                    marker_x = float(np.median([item[1].x for item in marker_samples]))
+                    marker_y = float(np.median([item[1].y for item in marker_samples]))
+                    marker = replace(marker, x=marker_x, y=marker_y)
+                    fresh_frame = marker_samples[-1][0]
             if not stationary_anchor(marker, allow_reanchor=stationary_reanchor):
                 raise OSError(
                     "yellow character marker was not detected for stationary attack"
                 )
+            # Manual 站桩攻击 starts deliberately request show_overlays=False
+            # to avoid the normal patrol's long calibration pause, but still
+            # need the full visual geometry check requested by the operator.
+            if show_overlays or stationary_reanchor:
+                screen_blinker.show_detection_regions(
+                    fresh_frame.window_rect,
+                    fresh_frame.image.size,
+                    (
+                        ("minimap", detection.window_box, 0x0000FF00),
+                        ("marker/patrol", detection.analysis_box, 0x0000FFFF),
+                        ("hp/mp", status_box, 0x00FF0000),
+                    ),
+                )
+                logging.info(
+                    "STATIONARY ATTACK DETECTION OVERLAY: minimap (green), "
+                    "marker/patrol (yellow), HP/MP (blue), fixed point crosshair"
+                )
+            # Show the temporary 站桩攻击 anchor once, directly on its minimap
+            # marker.  This is diagnostic only: the click-through crosshair
+            # never participates in patrol movement or the fixed-position
+            # calculation, and therefore cannot shift the saved anchor.
+            if stationary_reanchor and marker is not None:
+                try:
+                    left, top, right, bottom = fresh_frame.window_rect
+                    image_width, image_height = fresh_frame.image.size
+                    analysis_left, analysis_top, analysis_right, analysis_bottom = (
+                        detection.analysis_box
+                    )
+                    scale_x = (right - left) / max(1, image_width)
+                    scale_y = (bottom - top) / max(1, image_height)
+                    screen_blinker.show_aim_marker(
+                        round(left + (analysis_left + marker.x * (analysis_right - analysis_left)) * scale_x),
+                        round(top + (analysis_top + marker.y * (analysis_bottom - analysis_top)) * scale_y),
+                        ttl_seconds=2.5,
+                        size=11,
+                    )
+                    logging.info(
+                        "STATIONARY ATTACK marker: fixed position crosshair drawn x=%.6f y=%.6f",
+                        marker.x, marker.y,
+                    )
+                except Exception:
+                    logging.warning("STATIONARY ATTACK marker overlay failed", exc_info=True)
             logging.info(
                 "STATIONARY ATTACK startup: %s; recorded layers were not checked",
                 "temporary current-position anchor saved"
@@ -935,10 +1035,20 @@ def main() -> int:
             )
             return
         layer_bands = []
+        jump_point_overlay: list[tuple[float, float]] = []
         for layer_name in snapshot.route_order:
             layer = snapshot.layers.get(layer_name, {})
             if not isinstance(layer, dict):
                 continue
+            for point in layer.get("jump_points", []):
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    jump_point_overlay.append((
+                        float(point["x"]), float(point["y"])
+                    ))
+                except (KeyError, TypeError, ValueError):
+                    continue
             band = _layer_y_band(
                 layer, float(layer.get("y_tolerance", 0.020000))
             )
@@ -1081,22 +1191,34 @@ def main() -> int:
                         abs(float(canonical) - mean_observed),
                     )
         if show_overlays:
+            screen_blinker.show_jump_points(
+                fresh_frame.window_rect,
+                fresh_frame.image.size,
+                detection.analysis_box,
+                jump_point_overlay,
+            )
             screen_blinker.show_layer_bands(
                 fresh_frame.window_rect,
                 fresh_frame.image.size,
                 detection.analysis_box,
                 layer_bands,
+                # The screen-capture backend can include these translucent
+                # bands.  Do not arm movement until they are gone; otherwise
+                # the first live marker frames may be obscured and the patrol
+                # appears not to have started.
                 wait_until_hidden=True,
             )
-        # The overlay is deliberately gone before input is armed. Publish one
-        # clean post-overlay frame for screen-capture-based machines so the
-        # movement worker cannot consume a colour-tinted minimap.
-        try:
-            capture_worker.capture_now(timeout=2.0)
-        except TimeoutError:
-            logging.warning(
-                "LAYER BAND OVERLAY: clean post-overlay capture timed out"
-            )
+            # The overlay can be captured by desktop-based backends, so only
+            # when it was actually shown do we wait for it and publish a clean
+            # post-overlay frame. Manual patrol starts deliberately skip this
+            # optional visual step: it used to make a successful Start Patrol
+            # stand still for several seconds after its success sound.
+            try:
+                capture_worker.capture_now(timeout=2.0)
+            except TimeoutError:
+                logging.warning(
+                    "LAYER BAND OVERLAY: clean post-overlay capture timed out"
+                )
         detected_name = (
             detect_layer_by_y(marker.y, snapshot.layers)
             if marker is not None else None
@@ -1151,9 +1273,15 @@ def main() -> int:
 
         """
 
+        # Layer-band drawing is diagnostic only. Do not make a live patrol
+        # wait for it: the overlay's timed display and clean recapture caused
+        # a visible freeze immediately after the start confirmation.
+        # Start a new movement generation before arming input.  Delayed work
+        # from a stopped patrol remains cancelled until this exact point.
+        movement_worker.arm_patrol_input()
         armed = _start_live_input(
             key_sender, automation_active,
-            prepare_map_session,
+            lambda: prepare_map_session(show_overlays=False),
             patrol_preparing,
         )
         return armed
@@ -1183,6 +1311,7 @@ def main() -> int:
                                 "(%s) - starting the patrol anyway", exc)
 
         try:
+            movement_worker.arm_patrol_input()
             armed = _start_live_input(key_sender, automation_active, prepare, patrol_preparing)
         except OSError as exc:
             logging.warning("RECONNECT PATROL RESTART refused at the window/calibration step: %s", exc)
@@ -1219,13 +1348,6 @@ def main() -> int:
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
-    random_jump_worker = RandomJumpWorker(
-        key_sender,
-        stop_event,
-        climbing_active_event=action_motion_active,
-        automation_active_event=automation_active,
-        motion_arbiter=motion_arbiter,
-    )
     # TEMPORARILY DISABLED together with its hidden UI controls.
     # shutdown_worker = ShutdownWorker(...)
     shutdown_worker = None
@@ -1236,8 +1358,53 @@ def main() -> int:
     # chords, otherwise it registers them OS-wide and silently swallows them
     # with nothing to consume the queue - exactly how a stale --no-ui run made
     # Ctrl+` appear dead.
+    def release_hotkey_ctrl(action: str) -> None:
+        """End the GAME's Ctrl state after a recognized Ctrl chord.
+
+        The operator presses Ctrl+<key>; Windows consumes the second key, but
+        the game has already received the Ctrl key-down - and because the
+        operator keeps Ctrl held to finish the chord, the game's Ctrl-bound
+        attack keeps firing ("the attack is triggered infinitely").  One forced
+        Ctrl key-up ends it.
+
+        It is injected into the global input stream on purpose: only that
+        reaches the game.  Because this same injection also clears the modifier
+        state Windows matches ``RegisterHotKey`` chords against, chord
+        detection runs through the worker's own low-level hook, which tracks the
+        PHYSICAL modifiers and filters the assistant's stamped events - see
+        ``HotkeyWorker.delivery`` (defaults to "hook" while this cleanup is
+        enabled).
+        """
+
+        try:
+            key_sender.force_key_up("ctrl", reason=f"hotkey chord: {action}")
+        except Exception:
+            logging.warning("hotkey Ctrl cleanup failed for %s", action, exc_info=True)
+
+    def keep_hotkey_ctrl_released() -> None:
+        """Re-assert the Ctrl release while the operator still holds Ctrl.
+
+        One injected key-up is undone by the keyboard repeat of the physically
+        held key within tens of milliseconds, which is why the game resumed
+        attacking right after Ctrl+1 even though the cleanup had run.  The
+        worker calls this (silently) until Ctrl is let go.
+
+        It stands down while the assistant is sending a Ctrl chord of its own -
+        a quick message is Enter + Ctrl+V + Enter on the game window, and a
+        Ctrl key-up landing inside it would paste nothing.
+        """
+
+        guard = getattr(key_sender, "ctrl_chord_in_flight", None)
+        if callable(guard) and guard():
+            return
+        key_sender.force_key_up(
+            "ctrl", reason="Ctrl still held after a hotkey chord", quiet=True,
+        )
+
     hotkey_worker = None if args.no_ui else HotkeyWorker(
-        stop_event, hotkey_actions
+        stop_event, hotkey_actions,
+        on_chord=release_hotkey_ctrl,
+        keep_ctrl_released=keep_hotkey_ctrl_released,
     )
     quick_pickup_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=8)
     quick_pickup_worker = QuickPickupWorker(
@@ -1424,9 +1591,9 @@ def main() -> int:
                 character_frames,
                 "掉线/自动重连 (disconnect detection)",
                 armed_event=disconnect_watch_armed,
-                # The alert threshold is a FRAME COUNT (40 since 2026-09-18; it was 120 = 30 s at the
-                # normal capture interval, 40 frames = 10 s), so the disconnect feed keeps the normal
-                # cadence instead of the slower lie one.
+                # The marker gate is a normal-cadence frame count (25 samples,
+                # about 5 s at 5 FPS).  The separate login-page gate runs at
+                # 1 FPS only after those samples are missing.
                 interval=float(args.interval),
                 # A frame of the game window while the assistant's own panel covers it is not the game:
                 # counting it would fire a false 掉线 alert and a reconnect that clicks the game.
@@ -1624,7 +1791,9 @@ def main() -> int:
             rope_tiny_step_max_seconds=float(
                 calibration.get("rope_tiny_step_max_seconds", 0.15)
             ),
-            stair_jump_enabled=bool(calibration.get("stair_jump_enabled", True)),
+            # Automatic stair jumps were removed from the attack panel. The
+            # jump executor is retained only for explicit recorded jump points.
+            stair_jump_enabled=False,
             stair_jump_stall_diamonds=float(
                 calibration.get("stair_jump_stall_diamonds", 0.25)
             ),
@@ -1660,6 +1829,7 @@ def main() -> int:
             ),
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
+    motion_arbiter.set_facing_callback(movement_worker.perform_stationary_facing)
     stair_jump_worker = StairJumpWorker(
         stop_event,
         automation_active_event=automation_active,
@@ -1672,6 +1842,25 @@ def main() -> int:
     motion_arbiter.set_motion_gate_callback(
         movement_worker.motion_arbiter_motion_allowed
     )
+
+    def disarm_patrol_runtime(*, refocus_before_release: bool = False) -> None:
+        """Cancel every patrol-owned action, then perform one key scrub.
+
+        This is intentionally idempotent: Stop Patrol, focus loss, and a
+        disconnect can race, and none may leave a delayed arbiter/movement
+        action alive for a later patrol toggle.
+        """
+
+        automation_active.clear()
+        movement_worker.disarm_patrol_input()
+        motion_arbiter.cancel_pending("patrol lifecycle stopped")
+        stair_jump_worker.cancel_pending("patrol lifecycle stopped")
+        _stop_live_input(
+            key_sender,
+            automation_active,
+            refocus_before_release=refocus_before_release,
+        )
+
     small_step_worker = SmallStepWorker(
         stop_event,
         automation_active_event=automation_active,
@@ -1685,7 +1874,7 @@ def main() -> int:
         minimap_region_provider=lambda: getattr(
             movement_worker, "_last_minimap_region", None
         ),
-        # A disconnect needs 40 normal capture observations.  The capture worker may temporarily
+        # A disconnect needs 25 normal capture observations.  The capture worker may temporarily
         # accelerate for other workflows, but those extra frames must not shorten this confirmation.
         disconnect_alert_sample_seconds=float(args.interval),
         alert_sound_path=(
@@ -1720,7 +1909,6 @@ def main() -> int:
         status_worker,
         motion_arbiter,
         *attack_workers,
-        random_jump_worker,
         small_step_worker,
         stair_jump_worker,
         *([hotkey_worker] if hotkey_worker is not None else []),
@@ -1747,7 +1935,6 @@ def main() -> int:
             map_identity_store=map_identity_store,
             status_worker=status_worker,
             attack_worker=attack_worker,
-            random_jump_worker=random_jump_worker,
             small_step_worker=small_step_worker,
             hotkey_queue=hotkey_actions,
             hotkey_worker=hotkey_worker,
@@ -1771,8 +1958,8 @@ def main() -> int:
             # 自动重连 brought the character back into the game: prepare the map session again (layer
             # detection) and resume the patrol without the operator pressing 开始巡逻.
             on_patrol_restart=restart_patrol_after_reconnect,
-            on_patrol_stop=lambda: _stop_live_input(
-                key_sender, automation_active, refocus_before_release=True,
+            on_patrol_stop=lambda: disarm_patrol_runtime(
+                refocus_before_release=True,
             ),
             on_capture_now=lambda: _capture_focused_game_frame(
                 key_sender, capture_worker.capture_now
@@ -1798,6 +1985,22 @@ def main() -> int:
         lie_detector_worker.add_lie_seen_callback(
             lambda match, _frame: ui_worker.on_lie_event_for_api(match)
         )
+
+    def auto_lie_is_active() -> bool:
+        return bool(ui_worker is not None and ui_worker.auto_lie_pass_active())
+
+    def cancel_auto_lie() -> bool:
+        return bool(ui_worker is not None and ui_worker.request_cancel_auto_lie_pass())
+
+    workflow_cancel_worker = WorkflowCancelWorker(
+        stop_event,
+        (
+            ("auto reconnect", reconnect_worker.is_active, reconnect_worker.request_cancel),
+            ("automatic lie pass", auto_lie_is_active, cancel_auto_lie),
+            ("Ctrl+Q/Ctrl+W trade", trade_worker.is_trade_active, trade_worker.request_cancel),
+        ),
+    )
+    core_workers.append(workflow_cancel_worker)
 
     def request_stop(*_unused: object) -> None:
         stop_event.set()

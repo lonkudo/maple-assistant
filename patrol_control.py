@@ -739,6 +739,63 @@ class PatrolController:
                 layer_name, boundary, float(point["x"]), float(point["y"])
             )
 
+    def record_jump_point(
+        self, player_x: float, player_y: float, *, direction: str,
+        layout: Optional[CoordinateLayout] = None,
+    ) -> RecordedEndpoint:
+        """Add one immutable directional jump trigger, ordered by X."""
+
+        direction = str(direction).casefold()
+        if direction not in ("left", "right"):
+            raise ValueError("跳点方向必须是 left 或 right")
+
+        with self._lock:
+            layer_name = self._selected_layer
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                raise ValueError("没有可录制的楼层；请先点击「添加楼层」")
+            point: dict[str, Any] = {
+                "x": round(max(0.02, min(0.98, float(player_x))), 6),
+                "y": round(max(0.02, min(0.98, float(player_y))), 6),
+                "direction": direction,
+                "source": "manual-ui",
+            }
+            if layout is not None:
+                stable_x, stable_y = layout.stable_point(player_x, player_y)
+                point["coordinate_v2"] = {
+                    "x_diamond": round(stable_x, 6),
+                    "y_diamond": round(stable_y, 6),
+                    "recorded_layout": layout.as_dict(),
+                }
+            points = layer.setdefault("jump_points", [])
+            if not isinstance(points, list):
+                points = layer["jump_points"] = []
+            points.append(point)
+            points.sort(key=lambda item: float(item.get("x", 0.0)))
+            self._persist_locked()
+            return RecordedEndpoint(layer_name, "jump_point", point["x"], point["y"])
+
+    def delete_jump_point(self, layer_name: str, index: int) -> bool:
+        """Delete one locked jump point by its current X-sorted index.
+
+        Jump points are immutable once recorded: editing one would silently
+        make its Y trigger disagree with the actual platform.  The UI can
+        therefore only remove a point and let the operator record a new one.
+        """
+
+        with self._lock:
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                return False
+            points = layer.get("jump_points")
+            if not isinstance(points, list) or not (0 <= int(index) < len(points)):
+                return False
+            points.pop(int(index))
+            if not points:
+                layer.pop("jump_points", None)
+            self._persist_locked()
+            return True
+
     def _project_layers_locked(
         self, layers: dict[str, Any], layout: CoordinateLayout
     ) -> None:

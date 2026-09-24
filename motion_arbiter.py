@@ -39,6 +39,7 @@ LOG = logging.getLogger(__name__)
 JUMP = "jump"
 MICRO_STEP = "micro_step"
 STAIR_JUMP = "stair_jump"
+FACING = "facing"
 
 # A tap can be refused by the input layer (game window not foreground, input
 # disarmed, focus stolen mid-tap).  A jump/micro-step is stale by then and is
@@ -65,6 +66,7 @@ class MotionArbiter(threading.Thread):
         jump_motion_seconds: float = 0.9,
         buff_motion_seconds: float = 0.6,
         micro_step_motion_seconds: float = 0.25,
+        facing_motion_seconds: float = 0.10,
         attack_grace_seconds: float = 0.73,
         delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:
@@ -78,6 +80,7 @@ class MotionArbiter(threading.Thread):
         self.micro_step_motion_seconds = max(
             0.0, float(micro_step_motion_seconds)
         )
+        self.facing_motion_seconds = max(0.0, float(facing_motion_seconds))
         self.attack_grace_seconds = max(0.0, float(attack_grace_seconds))
         self.delivery_retry_seconds = max(0.0, float(delivery_retry_seconds))
         # How long a buff may wait for the safe-stage gate before it says so.
@@ -85,6 +88,7 @@ class MotionArbiter(threading.Thread):
         # Installed after MovementWorker exists.  The arbiter serializes the
         # timing, while movement owns the directional key handoff itself.
         self._micro_step_callback: Any = None
+        self._facing_callback: Any = None
         # A confirmed stair stall borrows patrol's current direction and taps
         # Alt.  It is queued only to serialize against attacks; it is not an
         # ordinary directional arbiter motion.
@@ -204,6 +208,44 @@ class MotionArbiter(threading.Thread):
             self._cv.notify_all()
             return True
 
+    def request_facing(self, direction: str) -> bool:
+        """Queue one short Left/Right facing correction after a recovery."""
+
+        direction = str(direction).casefold()
+        if direction not in ("left", "right"):
+            return False
+        token = f"{FACING}:{direction}"
+        with self._cv:
+            if not self._automation_allowed_locked():
+                self._set_refusal_locked("automation inactive (stop or patrol off)")
+                return False
+            if not self._motion_gate_allows_locked():
+                self._set_refusal_locked("movement is not in a safe facing stage")
+                return False
+            if token in self._queued:
+                return True
+            self._pending.append(token)
+            self._queued.add(token)
+            self._cv.notify_all()
+            return True
+
+    def facing_pending(self, direction: str) -> bool:
+        """Whether a facing correction for *direction* is queued or running.
+
+        Callers own the correction as an OBLIGATION: a token can be drained
+        without ever reaching its callback (the safe-stage gate shuts for a walk
+        handoff, or a focus dip disarms input), and a drained token must not be
+        mistaken for an applied facing.  Asking the queue itself lets the owner
+        re-request the correction on the next settled frame.
+        """
+
+        direction = str(direction).casefold()
+        if direction not in ("left", "right"):
+            return False
+        token = f"{FACING}:{direction}"
+        with self._cv:
+            return token in self._queued or token == self._executing_token
+
     def request_stair_jump(self, direction: str, on_complete: Any = None) -> bool:
         """Queue a confirmed direction-preserving stair jump.
 
@@ -238,6 +280,12 @@ class MotionArbiter(threading.Thread):
         with self._cv:
             self._micro_step_callback = callback
 
+    def set_facing_callback(self, callback: Any) -> None:
+        """Install MovementWorker's atomic one-direction facing action."""
+
+        with self._cv:
+            self._facing_callback = callback
+
     def set_stair_jump_callback(self, callback: Any) -> None:
         """Install MovementWorker's direction-preserving stair-jump action."""
 
@@ -261,6 +309,37 @@ class MotionArbiter(threading.Thread):
 
         with self._cv:
             self._motion_gate_callback = callback
+
+    def cancel_pending(self, reason: str = "patrol stopped") -> None:
+        """Drain queued automation motions at a patrol lifecycle boundary.
+
+        Stop Patrol is not merely a UI state change: a jump, buff, micro-step,
+        or facing correction may already be waiting behind an attack grace
+        window.  Leaving that token queued lets it run after the user believes
+        automation has stopped (or after the next start), so cancel the queue
+        synchronously before the input sender performs its neutral key scrub.
+        """
+
+        with self._cv:
+            tokens = list(self._pending)
+            self._pending.clear()
+            self._queued.clear()
+            self._delivery_deadline.clear()
+            # An attack reservation is only a logical lease.  Its sender will
+            # observe the disarmed automation gate, while clearing the lease
+            # here prevents a stopped session from blocking the next one.
+            self._attack_reserved = False
+            callbacks: list[Any] = []
+            for token in tokens:
+                callbacks.extend(self._buff_completion_callbacks.pop(token, []))
+                callbacks.extend(
+                    self._stair_jump_completion_callbacks.pop(token, [])
+                )
+            self._cv.notify_all()
+        self._notify_buff_completion(callbacks, False)
+        if tokens:
+            LOG.info("motion arbiter cancelled %d pending action(s): %s",
+                     len(tokens), reason)
 
     def _set_refusal_locked(self, reason: str) -> None:
         """Record why the arbiter refused (so caller logs can name it)."""
@@ -374,6 +453,8 @@ class MotionArbiter(threading.Thread):
             return self.jump_motion_seconds
         if token == MICRO_STEP:
             return self.micro_step_motion_seconds
+        if token.startswith(f"{FACING}:"):
+            return self.facing_motion_seconds
         return self.buff_motion_seconds
 
     def _pop_locked(self, token: str) -> list[Any]:
@@ -442,6 +523,17 @@ class MotionArbiter(threading.Thread):
                             )
                         self._cv.wait(0.10)
                         continue
+                    if token.startswith(f"{FACING}:"):
+                        # Movement owns the facing as an obligation and re-asks
+                        # on the next settled frame, so a drained token is safe
+                        # - but it must be visible: without this line the log
+                        # shows a correction that was queued and then simply
+                        # never happened.
+                        LOG.info(
+                            "motion arbiter dropped %s: the safe-stage gate "
+                            "shut before its turn; movement will re-request",
+                            token,
+                        )
                     callbacks = self._pop_locked(token)
                     self._cv.notify_all()
                     self._notify_buff_completion(callbacks, False)
@@ -486,6 +578,12 @@ class MotionArbiter(threading.Thread):
                 if token.startswith("buff:"):
                     self._cv.notify_all()
                     return
+                if token.startswith(f"{FACING}:"):
+                    LOG.info(
+                        "motion arbiter dropped %s: the safe-stage gate shut "
+                        "during the attack grace; movement will re-request",
+                        token,
+                    )
                 callbacks = self._pop_locked(token)
                 self._cv.notify_all()
                 dropped = True
@@ -538,8 +636,7 @@ class MotionArbiter(threading.Thread):
                     self._executing_token = None
                     self._cv.notify_all()
                 self._notify_buff_completion(callbacks, False)
-                LOG.info("motion arbiter dropped micro-step: climb/return input "
-                         "is active")
+                LOG.info("motion arbiter dropped %s: climb/return input is active", token)
                 return
             with self._cv:
                 callback = self._micro_step_callback
@@ -549,12 +646,12 @@ class MotionArbiter(threading.Thread):
                     self._executing_token = None
                     self._cv.notify_all()
                 self._notify_buff_completion(callbacks, False)
-                LOG.warning("motion arbiter dropped micro-step: movement unavailable")
+                LOG.warning("motion arbiter dropped %s: movement unavailable", token)
                 return
             try:
                 tap_ok = callback() is not False
             except Exception:
-                LOG.exception("motion arbiter micro-step failed")
+                LOG.exception("motion arbiter %s failed", token)
                 tap_ok = False
             with self._cv:
                 self._pop_locked(token)
@@ -563,13 +660,40 @@ class MotionArbiter(threading.Thread):
                     self._busy_until = time.monotonic() + self._duration_for(token)
                 self._cv.notify_all()
             if tap_ok:
-                LOG.info("motion arbiter executed micro-step (lock %.2fs)",
+                LOG.info("motion arbiter executed %s (lock %.2fs)", token,
                          self._duration_for(token))
                 self.stop_event.wait(self._duration_for(token))
             else:
-                LOG.warning(
-                    "motion arbiter micro-step NOT delivered; event drained"
-                )
+                LOG.warning("motion arbiter %s NOT delivered; event drained", token)
+            return
+        elif token.startswith(f"{FACING}:"):
+            with self._cv:
+                callback = self._facing_callback
+            if not callable(callback):
+                with self._cv:
+                    callbacks = self._pop_locked(token)
+                    self._executing_token = None
+                    self._cv.notify_all()
+                self._notify_buff_completion(callbacks, False)
+                LOG.warning("motion arbiter dropped facing correction: movement unavailable")
+                return
+            direction = token.partition(":")[2]
+            try:
+                tap_ok = callback(direction) is not False
+            except Exception:
+                LOG.exception("motion arbiter facing correction failed")
+                tap_ok = False
+            with self._cv:
+                self._pop_locked(token)
+                self._executing_token = None
+                if tap_ok:
+                    self._busy_until = time.monotonic() + self._duration_for(token)
+                self._cv.notify_all()
+            if tap_ok:
+                LOG.info("motion arbiter executed facing:%s", direction)
+                self.stop_event.wait(self._duration_for(token))
+            else:
+                LOG.warning("motion arbiter facing correction NOT delivered; event drained")
             return
         else:
             key = token.partition(":")[2]

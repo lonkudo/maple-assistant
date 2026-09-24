@@ -212,6 +212,11 @@ class WindowKeySender:
         # movement and attack workers must be able to overlap their events.
         self._selection_lock = threading.Lock()
         self._key_state_lock = threading.Lock()
+        # Stop Patrol must never leave the dashboard in its "releasing keys"
+        # state merely because another sender currently owns the ledger lock.
+        # This guard permits one deferred bookkeeping pass after the immediate
+        # game-side emergency release below.
+        self._deferred_forget_lock = threading.Lock()
         self._key_owners: dict[str, int] = {}
         # v0411: the name of the caller that owns the keyboard exclusively (the auto-reconnect takes
         # it while it runs, so the attack/jump/channel-switch workers cannot type into the game).
@@ -230,6 +235,13 @@ class WindowKeySender:
         self._used_keys: set[str] = set()
         self._input_session = 0
         self._delivery_warned_at = float("-inf")
+        # Count of assistant-sent transactions that involve Ctrl (the quick
+        # message's Enter/Ctrl+V/Enter, a trade paste, or a Ctrl attack key).
+        # The hotkey worker re-sends a Ctrl key-up while the operator holds Ctrl
+        # after a chord; a Ctrl key-up landing inside one of OUR Ctrl chords
+        # would turn that chord into nothing (the game would receive a bare
+        # "v"), so those callers stand down while this is non-zero.
+        self._ctrl_chord_in_flight = 0
         self._input_enabled = threading.Event()
         # Refusal-burst bookkeeping for ``_note_input_refused``.
         self._input_refusal_reason = ""
@@ -264,22 +276,162 @@ class WindowKeySender:
         the game window solely to deliver the neutralising key-up sequence.
         """
 
-        # Disarm before selecting a window: no worker may acquire a new key
-        # while the foreground transition is in progress.
-        self._input_enabled.clear()
+        # Remember whether the game already owns focus. A Ctrl+` stop happens
+        # in the game window, so its immediate scrub reaches MapleStory. Doing
+        # a second delayed scrub after an unnecessary refocus can land *after*
+        # the operator begins holding Left/Right manually and cancel that
+        # physical key-down.
+        game_was_foreground = False
         if refocus_before_release and not self.dry_run:
             try:
-                if not self.select_window():
-                    LOG.warning("INPUT RESET: could not refocus game before key release")
+                game_was_foreground = self.is_game_foreground()
             except Exception:
-                # Still clear local ownership below.  A later Start Patrol
-                # does another unconditional scrub before it re-arms input.
+                LOG.debug("could not check game focus before input shutdown", exc_info=True)
+
+        # Disarm before any foreground work: no worker may acquire a new key
+        # while shutdown is in progress.  Do not take the ownership lock before
+        # a UI-button stop has restored the game window: that old local reset
+        # both sent its key-ups to Tk (not the game) and could block Stop Patrol
+        # indefinitely behind a stalled sender.
+        self._input_enabled.clear()
+        delivered_to_game = game_was_foreground
+        if refocus_before_release and not self.dry_run and not game_was_foreground:
+            try:
+                delivered_to_game = bool(self.select_window()) and self.is_game_foreground()
+                if not delivered_to_game:
+                    LOG.warning("INPUT RESET: game was not foreground after refocus")
+            except Exception:
+                # The game-side key-up cannot be delivered without focus. A
+                # later Start Patrol always performs its own neutral reset.
                 LOG.warning(
                     "INPUT RESET: game refocus failed before key release",
                     exc_info=True,
                 )
-        self.reset_input_session("input disabled")
+
+        if delivered_to_game:
+            # Ctrl+` is pressed in MapleStory itself. Do not wait behind a
+            # worker's ownership lock before releasing the bot's keys: that
+            # late release can otherwise cancel the player's manual Left/Right
+            # press seconds after Stop Patrol. This same raw release is also
+            # correct for a UI-button stop after it has refocused the game.
+            # The ledger is cleared later without another game-side event.
+            release_reason = (
+                "input disabled (hotkey)"
+                if game_was_foreground else "input disabled (after UI refocus)"
+            )
+            self._emergency_release_without_lock(release_reason)
+            self._forget_input_session_or_defer(
+                f"{release_reason} bookkeeping"
+            )
+        else:
+            # No foreground game window means a raw SendInput key-up would hit
+            # some other app. Forget locally without delaying the UI; Start
+            # Patrol will do a full neutral game-side scrub after it selects
+            # the game again.
+            self._forget_input_session_or_defer("input disabled (no game focus)")
         LOG.info("live keyboard input disabled")
+
+    def _emergency_release_without_lock(self, reason: str) -> None:
+        """Send neutral key-ups now, without waiting for ownership bookkeeping.
+
+        This is used only when the game is already foreground at an explicit
+        hotkey stop. It deliberately does not edit the ledger; a concurrent
+        worker may be inside its own transition. ``_forget_input_session``
+        performs that local cleanup once the lock is available, without
+        emitting a delayed second key-up.
+        """
+
+        keys = set(self._MOVEMENT_KEYS)
+        try:
+            keys.update(tuple(self._used_keys))
+            keys.update(tuple(self._key_owners))
+            keys.update(tuple(self._physical_keys))
+        except RuntimeError:
+            # A concurrent set mutation only means this emergency pass uses
+            # the guaranteed movement superset; the normal ledger cleanup
+            # immediately follows.
+            pass
+        for key in sorted(keys):
+            if key not in self._SCAN:
+                continue
+            try:
+                scan_code, extended = self._SCAN[key]
+                if not self.dry_run:
+                    self._send_scan_code(scan_code, key_up=True, extended=extended)
+            except Exception:
+                LOG.debug("emergency key release failed: %s", key, exc_info=True)
+        LOG.info("INPUT EMERGENCY RELEASE reason=%s keys=%s", reason,
+                 ", ".join(sorted(keys)))
+
+    def _forget_input_session(self, reason: str) -> int:
+        """Clear ownership locally without emitting any Windows key event."""
+
+        with self._key_state_lock:
+            session = self._forget_input_session_locked()
+        LOG.info("INPUT SESSION FORGOTTEN session=%d reason=%s", session, reason)
+        return session
+
+    def _forget_input_session_locked(self) -> int:
+        """Forget ownership while ``_key_state_lock`` is already held."""
+
+        self._key_owners.clear()
+        self._physical_keys.clear()
+        self._input_session += 1
+        return self._input_session
+
+    def _forget_input_session_or_defer(self, reason: str) -> None:
+        """Forget an emergency-stop ledger without making Stop Patrol wait.
+
+        The immediate raw key-up has already reached the foreground game.  The
+        remaining work is only local bookkeeping, so it is safe to let it wait
+        for an in-flight sender.  In particular, holding this UI transition
+        behind the ledger lock made the app appear permanently broken after a
+        rope-climb transaction stalled.
+        """
+
+        if self._key_state_lock.acquire(blocking=False):
+            try:
+                session = self._forget_input_session_locked()
+            finally:
+                self._key_state_lock.release()
+            LOG.info("INPUT SESSION FORGOTTEN session=%d reason=%s", session, reason)
+            return
+
+        if not self._deferred_forget_lock.acquire(blocking=False):
+            LOG.info("INPUT SESSION FORGET already pending reason=%s", reason)
+            return
+
+        LOG.warning(
+            "INPUT SESSION FORGET deferred: keyboard ledger is busy; "
+            "Stop Patrol may continue now"
+        )
+
+        def forget_when_safe() -> None:
+            try:
+                with self._key_state_lock:
+                    # If a new patrol was armed before this old cleanup got
+                    # the lock, its fresh reset owns the ledger. Never erase
+                    # that new session from an old Stop Patrol request.
+                    if self._input_enabled.is_set():
+                        LOG.info(
+                            "INPUT SESSION FORGET skipped: a newer patrol "
+                            "session is already enabled"
+                        )
+                        return
+                    session = self._forget_input_session_locked()
+                LOG.info(
+                    "INPUT SESSION FORGOTTEN session=%d reason=%s (deferred)",
+                    session,
+                    reason,
+                )
+            finally:
+                self._deferred_forget_lock.release()
+
+        threading.Thread(
+            target=forget_when_safe,
+            name="input-session-forget",
+            daemon=True,
+        ).start()
 
     def _emit_locked(self, key: str, *, key_up: bool) -> None:
         """Emit and ledger one transition while the input state is locked."""
@@ -293,12 +445,36 @@ class WindowKeySender:
             self._physical_keys.add(key)
             self._used_keys.add(key)
 
-    def force_key_up(self, key: str, *, reason: str = "recovery") -> bool:
+    def ctrl_chord_in_flight(self) -> bool:
+        """True while the assistant itself is sending a Ctrl-involving chord.
+
+        The hotkey Ctrl cleanup re-sends a Ctrl key-up while the operator keeps
+        Ctrl held after a chord.  A quick message is Enter + Ctrl+V + Enter on
+        the game window, so a stray Ctrl key-up inside it would paste nothing -
+        the game would receive a bare "v".  Callers that re-send synthetic
+        key-ups must check this and stand down.
+        """
+
+        return self._ctrl_chord_in_flight > 0
+
+    def _begin_ctrl_chord(self) -> None:
+        self._ctrl_chord_in_flight += 1
+
+    def _end_ctrl_chord(self) -> None:
+        self._ctrl_chord_in_flight = max(0, self._ctrl_chord_in_flight - 1)
+
+    def force_key_up(
+        self, key: str, *, reason: str = "recovery", quiet: bool = False
+    ) -> bool:
         """Unconditionally inject key-up and forget every claim for ``key``.
 
         This is the recovery path for a game-side key that may still be held
         after a lost transition.  It intentionally works when the logical
         owner count is already zero.
+
+        ``quiet`` suppresses the per-call log line: the hotkey chord cleanup
+        repeats this while the operator keeps the modifier held (see
+        ``HotkeyWorker``), and one line per repeat would bury the running log.
         """
 
         key = key.casefold()
@@ -307,7 +483,8 @@ class WindowKeySender:
         with self._key_state_lock:
             self._key_owners.pop(key, None)
             self._emit_locked(key, key_up=True)
-        LOG.info("key-up forced=%s reason=%s", key, reason)
+        if not quiet:
+            LOG.info("key-up forced=%s reason=%s", key, reason)
         return True
 
     def reset_input_session(self, reason: str = "reset") -> int:
@@ -514,7 +691,15 @@ class WindowKeySender:
             return False
 
     def select_window(self) -> bool:
-        """Restore and foreground the configured game window automatically."""
+        """Restore and foreground the configured game window automatically.
+
+        The handle from the last successful selection is the least disruptive
+        target, so always try it first.  If Windows cannot activate it (or the
+        game recreated the top-level window), discard that handle and locate a
+        fresh matching game window before trying again.  Every caller shares
+        this rule: patrol, recording, trade, reconnect, and the hotkey workers
+        therefore cannot keep sending input to a stale game instance.
+        """
 
         if self.dry_run:
             return True
@@ -526,16 +711,12 @@ class WindowKeySender:
         LOG.info("WINDOW SELECT: waiting for selection lock")
         with self._selection_lock:
             LOG.info("WINDOW SELECT: selection lock acquired")
-            # A game can recreate its top-level window while keeping the same
-            # title. Never rely on an HWND cached by a previous selection.
-            hwnd = self._find_target_window()
-            LOG.info("WINDOW SELECT: found hwnd=%s", hwnd)
-            try:
+            def activate(hwnd: int) -> bool:
                 # Bring the game to the foreground WITHOUT pressing Alt (Alt is
                 # the game's JUMP key).  Windows can refuse briefly (foreground
                 # lock, or the assistant runs at a different privilege than the
                 # game), so retry direct SetForegroundWindow + thread-input
-                # attachment a few times before giving up.
+                # attachment a few times before considering this handle stale.
                 for attempt in range(5):
                     try:
                         if win32gui.IsIconic(hwnd):
@@ -550,7 +731,7 @@ class WindowKeySender:
                                       exc_info=True)
                         time.sleep(0.05)
                         if win32gui.GetForegroundWindow() == hwnd:
-                            LOG.info("WINDOW SELECT: activation verified")
+                            LOG.info("WINDOW SELECT: activation verified hwnd=%s", hwnd)
                             return True
                     except Exception:
                         LOG.debug("foreground attempt failed", exc_info=True)
@@ -592,10 +773,37 @@ class WindowKeySender:
                                 except Exception:
                                     pass
                         if win32gui.GetForegroundWindow() == hwnd:
-                            LOG.info("WINDOW SELECT: activation verified")
+                            LOG.info("WINDOW SELECT: activation verified hwnd=%s", hwnd)
                             return True
                     time.sleep(0.1)
+                return False
 
+            cached = self.hwnd
+            if cached:
+                try:
+                    current_is_valid = bool(
+                        win32gui.IsWindow(cached) and win32gui.IsWindowVisible(cached)
+                    )
+                except Exception:
+                    current_is_valid = False
+                if current_is_valid:
+                    LOG.info("WINDOW SELECT: trying current hwnd=%s", cached)
+                    if activate(cached):
+                        return True
+                    LOG.warning("WINDOW SELECT: current hwnd=%s could not be activated; "
+                                "re-anchoring game window", cached)
+                else:
+                    LOG.info("WINDOW SELECT: cached hwnd=%s is stale; re-anchoring game window",
+                             cached)
+
+            # A game can recreate its top-level window while keeping the same title.
+            # Only search after the current instance was proven unavailable.
+            self.hwnd = None
+            try:
+                hwnd = self._find_target_window()
+                LOG.info("WINDOW SELECT: re-anchored hwnd=%s", hwnd)
+                if activate(hwnd):
+                    return True
                 raise OSError(
                     "Windows 拒绝将游戏窗口置为前台。请确认：1) 助手与游戏以"
                     "相同权限运行（同为管理员或同为普通用户）；2) 游戏窗口"
@@ -845,6 +1053,21 @@ class WindowKeySender:
         """One down/hold/up with a focus check at both ends (see :meth:`tap`)."""
 
         started = time.monotonic()
+        # The configured attack key may be Ctrl itself: the hotkey cleanup's
+        # synthetic Ctrl key-up must not land inside our own attack tap, so the
+        # whole down/hold/up transaction stands down while it runs.
+        own_ctrl = key == "ctrl"
+        if own_ctrl:
+            self._begin_ctrl_chord()
+        try:
+            return self._tap_verified_inner(key, owner=owner, started=started)
+        finally:
+            if own_ctrl:
+                self._end_ctrl_chord()
+
+    def _tap_verified_inner(
+        self, key: str, *, owner: str, started: float
+    ) -> bool:
         if not self.key_down(key, owner=owner):
             return False
         owned_at_release = True
@@ -950,9 +1173,15 @@ class WindowKeySender:
             # Older/slower clients need time to open chat before Ctrl+V and
             # to consume the clipboard paste before the final Enter.
             time.sleep(0.15)
-            transition("ctrl", False)
-            direct_tap("v")
-            transition("ctrl", True)
+            # The hotkey Ctrl cleanup must not re-send a Ctrl key-up inside this
+            # chord: the paste would become a bare "v" in the game.
+            self._begin_ctrl_chord()
+            try:
+                transition("ctrl", False)
+                direct_tap("v")
+                transition("ctrl", True)
+            finally:
+                self._end_ctrl_chord()
             time.sleep(0.15)
             direct_tap("enter")
         LOG.info("quick message pasted and sent to game window")
@@ -982,13 +1211,22 @@ class WindowKeySender:
             self._send_scan_code(scan_code, key_up=key_up, extended=extended)
 
         with self._key_state_lock:
-            for keys in normalized:
-                for key in keys:
-                    transition(key, False)
-                time.sleep(0.025)
-                for key in reversed(keys):
-                    transition(key, True)
-                time.sleep(0.08)
+            # A chord of ours that contains Ctrl must not have a synthetic Ctrl
+            # key-up (the hotkey cleanup) land inside it.
+            involves_ctrl = any("ctrl" in keys for keys in normalized)
+            if involves_ctrl:
+                self._begin_ctrl_chord()
+            try:
+                for keys in normalized:
+                    for key in keys:
+                        transition(key, False)
+                    time.sleep(0.025)
+                    for key in reversed(keys):
+                        transition(key, True)
+                    time.sleep(0.08)
+            finally:
+                if involves_ctrl:
+                    self._end_ctrl_chord()
         return True
 
     @staticmethod

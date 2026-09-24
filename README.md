@@ -25,6 +25,10 @@ Two configuration files keep personal settings separate from shipped defaults:
 
 Use **导入配置** and **导出配置** in the running-log panel to move your personal configuration between installations. Import and export actions are recorded in the log.
 
+## Interface layout
+
+The interface calculates each main column from its widest supported content when it is created, then keeps that column width fixed for the rest of the session. Switching attack modes only enables or disables the controls already reserved in the layout; it does not repack rows or resize either column. The window height remains adjustable and is allowed to grow or shrink as content such as quick-message rows changes.
+
 ## Recording a map
 
 Record each map before enabling a route:
@@ -52,13 +56,11 @@ At patrol start, the assistant focuses the game, uses the recorded minimap geome
 
 ### Attack modes
 
-**固定攻击** performs the configured attack key at a fixed base interval with an optional random range. Optional actions include:
+**固定攻击** performs the configured attack key at its selected fixed interval. **小碎步** and **重置空打** are optional timed motions, each with its own interval.
 
-- **台阶跳** — detects sustained X/Y stalls and submits one recovery jump, with a cooldown to prevent repeat jumping.
-- **跳跃** — periodic jump behavior.
-- **小碎步** — a short, atomic left/right correction that yields to normal patrol movement after it completes.
+**小碎步** is an atomic left/right correction. Each direction is held for 220 ms with a 100 ms neutral gap; normal patrol resumes only after the sequence completes. **重置空打** performs a direction-preserving jump sequence with its own independent interval.
 
-**站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打** is an option under this mode.
+**站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
 
 HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input.
 
@@ -66,7 +68,7 @@ HP and MP potions have priority over ordinary combat actions. Pet food is treate
 
 The additional-functions panel can enable sound, screen flash, Telegram messages, disconnect alerts, lie-detection alerts, timer alarms, and other-player channel switching.
 
-Disconnect handling deliberately avoids treating every missing minimap marker as a disconnect. At the shared 5 FPS capture rate, the marker must be absent for 50 samples (about ten seconds), **and** the current frame must match the login page before an offline event is accepted. In minimap-less zones, monitoring pauses after the absence threshold and resumes when the marker returns; it does not repeatedly reconnect or stop patrol merely because a minimap is hidden.
+Disconnect handling deliberately avoids treating every missing minimap marker as a disconnect. At the shared 5 FPS capture rate, the marker must be absent for 50 samples (about ten seconds), **and** the current frame must show either the login-page evidence or the dedicated offline prompt. The prompt check remains valid when the prompt covers the login background. In minimap-less zones, monitoring pauses after the absence threshold and resumes when the marker returns; it does not repeatedly reconnect or stop patrol merely because a minimap is hidden.
 
 Automatic reconnect begins only after this verified offline event and then follows the login-page workflow.
 
@@ -93,6 +95,7 @@ Quick messages are ordered by creation time. Click once to copy, double-click to
 | `Ctrl+1` … `Ctrl+0` | Send quick messages in displayed order. |
 | `Ctrl+Left` / `Ctrl+Right` | Record left / right endpoint. |
 | `Ctrl+Up` | Record rope. |
+| `Ctrl+D` / `Ctrl+F` | Record a left-moving / right-moving jump point. |
 | `Ctrl+Down` | Select the next layer. |
 | `Ctrl+Home` | Select the patrol start layer. |
 | `Ctrl+Insert` / `Ctrl+Delete` | Add / delete the highest layer. |
@@ -124,5 +127,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
 The release script advances `VERSION`, creates `release/MapleAssistant-<version>.zip`, and removes the previous release ZIP. Field testing is the normal validation path; do not run broad unit-test suites unless specifically requested.
+
+### Release-to-Git mapping
+
+Each shipped version is committed and marked with a Git tag in the form
+`release/vX.Y.Z`. The tag is the authoritative mapping from a user-reported
+version to its exact source snapshot; use `git show release/vX.Y.Z` when
+investigating an older build. Tags are created after the release ZIP is built,
+and must not be moved after publication.
+
+| Release version | Git tag | Status |
+| --- | --- | --- |
+| `1.1.53` | `release/v1.1.53` | First durable release checkpoint. |
+
+Releases before `1.1.53` were distributed as replace-in-place ZIPs without
+matching Git checkpoints, so their exact historical source cannot be recovered
+reliably from a version number alone.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for component ownership, data flow, and concurrency rules.

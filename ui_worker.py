@@ -32,6 +32,10 @@ from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
 from countdown_worker import play_mp3
+from licensing import (
+    LicenseStatus, activate as activate_license, activate_via_server,
+    verify_license,
+)
 from reconnect_worker import (
     CHANNEL_DEFAULT,
     CHANNEL_MAX,
@@ -54,7 +58,11 @@ LOG = logging.getLogger(__name__)
 # Hotkey actions that TYPE into the game: they need live input armed, so they re-arm it themselves
 # when the auto-reconnect (or a failed run) left it off.  Recording/selection chords do not type and
 # are deliberately absent.
-TYPING_HOTKEY_PREFIXES = ("quick_message:", "trade:", "quick_pickup:")
+# Trade actions use ``send_direct_keys`` inside TradeWorker, which is scoped
+# to its explicit dialog sequence and works while general patrol input is
+# disarmed.  They must not be included here: re-arming general input on
+# Ctrl+Q/Ctrl+W can wake unrelated attack workers while patrol is stopped.
+TYPING_HOTKEY_PREFIXES = ("quick_message:", "quick_pickup:")
 
 # 自动过测谎 debouncing.  The lie detector reports a NEW event when it sees the square again after it
 # was gone (and None when it clears), but its detection can flicker frame to frame, so the consumer
@@ -78,8 +86,15 @@ AUTO_LIE_PENDING_MAX_SECONDS = 90.0
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1036
+_INITIAL_WINDOW_WIDTH = 1076
 _INITIAL_WINDOW_HEIGHT = 560
+_LEFT_COLUMN_WIDTH = 500
+_RIGHT_COLUMN_WIDTH = 540
+_LAYER_AXIS_WIDTH = 430
+_LAYER_AXIS_HEIGHT = 52
+_LAYER_AXIS_LEFT = 8
+_LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH - 8
+_LAYER_AXIS_Y = 36
 # Both columns are FIXED at 500px (500 + 500 + 12px gap + 24px padding).
 # The default height is deliberately compact; users can still enlarge it and
 # their saved window size is never overwritten.
@@ -637,7 +652,7 @@ def record_button_is_locked(saved_endpoint: Any, explicitly_unlocked: bool) -> b
 def recorded_coordinate_text(x: float, y: float) -> str:
     """Compact button-only display; stored coordinate precision is unchanged."""
 
-    return f"x={float(x):.4f} y={float(y):.4f}"
+    return f"({float(x):.4f}, {float(y):.4f})"
 
 
 def machine_name_button_text(name: str) -> str:
@@ -705,6 +720,9 @@ class UiWorker(threading.Thread):
     _SHOW_SHUTDOWN_PANEL = False
     _FIXED_RANDOM_GAP_STEP = 0.1
     _FIXED_RANDOM_GAP_MAX = 30.0
+    _FIXED_ATTACK_INTERVAL_MAX = 30.0
+    _OPTIONAL_MOTION_INTERVAL_MAX = 60.0
+    _ATTACK_TIMING_SLIDER_LENGTH = 112
     # A DOUBLE click on a 随机 −/+ button moves the gap by this much in one go
     # (five seconds instead of 0.1), while a single click keeps the precise fine
     # step and holding keeps repeating it.
@@ -817,6 +835,7 @@ class UiWorker(threading.Thread):
         # detector calls `on_lie_event_for_api()` from its own thread, which only raises a flag; the Tk
         # thread services it in `_poll` (nothing Tk is touched off-thread).
         self._api_auto_lie_pending = False
+        self._api_auto_lie_session_armed = False
         self._api_auto_lie_pending_since = 0.0
         self._api_auto_lie_wait_logged = False
         # Debounce state: whether the window currently on screen has already been handled, when
@@ -883,6 +902,10 @@ class UiWorker(threading.Thread):
         self.automation_active_event = automation_active_event
         self.lie_watch_armed_event = lie_watch_armed_event
         self.disconnect_watch_armed_event = disconnect_watch_armed_event
+        # License verification is an independent boundary: it never changes
+        # patrol/trade worker internals, it only decides whether UI actions may
+        # enter those workflows.
+        self._license_status: LicenseStatus = verify_license()
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -916,11 +939,21 @@ class UiWorker(threading.Thread):
         # disable and re-enable the controller within seconds; only a state
         # that holds for two consecutive polls is treated as a real change).
         self._patrol_pending_running: Optional[bool] = None
+        # Stop first changes the controller/UI state, then releases the game
+        # keys.  Key release may wait on an active worker transaction, so it
+        # must never freeze Tk or leave the Stop button visually stale.
+        self._patrol_stop_pending = False
+        self._patrol_stop_cleanup_done = threading.Event()
+        # Ctrl+` can be reported twice while Windows changes focus.  A second
+        # request queued during a start must not immediately undo that start
+        # after calibration completes.
+        self._hotkey_toggle_ignore_until = 0.0
 
     def run(self) -> None:
         try:
             import tkinter as tk
             from tkinter import ttk
+            self._tk = tk
             self._ttk = ttk
 
             root = tk.Tk()
@@ -999,6 +1032,16 @@ class UiWorker(threading.Thread):
             # inner panels must not spread the window open on first display.
             container.pack_propagate(False)
 
+            license_bar = ttk.Frame(container)
+            license_bar.pack(fill="x", pady=(4, 0))
+            self._license_label = ttk.Label(license_bar, anchor="w")
+            self._license_label.pack(side="left", fill="x", expand=True)
+            self._license_button = ttk.Button(
+                license_bar, text="激活授权", command=self._activate_license
+            )
+            self._license_button.pack(side="right")
+            self._refresh_license_ui()
+
             columns = ttk.Frame(container)
             # A shared small top inset keeps both panel stacks visually clear
             # of the title separator, without the old unequal left-only gap.
@@ -1009,8 +1052,11 @@ class UiWorker(threading.Thread):
             # Both stacks have the same compact fixed width. The child rows
             # deliberately use short controls and ellipsized quick messages
             # rather than making the left column wider than the right.
-            columns.columnconfigure(0, weight=0, minsize=500)
-            columns.columnconfigure(1, weight=0, minsize=500)
+            columns.columnconfigure(0, weight=0, minsize=_LEFT_COLUMN_WIDTH)
+            # The right stack contains the longest complete control line.
+            # Give it the extra 40px it actually needs instead of clipping
+            # labels or adding spacing inside individual panels.
+            columns.columnconfigure(1, weight=0, minsize=_RIGHT_COLUMN_WIDTH)
             # Keep the two independently-sized stacks pinned to the very top
             # of the available area.  A weighted grid row can leave a small
             # theme-dependent lead-in above a LabelFrame on some systems.
@@ -1020,6 +1066,11 @@ class UiWorker(threading.Thread):
             self._col1_frame = col1
             col2 = ttk.Frame(columns)
             col2.grid(row=0, column=1, sticky="new", padx=(6, 0))
+            # Keep the right stack at one stable width.  Its panel contents
+            # must wrap/truncate within it instead of changing grid geometry
+            # and causing a full window relayout.
+            col2.configure(width=_RIGHT_COLUMN_WIDTH)
+            col2.grid_propagate(False)
             self._col2_frame = col2
 
             controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=8)
@@ -1096,6 +1147,7 @@ class UiWorker(threading.Thread):
             )
             self._layer_rows_frame = ttk.Frame(controls)
             self._layer_rows_frame.pack(fill="x")
+            self._layer_axis_canvases: dict[str, Any] = {}
             # ``ttk.Label`` does not implement ``height`` on Tk 8.6 / Python
             # 3.10.  Reserve text space with a fixed-height parent instead;
             # the changing patrol-start status can then never shift the rows
@@ -1306,7 +1358,7 @@ class UiWorker(threading.Thread):
             # the fixed worker lives in the assistant process (AttackWorker)
             # and is applied live.
             fixed_panel = ttk.LabelFrame(
-                col1, text="攻击模式", padding=8
+                col1, text="攻击模式", padding=(6, 5)
             )
             fixed_panel.pack(fill="x", pady=(0, 8))
             mode_row = ttk.Frame(fixed_panel)
@@ -1339,45 +1391,22 @@ class UiWorker(threading.Thread):
             ).pack(side="left", padx=(0, 8))
             fixed_key_row = ttk.Frame(fixed_panel)
             self._fixed_key_row = fixed_key_row
-            fixed_key_row.pack(fill="x", pady=(6, 0))
-            # Keep the original left-to-right gadget sequence together, then
-            # right-align that complete sequence in every attack row.
-            fixed_gadget_group = ttk.Frame(fixed_key_row)
-            fixed_gadget_group.pack(side="right")
-            fixed_random_group = ttk.Frame(fixed_gadget_group)
-            self._fixed_random_group = fixed_random_group
-            ttk.Label(fixed_random_group, text="随机:").pack(side="left")
-            self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
-            fixed_gap_minus = ttk.Button(
-                fixed_random_group, text="−", width=2,
+            fixed_key_row.pack(fill="x", pady=(4, 0))
+            # 跳打 is a 站桩攻击 child option. Keep it directly before 按键
+            # on this same row so the mode's attack control is one unit.
+            self._stationary_jump_enabled_var = tk.BooleanVar(value=False)
+            stationary_jump_button = ttk.Checkbutton(
+                fixed_key_row, text="跳打",
+                variable=self._stationary_jump_enabled_var,
+                command=self._fixed_on_change,
             )
-            self._bind_repeat_step_button(
-                fixed_gap_minus,
-                lambda: self._fixed_adjust_random_gap(-0.1),
-                current=self._fixed_random_gap_seconds,
-                coarse=lambda anchor: self._set_fixed_random_gap(
-                    (self._fixed_random_gap_seconds() if anchor is None
-                     else anchor) - self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            fixed_gap_minus.pack(side="left", padx=(3, 2))
-            self._fixed_random_gap_label = ttk.Label(
-                fixed_random_group, text="0.1s", width=5, anchor="center"
-            )
-            self._fixed_random_gap_label.pack(side="left")
-            fixed_gap_plus = ttk.Button(fixed_random_group, text="+", width=2)
-            self._bind_repeat_step_button(
-                fixed_gap_plus,
-                lambda: self._fixed_adjust_random_gap(0.1),
-                current=self._fixed_random_gap_seconds,
-                coarse=lambda anchor: self._set_fixed_random_gap(
-                    (self._fixed_random_gap_seconds() if anchor is None
-                     else anchor) + self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            fixed_gap_plus.pack(side="left", padx=(2, 0))
-
-            ttk.Label(fixed_key_row, text="按键:").pack(
+            self._stationary_jump_button = stationary_jump_button
+            # This slot always exists.  Toggling attack mode only changes
+            # enabled state, never the row's geometry.
+            stationary_jump_button.pack(side="left", padx=(0, 4))
+            fixed_key_label = ttk.Label(fixed_key_row, text="按键:")
+            self._fixed_key_label = fixed_key_label
+            fixed_key_label.pack(
                 side="left", padx=(0, 4)
             )
             self._fixed_attack_key_var = tk.StringVar(value="ctrl")
@@ -1395,15 +1424,20 @@ class UiWorker(threading.Thread):
             self._attach_bind_hint(fixed_key_button)
             # The interval/range controls sit in their own sub-frame so the
             # 跳跃攻击 mode can hide them and leave only the 按键 row.
-            fixed_interval_group = ttk.Frame(fixed_gadget_group)
-            fixed_interval_group.pack(side="left")
+            fixed_interval_group = ttk.Frame(fixed_key_row)
+            fixed_interval_group.pack(side="right")
             ttk.Label(fixed_interval_group, text="每").pack(side="left")
             # A deliberately short slider keeps the full attack row inside
             # the compact left column without an artificial empty gap.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
             fixed_interval_slider = ttk.Scale(
-                fixed_interval_group, from_=0.2, to=10.0, orient="horizontal",
-                variable=self._fixed_interval_var, length=82,
+                fixed_interval_group, from_=0.2,
+                to=self._FIXED_ATTACK_INTERVAL_MAX, orient="horizontal",
+                # 0.2..10.0 in 0.1s steps needs at least 98 usable pixels;
+                # the former 82px track physically could not land on every
+                # value even with snap rounding.
+                variable=self._fixed_interval_var,
+                length=self._ATTACK_TIMING_SLIDER_LENGTH,
                 command=self._fixed_on_change,
             )
             fixed_interval_slider.pack(side="left", padx=(0, 2))
@@ -1411,168 +1445,138 @@ class UiWorker(threading.Thread):
                 fixed_interval_group, text="3.0s", width=5
             )
             self._fixed_interval_label.pack(side="left", padx=(0, 2))
-            self._fixed_range_label = ttk.Label(
-                fixed_interval_group, text="(3.0s, 3.1s)", width=13
+            self._fixed_interval_range_label = ttk.Label(
+                fixed_interval_group, text="(3.0s, 3.1s)", width=14,
+                anchor="w",
             )
-            self._fixed_range_label.pack(side="left")
+            self._fixed_interval_range_label.pack(side="left")
             self._fixed_interval_group = fixed_interval_group
-            fixed_random_group.pack(side="left", padx=(4, 0))
-
-            # Former 跳跃攻击 is a 站桩攻击 child option, not a peer mode.
-            # It belongs directly below the 按键 row and starts at the panel's
-            # left edge, matching the other optional controls.
-            stationary_jump_row = ttk.Frame(fixed_panel)
-            self._stationary_jump_row = stationary_jump_row
-            self._stationary_jump_enabled_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                stationary_jump_row, text="跳打",
-                variable=self._stationary_jump_enabled_var,
-                command=self._fixed_on_change,
-            ).pack(side="left")
-
-            jump_row = ttk.Frame(fixed_panel)
-            jump_row.pack(fill="x", pady=(6, 0))
-            self._jump_row = jump_row
-            jump_gadget_group = ttk.Frame(jump_row)
-            jump_gadget_group.pack(side="right")
-            jump_random_group = ttk.Frame(jump_gadget_group)
-            ttk.Label(jump_random_group, text="随机:").pack(side="left")
-            self._random_jump_gap_var = tk.DoubleVar(value=0.1)
-            jump_gap_minus = ttk.Button(jump_random_group, text="−", width=2)
+            fixed_random_group = ttk.Frame(fixed_key_row)
+            fixed_random_group.pack(side="right", padx=(0, 4))
+            self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
+            fixed_gap_minus = ttk.Button(fixed_random_group, text="−", width=2)
             self._bind_repeat_step_button(
-                jump_gap_minus,
-                lambda: self._random_jump_adjust_gap(-0.1),
-                current=self._random_jump_gap_seconds,
-                coarse=lambda anchor: self._set_random_jump_gap(
-                    (self._random_jump_gap_seconds() if anchor is None
-                     else anchor) - self._RANDOM_GAP_COARSE_STEP
+                fixed_gap_minus, lambda: self._fixed_adjust_random_gap(-0.1),
+                current=self._fixed_random_gap_seconds,
+                coarse=lambda anchor: self._set_fixed_random_gap(
+                    (self._fixed_random_gap_seconds() if anchor is None else anchor)
+                    - self._RANDOM_GAP_COARSE_STEP
                 ),
             )
-            jump_gap_minus.pack(side="left", padx=(3, 2))
-            self._random_jump_gap_label = ttk.Label(
-                jump_random_group, text="0.1s", width=5, anchor="center"
+            fixed_gap_minus.pack(side="left", padx=(0, 1))
+            self._fixed_random_gap_label = ttk.Label(
+                fixed_random_group, text="0.1s", width=5, anchor="center"
             )
-            self._random_jump_gap_label.pack(side="left")
-            jump_gap_plus = ttk.Button(jump_random_group, text="+", width=2)
+            self._fixed_random_gap_label.pack(side="left")
+            fixed_gap_plus = ttk.Button(fixed_random_group, text="+", width=2)
             self._bind_repeat_step_button(
-                jump_gap_plus,
-                lambda: self._random_jump_adjust_gap(0.1),
-                current=self._random_jump_gap_seconds,
-                coarse=lambda anchor: self._set_random_jump_gap(
-                    (self._random_jump_gap_seconds() if anchor is None
-                     else anchor) + self._RANDOM_GAP_COARSE_STEP
+                fixed_gap_plus, lambda: self._fixed_adjust_random_gap(0.1),
+                current=self._fixed_random_gap_seconds,
+                coarse=lambda anchor: self._set_fixed_random_gap(
+                    (self._fixed_random_gap_seconds() if anchor is None else anchor)
+                    + self._RANDOM_GAP_COARSE_STEP
                 ),
             )
-            jump_gap_plus.pack(side="left", padx=(2, 0))
+            fixed_gap_plus.pack(side="left", padx=(1, 0))
 
-            self._random_jump_enabled_var = tk.BooleanVar(value=False)
-            self._stair_jump_enabled_var = tk.BooleanVar(value=True)
-            ttk.Checkbutton(
-                jump_row, text="台阶跳", width=6,
-                variable=self._stair_jump_enabled_var,
+            # Facing is a stand-still recovery option, not part of 小碎步.
+            # Left and right are mutually exclusive, and the selected side
+            # is applied after an X correction returns to the temporary zone.
+            stationary_facing_row = ttk.Frame(fixed_panel)
+            self._stationary_facing_row = stationary_facing_row
+            ttk.Label(stationary_facing_row, text="朝向").pack(side="left")
+            self._stationary_facing_direction_var = tk.StringVar(value="right")
+            stationary_facing_controls = []
+            facing_left = ttk.Radiobutton(
+                stationary_facing_row, text="左", value="left",
+                variable=self._stationary_facing_direction_var,
                 command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 2))
-            ttk.Checkbutton(
-                jump_row, text="随机跳", width=6,
-                variable=self._random_jump_enabled_var,
-                command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 4))
-            jump_interval_group = ttk.Frame(jump_gadget_group)
-            jump_interval_group.pack(side="left")
-            ttk.Label(jump_interval_group, text="每").pack(side="left")
-            self._random_jump_interval_var = tk.DoubleVar(value=3.0)
-            # Jump motion occupies 0.9s, so the minimum trigger interval is
-            # 1.0s (a faster repeat would pile up stale jump events).  The base
-            # range reaches 30 s like the 小碎步 row, matching the 随机 ceiling.
-            ttk.Scale(
-                jump_interval_group, from_=1.0, to=self._FIXED_RANDOM_GAP_MAX,
-                orient="horizontal",
-                variable=self._random_jump_interval_var, length=82,
-                command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 2))
-            self._random_jump_interval_label = ttk.Label(
-                jump_interval_group, text="3.0s", width=5
             )
-            self._random_jump_interval_label.pack(side="left", padx=(0, 2))
-            self._random_jump_range_label = ttk.Label(
-                jump_interval_group, text="(3.0s, 3.1s)", width=13
+            facing_left.pack(side="left", padx=(4, 4))
+            stationary_facing_controls.append(facing_left)
+            facing_right = ttk.Radiobutton(
+                stationary_facing_row, text="右", value="right",
+                variable=self._stationary_facing_direction_var,
+                command=self._fixed_on_change,
             )
-            self._random_jump_range_label.pack(side="left")
-            jump_random_group.pack(side="left", padx=(4, 0))
+            facing_right.pack(side="left")
+            stationary_facing_controls.append(facing_right)
+            facing_both = ttk.Radiobutton(
+                stationary_facing_row, text="双向", value="both",
+                variable=self._stationary_facing_direction_var,
+                command=self._fixed_on_change,
+            )
+            facing_both.pack(side="left", padx=(4, 0))
+            stationary_facing_controls.append(facing_both)
+            self._stationary_facing_controls = stationary_facing_controls
+            stationary_facing_row.pack(fill="x", pady=(2, 0))
+
             step_row = ttk.Frame(fixed_panel)
-            step_row.pack(fill="x", pady=(6, 0))
+            step_row.pack(fill="x", pady=(4, 0))
             self._small_step_row = step_row
-            step_gadget_group = ttk.Frame(step_row)
-            step_gadget_group.pack(side="right")
-            step_random_group = ttk.Frame(step_gadget_group)
-            ttk.Label(step_random_group, text="随机:").pack(side="left")
-            self._small_step_gap_var = tk.DoubleVar(value=0.1)
-            step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
-            self._bind_repeat_step_button(
-                step_gap_minus,
-                lambda: self._small_step_adjust_gap(-0.1),
-                current=self._small_step_gap_seconds,
-                coarse=lambda anchor: self._set_small_step_gap(
-                    (self._small_step_gap_seconds() if anchor is None
-                     else anchor) - self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            step_gap_minus.pack(side="left", padx=(3, 2))
-            self._small_step_gap_label = ttk.Label(
-                step_random_group, text="0.1s", width=5, anchor="center"
-            )
-            self._small_step_gap_label.pack(side="left")
-            step_gap_plus = ttk.Button(step_random_group, text="+", width=2)
-            self._bind_repeat_step_button(
-                step_gap_plus,
-                lambda: self._small_step_adjust_gap(0.1),
-                current=self._small_step_gap_seconds,
-                coarse=lambda anchor: self._set_small_step_gap(
-                    (self._small_step_gap_seconds() if anchor is None
-                     else anchor) + self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            step_gap_plus.pack(side="left", padx=(2, 0))
             self._small_step_enabled_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(
                 step_row, text="小碎步", width=5,
                 variable=self._small_step_enabled_var,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 4))
-            # Checked: 左 then 右.  Unchecked: 右 then 左.
-            self._small_step_left_first_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                step_row, text="左右", width=5,
-                variable=self._small_step_left_first_var,
-                command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 4))
-            step_interval_group = ttk.Frame(step_gadget_group)
-            step_interval_group.pack(side="left")
+            step_interval_group = ttk.Frame(step_row)
+            step_interval_group.pack(side="right")
             ttk.Label(step_interval_group, text="每").pack(side="left")
             self._small_step_interval_var = tk.DoubleVar(value=5.0)
             ttk.Scale(
-                step_interval_group, from_=3.0, to=self._FIXED_RANDOM_GAP_MAX,
+                step_interval_group, from_=3.0,
+                to=self._OPTIONAL_MOTION_INTERVAL_MAX,
                 orient="horizontal",
-                variable=self._small_step_interval_var, length=82,
+                variable=self._small_step_interval_var,
+                length=self._ATTACK_TIMING_SLIDER_LENGTH,
                 command=self._fixed_on_change,
             ).pack(side="left", padx=(0, 2))
             self._small_step_interval_label = ttk.Label(
                 step_interval_group, text="5.0s", width=5
             )
             self._small_step_interval_label.pack(side="left", padx=(0, 2))
-            self._small_step_range_label = ttk.Label(
-                step_interval_group, text="(5.0s, 5.1s)", width=13
+            self._small_step_interval_range_label = ttk.Label(
+                step_interval_group, text="(5.0s, 5.1s)", width=14,
+                anchor="w",
             )
-            self._small_step_range_label.pack(side="left")
-            step_random_group.pack(side="left", padx=(4, 0))
+            self._small_step_interval_range_label.pack(side="left")
+            step_random_group = ttk.Frame(step_row)
+            step_random_group.pack(side="right", padx=(0, 4))
+            self._small_step_gap_var = tk.DoubleVar(value=0.1)
+            step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
+            self._bind_repeat_step_button(
+                step_gap_minus, lambda: self._small_step_adjust_gap(-0.1),
+                current=self._small_step_gap_seconds,
+                coarse=lambda anchor: self._set_small_step_gap(
+                    (self._small_step_gap_seconds() if anchor is None else anchor)
+                    - self._RANDOM_GAP_COARSE_STEP
+                ),
+            )
+            step_gap_minus.pack(side="left", padx=(0, 1))
+            self._small_step_gap_label = ttk.Label(
+                step_random_group, text="0.1s", width=5, anchor="center"
+            )
+            self._small_step_gap_label.pack(side="left")
+            step_gap_plus = ttk.Button(step_random_group, text="+", width=2)
+            self._bind_repeat_step_button(
+                step_gap_plus, lambda: self._small_step_adjust_gap(0.1),
+                current=self._small_step_gap_seconds,
+                coarse=lambda anchor: self._set_small_step_gap(
+                    (self._small_step_gap_seconds() if anchor is None else anchor)
+                    + self._RANDOM_GAP_COARSE_STEP
+                ),
+            )
+            step_gap_plus.pack(side="left", padx=(1, 0))
+
             self._fixed_status = ttk.Label(
                 fixed_panel, text="固定攻击未启用。", justify="left",
                 wraplength=440,
             )
             self._fixed_load_settings()
-            # Defensive: after the window realizes, re-render the mode rows
-            # once so the 跳跃 row visibility always matches the selected
-            # attack mode (fixed -> visible, jump attack -> hidden).
+            self._fixed_status.pack(fill="x", pady=(4, 0))
+            # Defensive: after realization, update only stationary control
+            # states. It must never pack/unpack rows or relayout column 0.
             root.after(200, self._fixed_refresh_rows)
 
             # Drug (HP/MP potion) panel: key binds + percent trigger sliders.
@@ -1874,8 +1878,13 @@ class UiWorker(threading.Thread):
             ttk.Label(alarm_row, text="间隔").pack(side="left", padx=(4, 0))
             self._countdown_interval_var = tk.DoubleVar(value=1.0)
             self._countdown_interval_slider = ttk.Scale(
-                alarm_row, from_=0.1, to=12.0, orient="horizontal",
-                length=45,
+                alarm_row, from_=0.1, to=6.0, orient="horizontal",
+                # The usable ttk trough is shorter than its requested length
+                # because the thumb occupies part of it.  60px therefore
+                # cannot represent all 59 tenth-hour steps (for example 3.0h
+                # can be skipped).  80px keeps the control compact while
+                # retaining every 0.1h selection through 6.0h.
+                length=80,
                 variable=self._countdown_interval_var,
                 command=self._countdown_on_change,
             )
@@ -1997,9 +2006,6 @@ class UiWorker(threading.Thread):
                 command=self._api_auto_lie_on_change,
             )
             self._api_auto_lie_check.pack(side="left")
-            self._api_auto_lie_check.bind(
-                "<FocusOut>", lambda _event: self._api_auto_lie_on_change()
-            )
             self._reconnect_var = tk.BooleanVar(value=saved_reconnect_enabled)
             self._reconnect_check = ttk.Checkbutton(
                 reconnect_row,
@@ -2180,11 +2186,30 @@ class UiWorker(threading.Thread):
             )
             self._log_label.pack(fill="x", anchor="w", pady=(3, 0))
 
+            # A missing/expired license never prevents the dashboard from
+            # opening.  It simply leaves every product control grey while the
+            # activation button above remains available.
+            self._set_license_visual_lock(not self._license_allowed())
+
             # Pin the window to the configured initial geometry AFTER all
             # content has been built: pack propagation from the panels would
             # otherwise let the content spread the window open taller than
             # the requested initial size on the very first display.
             root.update_idletasks()
+            locked_widths = self._freeze_column_widths()
+            if locked_widths is not None:
+                # 12px between the columns plus the container's 24px side
+                # inset.  Reserve it before mapping the root so the measured
+                # stationary row cannot be clipped by the previous geometry.
+                required_width = sum(locked_widths) + 36
+                width = max(root.winfo_width(), required_width)
+                root.minsize(
+                    max(_INITIAL_WINDOW_WIDTH, required_width),
+                    500 + (_CAPTION_HEIGHT if caption_installed else 0),
+                )
+                clamped = (
+                    f"{width}x{root.winfo_height()}+{root.winfo_x()}+{root.winfo_y()}"
+                )
             root.geometry(clamped)
             # Fit the first displayed window to the taller column.  A
             # previous release may have saved a manually enlarged height;
@@ -2727,17 +2752,31 @@ class UiWorker(threading.Thread):
                 self._render(self.last_snapshot)
             except Exception:
                 LOG.exception("could not update debug UI")
-        self._drain_logs()
-        self._refresh_automation_status()
-        self._sync_patrol_ui_state()
-        self._refresh_shutdown_status()
-        self._refresh_countdown_status()
-        self._refresh_telegram_status()
-        self._poll_yolo_exit()
-        self._drain_hotkey_actions()
-        self._drain_api_test_results()
-        self._service_api_auto_lie()
-        self._drain_api_auto_lie_results()
+        # Each periodic task is guarded on its own.  The whole body used to
+        # share ONE try/except, so an exception thrown by any single step (log
+        # drain, status refresh, patrol sync, YOLO exit poll, a result drain)
+        # skipped every step after it - including the hotkey dispatch - for the
+        # rest of the session, while buttons, workers and the log kept working:
+        # the operator's "the hotkey binding is lost" report.  A failing step
+        # now costs only itself.
+        for step in (
+            self._drain_logs,
+            self._refresh_automation_status,
+            self._sync_patrol_ui_state,
+            self._refresh_shutdown_status,
+            self._refresh_countdown_status,
+            self._refresh_telegram_status,
+            self._poll_yolo_exit,
+            self._drain_hotkey_actions,
+            self._drain_api_test_results,
+            self._service_api_auto_lie,
+            self._drain_api_auto_lie_results,
+        ):
+            try:
+                step()
+            except Exception:
+                LOG.exception("periodic UI step %s failed; the tick continues",
+                              getattr(step, "__name__", step))
 
     def _sync_patrol_ui_state(self) -> None:
         """Refresh patrol buttons when patrol stopped outside the UI.
@@ -2754,6 +2793,16 @@ class UiWorker(threading.Thread):
         if (self.patrol_controller is None
                 or not hasattr(self, "_start_patrol_button")):
             return
+        if (self._patrol_stop_pending
+                and self._patrol_stop_cleanup_done.is_set()):
+            self._patrol_stop_pending = False
+            self._patrol_stop_cleanup_done.clear()
+            self._refresh_patrol_controls()
+            try:
+                self._control_status.configure(text="巡逻已停止。")
+            except Exception:
+                LOG.debug("could not display completed patrol stop", exc_info=True)
+            LOG.info("STOP PATROL: background input cleanup completed")
         running = bool(self.patrol_controller.is_enabled())
         if running == getattr(self, "_patrol_ui_running", None):
             self._patrol_pending_running = None
@@ -2774,11 +2823,119 @@ class UiWorker(threading.Thread):
         elif not was_running and running:
             LOG.info(LOG_RUN_START + "。")
 
-    def _drain_hotkey_actions(self) -> None:
-        """Run physical hotkey actions safely on Tk's owning thread."""
+    def _license_allowed(self) -> bool:
+        """Refresh and return the signed-license gate without raising."""
 
-        self._drain_quick_pickup_results()
-        self._drain_reconnect_results()
+        self._license_status = verify_license()
+        return bool(self._license_status.valid)
+
+    def _refresh_license_ui(self) -> None:
+        """Render the non-fatal authorization state in the always-visible UI."""
+
+        status = self._license_status
+        label = getattr(self, "_license_label", None)
+        if label is not None:
+            if status.valid:
+                expiry = "永久" if status.expires_at is None else status.expires_at
+                label.configure(
+                    text=f"授权有效 · {status.edition.upper()} · 到期：{expiry}"
+                )
+            else:
+                label.configure(text=f"未授权 / 已过期：{status.message}")
+        button = getattr(self, "_license_button", None)
+        if button is not None:
+            button.configure(text="更换授权" if status.valid else "激活授权")
+
+    def _set_license_visual_lock(self, locked: bool) -> None:
+        """Grey every product control while retaining the activation button."""
+
+        content = getattr(self, "_columns_frame", None)
+        if content is None:
+            return
+        control_classes = {
+            "Button", "TButton", "Checkbutton", "TCheckbutton",
+            "Radiobutton", "TRadiobutton", "Scale", "TScale",
+            "Combobox", "TCombobox", "Entry", "TEntry",
+        }
+        # Only product panels are gated: the title-bar close/minimize/help
+        # controls and the separate activation row must remain usable.
+        stack = [content]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+                if widget.winfo_class() not in control_classes:
+                    continue
+                if locked:
+                    try:
+                        widget.state(["disabled"])
+                    except Exception:
+                        widget.configure(state="disabled")
+                else:
+                    try:
+                        widget.state(["!disabled"])
+                    except Exception:
+                        widget.configure(state="normal")
+            except Exception:
+                continue
+
+    def _show_license_refusal(self) -> None:
+        status = self._license_status
+        text = f"未授权：{status.message} 请先点击「激活授权」。"
+        if hasattr(self, "_control_status"):
+            self._control_status.configure(text=text)
+        if hasattr(self, "_quick_message_status"):
+            self._quick_message_status.configure(text=text)
+
+    def _activate_license(self) -> None:
+        """Accept a pasted offline signed activation token from the operator."""
+
+        try:
+            from tkinter import simpledialog
+            code = simpledialog.askstring(
+                "激活授权", "请输入授权码：", parent=self._root
+            )
+        except Exception:
+            LOG.exception("license activation dialog could not open")
+            return
+        if not code:
+            return
+        if str(code).strip().upper().startswith("MAL-"):
+            endpoint = simpledialog.askstring(
+                "授权服务器", "请输入授权服务器地址：",
+                initialvalue="http://127.0.0.1:8765", parent=self._root,
+            )
+            if not endpoint:
+                return
+            self._license_status = activate_via_server(code, endpoint)
+        else:
+            self._license_status = activate_license(code)
+        self._refresh_license_ui()
+        if self._license_status.valid:
+            LOG.info("license activated id=%s edition=%s", self._license_status.license_id,
+                     self._license_status.edition)
+            self._set_license_visual_lock(False)
+            self._shutdown_load_settings()
+            self._control_status.configure(text="授权已保存，自动功能已解锁。")
+        else:
+            LOG.warning("license activation failed: %s", self._license_status.code)
+            self._show_license_refusal()
+        self._refresh_patrol_controls()
+
+    def _drain_hotkey_actions(self) -> None:
+        """Run physical hotkey actions safely on Tk's owning thread.
+
+        Never raises: the queue is drained item by item, and the result reports
+        that run before it are guarded too, so a malformed item or a failing
+        result drain cannot leave a queued chord unexecuted.
+        """
+
+        for drain in (self._drain_quick_pickup_results,
+                      self._drain_reconnect_results):
+            try:
+                drain()
+            except Exception:
+                LOG.exception("periodic result drain failed; hotkeys continue")
         actions = self.hotkey_queue
         if actions is None:
             return
@@ -2799,10 +2956,21 @@ class UiWorker(threading.Thread):
                 except (AttributeError, ValueError):
                     pass
                 continue
+            if not self._license_allowed():
+                LOG.warning("hotkey %s ignored: license is not valid", action)
+                self._show_license_refusal()
+                try:
+                    actions.task_done()
+                except (AttributeError, ValueError):
+                    pass
+                continue
             LOG.info("hotkey action run: %s", action)
-            if action.startswith(TYPING_HOTKEY_PREFIXES):
-                self._arm_input_for_hotkey(action)
             try:
+                # Re-arming input belongs to this action: a failure here must
+                # cost this one chord, never the whole drain (which is what
+                # left every later hotkey dead for the session).
+                if action.startswith(TYPING_HOTKEY_PREFIXES):
+                    self._arm_input_for_hotkey(action)
                 if action.startswith("quick_message:"):
                     if not self._send_quick_message(
                         int(action.partition(":")[2])
@@ -2890,6 +3058,9 @@ class UiWorker(threading.Thread):
                 elif action.startswith("record:"):
                     boundary = action.partition(":")[2]
                     self._play_action_sound(self._record_endpoint(boundary))
+                elif action.startswith("record_jump_point:"):
+                    direction = action.partition(":")[2]
+                    self._play_action_sound(self._record_jump_point(direction))
                 elif action == "select_next_layer":
                     self._play_action_sound(self._select_next_layer())
                 elif action == "select_next_patrol_start":
@@ -2903,12 +3074,22 @@ class UiWorker(threading.Thread):
                 elif action == "delete_highest_layer":
                     self._play_action_sound(self._delete_highest_layer())
                 elif action == "toggle_patrol":
-                    if (self.patrol_controller is not None
-                            and self.patrol_controller.is_enabled()):
-                        self._stop_patrol()
-                        self._play_action_sound(False)
+                    now = time.monotonic()
+                    if now < self._hotkey_toggle_ignore_until:
+                        LOG.info(
+                            "hotkey toggle ignored: previous patrol transition "
+                            "just completed"
+                        )
                     else:
-                        self._play_action_sound(self._start_patrol())
+                        if (self.patrol_controller is not None
+                                and self.patrol_controller.is_enabled()):
+                            self._stop_patrol()
+                            self._play_action_sound(False)
+                        else:
+                            self._play_action_sound(self._start_patrol())
+                        # Suppress only a duplicate delivery of this chord,
+                        # not an ordinary later Ctrl+` requested by the user.
+                        self._hotkey_toggle_ignore_until = time.monotonic() + 0.75
             except Exception:
                 LOG.exception("hotkey action failed: %s", action)
                 self._play_action_sound(False)
@@ -2961,6 +3142,13 @@ class UiWorker(threading.Thread):
     def _reconnect_on_change(self) -> None:
         """Apply the 自动重连 selection (enable + world + channel) to its worker."""
 
+        if not self._license_allowed():
+            if hasattr(self, "_reconnect_var"):
+                self._reconnect_var.set(False)
+            if self.reconnect_worker is not None:
+                self.reconnect_worker.set_enabled(False)
+            self._show_license_refusal()
+            return
         worker = self.reconnect_worker
         enabled = bool(self._reconnect_var.get()) if hasattr(
             self, "_reconnect_var") else False
@@ -3396,8 +3584,15 @@ class UiWorker(threading.Thread):
     def _api_auto_lie_on_change(self) -> None:
         """Arm or disarm the automatic api pass, and persist it immediately."""
 
+        if not self._license_allowed():
+            if hasattr(self, "_api_auto_lie_var"):
+                self._api_auto_lie_var.set(False)
+            self._api_auto_lie_session_armed = False
+            self._show_license_refusal()
+            return
         armed = bool(self._api_auto_lie_var.get()) if hasattr(
             self, "_api_auto_lie_var") else False
+        self._api_auto_lie_session_armed = armed
         try:
             self._shutdown_save_settings(self._shutdown_collect_data())
         except Exception:
@@ -3458,6 +3653,9 @@ class UiWorker(threading.Thread):
         log explaining it (the old 3 s "square was absent" debounce swallowed the event).
         """
 
+        if not self._license_allowed():
+            LOG.info("自动过测谎: ignored because license is not valid")
+            return
         if not hasattr(self, "_api_auto_lie_var"):
             LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
             return
@@ -3466,6 +3664,9 @@ class UiWorker(threading.Thread):
                 "自动过测谎: lie event ignored - the 自动过测谎 selection is OFF "
                 "(tick it to pass automatically)"
             )
+            return
+        if not getattr(self, "_api_auto_lie_session_armed", False):
+            LOG.warning("自动过测谎: lie event ignored until enabled during this session")
             return
         now = time.monotonic()
         if match is None:
@@ -3680,6 +3881,35 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text=f"自动过测谎: {text}")
 
+    def auto_lie_pass_active(self) -> bool:
+        """Whether an automatic API lie pass may be stopped by Esc."""
+
+        worker = getattr(self, "_api_lie_pass_worker", None)
+        try:
+            return bool(worker is not None and worker.is_alive())
+        except Exception:
+            return False
+
+    def request_cancel_auto_lie_pass(self) -> bool:
+        """Ask the active automatic lie pass to stop, without touching Tk."""
+
+        worker = getattr(self, "_api_lie_pass_worker", None)
+        if worker is None:
+            return False
+        try:
+            if not worker.is_alive():
+                return False
+            stop = getattr(worker, "request_stop", None)
+            if not callable(stop):
+                return False
+            self._api_auto_lie_pending = False
+            stop()
+            LOG.warning("自动过测谎: cancellation requested by Esc")
+            return True
+        except Exception:
+            LOG.debug("自动过测谎: Esc cancellation failed", exc_info=True)
+            return False
+
     def _save_reconnect_settings(self, enabled: bool, world: str, channel: int) -> None:
         """Persist 自动重连 with the rest of the panel's settings."""
 
@@ -3825,13 +4055,14 @@ class UiWorker(threading.Thread):
                     pass
 
     def _arm_input_for_hotkey(self, action: str) -> None:
-        """Re-arm live input for a TYPING hotkey (Ctrl+1..0 / trade / pickup).
+        """Re-arm live input for message and pickup hotkeys only.
 
         The auto-reconnect leaves live input OFF when a run fails (it must not type on the login
         page), and a run that succeeds leaves it exactly as it found it - which, before Start Patrol,
-        is also OFF.  Every key the assistant then sends is refused, so the hotkeys looked dead.
-        Arming here is a deliberate operator action on a typing chord, and it is skipped while the
-        game is not focused, while patrol runs, or while the reconnect owns the machine.
+        is also OFF. Every ordinary message/pickup key would then be refused. Trade is deliberately
+        excluded because its worker uses direct dialog keys and must not wake general attack input.
+        Arming here is skipped while the game is not focused, while patrol runs, or while reconnect
+        owns the machine.
         """
 
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
@@ -4286,7 +4517,226 @@ class UiWorker(threading.Thread):
         )
         self._refresh_patrol_controls()
         return True
+
+    def _record_jump_point(self, direction: str) -> bool:
+        """Record a locked left- or right-moving jump trigger on this layer."""
+        direction = str(direction).casefold()
+        if direction not in ("left", "right"):
+            LOG.warning("ignored jump-point record request with direction=%r", direction)
+            return False
+        label = "左跳" if direction == "left" else "右跳"
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            self._control_status.configure(text=f"巡逻中无法录制{label}，请先停止巡逻。")
+            return False
+        snapshot = self._capture_snapshot_for_recording()
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(text=f"无法录制{label}: 未检测到黄色菱形标记。")
+            return False
+        if not is_verified_border(snapshot.detection):
+            self._control_status.configure(text=f"无法录制{label}: 未检测到可保存的小地图边框。")
+            return False
+        try:
+            recorded = self.patrol_controller.record_jump_point(
+                snapshot.player_x, snapshot.player_y, direction=direction,
+                layout=snapshot.coordinate_layout,
+            )
+        except (OSError, ValueError) as exc:
+            self._control_status.configure(text=f"无法录制{label}: {exc}")
+            return False
+        self._control_status.configure(
+            text=f"已插入 {recorded.layer} {label}: x={recorded.x:.6f}, y={recorded.y:.6f}"
+        )
+        LOG.info("%s jump point locked: layer=%s x=%.6f y=%.6f",
+                 direction, recorded.layer, recorded.x, recorded.y)
+        self._refresh_patrol_controls()
         return True
+
+    def _delete_recorded_axis_point(
+        self, layer_name: str, point_kind: str, jump_index: Optional[int] = None
+    ) -> None:
+        """Delete a point chosen by a double-click in the layer X-axis."""
+
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法删除录制点，请先停止巡逻。")
+            return
+        try:
+            if point_kind == "jump_point":
+                point = self.patrol_controller.snapshot().layers.get(layer_name, {}).get(
+                    "jump_points", []
+                )
+                direction = (
+                    str(point[int(jump_index)].get("direction", "")).casefold()
+                    if isinstance(point, list) and jump_index is not None
+                    and 0 <= int(jump_index) < len(point) and isinstance(point[int(jump_index)], dict)
+                    else ""
+                )
+                removed = self.patrol_controller.delete_jump_point(
+                    layer_name, int(jump_index) if jump_index is not None else -1
+                )
+                label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
+            else:
+                removed = self.patrol_controller.clear_endpoint(layer_name, point_kind)
+                self._unlocked_points.discard((layer_name, point_kind))
+                label = {
+                    "left_most_pos": "最左",
+                    "rope_pos": "绳索",
+                    "right_most_pos": "最右",
+                }.get(point_kind, "录制点")
+        except (OSError, ValueError) as exc:
+            LOG.warning("axis point delete failed", exc_info=True)
+            self._control_status.configure(text=f"无法删除录制点: {exc}")
+            return
+        if removed:
+            self._control_status.configure(
+                text=f"已删除 {self._patrol_display_name(layer_name)} {label}。"
+            )
+            LOG.info("layer axis point deleted layer=%s kind=%s index=%s",
+                     layer_name, point_kind, jump_index)
+            self._refresh_patrol_controls()
+
+    def _layer_axis_menu(self, event: Any, layer_name: str) -> None:
+        """Show point-recording choices for one single-clicked layer axis."""
+
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            return
+        self._select_recording_layer(layer_name)
+        menu = self._tk.Menu(self._root, tearoff=False)
+        entries = (
+            ("添加最左", "left_most_pos", lambda: self._record_endpoint("left_most_pos")),
+            ("添加绳索", "rope_pos", lambda: self._record_endpoint("rope_pos")),
+            ("添加最右", "right_most_pos", lambda: self._record_endpoint("right_most_pos")),
+            ("添加左跳", "jump_point", lambda: self._record_jump_point("left")),
+            ("添加右跳", "jump_point", lambda: self._record_jump_point("right")),
+        )
+        final_name = self.patrol_controller.final_layer_name()
+        for label, kind, command in entries:
+            already_recorded = (
+                kind != "jump_point"
+                and self.patrol_controller.endpoint(layer_name, kind) is not None
+            )
+            unavailable_rope = kind == "rope_pos" and layer_name == final_name
+            state = "disabled" if already_recorded or unavailable_rope else "normal"
+            menu.add_command(label=label, command=command, state=state)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    @staticmethod
+    def _layer_axis_point_text(label: str, point: Any) -> str:
+        return f"{label} ({float(point['x']):.4f}, {float(point['y']):.4f})"
+
+    @staticmethod
+    def _hide_layer_axis_hint(canvas: Any) -> None:
+        # A canvas may have been removed by a layer refresh between pointer
+        # enter/leave events.  Hover feedback is cosmetic and must never be
+        # allowed to propagate Tcl's "invalid command name" into the UI loop.
+        try:
+            if bool(canvas.winfo_exists()):
+                canvas.delete("axis_hint")
+        except Exception:
+            return
+
+    def _show_layer_axis_hint(self, canvas: Any, text: str, x: int) -> None:
+        """Show one short-lived coordinate hint above the hovered bar."""
+
+        try:
+            if not bool(canvas.winfo_exists()):
+                return
+            self._hide_layer_axis_hint(canvas)
+            label = canvas.create_text(
+                x, 4, text=text, anchor="n", fill="#1d1d1d",
+                tags=("axis_hint",),
+            )
+            bounds = canvas.bbox(label)
+            if bounds is not None:
+                left, top, right, bottom = bounds
+                background = canvas.create_rectangle(
+                    left - 3, top - 2, right + 3, bottom + 2,
+                    fill="#fff6bf", outline="#b49825", tags=("axis_hint",),
+                )
+                canvas.tag_lower(background, label)
+        except Exception:
+            # The pointer can leave while Tk is rebuilding this layer row;
+            # losing a hover hint is preferable to destabilising the window.
+            LOG.debug("layer-axis hover hint unavailable", exc_info=True)
+
+    def _draw_layer_axis(self, layer_name: str, layer: Any) -> None:
+        """Draw a fixed 0..1 X-axis with concise colour-coded point bars."""
+
+        canvas = self._layer_axis_canvases.get(layer_name)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        left, right, axis_y = _LAYER_AXIS_LEFT, _LAYER_AXIS_RIGHT, _LAYER_AXIS_Y
+        canvas.create_line(left, axis_y, right, axis_y, fill="#6b6b6b", width=1)
+        if not isinstance(layer, dict):
+            return
+        entries: list[tuple[str, Any, str, Optional[int]]] = []
+        for kind, label in (
+            ("left_most_pos", "最左"),
+            ("rope_pos", "绳索"),
+            ("right_most_pos", "最右"),
+        ):
+            point = layer.get(kind)
+            if isinstance(point, dict) and "x" in point and "y" in point:
+                entries.append((kind, point, label, None))
+        jump_points = layer.get("jump_points", [])
+        if isinstance(jump_points, list):
+            for index, point in enumerate(jump_points):
+                if isinstance(point, dict) and "x" in point and "y" in point:
+                    direction = str(point.get("direction", "")).casefold()
+                    label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
+                    entries.append(("jump_point", point, label, index))
+        entries.sort(key=lambda item: float(item[1].get("x", 0.0)))
+        colors = {
+            "left_most_pos": "#1479d1",
+            "right_most_pos": "#1479d1",
+            "rope_pos": "#d8a400",
+            "jump_point": "#1d9b45",
+        }
+        for kind, point, label, index in entries:
+            try:
+                x_value = max(0.0, min(1.0, float(point["x"])))
+            except (TypeError, ValueError, KeyError):
+                continue
+            x = left + round((right - left) * x_value)
+            text = self._layer_axis_point_text(label, point)
+            tag = f"axis:{layer_name}:{kind}:{'' if index is None else index}"
+            # Blue = endpoints, yellow = rope, green = jump point.  The
+            # coordinate text stays out of the fixed layout and floats only
+            # while the operator hovers this concise marker.
+            canvas.create_rectangle(
+                x - 2, axis_y - 12, x + 2, axis_y + 1,
+                fill=colors[kind], outline="", tags=(tag,),
+            )
+            canvas.tag_bind(
+                tag, "<Enter>",
+                lambda _event, canvas=canvas, text=text, x=x:
+                self._show_layer_axis_hint(canvas, text, x),
+            )
+            canvas.tag_bind(
+                tag, "<Leave>",
+                lambda _event, canvas=canvas: self._hide_layer_axis_hint(canvas),
+            )
+            canvas.tag_bind(
+                tag, "<Double-Button-1>",
+                lambda _event, layer_name=layer_name, kind=kind, index=index:
+                self._delete_recorded_axis_point(layer_name, kind, index),
+            )
+
+    def _layer_axis_click(self, event: Any, layer_name: str) -> None:
+        """A single axis click opens its four recording choices."""
+
+        try:
+            # Existing ticks are reserved for inspection/deletion.  A click
+            # on empty axis space is the add-point affordance.
+            if event.widget.find_withtag("current"):
+                self._select_recording_layer(layer_name)
+                return
+        except Exception:
+            pass
+        self._layer_axis_menu(event, layer_name)
 
     def _yolo_settings_path(self) -> Path:
         """JSON file holding the YOLO panel settings."""
@@ -4353,7 +4803,10 @@ class UiWorker(threading.Thread):
         return {
             "attack_mode": str(self._attack_mode_var.get()),
             "interval_seconds": round(
-                max(0.2, float(self._fixed_interval_var.get())), 1
+                max(0.2, min(
+                    self._FIXED_ATTACK_INTERVAL_MAX,
+                    float(self._fixed_interval_var.get()),
+                )), 1
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
@@ -4361,22 +4814,6 @@ class UiWorker(threading.Thread):
                 getattr(self, "_stationary_jump_enabled_var", None).get()
                 if hasattr(self, "_stationary_jump_enabled_var") else False
             ),
-            "stair_jump_enabled": bool(
-                getattr(self, "_stair_jump_enabled_var", None).get()
-                if hasattr(self, "_stair_jump_enabled_var") else True
-            ),
-            "random_jump_enabled": bool(
-                getattr(self, "_random_jump_enabled_var", None).get()
-                if hasattr(self, "_random_jump_enabled_var") else False
-            ),
-            "random_jump_interval_seconds": round(
-                max(1.0, float(
-                    getattr(self, "_random_jump_interval_var", None).get()
-                ))
-                if hasattr(self, "_random_jump_interval_var") else 3.0,
-                1,
-            ),
-            "random_jump_gap_seconds": self._random_jump_gap_seconds(),
             "small_step_enabled": bool(
                 getattr(self, "_small_step_enabled_var", None).get()
                 if hasattr(self, "_small_step_enabled_var") else False
@@ -4388,9 +4825,9 @@ class UiWorker(threading.Thread):
                 1,
             ),
             "small_step_gap_seconds": self._small_step_gap_seconds(),
-            "small_step_left_first": bool(
-                getattr(self, "_small_step_left_first_var", None).get()
-                if hasattr(self, "_small_step_left_first_var") else False
+            "stationary_facing_direction": str(
+                getattr(self, "_stationary_facing_direction_var", None).get()
+                if hasattr(self, "_stationary_facing_direction_var") else "right"
             ),
         }
 
@@ -4574,7 +5011,9 @@ class UiWorker(threading.Thread):
                 or self._root is None):
             return False
         current = float(self._fixed_interval_var.get())
-        value = round(max(0.2, min(10.0, current + float(delta))), 1)
+        value = round(max(
+            0.2, min(self._FIXED_ATTACK_INTERVAL_MAX, current + float(delta))
+        ), 1)
         if value == round(current, 1):
             return False
         self._fixed_interval_var.set(value)
@@ -4598,42 +5037,22 @@ class UiWorker(threading.Thread):
         self._play_action_sound(True)
 
     def _fixed_refresh_rows(self) -> None:
-        """Render the 随机跳跃 row for the active attack mode.
-
-        固定攻击: the independent random-jump row stays visible. 站桩攻击
-        owns position recovery and optionally bundles a jump into each attack
-        beat, so independent movement rows stay hidden.
-        The row is unconditionally re-packed on every call so mode switches
-        always re-render it dynamically.
-        """
+        """Update stationary-only controls without changing panel geometry."""
 
         mode = str(getattr(self, "_attack_mode_var", None).get()
                    if hasattr(self, "_attack_mode_var") else "fixed")
-        jump_row = getattr(self, "_jump_row", None)
-        step_row = getattr(self, "_small_step_row", None)
-        stationary_jump_row = getattr(self, "_stationary_jump_row", None)
-        fixed_key_row = getattr(self, "_fixed_key_row", None)
-        status = getattr(self, "_fixed_status", None)
-        if jump_row is None:
-            return
-        for row in (jump_row, step_row, stationary_jump_row):
-            if row is not None and row.winfo_manager():
-                row.pack_forget()
-        if mode == "stationary" and stationary_jump_row is not None:
-            pack_options = {"fill": "x", "pady": (2, 0)}
-            if fixed_key_row is not None:
-                pack_options["after"] = fixed_key_row
-            stationary_jump_row.pack(**pack_options)
-        if mode == "fixed":
-            if status is not None and status.winfo_manager():
-                jump_row.pack(fill="x", pady=(6, 0), before=status)
-            else:
-                jump_row.pack(fill="x", pady=(6, 0))
-        if step_row is not None and mode == "fixed":
-            if status is not None and status.winfo_manager():
-                step_row.pack(fill="x", pady=(6, 0), before=status)
-            else:
-                step_row.pack(fill="x", pady=(6, 0))
+        stationary_jump_button = getattr(self, "_stationary_jump_button", None)
+        stationary_enabled = mode == "stationary"
+        for widget in [
+            stationary_jump_button,
+            *getattr(self, "_stationary_facing_controls", []),
+        ]:
+            if widget is None:
+                continue
+            try:
+                widget.state(["!disabled" if stationary_enabled else "disabled"])
+            except Exception:
+                widget.configure(state="normal" if stationary_enabled else "disabled")
 
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
@@ -4649,53 +5068,44 @@ class UiWorker(threading.Thread):
         # random-gap buttons call this method repeatedly; packing/unpacking
         # their rows on every 0.1 s tick made the visible line flicker or
         # disappear.  Only an actual attack-mode change needs a layout pass.
-        interval = max(0.2, float(self._fixed_interval_var.get()))
-        self._fixed_interval_var.set(interval)
-        random_gap = self._fixed_random_gap_seconds()
-        if hasattr(self, "_fixed_random_gap_var"):
-            self._fixed_random_gap_var.set(random_gap)
+        # ttk.Scale is pixel-continuous: on this compact 82px track, an exact
+        # 3.0s position may have no physical pixel at all.  Quantize every
+        # drag to the persisted 0.1s unit so whole values (3.0, 4.0, …) are
+        # reachable and the displayed value is exactly what will be used.
+        raw_interval = max(
+            0.2, min(self._FIXED_ATTACK_INTERVAL_MAX,
+                     float(self._fixed_interval_var.get()))
+        )
+        interval = round(raw_interval, 1)
+        if abs(raw_interval - interval) > 1e-9:
+            self._fixed_interval_var.set(interval)
         self._fixed_interval_label.configure(text=f"{interval:.1f}s")
+        random_gap = self._fixed_random_gap_seconds()
         if hasattr(self, "_fixed_random_gap_label"):
             self._fixed_random_gap_label.configure(text=f"{random_gap:.1f}s")
-        if hasattr(self, "_fixed_range_label"):
-            self._fixed_range_label.configure(
+        if hasattr(self, "_fixed_interval_range_label"):
+            self._fixed_interval_range_label.configure(
                 text=f"({interval:.1f}s, {interval + random_gap:.1f}s)"
             )
-        if hasattr(self, "_random_jump_interval_var"):
-            # 1.0s .. 30s base range, matching the 小碎步 row and the 随机
-            # ceiling; a saved value outside it is clamped into range.
-            jump_interval = min(
-                self._FIXED_RANDOM_GAP_MAX,
-                max(1.0, float(self._random_jump_interval_var.get())),
-            )
-            self._random_jump_interval_var.set(jump_interval)
-            jump_gap = self._random_jump_gap_seconds()
-            self._random_jump_gap_var.set(jump_gap)
-            self._random_jump_interval_label.configure(
-                text=f"{jump_interval:.1f}s"
-            )
-            self._random_jump_gap_label.configure(text=f"{jump_gap:.1f}s")
-            self._random_jump_range_label.configure(
-                text=(f"({jump_interval:.1f}s, "
-                      f"{jump_interval + jump_gap:.1f}s)")
-            )
         if hasattr(self, "_small_step_interval_var"):
-            # 3.0s .. 30s base range (same ceiling as the 随机 jump/step gaps).
+            # 小碎步 is a longer optional motion; allow up to 60 seconds.
             step_interval = min(
-                self._FIXED_RANDOM_GAP_MAX,
+                self._OPTIONAL_MOTION_INTERVAL_MAX,
                 max(3.0, float(self._small_step_interval_var.get())),
             )
             self._small_step_interval_var.set(step_interval)
-            step_gap = self._small_step_gap_seconds()
-            self._small_step_gap_var.set(step_gap)
             self._small_step_interval_label.configure(
                 text=f"{step_interval:.1f}s"
             )
-            self._small_step_gap_label.configure(text=f"{step_gap:.1f}s")
-            self._small_step_range_label.configure(
-                text=(f"({step_interval:.1f}s, "
-                      f"{step_interval + step_gap:.1f}s)")
-            )
+            step_gap = self._small_step_gap_seconds()
+            if hasattr(self, "_small_step_gap_label"):
+                self._small_step_gap_label.configure(
+                    text=f"{step_gap:.1f}s"
+                )
+            if hasattr(self, "_small_step_interval_range_label"):
+                self._small_step_interval_range_label.configure(
+                    text=f"({step_interval:.1f}s, {step_interval + step_gap:.1f}s)"
+                )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
@@ -4743,7 +5153,7 @@ class UiWorker(threading.Thread):
             0.2, float(data.get("interval_seconds", 3.0))
         )
         worker.attack_jitter_seconds = max(
-            0.0, float(data.get("random_gap_seconds", 0.1))
+            0.0, float(data.get("random_gap_seconds", 0.0))
         )
         key = str(data.get("attack_key", "ctrl")).strip()
         if not worker.set_key(key):
@@ -4751,52 +5161,37 @@ class UiWorker(threading.Thread):
                         key, worker.attack_key)
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
+            mover.small_step_attack_key = worker.attack_key
             stationary_setter = getattr(
                 mover, "set_stationary_attack_enabled", None
             )
             if callable(stationary_setter):
                 stationary_setter(mode == "stationary")
-            # 台阶跳 only taps Alt while retaining the already-active travel
-            # direction; it is not queued as a separate left/right motion.
-            mover.stair_jump_enabled = bool(
-                data.get("stair_jump_enabled", True)
-            ) and mode == "fixed"
-            mover.stair_jump_stall_frames = 7
-            # Seven frozen X/Y samples qualify one forward stair jump, then
-            # its detector skips five samples before collecting again.
-            mover.stair_jump_attempts_max = 1
-        jump_worker = getattr(self, "random_jump_worker", None)
-        if jump_worker is not None:
-            # 站桩攻击 owns its anchor correction (and optional bundled jump),
-            # so independent random movement is switched off in that mode.
-            jump_worker.enabled = bool(
-                data.get("random_jump_enabled", False)
-            ) and mode == "fixed"
-            jump_worker.jump_interval = max(
-                1.0,
-                float(data.get("random_jump_interval_seconds", 3.0)),
-            )
-            jump_worker.jump_jitter_seconds = max(
-                0.0, float(data.get("random_jump_gap_seconds", 0.1))
-            )
+            # Automatic stuck stair-jumps are intentionally disabled.  The
+            # dedicated jump executor remains solely for recorded jump points.
+            mover.stair_jump_enabled = False
         step_worker = getattr(self, "small_step_worker", None)
         if step_worker is not None:
-            # 小碎步 deliberately belongs only to fixed-rate attack: stationary
-            # mode already owns position correction, while YOLO owns a
-            # separate combat/movement strategy.
+            # 小碎步 is available for fixed and stand-still attack. The latter
+            # uses it chiefly to finish facing the monster side.
             step_worker.enabled = bool(
                 data.get("small_step_enabled", False)
-            ) and mode == "fixed"
+            ) and mode in ("fixed", "stationary")
             step_worker.step_interval = max(
                 3.0,
                 float(data.get("small_step_interval_seconds", 5.0)),
             )
             step_worker.step_jitter_seconds = max(
-                0.0, float(data.get("small_step_gap_seconds", 0.1))
+                0.0, float(data.get("small_step_gap_seconds", 0.0))
             )
-            if mover is not None:
-                mover.small_step_left_first = bool(
-                    data.get("small_step_left_first", False)
+        if mover is not None:
+            direction = str(data.get("stationary_facing_direction", "right"))
+            setter = getattr(mover, "set_stationary_facing_direction", None)
+            if callable(setter):
+                setter(direction)
+            else:
+                mover.stationary_facing_direction = (
+                    direction if direction in ("left", "right", "both") else "right"
                 )
 
     def _fixed_refresh_grey(self) -> None:
@@ -4827,23 +5222,20 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_fixed_status"):
             if fixed_mode:
                 interval = float(self._fixed_interval_var.get())
-                random_gap = self._fixed_random_gap_seconds()
                 if mode == "stationary":
                     self._fixed_status.configure(
                         text=(f"站桩攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；"
                               f"开始巡逻时记录临时位置；"
                               f"{'先跳跃、0.3s 后攻击；' if self._stationary_jump_enabled_var.get() else ''}每 "
-                              f"{interval:.1f}s (+随机 {random_gap:.1f}s)。"
+                              f"{interval:.1f}s。"
                               "YOLO 怪物检测暂时停用。")
                     )
                 else:
                     self._fixed_status.configure(
                         text=(f"固定攻击已启用 - 按键 "
-                              f"{self._fixed_attack_key_var.get()}；"
-                              f"基础 {interval:.1f}s；随机间差 {random_gap:.1f}s；"
-                              f"范围 ({interval:.1f}s, "
-                              f"{interval + random_gap:.1f}s)。"
+                              f"{self._fixed_attack_key_var.get()}；每 "
+                              f"{interval:.1f}s。"
                               "YOLO 怪物检测暂时停用。")
                     )
             else:
@@ -4919,26 +5311,6 @@ class UiWorker(threading.Thread):
                 self._stationary_jump_enabled_var.set(bool(
                     data["stationary_jump_enabled"]
                 ))
-            if ("stair_jump_enabled" in data
-                    and hasattr(self, "_stair_jump_enabled_var")):
-                self._stair_jump_enabled_var.set(bool(
-                    data["stair_jump_enabled"]
-                ))
-            if ("random_jump_enabled" in data
-                    and hasattr(self, "_random_jump_enabled_var")):
-                self._random_jump_enabled_var.set(bool(
-                    data["random_jump_enabled"]
-                ))
-            if ("random_jump_interval_seconds" in data
-                    and hasattr(self, "_random_jump_interval_var")):
-                self._random_jump_interval_var.set(max(
-                    1.0, float(data["random_jump_interval_seconds"])
-                ))
-            if ("random_jump_gap_seconds" in data
-                    and hasattr(self, "_random_jump_gap_var")):
-                self._random_jump_gap_var.set(float(
-                    data["random_jump_gap_seconds"]
-                ))
             if ("small_step_enabled" in data
                     and hasattr(self, "_small_step_enabled_var")):
                 self._small_step_enabled_var.set(bool(
@@ -4954,11 +5326,13 @@ class UiWorker(threading.Thread):
                 self._small_step_gap_var.set(float(
                     data["small_step_gap_seconds"]
                 ))
-            if ("small_step_left_first" in data
-                    and hasattr(self, "_small_step_left_first_var")):
-                self._small_step_left_first_var.set(bool(
-                    data["small_step_left_first"]
-                ))
+            if hasattr(self, "_stationary_facing_direction_var"):
+                direction = str(data.get("stationary_facing_direction", ""))
+                if direction not in ("left", "right", "both"):
+                    # v1.0.75 had an opt-in right-facing checkbox.  The
+                    # selector replaces it and defaults to right.
+                    direction = "right"
+                self._stationary_facing_direction_var.set(direction)
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed fixed attack settings",
                         exc_info=True)
@@ -5243,6 +5617,19 @@ class UiWorker(threading.Thread):
     def _shutdown_apply_to_worker(self, data: dict) -> None:
         """Apply the shutdown settings to the ShutdownWorker live."""
 
+        if not self._license_allowed():
+            # A stored configuration must not silently reactivate parked
+            # capture, reconnect, or alert-driven automation before a license
+            # is entered on a fresh installation.
+            data = dict(data)
+            data.update({
+                "shutdown_enabled": False,
+                "player_check_enabled": False,
+                "disconnect_alert_enabled": False,
+                "lie_alert_enabled": False,
+                "auto_lie_api_enabled": False,
+                "auto_reconnect_enabled": False,
+            })
         worker = getattr(self, "shutdown_worker", None)
         if worker is not None:
             worker.enabled = bool(data.get("shutdown_enabled", False))
@@ -5615,6 +6002,31 @@ class UiWorker(threading.Thread):
             self._quick_message_status.configure(text=f"已删除：{deleted}")
             self._refit_window_to_content()
 
+    def _freeze_column_widths(self) -> Optional[tuple[int, int]]:
+        """Freeze both grid tracks after their complete initial layout.
+
+        Both columns have explicit, invariant pixel widths. Text in the patrol
+        stack must never participate in a later grid-width negotiation.
+        """
+
+        columns = getattr(self, "_columns_frame", None)
+        col1 = getattr(self, "_col1_frame", None)
+        col2 = getattr(self, "_col2_frame", None)
+        if columns is None or col1 is None or col2 is None:
+            return None
+        try:
+            left_width = _LEFT_COLUMN_WIDTH
+            right_width = _RIGHT_COLUMN_WIDTH
+            columns.columnconfigure(0, weight=0, minsize=left_width)
+            columns.columnconfigure(1, weight=0, minsize=right_width)
+            # The grid itself is non-propagating. The two constants are the
+            # complete width lock without clipping vertical panel growth.
+            self._locked_column_widths = (left_width, right_width)
+            return self._locked_column_widths
+        except Exception:
+            LOG.debug("column width lock unavailable", exc_info=True)
+            return None
+
     def _refit_window_to_content(self) -> None:
         """Fit the window height exactly to the UI content.
 
@@ -5711,6 +6123,7 @@ class UiWorker(threading.Thread):
         "left": "←", "right": "→", "up": "↑", "down": "↓",
         "home": "Home", "insert": "Insert", "delete": "Delete",
         "bracketleft": "[", "bracketright": "]", "grave": "`",
+        "d": "D", "f": "F",
         "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
         "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
     }
@@ -5719,6 +6132,8 @@ class UiWorker(threading.Thread):
         "record:left_most_pos": "录制当前图层的 最左 巡逻点",
         "record:rope_pos": "录制当前图层的 绳索 点",
         "record:right_most_pos": "录制当前图层的 最右 巡逻点",
+        "record_jump_point:left": "插入当前图层的 左跳 点 (Ctrl+D)",
+        "record_jump_point:right": "插入当前图层的 右跳 点 (Ctrl+F)",
         "select_next_layer": "选择下一个录制图层 (Ctrl+↓)",
         "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
         "add_highest_layer": "添加最高楼层",
@@ -5861,12 +6276,18 @@ class UiWorker(threading.Thread):
             f"快捷键总开关: {state_text}\n"
             "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
             "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
+            "按快捷键后会自动松开 Ctrl，避免游戏里的 Ctrl 攻击持续触发"
+            "(hotkey.json → release_ctrl_after_chord: true，默认开启)。\n"
+            "日文/中文/韩文输入法开启时会吞掉 Ctrl 组合键；"
+            "请把输入法切到「英数/半角英数」或关闭。\n"
             "修改 hotkey.json 后需重启程序生效。"
         )
         footer_text = (
             "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
             "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
-            "ignore_injected=true 只响应真实物理按键。\n"
+            "ignore_injected=true 只响应真实物理按键; "
+            "delivery=hook 用低级键盘钩子识别(默认，输入法开启时仍可用)、"
+            "delivery=native 用系统热键。\n"
             "移开鼠标即自动关闭本提示。"
         )
 
@@ -6004,7 +6425,12 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_countdown_interval_label"):
             return
-        hours = max(0.1, float(self._countdown_interval_var.get()))
+        raw_hours = max(0.1, min(6.0, float(self._countdown_interval_var.get())))
+        # Convert through an integer tenth-hour index so stored/displayed
+        # values are exact selectable grid points rather than slider floats.
+        hours = (int(round((raw_hours - 0.1) * 10.0)) + 1) / 10.0
+        if abs(raw_hours - hours) > 1e-9:
+            self._countdown_interval_var.set(hours)
         self._countdown_interval_label.configure(text=f"{hours:.1f}h")
         interval_seconds = hours * 3600.0
         self._countdown_remaining_slider.configure(to=interval_seconds)
@@ -6060,7 +6486,7 @@ class UiWorker(threading.Thread):
         # The UI's hour slider is the supported interval source. Restoring
         # the recorded interval first guarantees the remaining slider does
         # not clamp the durable deadline after a configuration change.
-        hours = max(0.1, min(12.0, interval / 3600.0))
+        hours = max(0.1, min(6.0, interval / 3600.0))
         interval = hours * 3600.0
         remaining = min(remaining, interval)
         self._countdown_interval_var.set(hours)
@@ -6086,7 +6512,9 @@ class UiWorker(threading.Thread):
                 text="循环警报: 工作线程未接入 (无界面模式)。"
             )
             return
-        hours = float(data.get("countdown_interval_hours", 1.0))
+        hours = max(
+            0.1, min(6.0, float(data.get("countdown_interval_hours", 1.0)))
+        )
         worker.set_interval_hours(hours)
         worker.set_enabled(bool(data.get("countdown_enabled", False)))
         if worker.enabled:
@@ -6127,9 +6555,16 @@ class UiWorker(threading.Thread):
     def _countdown_remaining_on_drag(self, value: str) -> None:
         """Move the live deadline as the user drags the remaining-time bar."""
 
-        if not bool(self._countdown_enabled_var.get()):
+        if (
+            not bool(self._countdown_enabled_var.get())
+            or not self._countdown_dragging
+        ):
             return
-        remaining = max(0.0, float(value))
+        # A remaining-time drag operates in whole minutes.  The worker still
+        # counts seconds internally; only manual selection is quantized.
+        remaining = max(0.0, round(float(value) / 60.0) * 60.0)
+        if abs(float(self._countdown_remaining_var.get()) - remaining) > 1e-9:
+            self._countdown_remaining_var.set(remaining)
         self._countdown_remaining_label.configure(
             text=self._format_countdown_seconds(remaining)
         )
@@ -6246,8 +6681,8 @@ class UiWorker(threading.Thread):
                 # application launch. Preserve only its configured time gap.
                 self._countdown_enabled_var.set(False)
                 if "countdown_interval_hours" in data:
-                    self._countdown_interval_var.set(float(
-                        data["countdown_interval_hours"]
+                    self._countdown_interval_var.set(max(
+                        0.1, min(6.0, float(data["countdown_interval_hours"]))
                     ))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed additional functions settings",
@@ -6709,6 +7144,13 @@ class UiWorker(threading.Thread):
         # operator's v1.0.30 report: he pressed 开始巡逻 at 18:08:01 ("yellow character marker was not
         # detected during patrol startup"), the reconnect then succeeded - and the patrol stayed
         # stopped because no patrol had ever been RUNNING for the reconnect to resume.
+        if not self._license_allowed():
+            self._show_license_refusal()
+            return False
+        if self._patrol_stop_pending:
+            LOG.info("START PATROL ignored: previous stop is still releasing keys")
+            self._control_status.configure(text="正在停止巡逻并释放按键，请稍候。")
+            return False
         self._patrol_intent = True
         if self.patrol_controller is None:
             LOG.warning("START PATROL refused: the patrol controller is unavailable")
@@ -6716,7 +7158,14 @@ class UiWorker(threading.Thread):
             return False
         if self.patrol_controller.is_enabled():
             return True
-        if not self.patrol_controller.can_start():
+        # A radio-button change is normally applied immediately, but a rapid
+        # click on 开始巡逻 can reach this callback before Tk has delivered the
+        # mode's command callback.  Apply the visible fixed/stationary choice
+        # synchronously: otherwise the UI says 站桩攻击 while the movement
+        # worker still follows an old route endpoint/temporary anchor.
+        self._fixed_on_change()
+        stationary_mode = self._stationary_attack_selected()
+        if not stationary_mode and not self.patrol_controller.can_start():
             # Logged, not only shown: this refusal used to leave no trace in the log the operator
             # sends, so "the patrol toggle does nothing" was undiagnosable.
             LOG.warning(
@@ -6771,24 +7220,90 @@ class UiWorker(threading.Thread):
     def _stop_patrol(self) -> bool:
         # The operator does NOT want to patrol any more: a later reconnect must not start one.
         self._patrol_intent = False
+        # This is lock-free and must happen in the hotkey/UI callback itself.
+        # The slower key scrub runs in the cleanup thread below; until then,
+        # leaving this event set lets attack or movement emit another key after
+        # the operator has already requested Stop Patrol.
+        event = getattr(self, "automation_active_event", None)
+        if event is not None:
+            event.clear()
         if self.patrol_controller is None:
             return False
-        self.patrol_controller.set_enabled(False)
-        if self.on_patrol_stop is not None:
+        if self._patrol_stop_pending:
+            LOG.info("STOP PATROL already releasing keys")
+            return True
+        try:
+            self.patrol_controller.set_enabled(False)
+        except Exception:
+            LOG.exception("Stop Patrol controller transition failed")
+            return False
+        self._patrol_stop_pending = True
+        self._patrol_stop_cleanup_done.clear()
+        # Render the stopped state before waiting on the keyboard-state lock.
+        # A worker may be halfway through a key transaction; waiting for that
+        # lock on Tk used to make the whole app look crashed.
+        try:
+            self._refresh_patrol_controls()
+            self._control_status.configure(text="正在停止巡逻并释放按键…")
+        except Exception:
+            LOG.exception("Stop Patrol immediate UI refresh failed")
+
+        def release_input_in_background() -> None:
             try:
-                self.on_patrol_stop()
+                LOG.info("STOP PATROL: background input cleanup starting")
+                if self.on_patrol_stop is not None:
+                    self.on_patrol_stop()
             except Exception:
                 # A foreground/key-release problem must be recorded, but Stop
                 # Patrol must leave the dashboard usable for manual recovery.
                 LOG.exception("Stop Patrol input cleanup failed")
+            finally:
+                self._patrol_stop_cleanup_done.set()
+
+        threading.Thread(
+            target=release_input_in_background,
+            name="patrol-stop-cleanup",
+            daemon=True,
+        ).start()
         # Stopping patrol also stops the YOLO attack subprocess: in stand-still
         # mode the character stands and the YOLO executor attacks, so without
         # this the character would keep attacking after Stop Patrol.
-        self._yolo_stop()
+        try:
+            self._yolo_stop()
+        except Exception:
+            # A detector subprocess/UI cleanup failure must never take down
+            # the dashboard after patrol input has already been disarmed.
+            LOG.exception("Stop Patrol detector cleanup failed")
         LOG.info(LOG_RUN_STOP + "。")
-        self._refresh_patrol_controls()
-        self._control_status.configure(text="巡逻已停止。")
+        try:
+            # The controls already reflect the stopped controller. Keep Start
+            # disabled until the background key cleanup says it is safe.
+            self._refresh_patrol_controls()
+        except Exception:
+            # The stop operation itself succeeded; a stale/destroyed Tk
+            # widget must not turn a safe input stop into an app crash.
+            LOG.exception("Stop Patrol UI refresh failed")
         return True
+
+    def _stationary_attack_selected(self) -> bool:
+        """Whether Start Patrol must use the route-independent stand-still mode.
+
+        The UI value is included as well as the live worker state.  This keeps
+        the Start button usable during the tiny interval between selecting
+        ``站桩攻击`` and the setting callback applying it to the worker.
+        """
+
+        mode_var = getattr(self, "_attack_mode_var", None)
+        if mode_var is not None:
+            try:
+                if str(mode_var.get()) == "stationary":
+                    return True
+            except Exception:
+                pass
+        return bool(getattr(
+            getattr(self, "movement_worker", None),
+            "stationary_attack_enabled", False,
+        ))
 
     def _add_layer_above(self) -> bool:
         if self.patrol_controller is None:
@@ -6807,40 +7322,84 @@ class UiWorker(threading.Thread):
         return True
 
     def _reset_recording(self) -> None:
-        if self.patrol_controller is None:
-            return
-        # Reset is deliberately immediate: no confirmation dialog or hint.
-        # Stop and release live input before mutating the recording.
-        self.patrol_controller.set_enabled(False)
-        if self.on_patrol_stop is not None:
+        controller = self.patrol_controller
+        if controller is None:
             try:
-                self.on_patrol_stop()
+                self._control_status.configure(text="巡逻控制器不可用。")
             except Exception:
-                LOG.exception("Reset Recording input cleanup failed")
+                pass
+            return
+        # Resetting the profile while a patrol owns its route/marker state can
+        # leave workers holding references to removed layers.  This used to be
+        # a visible refusal; retain that safe gate instead of trying to stop,
+        # delete, and rebuild everything in one Tk button callback.
+        if controller.is_enabled():
+            LOG.info("RESET RECORDING ignored: stop patrol first")
+            try:
+                self._control_status.configure(text="请先停止巡逻，再重置录制。")
+            except Exception:
+                LOG.debug("could not display reset refusal", exc_info=True)
+            return
+        if self._patrol_stop_pending:
+            LOG.info("RESET RECORDING ignored: patrol key cleanup is active")
+            try:
+                self._control_status.configure(text="正在停止巡逻并释放按键，请稍候再重置录制。")
+            except Exception:
+                LOG.debug("could not display reset wait", exc_info=True)
+            return
+
+        self._patrol_intent = False
         try:
-            self.patrol_controller.reset_recording()
+            controller.reset_recording()
+        except Exception as exc:
+            # The reset must never take down the UI.  A locked config/reference
+            # file, malformed on-disk profile, or a transient Windows error is
+            # reported as a normal refusal the operator can retry.
+            LOG.exception("Reset Recording failed")
+            try:
+                self._control_status.configure(text=f"无法重置录制: {exc}")
+            except Exception:
+                LOG.debug("could not display reset failure", exc_info=True)
+            return
+
+        # The profile write succeeded.  Everything below is best-effort
+        # cleanup: none of these optional references may turn a completed
+        # reset into an application crash.
+        try:
             # A reset starts a fresh recording for the current map; adopt the
             # map name now on disk (it may have been edited or re-identified
             # since the UI started) so identity checks use the current name.
-            self.configured_map_name = self.patrol_controller.map_name()
-            if getattr(self, "structure_tracker", None) is not None:
-                self.structure_tracker.reset(delete_reference=True)
-            reset_geometry = getattr(
-                getattr(self, "detector", None), "reset_geometry", None
-            )
-            if callable(reset_geometry):
-                reset_geometry()
-            if getattr(self, "map_identity_store", None) is not None:
-                self.map_identity_store.remove(self.configured_map_name)
-        except OSError as exc:
-            self._control_status.configure(text=f"无法重置录制: {exc}")
-            return
+            self.configured_map_name = controller.map_name()
+        except Exception:
+            LOG.warning("Reset Recording could not refresh the map name", exc_info=True)
+        for label, cleanup in (
+            ("structure reference", lambda: getattr(
+                self, "structure_tracker", None
+            ).reset(delete_reference=True) if getattr(
+                self, "structure_tracker", None
+            ) is not None else None),
+            ("minimap geometry", lambda: (
+                getattr(getattr(self, "detector", None), "reset_geometry", lambda: None)()
+            )),
+            ("map identity", lambda: getattr(
+                self, "map_identity_store", None
+            ).remove(self.configured_map_name) if getattr(
+                self, "map_identity_store", None
+            ) is not None else None),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                LOG.warning("Reset Recording could not clear %s", label, exc_info=True)
         self._unlocked_points.clear()
         self._layer_row_names = ()
-        self._refresh_patrol_controls()
-        self._control_status.configure(
-            text="录制已重置。图层1为空；巡逻已停止。"
-        )
+        try:
+            self._refresh_patrol_controls()
+            self._control_status.configure(
+                text="录制已重置。图层1为空；巡逻已停止。"
+            )
+        except Exception:
+            LOG.exception("Reset Recording UI rebuild failed")
 
     def _refresh_patrol_controls(self) -> None:
         if self.patrol_controller is None:
@@ -6862,7 +7421,13 @@ class UiWorker(threading.Thread):
         setter = getattr(hotkeys, "set_patrol_running", None)
         if setter is not None:
             setter(bool(running))
-        can_start = self.patrol_controller.can_start()
+        # 站桩攻击 records only a temporary current-position anchor at Start
+        # Patrol. It intentionally has no recorded layers, ropes, bands or
+        # route completeness requirement.
+        can_start = (
+            self._stationary_attack_selected()
+            or self.patrol_controller.can_start()
+        )
         selected = self.patrol_controller.selected_layer()
         snapshot = self.patrol_controller.snapshot()
         route = snapshot.route_order
@@ -6873,46 +7438,16 @@ class UiWorker(threading.Thread):
         self._ensure_layer_rows(tuple(layer_names))
         if hasattr(self, "_selected_layer_var"):
             self._selected_layer_var.set(selected)
-        button_labels = {
-            "left_most_pos": "最左",
-            "rope_pos": "绳索",
-            "right_most_pos": "最右",
-        }
-        final_name = self.patrol_controller.final_layer_name()
         for layer_name in layer_names:
-            # Keep this label compact so all three recording buttons retain
-            # enough width in the intentionally narrower controls column.
-            # The patrol range comboboxes carry selection/top-floor details.
             self._layer_labels[layer_name].configure(
                 text=self._patrol_display_name(layer_name)
             )
-            for point, button_label in button_labels.items():
-                final_rope = point == "rope_pos" and layer_name == final_name
-                recorded = self.patrol_controller.endpoint(layer_name, point)
-                key = (layer_name, point)
-                locked = not final_rope and record_button_is_locked(
-                    recorded, key in self._unlocked_points
-                )
-                if locked and recorded is not None:
-                    text = (
-                        f"🔒 {button_label}\n"
-                        f"{recorded_coordinate_text(recorded.x, recorded.y)}"
-                    )
-                else:
-                    text = (
-                        "绳索不可用 (最顶层)"
-                        if final_rope else f"录制 {button_label}"
-                    )
-                self._record_buttons[(layer_name, point)].configure(
-                    text=text,
-                    state="disabled" if final_rope else "normal",
-                    style=(
-                        "RecordLocked.TButton" if locked else "Record.TButton"
-                    ),
-                )
-                if point == "rope_pos":
-                    self._rope_tooltips[layer_name].set_enabled(final_rope)
+            self._draw_layer_axis(
+                layer_name, snapshot.layers.get(layer_name, {})
+            )
         start_state, stop_state = patrol_button_states(running, can_start)
+        if self._patrol_stop_pending:
+            start_state = "disabled"
         self._start_patrol_button.configure(state=start_state)
         self._stop_patrol_button.configure(state=stop_state)
         self._add_layer_button.configure(state="normal")
@@ -6920,6 +7455,18 @@ class UiWorker(threading.Thread):
             state="normal" if len(layer_names) > 0 else "disabled"
         )
         self._reset_recording_button.configure(state="normal")
+        if not self._license_allowed():
+            # The dashboard remains inspectable, but no capture-driven
+            # recording or automation entry point is usable before activation.
+            for button in (
+                self._start_patrol_button, self._stop_patrol_button,
+                self._add_layer_button, self._delete_layer_button,
+                self._reset_recording_button,
+                *self._record_buttons.values(),
+            ):
+                button.configure(state="disabled")
+            self._patrol_start_combo.configure(state="disabled")
+            self._patrol_end_combo.configure(state="disabled")
 
     def _update_patrol_range_combos(self, display_names: list[str]) -> None:
         """Feed the numeric-ascending floor list into the range comboboxes and
@@ -7093,16 +7640,12 @@ class UiWorker(threading.Thread):
         self._record_buttons.clear()
         self._rope_tooltips.clear()
         self._layer_labels.clear()
+        self._layer_axis_canvases.clear()
         self._layer_row_names = layer_names
         ttk = self._ttk
-        point_labels = (
-            ("left_most_pos", "最左"),
-            ("rope_pos", "绳索"),
-            ("right_most_pos", "最右"),
-        )
         for layer_name in layer_names:
             row = ttk.Frame(self._layer_rows_frame)
-            row.pack(fill="x", pady=3)
+            row.pack(fill="x", pady=(2, 4))
             selector = ttk.Radiobutton(
                 row,
                 variable=self._selected_layer_var,
@@ -7111,39 +7654,24 @@ class UiWorker(threading.Thread):
                     self._select_recording_layer(layer)
                 ),
             )
-            selector.pack(side="left", padx=(0, 1))
-            # ``layer1`` previously reserved 18 text columns, leaving a large
-            # blank strip and clipping the action buttons. ``楼层N`` fits in
-            # seven columns, including room for multi-digit floor numbers.
+            selector.pack(side="left", anchor="n", padx=(0, 1), pady=(4, 0))
             label = ttk.Label(row, width=4)
-            label.pack(side="left", padx=(0, 2))
+            label.pack(side="left", anchor="n", padx=(0, 2), pady=(5, 0))
             self._layer_labels[layer_name] = label
-            for point_name, point_label in point_labels:
-                button = ttk.Button(
-                    row,
-                    text=f"录制 {point_label}",
-                    style="Record.TButton",
-                )
-                button.pack(side="left", fill="x", expand=True, padx=(0, 2))
-                # 长按 1 秒 = 解锁并清除该点录制；短按 = 录制（仅对空点/
-                # 已解锁点生效，已录制的点短按无效）。
-                button.bind(
-                    "<ButtonPress-1>",
-                    lambda event, layer=layer_name, point=point_name: (
-                        self._record_button_press(layer, point)
-                    ),
-                )
-                button.bind(
-                    "<ButtonRelease-1>",
-                    lambda event, layer=layer_name, point=point_name: (
-                        self._record_button_release(layer, point)
-                    ),
-                )
-                self._record_buttons[(layer_name, point_name)] = button
-                if point_name == "rope_pos":
-                    self._rope_tooltips[layer_name] = HoverTooltip(
-                        button, rope_unavailable_hint()
-                    )
+            canvas = self._tk.Canvas(
+                row,
+                width=_LAYER_AXIS_WIDTH,
+                height=_LAYER_AXIS_HEIGHT,
+                highlightthickness=0,
+                background="#f5f5f5",
+                cursor="hand2",
+            )
+            canvas.pack(side="left", fill="x", expand=True)
+            canvas.bind(
+                "<Button-1>",
+                lambda event, layer=layer_name: self._layer_axis_click(event, layer),
+            )
+            self._layer_axis_canvases[layer_name] = canvas
 
 
 __all__ = [

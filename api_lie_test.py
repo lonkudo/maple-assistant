@@ -158,6 +158,23 @@ class ApiLieTestWorker(threading.Thread):
     def request_stop(self) -> None:
         self._stop_request.set()
 
+    def _sleep_or_stop(self, seconds: float) -> bool:
+        """Wait for a visual settle period, but let Esc end it immediately."""
+
+        if seconds <= 0:
+            return not (self._stop_request.is_set() or self.stop_event.is_set())
+        if self._sleep is not time.sleep:
+            self._sleep(float(seconds))
+            return not (self._stop_request.is_set() or self.stop_event.is_set())
+        deadline = time.monotonic() + float(seconds)
+        while True:
+            if self._stop_request.is_set() or self.stop_event.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            self._stop_request.wait(min(0.05, remaining))
+
     def set_key(self, key: str) -> None:
         """The panel's 密钥 button: an empty key means "use the local mimic"."""
 
@@ -376,6 +393,7 @@ class ApiLieTestWorker(threading.Thread):
             feed_frames = max(1, int(round(active_seconds * self.fps)))
             settle_deadline = pass_started + self.await_seconds
             remaining_settle = settle_deadline - time.perf_counter()
+            await_ticks = max(0, int(round(max(0.0, remaining_settle) * self.fps)))
             if remaining_settle > 0:
                 plan = (f"连接已建立，等待第二个窗口剩余 {remaining_settle:.1f} 秒后立即上传 "
                         f"{feed_frames} 帧 @ {self.fps:.0f} fps（{active_seconds:.0f} 秒）")
@@ -389,7 +407,9 @@ class ApiLieTestWorker(threading.Thread):
             if self.aim_enabled and self._aim is None:
                 self._start_aim(image.shape[1], image.shape[0])
             if remaining_settle > 0:
-                self._sleep(remaining_settle)
+                if not self._sleep_or_stop(remaining_settle):
+                    self._report("stopped", "等待测谎窗口时收到停止请求")
+                    return
             started = time.perf_counter()
             # The first upload is due now.  Later frames use the normal 5-fps
             # cadence; do not add an unnecessary first 200 ms tick.
@@ -403,7 +423,9 @@ class ApiLieTestWorker(threading.Thread):
                 next_at += interval
                 delay = next_at - time.perf_counter()
                 if delay > 0:
-                    self._sleep(delay)
+                    if not self._sleep_or_stop(delay):
+                        self._report("stopped", f"第 {tick} 帧前收到停止请求")
+                        break
                 frame_id += 1
                 image, rect = self._capture()
                 if image is None:

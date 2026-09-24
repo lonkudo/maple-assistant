@@ -85,15 +85,35 @@ ROUTE_CHECK_MIN_STRUCTURE_CONFIDENCE = 0.12
 
 # 站桩攻击 records the player's current marker only for the active session.
 # It is never persisted and is independent of the recorded route/layer data.
-STATIONARY_ATTACK_X_TOLERANCE = 0.012
-# The standing position has a Y half too, and it needs the same jitter band:
+STATIONARY_ATTACK_X_TOLERANCE = 0.006
+# The standing position has a Y half too, and it uses the same anchor band:
 # marker Y moves by a minimap pixel on its own, and a jump spent on that jitter
 # walks the character off its platform (observed in the field).  One single
 # jump is also not enough when the character really is displaced - the attempt
 # is re-armed while the mismatch lasts, one jump per window, with a slower
 # cadence after the first burst so a spot that a jump cannot reach never turns
 # into an endless jump loop.
-STATIONARY_ATTACK_Y_TOLERANCE = 0.012
+STATIONARY_ATTACK_Y_TOLERANCE = 0.006
+# Stationary recovery begins close to its anchor.  A normal patrol hold is
+# deliberately long, but it makes a near-anchor correction overshoot before
+# the next capture arrives.  Keep this distinct, short hold for stand-still
+# mode only.
+STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS = 0.12
+# Once a recovery walk has ARRIVED inside the tolerance above, the character is
+# only walked again after it leaves this wider band.  Without that hysteresis
+# the anchor is unreachable and the facing tap impossible: a 0.12s walk moves
+# the marker by about a pixel, and the 朝向 tap that follows a recovery moves it
+# by that same small step - so the tight arrival band alone would answer every
+# applied facing with an opposite recovery walk that turns the character back
+# (observed in the field as a face/walk twitch that never ends facing 左).
+STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.020
+# How long the 朝向 tap holds its direction.  It is the same "small hold" the
+# operator sees: long enough for the game to turn the character, short enough
+# to keep the step inside STATIONARY_ATTACK_X_HOLD_TOLERANCE.
+STATIONARY_ATTACK_FACING_HOLD_SECONDS = 0.10
+# 双向 alternates the final stationary facing after this many settled
+# minimap frames. At the shared 5 FPS capture cadence this is about 16s.
+STATIONARY_ATTACK_BILATERAL_FACING_FRAMES = 80
 STATIONARY_ATTACK_Y_JUMP_GAP_SECONDS = 1.5
 STATIONARY_ATTACK_Y_BURST_JUMPS = 4
 STATIONARY_ATTACK_Y_RETRY_SECONDS = 10.0
@@ -2335,6 +2355,15 @@ class MovementWorker(threading.Thread):
         while not self.stop_event.is_set():
             time.sleep(0.02)
             try:
+                if self._patrol_abort_event.is_set():
+                    # The sender's lifecycle scrub owns the real key-up.  Do
+                    # not let this asynchronous manager emit a second, late
+                    # release after the operator has resumed manual input.
+                    with self._direction_lock, self._hold_lock:
+                        self._walk_hold_key = None
+                        self._walk_hold_z = False
+                        self._walk_hold_until = 0.0
+                    continue
                 release = False
                 # Watchdog: the direction-handoff reservation is held for at
                 # most ~1.2s in normal patrol.  If one outlives that (an
@@ -2494,6 +2523,8 @@ class MovementWorker(threading.Thread):
         jump-to-rope.
         """
 
+        if not self._patrol_input_allowed():
+            return False
         if decision.key not in ("left", "right"):
             return _send_tap(self.key_sender, decision)
         if not _sender_is_safe(self.key_sender):
@@ -2505,6 +2536,8 @@ class MovementWorker(threading.Thread):
         direction_transition_started = False
         try:
             with self._direction_lock, self._hold_lock:
+                if not self._patrol_input_allowed():
+                    return False
                 # The focus worker releases all physical keys on a focus dip.  Its
                 # release happens outside this hold state, so the worker can still
                 # believe Right/Z are held after refocus and silently skip their
@@ -2546,7 +2579,7 @@ class MovementWorker(threading.Thread):
                             deadline = time.monotonic() + 1.0
                             while (attack_motion_active()
                                    and time.monotonic() < deadline):
-                                if self.stop_event.wait(0.02):
+                                if not self._wait_for_patrol_motion(0.02):
                                     if transition_event is not None:
                                         transition_event.clear()
                                     return False
@@ -2571,10 +2604,14 @@ class MovementWorker(threading.Thread):
                         # every endpoint turn is received as Left-up -> pause ->
                         # Right-down (or the reverse), rather than two events at
                         # the identical timestamp.
-                        if self.stop_event.wait(0.10):
+                        if not self._wait_for_patrol_motion(0.10):
                             if self.direction_transition_event is not None:
                                 self.direction_transition_event.clear()
                             return False
+                    if not self._patrol_input_allowed():
+                        if self.direction_transition_event is not None:
+                            self.direction_transition_event.clear()
+                        return False
                     claimed = key_down(decision.key) is not False
                     if not claimed:
                         if self.direction_transition_event is not None:
@@ -2597,10 +2634,19 @@ class MovementWorker(threading.Thread):
                 self._walk_hold_until = time.monotonic() + max(
                     0.01, float(decision.duration)
                 )
+                if (self.stationary_attack_enabled
+                        and self._walk_hold_key in ("left", "right")):
+                    # 站桩攻击 records the direction the character was really
+                    # turned to: the recovery walk toward the anchor is what
+                    # leaves it facing away from the selected 朝向.  Recording
+                    # it here (where the key went down) instead of at the
+                    # decision keeps a walk that the movement cooldown skipped
+                    # or the input layer refused from looking like a turn.
+                    self._stationary_facing_command = self._walk_hold_key
             if direction_transition_started:
                 # Let the new direction settle for a game input tick before
                 # the attack worker can send another action key.
-                self.stop_event.wait(0.15)
+                self._wait_for_patrol_motion(0.15)
             return True
         finally:
             # The handoff reservation must never outlive this call: a key
@@ -2719,7 +2765,8 @@ class MovementWorker(threading.Thread):
         rope_approach_creep_seconds: float = 0.25,
         rope_tiny_step_min_seconds: float = 0.05,
         rope_tiny_step_max_seconds: float = 0.15,
-        small_step_left_first: bool = False,
+        small_step_face_left: bool = False,
+        small_step_left_first: Optional[bool] = None,
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
         other_player_check_interval_seconds: float = 60.0,
@@ -2925,6 +2972,10 @@ class MovementWorker(threading.Thread):
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
         self.automation_active_event = automation_active_event
+        # A patrol stop is a stronger edge than the next capture frame.  It
+        # wakes any in-flight direction handoff / micro-step immediately so a
+        # stale action cannot finish after the operator has stopped patrol.
+        self._patrol_abort_event = threading.Event()
         # 自动重连 window tracking (see ROUTE_CHECK_AFTER_RECONNECT_SECONDS).  The event being SET
         # is only remembered; its falling edge arms ``_route_check_pending``, which then waits
         # (bounded by ``_route_check_deadline``) for one usable marker reading.
@@ -2947,6 +2998,14 @@ class MovementWorker(threading.Thread):
         self._stair_jump_skip_frames = 0
         self._stair_jump_completion_lock = threading.Lock()
         self._stair_jump_completion: Optional[bool] = None
+        # Recorded jump points are passed once per patrol leg.  Up remains
+        # held after their Alt tap until the marker has landed and its Y is
+        # stable, allowing a rope immediately above the point to be climbed.
+        self._jump_point_passed: set[tuple[str, int]] = set()
+        self._jump_point_direction: Optional[str] = None
+        self._jump_point_up_held = False
+        self._jump_point_up_started_at = 0.0
+        self._jump_point_y_samples: list[float] = []
         # True once the automation input gate has been observed active, so the
         # disarmed->armed edge (Start Patrol) can be detected exactly once.
         self._automation_was_active = False
@@ -2972,9 +3031,17 @@ class MovementWorker(threading.Thread):
         # while changing a key; rope/stair/drop and 小碎步 retain it for their
         # full chord so their directions cannot cross.
         self._direction_lock = threading.RLock()
-        # UI-controlled order for the atomic micro-step.  False preserves a
-        # right-then-left nudge; the “左右” option selects left-then-right.
-        self.small_step_left_first = bool(small_step_left_first)
+        # Compatibility for pre-v1.0.75 callers.  Small-step now always ends
+        # right; facing after a stand-still recovery is its own option.
+        if small_step_left_first is not None:
+            # Compatibility for callers written before the facing control:
+            # the former value chose the FIRST direction, while the current
+            # value chooses the FINAL facing direction.
+            small_step_face_left = not bool(small_step_left_first)
+        self.small_step_face_left = bool(small_step_face_left)
+        # UI keeps this aligned with the configured fixed-attack key.  The
+        # atomic 小碎步 owns two explicit taps between its two directions.
+        self.small_step_attack_key = "ctrl"
         # Published from the movement loop.  Queued jump/buff/small-step
         # input is only allowed while a normal horizontal patrol or rope
         # approach decision is live.
@@ -2984,7 +3051,25 @@ class MovementWorker(threading.Thread):
         # a temporary current-position anchor; recorded route data is never
         # used by this mode.
         self.stationary_attack_enabled = False
+        self.stationary_facing_direction = "right"
+        # 双向 is a session-only cycle. It starts facing right and flips only
+        # from settled stationary frames, never in the middle of a recovery.
+        self._stationary_bilateral_target = "right"
+        self._stationary_bilateral_frames = 0
         self._stationary_attack_anchor: Optional[Point] = None
+        # The horizontal direction this worker last COMMANDED in stand-still
+        # mode - a recovery walk or an applied 朝向 tap.  The selected 朝向 is
+        # owed whenever it differs from this value: a recovery walk turns the
+        # character toward the anchor it walks to, so the field fault was a
+        # character standing on its spot facing the way it came back from.
+        # None means "unknown" (the operator's own positioning at Start Patrol
+        # may face either way), which makes the selected side the one to apply.
+        self._stationary_facing_command: Optional[str] = None
+        # True once the character reached the anchor's X band.  Until it leaves
+        # STATIONARY_ATTACK_X_HOLD_TOLERANCE again no position walk is issued,
+        # so a settled anchor is never re-walked by the jitter of a pixel or by
+        # the small step of the 朝向 tap itself.
+        self._stationary_x_settled = False
         # Y recovery bookkeeping: how many jumps this displacement episode has
         # already spent and when the last one was sent.
         self._stationary_y_jumps = 0
@@ -3290,6 +3375,57 @@ class MovementWorker(threading.Thread):
 
         self.stair_jump_worker = worker
 
+    def arm_patrol_input(self) -> None:
+        """Permit a fresh patrol session after its sender has been reset."""
+
+        self._patrol_abort_event.clear()
+
+    def disarm_patrol_input(self) -> None:
+        """Immediately invalidate delayed movement without sending a key.
+
+        The central sender owns the one authoritative game-side key scrub.
+        This method deliberately only cancels worker-local work: it is safe
+        to call from the UI thread even when a movement transaction holds the
+        directional locks, and it cannot inject a late key-up over the
+        operator's manual controls.
+        """
+
+        self._patrol_abort_event.set()
+        if self.direction_transition_event is not None:
+            self.direction_transition_event.clear()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
+        if self.moving_active_event is not None:
+            self.moving_active_event.clear()
+        if self.pickup_active_event is not None:
+            self.pickup_active_event.clear()
+
+    def _patrol_input_allowed(self) -> bool:
+        """Whether this worker may still finish the current motion."""
+
+        return bool(
+            not self.stop_event.is_set()
+            and not self._patrol_abort_event.is_set()
+            and (self.automation_active_event is None
+                 or self.automation_active_event.is_set())
+        )
+
+    def _wait_for_patrol_motion(self, seconds: float) -> bool:
+        """Wait only while the current patrol lifecycle remains valid."""
+
+        if seconds <= 0:
+            return self._patrol_input_allowed()
+        deadline = time.monotonic() + float(seconds)
+        while self._patrol_input_allowed():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            if self._patrol_abort_event.wait(min(0.02, remaining)):
+                return False
+        return False
+
     def _consume_stair_jump_completion(self) -> None:
         """Apply the confirmed queue result on the movement thread.
 
@@ -3512,7 +3648,7 @@ class MovementWorker(threading.Thread):
                     key_up("alt")
                 key_up(direction)
 
-    def perform_stair_jump(self, direction: str) -> bool:
+    def perform_stair_jump(self, direction: str, hold_up: bool = False) -> bool:
         """Add one Alt tap to an already-running patrol direction.
 
         The patrol walk remains owned by ``_send_walk_hold`` while the
@@ -3524,9 +3660,9 @@ class MovementWorker(threading.Thread):
         """
 
         direction = str(direction).casefold()
-        if (direction not in ("left", "right") or not self.patrol_enabled
-                or (self.automation_active_event is not None
-                    and not self.automation_active_event.is_set())):
+        if (not self._patrol_input_allowed()
+                or direction not in ("left", "right")
+                or not self.patrol_enabled):
             return False
         if not _sender_is_safe(self.key_sender):
             LOG.warning("stair jump suppressed: target window is not safely selected")
@@ -3537,6 +3673,18 @@ class MovementWorker(threading.Thread):
             LOG.warning("stair jump requires key_down() and key_up(); suppressed")
             return False
         with self._direction_lock:
+            # Any new jump replaces a previous jump-point rope attempt.  A
+            # stale Up must never survive into the next Alt jump.
+            if self._jump_point_up_held:
+                key_up("up")
+                self._jump_point_up_held = False
+                self._jump_point_up_started_at = 0.0
+                self._jump_point_y_samples.clear()
+                if self.climbing_active_event is not None:
+                    self.climbing_active_event.clear()
+                LOG.info("JUMP POINT: released prior Up hold for new jump")
+            if not self._patrol_input_allowed():
+                return False
             is_key_down = getattr(self.key_sender, "is_key_down", None)
             walk_is_held = bool(
                 self._walk_hold_key == direction
@@ -3550,21 +3698,94 @@ class MovementWorker(threading.Thread):
             alt_down = False
             try:
                 lead = max(0.0, self.stair_jump_lead_seconds)
-                if lead and self.stop_event.wait(lead):
+                if lead and not self._wait_for_patrol_motion(lead):
+                    return False
+                if not self._patrol_input_allowed():
                     return False
                 if key_down("alt") is False:
                     return False
                 alt_down = True
-                if self.stop_event.wait(self.stair_jump_alt_hold_seconds):
+                if not self._wait_for_patrol_motion(self.stair_jump_alt_hold_seconds):
                     return False
                 key_up("alt")
                 alt_down = False
+                if hold_up:
+                    if key_down("up") is False:
+                        return False
+                    self._jump_point_up_held = True
+                    self._jump_point_up_started_at = time.monotonic()
+                    self._jump_point_y_samples.clear()
+                    if self.climbing_active_event is not None:
+                        self.climbing_active_event.set()
+                    LOG.info("JUMP POINT executed: keeping Up held until landing Y settles")
                 return True
             finally:
                 if alt_down:
                     key_up("alt")
                 if added_direction_claim:
                     key_up(direction)
+
+    def _jump_point_decision(self, observation: MinimapObservation, layer: Optional[str],
+                             plan: Optional[PositionMovementPlan]) -> Optional[MovementDecision]:
+        if (observation.player is None or not layer or plan is None
+                or plan.decision.key not in ("left", "right")):
+            return None
+        if self._jump_point_direction != plan.decision.key:
+            self._jump_point_direction = plan.decision.key
+            self._jump_point_passed.clear()
+        points = self.important_positions.get(layer, {}).get("jump_points", [])
+        if not isinstance(points, list):
+            return None
+        for index, point in enumerate(points):
+            if not isinstance(point, dict):
+                continue
+            recorded_direction = str(point.get("direction", "")).casefold()
+            # A jump point is directional.  Old undirected records stay
+            # visible so they can be deleted, but must never fire implicitly.
+            if recorded_direction not in ("left", "right"):
+                continue
+            if recorded_direction != plan.decision.key:
+                continue
+            try:
+                # The yellow marker is quantised by the minimap pixels and
+                # can wander a few thousandths between captures.  A ±0.005
+                # window keeps the recorded X/Y point responsive without
+                # allowing it to fire at a neighbouring platform.
+                matched = (abs(observation.player.x - float(point["x"])) <= 0.005
+                           and abs(observation.player.y - float(point["y"])) <= 0.005)
+            except (KeyError, TypeError, ValueError):
+                continue
+            token = (layer, index)
+            if matched and token not in self._jump_point_passed:
+                self._jump_point_passed.add(token)
+                direction = plan.decision.key
+                LOG.info("%s JUMP POINT %s[%d] matched x=%.6f y=%.6f; jumping %s+Up",
+                         "LEFT" if direction == "left" else "RIGHT", layer, index,
+                         observation.player.x, observation.player.y, direction)
+                return MovementDecision(f"jump_point_{direction}", "recorded jump point", plan.decision.duration)
+        return None
+
+    def _update_jump_point_landing(self, observation: MinimapObservation) -> None:
+        if not self._jump_point_up_held or observation.player is None:
+            return
+        # The samples immediately after Alt can still be from the take-off
+        # frame.  Keep Up down through that jump session, then accept only a
+        # later stable Y sequence as a landing on a horizontal platform.
+        if time.monotonic() - self._jump_point_up_started_at < 0.40:
+            return
+        self._jump_point_y_samples.append(float(observation.player.y))
+        if len(self._jump_point_y_samples) > 3:
+            del self._jump_point_y_samples[:-3]
+        if len(self._jump_point_y_samples) == 3 and max(self._jump_point_y_samples) - min(self._jump_point_y_samples) <= 0.001:
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(key_up):
+                key_up("up")
+            self._jump_point_up_held = False
+            self._jump_point_up_started_at = 0.0
+            self._jump_point_y_samples.clear()
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.clear()
+            LOG.info("JUMP POINT landing Y settled; released Up and resumed patrol")
 
     def perform_queued_stair_jump(self, direction: str) -> bool:
         """Compatibility entry point for older integrations.
@@ -4784,11 +5005,32 @@ class MovementWorker(threading.Thread):
         if self.stationary_attack_enabled != enabled:
             self.stationary_attack_enabled = enabled
             self._stationary_attack_anchor = None
+            self._stationary_facing_command = None
+            self._stationary_bilateral_target = "right"
+            self._stationary_bilateral_frames = 0
+            self._stationary_x_settled = False
             self._reset_stationary_y_recovery()
             LOG.info(
                 "stationary attack mode %s",
                 "enabled; awaiting temporary Start Patrol position" if enabled else "disabled",
             )
+
+    def set_stationary_facing_direction(self, direction: str) -> None:
+        """Apply a 朝向 selection and restart 双向 from the right side."""
+
+        direction = str(direction).casefold()
+        if direction not in ("left", "right", "both"):
+            direction = "right"
+        if self.stationary_facing_direction == direction:
+            return
+        self.stationary_facing_direction = direction
+        self._stationary_bilateral_target = "right"
+        self._stationary_bilateral_frames = 0
+        # A changed selection is owed even if the character had already been
+        # corrected for its old selection. The next settled frame queues the
+        # new target through the arbiter.
+        self._stationary_facing_command = None
+        LOG.info("stationary facing selection changed to %s", direction)
 
     def stationary_attack_anchor_position(self) -> Optional[Point]:
         """The temporary 站桩攻击 anchor of this session, or None.
@@ -4838,6 +5080,15 @@ class MovementWorker(threading.Thread):
             LOG.warning("stationary attack start rejected: yellow marker missing")
             return False
         self._stationary_attack_anchor = Point(float(marker.x), float(marker.y))
+        # The recorded position IS the anchor, so the X side starts settled.
+        # Starting patrol must not send a direction merely to restore 朝向: that
+        # visible tap nudges the character away from the just-recorded point.
+        # Treat the current facing as settled until a genuine recovery walk or
+        # a later 朝向 selection creates a new facing obligation.
+        self._stationary_facing_command = self._stationary_facing_target_for_frame()
+        self._stationary_bilateral_target = "right"
+        self._stationary_bilateral_frames = 0
+        self._stationary_x_settled = True
         self._reset_stationary_y_recovery()
         LOG.info(
             "STATIONARY ATTACK temporary anchor saved x=%.6f y=%.6f "
@@ -4957,15 +5208,172 @@ class MovementWorker(threading.Thread):
         if player is None:
             return MovementDecision(None, "stationary attack waiting for marker")
         gap_x = anchor.x - player.x
-        if gap_x > STATIONARY_ATTACK_X_TOLERANCE:
-            return MovementDecision("right", "stationary X recovery right",
-                                    self.movement_hold_seconds)
-        if gap_x < -STATIONARY_ATTACK_X_TOLERANCE:
-            return MovementDecision("left", "stationary X recovery left",
-                                    self.movement_hold_seconds)
-        # X is back in its zone; the standing Y is this session's launch
-        # position, not a recorded map layer.
-        return self._stationary_y_recovery_decision(anchor, player)
+        if abs(gap_x) <= STATIONARY_ATTACK_X_TOLERANCE:
+            # Arrived: the anchor band is reached, so the position is settled
+            # from here on (see _stationary_x_settled for the hysteresis).
+            self._stationary_x_settled = True
+        elif (abs(gap_x) > STATIONARY_ATTACK_X_HOLD_TOLERANCE
+                or not self._stationary_x_settled):
+            # Walk back to the anchor.  The walk turns the character toward the
+            # side it travels, which is exactly what the 朝向 correction below
+            # has to undo once the position is correct - ``_send_walk_hold``
+            # records that direction once the key is really pressed.
+            self._stationary_x_settled = False
+            direction = "right" if gap_x > 0 else "left"
+            return MovementDecision(
+                direction, f"stationary X recovery {direction}",
+                STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS,
+            )
+        # X is settled.  The standing Y is this session's launch position, not a
+        # recorded map layer.
+        decision = self._stationary_y_recovery_decision(anchor, player)
+        if decision.key is not None:
+            # A recovery jump owns this frame; turn the character afterwards.
+            return decision
+        # The facing is applied even while the Y side waits for its next jump:
+        # a jump does not change the facing, and holding the 朝向 hostage to a
+        # spot the jump cannot reach is how the correction disappeared.
+        return self._stationary_facing_decision(decision)
+
+    def _stationary_facing_decision(
+        self, settled_decision: MovementDecision
+    ) -> MovementDecision:
+        """Apply the selected 朝向 as the last atomic motion on a settled anchor.
+
+        The operator selects the side the character must face while it stands
+        and attacks (朝向).  A position recovery walks the character back to
+        the anchor, and that walk leaves it facing the way it came - the
+        observed field fault: 朝向左 selected, a monster knocks the character
+        to the left, the recovery walks right, and the character keeps standing
+        on its spot facing right.
+
+        The correction therefore rides the same atomic arbiter path as the
+        small-step, and it stays OWED until the arbiter reports the key really
+        went down: a queued token can be drained while a walk handoff or a
+        focus dip shuts the arbiter's safe-stage gate, and a dropped token must
+        never be mistaken for an applied facing.  Whether a token is still in
+        flight is asked of the arbiter itself, so a drained request is re-queued
+        on the next settled capture instead of latching the correction away.
+        """
+
+        direction = self._stationary_facing_target_for_frame(advance=True)
+        if direction not in ("left", "right"):
+            return settled_decision
+        if self._stationary_facing_command == direction:
+            return settled_decision
+        pending = getattr(self.motion_arbiter, "facing_pending", None)
+        if callable(pending) and pending(direction):
+            return MovementDecision(
+                None, f"stationary facing {direction} queued",
+            )
+        request = getattr(self.motion_arbiter, "request_facing", None)
+        if not callable(request):
+            return settled_decision
+        if self._walk_hold_key is not None:
+            # A direction key is still held from the recovery walk: the tap
+            # would be swallowed by that walk, or undone by its remainder.  The
+            # frame that decides "wait" releases the hold, so the next capture
+            # queues the correction.
+            return MovementDecision(
+                None,
+                f"stationary facing {direction} waiting for the walk to settle",
+            )
+        if request(direction):
+            return MovementDecision(
+                None, f"stationary facing {direction} queued",
+            )
+        return MovementDecision(
+            None, f"stationary facing {direction} refused; will retry",
+        )
+
+    def _stationary_facing_target_for_frame(self, *, advance: bool = False) -> str:
+        """Return the selected stationary facing for this settled frame.
+
+        双向 does not issue raw directional input from the movement loop.  It
+        merely changes the target after 80 settled minimap frames; the normal
+        facing obligation below then queues one atomic arbiter correction.
+        This preserves the same attack/movement exclusion as 左 and 右.
+        """
+
+        setting = str(self.stationary_facing_direction).casefold()
+        if setting in ("left", "right"):
+            self._stationary_bilateral_target = setting
+            self._stationary_bilateral_frames = 0
+            return setting
+        if setting != "both":
+            return "right"
+        if advance:
+            self._stationary_bilateral_frames += 1
+        if (advance and self._stationary_bilateral_frames
+                >= STATIONARY_ATTACK_BILATERAL_FACING_FRAMES):
+            self._stationary_bilateral_frames = 0
+            previous = self._stationary_bilateral_target
+            self._stationary_bilateral_target = (
+                "left" if previous == "right" else "right"
+            )
+            LOG.info(
+                "stationary bilateral facing toggled: %s -> %s after %d frames",
+                previous,
+                self._stationary_bilateral_target,
+                STATIONARY_ATTACK_BILATERAL_FACING_FRAMES,
+            )
+        return self._stationary_bilateral_target
+
+    def perform_stationary_facing(self, direction: str) -> bool:
+        """Atomically turn the character to the selected 朝向.
+
+        Called only by ``MotionArbiter``, so attacks and other queued motions
+        are already excluded and the movement loop's direction lock keeps the
+        ordinary walk out of the tap.  It returns False (the arbiter then drains
+        the token) whenever the character is not in a state where the tap can
+        stick; movement keeps the facing owed and queues it again.
+        """
+
+        direction = str(direction).casefold()
+        if (not self._patrol_input_allowed()
+                or direction not in ("left", "right")
+                or not _sender_is_safe(self.key_sender)):
+            return False
+        if not self.stationary_attack_enabled or self._movement_busy_now():
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_down is None or key_up is None:
+            return False
+        with self._direction_lock, self._hold_lock:
+            if (not self._patrol_input_allowed()
+                    or not self.stationary_attack_enabled
+                    or self._movement_busy_now()):
+                return False
+            if self._walk_hold_key not in (None, direction):
+                # The position recovery is still travelling the other way; a
+                # tap now would be undone by the rest of that walk.
+                LOG.info(
+                    "stationary facing %s deferred: still walking %s",
+                    direction, self._walk_hold_key,
+                )
+                return False
+            self._release_walk_hold()
+            if key_down(direction) is False:
+                return False
+            try:
+                if not self._wait_for_patrol_motion(
+                        STATIONARY_ATTACK_FACING_HOLD_SECONDS):
+                    return False
+            finally:
+                key_up(direction)
+        # The character faces the selected side now.  The obligation is cleared
+        # only here, after the key really went down and up, and the step the tap
+        # itself made is accepted as settled so that the tight arrival band
+        # cannot answer it with an opposite walk.
+        self._stationary_facing_command = direction
+        self._stationary_x_settled = True
+        self._patrol_facing = direction
+        LOG.info(
+            "stationary facing correction executed: %s (hold %.2fs)",
+            direction, STATIONARY_ATTACK_FACING_HOLD_SECONDS,
+        )
+        return True
 
     def _apply_pending_patrol_start(
         self, observation: MinimapObservation
@@ -6634,15 +7042,18 @@ class MovementWorker(threading.Thread):
             self._walk_hold_until = 0.0
 
     def perform_micro_step(self) -> bool:
-        """Run one short Left/Right pair while temporarily pausing patrol.
+        """Run one short Left/Right step with two attacks between directions.
 
         Called only by ``MotionArbiter``.  The arbiter has already blocked
         attack and other queued motions; this method clears the current patrol
-        walk, owns the directional sequence for 300 ms per side with a 100 ms
-        neutral gap between directions, and leaves no direction down. The
-        following patrol frame naturally re-arms its ordinary walk hold.
+        walk, then owns ``first direction -> attack twice -> second
+        direction``. The final direction is chosen from the stand-still 朝向
+        setting or the prior patrol direction, so the sequence preserves the
+        intended facing.
         """
 
+        if not self._patrol_input_allowed():
+            return False
         if not _sender_is_safe(self.key_sender):
             LOG.info("small-step blocked: target window is not safely selected")
             return False
@@ -6656,6 +7067,8 @@ class MovementWorker(threading.Thread):
         # Check and claim under the same directional lock.  A climb/drop
         # cannot begin between this busy check and the first tiny step.
         with self._direction_lock, self._hold_lock:
+            if not self._patrol_input_allowed():
+                return False
             if self._movement_busy_now():
                 LOG.info("small-step skipped: climb/drop input is active")
                 return False
@@ -6663,6 +7076,15 @@ class MovementWorker(threading.Thread):
             # never force-release Up/Down, Alt, or any unrelated key.  The
             # arbiter plus this directional lock keep jump/buff/climb/drop
             # transactions outside this atomic two-step sequence.
+            # In stand-still mode the operator's 朝向 selection is the facing
+            # source of truth.  On ordinary patrol, preserve the direction
+            # that was active before the asynchronous walk hold was released.
+            if self.stationary_attack_enabled:
+                resume_direction = self._stationary_facing_target_for_frame()
+            else:
+                resume_direction = self._walk_hold_key
+                if resume_direction not in ("left", "right"):
+                    resume_direction = None
             self._release_walk_hold()
             is_key_down = getattr(self.key_sender, "is_key_down", None)
             if callable(is_key_down) and (
@@ -6671,29 +7093,60 @@ class MovementWorker(threading.Thread):
                 return False
             if self.moving_active_event is not None:
                 self.moving_active_event.clear()
-            first = "left" if self.small_step_left_first else "right"
-            second = "right" if first == "left" else "left"
+            # The first micro-step deliberately points away from the facing
+            # target, then the second returns to it: 朝向左 is Right -> Left;
+            # 朝向右 is Left -> Right.  Outside stand-still mode, the prior
+            # patrol direction remains the target where one exists.
+            final_direction = resume_direction or "right"
+            first = "right" if final_direction == "left" else "left"
+            second = final_direction
             first_claimed = key_down(first) is not False
             if not first_claimed:
                 return False
             try:
-                time.sleep(0.30)
+                if not self._wait_for_patrol_motion(0.22):
+                    return False
             finally:
                 key_up(first)
-            # Let the game's movement state observe the release before the
-            # opposite direction is pressed; without this neutral window,
-            # latency can make repeated micro-steps drift in one direction.
-            time.sleep(0.10)
+            # The two attack taps are intentionally part of this exclusive
+            # arbiter motion.  The periodic attack worker cannot interleave
+            # another attack or directional event between them.
+            tap = getattr(self.key_sender, "tap", None)
+            attack_key = str(getattr(self, "small_step_attack_key", "ctrl"))
+            if not callable(tap):
+                LOG.info("small-step skipped: input sender cannot tap attack key")
+                return False
+            for attack_number in range(2):
+                if not self._patrol_input_allowed() or tap(attack_key) is False:
+                    return False
+                if self.motion_arbiter is not None:
+                    note_attack = getattr(self.motion_arbiter, "note_attack", None)
+                    if callable(note_attack):
+                        note_attack()
+                if attack_number == 0 and not self._wait_for_patrol_motion(0.04):
+                    return False
+            # Let the game observe the second attack release before reversing
+            # direction; otherwise the reversal can be swallowed as attack.
+            if not self._wait_for_patrol_motion(0.10):
+                return False
+            if not self._patrol_input_allowed():
+                return False
             second_claimed = key_down(second) is not False
             if not second_claimed:
                 return False
             try:
-                time.sleep(0.30)
+                if not self._wait_for_patrol_motion(0.22):
+                    return False
             finally:
                 key_up(second)
+        if self.stationary_attack_enabled:
+            # The pair ends facing the selected 朝向, so the stand-still facing
+            # obligation is satisfied and the (net zero) step is accepted.
+            self._stationary_facing_command = final_direction
+            self._stationary_x_settled = True
         LOG.info(
-            "small-step complete: %s -> %s (300ms each; 100ms neutral)",
-            first, second,
+            "small-step complete: %s -> attack x2 -> %s; facing target=%s",
+            first, second, resume_direction or "right",
         )
         return True
 
@@ -6707,9 +7160,12 @@ class MovementWorker(threading.Thread):
         movement or a climb/transition.
         """
 
-        if not key or not _sender_is_safe(self.key_sender):
+        if (not self._patrol_input_allowed()
+                or not key or not _sender_is_safe(self.key_sender)):
             return False
         with self._direction_lock, self._hold_lock:
+            if not self._patrol_input_allowed():
+                return False
             if not self.motion_arbiter_motion_allowed():
                 LOG.info("arbiter buff deferred: movement is not at a safe stage")
                 return False
@@ -6748,6 +7204,12 @@ class MovementWorker(threading.Thread):
                 or (self.direction_transition_event is not None
                     and self.direction_transition_event.is_set())):
             return False
+        if self.stationary_attack_enabled:
+            # Stand-still attack has no climb/drop/route phase. Its anchor
+            # correction is already excluded by _movement_busy_now(), so an
+            # otherwise idle frame is safe for the atomic small-step/facing
+            # action as well.
+            return True
         if self.patrol_enabled and not self._route_layers:
             return True
         return bool(
@@ -6905,15 +7367,21 @@ class MovementWorker(threading.Thread):
                 if (self.automation_active_event is not None
                         and not self.automation_active_event.is_set()):
                     if self._automation_was_active:
-                        # Patrol just stopped / input disarmed (Stop button,
-                        # focus loss, disconnect alert): release EVERY
-                        # movement key once so no key stays stuck in the game
-                        # for the next patrol (a lost key-up at stop freezes
-                        # the character at the next start otherwise).
+                        # Patrol just stopped / input disarmed. The central
+                        # StatusWorker owns the single game-side scrub. Do NOT
+                        # inject another delayed key-up here: by the time this
+                        # capture arrives the operator may already be holding
+                        # Left/Right manually after Ctrl+`, and a second worker
+                        # release would cancel that real key-down.
                         self._automation_was_active = False
-                        self._release_stuck_keys()
-                    self._release_climb_up()
-                    self._release_walk_hold()
+                    # Forget local claims only. ``disable_input`` advanced the
+                    # sender generation and already emitted the actual key-up.
+                    # These assignments must never send input after Stop.
+                    self._climb_state = ClimbState()
+                    with self._direction_lock, self._hold_lock:
+                        self._walk_hold_key = None
+                        self._walk_hold_z = False
+                        self._walk_hold_until = 0.0
                     if self.climbing_active_event is not None:
                         self.climbing_active_event.clear()
                     if self.dropping_active_event is not None:
@@ -6927,12 +7395,11 @@ class MovementWorker(threading.Thread):
                     continue
                 if (self.automation_active_event is not None
                         and not self._automation_was_active):
-                    # Input just got armed (Start Patrol): clear any movement
-                    # key the game may still hold from a previous run whose
-                    # key-up was lost at stop (observed: character stuck as
-                    # soon as a new patrol started).  Runs once per arm.
+                    # Input was just armed. ``enable_input`` already performed
+                    # the one authoritative key scrub; repeating it here used
+                    # to contend with the first attack press and visibly freeze
+                    # a newly started patrol.
                     self._automation_was_active = True
-                    self._release_stuck_keys()
                 if self._patrol_started_at is None:
                     self._patrol_started_at = time.monotonic()
                 # Attack priority: while the YOLO attack worker reports an
@@ -7427,6 +7894,10 @@ class MovementWorker(threading.Thread):
                             minimum_confidence=self.minimum_confidence,
                         )
                     decision = position_plan.decision
+                    layer_for_jump = route_label.partition(".")[0]
+                    jump_point_decision = self._jump_point_decision(
+                        observation, layer_for_jump, position_plan
+                    )
                     # Stairs that block the walk: when the marker stalls at a
                     # recorded jump-trigger X, replace the plain walk hold with
                     # a walk-and-jump (direction held, Alt tapped mid-hold).
@@ -7442,6 +7913,8 @@ class MovementWorker(threading.Thread):
                             None, "boundary unreachable; waiting for rerouted patrol phase"
                         )
                         active_target_x = None
+                    elif jump_point_decision is not None:
+                        decision = jump_point_decision
                     elif stair_decision is not None:
                         decision = stair_decision
                     active_target_x = route_target_x
@@ -7453,6 +7926,7 @@ class MovementWorker(threading.Thread):
                 # Self-rescue: 5 分钟一检，角色连续 20 帧位置不变则
                 # 回到第一层重启巡逻。
                 self._rescue_stuck_check(observation, time.monotonic())
+                self._update_jump_point_landing(observation)
                 decision = preserve_persistent_climb(self._climb_state, decision)
                 if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None
@@ -7595,7 +8069,11 @@ class MovementWorker(threading.Thread):
                     isinstance(decision.key, str)
                     and decision.key.startswith("stair_jump_")
                 )
-                if decision.key not in ("left", "right") and not is_stair_jump:
+                is_jump_point = bool(
+                    isinstance(decision.key, str)
+                    and decision.key.startswith("jump_point_")
+                )
+                if decision.key not in ("left", "right") and not is_stair_jump and not is_jump_point:
                     self._release_walk_hold()
                 if decision.key and now - self._last_send >= self.movement_cooldown:
                     if decision.key in (
@@ -7672,13 +8150,14 @@ class MovementWorker(threading.Thread):
                         self._run_climb_step(
                             observation, route_target_x, preferred_direction
                         )
-                    elif is_stair_jump:
+                    elif is_stair_jump or is_jump_point:
                         # The worker waits independently for the *current*
                         # fixed attack to end.  Keep walking in the patrol
                         # direction during that wait; do not release Left /
                         # Right and turn a confirmed stair recovery into a
                         # visible freeze.
-                        direction = decision.key.removeprefix("stair_jump_")
+                        direction = (decision.key.removeprefix("jump_point_")
+                                     if is_jump_point else decision.key.removeprefix("stair_jump_"))
                         walking = self._send_walk_hold(MovementDecision(
                             direction,
                             "keep patrol walk while stair jump waits for attack",
@@ -7693,6 +8172,7 @@ class MovementWorker(threading.Thread):
                                 queued = bool(request_stair_jump(
                                     direction,
                                     on_complete=self._on_stair_jump_complete,
+                                    hold_up=is_jump_point,
                                 ))
                             except TypeError:
                                 queued = bool(request_stair_jump(direction))

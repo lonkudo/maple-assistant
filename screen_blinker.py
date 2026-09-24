@@ -188,6 +188,132 @@ class ScreenBlinker(threading.Thread):
                 daemon=True,
             ).start()
 
+    def show_jump_points(
+        self,
+        window_rect: tuple[int, int, int, int],
+        image_size: tuple[int, int],
+        analysis_box: tuple[int, int, int, int],
+        points: Iterable[tuple[float, float]],
+    ) -> None:
+        """Show each recorded jump point as a small click-through up arrow.
+
+        This is only start-of-patrol feedback.  It deliberately has no input
+        or capture role and disappears before the layer-band clean recapture.
+        """
+
+        image_width, image_height = image_size
+        client_left, client_top, client_right, client_bottom = window_rect
+        client_width = client_right - client_left
+        client_height = client_bottom - client_top
+        analysis_left, analysis_top, analysis_right, analysis_bottom = analysis_box
+        analysis_width = analysis_right - analysis_left
+        analysis_height = analysis_bottom - analysis_top
+        if (image_width <= 0 or image_height <= 0 or client_width <= 0
+                or client_height <= 0 or analysis_width <= 0 or analysis_height <= 0):
+            return
+        screen_points: list[tuple[int, int]] = []
+        for x, y in points:
+            try:
+                point_x = max(0.0, min(1.0, float(x)))
+                point_y = max(0.0, min(1.0, float(y)))
+            except (TypeError, ValueError):
+                continue
+            pixel_x = analysis_left + round(point_x * analysis_width)
+            pixel_y = analysis_top + round(point_y * analysis_height)
+            screen_points.append((
+                client_left + round(pixel_x * client_width / image_width),
+                client_top + round(pixel_y * client_height / image_height),
+            ))
+        if not screen_points:
+            return
+        threading.Thread(
+            target=self._show_jump_point_arrows,
+            args=(tuple(screen_points),),
+            name="jump-point-overlay",
+            daemon=True,
+        ).start()
+
+    def _show_jump_point_arrows(self, points: Sequence[tuple[int, int]]) -> None:
+        """Render compact green upward arrows without taking game focus."""
+
+        if not hasattr(ctypes, "windll"):
+            return
+        windows: list[tuple[int, int, int]] = []
+        user32 = gdi32 = None
+        try:
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            kernel32 = ctypes.windll.kernel32
+            user32.CreateWindowExW.argtypes = (
+                wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                wintypes.HINSTANCE, wintypes.LPVOID,
+            )
+            user32.CreateWindowExW.restype = wintypes.HWND
+            user32.SetLayeredWindowAttributes.argtypes = (
+                wintypes.HWND, wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD,
+            )
+            user32.GetDC.argtypes = (wintypes.HWND,)
+            user32.GetDC.restype = wintypes.HDC
+            user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+            user32.DestroyWindow.argtypes = (wintypes.HWND,)
+            gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
+            gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+            gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+            gdi32.Polygon.argtypes = (wintypes.HDC, ctypes.POINTER(wintypes.POINT), ctypes.c_int)
+            gdi32.Polygon.restype = wintypes.BOOL
+            instance = kernel32.GetModuleHandleW(None)
+            black = _colorref((0, 0, 0))
+            green = _colorref((50, 235, 120))
+            for x, y in points:
+                hwnd = user32.CreateWindowExW(
+                    0x00000008 | 0x00000080 | 0x08000000 | 0x00080000 | 0x00000020,
+                    "STATIC", None, 0x80000000,
+                    x - 5, y - 12, 11, 12, None, None, instance, None,
+                )
+                if not hwnd:
+                    continue
+                background = gdi32.CreateSolidBrush(black)
+                arrow = gdi32.CreateSolidBrush(green)
+                windows.append((hwnd, background, arrow))
+                # Black is the transparent colour; the bright polygon is a
+                # 5px arrow head plus a 3px stem rooted at the recorded point.
+                user32.SetLayeredWindowAttributes(hwnd, black, 255, 0x00000001)
+                user32.ShowWindow(hwnd, 4)
+                hdc = user32.GetDC(hwnd)
+                if hdc:
+                    try:
+                        rect = wintypes.RECT(0, 0, 11, 12)
+                        user32.FillRect(hdc, ctypes.byref(rect), background)
+                        old = gdi32.SelectObject(hdc, arrow)
+                        polygon = (wintypes.POINT * 7)(
+                            wintypes.POINT(5, 0), wintypes.POINT(10, 5),
+                            wintypes.POINT(7, 5), wintypes.POINT(7, 11),
+                            wintypes.POINT(3, 11), wintypes.POINT(3, 5),
+                            wintypes.POINT(0, 5),
+                        )
+                        gdi32.Polygon(hdc, polygon, 7)
+                        gdi32.SelectObject(hdc, old)
+                    finally:
+                        user32.ReleaseDC(hwnd, hdc)
+            self._wait(1.8)
+        except Exception:
+            LOG.warning("jump-point overlay failed", exc_info=True)
+        finally:
+            for hwnd, background, arrow in windows:
+                try:
+                    if user32 is not None:
+                        user32.DestroyWindow(hwnd)
+                except Exception:
+                    pass
+                for brush in (background, arrow):
+                    try:
+                        if gdi32 is not None:
+                            gdi32.DeleteObject(brush)
+                    except Exception:
+                        pass
+
     def _show_layer_band_regions(
         self,
         bands: Sequence[
@@ -436,7 +562,9 @@ class ScreenBlinker(threading.Thread):
         with self._aim_lock:
             self._aim_point = (int(screen_x), int(screen_y),
                                time.monotonic() + max(0.1, float(ttl_seconds)))
-            self._aim_size = max(16, int(size))
+            # API aiming remains large by default; stationary-position
+            # confirmation intentionally requests a compact crosshair.
+            self._aim_size = max(8, int(size))
         thread = self._aim_thread
         if thread is None or not thread.is_alive():
             self._aim_thread = threading.Thread(target=self._aim_marker_loop,

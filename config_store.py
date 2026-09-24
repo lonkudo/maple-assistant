@@ -56,6 +56,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "random_jump_interval_seconds": 3.0,
         "random_jump_gap_seconds": .1,
         "stair_jump_enabled": True,
+        "stationary_facing_direction": "right",
     },
     "additional_functions": {
         "shutdown_enabled": False, "shutdown_hours": 3.0,
@@ -66,6 +67,13 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "telegram_enabled": False, "telegram_bot_token": "",
         "telegram_chat_id": "", "telegram_machine_name": "",
         "quick_messages": [],
+        # These controls live in the same Additional Functions panel.  Keep
+        # them in the user schema so an older user_config is upgraded with
+        # explicit values even before its operator changes either checkbox.
+        "auto_lie_api_enabled": False,
+        "auto_reconnect_enabled": False,
+        "auto_reconnect_world": "蘑菇仔",
+        "auto_reconnect_channel": 1,
     },
     "yolo_detection": {
         "threshold": .4, "attack_range": 30, "min_mob_size": 2,
@@ -225,7 +233,17 @@ class ConfigStore:
             legacy_unified = _read_json(self.legacy_unified_path)
             changed = not existed
             for section in USER_SECTIONS:
-                if isinstance(data.get(section), dict):
+                current = data.get(section)
+                if isinstance(current, dict):
+                    # A section can come from an older release and therefore
+                    # lack options added to its panel later.  Fill only those
+                    # missing keys: existing user values and any forward-
+                    # compatible unknown keys always remain untouched.
+                    defaults = DEFAULT_USER_CONFIG[section]
+                    for key, value in defaults.items():
+                        if key not in current:
+                            current[key] = deepcopy(value)
+                            changed = True
                     continue
                 value = legacy_unified.get(section)
                 if not isinstance(value, dict):

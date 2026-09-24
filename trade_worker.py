@@ -47,6 +47,11 @@ PRESENCE_BOX = (145, 105, 20, 20)
 PRESENCE_COLOR = np.array((227, 225, 215), dtype=np.int16)  # #e3e1d7
 TRADE_DIALOG_GREY_FRAMES = 2
 TRADER_PRESENT_FRAMES = 2
+# The empty trade dialog can be anti-aliased or slightly recoloured by a game
+# update.  Keep its actual sampled pixels as a baseline as well as checking
+# the original #e3e1d7 colour: a trader arriving must visibly change this box.
+TRADER_CHANGE_MEAN_DELTA = 8.0
+TRADER_CHANGE_PIXEL_RATIO = 0.15
 # A trade window that remains empty is a failed invitation, not a workflow
 # that should keep sampling the capture stream forever.
 TRADER_WAIT_TIMEOUT_SECONDS = 10.0
@@ -124,26 +129,37 @@ class TradeWorker(threading.Thread):
         self._requests: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=2)
         self._invite_lock = threading.Lock()
         self._invite_pending = False
+        self._active_action: Optional[str] = None
         self._invite_cancel = threading.Event()
+        self._presence_blank_reference: Optional[np.ndarray] = None
 
     def request(self, action: str, message: str = "") -> bool:
         if action == "trade:invite":
             return self.toggle_invite(message) == "started"
-        try:
-            self._requests.put_nowait((action, message))
-            LOG.info("trade request queued: %s", action)
-            return True
-        except queue.Full:
-            LOG.warning("trade request ignored: busy")
+        if action != "trade:accept":
+            LOG.warning("trade request ignored: unknown action %s", action)
             return False
+        with self._invite_lock:
+            if self._active_action is not None:
+                LOG.warning("trade request ignored: busy with %s", self._active_action)
+                return False
+            try:
+                self._requests.put_nowait((action, message))
+            except queue.Full:
+                LOG.warning("trade request ignored: busy")
+                return False
+            self._invite_cancel.clear()
+            self._active_action = action
+        LOG.info("trade request queued: %s", action)
+        return True
 
     def toggle_invite(self, message: str) -> str:
         """Start an invite sequence, or cancel the currently active one."""
 
         with self._invite_lock:
-            if self._invite_pending:
+            if self._active_action is not None:
                 self._invite_cancel.set()
-                LOG.info("trade invite cancellation requested")
+                LOG.info("trade cancellation requested for %s", self._active_action)
                 return "cancelled"
             try:
                 self._requests.put_nowait(("trade:invite", message))
@@ -152,8 +168,32 @@ class TradeWorker(threading.Thread):
                 return "busy"
             self._invite_cancel.clear()
             self._invite_pending = True
+            self._active_action = "trade:invite"
             LOG.info("trade request queued: trade:invite")
             return "started"
+
+    def is_invite_active(self) -> bool:
+        """Whether the Ctrl+Q invite workflow is queued or running."""
+
+        with self._invite_lock:
+            return bool(self._invite_pending)
+
+    def is_trade_active(self) -> bool:
+        """Whether Ctrl+Q or Ctrl+W currently owns a trade workflow."""
+
+        with self._invite_lock:
+            return self._active_action is not None
+
+    def request_cancel(self) -> bool:
+        """Cancel the active Ctrl+Q/Ctrl+W flow without touching manual trade."""
+
+        with self._invite_lock:
+            if self._active_action is None:
+                return False
+            action = self._active_action
+            self._invite_cancel.set()
+        LOG.warning("trade %s cancellation requested by Esc", action)
+        return True
 
     def _invite_cancelled(self) -> bool:
         if self.stop_event.is_set() or self._invite_cancel.is_set():
@@ -414,10 +454,10 @@ class TradeWorker(threading.Thread):
             LOG.exception("trade could not set clipboard")
             return False
 
-    def _sample_presence_is_grey(
+    def _sample_presence(
         self, geometry: tuple[int, int, int, int]
-    ) -> Optional[bool]:
-        """Return whether one fresh presence sample is the dialog grey.
+    ) -> Optional[tuple[bool, np.ndarray]]:
+        """Return one fresh ``(is_grey, pixels)`` presence sample.
 
         ``None`` means no usable frame arrived and is deliberately distinct
         from non-grey: a slow capture must not be treated as a failed dialog.
@@ -447,8 +487,9 @@ class TradeWorker(threading.Thread):
         grey_ratio = float(np.mean(
             np.all(np.abs(pixels - PRESENCE_COLOR) <= 5, axis=2)
         ))
-        LOG.info("trade presence sample grey=%s ratio=%.3f", grey_ratio >= 0.985, grey_ratio)
-        return grey_ratio >= 0.985
+        grey = grey_ratio >= 0.985
+        LOG.info("trade presence sample grey=%s ratio=%.3f", grey, grey_ratio)
+        return grey, pixels
 
     def _wait_for_trade_dialog(
         self, geometry: tuple[int, int, int, int], timeout: float = 1.0,
@@ -459,15 +500,20 @@ class TradeWorker(threading.Thread):
         deadline = time.monotonic() + max(0.5, float(timeout))
         grey_frames = 0
         non_grey_frames = 0
+        self._presence_blank_reference = None
         try:
             while (not self._invite_cancelled()
                    and time.monotonic() < deadline):
-                grey = self._sample_presence_is_grey(geometry)
-                if grey is None:
+                sample = self._sample_presence(geometry)
+                if sample is None:
                     continue
+                grey, pixels = sample
                 if grey:
                     grey_frames += 1
                     non_grey_frames = 0
+                    # Use the most recent confirmed blank dialog image.  This
+                    # accommodates the exact UI tint at this resolution.
+                    self._presence_blank_reference = pixels.copy()
                     if grey_frames >= TRADE_DIALOG_GREY_FRAMES:
                         LOG.info("trade dialog observed; waiting for trader")
                         return True
@@ -511,15 +557,31 @@ class TradeWorker(threading.Thread):
         try:
             while (not self._invite_cancelled() and
                    time.monotonic() < deadline):
-                grey = self._sample_presence_is_grey(geometry)
-                if grey is None:
+                sample = self._sample_presence(geometry)
+                if sample is None:
                     continue
-                if not grey:
+                grey, pixels = sample
+                changed = False
+                reference = self._presence_blank_reference
+                if reference is not None and reference.shape == pixels.shape:
+                    difference = np.abs(pixels - reference)
+                    mean_delta = float(np.mean(difference))
+                    changed_ratio = float(np.mean(np.max(difference, axis=2) >= 12))
+                    changed = (
+                        mean_delta >= TRADER_CHANGE_MEAN_DELTA
+                        and changed_ratio >= TRADER_CHANGE_PIXEL_RATIO
+                    )
+                    LOG.info(
+                        "trade presence change mean=%.2f ratio=%.3f changed=%s",
+                        mean_delta, changed_ratio, changed,
+                    )
+                if not grey or changed:
                     present_frames += 1
                     if present_frames >= TRADER_PRESENT_FRAMES:
                         LOG.info(
                             "trade trader detected after %d frames "
-                            "after confirmed dialog", present_frames,
+                            "after confirmed dialog (non_grey=%s changed=%s)",
+                            present_frames, not grey, changed,
                         )
                         return True
                 else:
@@ -561,6 +623,17 @@ class TradeWorker(threading.Thread):
             return False
         return bool(self.key_sender.send_direct_keys("ctrl+v", "enter"))
 
+    def _release_trade_hotkey_modifier(self) -> None:
+        """End a trade chord without changing ordinary Ctrl behavior."""
+
+        release = getattr(self.key_sender, "release_all_keys", None)
+        if not callable(release):
+            return
+        try:
+            release(reason="trade hotkey modifier release")
+        except Exception:
+            LOG.warning("trade could not release the triggering hotkey", exc_info=True)
+
     @staticmethod
     def _play_success() -> None:
         """Play completion feedback without holding up the trade worker."""
@@ -578,6 +651,7 @@ class TradeWorker(threading.Thread):
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
             LOG.warning("trade invite ignored: game window unavailable")
             return
+        self._release_trade_hotkey_modifier()
         geometry = self._client_geometry()
         if geometry is None:
             return
@@ -635,9 +709,12 @@ class TradeWorker(threading.Thread):
             self.capture_active_event.clear()
 
     def _accept(self, message: str) -> None:
+        if self._invite_cancelled():
+            return
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
             LOG.warning("trade accept ignored: game window unavailable")
             return
+        self._release_trade_hotkey_modifier()
         geometry = self._client_geometry()
         if geometry is None:
             return
@@ -657,13 +734,15 @@ class TradeWorker(threading.Thread):
             scaled, fixed,
         )
         VirtualMouse.click(*point)
-        time.sleep(0.20)
+        if not self._wait_or_cancel(0.20):
+            return
         confirmed = self._confirm_trade(geometry)
         LOG.info("trade acceptance confirmation submitted=%s", confirmed)
         if not confirmed:
             return
         # Let the accepted trade dialog settle before entering chat text.
-        time.sleep(0.35)
+        if not self._wait_or_cancel(0.35):
+            return
         if self._send_message(geometry, message):
             self._play_success()
             LOG.info("trade acceptance workflow completed")
@@ -684,9 +763,11 @@ class TradeWorker(threading.Thread):
                 except Exception:
                     LOG.exception("trade action failed: %s", action)
                 finally:
-                    if action == "trade:invite":
-                        with self._invite_lock:
+                    with self._invite_lock:
+                        if action == "trade:invite":
                             self._invite_pending = False
+                        if self._active_action == action:
+                            self._active_action = None
                             self._invite_cancel.clear()
                     self._requests.task_done()
         finally:

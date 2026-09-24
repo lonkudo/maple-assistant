@@ -106,13 +106,15 @@ The movement direction keys — left, right, up, and down — are mutually exclu
 3. arm the new direction;
 4. restore pickup ownership only when walking is active.
 
-`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, and queued buffs that must temporarily interrupt patrol movement. It force-releases conflicting directional keys at an action boundary and returns control to patrol after completion. It is deliberately not used for ordinary continuous walking.
+`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, and stationary-facing taps. It force-releases conflicting directional keys at an action boundary and returns control to patrol after completion. It is deliberately not used for ordinary continuous walking.
 
 Attack and buff workers ask whether a conflicting motion is active before sending input. Movement does not wait while holding the arbiter’s internal lock; this avoids a stalled worker deadlock at a direction handoff.
 
 ### Combat and consumables
 
 `attack_worker.py` performs fixed-interval attack and optional jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
+
+In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer. A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
 
 Stair jump observes sustained position stalls and submits one direction-preserving recovery jump. It uses a post-trigger frame cooldown and a movement-progress reset, preventing a single long stall from producing a burst of jumps.
 
@@ -121,10 +123,10 @@ Stair jump observes sustained position stalls and submits one direction-preservi
 `character_worker.py` identifies marker loss, disconnect candidates, other-player conditions, and related alerts. A marker absence alone is not a disconnect:
 
 1. the yellow marker must be absent for 50 shared frames;
-2. the same frame must pass the login-page check supplied by `reconnect_worker.py`;
+2. the same frame must pass the login-page check supplied by `reconnect_worker.py`, or match its dedicated offline-prompt square;
 3. only then may disconnect alerting, patrol stop, and reconnect begin.
 
-If the absence threshold occurs without a login page — for example in a minimap-less zone — the worker enters a quiet paused state. It resets and resumes normally when the marker returns. `reconnect_worker.py` owns the login-page interaction and confirmation clicks; its frame-only login-page detector is also used for the disconnect gate.
+If the absence threshold occurs without either offline evidence — for example in a minimap-less zone — the worker enters a quiet paused state. It resets and resumes normally when the marker returns. `reconnect_worker.py` owns the prompt dismissal, login-page interaction, and confirmation clicks; its frame-only evidence checks are also used for the disconnect gate.
 
 ### Automatic lie handling
 

@@ -73,11 +73,11 @@ LOGIN_PAGE_MIN_PIXELS = 20_000
 LOGIN_CHECK_ATTEMPTS = 12
 LOGIN_CHECK_INTERVAL_SECONDS = 1.0
 # Wait after pressing Enter on the login page / after opening a select window.
-LOGIN_WAIT_SECONDS = 5.0
-SELECT_WINDOW_WAIT_SECONDS = 3.0
+LOGIN_WAIT_SECONDS = 1.2
+SELECT_WINDOW_WAIT_SECONDS = 0.8
 # Time a single key hold and the pause between two channel moves.
 KEY_HOLD_SECONDS = 0.05
-KEY_DELAY_SECONDS = 0.60
+KEY_DELAY_SECONDS = 0.15
 # The login page's Enter needs a longer press than the relay keys, and it is retried: measured in
 # the field (v0391, 22:35) the page stayed on screen although the key was reported delivered, and
 # the rest of the sequence then typed into the login page (world/channel keys did nothing).
@@ -92,23 +92,25 @@ SCREEN_CHANGE_THUMBNAIL = (64, 36)
 # game lost focus to `MapleAssistant (v0391)`), so a key is retried after bringing the game back
 # instead of failing the whole run.
 KEY_REFOCUS_ATTEMPTS = 2
-KEY_REFOCUS_WAIT_SECONDS = 0.50
+KEY_REFOCUS_WAIT_SECONDS = 0.25
 # The game only starts accepting keys after its own window has been CLICKED: measured in the field
 # (v0391/v0392) the window was foreground and the keys were reported delivered, yet the login page
 # ignored Enter.  The operator's order is therefore: focus the window, click a harmless spot inside
 # the client, then press Enter.  (50, 50) is his choice - inside the client, far from every button
 # and list entry.
 ACTIVATE_CLICK_CLIENT = (50, 50)
-ACTIVATE_CLICK_WAIT_SECONDS = 3.0
+ACTIVATE_CLICK_WAIT_SECONDS = 0.8
 # 掉线提示窗口 (operator's rule, 2026-09-17): the moment the connection drops the game shows a prompt
 # over the client whose default button is 确定, and the login board behind it cannot be used until it
 # is closed.
 #
-# The CLOSE/CONFIRM BUTTON is anchored from ``screenshots/faulty_disconnect.jpg``.  That reference is
-# an exact 1080x768 client capture and the centre of its visible ``确定`` button is client **(554, 333)**.
-# This is deliberately a prompt-specific anchor, not a login-board point: the prompt art has a different
-# layout from the login page.  Its background does not scale with the client; it is centred, so map this
-# point by its centre offset on other client widths/heights.
+# ``screenshots/offline_prompt.jpg`` shows the prompt to close. Before any
+# login interaction, detect its peach panel from the supplied 40x40
+# ``offline_prompt_square.png`` crop. A small colour tolerance handles normal
+# capture/Windows-scaling variation in the paper texture.
+#
+# The ``确定`` centre is (middle, 330) on the 1080x768 preset. The prompt art
+# scales with client width, so the 1366x768 point is (683, 417).
 #
 # The button is CLICKED first and Enter is only the fallback: "this is the close prompt window button,
 # you either click it or you press enter (press enter seem to fail)".  Measured earlier on the same
@@ -117,10 +119,13 @@ ACTIVATE_CLICK_WAIT_SECONDS = 3.0
 # prompt - so the workflow must not start until the prompt is really gone.  The page still passes the
 # login-page COLOUR gate (9.2 % cream), so the page classifier is what tells them apart.
 OFFLINE_PROMPT_REFERENCE_CLIENT: tuple[int, int] = (1080, 768)
-OFFLINE_PROMPT_CLOSE_REFERENCE_POINT: tuple[int, int] = (554, 333)
+OFFLINE_PROMPT_CLOSE_REFERENCE_POINT: tuple[int, int] = (540, 330)
+OFFLINE_PROMPT_SQUARE_NAME = "offline_prompt_square.png"
+OFFLINE_PROMPT_COLOUR_TOLERANCE = 28
+OFFLINE_PROMPT_MIN_COVERAGE = 0.90
 OFFLINE_PROMPT_CLICK = True
 OFFLINE_PROMPT_ENTER = True
-OFFLINE_PROMPT_WAIT_SECONDS = 0.80
+OFFLINE_PROMPT_WAIT_SECONDS = 0.25
 OFFLINE_PROMPT_ATTEMPTS = 3
 # After a SUCCESSFUL reconnect the patrol is prepared again (layer detection + arm input).  The game
 # needs a moment to finish loading the character before that: measured on the operator's client, the
@@ -128,9 +133,6 @@ OFFLINE_PROMPT_ATTEMPTS = 3
 # finds no marker.  His instruction (v1.0.28): "i think the restart patrol is arranged too early, make
 # it 3s later, it would be fine, because the minimap isn't recovered yet, then you start the patrol".
 PATROL_RESTART_DELAY_SECONDS = 3.0
-OFFLINE_PROMPT_ENTER = True
-OFFLINE_PROMPT_WAIT_SECONDS = 0.80
-OFFLINE_PROMPT_ATTEMPTS = 3
 # The login board and its buttons, measured by the operator on his own login page.  The 1366x768
 # numbers are the preset space; he re-measured them on his second device (a 1080x768 client,
 # 2026-09-17, work/anchors_1080.json) and the numbers below are those measurements mapped back into
@@ -185,7 +187,7 @@ CHANNELS_PER_ROW = 4
 # The walk therefore moves down with the keyboard and scrolls one row whenever the selection cannot
 # move any further, so a channel that is not on screen is still reachable.
 CHANNEL_SCROLL_NOTCHES_PER_ROW = 1
-CHANNEL_SCROLL_WAIT_SECONDS = 1.0
+CHANNEL_SCROLL_WAIT_SECONDS = 0.4
 CHANNEL_SCROLL_ATTEMPTS = 2                      # a wheel can be swallowed while focus settles
 # The scroll is CLOSED-LOOP (v0402, the operator's channel-51 report): one notch is sent at a time,
 # each notch is verified on the list region, and how far the list really moved is MEASURED by
@@ -230,7 +232,7 @@ CHANNEL_LIST_POLL_SECONDS = 0.30                 # between two repaint checks
 CHANNEL_LIST_SETTLE_ATTEMPTS = 6                 # ~1.8 s before "the list did not react"
 # How many times a click is retried (after re-focusing) before the step gives up.
 CLICK_ATTEMPTS = 3
-CLICK_RETRY_WAIT_SECONDS = 1.0
+CLICK_RETRY_WAIT_SECONDS = 0.4
 # Safety clamp: a click is only sent inside the window area the two select frames differ in, so a
 # wrong constant can never click somewhere else in the game.
 SELECT_WINDOW_CLIENT_BOX = (292, 59, 731, 507)
@@ -245,12 +247,18 @@ CONNECT_BUTTON_ASPECT_RANGE = (1.2, 14.0)
 CONNECT_BUTTON_REFERENCE_NAME = "login_connect_target.jpg"
 # Template matching threshold for the 连接 button crop (a shipped crop must match the real art).
 CONNECT_TEMPLATE_MIN_SCORE = 0.62
-# The operator's sequence: ... -> channel moves -> Enter -> 2s -> Enter.
-# The first Enter confirms the channel, the second one starts the login; the pause in
-# between is what the game needs to show the character/loading screen.
-CHANNEL_CONFIRM_WAIT_SECONDS = 2.0
+# The final channel handoff is deliberately two quiet rounds: wait for the client
+# to accept the selected channel, then double-tap Enter.  A rapid continuous
+# Enter loop is often discarded by the client at this boundary.
+CHANNEL_CONFIRM_ROUND_WAIT_SECONDS = 2.0
+CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS = 0.12
+CHANNEL_CONFIRM_ROUNDS = 2
+# When no usable game window exists, retry a *fresh title search* at this pace.
+# The shared WindowKeySender itself first tries its current handle and only then
+# re-anchors to a newly created game window.
+FOCUS_REANCHOR_INTERVAL_SECONDS = 10.0
 # Pause after logging in, before the worker reports the reconnect as finished.
-LOGIN_SETTLE_SECONDS = 2.0
+LOGIN_SETTLE_SECONDS = 1.0
 
 
 # The reference client size the keyboard sequence is written for.  Nothing about the
@@ -316,19 +324,15 @@ def login_client_box(box, client_size=REFERENCE_CLIENT):
 
 
 def offline_prompt_close_client_point(client_size=REFERENCE_CLIENT) -> tuple[int, int]:
-    """Map the ``确定`` centre from ``faulty_disconnect.jpg`` into a live client.
+    """Map the offline-prompt ``确定`` centre by the client-width ratio."""
 
-    The faulty-disconnect dialog is a fixed-size, centred game panel.  Keeping its own 1080x768
-    reference avoids accidentally inheriting a login-board measurement when the dialog must be
-    dismissed before reconnecting.
-    """
-
-    width, height = _client_size_tuple(client_size)
-    reference_width, reference_height = OFFLINE_PROMPT_REFERENCE_CLIENT
+    width, _height = _client_size_tuple(client_size)
+    reference_width, _reference_height = OFFLINE_PROMPT_REFERENCE_CLIENT
     x, y = OFFLINE_PROMPT_CLOSE_REFERENCE_POINT
+    scale = width / float(reference_width)
     return (
-        int(round(x + (width - reference_width) / 2.0)),
-        int(round(y + (height - reference_height) / 2.0)),
+        int(round(x * scale)),
+        int(round(y * scale)),
     )
 
 
@@ -452,10 +456,10 @@ PAGE_REFERENCES = (
 PAGE_STEP_ATTEMPTS = 3
 # The game does not react instantly ("the process is stepping too quick, the game isn't react that
 # quick"), so after every action the page is POLLED for this long instead of sampled once.
-PAGE_POLL_SECONDS = 0.5
-PAGE_WAIT_SECONDS = 6.0                  # login page -> world page
-PAGE_WAIT_WORLD_SECONDS = 6.0            # world page -> channel page
-PAGE_WAIT_SHORT_SECONDS = 3.0            # the board click: it may or may not be enough
+PAGE_POLL_SECONDS = 0.2
+PAGE_WAIT_SECONDS = 3.0                  # login page -> world page
+PAGE_WAIT_WORLD_SECONDS = 3.0            # world page -> channel page
+PAGE_WAIT_SHORT_SECONDS = 1.2            # the board click: it may or may not be enough
 # How often the channel Enter is repeated while the channel page stays on screen.
 CHANNEL_CONFIRM_ATTEMPTS = 3
 
@@ -541,6 +545,76 @@ def load_page_references() -> dict:
                      page, path, image.shape[1], image.shape[0], box, space)
             break
     return {page: patches for page, patches in loaded.items() if patches}
+
+
+def load_offline_prompt_square():
+    """Load the supplied colour patch used to identify the offline prompt."""
+
+    import cv2
+
+    for folder in (SCREENSHOTS_DIR, ASSETS_DIR):
+        path = folder / OFFLINE_PROMPT_SQUARE_NAME
+        if not path.is_file():
+            continue
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is not None and image.size:
+            LOG.info(
+                "auto reconnect: offline prompt square loaded from %s (%dx%d)",
+                path,
+                image.shape[1],
+                image.shape[0],
+            )
+            return image
+    LOG.warning(
+        "auto reconnect: offline prompt square is missing; refusing prompt clicks"
+    )
+    return None
+
+
+def find_offline_prompt_square(frame, square):
+    """Return ``(x, y, width, height, coverage)`` for the prompt panel, if present.
+
+    The supplied square is intentionally a low-detail paper patch, so ordinary
+    correlation is not reliable. Instead every pixel is compared with the
+    reference colour within :data:`OFFLINE_PROMPT_COLOUR_TOLERANCE`, and a
+    scaled square must meet the required coverage. The scaling is tied to
+    client width, as is the prompt-button coordinate.
+    """
+
+    import cv2
+    import numpy as np
+
+    if (frame is None or square is None or not getattr(frame, "size", 0)
+            or not getattr(square, "size", 0)):
+        return None
+    try:
+        frame_h, frame_w = frame.shape[:2]
+        scale = frame_w / float(OFFLINE_PROMPT_REFERENCE_CLIENT[0])
+        patch_w = max(8, int(round(square.shape[1] * scale)))
+        patch_h = max(8, int(round(square.shape[0] * scale)))
+        if patch_w >= frame_w or patch_h >= frame_h:
+            return None
+        patch = cv2.resize(square, (patch_w, patch_h), interpolation=cv2.INTER_AREA)
+        colour = np.median(patch.reshape(-1, 3), axis=0).astype(np.int16)
+        delta = np.abs(frame.astype(np.int16) - colour.reshape(1, 1, 3))
+        matches = np.all(delta <= OFFLINE_PROMPT_COLOUR_TOLERANCE, axis=2).astype(np.float32)
+        coverage = cv2.boxFilter(
+            matches,
+            ddepth=-1,
+            ksize=(patch_w, patch_h),
+            normalize=True,
+            borderType=cv2.BORDER_CONSTANT,
+        )
+        _min, best, _min_loc, best_loc = cv2.minMaxLoc(coverage)
+        if float(best) < OFFLINE_PROMPT_MIN_COVERAGE:
+            return None
+        center_x, center_y = (int(best_loc[0]), int(best_loc[1]))
+        left = max(0, min(frame_w - patch_w, center_x - patch_w // 2))
+        top = max(0, min(frame_h - patch_h, center_y - patch_h // 2))
+        return (left, top, patch_w, patch_h, float(best))
+    except Exception:
+        LOG.debug("auto reconnect: offline prompt square matching failed", exc_info=True)
+        return None
 
 
 def window_rect(hwnd: int):
@@ -1482,6 +1556,8 @@ class ReconnectWorker(threading.Thread):
         self._frame_hwnd = 0
         self._reference: Optional[LoginColourReference] = None
         self._reference_loaded = False
+        self._offline_prompt_square = None
+        self._offline_prompt_square_loaded = False
         self._connect_template_image = None
         self._connect_template_loaded = False
         # The size of the last captured frame: the click constants are mapped from the 1366x768
@@ -1498,12 +1574,18 @@ class ReconnectWorker(threading.Thread):
         self._world = WORLD_DEFAULT
         self._channel = CHANNEL_DEFAULT
         self._wake = threading.Event()
+        # A reconnect is armed for the whole enabled session.  This only marks an
+        # event that has been queued but has not reached the worker loop yet; it
+        # must never become a permanent "already reconnected" latch.
+        self._disconnect_queued = False
         self._login_entered = False
         # Set by trigger_test(): the temporary 测试重连 button runs the sequence once even
         # when the enable checkbox is still off, so the operator can try it before trusting
         # the automatic 掉线 trigger.
         self._test_requested = False
         self._testing = False
+        self._running = False
+        self._cancel_requested = threading.Event()
 
     # ------------------------------------------------------------------ settings
 
@@ -1517,6 +1599,7 @@ class ReconnectWorker(threading.Thread):
 
         with self._lock:
             self._enabled = bool(enabled)
+            self._disconnect_queued = False
             self._login_entered = False
         LOG.info("auto reconnect %s", "enabled" if enabled else "disabled")
 
@@ -1558,8 +1641,16 @@ class ReconnectWorker(threading.Thread):
         """The 掉线 event happened (first sign) - check for the login page."""
 
         with self._lock:
-            if not self._enabled or self._login_entered:
+            if not self._enabled:
+                LOG.info("auto reconnect: disconnect ignored because it is disabled")
                 return
+            if self._running or self._disconnect_queued or self._testing or self._test_requested:
+                LOG.info("auto reconnect: duplicate disconnect ignored; a reconnect is already queued/running")
+                return
+            # A successful earlier run must not suppress a genuinely new offline
+            # event hours later.  Reset the historical marker for this new cycle.
+            self._disconnect_queued = True
+            self._login_entered = False
         LOG.info("auto reconnect: disconnect event seen; checking the game window")
         self._wake.set()
 
@@ -1572,7 +1663,7 @@ class ReconnectWorker(threading.Thread):
         """
 
         with self._lock:
-            if self._test_requested or self._testing:
+            if self._test_requested or self._testing or self._running or self._disconnect_queued:
                 LOG.info("auto reconnect: a manual test is already queued/running")
                 return False
             self._test_requested = True
@@ -1582,6 +1673,24 @@ class ReconnectWorker(threading.Thread):
         LOG.info("auto reconnect: manual test requested from the panel")
         self._report("test", "手动测试")
         self._wake.set()
+        return True
+
+    def is_active(self) -> bool:
+        """Whether a reconnect currently owns the game and may be cancelled."""
+
+        with self._lock:
+            return bool(self._running)
+
+    def request_cancel(self) -> bool:
+        """Stop the current reconnect at its next safe wait/checkpoint."""
+
+        with self._lock:
+            if not self._running:
+                return False
+        self._cancel_requested.set()
+        self._wake.set()
+        LOG.warning("auto reconnect: cancellation requested by Esc")
+        self._report("cancelled", "Esc 已取消自动重连")
         return True
 
     def _take_test_request(self) -> bool:
@@ -1629,13 +1738,23 @@ class ReconnectWorker(threading.Thread):
 
     def _handle_disconnect(self) -> None:
         enabled, world, channel = self.settings()
-        if not enabled and not self._test_requested:
+        with self._lock:
+            testing_requested = self._test_requested
+            # The queued flag protects only the handoff from notify_disconnect()
+            # to this loop iteration.  Once consumed, a later real disconnect can
+            # be handled after this run completes.
+            self._disconnect_queued = False
+        if not enabled and not testing_requested:
             return
         testing = self._take_test_request()
+        with self._lock:
+            self._running = True
+            self._cancel_requested.clear()
         try:
             self._run_sequence(world, channel, testing)
         finally:
             with self._lock:
+                self._running = False
                 self._testing = False
 
     def _run_sequence(self, world: str, channel: int, testing: bool) -> None:
@@ -1662,7 +1781,10 @@ class ReconnectWorker(threading.Thread):
         is the reconnect flag lowered, and only a successful login re-arms the automation explicitly.
         """
 
-        if not succeeded:
+        cancelled = self._cancel_requested.is_set()
+        if cancelled:
+            LOG.warning("auto reconnect: cancelled by Esc - patrol stays stopped")
+        elif not succeeded:
             LOG.error("auto reconnect: the login did NOT succeed - patrol stays stopped, it must not "
                       "run on the login page (character is not in game)")
             self._report("failed", "登录没有成功：已停止巡逻（不会在登录页乱按键），"
@@ -1690,7 +1812,7 @@ class ReconnectWorker(threading.Thread):
         # though the reconnect succeeded ("failed again" - the log said "manual test run with the
         # automation down - the patrol is not started by the test").  The assistant owns the decision:
         # it resumes only a patrol that the disconnect actually interrupted.
-        if succeeded:
+        if succeeded and not cancelled:
             # The gate flag goes down FIRST: the restart below arms the input again, and the focus gate
             # must not be holding the automation "paused for the auto-reconnect" while it does.
             self._restore_automation(automation_was)
@@ -2702,60 +2824,38 @@ class ReconnectWorker(threading.Thread):
         return False
 
     def _dismiss_offline_prompt(self) -> bool:
-        """Close the 掉线提示窗口 - the FIRST action of the reconnect (operator's rule).
+        """Close the expected 掉线提示窗口 before reconnecting.
 
-        Two ways, in the operator's order: **click the close button** at the image-derived centred
-        anchor (``faulty_disconnect.jpg`` -> (554, 333) on 1080x768) and, when that does not take, press Enter -
-        "this is the close prompt window button, you either click it or you press enter (press enter
-        seem to fail)".  After each attempt the page classifier decides whether the prompt is really
-        gone, and the whole thing is repeated up to ``OFFLINE_PROMPT_ATTEMPTS`` times: nothing may be
-        aimed at the board while the prompt still covers it.
-
-        ``_enter_game`` re-checks the page afterwards as well, so a click/Enter that already dropped us
-        onto the world page simply skips the rest of the login step.
+        The missing-marker watcher has already confirmed the login-page state.
+        The supplied prompt-paper square is not reliable enough to decide
+        whether a disconnect happened, nor to decide whether this fixed
+        confirmation click is needed.  Use the known button position, then
+        verify that a login-family page is available before continuing.
         """
 
         if not self.dismiss_offline_prompt:
             return True
         attempts = max(1, OFFLINE_PROMPT_ATTEMPTS)
-        if OFFLINE_PROMPT_CLICK and self._login_page_already_showing():
-            # Nothing to close: the login page is on screen with its board, so the prompt is gone (a
-            # prompt would cover the board and the login signature would not match).  Skipping the
-            # click keeps the anchor away from the login board on every ordinary run.
-            LOG.info("auto reconnect: no 掉线提示 window to close - the login page is already showing")
-            self._report("prompt", "没有掉线提示窗口（已经是登录页）")
-            return True
         for attempt in range(1, attempts + 1):
-            if OFFLINE_PROMPT_CLICK:
-                point = offline_prompt_close_client_point(self._click_size())
-                LOG.info("auto reconnect: clicking the 掉线提示 close button at client (%d, %d) "
-                         "from faulty_disconnect.jpg anchor (%d/%d)", point[0], point[1],
-                         attempt, attempts)
-                self._report("prompt", f"第 {attempt} 次 点击「确定」（{point[0]}, {point[1]}）")
-                self._click_client(point[0], point[1], "prompt", "掉线提示「确定」按钮")
-                if not self._sleep_checked(OFFLINE_PROMPT_WAIT_SECONDS):
-                    return False
-                if self._prompt_is_gone(attempt, attempts, "点击关闭按钮"):
-                    return True
-            if not self.dismiss_offline_prompt:
-                continue
-            reason = self._press("enter", hold=LOGIN_ENTER_HOLD_SECONDS)
-            if reason:
-                self._report("failed", reason)
+            point = offline_prompt_close_client_point(self._click_size())
+            LOG.info(
+                "auto reconnect: clicking expected 掉线提示「确定」at client (%d, %d) "
+                "(%d/%d)", point[0], point[1], attempt, attempts,
+            )
+            self._report("prompt", f"第 {attempt} 次点击掉线提示「确定」"
+                         f"（{point[0]}, {point[1]}）")
+            if not self._click_client(point[0], point[1], "prompt", "掉线提示「确定」按钮"):
+                self._report("failed", self._click_failure or "掉线提示「确定」按钮未点击成功")
                 return False
-            LOG.info("auto reconnect: Enter %d/%d sent to dismiss the offline prompt window",
-                     attempt, attempts)
-            self._report("prompt", f"第 {attempt} 次 Enter（关闭掉线提示窗口）")
-            # Let the prompt finish closing: its own animation would otherwise still cover the board.
             if not self._sleep_checked(OFFLINE_PROMPT_WAIT_SECONDS):
                 return False
-            if self._prompt_is_gone(attempt, attempts, "Enter"):
+            if self._prompt_is_gone(attempt, attempts, "点击「确定」"):
+                LOG.info("auto reconnect: 掉线提示 closed after click %d/%d", attempt, attempts)
+                self._report("prompt", "掉线提示已关闭")
                 return True
-        LOG.error("auto reconnect: the 掉线提示 window did not close after %d attempt(s) (click + "
-                  "Enter) - the login board is still covered, so NO board/连接 click is sent",
-                  attempts)
-        self._report("failed", f"掉线提示窗口没有关闭（{attempts} 次点击+Enter 都不行）；"
-                               f"为避免点到提示框，本次重连停止")
+
+        LOG.error("auto reconnect: detected 掉线提示 did not close after %d click(s)", attempts)
+        self._report("failed", f"掉线提示窗口没有关闭（已点击 {attempts} 次）；本次重连停止")
         return False
 
     def _login_page_already_showing(self) -> bool:
@@ -3018,21 +3118,31 @@ class ReconnectWorker(threading.Thread):
         if sender is None:
             self._report("failed", "没有按键发送器")
             return False
-        try:
-            selected = sender.select_window()
-        except Exception:
-            LOG.exception("auto reconnect: window selection failed")
-            self._report("failed", "选中游戏窗口时出错")
-            return False
-        if selected is False:
-            LOG.error("auto reconnect: the game window was not selected (%r)", self.window_title)
-            self._report("failed", f"找不到游戏窗口 {self.window_title or '(title)'}")
-            return False
-        if not self._window_is_foreground():
-            LOG.error("auto reconnect: the game window did not come to the foreground")
-            self._report("failed", "游戏窗口没有切到前台")
-            return False
-        return True
+        attempt = 0
+        while not (self.stop_event.is_set() or self._cancel_requested.is_set()):
+            attempt += 1
+            self._report("focus", f"正在重新定位游戏窗口（第 {attempt} 次）")
+            try:
+                # select_window first tries the last known HWND and then searches
+                # the desktop for a replacement if that window can no longer be
+                # focused.  This is shared by every automation workflow.
+                selected = sender.select_window()
+            except Exception:
+                LOG.warning("auto reconnect: game-window re-anchor attempt %d failed",
+                            attempt, exc_info=True)
+                selected = False
+            if selected is not False and self._window_is_foreground():
+                if attempt > 1:
+                    self._report("focus", "已重新定位并激活游戏窗口")
+                return True
+
+            detail = (f"无法激活游戏窗口；{FOCUS_REANCHOR_INTERVAL_SECONDS:.0f} 秒后"
+                      f"重新查找游戏实例（第 {attempt} 次）")
+            LOG.warning("auto reconnect: %s", detail)
+            self._report("focus-wait", detail)
+            if not self._sleep_checked(FOCUS_REANCHOR_INTERVAL_SECONDS):
+                return False
+        return False
 
     def _wait_for_login_page(self) -> bool:
         """Second sign: the game window must be the login page's base colour.
@@ -3555,46 +3665,39 @@ class ReconnectWorker(threading.Thread):
             self._report("channel", f"点击 {channel}频道 ({cell_x}, {cell_y}) 后画面无明显变化（继续）")
         self._report("channel", f"{channel}频道 已双击选中 ({cell_x}, {cell_y})")
 
-        # The last step is verified by the page as well: the game must LEAVE the channel page.
-        # `expected=None` means "none of the three pages", i.e. the login really started.
-        if not self._sleep_checked(CHANNEL_CONFIRM_WAIT_SECONDS):
-            return False
+        # The last handoff is intentionally not a one-second Enter loop.  The
+        # client needs a quiet interval after channel selection, then receives
+        # two Enter taps; repeat that complete round once more.
         before_enter = self._capture()[0]
-        reason = self._press("enter")
-        if reason:
-            self._report("failed", reason)
-            return False
-        if not self._sleep_checked(CHANNEL_CONFIRM_WAIT_SECONDS):
-            return False
+        for round_number in range(1, CHANNEL_CONFIRM_ROUNDS + 1):
+            if not self._sleep_checked(CHANNEL_CONFIRM_ROUND_WAIT_SECONDS):
+                return False
+            for press_number in range(1, 3):
+                reason = self._press("enter")
+                if reason:
+                    self._report("failed", reason)
+                    return False
+                if press_number == 1 and not self._sleep_checked(
+                    CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS
+                ):
+                    return False
+            self._report(
+                "enter-confirm",
+                f"{channel}频道：第 {round_number}/{CHANNEL_CONFIRM_ROUNDS} 轮双按 Enter",
+            )
+
         after_enter = self._capture()[0]
         change = screen_change(before_enter, after_enter)
         page, score = self.page_now()
-        LOG.info("auto reconnect: after the channel Enter the screen changed by %.2f and the page "
-                 "is %s (%.2f)", change, self._page_label(page), score)
+        LOG.info("auto reconnect: after two channel-confirmation rounds the screen changed by "
+                 "%.2f and the page is %s (%.2f)", change, self._page_label(page), score)
         if self.page_verification_available() and page is not None:
-            # The channel page is still there: the selection did not take, or the game needs a
-            # second Enter.  Retry, and only report a failure when it stays.
-            LOG.warning("auto reconnect: the game is still on %s after confirming channel %d - "
-                        "retrying the Enter", self._page_label(page), channel)
-            if self._enter_until_page(None, what=f"{channel}频道确认",
-                                      attempts=CHANNEL_CONFIRM_ATTEMPTS,
-                                      wait=PAGE_WAIT_WORLD_SECONDS):
-                self._report("enter", f"{channel}频道")
-                return self._sleep_checked(LOGIN_SETTLE_SECONDS)
-            page, score = self.page_now()
             LOG.error("auto reconnect: confirming channel %d did not leave the channel page (%s, "
-                      "%.2f) - the target channel was probably not selected", channel,
+                      "%.2f) after two double-Enter rounds", channel,
                       self._page_label(page), score)
-            self._report("failed", f"确认 {channel}频道 后页面仍是{self._page_label(page)}"
-                                   f"（可能只选中了频道 1）")
+            self._report("failed", f"确认 {channel}频道 后页面仍是{self._page_label(page)}")
             return False
         self._report("enter", f"{channel}频道")
-        # second Enter: the operator's sequence is ... Enter -> 2s -> Enter
-        reason = self._press("enter")
-        if reason:
-            self._report("failed", reason)
-            return False
-        self._report("enter-confirm", f"{channel}频道")
         return self._sleep_checked(LOGIN_SETTLE_SECONDS)
 
     # ------------------------------------------------------------------ plumbing
@@ -3789,11 +3892,18 @@ class ReconnectWorker(threading.Thread):
         """
 
         if seconds <= 0:
-            return True
+            return not (self.stop_event.is_set() or self._cancel_requested.is_set())
         if self._sleep is not time.sleep:
             self._sleep(float(seconds))
-            return not self.stop_event.is_set()
-        return not self.stop_event.wait(float(seconds))
+            return not (self.stop_event.is_set() or self._cancel_requested.is_set())
+        deadline = time.monotonic() + float(seconds)
+        while True:
+            if self.stop_event.is_set() or self._cancel_requested.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            self.stop_event.wait(min(0.05, remaining))
 
 
 __all__ = [
