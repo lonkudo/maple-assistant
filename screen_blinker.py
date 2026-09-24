@@ -275,21 +275,31 @@ class ScreenBlinker(threading.Thread):
             user32.GetDC.restype = wintypes.HDC
             user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
             user32.DestroyWindow.argtypes = (wintypes.HWND,)
+            user32.FillRect.argtypes = (
+                wintypes.HDC, ctypes.POINTER(wintypes.RECT), ctypes.c_void_p,
+            )
+            user32.FillRect.restype = ctypes.c_int
             gdi32.CreateSolidBrush.argtypes = (wintypes.COLORREF,)
             gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
             gdi32.CreatePen.argtypes = (ctypes.c_int, ctypes.c_int, wintypes.COLORREF)
-            gdi32.CreatePen.restype = wintypes.HGDIOBJ
-            gdi32.SelectObject.argtypes = (wintypes.HDC, wintypes.HGDIOBJ)
-            gdi32.SelectObject.restype = wintypes.HGDIOBJ
+            gdi32.CreatePen.restype = ctypes.c_void_p
+            # Never let ctypes use its default 32-bit ``int`` conversion for
+            # a GDI object.  On 64-bit Windows that truncates the brush/pen
+            # handle and was the direct cause of the missing marker overlay.
+            gdi32.SelectObject.argtypes = (wintypes.HDC, ctypes.c_void_p)
+            gdi32.SelectObject.restype = ctypes.c_void_p
             gdi32.MoveToEx.argtypes = (
                 wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.POINTER(wintypes.POINT),
             )
             gdi32.LineTo.argtypes = (wintypes.HDC, ctypes.c_int, ctypes.c_int)
             gdi32.LineTo.restype = wintypes.BOOL
-            gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+            gdi32.DeleteObject.argtypes = (ctypes.c_void_p,)
             gdi32.Polygon.argtypes = (wintypes.HDC, ctypes.POINTER(wintypes.POINT), ctypes.c_int)
             gdi32.Polygon.restype = wintypes.BOOL
             instance = kernel32.GetModuleHandleW(None)
+            def handle(value: int | ctypes.c_void_p) -> ctypes.c_void_p:
+                return value if isinstance(value, ctypes.c_void_p) else ctypes.c_void_p(value)
+
             black = _colorref((0, 0, 0))
             left = min(x - 7 for _kind, x, _y in points)
             top = min(y - 7 for _kind, _x, y in points)
@@ -346,17 +356,17 @@ class ScreenBlinker(threading.Thread):
                 if hdc:
                     try:
                         rect = wintypes.RECT(0, 0, width, height)
-                        user32.FillRect(hdc, ctypes.byref(rect), background)
+                        user32.FillRect(hdc, ctypes.byref(rect), handle(background))
                         for kind, screen_x, screen_y in points:
                             x = screen_x - left - 7
                             y = screen_y - top - 7
                             marker = marker_brushes.get(kind, marker_brushes["jump_right"])
                             if kind in ("left_endpoint", "right_endpoint"):
                                 bar = wintypes.RECT(x + 7, y + 1, x + 9, y + 14)
-                                user32.FillRect(hdc, ctypes.byref(bar), marker)
+                                user32.FillRect(hdc, ctypes.byref(bar), handle(marker))
                                 continue
                             old = gdi32.SelectObject(
-                                hdc, arrow_pens.get(kind, arrow_pens["jump_right"])
+                                hdc, handle(arrow_pens.get(kind, arrow_pens["jump_right"]))
                             )
 
                             def draw_line(start: tuple[int, int], end: tuple[int, int]) -> None:
@@ -378,7 +388,7 @@ class ScreenBlinker(threading.Thread):
                                 draw_line((8, 14), (8, 1))
                                 draw_line((8, 1), (2, 7))
                                 draw_line((8, 1), (14, 7))
-                            gdi32.SelectObject(hdc, old)
+                            gdi32.SelectObject(hdc, handle(old))
                     finally:
                         user32.ReleaseDC(overlay, hdc)
                 self.stop_event.wait(0.05)
@@ -394,7 +404,7 @@ class ScreenBlinker(threading.Thread):
             for brush in brushes:
                 try:
                     if gdi32 is not None:
-                        gdi32.DeleteObject(brush)
+                        gdi32.DeleteObject(handle(brush))
                 except Exception:
                     pass
 
