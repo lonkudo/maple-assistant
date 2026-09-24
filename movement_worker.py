@@ -66,10 +66,9 @@ ROPE_TARGET_SMOOTHING_ALPHA = 0.15
 # aligned and keeps the side it approached from, instead of flipping on marker
 # quantization noise.
 ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
-# Endpoint reversals still need a real neutral input tick, but 100 ms made a
-# visible pause at each turn.  50 ms preserves release-before-press ordering
-# while making the turnaround responsive.
-DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.05
+# Endpoint reversals need a real neutral input tick: Maple can otherwise
+# consume the new direction when it arrives in the old key-up poll slice.
+DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
 # Jump records are X-precise, but the marker can be one or more vertical
 # minimap pixels away while grabbing/climbing a rope.  Keep X at its proven
 # one-pixel range and permit a slightly wider Y approach window.
