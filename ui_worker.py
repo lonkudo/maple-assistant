@@ -3666,7 +3666,10 @@ class UiWorker(threading.Thread):
             )
             return
         if not getattr(self, "_api_auto_lie_session_armed", False):
-            LOG.warning("自动过测谎: lie event ignored until enabled during this session")
+            # The detector may see the same popup in several consecutive
+            # frames before the user enables this session.  It is expected,
+            # not an operator-facing warning.
+            LOG.debug("自动过测谎: lie event ignored until enabled during this session")
             return
         now = time.monotonic()
         if match is None:

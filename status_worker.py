@@ -1857,8 +1857,10 @@ class StatusWorker(threading.Thread):
             LOG.warning("ignored frame without PIL image")
             return
         reading = self.detector.detect(image)
-        LOG.info("status hp=%s mp=%s exp=%s confidence=%.2f",
-                 reading.hp, reading.mp, reading.exp, reading.confidence)
+        # Routine samples arrive at the shared capture cadence.  Keep them
+        # available for diagnosis without burying movement and alert events.
+        LOG.debug("status hp=%s mp=%s exp=%s confidence=%.2f",
+                  reading.hp, reading.mp, reading.exp, reading.confidence)
         config = self.detector.config
         if reading.confidence < config.minimum_action_confidence:
             # Potions are the highest priority: a low-confidence read must NOT

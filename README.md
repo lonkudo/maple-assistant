@@ -138,6 +138,7 @@ and must not be moved after publication.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.1.54` | `release/v1.1.54` | Routine-log cleanup release. |
 | `1.1.53` | `release/v1.1.53` | First durable release checkpoint. |
 
 Releases before `1.1.53` were distributed as replace-in-place ZIPs without
