@@ -3699,8 +3699,23 @@ class MovementWorker(threading.Thread):
                 if not added_direction_claim:
                     return False
             alt_down = False
+            jump_point_up_started = False
+            jump_succeeded = False
             try:
-                lead = max(0.0, self.stair_jump_lead_seconds)
+                # A recorded point has already met its exact X/Y condition.
+                # For a rope, Up must be down *before* the jump frame rather
+                # than 150ms later, otherwise the character can pass the rope
+                # before the game sees the climb input.
+                if hold_up:
+                    if key_down("up") is False:
+                        return False
+                    jump_point_up_started = True
+                    self._jump_point_up_held = True
+                    self._jump_point_up_started_at = time.monotonic()
+                    self._jump_point_y_samples.clear()
+                    if self.climbing_active_event is not None:
+                        self.climbing_active_event.set()
+                lead = 0.0 if hold_up else max(0.0, self.stair_jump_lead_seconds)
                 if lead and not self._wait_for_patrol_motion(lead):
                     return False
                 if not self._patrol_input_allowed():
@@ -3708,23 +3723,28 @@ class MovementWorker(threading.Thread):
                 if key_down("alt") is False:
                     return False
                 alt_down = True
-                if not self._wait_for_patrol_motion(self.stair_jump_alt_hold_seconds):
+                alt_hold = (
+                    min(0.03, self.stair_jump_alt_hold_seconds)
+                    if hold_up else self.stair_jump_alt_hold_seconds
+                )
+                if not self._wait_for_patrol_motion(alt_hold):
                     return False
                 key_up("alt")
                 alt_down = False
                 if hold_up:
-                    if key_down("up") is False:
-                        return False
-                    self._jump_point_up_held = True
-                    self._jump_point_up_started_at = time.monotonic()
-                    self._jump_point_y_samples.clear()
-                    if self.climbing_active_event is not None:
-                        self.climbing_active_event.set()
-                    LOG.info("JUMP POINT executed: keeping Up held until landing Y settles")
+                    LOG.info("JUMP POINT executed: Up was held before Alt and remains held until landing Y settles")
+                jump_succeeded = True
                 return True
             finally:
                 if alt_down:
                     key_up("alt")
+                if jump_point_up_started and not jump_succeeded:
+                    key_up("up")
+                    self._jump_point_up_held = False
+                    self._jump_point_up_started_at = 0.0
+                    self._jump_point_y_samples.clear()
+                    if self.climbing_active_event is not None:
+                        self.climbing_active_event.clear()
                 if added_direction_claim:
                     key_up(direction)
 
