@@ -3003,6 +3003,9 @@ class MovementWorker(threading.Thread):
         # stable, allowing a rope immediately above the point to be climbed.
         self._jump_point_passed: set[tuple[str, int]] = set()
         self._jump_point_direction: Optional[str] = None
+        # A coordinate match is only a candidate.  It becomes "passed" after
+        # the dedicated jump worker accepts the request, never before.
+        self._jump_point_candidate: Optional[tuple[str, int]] = None
         self._jump_point_up_held = False
         self._jump_point_up_started_at = 0.0
         self._jump_point_y_samples: list[float] = []
@@ -3733,6 +3736,7 @@ class MovementWorker(threading.Thread):
         if self._jump_point_direction != plan.decision.key:
             self._jump_point_direction = plan.decision.key
             self._jump_point_passed.clear()
+            self._jump_point_candidate = None
         points = self.important_positions.get(layer, {}).get("jump_points", [])
         if not isinstance(points, list):
             return None
@@ -3757,11 +3761,11 @@ class MovementWorker(threading.Thread):
                 continue
             token = (layer, index)
             if matched and token not in self._jump_point_passed:
-                self._jump_point_passed.add(token)
                 direction = plan.decision.key
-                LOG.info("%s JUMP POINT %s[%d] matched x=%.6f y=%.6f; jumping %s+Up",
+                self._jump_point_candidate = token
+                LOG.info("%s JUMP POINT %s[%d] matched x=%.6f y=%.6f; awaiting jump worker",
                          "LEFT" if direction == "left" else "RIGHT", layer, index,
-                         observation.player.x, observation.player.y, direction)
+                         observation.player.x, observation.player.y)
                 return MovementDecision(f"jump_point_{direction}", "recorded jump point", plan.decision.duration)
         return None
 
@@ -8075,7 +8079,13 @@ class MovementWorker(threading.Thread):
                 )
                 if decision.key not in ("left", "right") and not is_stair_jump and not is_jump_point:
                     self._release_walk_hold()
-                if decision.key and now - self._last_send >= self.movement_cooldown:
+                # A recorded jump point is a narrow, one-frame positional
+                # event.  It must not be lost merely because an ordinary walk
+                # send occurred in the preceding 250 ms.
+                if decision.key and (
+                    is_jump_point
+                    or now - self._last_send >= self.movement_cooldown
+                ):
                     if decision.key in (
                         "drop", "climb", "jump_climb_left",
                         "jump_climb_right", "jump_climb_up",
@@ -8177,13 +8187,20 @@ class MovementWorker(threading.Thread):
                             except TypeError:
                                 queued = bool(request_stair_jump(direction))
                         if not queued:
+                            if is_jump_point:
+                                self._jump_point_candidate = None
                             self._on_stair_jump_complete(False)
                             LOG.warning("stair jump could not enter dedicated worker")
                         else:
+                            if is_jump_point:
+                                token = self._jump_point_candidate
+                                if token is not None:
+                                    self._jump_point_passed.add(token)
+                                self._jump_point_candidate = None
                             self._stair_jump_skip_frames = 5
                             LOG.info(
-                                "STAIR JUMP registered; skipping the next 5 "
-                                "stair-detection frames"
+                                "%s registered; skipping the next 5 stair-detection frames",
+                                "JUMP POINT" if is_jump_point else "STAIR JUMP",
                             )
                     elif decision.key in ("left", "right"):
                         # 陈旧爬绳输入刹车：决策是普通左右走，但爬绳状态仍认为
