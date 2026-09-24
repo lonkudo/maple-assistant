@@ -66,6 +66,10 @@ ROPE_TARGET_SMOOTHING_ALPHA = 0.15
 # aligned and keeps the side it approached from, instead of flipping on marker
 # quantization noise.
 ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
+# Endpoint reversals still need a real neutral input tick, but 100 ms made a
+# visible pause at each turn.  50 ms preserves release-before-press ordering
+# while making the turnaround responsive.
+DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.05
 # Jump records are X-precise, but the marker can be one or more vertical
 # minimap pixels away while grabbing/climbing a rope.  Keep X at its proven
 # one-pixel range and permit a slightly wider Y approach window.
@@ -2614,7 +2618,9 @@ class MovementWorker(threading.Thread):
                         # every endpoint turn is received as Left-up -> pause ->
                         # Right-down (or the reverse), rather than two events at
                         # the identical timestamp.
-                        if not self._wait_for_patrol_motion(0.10):
+                        if not self._wait_for_patrol_motion(
+                            DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS
+                        ):
                             if self.direction_transition_event is not None:
                                 self.direction_transition_event.clear()
                             return False
