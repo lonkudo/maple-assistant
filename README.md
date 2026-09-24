@@ -56,7 +56,7 @@ At patrol start, the assistant focuses the game, uses the recorded minimap geome
 
 ### Attack modes
 
-**固定攻击** performs the configured attack key at its selected fixed interval. **小碎步** and **重置空打** are optional timed motions, each with its own interval.
+**巡逻攻击** performs the configured attack key at its selected fixed interval. **小碎步** is an optional timed motion with its own interval.
 
 **小碎步** is an atomic left/right correction. Each direction is held for 220 ms with a 100 ms neutral gap; normal patrol resumes only after the sequence completes. **重置空打** performs a direction-preserving jump sequence with its own independent interval.
 
@@ -138,6 +138,7 @@ and must not be moved after publication.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.1.59` | `release/v1.1.59` | Patrol-attack naming and marker-overlay release. |
 | `1.1.58` | `release/v1.1.58` | Directional jump-point rope-hold release. |
 | `1.1.57` | `release/v1.1.57` | Jump-point rope-input timing release. |
 | `1.1.56` | `release/v1.1.56` | Jump-point capture-grid tolerance release. |

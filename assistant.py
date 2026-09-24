@@ -721,6 +721,7 @@ def main() -> int:
     )
 
     def prepare_map_session(*, stationary_reanchor: bool = True, show_overlays: bool = True,
+                            show_startup_marker: bool = False,
                             require_layer: bool = True) -> None:
         """Verify the recorded map name and re-anchor transient world Y.
 
@@ -735,6 +736,10 @@ def main() -> int:
         ``require_layer`` is False for the same automatic restart: the character may be OFF the patrol
         route after a reconnect, and then the patrol still has to start (from the route's base layer)
         so the movement worker's out-of-route return logic can bring it back.
+
+        ``show_startup_marker`` draws only the manual-start geometry and a
+        short marker crosshair.  It deliberately does not draw layer bands or
+        wait for a clean overlay-free capture, so the patrol does not freeze.
 
         The old ``abort_event`` hook (a lie takeover abandoning this session) is
         gone with the local lie pass.
@@ -984,7 +989,7 @@ def main() -> int:
         # The colours make the startup check easy to read: green is the
         # detected minimap frame, yellow is the marker/patrol analysis area,
         # and blue is the HP/MP status capture area.
-        if show_overlays:
+        if show_overlays or show_startup_marker:
             screen_blinker.show_detection_regions(
                 fresh_frame.window_rect,
                 fresh_frame.image.size,
@@ -1007,6 +1012,27 @@ def main() -> int:
             fresh_frame.image.crop(detection.analysis_box).convert("RGB")
         )
         marker = detect_yellow_diamond(analysis_rgb)
+        if show_startup_marker and marker is not None:
+            try:
+                left, top, right, bottom = fresh_frame.window_rect
+                analysis_left, analysis_top, analysis_right, analysis_bottom = (
+                    detection.analysis_box
+                )
+                image_width, image_height = fresh_frame.image.size
+                scale_x = (right - left) / max(1, image_width)
+                scale_y = (bottom - top) / max(1, image_height)
+                screen_blinker.show_aim_marker(
+                    round(left + (analysis_left + marker.x * (analysis_right - analysis_left)) * scale_x),
+                    round(top + (analysis_top + marker.y * (analysis_bottom - analysis_top)) * scale_y),
+                    ttl_seconds=2.5,
+                    size=11,
+                )
+                logging.info(
+                    "PATROL ATTACK marker: startup crosshair drawn x=%.6f y=%.6f",
+                    marker.x, marker.y,
+                )
+            except Exception:
+                logging.warning("PATROL ATTACK marker overlay failed", exc_info=True)
         layout = None
         if marker is not None:
             analysis_left, analysis_top, analysis_right, analysis_bottom = (
@@ -1281,7 +1307,9 @@ def main() -> int:
         movement_worker.arm_patrol_input()
         armed = _start_live_input(
             key_sender, automation_active,
-            lambda: prepare_map_session(show_overlays=False),
+            lambda: prepare_map_session(
+                show_overlays=False, show_startup_marker=True,
+            ),
             patrol_preparing,
         )
         return armed

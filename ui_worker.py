@@ -1380,7 +1380,7 @@ class UiWorker(threading.Thread):
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
                 yolo_mode_button.configure(state="disabled")
             ttk.Radiobutton(
-                mode_row, text="固定攻击", value="fixed",
+                mode_row, text="巡逻攻击", value="fixed",
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left")
@@ -1570,7 +1570,7 @@ class UiWorker(threading.Thread):
             step_gap_plus.pack(side="left", padx=(1, 0))
 
             self._fixed_status = ttk.Label(
-                fixed_panel, text="固定攻击未启用。", justify="left",
+                fixed_panel, text="巡逻攻击未启用。", justify="left",
                 wraplength=440,
             )
             self._fixed_load_settings()
@@ -5140,7 +5140,7 @@ class UiWorker(threading.Thread):
         worker = getattr(self, "attack_worker", None)
         if worker is None:
             self._fixed_status.configure(
-                text="固定攻击: 工作线程未接入 (无界面模式)。"
+                text="巡逻攻击: 工作线程未接入 (无界面模式)。"
             )
             return
         mode = str(data.get("attack_mode", "fixed"))
@@ -5236,14 +5236,14 @@ class UiWorker(threading.Thread):
                     )
                 else:
                     self._fixed_status.configure(
-                        text=(f"固定攻击已启用 - 按键 "
+                        text=(f"巡逻攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；每 "
                               f"{interval:.1f}s。"
                               "YOLO 怪物检测暂时停用。")
                     )
             else:
                 self._fixed_status.configure(
-                    text="固定攻击未启用 - 使用 YOLO 检测模式。"
+                    text="巡逻攻击未启用 - 使用 YOLO 检测模式。"
                 )
         if hasattr(self, "_yolo_status"):
             if fixed_mode:
@@ -6142,8 +6142,8 @@ class UiWorker(threading.Thread):
         "add_highest_layer": "添加最高楼层",
         "delete_highest_layer": "删除最高楼层",
         "toggle_patrol": "开始 / 停止巡逻 (Ctrl+`)",
-        "adjust_fixed_attack_interval:-0.1": "缩短固定攻击间隔 0.1 秒",
-        "adjust_fixed_attack_interval:+0.1": "加长固定攻击间隔 0.1 秒",
+        "adjust_fixed_attack_interval:-0.1": "缩短巡逻攻击间隔 0.1 秒",
+        "adjust_fixed_attack_interval:+0.1": "加长巡逻攻击间隔 0.1 秒",
         "quick_pickup:toggle": "开启 / 关闭快速拾取（仅停止巡逻时）",
     }
 
