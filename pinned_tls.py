@@ -1,0 +1,60 @@
+"""HTTPS transport that accepts only an explicitly pinned server public key."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import http.client
+import json
+from pathlib import Path
+import ssl
+from urllib.parse import urlsplit
+
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
+
+class PinnedTlsError(ConnectionError):
+    pass
+
+
+def load_pin(path: Path) -> str:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        value = str(data["spki_sha256"])
+        if data.get("format") != "maple-assistant-tls-pin/v1" or len(base64.b64decode(value, validate=True)) != 32:
+            raise ValueError
+        return value
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PinnedTlsError("安全连接配置不可用。") from exc
+
+
+def post_json(endpoint: str, path: str, payload: dict, pin_path: Path, timeout: float = 10.0) -> dict:
+    """Pin before transmitting the request body; never silently fall back."""
+    parts = urlsplit(endpoint)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        raise PinnedTlsError("授权服务器必须使用 HTTPS。")
+    expected = load_pin(pin_path)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=timeout)
+    try:
+        connection.connect()
+        certificate = x509.load_der_x509_certificate(connection.sock.getpeercert(binary_form=True))
+        spki = certificate.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        actual = base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+        if not hmac.compare_digest(expected, actual):
+            raise PinnedTlsError("服务器身份校验失败，连接已拒绝。")
+        body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        target = (parts.path.rstrip("/") + "/" + path.lstrip("/"))
+        connection.request("POST", target, body=body, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        data = json.loads(response.read().decode("utf-8"))
+        if response.status >= 400:
+            raise PinnedTlsError(str(data.get("message", "授权服务器拒绝请求。")))
+        return data
+    except (OSError, ssl.SSLError, json.JSONDecodeError) as exc:
+        raise PinnedTlsError("无法建立安全授权连接。") from exc
+    finally:
+        connection.close()
