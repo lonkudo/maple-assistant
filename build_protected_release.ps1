@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) { throw "Could not stage protected release." }
 
 Push-Location $root
 try {
-    & $Python -m nuitka --standalone --assume-yes-for-downloads `
+    & $Python -m nuitka --standalone --assume-yes-for-downloads --enable-plugin=tk-inter `
         "--output-dir=$out" "--output-filename=MapleAssistant.exe" `
         --include-data-dir=recording-assets=recording-assets `
         --include-data-dir=sound=sound `
@@ -54,7 +54,10 @@ $launcher = @"
 start "" "%~dp0MapleAssistant.exe" %*
 "@
 [System.IO.File]::WriteAllText(
-    (Join-Path $dist.FullName "启动助手.bat"), $launcher,
+    # Use Unicode code points instead of a Chinese string literal.  Windows
+    # PowerShell can otherwise decode this script with the active ANSI code
+    # page and create a mojibake launcher name in the release directory.
+    (Join-Path $dist.FullName (([char]0x542F).ToString() + ([char]0x52A8) + ([char]0x52A9) + ([char]0x624B) + ".bat")), $launcher,
     [System.Text.Encoding]::ASCII
 )
 [System.IO.File]::WriteAllText(
