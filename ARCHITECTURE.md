@@ -10,6 +10,7 @@ Maple Assistant is a stateful Windows automation application. Its architecture f
 - one input arbitration boundary;
 - one durable user configuration;
 - explicit ownership and release of every held key.
+- local signature verification separated from server-side activation authority.
 
 This keeps patrol recovery, combat, alerts, and optional helpers from fighting over the same keyboard state.
 
@@ -54,6 +55,23 @@ This keeps patrol recovery, combat, alerts, and optional helpers from fighting o
 `assistant.py` creates workers, supplies their callbacks, manages startup/shutdown, and owns the integration decisions that cross component boundaries. It also prepares the automatic-lie WebSocket endpoint in the background at application startup.
 
 The coordinator is intentionally the only place where a capture source, a worker callback, and a UI action are connected together. Feature workers should remain independently understandable and should not reach across the application to manipulate unrelated state.
+
+### Licensing and online-service boundary
+
+`licensing.py` is the local authorization boundary: it verifies signed license
+documents using the public key packaged with the desktop application and keeps
+the automation gate non-throwing. The activation server is a separate Django
+repository and owns code issuance, device binding, expiry, bans, and private
+signing material. The desktop repository must never contain the server
+database, plaintext activation inventory, signing private key, TLS private key,
+or auto-lie product secret.
+
+`pinned_tls.py` is a transport-only component. It checks the server's pinned
+TLS public-key hash before a request body is sent and never falls back to plain
+HTTP. It does not alter the existing auto-lie WebSocket adapter. A future
+online-session component will obtain a short-lived in-memory product key only
+after server authentication; that component must remain separate from both
+license verification and vendor `autolie_api/` code.
 
 ### Shared capture pipeline
 
@@ -161,6 +179,7 @@ Personal settings are stored in `user_config.json`; application defaults are sto
 | `hotkey.json` | Hotkey worker | Ordered hotkey bindings. |
 | `work/` | Runtime workers | Recoverable patrol/timer/session state. |
 | `error.log` | Error reporting | Critical unexpected-error record. |
+| `server_client.log` | Future online-session component | Safe authentication, pin, and heartbeat events; never secrets. |
 | `autolie_api/` | Vendor | Reference protocol implementation; read-only. |
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.

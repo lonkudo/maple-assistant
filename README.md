@@ -25,6 +25,26 @@ Two configuration files keep personal settings separate from shipped defaults:
 
 Use **导入配置** and **导出配置** in the running-log panel to move your personal configuration between installations. Import and export actions are recorded in the log.
 
+## Licensing and activation service
+
+The desktop package verifies signed licenses locally using only an Ed25519
+public key. The separate `maple-assistant-server` repository owns activation
+records, device bindings, expiry calculation, and every server private key.
+It must never be copied into a desktop release.
+
+Server-issued activation codes are exactly 256 characters long (`MAL-` plus
+252 cryptographically random hexadecimal characters). The server retains only
+their SHA-256 hashes, binds one code to one device on first activation, and
+starts a time-limited expiry then. Ten failed activations for one fingerprint
+within 24 hours ban that fingerprint.
+
+The client has a pinned-HTTPS transport foundation for the private activation
+service at `https://211.149.169.194:8443`. Its public pin may be shipped as
+`activation_tls_pin.json`; server TLS private keys and product secrets must
+remain server-only. Online auto-lie session/key delivery is deliberately kept
+separate from the existing auto-lie adapter until the versioned server-client
+session protocol is completed.
+
 ## Interface layout
 
 The interface calculates each main column from its widest supported content when it is created, then keeps that column width fixed for the rest of the session. Switching attack modes only enables or disables the controls already reserved in the layout; it does not repack rows or resize either column. The window height remains adjustable and is allowed to grow or shrink as content such as quick-message rows changes.
@@ -148,6 +168,7 @@ and must not be moved after publication.
 | Release version | Git tag | Status |
 | --- | --- | --- |
 | `1.1.65` | `release/v1.1.65` | Climb-aware jump-point triggering and compact arrows. |
+| `1.1.69` | `release/v1.1.69` | First protected EXE package; corrected Tk runtime packaging. |
 | `1.1.64` | `release/v1.1.64` | 64-bit native marker-canvas handle repair. |
 | `1.1.63` | `release/v1.1.63` | Persistent patrol-marker shared-canvas repair. |
 | `1.1.62` | `release/v1.1.62` | Atomic patrol-marker canvas release. |
