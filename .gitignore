@@ -38,3 +38,7 @@ venv*/
 lie_windows/
 lie_20260910_155856/
 screenshots/
+
+# Operator-only license inventory and local licensing database. Never ship or commit.
+operator_tools/local_licenses.sqlite3
+operator_tools/issued_*.txt

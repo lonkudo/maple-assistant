@@ -30,7 +30,7 @@ if ($LASTEXITCODE -ne 0) { throw "Could not stage protected release." }
 Push-Location $root
 try {
     & $Python -m nuitka --standalone --assume-yes-for-downloads `
-        --output-dir $out --output-filename MapleAssistant.exe `
+        "--output-dir=$out" "--output-filename=MapleAssistant.exe" `
         --include-data-dir=recording-assets=recording-assets `
         --include-data-dir=sound=sound `
         --include-data-dir=autolie_api=autolie_api `
@@ -61,4 +61,15 @@ start "" "%~dp0MapleAssistant.exe" %*
     (Join-Path $dist.FullName "start_assistant.bat"), $launcher,
     [System.Text.Encoding]::ASCII
 )
-Write-Host "Protected build ready: $($dist.FullName)" -ForegroundColor Green
+
+# Ship the complete standalone directory.  The executable's embedded Python
+# runtime lives beside MapleAssistant.exe, so distributing only the .exe would
+# be broken.  Operator-side license inventory/private material was never
+# copied into this directory by build_release.ps1.
+$zip = Join-Path $root "release\MapleAssistant-EXE-$Version.zip"
+Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+Compress-Archive -Path (Join-Path $dist.FullName "*") -DestinationPath $zip -Force
+Get-ChildItem (Join-Path $root "release") -File -Filter "MapleAssistant-EXE-*.zip" |
+    Where-Object { $_.FullName -ne $zip } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+Write-Host "Protected EXE release ready: $zip" -ForegroundColor Green
