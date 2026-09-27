@@ -650,11 +650,11 @@ class WindowKeySender:
         threading.Thread(target=scan, name="window-title-scan", daemon=True).start()
         if not scan_done.wait(1.5):
             raise OSError(
-                "game-window title scan timed out; close blocking overlays or "
-                "configure the exact game window title"
+                "游戏窗口标题扫描超时；请关闭遮挡窗口，"
+                "或在设置中填写准确的游戏窗口标题"
             )
         if scan_error:
-            raise OSError("could not enumerate visible Windows windows") from scan_error[0]
+            raise OSError("无法枚举当前可见窗口") from scan_error[0]
         wanted = self.window_title.casefold()
         matches = [hwnd for hwnd, title in visible if wanted in title.casefold()]
         LOG.info("WINDOW SELECT: fallback title scan found %d matching window(s)",
@@ -813,7 +813,7 @@ class WindowKeySender:
                 )
             except Exception as exc:
                 raise OSError(
-                    f"could not automatically select the current game window: {exc}"
+                    f"无法自动选择当前游戏窗口：{exc}"
                 ) from exc
 
     def _foreground_matches(self) -> bool:

@@ -141,7 +141,7 @@ def minimap_calibration_to_dict(
     """
 
     if not is_verified_border(detection):
-        raise ValueError("only a verified minimap border can be calibrated")
+        raise ValueError("只有已确认的小地图边框才能校准：请先让小地图完整可见再录制。")
     return {
         "schema": 2,
         "border_source": detection.source,
@@ -327,7 +327,7 @@ class MinimapDetector:
         """Lock a verified minimap border as this map session's baseline."""
 
         if not is_verified_border(detection):
-            raise ValueError("minimap geometry must come from a verified border")
+            raise ValueError("小地图坐标必须来自已确认的边框：本次画面边框未通过校验。")
         boxes = (
             detection.window_box,
             detection.analysis_box,
@@ -888,7 +888,7 @@ def choose_stable_minimap_index(
                 verified,
                 key=lambda index: detections[index].confidence,
             )
-        raise OSError("could not establish a stable detected minimap border")
+        raise OSError("无法稳定检测到小地图边框：请让小地图完整可见（不要被界面遮挡）后重试。")
     # Most repeats wins.  If both the true border and a larger enclosing
     # rectangle repeat equally, the smaller measured border is the minimap;
     # the larger one is commonly the bounded top-left search area.

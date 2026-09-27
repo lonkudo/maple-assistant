@@ -141,7 +141,7 @@ def capture_window(
     """
 
     if not window_title.strip():
-        raise ValueError("window_title must not be empty")
+        raise ValueError("游戏窗口标题不能为空")
 
     try:
         import win32con
@@ -149,14 +149,14 @@ def capture_window(
         import win32ui
     except ImportError as exc:  # pragma: no cover - exercised only off Windows
         raise WindowCaptureError(
-            "Windows capture requires pywin32 (pip install pywin32)"
+            "截图需要 pywin32，请重新双击 安装.bat 安装依赖"
         ) from exc
 
     hwnd = win32gui.FindWindow(None, window_title)
     if not hwnd:
-        raise WindowCaptureError(f"window not found: {window_title!r}")
+        raise WindowCaptureError(f"未找到游戏窗口：{window_title}")
     if win32gui.IsIconic(hwnd):
-        raise WindowCaptureError(f"window is minimized: {window_title!r}")
+        raise WindowCaptureError(f"游戏窗口已最小化：{window_title}")
 
     client_left, client_top, client_right, client_bottom = win32gui.GetClientRect(hwnd)
     screen_left, screen_top = win32gui.ClientToScreen(hwnd, (client_left, client_top))
@@ -166,7 +166,7 @@ def capture_window(
     client_width = screen_right - screen_left
     client_height = screen_bottom - screen_top
     if client_width <= 0 or client_height <= 0:
-        raise WindowCaptureError(f"window has an empty client area: {window_title!r}")
+        raise WindowCaptureError(f"游戏窗口客户区为空：{window_title}")
 
     if pixel_region is not None:
         source_x, source_top, source_right, source_bottom = pixel_region
@@ -412,7 +412,7 @@ class CaptureWorker(threading.Thread):
             # A scheduled capture already in progress when the button was
             # clicked is stale for recording. Wait for the requested one.
             after_sequence = frame.sequence
-        raise TimeoutError("immediate game capture timed out")
+        raise TimeoutError("即时截图超时（请确认游戏窗口可见且未最小化）")
 
     def run(self) -> None:
         if self.debug_dir is not None:

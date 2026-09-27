@@ -210,6 +210,8 @@ Personal settings are stored in `user_config.json`; application defaults are sto
 | `work/` | Runtime workers | Recoverable patrol/timer/session state. |
 | `error.log` | Error reporting | Critical unexpected-error record. |
 | `server_client.log` | Licensing transport | Safe activation connection, pin, HTTP, and local verification events; never secrets. |
+| `assistant-launch-error.log` | `startup_probe.py` | Hidden-launch failures, including the missing dependency that triggered the automatic install. |
+| `assistant-launch-status.log` | `startup_probe.py` | Launcher milestones: probe reached, repair started/finished, normal exit. |
 | `autolie_api/` | Vendor | Reference protocol implementation; read-only. |
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.
@@ -224,6 +226,58 @@ Atomic file replacement is used for runtime state where possible. A permission f
 6. **Release is mandatory.** Stop, focus loss, and worker failure must clear every held key through the shared sender.
 7. **Vendor boundaries remain intact.** Extend auto-lie behavior in the adapter layer, never by editing `autolie_api/`.
 
+## Packaging and release surfaces
+
+Two packages are built from the same staged sources, and both must behave the
+same way for the operator:
+
+- `release/MapleAssistant-<version>.zip` — the normal package: Python sources
+  plus data, installed into `.venv` by `安装.bat`. `startup_probe.py` owns its
+  hidden-launch failure path: it records the traceback to
+  `assistant-launch-error.log`/`error.log`, and when the failure is a
+  `ModuleNotFoundError` for a *third-party* module it runs `安装.bat` once and
+  restarts the assistant in a fresh process (guarded by an environment flag, so
+  it cannot loop). A missing local module is a damaged package, not an
+  installable requirement, and is only reported.
+- `release/MapleAssistant-release-<version>.zip` — the standalone package built
+  by `build_protected_release.ps1`: the same staged layout with the Python
+  sources compiled by Nuitka into `MapleAssistant.exe`. It contains no source,
+  so `安装.bat` is absent and its launcher is generated from code points rather
+  than Chinese literals.
+
+Four rules keep the standalone package from drifting away from the normal one:
+
+1. **Data parity is mechanical.** The build mirrors every non-source file of the
+   staged normal package 1:1 instead of carrying a hand-written include list. A
+   partial list is how `hotkey.json`, `system_config.json` and `timer.json`
+   disappeared once, and the packaged app then started with
+   `hotkey config unavailable` and no hotkey bindings.
+2. **Dynamic imports must be named.** Nuitka sees only static `import`
+   statements; `importlib.import_module("mouse_aim_controller")` in
+   `api_lie_video.py` is invisible to it and is therefore passed explicitly with
+   `--include-module`. Any new dynamic import needs the same treatment.
+3. **The build must prove the result.** After compiling, the build starts the
+   packaged executable once and refuses to publish when it cannot import a
+   bundled module. Imports happen before the single-instance guard, so an
+   immediate clean exit means "another instance is running", not a failure.
+4. **Launcher behaviour is part of the package.** The standalone launcher is a
+   hidden `wscript` that starts the executable with the `runas` verb, matching
+   the normal package: at a different privilege level from the game, Windows
+   silently drops injected keys. The executable is compiled with
+   `--windows-console-mode=hide`, so no console window appears, while a console
+   launched by the operator (the diagnostic launcher) still shows output.
+
+The frozen package cannot host a feature that starts a *separate* Python
+interpreter: `ui_worker.py` launches `yolo-detection/live_view.py` through
+`sys.executable`, which inside the executable is the assistant itself. Such a
+feature needs a bundled interpreter or must be compiled in; the YOLO panel is
+hidden meanwhile. External binaries (ffmpeg in `lie_video_tools.py`) are
+unaffected.
+
+Operator-facing text rule: status and refusal hints are Chinese, including
+every reason printed under **图层校准与巡逻**, while text that only reaches a log
+file or a developer stays English so a traceback keeps its searchable wording.
+
 ## Release discipline
 
 `VERSION` is the release source of truth. A behavior change is packaged with:
@@ -232,6 +286,17 @@ Atomic file replacement is used for runtime state where possible. A permission f
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
-The script creates the single `release/MapleAssistant-<version>.zip` package and removes the prior ZIP. Field runs are the normal verification path. Do not run broad unit-test suites unless the operator specifically requests them.
+The script creates the `release/MapleAssistant-<version>.zip` package and removes
+the prior ZIP. The standalone package is built from that staged package
+afterwards with the same version:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_protected_release.ps1 -Version X.Y.Z
+```
+
+The order matters: `release_now.ps1` prunes `MapleAssistant-*.zip`, which also
+matches the standalone package name. Field runs are the normal verification
+path. Do not run broad unit-test suites unless the operator specifically requests
+them.
 
 For a component-level guide, start with the source modules named above, then follow their constructor wiring in `assistant.py`. This preserves the intended direction of dependency: UI and workers depend on coordinator-provided interfaces; they do not depend directly on one another.

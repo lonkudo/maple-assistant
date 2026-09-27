@@ -28,7 +28,7 @@ def _write_image_unicode_safe(path: Path, image: np.ndarray) -> None:
     ok, encoded = cv2.imencode(".jpg", image,
                                [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not ok:
-        raise OSError(f"could not encode image for {path}")
+        raise OSError(f"无法编码地图参照图：{path}")
     path.write_bytes(encoded.tobytes())
 
 
@@ -76,7 +76,7 @@ class MapIdentityStore:
     def record(self, map_name: str, image: Image.Image) -> Path:
         name = map_name.strip()
         if not name:
-            raise ValueError("map name is empty")
+            raise ValueError("地图形名为空：请先填写地图形名再录制。")
         signature = self._normalize(image)
         with self._lock:
             self.root.mkdir(parents=True, exist_ok=True)

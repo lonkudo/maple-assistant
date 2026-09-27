@@ -6,13 +6,32 @@ The assistant is designed around one principle: **automation must be observable,
 
 ## Install and start
 
+Two packages are published for each version:
+
+| Package | Audience | Start |
+| --- | --- | --- |
+| `MapleAssistant-<version>.zip` | normal package, needs a Python environment | extract, run `安装.bat` once, then `启动助手.bat` |
+| `MapleAssistant-release-<version>.zip` | standalone package, no Python installation | extract, run `启动助手.bat` |
+
+Normal package:
+
 1. Extract the newest `MapleAssistant-<version>.zip` to a normal writable folder.
 2. Run `安装.bat` once. Approve the single Windows permission prompt when requested.
 3. Run `启动助手.bat`.
 
-The release contains one package only. There is no separate CPU/CUDA edition: automatic lie handling uses the configured remote API rather than a local model runtime.
+There is no separate CPU/CUDA edition: automatic lie handling uses the configured remote API rather than a local model runtime.
 
-The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer release package. A successful update replaces program files, imports a newer user configuration only when its configuration revision is newer, removes the consumed ZIP, and restarts the assistant.
+Standalone package:
+
+1. Extract the whole `MapleAssistant-release-<version>.zip` folder — the executable needs the files beside it, so running `MapleAssistant.exe` alone is not supported.
+2. Run `启动助手.bat` and approve the Windows permission prompt. The launcher is hidden and requests administrator rights, because the assistant must run at the same privilege level as the game or Windows silently drops injected keys.
+3. If the assistant does not appear, run `诊断启动.bat` (`diagnose_start.bat`); it keeps its console window open and prints the startup error.
+
+The standalone package starts no console window and needs no `安装.bat`: it carries its own Python runtime, the complete data layout of the normal package (configurations, assets, model weights), and the same `user_config.json` behavior. It ships no application source, so features that must start a *separate* Python interpreter cannot work there — the YOLO detector panel is the known case, and it stays hidden.
+
+If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
+
+The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer release package. A successful update replaces program files, imports a newer user configuration only when its configuration revision is newer, removes the consumed ZIP, and restarts the assistant. Only packages that contain `assistant.py` are accepted as updates, so the standalone package never replaces an installation by itself.
 
 ## Configuration
 
@@ -71,6 +90,8 @@ completed.
 ## Interface layout
 
 The interface calculates each main column from its widest supported content when it is created, then keeps that column width fixed for the rest of the session. Switching attack modes only enables or disables the controls already reserved in the layout; it does not repack rows or resize either column. The window height remains adjustable and is allowed to grow or shrink as content such as quick-message rows changes.
+
+Every hint shown to the operator is Chinese, including the refusal reasons printed under **图层校准与巡逻** — a failed recording names the cause in Chinese (for example 最上层无法录制绳索点, 该楼层尚未录制, 未找到游戏窗口, 巡逻启动时未检测到黄色角色标记) instead of mixing an English reason into a Chinese prefix. Messages that only reach the log or a developer remain English on purpose, so a traceback can be searched for by its original wording.
 
 ## Recording a map
 
@@ -186,6 +207,21 @@ For a failed patrol start, check in this order:
 3. The relevant layer endpoints and rope point have been recorded.
 4. The patrol start/end layer selection is valid.
 
+The status line under **图层校准与巡逻** states the refusal reason in Chinese, so
+repeat the step it names (record the missing point, walk onto the selected
+floor, bring the game window forward) rather than only pressing 开始运行 again.
+
+When the assistant itself does not start, use the launcher's own log:
+
+| Package | Where the failure is recorded |
+| --- | --- |
+| normal | `assistant-launch-error.log`; a missing library is installed automatically once |
+| standalone | run `诊断启动.bat` and read its console output |
+
+If a hotkey does nothing, the log names the cause: an active IME can swallow the
+`Ctrl` chords (`hotkey IME state: ON`), and the fix is printed with it — switch
+the IME to 英数/半角英数, or set `"delivery": "hook"` in `hotkey.json`.
+
 For a minimap-less area, return to a normal map before expecting patrol or disconnect monitoring to resume.
 
 ## Development and releases
@@ -197,6 +233,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
 The release script advances `VERSION`, creates `release/MapleAssistant-<version>.zip`, and removes the previous release ZIP. Field testing is the normal validation path; do not run broad unit-test suites unless specifically requested.
+
+Pass `-Version X.Y.Z` to publish an exact version without advancing it, and `-Minor` / `-Major` to move the second or first part.
+
+The standalone package is built from that staged normal package afterwards, with the same version:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_protected_release.ps1 -Version X.Y.Z
+```
+
+Run the two commands in that order: `release_now.ps1` prunes `MapleAssistant-*.zip`, which also matches the standalone package name. The standalone build mirrors the staged package's data layout, installs any missing build requirement automatically, compiles from inside the staged package, refuses to publish an executable that cannot import a bundled module, and writes `release/MapleAssistant-release-<version>.zip`.
 
 ### Release-to-Git mapping
 

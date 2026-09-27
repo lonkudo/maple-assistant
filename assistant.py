@@ -192,9 +192,9 @@ def _start_live_input(
 
     logging.info("START PATROL: selecting game window")
     if key_sender.select_window() is False:
-        raise OSError("game window selection returned failure")
+        raise OSError("游戏窗口选择失败")
     if not key_sender.is_game_foreground():
-        raise OSError("game window did not become foreground")
+        raise OSError("游戏窗口未能切换到前台")
     logging.info("START PATROL: game window verified foreground")
     veto_text = veto_reason or "patrol input is owned elsewhere"
     if veto_event is not None and veto_event.is_set():
@@ -255,9 +255,9 @@ def _capture_focused_game_frame(
 
     logging.info("RECORD POSITION: selecting game window before capture")
     if key_sender.select_window() is False:
-        raise OSError("game window selection returned failure")
+        raise OSError("游戏窗口选择失败")
     if not key_sender.is_game_foreground():
-        raise OSError("game window did not become foreground")
+        raise OSError("游戏窗口未能切换到前台")
     # Allow DWM/compositor state to settle after the foreground transition.
     time.sleep(0.08)
     return capture_now()
@@ -793,7 +793,7 @@ def main() -> int:
                 raise
             if (time.monotonic() - latest_frame.captured_at) > 1.0:
                 raise OSError(
-                    "could not capture a current minimap frame for stationary attack"
+                    "无法为站桩攻击捕获当前小地图画面"
                 )
             fresh_frame = latest_frame
             logging.warning(
@@ -897,7 +897,7 @@ def main() -> int:
             )
             if not callable(stationary_anchor):
                 raise OSError(
-                    "stationary attack is not supported by this movement worker"
+                    "当前移动模块不支持站桩攻击"
                 )
             marker = None
             if stationary_reanchor:
@@ -934,7 +934,7 @@ def main() -> int:
                     fresh_frame = marker_samples[-1][0]
             if not stationary_anchor(marker, allow_reanchor=stationary_reanchor):
                 raise OSError(
-                    "yellow character marker was not detected for stationary attack"
+                    "站桩攻击启动时未检测到黄色角色标记"
                 )
             # Stand-still attack automatically reuses only an existing,
             # correctly configured route.  The temporary standing point is
@@ -1025,8 +1025,9 @@ def main() -> int:
             matched, score = map_identity_store.matches(configured_name, title_image)
             if not matched:
                 raise OSError(
-                    f"current minimap name does not match recorded map "
-                    f"{configured_name!r} (visual match {score:.2f})"
+                    f"当前地图名称与已录制的地图不匹配 "
+                    f"{configured_name}（画面相似度 {score:.2f}）；"
+                    "请确认当前地图，或在「重置录制」后重新录制。"
                 )
             logging.info(
                 "MAP NAME matched recorded profile %s confidence=%.3f",
@@ -1314,7 +1315,7 @@ def main() -> int:
         )
         if marker is None:
             raise OSError(
-                "yellow character marker was not detected during patrol startup"
+                "巡逻启动时未检测到黄色角色标记"
             )
         startup_above_route = False
         if detected_name is None:
@@ -1354,8 +1355,8 @@ def main() -> int:
         if detected_name is None:
             if require_layer:
                 raise OSError(
-                    f"character marker Y={marker.y:.6f} does not match any "
-                    "recorded layer; record the current map layers again"
+                    f"角色当前 Y={marker.y:.6f} 不属于任何已录制楼层；"
+                    "请在本图重新录制各楼层。"
                 )
             # The automatic restart after a reconnect (the operator: "you should first detect current
             # layer, if it is out of patrol route then check how to go back"): the character is not on
@@ -1365,7 +1366,7 @@ def main() -> int:
             # so the decision is readable from the log.
             fallback = next(iter(snapshot.route_order), None)
             if fallback is None:
-                raise OSError("the patrol route has no layer to start from")
+                raise OSError("巡逻路线没有可用的起始楼层（请先录制楼层与最左/最右点）")
             logging.warning(
                 "MAP SESSION: marker Y=%.6f is OUTSIDE every recorded layer band (the character is "
                 "off the patrol route) - starting the patrol from the base layer %s so the "
@@ -1379,8 +1380,7 @@ def main() -> int:
         anchor_world_y = anchor_layer.get("layer_world_y")
         if anchor_world_y is None:
             raise OSError(
-                f"{anchor_name or 'first layer'} has no recorded world Y; "
-                "record this map once"
+                f"{anchor_name or '第一层'} 没有录制世界 Y；请在本图重新录制一次"
             )
         structure_tracker.start_session(float(anchor_world_y))
         movement_worker.prepare_patrol_start(

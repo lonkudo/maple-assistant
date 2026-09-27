@@ -352,7 +352,7 @@ class PatrolController:
 
         with self._lock:
             if layer_name not in self._profile.get("layers", {}):
-                raise ValueError(f"unknown layer: {layer_name}")
+                raise ValueError(f"未知楼层：{layer_name}")
             self._selected_layer = layer_name
 
     def reset_recording(self) -> None:
@@ -498,11 +498,11 @@ class PatrolController:
             layers = self._profile.get("layers", {})
             for name in (start_layer, end_layer):
                 if name and name not in layers:
-                    raise ValueError(f"layer not recorded: {name}")
+                    raise ValueError(f"该楼层尚未录制：{name}")
             if start_layer and end_layer:
                 if _layer_number(start_layer) > _layer_number(end_layer):
                     raise ValueError(
-                        f"patrol start {start_layer} must not be above end {end_layer}"
+                        f"巡逻起始楼层 {start_layer} 不能高于结束楼层 {end_layer}"
                     )
             self._profile["patrol_start_layer"] = start_layer
             self._profile["patrol_end_layer"] = end_layer
@@ -532,7 +532,7 @@ class PatrolController:
         """
 
         if boundary not in REQUIRED_LAYER_POINTS:
-            raise ValueError(f"unsupported patrol point: {boundary}")
+            raise ValueError(f"不支持的点类型：{boundary}")
         with self._lock:
             layers = self._profile.get("layers", {})
             layer_data = layers.get(layer)
@@ -638,7 +638,7 @@ class PatrolController:
         """Record Left/Rope/Right for the selected calibration layer."""
 
         if boundary not in REQUIRED_LAYER_POINTS:
-            raise ValueError(f"unsupported patrol point: {boundary}")
+            raise ValueError(f"不支持的点类型：{boundary}")
         with self._lock:
             layer_name = self._selected_layer
             if layer_name not in self._profile.get("layers", {}):
@@ -649,7 +649,10 @@ class PatrolController:
             layers = self._profile["layers"]
             layer = layers[layer_name]
             if boundary == "rope_pos" and layer_name == self._final_layer_name_locked():
-                raise ValueError("Rope cannot be recorded on the final layer")
+                raise ValueError(
+                    "最上层无法录制绳索点：绳索用于爬到上一层，"
+                    "当前楼层已是最上面的巡逻楼层。"
+                )
             match = re.search(r"(\d+)$", layer_name)
             lower_name = f"layer{int(match.group(1)) - 1}" if match and int(
                 match.group(1)
@@ -701,8 +704,9 @@ class PatrolController:
                 tolerance = float(layer.get("y_tolerance", 0.020000))
                 if gap > tolerance:
                     raise ValueError(
-                        f"player Y {player_y:.6f} is not on selected {layer_name} "
-                        f"(Y={float(layer['layer_y']):.6f} ±{tolerance:.6f})"
+                        f"角色当前不在所选 {layer_name} 上"
+                        f"（角色 Y={player_y:.6f}，该层 Y={float(layer['layer_y']):.6f} "
+                        f"±{tolerance:.6f}）；请先走到该楼层再录制。"
                     )
             point = layer.setdefault(boundary, {})
             # 录制坐标钳制到小地图有效范围 [0.02, 0.98]：边缘附近的标记可能
