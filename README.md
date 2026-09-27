@@ -38,12 +38,27 @@ their SHA-256 hashes, binds one code to one device on first activation, and
 starts a time-limited expiry then. Ten failed activations for one fingerprint
 within 24 hours ban that fingerprint.
 
-The client has a pinned-HTTPS transport foundation for the private activation
-service at `https://211.149.169.194:8443`. Its public pin may be shipped as
-`activation_tls_pin.json`; server TLS private keys and product secrets must
-remain server-only. Online auto-lie session/key delivery is deliberately kept
-separate from the existing auto-lie adapter until the versioned server-client
-session protocol is completed.
+The activation address is built into the desktop client:
+`https://211.149.169.194:8443`. Customers enter only their activation code;
+they never enter or choose a server address. Before the activation request body
+is sent, the client verifies the public certificate pin in
+`activation_server_pin.json`. There is no HTTP fallback.
+
+The server uses `LICENSE_SIGNING_PRIVATE_KEY` only to sign successful license
+responses. It is a Base64url-encoded 32-byte Ed25519 private key stored only
+in the server environment. The matching public key is packaged in
+`license_public_key.json` with each desktop release. Changing the server
+private key therefore requires a matching client public-key release; a private
+key can never be reconstructed from its public key.
+
+`server_client.log` records safe activation diagnostics: connection start,
+certificate-pin outcome, HTTP result, and local acceptance/refusal category.
+It never records an activation code, hardware fingerprint, token, or secret.
+The linked-node icon in **运行日志** copies this file to the clipboard.
+
+Online auto-lie session/key delivery remains deliberately separate from the
+existing auto-lie adapter until the versioned server-client session protocol is
+completed.
 
 ## Interface layout
 
@@ -61,6 +76,8 @@ Record each map before enabling a route:
 6. Select the patrol start and end layers.
 
 Layers are stored from bottom to top. A patrol route can cover any contiguous range; a map does not need exactly three layers.
+
+Each layer's row has an axis band beside its name. **Right-click the axis** to open its point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳); the menu is only available while patrol is stopped, because recording is locked while it runs. A left click on empty axis space opens the same menu, while a left click on an already-recorded marker selects that layer instead — so the right click is the reliable way to the menu.
 
 The minimap detector first finds the actual map border and calculates marker coordinates relative to that border. A broad search rectangle may help locate a map, but it is never saved as map geometry. This matters when the minimap size changes between maps or when the UI temporarily covers part of the game window.
 
@@ -92,6 +109,19 @@ At patrol start, all recorded points are displayed together for five seconds: bl
 **站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
 
 HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input.
+
+### Position correction while standing
+
+站桩攻击 holds the recorded spot with one atomic motion per correction: a short direction hold — the tiny step inside the inner band, a longer walk when the character is further out — followed immediately by one attack. The attack belongs to the correction, so a correction can never be the moment a beat is lost; corrections repeat about 300 ms apart until the marker is back inside the arrival band (±0.006X). A drift is always walked back: the character never settles a pixel or two away from its 桩. The small-step band ends at ±0.010X, and the correction interval only spaces the corrections — it does not create a gap in which a beat is skipped.
+
+Two related rules protect that motion:
+
+- While the optional **小碎步** pair is queued or running, nothing is queued behind it. The pair deliberately steps away from and back to the selected 朝向 and sets the facing itself when it finishes, so a correction or facing tap queued during it used to land as an extra step (and an extra attack) immediately after 小碎步.
+- The **朝向** tap is a 30 ms turn. It is long enough for the game to turn the character and short enough to stay inside the anchor band; a longer hold walks the character out of the band, and the correction that answers it turns the character back — the face/walk twitch.
+
+### 捡东西 (stand-still pickup circuit)
+
+**捡东西** walks the recorded left endpoint, then the right endpoint, then back to the 桩. Its trigger interval is set in **minutes** on its own row (`每 … m`, from 2.0m to 30.0m); the random gap beside it stays in seconds. That row is the only place minutes are used — the configuration file and the movement worker keep seconds, and the interval is clamped to the same 2–30 minutes when it is loaded.
 
 ## Alerts and recovery
 
@@ -136,7 +166,10 @@ Hotkeys have cooldown and hold protection so a single held key does not repeated
 
 ## Logs and troubleshooting
 
-The in-app running log is the first place to check. Critical unexpected errors are also written to `error.log`.
+The in-app running log is the first place to check. Critical unexpected errors
+are also written to `error.log`. For an activation problem, use the linked-node
+icon in **运行日志** to copy `server_client.log`; it contains the safe
+client–server diagnostic trail.
 
 For a failed patrol start, check in this order:
 

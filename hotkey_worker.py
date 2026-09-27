@@ -217,6 +217,7 @@ class HotkeyWorker(threading.Thread):
         self._ctrl_repeat_next = 0.0
         self._ctrl_repeat_active = False
         self._ctrl_repeat_count = 0
+        self._ctrl_physical_up_polls = 0
         self.enabled = True
         self.ignore_injected = True
         self._bindings: dict[int, tuple[str, bool]] = {}
@@ -406,9 +407,21 @@ class HotkeyWorker(threading.Thread):
         # slow Ctrl+Q chord, which is exactly the failure this protects.
         self._ctrl_repeat_until = float("inf")
         self._ctrl_repeat_next = now
+        self._ctrl_physical_up_polls = 0
         if not self._ctrl_repeat_active:
             self._ctrl_repeat_active = True
             self._ctrl_repeat_count = 0
+            # The first repeat cannot wait for this worker's next message
+            # pump turn.  Ctrl+Q/Ctrl+W must neutralize a Ctrl-bound game
+            # attack at the instant their chord is recognized; the later
+            # trade wait has no bearing on that modifier cleanup.
+            try:
+                self.keep_ctrl_released()
+                self._ctrl_repeat_count = 1
+            except Exception:
+                LOG.warning("could not immediately release Ctrl", exc_info=True)
+                self._ctrl_repeat_active = False
+                return
             LOG.info(
                 "hotkey %s: Ctrl is still held, keeping it released in the game "
                 "until you let go (otherwise the keyboard repeat re-triggers the "
@@ -421,8 +434,24 @@ class HotkeyWorker(threading.Thread):
         if not self._ctrl_repeat_active:
             return
         now = time.monotonic()
+        # RegisterHotKey may consume the physical Ctrl-up before the passive
+        # hook observes it.  Poll the OS key state as a fallback, so Ctrl+Q/W
+        # never leaves an invisible, indefinite modifier guard behind.
+        try:
+            physical_ctrl_down = bool(
+                ctypes.windll.user32.GetAsyncKeyState(VK_CONTROL) & 0x8000
+            )
+        except Exception:
+            physical_ctrl_down = None
+        if physical_ctrl_down is False:
+            self._ctrl_physical_up_polls += 1
+            if self._ctrl_physical_up_polls >= 3:
+                self._ctrl_down = False
+        elif physical_ctrl_down is True:
+            self._ctrl_physical_up_polls = 0
         if not self._ctrl_down:
             self._ctrl_repeat_active = False
+            self._ctrl_physical_up_polls = 0
             LOG.info("hotkey Ctrl release finished after %d re-sends",
                      self._ctrl_repeat_count)
             return
@@ -441,11 +470,11 @@ class HotkeyWorker(threading.Thread):
     def _queue_action(self, action: str, *, native_delivery: bool = False) -> None:
         """Queue one recognized chord without corrupting native Ctrl state.
 
-        Native registration owns the key lifecycle. It needs one immediate
-        game-side Ctrl release, but must not enter the repeated-release loop:
-        forwarded input can lose a Ctrl-up, leaving that loop armed forever and
-        making later hotkeys appear dead. The loop remains for hook fallback
-        chords, where the hook owns physical modifier tracking.
+        Both native and hook delivery need the same Ctrl release guard. Native
+        registration consumes the paired key, but it does not stop the game's
+        Ctrl-bound action from seeing the physical modifier reassert itself
+        while Ctrl+Q/Ctrl+W is held. A passive low-level hook tracks the real
+        Ctrl-up and ends this guard as soon as the operator releases it.
         """
         # Ctrl+[ / Ctrl+] are intentionally repeatable while the operator keeps
         # Ctrl held.  An injected Ctrl-up after the first press makes Windows
@@ -453,7 +482,11 @@ class HotkeyWorker(threading.Thread):
         # registration already consumes these chords; leave their modifier
         # lifecycle untouched so each press adjusts the interval by 0.1s.
         preserve_modifier = action.startswith("adjust_fixed_attack_interval:")
-        if self.release_ctrl_after_chord and not preserve_modifier:
+        # Trade must never inherit a held Ctrl from Ctrl+Q/Ctrl+W.  Enforce
+        # this even if a legacy hotkey.json disabled the general cleanup: a
+        # trader wait is unrelated to whether the game's Ctrl attack is safe.
+        release_ctrl = self.release_ctrl_after_chord or action.startswith("trade:")
+        if release_ctrl and not preserve_modifier:
             callback = self.on_chord
             if callable(callback):
                 try:
@@ -461,8 +494,12 @@ class HotkeyWorker(threading.Thread):
                 except Exception:
                     LOG.warning("hotkey Ctrl cleanup failed for %s", action,
                                 exc_info=True)
-            if not native_delivery:
-                self._arm_ctrl_release(action)
+            if native_delivery:
+                # RegisterHotKey can deliver WM_HOTKEY before the passive
+                # hook sees Ctrl-down. The native chord itself is direct
+                # evidence that Ctrl is physically held.
+                self._ctrl_down = True
+            self._arm_ctrl_release(action)
         # Exempt actions bypass the two-second cooldown; MOD_NOREPEAT / the hook key-up state still
         # prevent a held chord from firing repeatedly.
         repeatable = self._cooldown_exempt(action)
@@ -752,16 +789,15 @@ class HotkeyWorker(threading.Thread):
                 ", ".join(sorted(self._chord_name(vk) for vk in hook_vks)),
             )
 
-        # Native hotkeys deliberately stay hook-free. RegisterHotKey owns a
-        # complete key lifecycle; adding a modifier-tracking hook merely to
-        # repeat injected Ctrl-up events was the repeated-use failure path for
-        # forwarded Mouse Without Borders input. Install a hook only for chords
-        # Windows actually refused to register.
+        # Keep one passive low-level hook even when every chord registered
+        # natively. It does not claim native chord keys (``hook_vks`` can be
+        # empty), but it sees the physical Ctrl-up that terminates the game-
+        # side Ctrl release guard. Without it Ctrl+Q/Ctrl+W could re-trigger a
+        # Ctrl-bound attack after the one immediate key-up.
         hook_ok = True
-        if hook_vks:
-            hook_ok = self._install_hook(hook_vks)
-            if not hook_ok:
-                LOG.warning("could not install global hotkey hook")
+        hook_ok = self._install_hook(hook_vks)
+        if not hook_ok:
+            LOG.warning("could not install global hotkey modifier hook")
         if not registered and not hook_ok:
             # Hotkeys are optional. A hook permission failure must not make
             # the core-worker supervisor shut down normal gameplay.

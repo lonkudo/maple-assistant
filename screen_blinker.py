@@ -313,6 +313,7 @@ class ScreenBlinker(threading.Thread):
                 "rope": _colorref((245, 205, 35)),
                 "left_endpoint": _colorref((45, 140, 245)),
                 "right_endpoint": _colorref((45, 140, 245)),
+                "fixed_anchor": _colorref((235, 65, 65)),
             }
             marker_brushes = {
                 kind: gdi32.CreateSolidBrush(colour)
@@ -384,6 +385,12 @@ class ScreenBlinker(threading.Thread):
                                 draw_line((10, 9), (3, 2))
                                 draw_line((3, 2), (7, 2))
                                 draw_line((3, 2), (3, 6))
+                            elif kind == "fixed_anchor":
+                                # Same thin, compact grammar as patrol
+                                # markers; unlike the old separate aim
+                                # overlay it shares this repaint-safe canvas.
+                                draw_line((3, 7), (11, 7))
+                                draw_line((7, 3), (7, 11))
                             else:  # rope: a conventional upward arrow
                                 draw_line((8, 14), (8, 1))
                                 draw_line((8, 1), (2, 7))

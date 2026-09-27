@@ -1,10 +1,7 @@
-"""Route-walking Z pickup worker for patrol (independent thread).
+"""Retired automatic route-pickup worker.
 
-Presses Z in bursts ONLY while the character is walking one of the three
-route phases - move-to-left-most, move-to-right-most, move-to-rope: hold Z
-for ``pickup_hold_seconds`` (default 1s), release, then repeat quickly after
-a short gap.  Any other logic (jumping onto the rope, climbing, dropping,
-patrol paused, route complete) immediately blocks pickup and releases Z.
+Automatic Z pickup has been retired.  Manual Ctrl+Z quick pickup is provided
+by ``quick_pickup_worker.py`` and is the only component allowed to send Z.
 
 The worker owns no screenshots and no direction keys; it only drives the Z
 key through the shared key sender, gated by events published by the movement
@@ -25,6 +22,11 @@ from typing import Any, Optional
 
 
 LOG = logging.getLogger(__name__)
+
+# Keep this hard-off even though the old class remains import-compatible for
+# external integrations.  It prevents an accidental future instantiation from
+# reintroducing automatic Z input.
+AUTOMATIC_PICKUP_ENABLED = False
 
 
 class PickupWorker(threading.Thread):
@@ -94,6 +96,8 @@ class PickupWorker(threading.Thread):
         decisions, so this is the strict phase gate the user asked for.
         """
 
+        if not AUTOMATIC_PICKUP_ENABLED:
+            return False
         if (self.automation_active_event is not None
                 and not self.automation_active_event.is_set()):
             return False

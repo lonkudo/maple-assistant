@@ -147,6 +147,21 @@ class FocusWorker(threading.Thread):
                     self.reconnect_active_event is not None
                     and self.reconnect_active_event.is_set()
                 )
+                # The game's login dialog is a separate top-level window (and
+                # on some clients a separate process), so the normal gameplay
+                # foreground check quite correctly says "not focused" while
+                # reconnect is clicking it.  That must never turn into the
+                # normal lost-focus shutdown: it disarmed live input between
+                # selecting a channel and the final Enter confirmations.
+                # Reconnect owns focus and keyboard delivery for its entire
+                # sequence, including its post-login marker gate.
+                if reconnect_owns:
+                    self.automation_active_event.clear()
+                    self._lost_since = None
+                    previous = False
+                    if self.stop_event.wait(self.poll_interval):
+                        break
+                    continue
                 active = bool(input_enabled and game_focused and not reconnect_owns)
                 if active:
                     self.automation_active_event.set()

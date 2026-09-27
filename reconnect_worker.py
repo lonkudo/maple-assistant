@@ -127,12 +127,12 @@ OFFLINE_PROMPT_CLICK = True
 OFFLINE_PROMPT_ENTER = True
 OFFLINE_PROMPT_WAIT_SECONDS = 0.25
 OFFLINE_PROMPT_ATTEMPTS = 3
-# After a SUCCESSFUL reconnect the patrol is prepared again (layer detection + arm input).  The game
-# needs a moment to finish loading the character before that: measured on the operator's client, the
-# minimap is not painted yet right after the channel Enter, so a layer detection that runs immediately
-# finds no marker.  His instruction (v1.0.28): "i think the restart patrol is arranged too early, make
-# it 3s later, it would be fine, because the minimap isn't recovered yet, then you start the patrol".
-PATROL_RESTART_DELAY_SECONDS = 3.0
+# A reconnect may reach the game before the minimap and its yellow character marker are painted.
+# Restart patrol as soon as a short consecutive run of real marker samples proves the game is ready,
+# instead of blindly sleeping for a fixed amount of time.
+POST_LOGIN_MARKER_CONFIRM_SAMPLES = 3
+POST_LOGIN_MARKER_POLL_SECONDS = 0.20  # shared capture cadence: 5 fps
+POST_LOGIN_MARKER_TIMEOUT_SECONDS = 20.0
 # The login board and its buttons, measured by the operator on his own login page.  The 1366x768
 # numbers are the preset space; he re-measured them on his second device (a 1080x768 client,
 # 2026-09-17, work/anchors_1080.json) and the numbers below are those measurements mapped back into
@@ -247,12 +247,12 @@ CONNECT_BUTTON_ASPECT_RANGE = (1.2, 14.0)
 CONNECT_BUTTON_REFERENCE_NAME = "login_connect_target.jpg"
 # Template matching threshold for the 连接 button crop (a shipped crop must match the real art).
 CONNECT_TEMPLATE_MIN_SCORE = 0.62
-# The final channel handoff is deliberately two quiet rounds: wait for the client
+# The final channel handoff is deliberately three quiet rounds: wait for the client
 # to accept the selected channel, then double-tap Enter.  A rapid continuous
 # Enter loop is often discarded by the client at this boundary.
 CHANNEL_CONFIRM_ROUND_WAIT_SECONDS = 2.0
 CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS = 0.12
-CHANNEL_CONFIRM_ROUNDS = 2
+CHANNEL_CONFIRM_ROUNDS = 3
 # When no usable game window exists, retry a *fresh title search* at this pace.
 # The shared WindowKeySender itself first tries its current handle and only then
 # re-anchors to a newly created game window.
@@ -1444,9 +1444,15 @@ class _FocusWatch(threading.Thread):
 
     def __init__(self, stop_event: threading.Event) -> None:
         super().__init__(name="auto-reconnect-focus-watch", daemon=True)
-        self._stop = stop_event
+        self._app_stop = stop_event
+        self._stop = threading.Event()
         self.changes: list = []
         self._current: Optional[int] = None
+
+    def close(self) -> None:
+        """Stop this one reconnect-run diagnostic watcher."""
+
+        self._stop.set()
 
     def sample(self) -> Optional[int]:
         """The foreground window handle right now (None when it cannot be read)."""
@@ -1471,8 +1477,10 @@ class _FocusWatch(threading.Thread):
 
     def run(self) -> None:
         self._current = self.sample()
-        while not self._stop.is_set():
+        while not self._app_stop.is_set() and not self._stop.is_set():
             if self._stop.wait(self.INTERVAL_SECONDS):
+                return
+            if self._app_stop.is_set():
                 return
             now = self.sample()
             if now is None or now == self._current:
@@ -1509,6 +1517,7 @@ class ReconnectWorker(threading.Thread):
         wheel_fn: Optional[Callable[[int, int, int], bool]] = None,
         point_owner_fn: Optional[Callable[[int, int], Optional[tuple[int, str, str]]]] = None,
         page_fn: Optional[Callable[[], tuple[Optional[str], float]]] = None,
+        post_login_marker_ready_fn: Optional[Callable[[], bool]] = None,
         automation_event: Optional[threading.Event] = None,
         reconnect_active_event: Optional[threading.Event] = None,
     ) -> None:
@@ -1568,6 +1577,10 @@ class ReconnectWorker(threading.Thread):
         self._page_references_loaded = False
         self._page_references: dict = {}
         self._page_fn = page_fn
+        # The application owns minimap geometry and injects this fresh-frame
+        # marker probe.  Keeping it here as a callback prevents reconnect from
+        # maintaining a second, conflicting minimap detector.
+        self._post_login_marker_ready_fn = post_login_marker_ready_fn
 
         self._lock = threading.Lock()
         self._enabled = False
@@ -1813,16 +1826,18 @@ class ReconnectWorker(threading.Thread):
         # automation down - the patrol is not started by the test").  The assistant owns the decision:
         # it resumes only a patrol that the disconnect actually interrupted.
         if succeeded and not cancelled:
+            if not self._wait_for_post_login_marker():
+                self._disarm_input()
+                self._report(
+                    "failed",
+                    "已登录但未连续检测到黄色角色标记；巡逻未恢复",
+                )
+                self._announce_disarmed_input()
+                return
             # The gate flag goes down FIRST: the restart below arms the input again, and the focus gate
             # must not be holding the automation "paused for the auto-reconnect" while it does.
             self._restore_automation(automation_was)
-            # Let the game finish LOADING before the patrol is prepared: the minimap (and the yellow
-            # marker the layer detection needs) is not painted yet right after the channel Enter -
-            # "the restart patrol is arranged too early ... because the minimap isn't recovered yet".
-            LOG.info("auto reconnect: waiting %.1fs for the game to finish loading before the patrol "
-                     "restart (the minimap must be back)", PATROL_RESTART_DELAY_SECONDS)
-            self._sleep(PATROL_RESTART_DELAY_SECONDS)
-            self._report("patrol-restart", "重连完成，重新检测层数并恢复巡逻")
+            self._report("patrol-restart", "重连完成：黄色角色标记已连续确认，重新检测层数并恢复巡逻")
         elif automation_was:
             self._restore_automation(True)
         elif succeeded:
@@ -1831,6 +1846,53 @@ class ReconnectWorker(threading.Thread):
         # any more: with live input OFF every hotkey that sends keys is refused (and used to say so
         # only at DEBUG level, which is what made it look like a lost hotkey binding).
         self._announce_disarmed_input()
+
+    def _wait_for_post_login_marker(self) -> bool:
+        """Wait for consecutive fresh yellow-marker samples after channel entry.
+
+        The callback is deliberately supplied by ``assistant.py``: it captures
+        a fresh shared frame and uses the application's one minimap coordinate
+        system.  Reconnect only owns the timing and confirmation policy.
+        """
+
+        probe = self._post_login_marker_ready_fn
+        if not callable(probe):
+            # Compatibility seam for isolated callers.  The real application
+            # always injects the probe below.
+            LOG.warning("auto reconnect: no post-login marker probe; skipping readiness gate")
+            return True
+        self._report("loading", "等待黄色角色标记连续出现")
+        deadline = time.monotonic() + POST_LOGIN_MARKER_TIMEOUT_SECONDS
+        consecutive = 0
+        samples = 0
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set() or self._cancel_requested.is_set():
+                return False
+            samples += 1
+            try:
+                visible = bool(probe())
+            except Exception:
+                LOG.debug("auto reconnect: post-login marker probe failed", exc_info=True)
+                visible = False
+            consecutive = consecutive + 1 if visible else 0
+            if consecutive >= POST_LOGIN_MARKER_CONFIRM_SAMPLES:
+                LOG.info(
+                    "auto reconnect: yellow marker confirmed %d/%d consecutive samples; "
+                    "restarting patrol immediately",
+                    consecutive,
+                    POST_LOGIN_MARKER_CONFIRM_SAMPLES,
+                )
+                return True
+            if not self._sleep_checked(POST_LOGIN_MARKER_POLL_SECONDS):
+                return False
+        LOG.error(
+            "auto reconnect: yellow marker did not remain visible for %d consecutive samples "
+            "within %.1fs (%d probes)",
+            POST_LOGIN_MARKER_CONFIRM_SAMPLES,
+            POST_LOGIN_MARKER_TIMEOUT_SECONDS,
+            samples,
+        )
+        return False
 
     def _announce_disarmed_input(self) -> None:
         """State loudly that typing is off after this run, in the log and in the panel."""
@@ -1905,6 +1967,16 @@ class ReconnectWorker(threading.Thread):
                 # input (the patrol state), which also makes the focus gate keep the automation
                 # cleared by itself.
                 self._disarm_input()
+            # This diagnostic belongs to ONE reconnect run. Leaving it alive
+            # made it keep watching foreground changes for the rest of the
+            # application lifetime, including the hidden FFmpeg diagnostic
+            # encoder that runs after a disconnect screenshot recording.
+            try:
+                watch.close()
+                if watch.is_alive():
+                    watch.join(timeout=0.25)
+            except Exception:
+                LOG.debug("auto reconnect: focus watcher could not be stopped", exc_info=True)
             self._focus_watch = None
 
     def _check_frame_size(self) -> None:
@@ -3667,7 +3739,7 @@ class ReconnectWorker(threading.Thread):
 
         # The last handoff is intentionally not a one-second Enter loop.  The
         # client needs a quiet interval after channel selection, then receives
-        # two Enter taps; repeat that complete round once more.
+        # two Enter taps; repeat that complete round twice more.
         before_enter = self._capture()[0]
         for round_number in range(1, CHANNEL_CONFIRM_ROUNDS + 1):
             if not self._sleep_checked(CHANNEL_CONFIRM_ROUND_WAIT_SECONDS):
@@ -3689,12 +3761,13 @@ class ReconnectWorker(threading.Thread):
         after_enter = self._capture()[0]
         change = screen_change(before_enter, after_enter)
         page, score = self.page_now()
-        LOG.info("auto reconnect: after two channel-confirmation rounds the screen changed by "
-                 "%.2f and the page is %s (%.2f)", change, self._page_label(page), score)
+        LOG.info("auto reconnect: after %d channel-confirmation rounds the screen changed by "
+                 "%.2f and the page is %s (%.2f)", CHANNEL_CONFIRM_ROUNDS,
+                 change, self._page_label(page), score)
         if self.page_verification_available() and page is not None:
             LOG.error("auto reconnect: confirming channel %d did not leave the channel page (%s, "
-                      "%.2f) after two double-Enter rounds", channel,
-                      self._page_label(page), score)
+                      "%.2f) after %d double-Enter rounds", channel,
+                      self._page_label(page), score, CHANNEL_CONFIRM_ROUNDS)
             self._report("failed", f"确认 {channel}频道 后页面仍是{self._page_label(page)}")
             return False
         self._report("enter", f"{channel}频道")

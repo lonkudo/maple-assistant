@@ -109,6 +109,7 @@ class VideoSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         ffmpeg = find_ffmpeg()
         if ffmpeg is not None:
+            import os
             import subprocess
 
             width, height = self.size
@@ -122,9 +123,26 @@ class VideoSink:
                 str(self.path),
             ]
             try:
+                # The diagnostic encoder runs after an automatic offline
+                # recording, often just as patrol has stopped.  On Windows a
+                # normal Popen can create/activate an FFmpeg console window;
+                # it steals focus and looks like a prompt.  Encoding is fully
+                # background work, so it must never expose a window.
+                popen_kwargs: dict[str, Any] = {
+                    "stdin": subprocess.PIPE,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.PIPE,
+                }
+                if os.name == "nt":
+                    creation_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if creation_flag:
+                        popen_kwargs["creationflags"] = creation_flag
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0  # SW_HIDE
+                    popen_kwargs["startupinfo"] = startupinfo
                 self._process = subprocess.Popen(
-                    command, stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    command, **popen_kwargs,
                 )
                 self.codec = "h264 (ffmpeg)"
             except Exception:

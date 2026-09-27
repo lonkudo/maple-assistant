@@ -126,7 +126,11 @@ class TradeWorker(threading.Thread):
         self.capture_active_event = capture_active_event
         self.key_sender = key_sender
         self.window_title = window_title
-        self._requests: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=2)
+        # The invite hotkey must use the cursor position from the instant the
+        # operator pressed Ctrl+Q.  Selecting/refocusing the game can take a
+        # few seconds, by which time querying the cursor again may see a
+        # completely unrelated position.
+        self._requests: "queue.Queue[tuple[str, str, Optional[tuple[int, int]]]]" = queue.Queue(maxsize=2)
         self._invite_lock = threading.Lock()
         self._invite_pending = False
         self._active_action: Optional[str] = None
@@ -144,7 +148,7 @@ class TradeWorker(threading.Thread):
                 LOG.warning("trade request ignored: busy with %s", self._active_action)
                 return False
             try:
-                self._requests.put_nowait((action, message))
+                self._requests.put_nowait((action, message, None))
             except queue.Full:
                 LOG.warning("trade request ignored: busy")
                 return False
@@ -156,20 +160,28 @@ class TradeWorker(threading.Thread):
     def toggle_invite(self, message: str) -> str:
         """Start an invite sequence, or cancel the currently active one."""
 
+        # Snapshot before queuing.  This is deliberately outside the worker:
+        # window activation and keyboard cleanup inside that worker are slow
+        # enough to make a later cursor lookup miss the trader.
+        try:
+            cursor = VirtualMouse.position()
+        except Exception:
+            LOG.warning("trade invite: could not snapshot the user cursor", exc_info=True)
+            cursor = None
         with self._invite_lock:
             if self._active_action is not None:
                 self._invite_cancel.set()
                 LOG.info("trade cancellation requested for %s", self._active_action)
                 return "cancelled"
             try:
-                self._requests.put_nowait(("trade:invite", message))
+                self._requests.put_nowait(("trade:invite", message, cursor))
             except queue.Full:
                 LOG.warning("trade invite ignored: worker is busy")
                 return "busy"
             self._invite_cancel.clear()
             self._invite_pending = True
             self._active_action = "trade:invite"
-            LOG.info("trade request queued: trade:invite")
+            LOG.info("trade request queued: trade:invite cursor_snapshot=%s", cursor)
             return "started"
 
     def is_invite_active(self) -> bool:
@@ -623,17 +635,6 @@ class TradeWorker(threading.Thread):
             return False
         return bool(self.key_sender.send_direct_keys("ctrl+v", "enter"))
 
-    def _release_trade_hotkey_modifier(self) -> None:
-        """End a trade chord without changing ordinary Ctrl behavior."""
-
-        release = getattr(self.key_sender, "release_all_keys", None)
-        if not callable(release):
-            return
-        try:
-            release(reason="trade hotkey modifier release")
-        except Exception:
-            LOG.warning("trade could not release the triggering hotkey", exc_info=True)
-
     @staticmethod
     def _play_success() -> None:
         """Play completion feedback without holding up the trade worker."""
@@ -645,18 +646,20 @@ class TradeWorker(threading.Thread):
             daemon=True,
         ).start()
 
-    def _invite(self, message: str) -> None:
+    def _invite(self, message: str, cursor_snapshot: Optional[tuple[int, int]] = None) -> None:
         if self._invite_cancelled():
             return
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
             LOG.warning("trade invite ignored: game window unavailable")
             return
-        self._release_trade_hotkey_modifier()
+        # Ctrl+Q is released synchronously by HotkeyWorker when it recognizes
+        # the chord.  Do not reset all keys here: this runs much later than
+        # the hotkey and has no relationship to waiting for the trader.
         geometry = self._client_geometry()
         if geometry is None:
             return
         try:
-            cursor = VirtualMouse.position()
+            cursor = cursor_snapshot if cursor_snapshot is not None else VirtualMouse.position()
             if cursor is None:
                 LOG.warning("trade invite ignored: mouse position unavailable")
                 return
@@ -664,7 +667,11 @@ class TradeWorker(threading.Thread):
             if not (left <= cursor[0] < left + width and top <= cursor[1] < top + height):
                 LOG.warning("trade invite ignored: place the cursor on a trader in the game window first")
                 return
-            LOG.info("trade invite: using user cursor at screen=%s", cursor)
+            LOG.info(
+                "trade invite: using %s cursor at screen=%s",
+                "hotkey-snapshotted" if cursor_snapshot is not None else "current",
+                cursor,
+            )
             VirtualMouse.click(*cursor, right=True)
             if not self._wait_or_cancel(0.18):
                 return
@@ -714,7 +721,8 @@ class TradeWorker(threading.Thread):
         if self.key_sender.select_window() is False or not self.key_sender.is_game_foreground():
             LOG.warning("trade accept ignored: game window unavailable")
             return
-        self._release_trade_hotkey_modifier()
+        # Ctrl+W is released synchronously by HotkeyWorker.  The accept flow
+        # must not perform a delayed global input reset before its clicks.
         geometry = self._client_geometry()
         if geometry is None:
             return
@@ -752,12 +760,12 @@ class TradeWorker(threading.Thread):
         try:
             while not self.stop_event.is_set():
                 try:
-                    action, message = self._requests.get(timeout=0.2)
+                    action, message, cursor_snapshot = self._requests.get(timeout=0.2)
                 except queue.Empty:
                     continue
                 try:
                     if action == "trade:invite":
-                        self._invite(message)
+                        self._invite(message, cursor_snapshot)
                     elif action == "trade:accept":
                         self._accept(message)
                 except Exception:

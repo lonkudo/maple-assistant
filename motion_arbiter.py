@@ -40,6 +40,12 @@ JUMP = "jump"
 MICRO_STEP = "micro_step"
 STAIR_JUMP = "stair_jump"
 FACING = "facing"
+# 站桩攻击's anchor correction.  It is the "combination" motion: a tiny step (or
+# a short walk back) that ends with the attack belonging to that correction.
+# Like every other queued motion it excludes the fixed cadence while it is
+# queued or running, and the attack it taps is what the character would
+# otherwise lose while correcting its position.
+STEP = "step"
 
 # A tap can be refused by the input layer (game window not foreground, input
 # disarmed, focus stolen mid-tap).  A jump/micro-step is stale by then and is
@@ -64,9 +70,15 @@ class MotionArbiter(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         automation_active_event: Optional[threading.Event] = None,
         jump_motion_seconds: float = 0.9,
-        buff_motion_seconds: float = 0.6,
+        buff_motion_seconds: float = 1.0,
+        buff_tap_hold_seconds: float = 0.20,
         micro_step_motion_seconds: float = 0.25,
+        micro_step_pre_step_quiet_seconds: float = 0.20,
         facing_motion_seconds: float = 0.10,
+        # A stand-still correction ends with an attack tap, so its lock is the
+        # same kind of hold a 小碎步 uses: the moment after the tap is where the
+        # fixed cadence would otherwise re-tap on top of it.
+        step_motion_seconds: float = 0.25,
         attack_grace_seconds: float = 0.73,
         delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:
@@ -77,10 +89,23 @@ class MotionArbiter(threading.Thread):
         self.automation_active_event = automation_active_event
         self.jump_motion_seconds = max(0.0, float(jump_motion_seconds))
         self.buff_motion_seconds = max(0.0, float(buff_motion_seconds))
+        self.buff_tap_hold_seconds = max(0.01, min(1.0, float(buff_tap_hold_seconds)))
         self.micro_step_motion_seconds = max(
             0.0, float(micro_step_motion_seconds)
         )
+        # The shared attack grace ends the known attack animation window. A
+        # 小碎步 needs a short neutral gap before its FIRST
+        # direction: otherwise Maple may still consume that first hold while
+        # accepting the later post-step direction normally.
+        self.micro_step_pre_step_quiet_seconds = max(
+            0.0, float(micro_step_pre_step_quiet_seconds)
+        )
         self.facing_motion_seconds = max(0.0, float(facing_motion_seconds))
+        # The 站桩 correction ends with an attack tap, so its lock keeps the
+        # fixed cadence from re-tapping on top of that attack.
+        self.step_motion_seconds = max(
+            0.0, float(step_motion_seconds)
+        )
         self.attack_grace_seconds = max(0.0, float(attack_grace_seconds))
         self.delivery_retry_seconds = max(0.0, float(delivery_retry_seconds))
         # How long a buff may wait for the safe-stage gate before it says so.
@@ -89,6 +114,10 @@ class MotionArbiter(threading.Thread):
         # timing, while movement owns the directional key handoff itself.
         self._micro_step_callback: Any = None
         self._facing_callback: Any = None
+        # The stand-still anchor correction is a finite motion too: a tiny step
+        # that carries its own attack tap, so it is serialized here instead of
+        # being sent as an ordinary walk beside the fixed cadence.
+        self._step_callback: Any = None
         # A confirmed stair stall borrows patrol's current direction and taps
         # Alt.  It is queued only to serialize against attacks; it is not an
         # ordinary directional arbiter motion.
@@ -246,6 +275,66 @@ class MotionArbiter(threading.Thread):
         with self._cv:
             return token in self._queued or token == self._executing_token
 
+    def request_step(self, direction: str) -> bool:
+        """Queue one 站桩 anchor correction (the step-plus-attack combination).
+
+        The motion itself is a short direction hold or a short walk back,
+        followed by the attack that belongs to that correction - so it is
+        queued rather than walked: the movement loop never blocks on a key
+        hold, no jump/buff tap lands inside it, and the correction cannot
+        become the frame that loses a fixed-attack beat.
+        """
+
+        direction = str(direction).casefold()
+        if direction not in ("left", "right"):
+            return False
+        token = f"{STEP}:{direction}"
+        with self._cv:
+            if not self._automation_allowed_locked():
+                self._set_refusal_locked("automation inactive (stop or patrol off)")
+                return False
+            if not self._motion_gate_allows_locked():
+                self._set_refusal_locked("movement is not in a safe step stage")
+                return False
+            if token in self._queued:
+                return True
+            self._pending.append(token)
+            self._queued.add(token)
+            self._cv.notify_all()
+            return True
+
+    def step_pending(self) -> bool:
+        """Whether an anchor correction is queued or running.
+
+        The correction owner asks before queueing another one: each correction
+        moves the marker by about a pixel, so two of them in flight would walk
+        in opposite directions and net out, and each carries its own attack.
+        """
+
+        with self._cv:
+            return any(
+                token.startswith(f"{STEP}:") for token in self._queued
+            )
+
+    def micro_step_pending(self) -> bool:
+        """Whether the optional 小碎步 pair is queued or running.
+
+        The movement loop asks before issuing a position correction or a 朝向
+        tap.  The pair moves the character deliberately (away from, then back
+        to the selected 朝向) and sets the facing itself when it ends, so a
+        correction that answers the pair's own step is the extra step (and extra
+        attack) the operator saw right after 小碎步 and does not want.
+        """
+
+        with self._cv:
+            return MICRO_STEP in self._queued
+
+    @staticmethod
+    def _is_step_token(token: Optional[str]) -> bool:
+        """Whether *token* is a 站桩 anchor correction."""
+
+        return bool(token) and str(token).startswith(f"{STEP}:")
+
     def request_stair_jump(self, direction: str, on_complete: Any = None) -> bool:
         """Queue a confirmed direction-preserving stair jump.
 
@@ -285,6 +374,12 @@ class MotionArbiter(threading.Thread):
 
         with self._cv:
             self._facing_callback = callback
+
+    def set_step_callback(self, callback: Any) -> None:
+        """Install MovementWorker's atomic 站桩 correction (step + its attack)."""
+
+        with self._cv:
+            self._step_callback = callback
 
     def set_stair_jump_callback(self, callback: Any) -> None:
         """Install MovementWorker's direction-preserving stair-jump action."""
@@ -374,8 +469,9 @@ class MotionArbiter(threading.Thread):
 
         Call ``finish_attack`` in a ``finally`` block after a successful
         reservation.  This replaces the unsafe ``is_idle`` then ``tap``
-        sequence: a micro-step, jump, or buff cannot slip between those two
-        operations and change the character's direction mid-animation.
+        sequence: a micro-step, jump, buff, or anchor correction cannot slip
+        between those two operations and change the character's direction
+        mid-animation.
         """
 
         with self._cv:
@@ -455,6 +551,8 @@ class MotionArbiter(threading.Thread):
             return self.micro_step_motion_seconds
         if token.startswith(f"{FACING}:"):
             return self.facing_motion_seconds
+        if token.startswith(f"{STEP}:"):
+            return self.step_motion_seconds
         return self.buff_motion_seconds
 
     def _pop_locked(self, token: str) -> list[Any]:
@@ -523,12 +621,13 @@ class MotionArbiter(threading.Thread):
                             )
                         self._cv.wait(0.10)
                         continue
-                    if token.startswith(f"{FACING}:"):
-                        # Movement owns the facing as an obligation and re-asks
-                        # on the next settled frame, so a drained token is safe
-                        # - but it must be visible: without this line the log
-                        # shows a correction that was queued and then simply
-                        # never happened.
+                    if (token.startswith(f"{FACING}:")
+                            or token.startswith(f"{STEP}:")):
+                        # Movement owns the facing and the 桩 step as obligations
+                        # and re-asks on the next settled frame, so a drained
+                        # token is safe - but it must be visible: without this
+                        # line the log shows a correction that was queued and
+                        # then simply never happened.
                         LOG.info(
                             "motion arbiter dropped %s: the safe-stage gate "
                             "shut before its turn; movement will re-request",
@@ -547,14 +646,19 @@ class MotionArbiter(threading.Thread):
                 return
         # Wait out the tail of any attack motion before pressing a motion
         # key; the token stays queued meanwhile, so attack stays suppressed.
-        while not self.stop_event.is_set():
-            with self._cv:
-                grace = self.attack_grace_seconds - (
-                    time.monotonic() - self._last_attack_at
-                )
-            if grace <= 0:
-                break
-            self.stop_event.wait(grace)
+        # The 站桩 correction is exempt because it carries its own attack and
+        # registers it (``note_attack``): waiting the shared grace after its own
+        # tap would stretch a correction that the operator wants about 0.3s
+        # apart out to one per second.
+        if not self._is_step_token(token):
+            while not self.stop_event.is_set():
+                with self._cv:
+                    grace = self.attack_grace_seconds - (
+                        time.monotonic() - self._last_attack_at
+                    )
+                if grace <= 0:
+                    break
+                self.stop_event.wait(grace)
         if self.stop_event.is_set():
             with self._cv:
                 self._executing_token = None
@@ -562,6 +666,20 @@ class MotionArbiter(threading.Thread):
                 self._cv.notify_all()
             self._notify_buff_completion(callbacks, False)
             return
+
+        if token == MICRO_STEP and self.micro_step_pre_step_quiet_seconds:
+            LOG.info(
+                "motion arbiter micro-step: waiting %.2fs after attack grace "
+                "before first direction",
+                self.micro_step_pre_step_quiet_seconds,
+            )
+            if self.stop_event.wait(self.micro_step_pre_step_quiet_seconds):
+                with self._cv:
+                    self._executing_token = None
+                    callbacks = self._pop_locked(token)
+                    self._cv.notify_all()
+                self._notify_buff_completion(callbacks, False)
+                return
 
         # The grace wait can overlap a movement transition.  Recheck the safe
         # stage immediately before injecting the key; a buff remains queued
@@ -578,7 +696,8 @@ class MotionArbiter(threading.Thread):
                 if token.startswith("buff:"):
                     self._cv.notify_all()
                     return
-                if token.startswith(f"{FACING}:"):
+                if (token.startswith(f"{FACING}:")
+                        or token.startswith(f"{STEP}:")):
                     LOG.info(
                         "motion arbiter dropped %s: the safe-stage gate shut "
                         "during the attack grace; movement will re-request",
@@ -666,22 +785,33 @@ class MotionArbiter(threading.Thread):
             else:
                 LOG.warning("motion arbiter %s NOT delivered; event drained", token)
             return
-        elif token.startswith(f"{FACING}:"):
+        elif (token.startswith(f"{FACING}:")
+                or token.startswith(f"{STEP}:")):
+            # Both are MovementWorker's atomic one-direction actions and both
+            # take the direction as their argument, so they share one branch:
+            # the facing tap turns the character after a recovery, the 站桩
+            # correction holds a direction and then taps the attack that
+            # belongs to it (the step-plus-attack combination).
+            is_step = token.startswith(f"{STEP}:")
             with self._cv:
-                callback = self._facing_callback
+                callback = (self._step_callback if is_step
+                            else self._facing_callback)
+            label = "anchor correction" if is_step else "facing correction"
             if not callable(callback):
                 with self._cv:
                     callbacks = self._pop_locked(token)
                     self._executing_token = None
                     self._cv.notify_all()
                 self._notify_buff_completion(callbacks, False)
-                LOG.warning("motion arbiter dropped facing correction: movement unavailable")
+                LOG.warning(
+                    "motion arbiter dropped %s: movement unavailable", label
+                )
                 return
             direction = token.partition(":")[2]
             try:
                 tap_ok = callback(direction) is not False
             except Exception:
-                LOG.exception("motion arbiter facing correction failed")
+                LOG.exception("motion arbiter %s failed", label)
                 tap_ok = False
             with self._cv:
                 self._pop_locked(token)
@@ -690,10 +820,12 @@ class MotionArbiter(threading.Thread):
                     self._busy_until = time.monotonic() + self._duration_for(token)
                 self._cv.notify_all()
             if tap_ok:
-                LOG.info("motion arbiter executed facing:%s", direction)
+                LOG.info("motion arbiter executed %s", token)
                 self.stop_event.wait(self._duration_for(token))
             else:
-                LOG.warning("motion arbiter facing correction NOT delivered; event drained")
+                LOG.warning(
+                    "motion arbiter %s NOT delivered; event drained", label
+                )
             return
         else:
             key = token.partition(":")[2]
@@ -705,9 +837,9 @@ class MotionArbiter(threading.Thread):
                 with self._cv:
                     callback = self._buff_callback
             if callable(callback):
-                tap_ok = callback(key) is not False
+                tap_ok = callback(key, self.buff_tap_hold_seconds) is not False
             else:
-                tap_ok = self.key_sender.tap(key) is not False
+                tap_ok = self.key_sender.tap(key, hold_seconds=self.buff_tap_hold_seconds) is not False
         except Exception:
             LOG.exception("motion arbiter tap failed key=%s", key)
         if tap_ok:

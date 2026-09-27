@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -20,8 +21,10 @@ import tempfile
 import threading
 import time
 from typing import Any, Optional
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from pinned_tls import PinnedTlsError, post_json
+
+
+SERVER_LOG = logging.getLogger("server-client")
 
 try:
     from cryptography.exceptions import InvalidSignature
@@ -40,6 +43,8 @@ ACTIVATION_PREFIX = "MA1-"
 DEVICE_REQUEST_PREFIX = "MADR1-"
 PUBLIC_KEY_FILE = "license_public_key.json"
 LICENSE_FILE = "license.json"
+ACTIVATION_SERVER_ENDPOINT = "https://211.149.169.194:8443"
+ACTIVATION_SERVER_PIN_FILE = "activation_server_pin.json"
 EDITION_NORMAL = "normal"
 EDITION_NP = "np"
 _FINGERPRINT_CACHE_SECONDS = 300.0
@@ -151,6 +156,18 @@ def device_request_code() -> str:
     return DEVICE_REQUEST_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def machine_fingerprint_hash() -> str:
+    """Return the opaque, stable fingerprint sent to the fixed activation server."""
+
+    components = machine_fingerprint_components()
+    if len(components) < 2:
+        raise ValueError("无法读取足够的设备信息，请以管理员身份重新启动助手。")
+    material = json.dumps(components, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(
+        f"MapleAssistant-online-fingerprint/v1\\0{material}".encode("ascii")
+    ).hexdigest()
+
+
 def machine_binding_from_request(code: str) -> dict[str, Any]:
     """Validate an operator-supplied device request for inclusion in a license."""
 
@@ -228,17 +245,25 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
         return LicenseStatus(False, "signature", "授权签名无效。")
     except ValueError as exc:
         return LicenseStatus(False, "key", str(exc))
-    if payload.get("format") != LICENSE_FORMAT:
+    document_format = payload.get("format")
+    if document_format not in {LICENSE_FORMAT, "maple-assistant-license/v2"}:
         return LicenseStatus(False, "format", "授权文件版本不受支持。")
     license_id = str(payload.get("license_id", "")).strip()
     edition = str(payload.get("edition", "")).strip().casefold()
     if not license_id or edition not in (EDITION_NORMAL, EDITION_NP):
         return LicenseStatus(False, "fields", "授权文件内容不完整。")
-    machine_status = _machine_binding_status(payload.get("machine_binding"))
-    if machine_status is not None:
-        return LicenseStatus(
-            False, machine_status.code, machine_status.message, license_id, edition
-        )
+    if document_format == "maple-assistant-license/v2":
+        try:
+            if payload.get("fingerprint_hash") != machine_fingerprint_hash():
+                return LicenseStatus(False, "machine", "此授权码仅适用于另一台设备。", license_id, edition)
+        except ValueError as exc:
+            return LicenseStatus(False, "machine", str(exc), license_id, edition)
+    else:
+        machine_status = _machine_binding_status(payload.get("machine_binding"))
+        if machine_status is not None:
+            return LicenseStatus(
+                False, machine_status.code, machine_status.message, license_id, edition
+            )
     permanent = bool(payload.get("permanent", False))
     expires_at = payload.get("expires_at")
     if not permanent:
@@ -325,32 +350,38 @@ def _persist_document(document: dict[str, Any], status: LicenseStatus, root: Opt
 
 
 def activate_via_server(
-    code: str, endpoint: str, root: Optional[Path] = None,
-    *, edition: str = EDITION_NORMAL,
+    code: str, root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
 ) -> LicenseStatus:
-    """Activate a short server-issued code and store its signed response locally.
-
-    The protocol is deliberately tiny so the local emulator and a later HTTPS
-    service can share it: the client submits its hashed device request and
-    receives only a signed license document.
-    """
+    """Activate against the built-in, certificate-pinned licensing endpoint."""
 
     try:
-        request_payload = json.dumps({
-            "code": "".join(str(code).split()),
-            "device_request": device_request_code(),
-        }).encode("utf-8")
-        url = endpoint.rstrip("/") + "/v1/activate"
-        request = Request(url, data=request_payload, method="POST", headers={"Content-Type": "application/json"})
-        with urlopen(request, timeout=10) as response:
-            answer = json.loads(response.read().decode("utf-8"))
+        SERVER_LOG.info("activation requested edition=%s", edition.casefold())
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/activate",
+            {
+                "activation_code": "".join(str(code).upper().split()),
+                "fingerprint": machine_fingerprint_hash(),
+                "edition": edition.casefold(),
+            },
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
         document = answer["license"]
-    except (ValueError, KeyError, OSError, URLError, json.JSONDecodeError) as exc:
+    except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("activation failed category=%s", type(exc).__name__)
         return LicenseStatus(False, "server", f"授权服务器不可用：{exc}")
     status = _parse_document(document, root)
     if status.valid and status.edition != edition.casefold():
         status = LicenseStatus(False, "edition", "此授权不适用于当前版本。", status.license_id, status.edition)
-    return _persist_document(document, status, root) if status.valid else status
+    if not status.valid:
+        SERVER_LOG.warning("activation response rejected category=%s", status.code)
+        return status
+    persisted = _persist_document(document, status, root)
+    if persisted.valid:
+        SERVER_LOG.info("activation accepted license_id=%s edition=%s", persisted.license_id, persisted.edition)
+    else:
+        SERVER_LOG.warning("activation could not be saved category=%s", persisted.code)
+    return persisted
 
 
 __all__ = [

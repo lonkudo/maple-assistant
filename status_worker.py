@@ -39,6 +39,7 @@ INPUT_NOT_ENABLED_REASON = (
 # also the only event that can be "sent" and still do nothing in the game, so it
 # is verified at both ends of the hold and retried a bounded number of times.
 _ACTION_TAP_HOLD_SECONDS = 0.045
+_BUFF_TAP_HOLD_SECONDS = 0.200
 _ACTION_TAP_ATTEMPTS = 3
 _ACTION_TAP_RETRY_SECONDS = 0.06
 # One delivery warning per interval, so a stolen focus cannot flood the log.
@@ -68,7 +69,7 @@ BINDABLE_KEYS = frozenset({
 class KeySender(Protocol):
     """Small interface shared by the movement and status workers."""
 
-    def tap(self, key: str) -> bool:
+    def tap(self, key: str, *, hold_seconds: Optional[float] = None) -> bool:
         """Tap *key*, returning True only when it was sent (or dry-run logged)."""
 
 
@@ -1001,7 +1002,9 @@ class WindowKeySender:
         with self._key_state_lock:
             return self._key_owners.get(key.casefold(), 0) > 0
 
-    def tap(self, key: str, *, owner: str = "") -> bool:
+    def tap(
+        self, key: str, *, owner: str = "", hold_seconds: Optional[float] = None,
+    ) -> bool:
         """Tap an ACTION key (jump/buff) and verify the game got it.
 
         ``owner`` follows the same rule as :meth:`press`: while another owner holds the keyboard
@@ -1045,7 +1048,7 @@ class WindowKeySender:
                 if attempt < _ACTION_TAP_ATTEMPTS:
                     time.sleep(_ACTION_TAP_RETRY_SECONDS)
                 continue
-            if self._tap_verified(key, owner=owner):
+            if self._tap_verified(key, owner=owner, hold_seconds=hold_seconds):
                 return True
             if attempt < _ACTION_TAP_ATTEMPTS:
                 time.sleep(_ACTION_TAP_RETRY_SECONDS)
@@ -1055,7 +1058,9 @@ class WindowKeySender:
         )
         return False
 
-    def _tap_verified(self, key: str, *, owner: str = "") -> bool:
+    def _tap_verified(
+        self, key: str, *, owner: str = "", hold_seconds: Optional[float] = None,
+    ) -> bool:
         """One down/hold/up with a focus check at both ends (see :meth:`tap`)."""
 
         started = time.monotonic()
@@ -1066,19 +1071,22 @@ class WindowKeySender:
         if own_ctrl:
             self._begin_ctrl_chord()
         try:
-            return self._tap_verified_inner(key, owner=owner, started=started)
+            return self._tap_verified_inner(
+                key, owner=owner, started=started, hold_seconds=hold_seconds,
+            )
         finally:
             if own_ctrl:
                 self._end_ctrl_chord()
 
     def _tap_verified_inner(
-        self, key: str, *, owner: str, started: float
+        self, key: str, *, owner: str, started: float, hold_seconds: Optional[float]
     ) -> bool:
         if not self.key_down(key, owner=owner):
             return False
         owned_at_release = True
         try:
-            time.sleep(_ACTION_TAP_HOLD_SECONDS)
+            duration = _ACTION_TAP_HOLD_SECONDS if hold_seconds is None else float(hold_seconds)
+            time.sleep(float(np.clip(duration, 0.01, 1.0)))
             # The release must land in the game too: a key-up that goes to a
             # window which stole the focus leaves the game holding the key.
             owned_at_release = bool(self.dry_run or self._foreground_matches())
@@ -1805,7 +1813,7 @@ class StatusWorker(threading.Thread):
                 # 宠物食品 is a periodic drug, not an action buff.  It is
                 # intentionally sent directly and never pauses patrol or
                 # joins MotionArbiter's directional handoff.
-                if self.key_sender.tap(key):
+                if self.key_sender.tap(key, hold_seconds=_BUFF_TAP_HOLD_SECONDS):
                     with self._buff_timer_lock:
                         self._last_buff[name] = time.monotonic()
                     LOG.warning("宠物食品 refresh: used %s (every %.0fs)",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import collections
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import queue
@@ -91,10 +91,10 @@ _INITIAL_WINDOW_HEIGHT = 560
 _LEFT_COLUMN_WIDTH = 500
 _RIGHT_COLUMN_WIDTH = 540
 _LAYER_AXIS_WIDTH = 430
-_LAYER_AXIS_HEIGHT = 52
+_LAYER_AXIS_HEIGHT = 38
 _LAYER_AXIS_LEFT = 8
 _LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH - 8
-_LAYER_AXIS_Y = 36
+_LAYER_AXIS_Y = 28
 # Both columns are FIXED at 500px (500 + 500 + 12px gap + 24px padding).
 # The default height is deliberately compact; users can still enlarge it and
 # their saved window size is never overwritten.
@@ -439,7 +439,8 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
 
     ``archive`` = a document sheet (copy the running log); ``user`` = a
     person silhouette (copy the user settings); ``error`` = an alert
-    triangle with "!" (copy the root error.log).  Drawn with PIL so the
+    triangle with "!" (copy the root error.log); ``server`` = a compact
+    linked-node glyph (copy server_client.log). Drawn with PIL so the
     glyphs render identically on every Windows theme/font set.
     """
 
@@ -463,6 +464,12 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
         draw.polygon(((8, 1), (15, 14), (1, 14)), fill=paper, outline=ink)
         draw.line((8, 5, 8, 10), fill=ink)
         draw.point((8, 12), fill=ink)
+    elif kind == "server":
+        draw.rounded_rectangle((1, 5, 7, 11), radius=1, fill=paper, outline=ink)
+        draw.rounded_rectangle((9, 2, 15, 8), radius=1, fill=paper, outline=ink)
+        draw.line((7, 7, 9, 5), fill=ink)
+        draw.point((3, 8), fill=ink)
+        draw.point((11, 5), fill=ink)
     else:
         raise ValueError(f"unknown log icon kind: {kind!r}")
     # The UI is built on an explicit Tk root.  Letting ImageTk choose the
@@ -722,6 +729,14 @@ class UiWorker(threading.Thread):
     _FIXED_RANDOM_GAP_MAX = 30.0
     _FIXED_ATTACK_INTERVAL_MAX = 30.0
     _OPTIONAL_MOTION_INTERVAL_MAX = 60.0
+    # 捡东西 (the stand-still pickup circuit) is deliberately configured in
+    # MINUTES: the operator reads and sets that row in "m", and its trigger
+    # range is 2.0m .. 30.0m.  The configuration and the movement worker keep
+    # their seconds-scale keys, so this row converts both ways (x60 when it
+    # publishes, /60 when it loads).
+    _STATIONARY_PICKUP_INTERVAL_MIN_MINUTES = 2.0
+    _STATIONARY_PICKUP_INTERVAL_MAX_MINUTES = 30.0
+    _STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES = 15.0
     _ATTACK_TIMING_SLIDER_LENGTH = 112
     # A DOUBLE click on a 随机 −/+ button moves the gap by this much in one go
     # (five seconds instead of 0.1), while a single click keeps the precise fine
@@ -1097,11 +1112,11 @@ class UiWorker(threading.Thread):
             action_row = ttk.Frame(controls)
             action_row.pack(fill="x", pady=(0, 8))
             self._start_patrol_button = ttk.Button(
-                action_row, text="开始巡逻", width=7, command=self._start_patrol
+                action_row, text="开始运行", width=7, command=self._start_patrol
             )
             self._start_patrol_button.pack(side="left", padx=(0, 4))
             self._stop_patrol_button = ttk.Button(
-                action_row, text="停止巡逻", width=7, command=self._stop_patrol
+                action_row, text="停止运行", width=7, command=self._stop_patrol
             )
             self._stop_patrol_button.pack(side="left", padx=(0, 4))
             self._add_layer_button = ttk.Button(
@@ -1510,6 +1525,69 @@ class UiWorker(threading.Thread):
             stationary_facing_controls.append(facing_both)
             self._stationary_facing_controls = stationary_facing_controls
             stationary_facing_row.pack(fill="x", pady=(2, 0))
+
+            pickup_row = ttk.Frame(fixed_panel)
+            pickup_row.pack(fill="x", pady=(2, 0))
+            self._stationary_pickup_enabled_var = tk.BooleanVar(value=False)
+            pickup_enabled = ttk.Checkbutton(
+                pickup_row, text="捡东西", width=5,
+                variable=self._stationary_pickup_enabled_var,
+                command=self._fixed_on_change,
+            )
+            pickup_enabled.pack(side="left", padx=(0, 4))
+            pickup_interval_group = ttk.Frame(pickup_row)
+            pickup_interval_group.pack(side="right")
+            ttk.Label(pickup_interval_group, text="每").pack(side="left")
+            self._stationary_pickup_interval_var = tk.DoubleVar(
+                value=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES
+            )
+            pickup_slider = ttk.Scale(
+                pickup_interval_group,
+                from_=self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES,
+                to=self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
+                orient="horizontal", variable=self._stationary_pickup_interval_var,
+                length=self._ATTACK_TIMING_SLIDER_LENGTH,
+                command=self._fixed_on_change,
+            )
+            pickup_slider.pack(side="left", padx=(0, 2))
+            self._stationary_pickup_interval_label = ttk.Label(
+                pickup_interval_group, text="15.0m", width=5
+            )
+            self._stationary_pickup_interval_label.pack(side="left", padx=(0, 2))
+            self._stationary_pickup_interval_range_label = ttk.Label(
+                pickup_interval_group, text="(15.0m, 15.0m)", width=14, anchor="w"
+            )
+            self._stationary_pickup_interval_range_label.pack(side="left")
+            pickup_random_group = ttk.Frame(pickup_row)
+            pickup_random_group.pack(side="right", padx=(0, 4))
+            self._stationary_pickup_gap_var = tk.DoubleVar(value=0.1)
+            pickup_gap_minus = ttk.Button(pickup_random_group, text="−", width=2)
+            self._bind_repeat_step_button(
+                pickup_gap_minus, lambda: self._stationary_pickup_adjust_gap(-0.1),
+                current=self._stationary_pickup_gap_seconds,
+                coarse=lambda anchor: self._set_stationary_pickup_gap(
+                    (self._stationary_pickup_gap_seconds() if anchor is None else anchor)
+                    - self._RANDOM_GAP_COARSE_STEP
+                ),
+            )
+            pickup_gap_minus.pack(side="left", padx=(0, 1))
+            self._stationary_pickup_gap_label = ttk.Label(
+                pickup_random_group, text="0.1s", width=5, anchor="center"
+            )
+            self._stationary_pickup_gap_label.pack(side="left")
+            pickup_gap_plus = ttk.Button(pickup_random_group, text="+", width=2)
+            self._bind_repeat_step_button(
+                pickup_gap_plus, lambda: self._stationary_pickup_adjust_gap(0.1),
+                current=self._stationary_pickup_gap_seconds,
+                coarse=lambda anchor: self._set_stationary_pickup_gap(
+                    (self._stationary_pickup_gap_seconds() if anchor is None else anchor)
+                    + self._RANDOM_GAP_COARSE_STEP
+                ),
+            )
+            pickup_gap_plus.pack(side="left", padx=(1, 0))
+            self._stationary_pickup_controls = [
+                pickup_enabled, pickup_slider, pickup_gap_minus, pickup_gap_plus,
+            ]
 
             step_row = ttk.Frame(fixed_panel)
             step_row.pack(fill="x", pady=(4, 0))
@@ -2056,6 +2134,14 @@ class UiWorker(threading.Thread):
             self._reconnect_channel_box.bind(
                 "<FocusOut>", lambda _event: self._reconnect_on_change()
             )
+            # Clicking a plain label/panel does not necessarily give Tk a
+            # different focus owner, so Spinbox <FocusOut> alone never fires.
+            # Watch root clicks as well and explicitly commit/blur this one
+            # field when the click lands outside it.
+            root.bind_all(
+                "<Button-1>", self._reconnect_channel_commit_on_outside_click,
+                add="+",
+            )
             # The shared hint area lives at the BOTTOM of the panel (see below); its two lines are
             # created here so the rows above stay a single compact line each.
             self._reconnect_status = ttk.Label(
@@ -2174,6 +2260,14 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._copy_error_button.pack(side="left", padx=(0, 3))
+            self._log_server_photo = _make_log_icon("server", root)
+            self._copy_server_log_button = ttk.Button(
+                log_actions,
+                image=self._log_server_photo,
+                command=self._copy_server_client_log,
+                takefocus=False,
+            )
+            self._copy_server_log_button.pack(side="left", padx=(0, 3))
             self._import_config_button.pack(side="left", padx=(0, 3))
             self._export_config_button.pack(side="left")
             self._log_display_lines: list[str] = []
@@ -2836,7 +2930,9 @@ class UiWorker(threading.Thread):
         label = getattr(self, "_license_label", None)
         if label is not None:
             if status.valid:
-                expiry = "永久" if status.expires_at is None else status.expires_at
+                expiry = "永久" if status.expires_at is None else self._format_license_expiry(
+                    status.expires_at
+                )
                 label.configure(
                     text=f"授权有效 · {status.edition.upper()} · 到期：{expiry}"
                 )
@@ -2845,6 +2941,19 @@ class UiWorker(threading.Thread):
         button = getattr(self, "_license_button", None)
         if button is not None:
             button.configure(text="更换授权" if status.valid else "激活授权")
+
+    @staticmethod
+    def _format_license_expiry(value: str) -> str:
+        """Display license expiry in the operator's local GMT+8 format."""
+
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            local = parsed.astimezone(timezone(timedelta(hours=8)))
+            return local.strftime("%Y-%m-%d %H-%M (GMT+8)")
+        except (TypeError, ValueError):
+            return str(value)
 
     def _set_license_visual_lock(self, locked: bool) -> None:
         """Grey every product control while retaining the activation button."""
@@ -2888,7 +2997,7 @@ class UiWorker(threading.Thread):
             self._quick_message_status.configure(text=text)
 
     def _activate_license(self) -> None:
-        """Accept a pasted offline signed activation token from the operator."""
+        """Accept a customer activation code for the built-in licensing service."""
 
         try:
             from tkinter import simpledialog
@@ -2901,13 +3010,7 @@ class UiWorker(threading.Thread):
         if not code:
             return
         if str(code).strip().upper().startswith("MAL-"):
-            endpoint = simpledialog.askstring(
-                "授权服务器", "请输入授权服务器地址：",
-                initialvalue="http://127.0.0.1:8765", parent=self._root,
-            )
-            if not endpoint:
-                return
-            self._license_status = activate_via_server(code, endpoint)
+            self._license_status = activate_via_server(code)
         else:
             self._license_status = activate_license(code)
         self._refresh_license_ui()
@@ -3139,10 +3242,41 @@ class UiWorker(threading.Thread):
             return False
         return CHANNEL_MIN <= int(text) <= CHANNEL_MAX
 
+    def _reconnect_channel_commit_on_outside_click(self, event: Any) -> None:
+        """Commit the channel when a click leaves its Spinbox without focus.
+
+        Labels, panels, and canvas-like areas generally do not claim keyboard
+        focus in Tk.  Without this explicit blur, clicking those areas left a
+        partially edited channel in the Spinbox and never wrote it to the
+        user configuration.
+        """
+
+        box = getattr(self, "_reconnect_channel_box", None)
+        root = getattr(self, "_root", None)
+        if box is None or root is None:
+            return
+        try:
+            if event.widget is box or root.focus_get() is not box:
+                return
+            # The click is outside the field.  Release the text selection and
+            # move focus to the toplevel so the native <FocusOut> semantics
+            # are also preserved for other Tk bindings.
+            box.selection_clear()
+            root.focus_set()
+            self._reconnect_on_change()
+        except Exception:
+            LOG.debug("auto reconnect channel outside-click commit failed", exc_info=True)
+
     def _reconnect_on_change(self) -> None:
         """Apply the 自动重连 selection (enable + world + channel) to its worker."""
 
-        if not self._license_allowed():
+        # Changing or blurring a settings field must not perform a fresh
+        # license-file read.  The startup/activation result is the session's
+        # authorization gate; a transient file read here used to turn an
+        # already-authorized UI into a false 未授权 state while committing the
+        # reconnect channel.
+        if not bool(getattr(self, "_license_status", None)
+                    and self._license_status.valid):
             if hasattr(self, "_reconnect_var"):
                 self._reconnect_var.set(False)
             if self.reconnect_worker is not None:
@@ -4228,6 +4362,8 @@ class UiWorker(threading.Thread):
         for button in (
             self._copy_log_button, getattr(self, "_import_config_button", None),
             getattr(self, "_export_config_button", None),
+            getattr(self, "_copy_error_button", None),
+            getattr(self, "_copy_server_log_button", None),
         ):
             if button is None:
                 continue
@@ -4275,6 +4411,21 @@ class UiWorker(threading.Thread):
             text = "(error.log 为空或不存在)"
         self._copy_to_clipboard(text)
         LOG.info("error.log 已复制到剪贴板（%d 行）", text.count("\n") + 1)
+
+    def _copy_server_client_log(self) -> None:
+        """Linked-nodes button: copy the safe server-client interaction log."""
+
+        path = Path(__file__).resolve().parent / "server_client.log"
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            text = ""
+        else:
+            text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            text = "(server_client.log 为空或不存在)"
+        self._copy_to_clipboard(text)
+        LOG.info("server_client.log 已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
     def _import_user_config(self) -> None:
         """Choose a saved user_config.json, load it, and restart to apply it.
@@ -4498,7 +4649,7 @@ class UiWorker(threading.Thread):
                 world_y=snapshot.world_y_diamonds,
                 tracking_confidence=snapshot.structure_confidence,
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             LOG.warning("record rejected: layer=%s point=%s error=%s",
                         self.patrol_controller.selected_layer(), boundary, exc)
             self._control_status.configure(text=f"无法录制: {exc}")
@@ -4543,7 +4694,7 @@ class UiWorker(threading.Thread):
                 snapshot.player_x, snapshot.player_y, direction=direction,
                 layout=snapshot.coordinate_layout,
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self._control_status.configure(text=f"无法录制{label}: {exc}")
             return False
         self._control_status.configure(
@@ -4562,6 +4713,11 @@ class UiWorker(threading.Thread):
         if self.patrol_controller is None or self.patrol_controller.is_enabled():
             self._control_status.configure(text="巡逻中无法删除录制点，请先停止巡逻。")
             return
+        # A canvas redraw does not reliably emit <Leave> for an item removed
+        # beneath a stationary pointer.  Close the hover popup *before* the
+        # backing recording is deleted so its former coordinate can never
+        # remain as a stale floating hint.
+        self._hide_layer_axis_hint()
         try:
             if point_kind == "jump_point":
                 point = self.patrol_controller.snapshot().layers.get(layer_name, {}).get(
@@ -4629,43 +4785,53 @@ class UiWorker(threading.Thread):
     def _layer_axis_point_text(label: str, point: Any) -> str:
         return f"{label} ({float(point['x']):.4f}, {float(point['y']):.4f})"
 
-    @staticmethod
-    def _hide_layer_axis_hint(canvas: Any) -> None:
-        # A canvas may have been removed by a layer refresh between pointer
-        # enter/leave events.  Hover feedback is cosmetic and must never be
-        # allowed to propagate Tcl's "invalid command name" into the UI loop.
+    def _hide_layer_axis_hint(self, _canvas: Any = None) -> None:
+        """Destroy the out-of-canvas layer-axis coordinate popup safely."""
+
+        # Drawing the hint *inside* the canvas let its rectangle cover a rope
+        # or jump arrow at the same X. Tk then emitted Enter/Leave in a tight
+        # loop (hint appears -> marker leaves -> hint disappears -> marker
+        # re-enters). Keep it in its own non-focus popup instead.
+        popup = getattr(self, "_layer_axis_hint_popup", None)
+        self._layer_axis_hint_popup = None
         try:
-            if bool(canvas.winfo_exists()):
-                canvas.delete("axis_hint")
+            if popup is not None and bool(popup.winfo_exists()):
+                popup.destroy()
         except Exception:
             return
 
-    def _show_layer_axis_hint(self, canvas: Any, text: str, x: int) -> None:
-        """Show one short-lived coordinate hint above the hovered bar."""
+    def _show_layer_axis_hint(self, event: Any, canvas: Any, text: str) -> None:
+        """Show a non-overlapping coordinate hint for one layer-axis marker."""
 
         try:
             if not bool(canvas.winfo_exists()):
                 return
-            self._hide_layer_axis_hint(canvas)
-            label = canvas.create_text(
-                x, 4, text=text, anchor="n", fill="#1d1d1d",
-                tags=("axis_hint",),
+            self._hide_layer_axis_hint()
+            popup = self._tk.Toplevel(self._root)
+            popup.overrideredirect(True)
+            try:
+                popup.attributes("-topmost", True)
+            except Exception:
+                pass
+            label = self._ttk.Label(
+                popup, text=text, padding=(4, 2), relief="solid",
             )
-            bounds = canvas.bbox(label)
-            if bounds is not None:
-                left, top, right, bottom = bounds
-                background = canvas.create_rectangle(
-                    left - 3, top - 2, right + 3, bottom + 2,
-                    fill="#fff6bf", outline="#b49825", tags=("axis_hint",),
-                )
-                canvas.tag_lower(background, label)
+            label.pack()
+            popup.update_idletasks()
+            # Place it clear of the canvas item beneath the pointer. It does
+            # not claim focus and therefore cannot generate a second marker
+            # Enter/Leave sequence when rope and jump share an X coordinate.
+            width = max(1, int(popup.winfo_reqwidth()))
+            popup.geometry(
+                f"+{int(event.x_root) - width // 2}+{int(event.y_root) - 28}"
+            )
+            self._layer_axis_hint_popup = popup
         except Exception:
-            # The pointer can leave while Tk is rebuilding this layer row;
-            # losing a hover hint is preferable to destabilising the window.
+            self._hide_layer_axis_hint()
             LOG.debug("layer-axis hover hint unavailable", exc_info=True)
 
     def _draw_layer_axis(self, layer_name: str, layer: Any) -> None:
-        """Draw a fixed 0..1 X-axis with concise colour-coded point bars."""
+        """Draw the layer axis with the same marker grammar as the blinker."""
 
         canvas = self._layer_axis_canvases.get(layer_name)
         if canvas is None:
@@ -4691,7 +4857,18 @@ class UiWorker(threading.Thread):
                     direction = str(point.get("direction", "")).casefold()
                     label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
                     entries.append(("jump_point", point, label, index))
-        entries.sort(key=lambda item: float(item[1].get("x", 0.0)))
+        def _axis_x(entry: tuple[str, Any, str, Optional[int]]) -> float:
+            try:
+                return float(entry[1].get("x", 0.0))
+            except (AttributeError, TypeError, ValueError):
+                # Keep malformed legacy entries visible only as safely as
+                # possible; a new recording must never crash the UI because
+                # an unrelated saved point has an invalid coordinate.
+                return 0.0
+
+        # This is display-only sorting.  The retained source index is used by
+        # the double-click delete handler, while JSON remains append-order.
+        entries.sort(key=_axis_x)
         colors = {
             "left_most_pos": "#1479d1",
             "right_most_pos": "#1479d1",
@@ -4706,17 +4883,40 @@ class UiWorker(threading.Thread):
             x = left + round((right - left) * x_value)
             text = self._layer_axis_point_text(label, point)
             tag = f"axis:{layer_name}:{kind}:{'' if index is None else index}"
-            # Blue = endpoints, yellow = rope, green = jump point.  The
-            # coordinate text stays out of the fixed layout and floats only
-            # while the operator hovers this concise marker.
-            canvas.create_rectangle(
-                x - 2, axis_y - 12, x + 2, axis_y + 1,
-                fill=colors[kind], outline="", tags=(tag,),
-            )
+            # The axis mirrors the native blinker grammar: endpoint bars, a
+            # vertical rope arrow, and thin 45-degree directional jump arrows.
+            # One Tk canvas paints the complete layer atomically.
+            if kind in ("left_most_pos", "right_most_pos"):
+                canvas.create_rectangle(
+                    x - 2, axis_y - 12, x + 2, axis_y + 1,
+                    fill=colors[kind], outline="", tags=(tag,),
+                )
+            elif kind == "rope_pos":
+                canvas.create_line(x, axis_y - 2, x, axis_y - 15,
+                                   x - 6, axis_y - 9, tags=(tag,),
+                                   fill=colors[kind], width=1)
+                canvas.create_line(x, axis_y - 15, x + 6, axis_y - 9,
+                                   tags=(tag,), fill=colors[kind], width=1)
+            else:
+                direction = str(point.get("direction", "")).casefold()
+                if direction == "left":
+                    canvas.create_line(x + 5, axis_y - 6, x - 4, axis_y - 15,
+                                       tags=(tag,), fill=colors[kind], width=1)
+                    canvas.create_line(x - 4, axis_y - 15, x, axis_y - 15,
+                                       tags=(tag,), fill=colors[kind], width=1)
+                    canvas.create_line(x - 4, axis_y - 15, x - 4, axis_y - 11,
+                                       tags=(tag,), fill=colors[kind], width=1)
+                else:
+                    canvas.create_line(x - 5, axis_y - 6, x + 4, axis_y - 15,
+                                       tags=(tag,), fill=colors[kind], width=1)
+                    canvas.create_line(x + 4, axis_y - 15, x, axis_y - 15,
+                                       tags=(tag,), fill=colors[kind], width=1)
+                    canvas.create_line(x + 4, axis_y - 15, x + 4, axis_y - 11,
+                                       tags=(tag,), fill=colors[kind], width=1)
             canvas.tag_bind(
                 tag, "<Enter>",
-                lambda _event, canvas=canvas, text=text, x=x:
-                self._show_layer_axis_hint(canvas, text, x),
+                lambda event, canvas=canvas, text=text:
+                self._show_layer_axis_hint(event, canvas, text),
             )
             canvas.tag_bind(
                 tag, "<Leave>",
@@ -4727,6 +4927,28 @@ class UiWorker(threading.Thread):
                 lambda _event, layer_name=layer_name, kind=kind, index=index:
                 self._delete_recorded_axis_point(layer_name, kind, index),
             )
+        # The temporary 站桩 anchor is not recording data and therefore has
+        # no delete/click action.  When its current location successfully
+        # matches a usable route layer, paint a quiet X on that layer's axis.
+        mover = getattr(self, "movement_worker", None)
+        marker_getter = getattr(mover, "stationary_route_anchor_marker", None)
+        marker = marker_getter() if callable(marker_getter) else None
+        if marker is not None and marker[0] == layer_name:
+            try:
+                x_value = max(0.0, min(1.0, float(marker[1].x)))
+                x = left + round((right - left) * x_value)
+                facing = str(marker[2] if len(marker) > 2 else "right").casefold()
+                marker_text = {
+                    "left": "<",
+                    "right": ">",
+                    "both": "<>",
+                }.get(facing, ">")
+                canvas.create_text(
+                    x, axis_y - 10, text=marker_text,
+                    fill="#cc2222", font=("TkDefaultFont", 9, "bold"),
+                )
+            except (AttributeError, TypeError, ValueError):
+                LOG.debug("stationary route axis marker unavailable", exc_info=True)
 
     def _layer_axis_click(self, event: Any, layer_name: str) -> None:
         """A single axis click opens its four recording choices."""
@@ -4832,6 +5054,14 @@ class UiWorker(threading.Thread):
                 getattr(self, "_stationary_facing_direction_var", None).get()
                 if hasattr(self, "_stationary_facing_direction_var") else "right"
             ),
+            "stationary_pickup_enabled": bool(
+                getattr(self, "_stationary_pickup_enabled_var", None).get()
+                if hasattr(self, "_stationary_pickup_enabled_var") else False
+            ),
+            "stationary_pickup_interval_seconds": round(
+                self._stationary_pickup_interval_minutes() * 60.0, 1
+            ),
+            "stationary_pickup_gap_seconds": self._stationary_pickup_gap_seconds(),
         }
 
     def _fixed_random_gap_seconds(self) -> float:
@@ -5007,6 +5237,35 @@ class UiWorker(threading.Thread):
             self._small_step_gap_seconds() + (step if delta > 0 else -step)
         )
 
+    def _stationary_pickup_interval_minutes(self) -> float:
+        """Return the 捡东西 trigger interval in MINUTES (this row's unit)."""
+
+        var = getattr(self, "_stationary_pickup_interval_var", None)
+        raw = (self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES
+               if var is None else float(var.get()))
+        return round(min(
+            self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
+            max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES, raw),
+        ), 1)
+
+    def _stationary_pickup_gap_seconds(self) -> float:
+        var = getattr(self, "_stationary_pickup_gap_var", None)
+        raw = 0.1 if var is None else float(var.get())
+        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+
+    def _set_stationary_pickup_gap(self, value: Optional[float]) -> None:
+        base = self._stationary_pickup_gap_seconds() if value is None else value
+        self._stationary_pickup_gap_var.set(round(
+            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
+        ))
+        self._fixed_on_change()
+
+    def _stationary_pickup_adjust_gap(self, delta: float) -> None:
+        step = abs(delta) or self._FIXED_RANDOM_GAP_STEP
+        self._set_stationary_pickup_gap(
+            self._stationary_pickup_gap_seconds() + (step if delta > 0 else -step)
+        )
+
     def _hotkey_adjust_fixed_interval(self, delta: float) -> bool:
         """Apply one held Ctrl+[ / Ctrl+] fixed-attack interval step."""
 
@@ -5049,6 +5308,7 @@ class UiWorker(threading.Thread):
         for widget in [
             stationary_jump_button,
             *getattr(self, "_stationary_facing_controls", []),
+            *getattr(self, "_stationary_pickup_controls", []),
         ]:
             if widget is None:
                 continue
@@ -5109,6 +5369,18 @@ class UiWorker(threading.Thread):
                 self._small_step_interval_range_label.configure(
                     text=f"({step_interval:.1f}s, {step_interval + step_gap:.1f}s)"
                 )
+        if hasattr(self, "_stationary_pickup_interval_var"):
+            pickup_interval = self._stationary_pickup_interval_minutes()
+            self._stationary_pickup_interval_var.set(pickup_interval)
+            self._stationary_pickup_interval_label.configure(
+                text=f"{pickup_interval:.1f}m"
+            )
+            pickup_gap = self._stationary_pickup_gap_seconds()
+            self._stationary_pickup_gap_label.configure(text=f"{pickup_gap:.1f}s")
+            self._stationary_pickup_interval_range_label.configure(
+                text=f"({pickup_interval:.1f}m, "
+                     f"{pickup_interval + pickup_gap / 60.0:.1f}m)"
+            )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
@@ -5196,6 +5468,16 @@ class UiWorker(threading.Thread):
                 mover.stationary_facing_direction = (
                     direction if direction in ("left", "right", "both") else "right"
                 )
+            pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
+            if callable(pickup_setter):
+                # The worker and the configuration keep seconds; the 捡东西 row
+                # is the only place the interval is read as minutes.
+                pickup_setter(
+                    bool(data.get("stationary_pickup_enabled", False))
+                    and mode == "stationary",
+                    float(data.get("stationary_pickup_interval_seconds", 900.0)),
+                    float(data.get("stationary_pickup_gap_seconds", 0.0)),
+                )
 
     def _fixed_refresh_grey(self) -> None:
         """Grey the YOLO panel + update status lines for the active mode."""
@@ -5229,17 +5511,16 @@ class UiWorker(threading.Thread):
                     self._fixed_status.configure(
                         text=(f"站桩攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；"
-                              f"开始巡逻时记录临时位置；"
+                              f"开始运行时记录临时位置；"
+                              f"只有正确配置楼层，才能寻路回去；"
                               f"{'先跳跃、0.3s 后攻击；' if self._stationary_jump_enabled_var.get() else ''}每 "
-                              f"{interval:.1f}s。"
-                              "YOLO 怪物检测暂时停用。")
+                              f"{interval:.1f}s。")
                     )
                 else:
                     self._fixed_status.configure(
                         text=(f"巡逻攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；每 "
-                              f"{interval:.1f}s。"
-                              "YOLO 怪物检测暂时停用。")
+                              f"{interval:.1f}s。")
                     )
             else:
                 self._fixed_status.configure(
@@ -5247,10 +5528,7 @@ class UiWorker(threading.Thread):
                 )
         if hasattr(self, "_yolo_status"):
             if fixed_mode:
-                self._yolo_status.configure(
-                    text=("暂时停用 - 当前模型识别率不足；"
-                          "恢复方法见 README.md。")
-                )
+                self._yolo_status.configure(text="暂时停用。")
             else:
                 self._yolo_status.configure(text="YOLO 检测已停止。")
 
@@ -5328,6 +5606,24 @@ class UiWorker(threading.Thread):
                     and hasattr(self, "_small_step_gap_var")):
                 self._small_step_gap_var.set(float(
                     data["small_step_gap_seconds"]
+                ))
+            if ("stationary_pickup_enabled" in data
+                    and hasattr(self, "_stationary_pickup_enabled_var")):
+                self._stationary_pickup_enabled_var.set(bool(
+                    data["stationary_pickup_enabled"]
+                ))
+            if ("stationary_pickup_interval_seconds" in data
+                    and hasattr(self, "_stationary_pickup_interval_var")):
+                # Stored in seconds; this row shows and clamps minutes.
+                self._stationary_pickup_interval_var.set(min(
+                    self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
+                    max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES,
+                        float(data["stationary_pickup_interval_seconds"]) / 60.0),
+                ))
+            if ("stationary_pickup_gap_seconds" in data
+                    and hasattr(self, "_stationary_pickup_gap_var")):
+                self._stationary_pickup_gap_var.set(float(
+                    data["stationary_pickup_gap_seconds"]
                 ))
             if hasattr(self, "_stationary_facing_direction_var"):
                 direction = str(data.get("stationary_facing_direction", ""))
@@ -6777,9 +7073,7 @@ class UiWorker(threading.Thread):
         """Launch the YOLO live detection as a subprocess with the UI threshold."""
 
         if not self._YOLO_MONSTER_DETECTION_ENABLED:
-            self._yolo_status.configure(
-                text="YOLO 怪物检测暂时停用；恢复方法见 README.md。"
-            )
+            self._yolo_status.configure(text="暂时停用。")
             LOG.info("yolo detection launch ignored: feature temporarily disabled")
             return
 
@@ -7169,6 +7463,7 @@ class UiWorker(threading.Thread):
         self._fixed_on_change()
         stationary_mode = self._stationary_attack_selected()
         if not stationary_mode and not self.patrol_controller.can_start():
+            route_errors = self.patrol_controller.validate_patrol_route()
             # Logged, not only shown: this refusal used to leave no trace in the log the operator
             # sends, so "the patrol toggle does nothing" was undiagnosable.
             LOG.warning(
@@ -7178,8 +7473,8 @@ class UiWorker(threading.Thread):
                 sorted(self.patrol_controller.snapshot_layers()),
             )
             self._control_status.configure(
-                text=("无法开始: 每层至少录制一个巡逻点 (最左 / 绳索 / 最右)。"
-                      "不录制任何点时将原地站立只进行攻击。")
+                text=("无法开始: 巡逻路线的每层都需要最左和最右点。"
+                      + (" " + "；".join(route_errors) if route_errors else ""))
             )
             return False
         self._control_status.configure(text="正在选择游戏窗口…")
@@ -7194,6 +7489,14 @@ class UiWorker(threading.Thread):
                 self._control_status.configure(
                     text=f"无法开始: 游戏窗口选择失败: {exc}"
                 )
+                return False
+            except Exception as exc:
+                # A setup error must never leave the dashboard stranded on
+                # “正在选择游戏窗口…”.  Keep the traceback in the log, but
+                # turn every unexpected callback failure into an actionable
+                # visible refusal.
+                LOG.exception("START PATROL setup failed")
+                self._control_status.configure(text=f"无法开始: 启动设置失败: {exc}")
                 return False
             # The hook returns False when it deliberately did not arm input (the
             # game window could not be prepared).  Nothing re-arms it later, so
@@ -7216,7 +7519,13 @@ class UiWorker(threading.Thread):
                 and self._attack_mode_var.get() == "yolo"):
             self._yolo_start()
         self._refresh_patrol_controls()
-        self._control_status.configure(text="巡逻已开始。")
+        if str(getattr(self, "_attack_mode_var", None).get()
+               if hasattr(self, "_attack_mode_var") else "fixed") == "stationary":
+            self._control_status.configure(
+                text="运行已开始。只有正确配置楼层，才能寻路回去。"
+            )
+        else:
+            self._control_status.configure(text="运行已开始。")
         LOG.info(LOG_RUN_START + "。")
         return True
 
@@ -7648,7 +7957,7 @@ class UiWorker(threading.Thread):
         ttk = self._ttk
         for layer_name in layer_names:
             row = ttk.Frame(self._layer_rows_frame)
-            row.pack(fill="x", pady=(2, 4))
+            row.pack(fill="x", pady=(1, 2))
             selector = ttk.Radiobutton(
                 row,
                 variable=self._selected_layer_var,
@@ -7657,9 +7966,15 @@ class UiWorker(threading.Thread):
                     self._select_recording_layer(layer)
                 ),
             )
-            selector.pack(side="left", anchor="n", padx=(0, 1), pady=(4, 0))
-            label = ttk.Label(row, width=4)
-            label.pack(side="left", anchor="n", padx=(0, 2), pady=(5, 0))
+            selector.pack(side="left", anchor="center", padx=(0, 1))
+            # This is deliberately a fixed width, sized for the widest normal
+            # display name (for example, 楼层10).  A 4-character Tk width clips
+            # CJK glyphs on some Windows font/DPI combinations and lets the
+            # axis canvas visually cover the final digit.
+            label = ttk.Label(row, width=6)
+            # Keep the axis marker canvas a further fixed three pixels away;
+            # no row is resized when modes or recordings change.
+            label.pack(side="left", anchor="center", padx=(0, 10))
             self._layer_labels[layer_name] = label
             canvas = self._tk.Canvas(
                 row,
@@ -7673,6 +7988,15 @@ class UiWorker(threading.Thread):
             canvas.bind(
                 "<Button-1>",
                 lambda event, layer=layer_name: self._layer_axis_click(event, layer),
+            )
+            # A RIGHT click always opens the point-recording menu.  The left
+            # click only opens it on empty axis space: one that lands on an
+            # already-recorded marker means "select this layer" (existing ticks
+            # are reserved for inspection/deletion), which the operator read as
+            # "the dropdown does not open in the layer UI".
+            canvas.bind(
+                "<Button-3>",
+                lambda event, layer=layer_name: self._layer_axis_menu(event, layer),
             )
             self._layer_axis_canvases[layer_name] = canvas
 

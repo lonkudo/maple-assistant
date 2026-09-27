@@ -60,17 +60,28 @@ The coordinator is intentionally the only place where a capture source, a worker
 
 `licensing.py` is the local authorization boundary: it verifies signed license
 documents using the public key packaged with the desktop application and keeps
-the automation gate non-throwing. The activation server is a separate Django
-repository and owns code issuance, device binding, expiry, bans, and private
-signing material. The desktop repository must never contain the server
-database, plaintext activation inventory, signing private key, TLS private key,
-or auto-lie product secret.
+the automation gate non-throwing. For a `MAL-` activation code, it derives an
+opaque stable fingerprint locally and calls the fixed activation API at
+`https://211.149.169.194:8443/api/v1/activate`. The customer never supplies an
+endpoint. A successful v2 response is Ed25519-verified, checked against the
+local fingerprint, and atomically saved as `license.json`.
 
-`pinned_tls.py` is a transport-only component. It checks the server's pinned
-TLS public-key hash before a request body is sent and never falls back to plain
-HTTP. It does not alter the existing auto-lie WebSocket adapter. A future
-online-session component will obtain a short-lived in-memory product key only
-after server authentication; that component must remain separate from both
+The activation server is a separate Django repository and owns code issuance,
+device binding, expiry, bans, the PostgreSQL database, and private signing
+material. `LICENSE_SIGNING_PRIVATE_KEY` is an environment-only Base64url
+Ed25519 private key. Its matching public key is the `license_public_key.json`
+file shipped with the desktop release. The desktop repository must never
+contain the server database, plaintext activation inventory, signing private
+key, TLS private key, operator token, or auto-lie product secret.
+
+`pinned_tls.py` is a transport-only component. It reads the public pin from
+`activation_server_pin.json`, checks the server TLS public-key hash before a
+request body is sent, and never falls back to plain HTTP. Safe milestones are
+written to the dedicated `server-client` logger, which `assistant.py` persists
+as `server_client.log`. This log records no activation code, fingerprint,
+token, or secret. It does not alter the existing auto-lie WebSocket adapter. A
+future online-session component will obtain a short-lived in-memory product key
+only after server authentication; that component must remain separate from both
 license verification and vendor `autolie_api/` code.
 
 ### Shared capture pipeline
@@ -99,7 +110,7 @@ A broad search region is never promoted to saved geometry. This protects patrol 
 
 Recorded points contain minimap-relative X/Y values. Layer recognition uses recorded Y anchors and asymmetric layer bands: the top of a layer is more tolerant than its confirmed base. World-Y tracking provides continuity between frames and is re-anchored only by explicit recovery logic, not by ordinary movement such as stepping onto a bench.
 
-Each layer may also own X-sorted, immutable directional jump points. A point records X, Y, and either left or right travel direction. During a horizontal leg, the direction must match the leg. During an active rope climb, either directional record may be selected if the marker matches its X/Y window. The jump-point matching policy is intentionally asymmetric: X is ±0.010, while Y is ±0.020 to accommodate vertical rope movement. A matched point is marked passed only after the dedicated jump worker accepts it.
+Each layer may also own X-sorted, immutable directional jump points. A point records X, Y, and either left or right travel direction. During a horizontal leg, the direction must match the leg. During an active rope climb, either directional record may be selected if the marker matches its X/Y window: the recorded direction is only a preference there (it breaks a tie when a 左跳 and a 右跳 sit at the same height), because a climb has no horizontal leg to compare against. Gating a rope point on the direction the character happened to *walk in* to the rope made a point recorded as a right jump invisible during a return climb that approached from the right — the rope jump point that never fired. The matching policy is intentionally asymmetric: X is ±0.010, while Y is ±0.020 to accommodate vertical rope movement. A matched point is marked passed only after the dedicated jump worker accepts it.
 
 ### Patrol and movement
 
@@ -126,7 +137,11 @@ Horizontal directions are mutually exclusive with each other, as are vertical di
 3. arm the new direction;
 4. restore pickup ownership only when walking is active.
 
-`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, and stationary-facing taps. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
+`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, stationary-facing taps, and the 站桩 anchor correction. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
+
+The anchor correction is the one motion that also carries an attack (see the combat section). It is exclusive in the usual way — while it is queued or running, the fixed cadence cannot reserve a beat, so the correction’s own attack can never be doubled — but it is exempt from the arbiter’s shared post-attack grace, because that grace is measured from the correction’s own attack and would stretch a correction the operator expects roughly every 300 ms into one per second.
+
+While the optional 小碎步 pair is queued or running the movement loop queues nothing behind it: neither an anchor correction nor a 朝向 tap. The pair moves the character on purpose (away from, then back to the selected 朝向) and records the facing itself when it completes, so anything queued during it executed as an extra step straight after the pair. The facing obligation stays owed, so a pair that is dropped is corrected on the next settled capture.
 
 Attack and buff workers ask whether a conflicting motion is active before sending input. Movement does not wait while holding the arbiter’s internal lock; this avoids a stalled worker deadlock at a direction handoff.
 
@@ -135,6 +150,10 @@ Attack and buff workers ask whether a conflicting motion is active before sendin
 `attack_worker.py` performs fixed-interval attack and optional jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
 
 In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer. A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
+
+That facing tap is a 30 ms turn, deliberately as short as the tiny anchor step: it exists to turn the character, and a longer hold walks it out of the anchor band, after which the correction walks it back, turns it again and re-arms the facing — the face/walk twitch.
+
+The anchor correction is one atomic motion per correction, shaped as “direction hold, then the attack belonging to that correction”. The hold is the tiny step inside the small-step band (±0.010X of the anchor) and the longer walk when the character is further out; both carry exactly one attack. The design reason is direct field evidence: as an ordinary walk hold the correction either deferred the fixed cadence (direction handoff) or blocked it (exclusive recovery), so the character corrected its position and attacked nothing. Corrections are spaced about 300 ms apart and repeat until the marker is inside the arrival band (±0.006X). That band is not widened to “hold” a small drift: a position that is off the band is always walked back, because tolerating it left the character standing a pixel or two away from its 桩.
 
 Stair jump observes sustained position stalls and submits one direction-preserving recovery jump. It uses a post-trigger frame cooldown and a movement-progress reset, preventing a single long stall from producing a burst of jumps. Recorded jump points are separate from this recovery rule: they are deliberate X/Y triggers, have their own once-per-leg pass record, and can fire while a rope climb is active.
 
@@ -166,6 +185,10 @@ The live frame stream uses the shared capture cadence. The temporary detection r
 
 `ui_worker.py` presents the Chinese desktop interface. It reads and writes only through configuration callbacks supplied by the coordinator. UI redraw work is deferred during resize/drag operations to avoid black component flashes and expensive intermediate layouts. `screen_blinker.py` owns click-through diagnostic overlays: crosshairs and all patrol-point symbols are painted on persistent native canvases, never into capture input.
 
+Each recorded layer row carries an axis band whose point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳) opens on a **right click**. A left click is ambiguous by design — on an already-recorded marker it selects that layer — so the right click is the reliable affordance for the menu. The menu itself is refused while patrol runs, because recording is locked then.
+
+One optional control deliberately uses its own unit: the 捡东西 (stand-still pickup circuit) trigger interval is set in **minutes** (`每 … m`, 2.0m to 30.0m). The row converts before it publishes and after it loads, so `stationary_pickup_interval_seconds` and the movement worker’s own bounds stay in seconds; the interval is clamped to the same two minutes at the bottom and thirty at the top in both places, so a hand-edited configuration cannot schedule a sweep every few seconds. The random gap in that row remains a seconds control.
+
 Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`.
 
 `hotkey_worker.py`, quick messages, trade helpers, Telegram notification, screen blinking, countdowns, and shutdown logic are optional subsystems. They use isolated configuration/state and may request input only through the shared focus/key boundary.
@@ -179,7 +202,7 @@ Personal settings are stored in `user_config.json`; application defaults are sto
 | `hotkey.json` | Hotkey worker | Ordered hotkey bindings. |
 | `work/` | Runtime workers | Recoverable patrol/timer/session state. |
 | `error.log` | Error reporting | Critical unexpected-error record. |
-| `server_client.log` | Future online-session component | Safe authentication, pin, and heartbeat events; never secrets. |
+| `server_client.log` | Licensing transport | Safe activation connection, pin, HTTP, and local verification events; never secrets. |
 | `autolie_api/` | Vendor | Reference protocol implementation; read-only. |
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.

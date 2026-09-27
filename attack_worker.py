@@ -44,6 +44,7 @@ class AttackWorker(threading.Thread):
         direction_transition_event: Optional[threading.Event] = None,
         jump_attack: bool = False,
         jump_attack_delay: float = 0.3,
+        attack_resume_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
@@ -74,6 +75,10 @@ class AttackWorker(threading.Thread):
         # registered into the motion-arbiter queue.
         self.jump_attack = bool(jump_attack)
         self.jump_attack_delay = max(0.0, float(jump_attack_delay))
+        # Raised by stand-still recovery after its exclusive off-layer/far-X
+        # phase ends.  A skipped beat must not impose another whole attack
+        # interval before the first near-anchor attack can fire.
+        self.attack_resume_event = attack_resume_event
         self.initial_offset = (
             self.attack_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
@@ -138,10 +143,24 @@ class AttackWorker(threading.Thread):
                  self.enabled)
         next_attack = time.monotonic() + self.initial_offset
         while not self.stop_event.is_set():
-            if self.stop_event.wait(max(0.0, next_attack - time.monotonic())):
+            while not self.stop_event.is_set():
+                resume = self.attack_resume_event
+                if resume is not None and resume.is_set():
+                    resume.clear()
+                    next_attack = time.monotonic()
+                    LOG.info("attack cadence resumed immediately after stand-still recovery")
+                    break
+                remaining = next_attack - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                # The dedicated event keeps this responsive without a second
+                # worker or coupling normal attack cadence to movement frames.
+                self.stop_event.wait(min(0.05, remaining))
+            if self.stop_event.is_set():
                 break
             can_fire = self.enabled
             attack_lease = False
+            handoff_deferred = False
             if can_fire and (self.automation_active_event is not None
                     and not self.automation_active_event.is_set()):
                 can_fire = False
@@ -153,6 +172,7 @@ class AttackWorker(threading.Thread):
                     and self.direction_transition_event.is_set()):
                 LOG.info("attack skipped: patrol direction handoff is active")
                 can_fire = False
+                handoff_deferred = True
             if can_fire and self.motion_arbiter is not None:
                 # Reservation is deliberately atomic.  Checking idle and
                 # tapping separately allowed a queued 小碎步 to start between
@@ -186,6 +206,19 @@ class AttackWorker(threading.Thread):
                 finally:
                     if self.motion_arbiter is not None and attack_lease:
                         self.motion_arbiter.finish_attack(sent)
+            if handoff_deferred:
+                # A route endpoint turn deliberately reserves a short window
+                # around Left-up -> Right-down (or the reverse).  Treating a
+                # beat that lands in that window as a completed attack used to
+                # lose a whole configured interval, creating the visible
+                # ~2-second no-attack pause at every turn.  Wait quietly for
+                # the handoff owner to clear its reservation, then retry now.
+                while (not self.stop_event.is_set()
+                       and self.direction_transition_event is not None
+                       and self.direction_transition_event.is_set()):
+                    self.stop_event.wait(0.02)
+                next_attack = time.monotonic()
+                continue
             # The random component is additive only: attack + random_gap.
             next_attack = time.monotonic() + self.next_delay()
         LOG.info("attack worker stopped")

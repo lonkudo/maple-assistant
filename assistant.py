@@ -381,6 +381,20 @@ def main() -> int:
     trace_log_handler.setFormatter(_compact_log_formatter())
     logging.getLogger().addHandler(trace_log_handler)
 
+    # The licensing/server boundary gets its own compact, safe-to-share trace.
+    # It deliberately records no activation code, fingerprint, token, or secret.
+    server_log_handler = RotatingFileHandler(
+        Path(__file__).with_name("server_client.log"),
+        maxBytes=500_000,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    server_log_handler.setLevel(logging.INFO)
+    server_log_handler.setFormatter(_compact_log_formatter())
+    server_logger = logging.getLogger("server-client")
+    server_logger.setLevel(logging.INFO)
+    server_logger.addHandler(server_log_handler)
+
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
         logging.critical(
             "uncaught exception in worker %s",
@@ -442,7 +456,7 @@ def main() -> int:
     from marker_detector import DiamondSizeTracker, detect_yellow_diamond
     from map_identity import MapIdentityStore
     from map_structure_tracker import MapStructureTracker
-    from patrol_control import CoordinateLayout, PatrolController
+    from patrol_control import CoordinateLayout, PatrolController, _layer_y_band
     from ui_worker import UiLogHandler, UiWorker
 
     stop_event = threading.Event()
@@ -452,7 +466,15 @@ def main() -> int:
     # is not a rope climb/return.  Keep its lifetime independent so a parked
     # no-route patrol (action=wait) can still attack and use 小碎步.
     stair_jump_active = threading.Event()
-    action_motion_active = _AnyEvent(climbing_active, stair_jump_active)
+    # Stand-still anchor recovery temporarily takes attack priority while the
+    # character walks back into its small fixed-position zone.
+    stationary_recovery_active = threading.Event()
+    # Lets the fixed attack cadence wake immediately when stand-still return
+    # reaches its small adjustment zone, rather than losing one full interval.
+    stationary_attack_resume = threading.Event()
+    action_motion_active = _AnyEvent(
+        climbing_active, stair_jump_active, stationary_recovery_active
+    )
     dropping_active = threading.Event()
     # The API lie pass joins the normal shared 5 fps capture stream while it owns the cursor.
     lie_active = threading.Event()
@@ -914,6 +936,40 @@ def main() -> int:
                 raise OSError(
                     "yellow character marker was not detected for stationary attack"
                 )
+            # Stand-still attack automatically reuses only an existing,
+            # correctly configured route.  The temporary standing point is
+            # never added to the recording.  A non-matching anchor simply
+            # stays ordinary stand-still attack for this start.
+            configure_stationary_return = getattr(
+                movement_worker, "configure_stationary_return_route", None
+            )
+            if callable(configure_stationary_return):
+                if configure_stationary_return():
+                    logging.info(
+                        "STATIONARY ATTACK startup: temporary point selected "
+                        "its patrol layer; route return is armed"
+                    )
+                else:
+                    route_error = getattr(
+                        movement_worker, "stationary_route_validation_error", None
+                    )
+                    detail = route_error() if callable(route_error) else ""
+                    pickup_enabled = bool(getattr(
+                        movement_worker, "stationary_pickup_enabled", False
+                    ))
+                    if detail and pickup_enabled:
+                        # This is a normal configuration refusal. UiWorker
+                        # catches OSError and shows the text; nothing should
+                        # escape the callback or crash the dashboard.
+                        raise OSError(
+                            "已启用捡东西：桩点楼层必须录制最左和最右点（"
+                            + detail + "）"
+                        )
+                    logging.warning(
+                        "STATIONARY ATTACK startup: no usable route helper; "
+                        "ordinary stand-still attack continues%s",
+                        f" ({detail})" if detail else "",
+                    )
             # Manual 站桩攻击 starts deliberately request show_overlays=False
             # to avoid the normal patrol's long calibration pause, but still
             # need the full visual geometry check requested by the operator.
@@ -931,27 +987,19 @@ def main() -> int:
                     "STATIONARY ATTACK DETECTION OVERLAY: minimap (green), "
                     "marker/patrol (yellow), HP/MP (blue), fixed point crosshair"
                 )
-            # Show the temporary 站桩攻击 anchor once, directly on its minimap
-            # marker.  This is diagnostic only: the click-through crosshair
-            # never participates in patrol movement or the fixed-position
-            # calculation, and therefore cannot shift the saved anchor.
+            # Show the temporary 站桩攻击 anchor on the same shared marker
+            # canvas as patrol points.  It is diagnostic only and never
+            # participates in the fixed-position calculation.
             if stationary_reanchor and marker is not None:
                 try:
-                    left, top, right, bottom = fresh_frame.window_rect
-                    image_width, image_height = fresh_frame.image.size
-                    analysis_left, analysis_top, analysis_right, analysis_bottom = (
-                        detection.analysis_box
-                    )
-                    scale_x = (right - left) / max(1, image_width)
-                    scale_y = (bottom - top) / max(1, image_height)
-                    screen_blinker.show_aim_marker(
-                        round(left + (analysis_left + marker.x * (analysis_right - analysis_left)) * scale_x),
-                        round(top + (analysis_top + marker.y * (analysis_bottom - analysis_top)) * scale_y),
-                        ttl_seconds=2.5,
-                        size=11,
+                    screen_blinker.show_patrol_points(
+                        fresh_frame.window_rect,
+                        fresh_frame.image.size,
+                        detection.analysis_box,
+                        (("fixed_anchor", marker.x, marker.y),),
                     )
                     logging.info(
-                        "STATIONARY ATTACK marker: fixed position crosshair drawn x=%.6f y=%.6f",
+                        "STATIONARY ATTACK marker: shared fixed-position crosshair drawn x=%.6f y=%.6f",
                         marker.x, marker.y,
                     )
                 except Exception:
@@ -1012,27 +1060,6 @@ def main() -> int:
             fresh_frame.image.crop(detection.analysis_box).convert("RGB")
         )
         marker = detect_yellow_diamond(analysis_rgb)
-        if show_startup_marker and marker is not None:
-            try:
-                left, top, right, bottom = fresh_frame.window_rect
-                analysis_left, analysis_top, analysis_right, analysis_bottom = (
-                    detection.analysis_box
-                )
-                image_width, image_height = fresh_frame.image.size
-                scale_x = (right - left) / max(1, image_width)
-                scale_y = (bottom - top) / max(1, image_height)
-                screen_blinker.show_aim_marker(
-                    round(left + (analysis_left + marker.x * (analysis_right - analysis_left)) * scale_x),
-                    round(top + (analysis_top + marker.y * (analysis_bottom - analysis_top)) * scale_y),
-                    ttl_seconds=2.5,
-                    size=11,
-                )
-                logging.info(
-                    "PATROL ATTACK marker: startup crosshair drawn x=%.6f y=%.6f",
-                    marker.x, marker.y,
-                )
-            except Exception:
-                logging.warning("PATROL ATTACK marker overlay failed", exc_info=True)
         layout = None
         if marker is not None:
             analysis_left, analysis_top, analysis_right, analysis_bottom = (
@@ -1059,9 +1086,17 @@ def main() -> int:
             logging.info(
                 "MAP SESSION no patrol route recorded; standing still + attack"
             )
+            if show_startup_marker and marker is not None:
+                screen_blinker.show_patrol_points(
+                    fresh_frame.window_rect, fresh_frame.image.size,
+                    detection.analysis_box,
+                    (("fixed_anchor", marker.x, marker.y),),
+                )
             return
         layer_bands = []
         patrol_point_overlay: list[tuple[str, float, float]] = []
+        if show_startup_marker and marker is not None:
+            patrol_point_overlay.append(("fixed_anchor", marker.x, marker.y))
         for layer_name in snapshot.route_order:
             layer = snapshot.layers.get(layer_name, {})
             if not isinstance(layer, dict):
@@ -1272,6 +1307,41 @@ def main() -> int:
             raise OSError(
                 "yellow character marker was not detected during patrol startup"
             )
+        startup_above_route = False
+        if detected_name is None:
+            # A player can start on an upper platform that has no separately
+            # recorded layer.  If its marker is visibly above the configured
+            # patrol range, do not refuse Start Patrol: arm the normal
+            # drop-to-route state until it enters the recorded range.
+            route_candidates = [
+                name for name in snapshot.route_order
+                if name in snapshot.layers
+                and (not snapshot.patrol_start_layer
+                     or int("".join(filter(str.isdigit, name)) or 0)
+                     >= int("".join(filter(str.isdigit, snapshot.patrol_start_layer)) or 0))
+                and (not snapshot.patrol_end_layer
+                     or int("".join(filter(str.isdigit, name)) or 0)
+                     <= int("".join(filter(str.isdigit, snapshot.patrol_end_layer)) or 0))
+            ]
+            top_route = max(
+                route_candidates,
+                key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
+                default=None,
+            )
+            top_band = (
+                _layer_y_band(
+                    snapshot.layers.get(top_route, {}),
+                    float(snapshot.layers.get(top_route, {}).get("y_tolerance", 0.020000)),
+                ) if top_route is not None else None
+            )
+            if top_band is not None and marker.y < top_band[0]:
+                startup_above_route = True
+                detected_name = top_route
+                logging.warning(
+                    "MAP SESSION: marker Y=%.6f is above the patrol route "
+                    "(top %s begins at %.6f); dropping into the route",
+                    marker.y, top_route, top_band[0],
+                )
         if detected_name is None:
             if require_layer:
                 raise OSError(
@@ -1304,12 +1374,15 @@ def main() -> int:
                 "record this map once"
             )
         structure_tracker.start_session(float(anchor_world_y))
-        movement_worker.prepare_patrol_start(anchor_name)
+        movement_worker.prepare_patrol_start(
+            anchor_name, above_route=startup_above_route
+        )
         logging.info(
-            "MAP SESSION detected %s from marker_y=%s; re-anchoring "
+            "MAP SESSION detected %s from marker_y=%s%s; re-anchoring "
             "world_y=%.6f",
             anchor_name,
             f"{marker.y:.6f}" if marker is not None else "unknown",
+            " (above patrol route)" if startup_above_route else "",
             float(anchor_world_y),
         )
 
@@ -1392,6 +1465,7 @@ def main() -> int:
         automation_active_event=automation_active,
         motion_arbiter=motion_arbiter,
         direction_transition_event=direction_transition_active,
+        attack_resume_event=stationary_attack_resume,
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
@@ -1465,12 +1539,48 @@ def main() -> int:
     # the login page's base colour (screenshots/login_page_target.jpg) its confirmation
     # (see reconnect_worker.py).
     reconnect_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=16)
+
+    def reconnect_post_login_marker_ready() -> bool:
+        """Probe one fresh shared frame for the yellow character marker.
+
+        Reconnect owns only its channel/login sequence.  This callback keeps
+        the post-login readiness gate in the application's established minimap
+        coordinate system and deliberately creates an isolated detector, so a
+        failed loading-frame probe cannot disturb live patrol calibration.
+        """
+
+        try:
+            frame = capture_worker.capture_now(timeout=1.0)
+            saved_detection = minimap_calibration_from_dict(
+                config_store.read_section("minimap_calibration"),
+                frame.image.size,
+            )
+            detection = saved_detection
+            if detection is None:
+                detector = MinimapDetector(
+                    fallback_region=minimap_region,
+                    dedicated_crop=True,
+                    opencv_size=MINIMAP_ANALYSIS_SIZE,
+                )
+                detection = detector.detect(frame.image)
+            analysis_rgb = np.asarray(
+                frame.image.crop(detection.analysis_box).convert("RGB")
+            )
+            return detect_yellow_diamond(analysis_rgb) is not None
+        except Exception:
+            logging.debug(
+                "AUTO RECONNECT post-login yellow-marker probe did not produce a usable frame",
+                exc_info=True,
+            )
+            return False
+
     reconnect_worker = ReconnectWorker(
         key_sender,
         stop_event,
         reconnect_results,
         window_title=args.window_title,
         dry_run=args.dry_run,
+        post_login_marker_ready_fn=reconnect_post_login_marker_ready,
         # The reconnect stands the automation down while it runs: arming live input for its own keys
         # otherwise wakes the attack worker too (measured 19:07: `attack repetition: a` every second
         # through the whole sequence).
@@ -1748,6 +1858,8 @@ def main() -> int:
             climb_attack_lock=climb_attack_lock,
             direction_transition_event=direction_transition_active,
             climbing_active_event=climbing_active,
+            stationary_recovery_active_event=stationary_recovery_active,
+            stationary_attack_resume_event=stationary_attack_resume,
             dropping_active_event=dropping_active,
             important_positions=map_profile.get("layers", {}),
             route_order=map_profile.get("route_order", []),
@@ -1877,6 +1989,12 @@ def main() -> int:
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
     motion_arbiter.set_facing_callback(movement_worker.perform_stationary_facing)
+    # 站桩攻击's final correction onto the 桩: one tiny step, deliberately
+    # concurrent with the fixed attack cadence (see
+    # MovementWorker.perform_stationary_step).
+    motion_arbiter.set_step_callback(
+        movement_worker.perform_stationary_step
+    )
     stair_jump_worker = StairJumpWorker(
         stop_event,
         automation_active_event=automation_active,
@@ -2103,6 +2221,8 @@ def main() -> int:
         error_log_handler.close()
         logging.getLogger().removeHandler(trace_log_handler)
         trace_log_handler.close()
+        server_logger.removeHandler(server_log_handler)
+        server_log_handler.close()
         _release_single_instance_mutex(singleton_handle)
     return 0
 

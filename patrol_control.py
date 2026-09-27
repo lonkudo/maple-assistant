@@ -33,6 +33,13 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
+    if len(values) == 1:
+        # Keep the UI/controller interpretation exactly aligned with the
+        # movement worker: a rope-only layer is only [y, y + 0.002].  Jump
+        # points never enter _layer_point_ys, so their vertical coordinate
+        # cannot widen or shift a layer band.
+        only_y = values[0]
+        return only_y, only_y + 0.002
     # The margin above covers climb/drop arrival movement, scaled by the upper-band factor. A smaller
     # one-third margin below the confirmed layer base absorbs OpenCV marker precision noise without
     # excessive overlap with the layer below.
@@ -287,17 +294,51 @@ class PatrolController:
             self._enabled = bool(enabled)
 
     def can_start(self) -> bool:
+        """Whether the selected patrol route has both horizontal endpoints."""
+
+        return not self.validate_patrol_route()
+
+    def _patrol_route_layers_locked(self) -> list[str]:
+        """Physical layers inside the selected contiguous patrol range."""
+
+        start, end = self.patrol_range_locked()
+        if not start or not end:
+            return []
+        start_number, end_number = _layer_number(start), _layer_number(end)
+        return [
+            name for name in sorted(self._profile.get("layers", {}), key=_layer_number)
+            if start_number <= _layer_number(name) <= end_number
+        ]
+
+    def validate_patrol_route(self) -> tuple[str, ...]:
+        """Return human-readable errors for the selected patrol route.
+
+        Recording stays deliberately loose: a layer outside the route may have
+        only a rope, only one endpoint, or no point at all.  The stricter
+        left/right requirement is applied only immediately before a route is
+        started, after the operator has chosen its start/end layers.
+        """
+
         with self._lock:
-            route = self._profile.get("route_order", [])
+            route = self._patrol_route_layers_locked()
             if not route:
-                # Nothing recorded is still startable: the worker stands still
-                # and only attacks (e.g. Fixed Attack / YOLO farming).
-                return True
-            # Start as soon as every routed layer has at least one recorded
-            # action point.  Adaptive coordinate_v2 is NOT required to start -
-            # the UI labels a layer "legacy layout" when it should be
-            # re-recorded, but patrol is enabled regardless.
-            return all(self.layer_is_complete(name) for name in route)
+                return ("未选择有效的巡逻楼层。",)
+            errors: list[str] = []
+            layers = self._profile.get("layers", {})
+            for name in route:
+                layer = layers.get(name)
+                missing = [
+                    label for point, label in (
+                        ("left_most_pos", "最左"),
+                        ("right_most_pos", "最右"),
+                    )
+                    if not (isinstance(layer, dict)
+                            and isinstance(layer.get(point), dict)
+                            and "x" in layer[point] and "y" in layer[point])
+                ]
+                if missing:
+                    errors.append(f"{name} 缺少{'、'.join(missing)}点")
+            return tuple(errors)
 
     def selected_layer(self) -> str:
         with self._lock:
@@ -715,9 +756,9 @@ class PatrolController:
                 layer["world_y_tolerance"] = round(float(
                     layer.get("world_y_tolerance", 0.75)
                 ), 6)
-            # The route includes a layer as soon as it has any action point -
-            # record only the points you want patrolled (Left and/or Right
-            # and/or Rope).
+            # Recording is intentionally permissive.  A partial point may be
+            # useful later, but only the selected patrol range is checked for
+            # its required Left/Right endpoints at Start.
             any_action = bool(_layer_present_actions(layer))
             has_edges = self._layer_has_points_locked(
                 layer_name, PATROL_EDGE_POINTS
@@ -743,7 +784,13 @@ class PatrolController:
         self, player_x: float, player_y: float, *, direction: str,
         layout: Optional[CoordinateLayout] = None,
     ) -> RecordedEndpoint:
-        """Add one immutable directional jump trigger, ordered by X."""
+        """Add one immutable directional jump trigger.
+
+        Storage preserves recording order.  The layer axis is responsible for
+        presenting points in X order, so persisted JSON order is never a
+        validity requirement for an otherwise empty or partially recorded
+        layer.
+        """
 
         direction = str(direction).casefold()
         if direction not in ("left", "right"):
@@ -771,12 +818,11 @@ class PatrolController:
             if not isinstance(points, list):
                 points = layer["jump_points"] = []
             points.append(point)
-            points.sort(key=lambda item: float(item.get("x", 0.0)))
             self._persist_locked()
             return RecordedEndpoint(layer_name, "jump_point", point["x"], point["y"])
 
     def delete_jump_point(self, layer_name: str, index: int) -> bool:
-        """Delete one locked jump point by its current X-sorted index.
+        """Delete one locked jump point by its stored list index.
 
         Jump points are immutable once recorded: editing one would silently
         make its Y trigger disagree with the actual platform.  The UI can

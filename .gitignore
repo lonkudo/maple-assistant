@@ -42,3 +42,9 @@ screenshots/
 # Operator-only license inventory and local licensing database. Never ship or commit.
 operator_tools/local_licenses.sqlite3
 operator_tools/issued_*.txt
+
+# Django activation service runtime secrets and collected/static state.
+activation_service/.env
+activation_service/__pycache__/
+activation_service/**/__pycache__/
+activation_service/staticfiles/
