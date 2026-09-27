@@ -34,7 +34,7 @@ from config_store import config_section_file
 from countdown_worker import play_mp3
 from licensing import (
     LicenseStatus, activate as activate_license, activate_via_server,
-    revoke_license, verify_license,
+    revoke_license, validate_via_server, verify_license,
 )
 from reconnect_worker import (
     CHANNEL_DEFAULT,
@@ -920,11 +920,25 @@ class UiWorker(threading.Thread):
         # License verification is an independent boundary: it never changes
         # patrol/trade worker internals, it only decides whether UI actions may
         # enter those workflows.
-        self._license_status: LicenseStatus = verify_license()
-        # An unsuccessful activation attempt must lock THIS session at once.
-        # Do not fall back to a previously saved license file until a fresh,
-        # successful activation explicitly unlocks it again.
-        self._license_session_locked = not self._license_status.valid
+        local_license_status = verify_license()
+        # A local signature proves the document was issued by us, but does not
+        # prove the online entitlement is still live.  Start locked and let
+        # the immediate pinned heartbeat unlock the dashboard only after the
+        # activation server accepts this device/license pair.
+        self._license_status: LicenseStatus = (
+            LicenseStatus(
+                False, "checking", "正在验证在线授权…",
+                local_license_status.license_id, local_license_status.edition,
+                local_license_status.expires_at,
+            )
+            if local_license_status.valid else local_license_status
+        )
+        self._license_session_locked = True
+        self._license_heartbeat_results: "queue.Queue[tuple[int, LicenseStatus]]" = (
+            queue.Queue()
+        )
+        self._license_heartbeat_started = False
+        self._license_heartbeat_generation = 0
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -2301,6 +2315,7 @@ class UiWorker(threading.Thread):
             self._refit_window_to_content()
             root.deiconify()
 
+            self._start_license_heartbeat()
             root.after(0, self._poll)
             root.mainloop()
         except Exception:
@@ -2843,6 +2858,7 @@ class UiWorker(threading.Thread):
         # now costs only itself.
         for step in (
             self._drain_logs,
+            self._drain_license_heartbeat_results,
             self._refresh_automation_status,
             self._sync_patrol_ui_state,
             self._refresh_shutdown_status,
@@ -2912,6 +2928,66 @@ class UiWorker(threading.Thread):
             return False
         self._license_status = verify_license()
         return bool(self._license_status.valid)
+
+    def _start_license_heartbeat(self) -> None:
+        """Start the immediate + three-hour online entitlement heartbeat."""
+
+        if getattr(self, "_license_heartbeat_started", False):
+            return
+        self._license_heartbeat_started = True
+
+        def heartbeat_loop() -> None:
+            while not self.stop_event.is_set():
+                generation = self._license_heartbeat_generation
+                status = validate_via_server()
+                try:
+                    self._license_heartbeat_results.put_nowait((generation, status))
+                except Exception:
+                    LOG.warning("license heartbeat result could not be queued", exc_info=True)
+                # The first iteration intentionally happens immediately.
+                # Subsequent online checks are every three hours, as agreed.
+                if self.stop_event.wait(3 * 60 * 60):
+                    return
+
+        threading.Thread(
+            target=heartbeat_loop,
+            name="license-heartbeat",
+            daemon=True,
+        ).start()
+
+    def _drain_license_heartbeat_results(self) -> None:
+        """Apply online validation results on Tk's owning thread."""
+
+        latest: Optional[tuple[int, LicenseStatus]] = None
+        while True:
+            try:
+                latest = self._license_heartbeat_results.get_nowait()
+            except queue.Empty:
+                break
+        if latest is None:
+            return
+        generation, status = latest
+        # A manual activation may complete while the initial heartbeat is in
+        # flight.  Its older result must never undo the explicit success.
+        if generation != self._license_heartbeat_generation:
+            return
+        self._license_status = status
+        if status.valid:
+            was_locked = self._license_session_locked
+            self._license_session_locked = False
+            self._refresh_license_ui()
+            self._set_license_visual_lock(False)
+            if was_locked:
+                LOG.info("license heartbeat accepted; automation unlocked")
+                self._shutdown_load_settings()
+            self._refresh_patrol_controls()
+            return
+        LOG.warning("license heartbeat failed: %s", status.code)
+        self._lock_licensed_functions()
+        if hasattr(self, "_control_status"):
+            self._control_status.configure(
+                text=f"在线授权验证失败：{status.message}"
+            )
 
     def _refresh_license_ui(self) -> None:
         """Render the non-fatal authorization state in the always-visible UI."""
@@ -3186,6 +3262,9 @@ class UiWorker(threading.Thread):
         if not code:
             return
         code = str(code).strip()
+        # Supersede an initial/previous heartbeat that may still be awaiting a
+        # response.  The explicit activation result is the new session state.
+        self._license_heartbeat_generation += 1
         # Save the new code before contacting a local or online validator.  A
         # rejected value must not silently leave the previous submitted code
         # in user_config.json.

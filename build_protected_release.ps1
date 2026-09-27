@@ -35,6 +35,7 @@ try {
         --include-data-dir=sound=sound `
         --include-data-dir=autolie_api=autolie_api `
         --include-data-file=license_public_key.json=license_public_key.json `
+        --include-data-file=activation_server_pin.json=activation_server_pin.json `
         --include-data-file=VERSION=VERSION `
         assistant.py
     if ($LASTEXITCODE -ne 0) { throw "Nuitka compilation failed." }

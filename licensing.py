@@ -407,9 +407,61 @@ def activate_via_server(
     return persisted
 
 
+def validate_via_server(
+    root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
+) -> LicenseStatus:
+    """Revalidate the saved entitlement through the pinned activation server.
+
+    This is deliberately separate from local signature verification.  A
+    signed document proves authenticity, while the online heartbeat proves the
+    activation service is currently reachable and has not revoked the bound
+    license.
+    """
+
+    local = verify_license(root, edition=edition)
+    if not local.valid:
+        return local
+    if not local.license_id:
+        return LicenseStatus(False, "server", "授权文件缺少在线验证信息。")
+    try:
+        SERVER_LOG.info("license heartbeat requested edition=%s", edition.casefold())
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/validate",
+            {
+                "fingerprint": machine_fingerprint_hash(),
+                "license_id": local.license_id,
+            },
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
+        document = answer["license"]
+    except PinnedTlsResponseError as exc:
+        SERVER_LOG.warning(
+            "license heartbeat rejected status=%s code=%s", exc.status, exc.code
+        )
+        return LicenseStatus(False, f"server:{exc.code}", exc.message)
+    except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("license heartbeat failed category=%s", type(exc).__name__)
+        return LicenseStatus(False, "server", f"授权服务器不可用：{exc}")
+    status = _parse_document(document, root)
+    if status.valid and status.edition != edition.casefold():
+        status = LicenseStatus(
+            False, "edition", "此授权不适用于当前版本。",
+            status.license_id, status.edition,
+        )
+    if not status.valid:
+        SERVER_LOG.warning("license heartbeat response rejected category=%s", status.code)
+        return status
+    persisted = _persist_document(document, status, root)
+    if persisted.valid:
+        SERVER_LOG.info("license heartbeat accepted license_id=%s", persisted.license_id)
+    return persisted
+
+
 __all__ = [
     "ACTIVATION_PREFIX", "EDITION_NORMAL", "EDITION_NP", "LICENSE_FORMAT",
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
     "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
+    "validate_via_server",
 ]
