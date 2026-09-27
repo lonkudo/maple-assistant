@@ -138,6 +138,11 @@ STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS = 0.30
 # keeps a settled anchor from being re-walked by the jitter of a pixel or by the
 # small step of the 朝向 tap itself.
 STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.010
+# Outside this band the character is plainly away from the stake and must
+# walk back normally.  The short correction-plus-attack motion is reserved
+# for the final approach only; using it for a rope-top or another platform
+# created a visible tiny-step/attack loop before the stake was reached.
+STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.020
 # How long the 朝向 tap holds its direction.  Deliberately as short as the tiny
 # step: the tap is a TURN, not a move, and a longer hold walks the character out
 # of the anchor band (at 0.10s it travels about a minimap pixel, which on a
@@ -5859,14 +5864,21 @@ class MovementWorker(threading.Thread):
             self._stationary_x_settled = True
             self._stationary_near_correction_next_at = 0.0
         else:
-            # Correct back to the anchor with ONE arbiter motion that carries
-            # its own attack: the tiny 30ms step inside the small-step band,
-            # or the longer walk back when the character is further out.  Both
-            # are the same "combination" motion - what changes is only how long
-            # the direction is held - so a correction can never be the frame
-            # that eats a fixed-attack beat.
+            # Outside the final approach zone, walk normally and do not
+            # attack.  A layer-return can reach the anchor platform at its
+            # rope top, far from the temporary stake; treating that distance
+            # as a stream of tiny step-plus-attack motions prevented it from
+            # ever walking across the layer.  Only the last +/-0.02 X uses
+            # the short, attack-carrying correction below.
             self._stationary_x_settled = False
             direction = "right" if gap_x > 0 else "left"
+            if distance_x > STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE:
+                self._stationary_near_correction_next_at = 0.0
+                return MovementDecision(
+                    direction,
+                    "stationary return walking to final approach zone",
+                    self.movement_hold_seconds,
+                )
             now = time.monotonic()
             if now < self._stationary_near_correction_next_at:
                 return MovementDecision(
@@ -6462,10 +6474,17 @@ class MovementWorker(threading.Thread):
         # A temporary anchor can deliberately belong to an empty layer.  It
         # has no saved ``layer_y`` for the ordinary detector, but its current
         # minimap Y is still valid for confirming arrival after a rope climb.
+        # This answers "am I still on the stake's physical platform?", not
+        # "am I exactly at the temporary launch pixel?"  A monster hit and
+        # normal marker quantisation can move a standing character one pixel
+        # (about 0.007 here) without making them fall.  Using the exact
+        # ±0.006 launch tolerance falsely started a layer-return climb after
+        # those harmless hits, even though the current temporary anchor was
+        # the strongest live evidence for its layer.
         anchor_match = bool(
             anchor is not None
             and abs(float(observation.player.y) - float(anchor.y))
-            <= STATIONARY_ATTACK_Y_TOLERANCE
+            <= STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE
         )
         if not after_confirmed_fall:
             return anchor_layer if anchor_match else self._detect_floor_all(observation)
@@ -6815,14 +6834,38 @@ class MovementWorker(threading.Thread):
             if (self.stationary_attack_enabled
                 and self._stationary_return_route_ready) else None
         )
+        # A stand-still return deliberately narrows the active patrol range
+        # to the temporary stake layer.  The floors below it are consequently
+        # *not* in ``_route_layers`` even though their recorded ropes are the
+        # route home.  Treat a higher recorded floor between the current
+        # departure floor and the stake as a real climb arrival: _finish_return
+        # will then make that floor the next rope source.  Without this, a
+        # physical arrival on layer2 was rejected as off-route and the old
+        # layer1 climb state kept sending Alt jumps in place.
+        def stationary_intermediate(candidate: Optional[str]) -> bool:
+            return bool(
+                stationary_anchor_layer is not None
+                and candidate is not None
+                and candidate in self.important_positions
+                and self._return_from_floor is not None
+                and _layer_number(self._return_from_floor)
+                < _layer_number(candidate)
+                < _layer_number(stationary_anchor_layer)
+            )
+
+        stationary_intermediate_return_floor = stationary_intermediate(floor)
         arrival_is_route_or_stationary_anchor = bool(
             floor in self._route_layers
             or (stationary_anchor_layer is not None
                 and floor == stationary_anchor_layer)
+            or stationary_intermediate_return_floor
         )
         if (state.target_layer_since is not None
                 and (self._return_arrival_floor in self._route_layers
-                     or self._return_arrival_floor == stationary_anchor_layer)):
+                     or self._return_arrival_floor == stationary_anchor_layer
+                     or stationary_intermediate(
+                         self._return_arrival_floor
+                     ))):
             elapsed = time.monotonic() - state.target_layer_since
             if elapsed < self.climb_layer_confirm_seconds:
                 LOG.info(
@@ -7304,10 +7347,6 @@ class MovementWorker(threading.Thread):
                     return self._stationary_attack_anchor.x, False, "stationary-attack"
             else:
                 return self._stationary_attack_anchor.x, False, "stationary-attack"
-        if not self._route_layers:
-            # Nothing recorded on any layer: stand still (Fixed Attack / YOLO
-            # keep attacking) instead of the old fall-back-to-rope walk.
-            return None, False, "stand-still"
         if observation.player is None:
             return None, False, "waiting-marker"
         if self._return_mode == "drop-to-route":
@@ -7354,6 +7393,13 @@ class MovementWorker(threading.Thread):
                 else self.fixed_target_x
             )
             return rope_x, True, "return.climb"
+        if not self._route_layers:
+            # Nothing recorded on any layer: stand still (Fixed Attack / YOLO
+            # keep attacking) instead of the old fall-back-to-rope walk.  An
+            # active stand-still return above is deliberately handled first:
+            # it can use a lower layer's rope even when that layer has no
+            # patrol edges and therefore is absent from ``_route_layers``.
+            return None, False, "stand-still"
         self._select_route_layer(observation)
         if self._route_layer_index is None or self._route_layer_index >= len(self._route_layers):
             return None, False, "route-complete"
@@ -8833,6 +8879,23 @@ class MovementWorker(threading.Thread):
                         )
                         if pickup_jump is not None:
                             decision = pickup_jump
+                    # Returning to the temporary stake is also a real
+                    # horizontal traversal of its layer.  It can pass a
+                    # left/right jump point before it reaches the final
+                    # +/-0.02 anchor approach zone.  Previously only the
+                    # optional pickup circuit consulted jump points here, so
+                    # a layer-2 return walked straight through a valid point.
+                    elif (decision.reason.startswith("stationary return walking")
+                          and decision.key in ("left", "right")
+                          and self._stationary_route_anchor_layer):
+                        return_jump = self._jump_point_decision(
+                            observation,
+                            self._stationary_route_anchor_layer,
+                            None,
+                            travel_direction=decision.key,
+                        )
+                        if return_jump is not None:
+                            decision = return_jump
                 elif route_label == "stationary-attack-awaiting-anchor":
                     decision = MovementDecision(
                         None, "stationary attack requires a fresh Start Patrol position"

@@ -702,9 +702,12 @@ class TradeWorker(threading.Thread):
                         "refocused after trader detection"
                     )
                     return
-                if not self._send_message(geometry, message):
-                    LOG.warning("trade message failed; confirmation skipped")
-                    return
+                if message:
+                    if not self._send_message(geometry, message):
+                        LOG.warning("trade message failed; confirmation skipped")
+                        return
+                else:
+                    LOG.info("trade invite: no quick message configured; skipping chat text")
                 if not self._wait_or_cancel(0.35):
                     return
                 confirmed = self._confirm_trade(geometry)
@@ -751,9 +754,14 @@ class TradeWorker(threading.Thread):
         # Let the accepted trade dialog settle before entering chat text.
         if not self._wait_or_cancel(0.35):
             return
-        if self._send_message(geometry, message):
-            self._play_success()
-            LOG.info("trade acceptance workflow completed")
+        if message:
+            if not self._send_message(geometry, message):
+                LOG.warning("trade acceptance message failed")
+                return
+        else:
+            LOG.info("trade accept: no quick message configured; skipping chat text")
+        self._play_success()
+        LOG.info("trade acceptance workflow completed")
 
     def run(self) -> None:
         LOG.info("trade worker started")

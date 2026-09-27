@@ -22,6 +22,16 @@ class PinnedTlsError(ConnectionError):
     pass
 
 
+class PinnedTlsResponseError(PinnedTlsError):
+    """A verified server returned an application-level rejection."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = int(status)
+        self.code = str(code)
+        self.message = str(message)
+
+
 def load_pin(path: Path) -> str:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -61,7 +71,11 @@ def post_json(endpoint: str, path: str, payload: dict, pin_path: Path, timeout: 
         data = json.loads(response.read().decode("utf-8"))
         if response.status >= 400:
             SERVER_LOG.warning("secure request rejected by server status=%s endpoint=%s", response.status, safe_endpoint)
-            raise PinnedTlsError(str(data.get("message", "授权服务器拒绝请求。")))
+            raise PinnedTlsResponseError(
+                response.status,
+                str(data.get("code", "SERVER_REJECTED")),
+                str(data.get("message", "授权服务器拒绝请求。")),
+            )
         SERVER_LOG.info("secure request completed status=%s endpoint=%s", response.status, safe_endpoint)
         return data
     except PinnedTlsError:

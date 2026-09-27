@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Optional
-from pinned_tls import PinnedTlsError, post_json
+from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json
 
 
 SERVER_LOG = logging.getLogger("server-client")
@@ -73,6 +73,22 @@ def runtime_root() -> Path:
 
 def license_path(root: Optional[Path] = None) -> Path:
     return Path(root or runtime_root()) / LICENSE_FILE
+
+
+def revoke_license(root: Optional[Path] = None) -> bool:
+    """Remove the locally saved entitlement after a rejected replacement code.
+
+    An activation attempt is authoritative: if the submitted code cannot be
+    validated, an older entitlement must not make the next launch appear
+    authorized.  A fresh valid activation recreates this file atomically.
+    """
+
+    target = license_path(root)
+    try:
+        target.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
 
 
 def public_key_path(root: Optional[Path] = None) -> Path:
@@ -367,6 +383,13 @@ def activate_via_server(
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
         document = answer["license"]
+    except PinnedTlsResponseError as exc:
+        SERVER_LOG.warning(
+            "activation rejected by server status=%s code=%s", exc.status, exc.code
+        )
+        return LicenseStatus(
+            False, f"server:{exc.code}", exc.message
+        )
     except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
         SERVER_LOG.warning("activation failed category=%s", type(exc).__name__)
         return LicenseStatus(False, "server", f"授权服务器不可用：{exc}")
@@ -388,5 +411,5 @@ __all__ = [
     "ACTIVATION_PREFIX", "EDITION_NORMAL", "EDITION_NP", "LICENSE_FORMAT",
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
     "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
-    "license_path", "public_key_path", "runtime_root", "verify_license",
+    "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
 ]

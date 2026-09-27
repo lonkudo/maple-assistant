@@ -253,6 +253,10 @@ CONNECT_TEMPLATE_MIN_SCORE = 0.62
 CHANNEL_CONFIRM_ROUND_WAIT_SECONDS = 2.0
 CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS = 0.12
 CHANNEL_CONFIRM_ROUNDS = 3
+# During the final channel handoff, a real minimap marker is stronger evidence
+# than a completed Enter routine.  Poll at the shared capture cadence so an
+# already-loaded game immediately cancels the remaining confirmation keys.
+CHANNEL_CONFIRM_MARKER_POLL_SECONDS = 0.20
 # When no usable game window exists, retry a *fresh title search* at this pace.
 # The shared WindowKeySender itself first tries its current handle and only then
 # re-anchors to a newly created game window.
@@ -1869,11 +1873,7 @@ class ReconnectWorker(threading.Thread):
             if self.stop_event.is_set() or self._cancel_requested.is_set():
                 return False
             samples += 1
-            try:
-                visible = bool(probe())
-            except Exception:
-                LOG.debug("auto reconnect: post-login marker probe failed", exc_info=True)
-                visible = False
+            visible = self._post_login_marker_visible()
             consecutive = consecutive + 1 if visible else 0
             if consecutive >= POST_LOGIN_MARKER_CONFIRM_SAMPLES:
                 LOG.info(
@@ -1893,6 +1893,54 @@ class ReconnectWorker(threading.Thread):
             samples,
         )
         return False
+
+    def _post_login_marker_visible(self) -> bool:
+        """Return one safe fresh yellow-marker observation, if available."""
+
+        probe = self._post_login_marker_ready_fn
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            LOG.debug("auto reconnect: post-login marker probe failed", exc_info=True)
+            return False
+
+    def _wait_for_channel_confirm_or_marker(self, seconds: float) -> Optional[bool]:
+        """Wait for a channel handoff window, unless the game is already live.
+
+        ``True`` means a character marker was seen and the remaining Enter
+        confirmation must be skipped; ``False`` means the quiet interval
+        elapsed; ``None`` means stop/Esc interrupted the reconnect.
+        """
+
+        # Test clocks intentionally do not advance ``time.monotonic()``.  Use
+        # their supplied one-shot wait while retaining the real application's
+        # responsive 5 fps marker polling below.
+        if self._sleep is not time.sleep:
+            if self._post_login_marker_visible():
+                return True
+            if not self._sleep_checked(seconds):
+                return None
+            return self._post_login_marker_visible()
+
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self.stop_event.is_set() or self._cancel_requested.is_set():
+                return None
+            if self._post_login_marker_visible():
+                LOG.info(
+                    "auto reconnect: yellow marker appeared during channel confirmation; "
+                    "skipping remaining Enter pairs"
+                )
+                self._report("loading", "角色已进入地图，停止后续 Enter 确认")
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if not self._sleep_checked(
+                    min(CHANNEL_CONFIRM_MARKER_POLL_SECONDS, remaining)):
+                return None
 
     def _announce_disarmed_input(self) -> None:
         """State loudly that typing is off after this run, in the log and in the panel."""
@@ -3739,11 +3787,18 @@ class ReconnectWorker(threading.Thread):
 
         # The last handoff is intentionally not a one-second Enter loop.  The
         # client needs a quiet interval after channel selection, then receives
-        # two Enter taps; repeat that complete round twice more.
+        # two Enter taps; repeat that complete round twice more.  Once the
+        # yellow character marker appears, the client has already loaded into
+        # the map, so no remaining Enter pair is sent.
         before_enter = self._capture()[0]
         for round_number in range(1, CHANNEL_CONFIRM_ROUNDS + 1):
-            if not self._sleep_checked(CHANNEL_CONFIRM_ROUND_WAIT_SECONDS):
+            marker_seen = self._wait_for_channel_confirm_or_marker(
+                CHANNEL_CONFIRM_ROUND_WAIT_SECONDS
+            )
+            if marker_seen is None:
                 return False
+            if marker_seen:
+                return True
             for press_number in range(1, 3):
                 reason = self._press("enter")
                 if reason:

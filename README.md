@@ -35,8 +35,9 @@ It must never be copied into a desktop release.
 Server-issued activation codes are exactly 256 characters long (`MAL-` plus
 252 cryptographically random hexadecimal characters). The server retains only
 their SHA-256 hashes, binds one code to one device on first activation, and
-starts a time-limited expiry then. Ten failed activations for one fingerprint
-within 24 hours ban that fingerprint.
+starts a time-limited expiry then. A device may own multiple separately issued
+codes; each individual code can bind to only one device. Ten failed activations
+for one fingerprint within 24 hours ban that fingerprint.
 
 The activation address is built into the desktop client:
 `https://211.149.169.194:8443`. Customers enter only their activation code;
@@ -55,6 +56,13 @@ key can never be reconstructed from its public key.
 certificate-pin outcome, HTTP result, and local acceptance/refusal category.
 It never records an activation code, hardware fingerprint, token, or secret.
 The linked-node icon in **运行日志** copies this file to the clipboard.
+
+The most recently submitted code and its validation result are stored in the
+`license` section of `user_config.json`. The signed `license.json` document is
+the actual local entitlement. A verified rejected replacement code immediately
+locks automation and removes that signed document, so the rejected state also
+persists after restart. A connection, TLS, or server-configuration failure is
+reported separately and does not erase a previously saved entitlement.
 
 Online auto-lie session/key delivery remains deliberately separate from the
 existing auto-lie adapter until the versioned server-client session protocol is

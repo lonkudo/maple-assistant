@@ -25,6 +25,7 @@ SECTION_FILES = {
     "yolo_detection": "yolo_detection_settings.json",
     "ui_window": "ui_window_settings.json",
     "tracking_test": "tracking_test_settings.json",
+    "license": "license_settings.json",
 }
 
 DEFAULT_USER_CONFIG: dict[str, Any] = {
@@ -86,6 +87,16 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     # picker opens in the right folder instead of always falling back to the
     # bundled demo clip.
     "tracking_test": {"video": ""},
+    # The most recently submitted activation code is user-owned state.  The
+    # signed license document remains the authorization authority; this
+    # section only remembers what the operator last submitted and its result.
+    "license": {
+        "activation_code": "",
+        "last_validation_valid": False,
+        "last_validation_code": "",
+        "last_validation_message": "",
+        "last_validation_at": "",
+    },
 }
 
 DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {

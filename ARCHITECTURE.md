@@ -60,8 +60,13 @@ The coordinator is intentionally the only place where a capture source, a worker
 
 `licensing.py` is the local authorization boundary: it verifies signed license
 documents using the public key packaged with the desktop application and keeps
-the automation gate non-throwing. For a `MAL-` activation code, it derives an
-opaque stable fingerprint locally and calls the fixed activation API at
+the automation gate non-throwing. The latest submitted activation code and its
+safe validation result live in the user-owned `license` configuration section;
+the signed `license.json` is the entitlement authority. A verified rejected
+replacement code removes that entitlement and locks every automation worker,
+whereas transport/TLS/server-availability failures remain distinguishable and
+do not erase a previous entitlement. For a `MAL-` activation code, it derives
+an opaque stable fingerprint locally and calls the fixed activation API at
 `https://211.149.169.194:8443/api/v1/activate`. The customer never supplies an
 endpoint. A successful v2 response is Ed25519-verified, checked against the
 local fingerprint, and atomically saved as `license.json`.
@@ -72,7 +77,9 @@ material. `LICENSE_SIGNING_PRIVATE_KEY` is an environment-only Base64url
 Ed25519 private key. Its matching public key is the `license_public_key.json`
 file shipped with the desktop release. The desktop repository must never
 contain the server database, plaintext activation inventory, signing private
-key, TLS private key, operator token, or auto-lie product secret.
+key, TLS private key, operator token, or auto-lie product secret. Its binding
+policy is one code to one fingerprint; a fingerprint may activate multiple
+different codes over time.
 
 `pinned_tls.py` is a transport-only component. It reads the public pin from
 `activation_server_pin.json`, checks the server TLS public-key hash before a

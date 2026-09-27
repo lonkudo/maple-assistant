@@ -225,9 +225,12 @@ class PatrolController:
         self.config_store = config_store
         self._profile = deepcopy(profile)
         self._enabled = bool(profile.get("patrol_enabled", False))
-        route = list(profile.get("route_order", []))
         layers = profile.get("layers", {})
-        self._selected_layer = route[-1] if route else next(iter(layers), "")
+        # The calibration row starts on the physical final (top) layer, not
+        # the last JSON/recording-order entry.  Recording order is arbitrary:
+        # a lower rope can be saved after a final-layer endpoint, which used
+        # to make the assistant open on the wrong row.
+        self._selected_layer = self._final_layer_name_locked()
         # Contiguous patrol floor range lives in the profile
         # (``patrol_start_layer`` / ``patrol_end_layer``) so recordings, the
         # UI and the movement worker all see the same persisted selection.
@@ -605,7 +608,7 @@ class PatrolController:
 
     def _final_layer_name_locked(self) -> Optional[str]:
         layers = self._profile.get("layers", {})
-        return next(reversed(layers), None) if layers else None
+        return max(layers, key=_layer_number) if layers else None
 
     def _layer_has_points_locked(
         self,

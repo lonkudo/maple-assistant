@@ -34,7 +34,7 @@ from config_store import config_section_file
 from countdown_worker import play_mp3
 from licensing import (
     LicenseStatus, activate as activate_license, activate_via_server,
-    verify_license,
+    revoke_license, verify_license,
 )
 from reconnect_worker import (
     CHANNEL_DEFAULT,
@@ -921,6 +921,10 @@ class UiWorker(threading.Thread):
         # patrol/trade worker internals, it only decides whether UI actions may
         # enter those workflows.
         self._license_status: LicenseStatus = verify_license()
+        # An unsuccessful activation attempt must lock THIS session at once.
+        # Do not fall back to a previously saved license file until a fresh,
+        # successful activation explicitly unlocks it again.
+        self._license_session_locked = not self._license_status.valid
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -1564,23 +1568,23 @@ class UiWorker(threading.Thread):
             pickup_gap_minus = ttk.Button(pickup_random_group, text="−", width=2)
             self._bind_repeat_step_button(
                 pickup_gap_minus, lambda: self._stationary_pickup_adjust_gap(-0.1),
-                current=self._stationary_pickup_gap_seconds,
+                current=self._stationary_pickup_gap_minutes,
                 coarse=lambda anchor: self._set_stationary_pickup_gap(
-                    (self._stationary_pickup_gap_seconds() if anchor is None else anchor)
+                    (self._stationary_pickup_gap_minutes() if anchor is None else anchor)
                     - self._RANDOM_GAP_COARSE_STEP
                 ),
             )
             pickup_gap_minus.pack(side="left", padx=(0, 1))
             self._stationary_pickup_gap_label = ttk.Label(
-                pickup_random_group, text="0.1s", width=5, anchor="center"
+                pickup_random_group, text="0.1m", width=5, anchor="center"
             )
             self._stationary_pickup_gap_label.pack(side="left")
             pickup_gap_plus = ttk.Button(pickup_random_group, text="+", width=2)
             self._bind_repeat_step_button(
                 pickup_gap_plus, lambda: self._stationary_pickup_adjust_gap(0.1),
-                current=self._stationary_pickup_gap_seconds,
+                current=self._stationary_pickup_gap_minutes,
                 coarse=lambda anchor: self._set_stationary_pickup_gap(
-                    (self._stationary_pickup_gap_seconds() if anchor is None else anchor)
+                    (self._stationary_pickup_gap_minutes() if anchor is None else anchor)
                     + self._RANDOM_GAP_COARSE_STEP
                 ),
             )
@@ -1652,7 +1656,9 @@ class UiWorker(threading.Thread):
                 wraplength=440,
             )
             self._fixed_load_settings()
-            self._fixed_status.pack(fill="x", pady=(4, 0))
+            # Keep the status sink for non-UI callers, but do not display a
+            # hint in the attack-mode panel.  It consumed vertical space and
+            # duplicated information available in the run/status panels.
             # Defensive: after realization, update only stationary control
             # states. It must never pack/unpack rows or relayout column 0.
             root.after(200, self._fixed_refresh_rows)
@@ -2151,34 +2157,16 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            # TEMPORARY (testing aid): run the whole reconnect sequence immediately, so the
-            # operator can check Enter -> 3s -> world -> channel -> Enter -> 2s -> Enter
-            # without waiting for a real 掉线.  It is the only button here: the sequence is
-            # keyboard only, so there is no window capture and no calibration to do.
-            # ONE row for both test buttons (the operator's layout), the hint area below them.
-            reconnect_buttons = ttk.Frame(extra_panel)
-            reconnect_buttons.pack(fill="x", pady=(2, 0))
-            self._reconnect_test_button = ttk.Button(
-                reconnect_buttons,
-                text="测试自动重连（临时）",
-                command=self._reconnect_test_clicked,
-            )
-            self._reconnect_test_button.pack(side="left")
-            # 测试api: pick a video file, play it in its own focused window and send each frame's
-            # ROI (372x248 jpeg90 base64) to the RoiTrack backend at the API's 5 fps, showing every
-            # answer.  The mouse is confined to the picture rectangle, so it never touches the game.
-            # One button only: the run length is the measured ~30s and the product key travels with
-            # the application (autolie_api/key_secret.txt, or LIE_PRODUCT_KEY), so there is nothing
-            # for the operator to configure here.
-            self._api_test_button = ttk.Button(
-                reconnect_buttons, text="测试api", command=self._api_test_clicked,
-            )
-            self._api_test_button.pack(side="left", padx=(6, 0))
-            # The shared HINT area at the bottom of the panel: 自动过测谎 and 自动重连 report into it.
+            # v1.1.147: the temporary 「测试自动重连」and 「测试api」
+            # release controls, together with their manual-test hint, are
+            # intentionally not constructed.  The actual automatic reconnect
+            # and automatic lie workflows remain enabled above.
+            # This status line is reserved for automatic-lie progress only;
+            # it starts blank so no diagnostic/test wording reaches users.
             hint_row = ttk.Frame(extra_panel)
             hint_row.pack(fill="x", pady=(2, 0))
             self._api_test_status = ttk.Label(
-                hint_row, text=self._api_test_status_text(),
+                hint_row, text="",
                 justify="left", wraplength=440,
             )
             self._api_test_status.pack(anchor="w")
@@ -2920,6 +2908,8 @@ class UiWorker(threading.Thread):
     def _license_allowed(self) -> bool:
         """Refresh and return the signed-license gate without raising."""
 
+        if getattr(self, "_license_session_locked", False):
+            return False
         self._license_status = verify_license()
         return bool(self._license_status.valid)
 
@@ -2934,10 +2924,14 @@ class UiWorker(threading.Thread):
                     status.expires_at
                 )
                 label.configure(
-                    text=f"授权有效 · {status.edition.upper()} · 到期：{expiry}"
+                    text=f"授权有效 · {status.edition.upper()} · 到期：{expiry}",
+                    foreground="#17803d",
                 )
             else:
-                label.configure(text=f"未授权 / 已过期：{status.message}")
+                label.configure(
+                    text=f"未授权 / 已过期：{status.message}",
+                    foreground="#202020",
+                )
         button = getattr(self, "_license_button", None)
         if button is not None:
             button.configure(text="更换授权" if status.valid else "激活授权")
@@ -2996,6 +2990,188 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_quick_message_status"):
             self._quick_message_status.configure(text=text)
 
+    def _show_license_status_alert(self) -> None:
+        """Confirm a successful authorization in a user-visible alert."""
+
+        root = getattr(self, "_root", None)
+        status = self._license_status
+        if root is None or not status.valid:
+            return
+        expiry = "永久" if status.expires_at is None else self._format_license_expiry(
+            status.expires_at
+        )
+        try:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "授权状态",
+                f"授权有效\n版本：{status.edition.upper()}\n到期：{expiry}",
+                parent=root,
+            )
+        except Exception:
+            LOG.debug("license status alert could not open", exc_info=True)
+
+    def _show_activation_result_alert(self) -> None:
+        """Show the result of this explicit user activation attempt only."""
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        status = self._license_status
+        try:
+            from tkinter import messagebox
+            if status.valid:
+                self._show_license_status_alert()
+            else:
+                messagebox.showerror(
+                    "授权失败",
+                    f"授权码未通过验证。\n\n{status.message}",
+                    parent=root,
+                )
+        except Exception:
+            LOG.debug("activation result alert could not open", exc_info=True)
+
+    @staticmethod
+    def _license_settings_path() -> Path:
+        """Return the user-owned activation-attempt settings section."""
+
+        return config_section_file("license")
+
+    def _save_license_attempt(
+        self, activation_code: str, status: Optional[LicenseStatus] = None
+    ) -> None:
+        """Persist the submitted code regardless of whether validation succeeds.
+
+        ``license.json`` is the signed authorization document.  This
+        user-config entry records the last code the operator chose to submit
+        and the outcome of that exact validation attempt.
+        """
+
+        try:
+            path = self._license_settings_path()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["activation_code"] = str(activation_code)
+            if status is not None:
+                data.update({
+                    "last_validation_valid": bool(status.valid),
+                    "last_validation_code": str(status.code),
+                    "last_validation_message": str(status.message),
+                    "last_validation_at": datetime.now(timezone.utc).isoformat(),
+                })
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            LOG.warning("could not save activation attempt to user_config", exc_info=True)
+
+    def _lock_licensed_functions(self) -> None:
+        """Immediately stop and lock every licensed automation surface."""
+
+        self._license_session_locked = True
+        self._patrol_intent = False
+        self._api_auto_lie_pending = False
+        self._api_auto_lie_session_armed = False
+        for event in (
+            getattr(self, "automation_active_event", None),
+            getattr(self, "lie_watch_armed_event", None),
+            getattr(self, "disconnect_watch_armed_event", None),
+        ):
+            try:
+                if event is not None:
+                    event.clear()
+            except Exception:
+                LOG.debug("license lock could not clear an automation event", exc_info=True)
+        for name in ("attack_worker", "random_jump_worker", "small_step_worker"):
+            worker = getattr(self, name, None)
+            if worker is not None and hasattr(worker, "enabled"):
+                try:
+                    worker.enabled = False
+                except Exception:
+                    LOG.debug("license lock could not disable %s", name, exc_info=True)
+        mover = getattr(self, "movement_worker", None)
+        if mover is not None:
+            try:
+                stationary_setter = getattr(mover, "set_stationary_attack_enabled", None)
+                if callable(stationary_setter):
+                    stationary_setter(False)
+                pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
+                if callable(pickup_setter):
+                    pickup_setter(False, 0.0, 0.0)
+            except Exception:
+                LOG.debug("license lock could disable stationary actions", exc_info=True)
+        for variable_name in (
+            "_stationary_jump_enabled_var", "_stationary_pickup_enabled_var",
+            "_small_step_enabled_var",
+        ):
+            variable = getattr(self, variable_name, None)
+            try:
+                if variable is not None:
+                    variable.set(False)
+            except Exception:
+                LOG.debug("license lock could clear %s", variable_name, exc_info=True)
+        reconnect = getattr(self, "reconnect_worker", None)
+        if reconnect is not None:
+            try:
+                reconnect.set_enabled(False)
+                reconnect.request_cancel()
+            except Exception:
+                LOG.debug("license lock could not stop auto reconnect", exc_info=True)
+        for worker, method in (
+            (getattr(self, "trade_worker", None), "request_cancel"),
+            (getattr(self, "lie_detector_worker", None), "set_enabled"),
+            (getattr(self, "character_worker", None), "set_disconnect_alert"),
+            (getattr(self, "movement_worker", None), "set_other_player_check"),
+        ):
+            callback = getattr(worker, method, None)
+            if callable(callback):
+                try:
+                    callback(False) if method in {
+                        "set_enabled", "set_disconnect_alert", "set_other_player_check"
+                    } else callback()
+                except Exception:
+                    LOG.debug("license lock could not stop %s", method, exc_info=True)
+        self.request_cancel_auto_lie_pass()
+        for variable_name in (
+            "_reconnect_var", "_api_auto_lie_var", "_disconnect_alert_var",
+            "_lie_alert_var", "_shutdown_enabled_var", "_player_check_var",
+        ):
+            variable = getattr(self, variable_name, None)
+            try:
+                if variable is not None:
+                    variable.set(False)
+            except Exception:
+                pass
+        controller = getattr(self, "patrol_controller", None)
+        was_running = bool(controller is not None and controller.is_enabled())
+        if was_running:
+            self._stop_patrol()
+        self._set_license_visual_lock(True)
+        self._refresh_license_ui()
+
+    def _revoke_saved_license(self) -> None:
+        """Ensure a rejected activation also remains rejected after restart."""
+
+        if revoke_license():
+            LOG.info("invalid activation removed the saved license")
+        else:
+            LOG.warning("invalid activation could not remove saved license")
+
+    @staticmethod
+    def _activation_failure_replaces_license(status: LicenseStatus) -> bool:
+        """Only a verified rejected code supersedes an existing entitlement.
+
+        A bad activation code must lock the product permanently.  A network,
+        TLS, or server-configuration outage must not erase a valid paid
+        entitlement merely because validation could not be reached.
+        """
+
+        return status.code == "activation" or status.code.startswith("server:")
+
     def _activate_license(self) -> None:
         """Accept a customer activation code for the built-in licensing service."""
 
@@ -3009,12 +3185,19 @@ class UiWorker(threading.Thread):
             return
         if not code:
             return
+        code = str(code).strip()
+        # Save the new code before contacting a local or online validator.  A
+        # rejected value must not silently leave the previous submitted code
+        # in user_config.json.
+        self._save_license_attempt(code)
         if str(code).strip().upper().startswith("MAL-"):
             self._license_status = activate_via_server(code)
         else:
             self._license_status = activate_license(code)
+        self._save_license_attempt(code, self._license_status)
         self._refresh_license_ui()
         if self._license_status.valid:
+            self._license_session_locked = False
             LOG.info("license activated id=%s edition=%s", self._license_status.license_id,
                      self._license_status.edition)
             self._set_license_visual_lock(False)
@@ -3022,7 +3205,14 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="授权已保存，自动功能已解锁。")
         else:
             LOG.warning("license activation failed: %s", self._license_status.code)
+            if self._activation_failure_replaces_license(self._license_status):
+                # A verified rejected code replaces the prior activation
+                # choice.  Remove the old signed document so a restart cannot
+                # silently restore authorization from a previous code.
+                self._revoke_saved_license()
+            self._lock_licensed_functions()
             self._show_license_refusal()
+        self._show_activation_result_alert()
         self._refresh_patrol_controls()
 
     def _drain_hotkey_actions(self) -> None:
@@ -3084,11 +3274,7 @@ class UiWorker(threading.Thread):
                         self._quick_messages[0]
                         if getattr(self, "_quick_messages", []) else ""
                     )
-                    if action == "trade:invite" and not message:
-                        self._quick_message_status.configure(
-                            text="交易失败：请先添加第一条快捷消息。"
-                        )
-                    elif action == "trade:invite" and self.trade_worker is not None:
+                    if action == "trade:invite" and self.trade_worker is not None:
                         result = self.trade_worker.toggle_invite(message)
                         if result == "cancelled":
                             self._quick_message_status.configure(
@@ -4359,18 +4545,23 @@ class UiWorker(threading.Thread):
             self.patrol_controller is not None
             and self.patrol_controller.is_enabled()
         )
-        for button in (
-            self._copy_log_button, getattr(self, "_import_config_button", None),
-            getattr(self, "_export_config_button", None),
-            getattr(self, "_copy_error_button", None),
-            getattr(self, "_copy_server_log_button", None),
-        ):
+        # Rebuild in the same left-to-right order used when the panel is
+        # created.  ``pack_forget`` drops the original side option, which
+        # previously made these controls reappear right-aligned after a run.
+        buttons = (
+            (self._copy_log_button, (0, 3)),
+            (getattr(self, "_copy_error_button", None), (0, 3)),
+            (getattr(self, "_copy_server_log_button", None), (0, 3)),
+            (getattr(self, "_import_config_button", None), (0, 3)),
+            (getattr(self, "_export_config_button", None), (0, 0)),
+        )
+        for button, padding in buttons:
             if button is None:
                 continue
             if running:
                 button.pack_forget()
             elif not button.winfo_manager():
-                button.pack(side="right", padx=(3, 0))
+                button.pack(side="left", padx=padding)
 
     def _copy_to_clipboard(self, text: str) -> None:
         root = getattr(self, "_root", None)
@@ -4950,19 +5141,6 @@ class UiWorker(threading.Thread):
             except (AttributeError, TypeError, ValueError):
                 LOG.debug("stationary route axis marker unavailable", exc_info=True)
 
-    def _layer_axis_click(self, event: Any, layer_name: str) -> None:
-        """A single axis click opens its four recording choices."""
-
-        try:
-            # Existing ticks are reserved for inspection/deletion.  A click
-            # on empty axis space is the add-point affordance.
-            if event.widget.find_withtag("current"):
-                self._select_recording_layer(layer_name)
-                return
-        except Exception:
-            pass
-        self._layer_axis_menu(event, layer_name)
-
     def _yolo_settings_path(self) -> Path:
         """JSON file holding the YOLO panel settings."""
 
@@ -5061,7 +5239,12 @@ class UiWorker(threading.Thread):
             "stationary_pickup_interval_seconds": round(
                 self._stationary_pickup_interval_minutes() * 60.0, 1
             ),
-            "stationary_pickup_gap_seconds": self._stationary_pickup_gap_seconds(),
+            # UI values for 捡东西 are minutes.  Keep the seconds value for
+            # the worker/config compatibility, alongside the explicit unit.
+            "stationary_pickup_gap_minutes": self._stationary_pickup_gap_minutes(),
+            "stationary_pickup_gap_seconds": round(
+                self._stationary_pickup_gap_minutes() * 60.0, 1
+            ),
         }
 
     def _fixed_random_gap_seconds(self) -> float:
@@ -5248,13 +5431,15 @@ class UiWorker(threading.Thread):
             max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES, raw),
         ), 1)
 
-    def _stationary_pickup_gap_seconds(self) -> float:
+    def _stationary_pickup_gap_minutes(self) -> float:
+        """Return the 捡东西 random interval in MINUTES (this row's unit)."""
+
         var = getattr(self, "_stationary_pickup_gap_var", None)
         raw = 0.1 if var is None else float(var.get())
         return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
 
     def _set_stationary_pickup_gap(self, value: Optional[float]) -> None:
-        base = self._stationary_pickup_gap_seconds() if value is None else value
+        base = self._stationary_pickup_gap_minutes() if value is None else value
         self._stationary_pickup_gap_var.set(round(
             max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
         ))
@@ -5263,7 +5448,7 @@ class UiWorker(threading.Thread):
     def _stationary_pickup_adjust_gap(self, delta: float) -> None:
         step = abs(delta) or self._FIXED_RANDOM_GAP_STEP
         self._set_stationary_pickup_gap(
-            self._stationary_pickup_gap_seconds() + (step if delta > 0 else -step)
+            self._stationary_pickup_gap_minutes() + (step if delta > 0 else -step)
         )
 
     def _hotkey_adjust_fixed_interval(self, delta: float) -> bool:
@@ -5304,7 +5489,9 @@ class UiWorker(threading.Thread):
         mode = str(getattr(self, "_attack_mode_var", None).get()
                    if hasattr(self, "_attack_mode_var") else "fixed")
         stationary_jump_button = getattr(self, "_stationary_jump_button", None)
-        stationary_enabled = mode == "stationary"
+        # This method runs again after several ordinary UI refreshes.  It must
+        # never reopen stationary controls that the authorization lock closed.
+        stationary_enabled = mode == "stationary" and self._license_allowed()
         for widget in [
             stationary_jump_button,
             *getattr(self, "_stationary_facing_controls", []),
@@ -5375,11 +5562,11 @@ class UiWorker(threading.Thread):
             self._stationary_pickup_interval_label.configure(
                 text=f"{pickup_interval:.1f}m"
             )
-            pickup_gap = self._stationary_pickup_gap_seconds()
-            self._stationary_pickup_gap_label.configure(text=f"{pickup_gap:.1f}s")
+            pickup_gap = self._stationary_pickup_gap_minutes()
+            self._stationary_pickup_gap_label.configure(text=f"{pickup_gap:.1f}m")
             self._stationary_pickup_interval_range_label.configure(
                 text=f"({pickup_interval:.1f}m, "
-                     f"{pickup_interval + pickup_gap / 60.0:.1f}m)"
+                     f"{pickup_interval + pickup_gap:.1f}m)"
             )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
@@ -5414,6 +5601,26 @@ class UiWorker(threading.Thread):
             self._fixed_status.configure(
                 text="巡逻攻击: 工作线程未接入 (无界面模式)。"
             )
+            return
+        # Settings may be refreshed after an authorization failure (for
+        # example by a slider callback).  Do not let that repaint reactivate
+        # any attack, facing, jump-attack, or pickup behavior.
+        if not self._license_allowed():
+            worker.enabled = False
+            worker.jump_attack = False
+            step_worker = getattr(self, "small_step_worker", None)
+            if step_worker is not None:
+                step_worker.enabled = False
+            mover = getattr(self, "movement_worker", None)
+            if mover is not None:
+                stationary_setter = getattr(
+                    mover, "set_stationary_attack_enabled", None
+                )
+                if callable(stationary_setter):
+                    stationary_setter(False)
+                pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
+                if callable(pickup_setter):
+                    pickup_setter(False, 0.0, 0.0)
             return
         mode = str(data.get("attack_mode", "fixed"))
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
@@ -5620,11 +5827,17 @@ class UiWorker(threading.Thread):
                     max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES,
                         float(data["stationary_pickup_interval_seconds"]) / 60.0),
                 ))
-            if ("stationary_pickup_gap_seconds" in data
-                    and hasattr(self, "_stationary_pickup_gap_var")):
-                self._stationary_pickup_gap_var.set(float(
-                    data["stationary_pickup_gap_seconds"]
-                ))
+            if hasattr(self, "_stationary_pickup_gap_var"):
+                if "stationary_pickup_gap_minutes" in data:
+                    self._stationary_pickup_gap_var.set(float(
+                        data["stationary_pickup_gap_minutes"]
+                    ))
+                elif "stationary_pickup_gap_seconds" in data:
+                    # Older configs stored this particular UI value in
+                    # seconds.  Convert once when loading them.
+                    self._stationary_pickup_gap_var.set(
+                        float(data["stationary_pickup_gap_seconds"]) / 60.0
+                    )
             if hasattr(self, "_stationary_facing_direction_var"):
                 direction = str(data.get("stationary_facing_direction", ""))
                 if direction not in ("left", "right", "both"):
@@ -6441,6 +6654,8 @@ class UiWorker(threading.Thread):
         "adjust_fixed_attack_interval:-0.1": "缩短巡逻攻击间隔 0.1 秒",
         "adjust_fixed_attack_interval:+0.1": "加长巡逻攻击间隔 0.1 秒",
         "quick_pickup:toggle": "开启 / 关闭快速拾取（仅停止巡逻时）",
+        "trade:invite": "向鼠标所在角色发起交易",
+        "trade:accept": "接受交易邀请",
     }
 
     def _help_key_label(self, keys: str) -> str:
@@ -6569,24 +6784,24 @@ class UiWorker(threading.Thread):
         self._help_popup = popup
 
         enabled = bool(data.get("enabled", True))
-        state_text = "已启用 (hotkey.json → enabled: true)" if enabled \
-            else "已停用 (hotkey.json → enabled: false)"
+        state_text = "已启用（配置文件 hotkey.json：enabled=true）" if enabled \
+            else "已停用（配置文件 hotkey.json：enabled=false）"
         header_text = (
             f"快捷键总开关: {state_text}\n"
             "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
             "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
             "按快捷键后会自动松开 Ctrl，避免游戏里的 Ctrl 攻击持续触发"
-            "(hotkey.json → release_ctrl_after_chord: true，默认开启)。\n"
+            "（配置项 release_ctrl_after_chord=true，默认开启）。\n"
             "日文/中文/韩文输入法开启时会吞掉 Ctrl 组合键；"
             "请把输入法切到「英数/半角英数」或关闭。\n"
-            "修改 hotkey.json 后需重启程序生效。"
+            "修改快捷键配置文件后需重启程序生效。"
         )
         footer_text = (
-            "启用/停用: hotkey.json 的 enabled 字段控制总开关; "
-            "巡逻中自动停用除 Ctrl+` 与攻击间隔外的快捷键; "
-            "ignore_injected=true 只响应真实物理按键; "
-            "delivery=hook 用低级键盘钩子识别(默认，输入法开启时仍可用)、"
-            "delivery=native 用系统热键。\n"
+            "启用/停用：配置文件的 enabled 控制总开关；"
+            "巡逻中除 Ctrl+` 与攻击间隔外的快捷键会暂时停用；"
+            "ignore_injected=true 表示只响应真实物理按键；"
+            "delivery=hook 表示使用低级键盘钩子（默认，输入法开启时仍可用），"
+            "delivery=native 表示使用系统热键。\n"
             "移开鼠标即自动关闭本提示。"
         )
 
@@ -6601,9 +6816,6 @@ class UiWorker(threading.Thread):
             if not isinstance(item, dict):
                 continue
             action = str(item.get("action", ""))
-            # Trade controls are intentionally not public help bindings.
-            if action.startswith("trade:"):
-                continue
             # The ten quick-message slots (Ctrl+1..Ctrl+9, Ctrl+0) share one
             # row instead of ten identical rows.
             if action.startswith("quick_message:"):
@@ -7981,19 +8193,13 @@ class UiWorker(threading.Thread):
                 width=_LAYER_AXIS_WIDTH,
                 height=_LAYER_AXIS_HEIGHT,
                 highlightthickness=0,
-                background="#f5f5f5",
+                background="#f0f0f0",
                 cursor="hand2",
             )
             canvas.pack(side="left", fill="x", expand=True)
-            canvas.bind(
-                "<Button-1>",
-                lambda event, layer=layer_name: self._layer_axis_click(event, layer),
-            )
-            # A RIGHT click always opens the point-recording menu.  The left
-            # click only opens it on empty axis space: one that lands on an
-            # already-recorded marker means "select this layer" (existing ticks
-            # are reserved for inspection/deletion), which the operator read as
-            # "the dropdown does not open in the layer UI".
+            # Recording choices are intentionally right-click only.  Left
+            # clicks remain free for normal UI selection and marker double-
+            # click deletion, never opening an add-recording menu.
             canvas.bind(
                 "<Button-3>",
                 lambda event, layer=layer_name: self._layer_axis_menu(event, layer),

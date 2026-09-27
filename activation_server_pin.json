@@ -1,0 +1,7 @@
+{
+  "format": "maple-assistant-tls-pin/v1",
+  "endpoint": "https://211.149.169.194:8443",
+  "spki_sha256": "J1zR+0LlTp+YJSoRenFnZ+FtH+rRwc9HO05KCvjfCRc=",
+  "certificate_sha256": "5caf0d76809e6b9757abd225b62b069565e09d709e785e41f96c16e8e46e8fec",
+  "expires_at": "2027-09-25T06:39:48Z"
+}

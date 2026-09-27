@@ -1004,13 +1004,22 @@ def main() -> int:
                     )
                 except Exception:
                     logging.warning("STATIONARY ATTACK marker overlay failed", exc_info=True)
+            if stationary_reanchor:
+                # A manual stand-still start deliberately has no route
+                # handoff: the just-recorded temporary point is the entire
+                # starting state.  Automatic resumes are different.  They
+                # must preserve this point, then inspect the *current*
+                # marker against the recorded route so the movement worker
+                # can either drop down or climb/walk back to it.
+                logging.info(
+                    "STATIONARY ATTACK startup: temporary current-position "
+                    "anchor saved; recorded layers were not checked"
+                )
+                return
             logging.info(
-                "STATIONARY ATTACK startup: %s; recorded layers were not checked",
-                "temporary current-position anchor saved"
-                if stationary_reanchor
-                else "automatic resume kept the recorded standing position",
+                "STATIONARY ATTACK automatic resume: preserved temporary "
+                "standing point; checking the current floor for route return"
             )
-            return
         title_image = fresh_frame.image.crop(detection.map_name_box)
         if configured_name and map_identity_store.has_reference(configured_name):
             matched, score = map_identity_store.matches(configured_name, title_image)
@@ -1423,7 +1432,15 @@ def main() -> int:
 
         def prepare() -> None:
             try:
-                prepare_map_session(show_overlays=False, require_layer=False)
+                # This is an automatic resume, never a new manual standing
+                # point.  Preserve the temporary stationary anchor and hand
+                # the freshly detected marker to the normal drop/return
+                # startup logic.
+                prepare_map_session(
+                    stationary_reanchor=False,
+                    show_overlays=False,
+                    require_layer=False,
+                )
             except OSError as exc:
                 # The map session could not be prepared at all (no minimap, no marker, wrong map):
                 # still arm the patrol, so the workers can recover instead of staying dead.
