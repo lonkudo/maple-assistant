@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    打包 MapleAssistant 的最小发布文件夹。
+    打包 TodoHelper 的最小发布文件夹。
 
 .DESCRIPTION
     只复制运行所需的文件（不含虚拟环境、日志、测试、work 数据、git 元数据）。
@@ -30,7 +30,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "版本号必须是 1.0.0 这样的三段数字（主.次.补丁）: $Version"
 }
 if (-not $OutDir) {
-    $OutDir = "release\MapleAssistant"
+    $OutDir = "release\TodoHelper"
 }
 $out = Join-Path $root $OutDir
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
@@ -98,7 +98,7 @@ On Error Resume Next
 shellApp.ShellExecute "powershell.exe", arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
-    MsgBox "MapleAssistant could not start. Open assistant-launch-status.log in this folder.", 16, "MapleAssistant"
+    MsgBox "TodoHelper could not start. Open assistant-launch-status.log in this folder.", 16, "TodoHelper"
 End If
 On Error GoTo 0
 
@@ -175,6 +175,20 @@ if (Test-Path $offlinePromptSquareIn) {
     Copy-Item $offlinePromptSquareIn (Join-Path $out "recording-assets\offline_prompt_square.png") -Force
 }
 
+# Auto reconnect cannot safely decide that an absent yellow marker is an
+# offline screen without the shipped login-page colour crop.  Fail the build
+# here instead of producing an apparently healthy package that can never
+# reconnect on an installed machine.
+$requiredReconnectAssets = @(
+    "login_page_target.jpg"
+)
+foreach ($assetName in $requiredReconnectAssets) {
+    $shippedAsset = Join-Path $out ("recording-assets\" + $assetName)
+    if (-not (Test-Path -LiteralPath $shippedAsset -PathType Leaf)) {
+        throw "Release package is missing required auto-reconnect asset: $shippedAsset"
+    }
+}
+
 # --- autolie_api（自动过测谎 API 集成：图像转换 + 坐标换算）------------------------
 # 该目录是一个 Python 包，必须随包分发，否则 import autolie_api 会失败。除本机测试
 # 文件与体积较大的 sample_captures 外，整个目录原样复制——厂商参考材料
@@ -223,7 +237,7 @@ Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundCo
 Write-Host ""
 
 if ($Zip) {
-    $zipPath = Join-Path $root "release\MapleAssistant-$Version.zip"
+    $zipPath = Join-Path $root "release\TodoHelper-$Version.zip"
     # 仅替换同版本的压缩包；历史发布包保留。
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue

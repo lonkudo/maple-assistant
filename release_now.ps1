@@ -104,7 +104,7 @@ if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes
 }
 $zips = @()
 # One package only: no CPU/CUDA split (the API does the work, there is no local model).
-Write-Host "building the MapleAssistant package..." -ForegroundColor Cyan
+Write-Host "building the TodoHelper package..." -ForegroundColor Cyan
 & powershell -NoProfile -ExecutionPolicy Bypass `
     -File $buildScript -Version $version -Zip 2>&1
 if ($LASTEXITCODE -ne 0) {
@@ -113,7 +113,7 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 $zip = Get-Item -LiteralPath (
-    Join-Path $root "release\MapleAssistant-$version.zip"
+    Join-Path $root "release\TodoHelper-$version.zip"
 ) -ErrorAction SilentlyContinue
 if ($null -eq $zip) {
     Restore-VersionFile
@@ -130,7 +130,7 @@ $zips | ForEach-Object {
 # release never destroys the last usable zip.
 $keep = @{}
 $zips | ForEach-Object { $keep[$_.FullName] = $true }
-Get-ChildItem (Join-Path $root "release") -File -Filter "MapleAssistant-*.zip" |
+Get-ChildItem (Join-Path $root "release") -File -Filter "TodoHelper-*.zip" |
     Where-Object { -not $keep.ContainsKey($_.FullName) } |
     ForEach-Object {
         try {

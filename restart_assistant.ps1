@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $rootPath = [System.IO.Path]::GetFullPath($Root)
 $venvScripts = Join-Path $rootPath ".venv\Scripts"
 $pythonwPath = Join-Path $venvScripts "pythonw.exe"
-$assistantExePath = Join-Path $venvScripts "MapleAssistant.exe"
+$assistantExePath = Join-Path $venvScripts "TodoHelper.exe"
 $startupPath = Join-Path $rootPath "startup_probe.py"
 
 if (-not (Test-Path -LiteralPath $pythonwPath)) {
@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $pythonwPath)) {
 # untouched.
 $targets = Get-CimInstance Win32_Process | Where-Object {
     $_.ProcessId -ne $PID -and (
-        $_.Name -ieq "MapleAssistant.exe" -or
+        $_.Name -ieq "TodoHelper.exe" -or
         (( $_.Name -ieq "pythonw.exe" -or $_.Name -ieq "python.exe" ) -and
          $_.CommandLine -like "*startup_probe.py*" -and
          $_.CommandLine -like "*$rootPath*")
@@ -37,7 +37,7 @@ $deadline = [DateTime]::UtcNow.AddSeconds(3)
 do {
     Start-Sleep -Milliseconds 100
     $remaining = Get-CimInstance Win32_Process | Where-Object {
-        $_.ProcessId -ne $PID -and $_.Name -ieq "MapleAssistant.exe"
+        $_.ProcessId -ne $PID -and $_.Name -ieq "TodoHelper.exe"
     }
 } while ($remaining -and [DateTime]::UtcNow -lt $deadline)
 

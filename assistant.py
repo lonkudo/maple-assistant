@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from minimap_detector import hud_scale_for
+from runtime_paths import application_root
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -71,7 +72,7 @@ MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
 STATUS_CAPTURE_WIDTH = 538
 STATUS_CAPTURE_HEIGHT = 40
 STATUS_CAPTURE_CENTER_OFFSET = 37  # info-bar centre, ref px right of centre
-SINGLE_INSTANCE_MUTEX_NAME = "Local\\MapleAssistant.Singleton.v1"
+SINGLE_INSTANCE_MUTEX_NAME = "Local\\TodoHelper.Singleton.v1"
 # Status-bar widths are FIXED PIXEL values measured on the real client:
 # with the updated UI every bar (HP/MP/EXP) is ~130 px wide at the 1080x768
 # preset, i.e. 164 px inside the 538px reference capture; minimum meaningful
@@ -137,7 +138,7 @@ def _acquire_single_instance_mutex(
         # Treat access denied as proof that the singleton already exists.
         if error_code == 5:
             return None
-        raise OSError(error_code, "could not create Maple Assistant singleton mutex")
+        raise OSError(error_code, "could not create TodoHelper singleton mutex")
     if error_code == 183:  # ERROR_ALREADY_EXISTS
         kernel32.CloseHandle(handle)
         return None
@@ -164,8 +165,8 @@ def _show_already_running_notice() -> None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.MessageBoxW(
             None,
-            "MapleAssistant 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
-            "MapleAssistant",
+            "TodoHelper 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
+            "TodoHelper",
             0x00000040,  # MB_ICONINFORMATION
         )
     except Exception:
@@ -306,7 +307,7 @@ def _clear_previous_log_files() -> None:
 
     Runs after the single-instance check so a second instance never clears
     a live session's logs.  error.log, work/assistant.log, yolo logs, demo
-    console logs and target_tracker logs all start fresh each launch, which
+    console logs, the dedicated auto_lie.log and target_tracker logs all start fresh each launch, which
     keeps any pasted diagnostic output attributable to the current run.
     """
 
@@ -394,6 +395,33 @@ def main() -> int:
     server_logger = logging.getLogger("server-client")
     server_logger.setLevel(logging.INFO)
     server_logger.addHandler(server_log_handler)
+
+    # Automatic lie handling needs a shareable diagnosis file independent of
+    # the noisy patrol log.  It contains the detector-to-pass handoff, the
+    # prepared WebSocket connection, every worker outcome and all API-worker
+    # progress/errors; it deliberately does not add keys, activation codes or
+    # raw frames.  UI lifecycle messages retain their normal logger, so the
+    # filter also recognises their stable Chinese feature prefix.
+    class _AutoLieLogFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.name in {"auto-lie", "api_lie_test"}:
+                return True
+            try:
+                return "自动过测谎" in record.getMessage()
+            except Exception:
+                return False
+
+    auto_lie_log_handler = RotatingFileHandler(
+        Path(__file__).with_name("auto_lie.log"),
+        maxBytes=1_000_000,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    auto_lie_log_handler.setLevel(logging.INFO)
+    auto_lie_log_handler.setFormatter(_compact_log_formatter())
+    auto_lie_log_handler.addFilter(_AutoLieLogFilter())
+    logging.getLogger().addHandler(auto_lie_log_handler)
+    auto_lie_logger = logging.getLogger("auto-lie")
 
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
         logging.critical(
@@ -542,14 +570,14 @@ def main() -> int:
             with auto_lie_endpoint_lock:
                 auto_lie_endpoint["value"] = best
                 auto_lie_endpoint["error"] = ""
-            logging.info(
+            auto_lie_logger.info(
                 "AUTO LIE preflight ready: cached WebSocket endpoint %s (%.0f ms)",
                 best.endpoint, best.rtt_ms,
             )
         except Exception as exc:
             with auto_lie_endpoint_lock:
                 auto_lie_endpoint["error"] = f"{type(exc).__name__}: {exc}"
-            logging.warning("AUTO LIE preflight failed; event will retry discovery: %s", exc)
+            auto_lie_logger.warning("AUTO LIE preflight failed; event will retry discovery: %s", exc)
 
     threading.Thread(
         target=warm_auto_lie_endpoint,
@@ -586,7 +614,7 @@ def main() -> int:
             if not choices:
                 raise RuntimeError("no configured WebSocket endpoint")
             endpoint = choices[0]
-            logging.warning(
+            auto_lie_logger.warning(
                 "AUTO LIE preflight is unavailable (%s); trying configured endpoint %s directly",
                 preflight_error or "still running", endpoint.url,
             )
@@ -624,7 +652,7 @@ def main() -> int:
             f"真实后端 {endpoint_url} 密钥来自{source} "
             f"(quota_left={ack.get('quota_left')}；UI 启动预探测)"
         )
-        logging.info(
+        auto_lie_logger.info(
             "AUTO LIE ready: direct handshake %s in %.0f ms (key %s)",
             endpoint_url, elapsed_ms, mask_key(key),
         )
@@ -1111,6 +1139,18 @@ def main() -> int:
             layer = snapshot.layers.get(layer_name, {})
             if not isinstance(layer, dict):
                 continue
+            # A layer may legitimately carry a single supporter (rope only, or
+            # left-most/right-most only).  Its band is then the operator's
+            # one-sided [y, y + small_gap] with small_gap >= one marker row, so
+            # say which shape produced the band that is printed below.
+            single_supporter = (
+                sum(
+                    1
+                    for point_name in ("left_most_pos", "rope_pos", "right_most_pos")
+                    if isinstance(layer.get(point_name), dict)
+                )
+                <= 1
+            )
             for point_name, marker_kind in (
                 ("left_most_pos", "left_endpoint"),
                 ("rope_pos", "rope"),
@@ -1144,8 +1184,10 @@ def main() -> int:
             if band is not None:
                 layer_bands.append((layer_name, band))
                 logging.info(
-                    "LAYER BAND: %s y=(%.6f, %.6f)",
-                    layer_name, band[0], band[1],
+                    "LAYER BAND: %s y=(%.6f, %.6f) width=%.6f%s",
+                    layer_name, band[0], band[1], band[1] - band[0],
+                    " (single supporter: [y, y + small_gap])"
+                    if single_supporter else "",
                 )
         # The world-Y bands are what decides a floor when the marker reading is ambiguous, so a recording
         # whose floors disagree in world Y is a silent trap: his 13:16 log had the character standing on
@@ -1597,6 +1639,16 @@ def main() -> int:
         reconnect_results,
         window_title=args.window_title,
         dry_run=args.dry_run,
+        # The bundled login-colour crop is application data.  Pass its
+        # concrete path from the entry process instead of asking a worker
+        # module to infer its own directory: this is stable for source,
+        # normal ZIP and Nuitka releases, regardless of the extraction
+        # folder's name or its parent path.
+        template_path=(
+            application_root(__file__)
+            / "recording-assets"
+            / "login_page_target.jpg"
+        ),
         post_login_marker_ready_fn=reconnect_post_login_marker_ready,
         # The reconnect stands the automation down while it runs: arming live input for its own keys
         # otherwise wakes the attack worker too (measured 19:07: `attack repetition: a` every second
@@ -1671,7 +1723,7 @@ def main() -> int:
         # like the drill's 时长.
         from api_lie_video import AWAIT_SECOND_WINDOW_SEC
 
-        logging.info("自动过测谎: starting a pass for the lie window")
+        auto_lie_logger.info("自动过测谎: starting a pass for the lie window")
         return ApiLieTestWorker(
             results=api_auto_lie_results,
             stop_event=stop_event,
@@ -1697,16 +1749,21 @@ def main() -> int:
         )
 
     def _on_disconnect_event() -> None:
-        """掉线: the recorder grabs its diagnostic frames, then 自动重连 checks/login."""
+        """掉线: immediately dispatch reconnect, then begin diagnostic recording."""
 
+        try:
+            accepted = reconnect_worker.notify_disconnect()
+            logging.info(
+                "auto reconnect: confirmed disconnect dispatch %s (worker_enabled=%s)",
+                "queued" if accepted else "rejected",
+                reconnect_worker.enabled,
+            )
+        except Exception:
+            logging.warning("auto reconnect notify failed", exc_info=True)
         try:
             screenshot_recorder.on_disconnect()
         except Exception:
             logging.warning("disconnect screenshot recorder failed", exc_info=True)
-        try:
-            reconnect_worker.notify_disconnect()
-        except Exception:
-            logging.warning("auto reconnect notify failed", exc_info=True)
 
     def save_recording_minimap_calibration(snapshot: object) -> None:
         """Publish recording's verified border for independent patrol use."""
@@ -1829,10 +1886,13 @@ def main() -> int:
                 calibration.get("aligned_frames_required", 2), 2
             ),
             climb_layer_confirm_frames=five_fps_frames(
-                calibration.get("climb_layer_confirm_frames", 3), 2
+                # Arrival is already verified by the explicit target band;
+                # two fresh 5-FPS samples are enough and avoid a visibly long
+                # pause at the platform lip.  Cap old saved calibrations too.
+                min(2, calibration.get("climb_layer_confirm_frames", 2)), 2
             ),
             climb_layer_confirm_seconds=float(
-                calibration.get("climb_layer_confirm_seconds", 0.3)
+                min(0.12, calibration.get("climb_layer_confirm_seconds", 0.12))
             ),
             climb_arrival_world_tolerance=float(
                 calibration.get("climb_arrival_world_tolerance", 0.20)
@@ -1852,7 +1912,7 @@ def main() -> int:
                 calibration.get("climb_failed_shift_right_seconds", 0.01)
             ),
             climb_attempt_interval_seconds=float(
-                calibration.get("climb_attempt_interval_seconds", 1.0)
+                min(0.5, calibration.get("climb_attempt_interval_seconds", 0.5))
             ),
             climb_failed_cycles_reset=int(
                 calibration.get("climb_failed_cycles_reset", 3)
@@ -2207,7 +2267,7 @@ def main() -> int:
     supervisor.start()
 
     logging.info(
-        "MapleAssistant %s starting from %s",
+        "TodoHelper %s starting from %s",
         version_label(),
         Path(__file__).resolve().parent,
     )
@@ -2217,7 +2277,7 @@ def main() -> int:
     )
     try:
         if ui_worker is not None:
-            logging.info("opening Maple Assistant Debug UI")
+            logging.info("opening TodoHelper Debug UI")
             # Tk must run on Python's main thread on Windows. All automation
             # work remains in its own independent workers.
             ui_worker.run()

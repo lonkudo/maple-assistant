@@ -26,24 +26,95 @@ def _layer_point_ys(layer: Any) -> list[float]:
 # modules: this one answers the panel's "is the marker on a recorded layer" question.
 LAYER_UP_REACH_FACTOR = 0.7
 
+# Last-resort ``small_gap`` for a single-supporter layer whose recording carries no layout at all, so one
+# marker row cannot be derived.  Kept identical to
+# ``movement_worker.LAYER_SINGLE_SUPPORTER_GAP_FALLBACK``.
+LAYER_SINGLE_SUPPORTER_GAP_FALLBACK = 0.002
+
+
+def _layer_marker_row(layer: Any) -> Optional[float]:
+    """One marker row (1 px) in normalised minimap Y, from the recorded layout.
+
+    Identical rule to ``movement_worker._layer_marker_row``: a layer that has a single supporter (rope
+    only, left-most only, right-most only) keeps the operator's one-sided band ``[y, y + small_gap]``,
+    and ``small_gap`` must never be smaller than one marker row, because the yellow diamond's centre
+    quantises to ``1 / analysis_height`` (0.007143 on the 114x140 minimap).  The old fixed 0.002 -
+    0.28 px - could only match a reading that landed on the recorded row exactly.
+    """
+
+    if not isinstance(layer, dict):
+        return None
+    candidates: list[Any] = [
+        layer.get(name)
+        for name in ("left_most_pos", "rope_pos", "right_most_pos")
+    ]
+    jump_points = layer.get("jump_points")
+    if isinstance(jump_points, list):
+        candidates.extend(jump_points)
+    for point in candidates:
+        coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
+        if not isinstance(coordinate, dict):
+            continue
+        layout = coordinate.get("recorded_layout")
+        if not isinstance(layout, dict):
+            continue
+        try:
+            height = float(layout.get("analysis_height"))
+        except (TypeError, ValueError):
+            continue
+        if height >= 1.0:
+            return 1.0 / height
+    return None
+
 
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    """Return the persisted layer band, rebuilding only legacy recordings.
+
+    New recordings store the final bounds in ``layer_band``.  Reading that
+    immutable recording summary is intentional: the movement worker must not
+    derive a different floor from a different subset of endpoint points on
+    every frame.  The calculation below remains solely as a compatibility
+    fallback for profiles made before explicit bands existed.
+    """
+
+    saved = layer.get("layer_band") if isinstance(layer, dict) else None
+    # An explicit null is different from a legacy profile with no key: the
+    # last supporter was removed, so the old cached ``layer_y`` must never
+    # resurrect a deleted floor.
+    if isinstance(layer, dict) and "layer_band" in layer and saved is None:
+        return None
+    if isinstance(saved, dict):
+        try:
+            upper = float(saved["y_upper"])
+            lower = float(saved["y_lower"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            if upper <= lower:
+                return upper, lower
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
     if not values:
         return None
+    effective_tolerance = max(0.0, float(tolerance))
     if len(values) == 1:
         # Keep the UI/controller interpretation exactly aligned with the
-        # movement worker: a rope-only layer is only [y, y + 0.002].  Jump
-        # points never enter _layer_point_ys, so their vertical coordinate
+        # movement worker: a single-supporter layer is [y, y + small_gap], with
+        # small_gap the one-third margin but never less than one marker row.
+        # Jump points never enter _layer_point_ys, so their vertical coordinate
         # cannot widen or shift a layer band.
         only_y = values[0]
-        return only_y, only_y + 0.002
+        gap = effective_tolerance / 3.0
+        marker_row = _layer_marker_row(layer)
+        if marker_row is not None:
+            gap = max(gap, marker_row)
+        if gap <= 0.0:
+            gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
+        return only_y, only_y + gap
     # The margin above covers climb/drop arrival movement, scaled by the upper-band factor. A smaller
     # one-third margin below the confirmed layer base absorbs OpenCV marker precision noise without
     # excessive overlap with the layer below.
-    effective_tolerance = max(0.0, float(tolerance))
     return (
         min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
         max(values) + effective_tolerance / 3.0,
@@ -76,6 +147,20 @@ def _coherent_observed_world_values(layer: Any) -> list[float]:
 
 
 def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
+    """Return the persisted world-Y band, with a legacy fallback."""
+
+    saved = layer.get("layer_band") if isinstance(layer, dict) else None
+    if isinstance(layer, dict) and "layer_band" in layer and saved is None:
+        return None
+    if isinstance(saved, dict):
+        try:
+            upper = float(saved["world_y_upper"])
+            lower = float(saved["world_y_lower"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            if upper <= lower:
+                return upper, lower
     values = _coherent_observed_world_values(layer)
     if not values:
         for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
@@ -89,6 +174,78 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
     # Same rule as _layer_y_band: tolerance only above the topmost point,
     # never below the lowermost point (no reach into the layer below).
     return min(values) - tolerance, max(values)
+
+
+def _recalculate_layer_band(layer: Any) -> bool:
+    """Materialise one layer's complete Y/world-Y detection envelope.
+
+    Only left-most, rope, and right-most recordings are supporters.  Jump
+    points deliberately never change a layer's identity.  A single supporter
+    produces the documented one-sided ``[y, y + small_gap]`` envelope; two or
+    more supporters span their observed top/bottom positions with the normal
+    asymmetric tolerance.  The same calculation produces the world-Y band.
+    """
+
+    if not isinstance(layer, dict):
+        return False
+    values = _layer_point_ys(layer)
+    if not values:
+        previous = layer.get("layer_band", object())
+        layer["layer_band"] = None
+        return previous is not None
+
+    tolerance = max(0.0, float(layer.get("y_tolerance", 0.020000)))
+    if len(values) == 1:
+        raw_upper = raw_lower = values[0]
+        gap = tolerance / 3.0
+        marker_row = _layer_marker_row(layer)
+        if marker_row is not None:
+            gap = max(gap, marker_row)
+        if gap <= 0.0:
+            gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
+        y_upper, y_lower = raw_upper, raw_lower + gap
+    else:
+        raw_upper, raw_lower = min(values), max(values)
+        y_upper = raw_upper - tolerance * LAYER_UP_REACH_FACTOR
+        y_lower = raw_lower + tolerance / 3.0
+
+    world_values: list[float] = []
+    for point_name in REQUIRED_LAYER_POINTS:
+        point = layer.get(point_name)
+        if isinstance(point, dict) and "world_y" in point:
+            try:
+                world_values.append(float(point["world_y"]))
+            except (TypeError, ValueError):
+                pass
+    if not world_values and "layer_world_y" in layer:
+        try:
+            world_values = [float(layer["layer_world_y"])]
+        except (TypeError, ValueError):
+            pass
+
+    band: dict[str, Any] = {
+        "version": 1,
+        "supporter_count": len(values),
+        "y_top": round(raw_upper, 6),
+        "y_bottom": round(raw_lower, 6),
+        "y_upper": round(y_upper, 6),
+        "y_lower": round(y_lower, 6),
+    }
+    if world_values:
+        world_tolerance = max(
+            0.0, float(layer.get("world_y_tolerance", 0.75))
+        )
+        world_top, world_bottom = min(world_values), max(world_values)
+        band.update({
+            "world_y": round(sum(world_values) / len(world_values), 6),
+            "world_y_top": round(world_top, 6),
+            "world_y_bottom": round(world_bottom, 6),
+            "world_y_upper": round(world_top - world_tolerance, 6),
+            "world_y_lower": round(world_bottom, 6),
+        })
+    previous = layer.get("layer_band")
+    layer["layer_band"] = band
+    return previous != band
 
 
 
@@ -238,6 +395,17 @@ class PatrolController:
         # The last inverted range this profile reported, so the warning below is said once per
         # distinct pair instead of on every frame.
         self._inverted_range_reported: tuple[str, str] = ("", "")
+        # Materialise the explicit detection envelopes for profiles recorded
+        # before this schema existed.  Later UI recordings recalculate only
+        # their own layer below.
+        migrated = False
+        for layer in self._profile.get("layers", {}).values():
+            # Do not use ``any(generator)`` here: it short-circuits after the
+            # first changed floor and would leave the rest of the profile on
+            # the legacy per-frame calculation.
+            migrated = _recalculate_layer_band(layer) or migrated
+        if migrated:
+            self._persist_locked()
 
     def _sorted_layer_names_locked(self) -> list[str]:
         """Bottom-up layer order by numeric suffix, never recording order.
@@ -540,6 +708,7 @@ class PatrolController:
                 return False
             removed = layer_data.pop(boundary, None) is not None
             if removed:
+                _recalculate_layer_band(layer_data)
                 any_action = bool(_layer_present_actions(layer_data))
                 has_edges = self._layer_has_points_locked(
                     layer, PATROL_EDGE_POINTS
@@ -601,6 +770,15 @@ class PatrolController:
             name = layer_name or self._selected_layer
             layer = self._profile.get("layers", {}).get(name, {})
             return bool(_layer_present_actions(layer))
+
+    def layer_has_band(self, layer_name: str) -> bool:
+        """Whether this layer still has a usable Y supporter band."""
+
+        with self._lock:
+            layer = self._profile.get("layers", {}).get(layer_name)
+            return isinstance(layer, dict) and isinstance(
+                layer.get("layer_band"), dict
+            )
 
     def final_layer_name(self) -> Optional[str]:
         with self._lock:
@@ -763,6 +941,7 @@ class PatrolController:
                 layer["world_y_tolerance"] = round(float(
                     layer.get("world_y_tolerance", 0.75)
                 ), 6)
+            _recalculate_layer_band(layer)
             # Recording is intentionally permissive.  A partial point may be
             # useful later, but only the selected patrol range is checked for
             # its required Left/Right endpoints at Start.
@@ -952,6 +1131,7 @@ class PatrolController:
                     * layout.diamond_height / layout.analysis_height,
                     6,
                 )
+            _recalculate_layer_band(layer)
 
     def add_layer_above(self) -> str:
         """Always create and select a new highest numeric layer."""

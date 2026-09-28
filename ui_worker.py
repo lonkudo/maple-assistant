@@ -46,11 +46,11 @@ from reconnect_worker import (
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
 from update_manager import (
-    UpdateError, apply_desktop_update, export_user_config, import_user_config,
+    UpdateError, export_user_config, import_user_config,
     find_newer_desktop_update,
-    remove_consumed_update_package,
-    schedule_hidden_restart,
+    schedule_hidden_restart, schedule_package_update,
 )
+from runtime_paths import application_root, package_format
 
 
 LOG = logging.getLogger(__name__)
@@ -849,6 +849,7 @@ class UiWorker(threading.Thread):
         # v0423: 自动过测谎 - the api pass runs by itself when the game's lie window appears.  The lie
         # detector calls `on_lie_event_for_api()` from its own thread, which only raises a flag; the Tk
         # thread services it in `_poll` (nothing Tk is touched off-thread).
+        self._api_auto_lie_events: "queue.Queue[object]" = queue.Queue(maxsize=16)
         self._api_auto_lie_pending = False
         self._api_auto_lie_session_armed = False
         self._api_auto_lie_pending_since = 0.0
@@ -933,6 +934,11 @@ class UiWorker(threading.Thread):
             )
             if local_license_status.valid else local_license_status
         )
+        # Keep the UI honest while the immediate pinned validation is in
+        # flight.  A locally signed document is useful context (edition and
+        # expiry), but it is not an active online entitlement until the
+        # server has accepted it for this session.
+        self._license_online_validation_pending = bool(local_license_status.valid)
         self._license_session_locked = True
         self._license_heartbeat_results: "queue.Queue[tuple[int, LicenseStatus]]" = (
             queue.Queue()
@@ -995,7 +1001,7 @@ class UiWorker(threading.Thread):
             root.withdraw()
             self._root = root
             app_version = version_label()
-            root.title(f"MapleAssistant {app_version}")
+            root.title(f"TodoHelper {app_version}")
             screen_width = root.winfo_screenwidth()
             screen_height = root.winfo_screenheight()
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
@@ -2077,7 +2083,9 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            self._telegram_status.pack(anchor="w", pady=(4, 0))
+            # Keep the status widget as an internal sink for notifier updates,
+            # but do not show explanatory hints in the Additional Functions
+            # panel.  Operational failures remain in the running log.
 
             # 自动重连: a selection plus its two settings (which world, which channel).
             # 掉线 (the character detector's event) is only the FIRST sign; the worker
@@ -2162,12 +2170,12 @@ class UiWorker(threading.Thread):
                 "<Button-1>", self._reconnect_channel_commit_on_outside_click,
                 add="+",
             )
-            # The shared hint area lives at the BOTTOM of the panel (see below); its two lines are
-            # created here so the rows above stay a single compact line each.
+            # Retain invisible status sinks for workflow callbacks.  The
+            # Additional Functions panel intentionally shows controls only;
+            # progress and failures are reported in the running log instead.
             self._reconnect_status = ttk.Label(
                 extra_panel,
-                text=("自动重连: 已启用 - %s %d频道。" % (saved_world, saved_channel)
-                      if saved_reconnect_enabled else "自动重连: 未启用。"),
+                text="",
                 justify="left",
                 wraplength=440,
             )
@@ -2175,21 +2183,11 @@ class UiWorker(threading.Thread):
             # release controls, together with their manual-test hint, are
             # intentionally not constructed.  The actual automatic reconnect
             # and automatic lie workflows remain enabled above.
-            # This status line is reserved for automatic-lie progress only;
-            # it starts blank so no diagnostic/test wording reaches users.
-            hint_row = ttk.Frame(extra_panel)
-            hint_row.pack(fill="x", pady=(2, 0))
+            # These labels deliberately are not packed.
             self._api_test_status = ttk.Label(
-                hint_row, text="",
+                extra_panel, text="",
                 justify="left", wraplength=440,
             )
-            self._api_test_status.pack(anchor="w")
-            self._reconnect_status.pack(anchor="w")
-            if saved_api_auto_lie and hasattr(self, "_api_test_status"):
-                # 自动过测谎 was armed last time: say so in the shared hint area straight away.
-                self._api_test_status.configure(
-                    text="自动过测谎: 已启用 - 测谎窗口出现时自动过测谎（未开始巡逻也会检测并接管）。"
-                )
             if saved_reconnect_enabled:
                 # apply the saved values to the worker once it exists (Tk's own timer:
                 # the UiWorker is not a Tk object)
@@ -2270,6 +2268,13 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._copy_server_log_button.pack(side="left", padx=(0, 3))
+            self._copy_auto_lie_log_button = ttk.Button(
+                log_actions,
+                text="测谎日志",
+                command=self._copy_auto_lie_log,
+                takefocus=False,
+            )
+            self._copy_auto_lie_log_button.pack(side="left", padx=(0, 3))
             self._import_config_button.pack(side="left", padx=(0, 3))
             self._export_config_button.pack(side="left")
             self._log_display_lines: list[str] = []
@@ -2386,7 +2391,7 @@ class UiWorker(threading.Thread):
         self._caption_separator = separator
 
         title = tk.Label(
-            bar, text=f"MapleAssistant {app_version}", bg="#f0f0f0",
+            bar, text=f"TodoHelper {app_version}", bg="#f0f0f0",
             anchor="w",
         )
         title.pack(side="left", padx=(10, 0))
@@ -2440,7 +2445,7 @@ class UiWorker(threading.Thread):
         """
 
         try:
-            schedule_hidden_restart(Path(__file__).resolve().parent)
+            schedule_hidden_restart(application_root(__file__))
         except UpdateError as exc:
             LOG.warning("自动重启失败：%s", exc)
             return False
@@ -2458,48 +2463,29 @@ class UiWorker(threading.Thread):
     def _check_desktop_update(self) -> None:
         """Find and apply the highest newer nearby/Desktop release on request."""
 
-        install_root = Path(__file__).resolve().parent
+        install_root = application_root(__file__)
         current = read_version(install_root / "VERSION")
         LOG.info(
-            "更新：正在桌面、当前目录及上级目录查找比 v%s 更新的 Maple 助手安装包。",
+            "更新：正在桌面、当前目录及上级目录查找比 v%s 更新的 TodoHelper 安装包。",
             current,
         )
         try:
             package = find_newer_desktop_update(
-                current, local_roots=(install_root, install_root.parent)
+                current, local_roots=(install_root, install_root.parent),
+                package_format=package_format(install_root),
             )
             LOG.info("更新：找到 v%s，来源 %s", package.version, package.path)
-            result = apply_desktop_update(package, install_root)
+            schedule_package_update(package, install_root)
         except UpdateError as exc:
             LOG.warning("更新失败：%s", exc)
             return
         except Exception:
             LOG.exception("更新失败：发生未预期错误")
             return
-        if result.config_copied:
-            config_text = f"已覆盖 user_config.json（来源: {result.config_source}）"
-        elif result.config_unchanged:
-            config_text = "Desktop user_config.json 版本未变化，未覆盖当前配置"
-        else:
-            config_text = "安装包未提供 user_config.json，已保留当前配置"
-        if not self._schedule_restart():
-            LOG.warning(
-                "更新完成：v%s，已覆盖 %d 个文件；%s。自动重启失败：请手动关闭并重新启动助手。",
-                result.package.version, result.copied_files, config_text,
-            )
-            return
-        try:
-            package_removed = remove_consumed_update_package(result.package)
-        except UpdateError as exc:
-            # The program files are already updated and restart is safely
-            # scheduled.  A locked Desktop ZIP must not turn cleanup into a
-            # failed update or keep the old instance running.
-            LOG.warning("更新完成，但清理安装包失败：%s", exc)
-            package_removed = False
         LOG.info(
-            "更新完成：v%s，已覆盖 %d 个文件；%s%s。助手将在关闭后自动重新启动。",
-            result.package.version, result.copied_files, config_text,
-            "；已删除已使用的安装包" if package_removed else "",
+            "更新已安排：v%s 将在当前程序退出后由固定更新程序安装；"
+            "将保留 user_config.json，成功后自动删除安装包并重启。",
+            package.version,
         )
         self._close_for_restart()
 
@@ -2818,6 +2804,13 @@ class UiWorker(threading.Thread):
     def _poll_body(self, root: Any) -> None:
         """One tick's work, without the re-arm (see :meth:`_poll`)."""
 
+        # Online entitlement is a state gate, not visual work.  A resize burst
+        # may defer expensive frame rendering and log insertion, but it must
+        # never defer the heartbeat result: otherwise a successful immediate
+        # validation can leave the visible header stuck at “正在验证授权” until
+        # some unrelated UI change ends the freeze state.
+        self._drain_license_heartbeat_results()
+
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
         # so the resize stays light, but keep the poll cadence alive.
@@ -2858,7 +2851,6 @@ class UiWorker(threading.Thread):
         # now costs only itself.
         for step in (
             self._drain_logs,
-            self._drain_license_heartbeat_results,
             self._refresh_automation_status,
             self._sync_patrol_ui_state,
             self._refresh_shutdown_status,
@@ -2972,6 +2964,7 @@ class UiWorker(threading.Thread):
         if generation != self._license_heartbeat_generation:
             return
         self._license_status = status
+        self._license_online_validation_pending = False
         if status.valid:
             was_locked = self._license_session_locked
             self._license_session_locked = False
@@ -2995,7 +2988,18 @@ class UiWorker(threading.Thread):
         status = self._license_status
         label = getattr(self, "_license_label", None)
         if label is not None:
-            if status.valid:
+            if getattr(self, "_license_online_validation_pending", False):
+                expiry = "永久" if status.expires_at is None else self._format_license_expiry(
+                    status.expires_at
+                )
+                label.configure(
+                    text=(
+                        f"正在验证在线授权 · {status.edition.upper()} · "
+                        f"到期：{expiry}"
+                    ),
+                    foreground="#9a6700",
+                )
+            elif status.valid:
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
@@ -3060,7 +3064,10 @@ class UiWorker(threading.Thread):
 
     def _show_license_refusal(self) -> None:
         status = self._license_status
-        text = f"未授权：{status.message} 请先点击「激活授权」。"
+        if getattr(self, "_license_online_validation_pending", False) or status.code == "checking":
+            text = "正在验证在线授权，请稍候。"
+        else:
+            text = f"未授权：{status.message} 请先点击「激活授权」。"
         if hasattr(self, "_control_status"):
             self._control_status.configure(text=text)
         if hasattr(self, "_quick_message_status"):
@@ -3265,6 +3272,7 @@ class UiWorker(threading.Thread):
         # Supersede an initial/previous heartbeat that may still be awaiting a
         # response.  The explicit activation result is the new session state.
         self._license_heartbeat_generation += 1
+        self._license_online_validation_pending = False
         # Save the new code before contacting a local or online validator.  A
         # rejected value must not silently leave the previous submitted code
         # in user_config.json.
@@ -3274,15 +3282,16 @@ class UiWorker(threading.Thread):
         else:
             self._license_status = activate_license(code)
         self._save_license_attempt(code, self._license_status)
-        self._refresh_license_ui()
         if self._license_status.valid:
             self._license_session_locked = False
+            self._refresh_license_ui()
             LOG.info("license activated id=%s edition=%s", self._license_status.license_id,
                      self._license_status.edition)
             self._set_license_visual_lock(False)
             self._shutdown_load_settings()
             self._control_status.configure(text="授权已保存，自动功能已解锁。")
         else:
+            self._refresh_license_ui()
             LOG.warning("license activation failed: %s", self._license_status.code)
             if self._activation_failure_replaces_license(self._license_status):
                 # A verified rejected code replaces the prior activation
@@ -3551,6 +3560,15 @@ class UiWorker(threading.Thread):
         worker = self.reconnect_worker
         enabled = bool(self._reconnect_var.get()) if hasattr(
             self, "_reconnect_var") else False
+        # 自动重连 has no independent trigger: 掉线 is the character
+        # detector that raises the reconnect event.  Enabling reconnect must
+        # therefore force-enable 掉线 immediately, persist it, and arm the
+        # parked capture watch before the reconnect worker is enabled.
+        if enabled and hasattr(self, "_disconnect_alert_var"):
+            if not bool(self._disconnect_alert_var.get()):
+                self._disconnect_alert_var.set(True)
+                self._shutdown_on_change()
+                LOG.info("自动重连 enabled; 掉线 was enabled as its required trigger")
         world = self._reconnect_world_var.get() if hasattr(
             self, "_reconnect_world_var") else WORLD_NAMES[0]
         channel_text = self._reconnect_channel_var.get() if hasattr(
@@ -3580,17 +3598,6 @@ class UiWorker(threading.Thread):
                 )
             else:
                 self._reconnect_status.configure(text="自动重连: 未启用。")
-        if enabled and not self._disconnect_detection_armed():
-            # 掉线 is the detector the reconnect waits for: without it no disconnect is ever noticed, so
-            # say it here instead of leaving the operator with a reconnect that can never fire.
-            LOG.warning(
-                "自动重连 is armed but 掉线 (disconnect alert) is OFF: nothing detects the disconnect, so "
-                "the reconnect can never start - tick 掉线 as well"
-            )
-            if hasattr(self, "_reconnect_status"):
-                self._reconnect_status.configure(
-                    text="自动重连: 已启用，但「掉线」未勾选 - 检测不到掉线，不会自动重连。"
-                )
 
     def _register_validator(self, widget, callback):
         """A Tk entry validator for ``callback``, registered on ``widget``.
@@ -3992,8 +3999,18 @@ class UiWorker(threading.Thread):
         armed = bool(self._api_auto_lie_var.get()) if hasattr(
             self, "_api_auto_lie_var") else False
         self._api_auto_lie_session_armed = armed
+        # 自动过测谎 has no independent frame source: the normal 测谎 worker
+        # is its prerequisite.  Selecting the dependent option must therefore
+        # arm its prerequisite immediately, rather than merely displaying a
+        # warning which leaves a checked 自动过测谎 box unable to ever start.
+        if (armed and hasattr(self, "_lie_alert_var")
+                and not bool(self._lie_alert_var.get())):
+            self._lie_alert_var.set(True)
+            LOG.info("自动过测谎 enabled 测谎 automatically (required prerequisite)")
         try:
-            self._shutdown_save_settings(self._shutdown_collect_data())
+            data = self._shutdown_collect_data()
+            self._shutdown_save_settings(data)
+            self._shutdown_apply_to_worker(data)
         except Exception:
             LOG.warning("自动过测谎 setting could not be saved", exc_info=True)
         if hasattr(self, "_api_test_status"):
@@ -4040,16 +4057,19 @@ class UiWorker(threading.Thread):
             return False
 
     def on_lie_event_for_api(self, match: object = None) -> None:
-        """One detector frame: ``match`` is the square bbox, or None when the square is gone.
+        """Queue one detector event; safe to call from the detector thread."""
 
-        Called from the lie detector's thread - only flags are raised here, the Tk thread services
-        them in ``_poll``, so nothing Tk is touched from another thread.
+        try:
+            self._api_auto_lie_events.put_nowait(match)
+        except queue.Full:
+            LOG.warning("自动过测谎: event queue is full; newest detector event was dropped")
 
-        The detector calls this with a bbox only for a NEW event (after the previous one cleared), so
-        a new window arms a pass at once; only the minimum gap between passes can refuse it, and that
-        refusal is LOGGED.  Nothing here may return silently for a new window - the v1.0.26 field
-        report was "the lie event happened, but the autolie_api is not taking over" with no line in the
-        log explaining it (the old 3 s "square was absent" debounce swallowed the event).
+    def _handle_lie_event_for_api(self, match: object = None) -> None:
+        """Handle one queued lie event on the UI thread.
+
+        This owns all Tk variable/widget access.  The detector must only
+        enqueue an event, otherwise a cross-thread BooleanVar read can make a
+        legitimate lie window fail before the API worker is created.
         """
 
         if not self._license_allowed():
@@ -4135,6 +4155,22 @@ class UiWorker(threading.Thread):
 
     def _service_api_auto_lie(self) -> None:
         """Start the api pass for a pending lie event (Tk thread)."""
+
+        # The detector thread only queues events.  Consume them here before
+        # deciding whether a pass is pending, so every selection/license/UI
+        # read happens on Tk's owning thread.
+        events = getattr(self, "_api_auto_lie_events", None)
+        if events is not None:
+            while True:
+                try:
+                    match = events.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle_lie_event_for_api(match)
+                try:
+                    events.task_done()
+                except ValueError:
+                    pass
 
         # A pass that WE started for a lie window pauses the patrol (the lie test freezes the
         # character, so the movement worker otherwise counts it as stuck and fires its self-rescue
@@ -4280,6 +4316,10 @@ class UiWorker(threading.Thread):
             return
         state, detail = latest
         text = f"{state}: {detail}" if detail else str(state)
+        # Keep the independent auto_lie.log useful after the handoff too:
+        # progress/results originate in the worker queue, rather than all
+        # being emitted by the worker's general-purpose logger.
+        LOG.info("自动过测谎: worker result %s", text)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text=f"自动过测谎: {text}")
 
@@ -4631,6 +4671,7 @@ class UiWorker(threading.Thread):
             (self._copy_log_button, (0, 3)),
             (getattr(self, "_copy_error_button", None), (0, 3)),
             (getattr(self, "_copy_server_log_button", None), (0, 3)),
+            (getattr(self, "_copy_auto_lie_log_button", None), (0, 3)),
             (getattr(self, "_import_config_button", None), (0, 3)),
             (getattr(self, "_export_config_button", None), (0, 0)),
         )
@@ -4697,14 +4738,29 @@ class UiWorker(threading.Thread):
         self._copy_to_clipboard(text)
         LOG.info("server_client.log 已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
+    def _copy_auto_lie_log(self) -> None:
+        """Copy the dedicated automatic lie-detector/API trace for pasting."""
+
+        path = application_root(__file__) / "auto_lie.log"
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            text = ""
+        else:
+            text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            text = "(自动过测谎日志为空或不存在)"
+        self._copy_to_clipboard(text)
+        LOG.info("自动过测谎日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
+
     def _import_user_config(self) -> None:
-        """Choose a saved user_config.json, load it, and restart to apply it.
+        """Choose a saved user_config.json, load it, then close this instance.
 
         The imported file is only read at startup, and the running instance
         would otherwise write its own in-memory settings back over it while
-        still patrolling the old route.  A successful import therefore
-        restarts the assistant at once (the same hidden-helper handoff the
-        update button uses) instead of asking the operator to do it.
+        still patrolling the old route.  A successful import therefore stops
+        and closes the assistant.  It deliberately does *not* schedule the
+        restart helper: the operator starts it again when ready.
         """
 
         if not self.user_config_path:
@@ -4730,17 +4786,17 @@ class UiWorker(threading.Thread):
         except UpdateError as exc:
             LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, exc)
             return
-        if not self._schedule_restart():
-            LOG.warning(
-                "%s成功：已载入 %s；自动重启失败，请手动关闭并重新启动助手后生效。",
-                LOG_CONFIG_IMPORT, source,
-            )
-            return
         LOG.info(
-            "%s成功：已载入 %s；正在关闭当前助手，重启后生效。",
+            "%s成功：已载入 %s；正在关闭当前助手，请手动重新启动后生效。",
             LOG_CONFIG_IMPORT, source,
         )
-        self._close_for_restart()
+        # Same safe input release and delayed UI close as a restart, but no
+        # helper process is launched.  Once the UI closes assistant.py stops
+        # the worker process as well.
+        self._stop_patrol()
+        root = getattr(self, "_root", None)
+        if root is not None:
+            root.after(250, self._on_debug_window_close)
 
     def _export_user_config(self) -> None:
         """Overwrite the Desktop copy used by the in-app updater."""
@@ -5016,8 +5072,17 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text=f"无法删除录制点: {exc}")
             return
         if removed:
+            band_note = ""
+            if point_kind != "jump_point":
+                if self.patrol_controller.layer_has_band(layer_name):
+                    band_note = " 已重新计算该层图层带。"
+                else:
+                    band_note = (
+                        " 该层已无最左/绳索/最右支持点，"
+                        "图层带已清空；开始运行会提示需先录制支持点。"
+                    )
             self._control_status.configure(
-                text=f"已删除 {self._patrol_display_name(layer_name)} {label}。"
+                text=f"已删除 {self._patrol_display_name(layer_name)} {label}。{band_note}"
             )
             LOG.info("layer axis point deleted layer=%s kind=%s index=%s",
                      layer_name, point_kind, jump_index)
@@ -6180,6 +6245,14 @@ class UiWorker(threading.Thread):
     def _on_lie_alert_change(self) -> None:
         """Turning off lie detection also disarms its dependent automation."""
 
+        lie_armed = self._lie_detection_armed()
+        if (not lie_armed and hasattr(self, "_api_auto_lie_var")
+                and bool(self._api_auto_lie_var.get())):
+            self._api_auto_lie_var.set(False)
+            self._api_auto_lie_session_armed = False
+            self._api_auto_lie_pending = False
+            self.request_cancel_auto_lie_pass()
+            LOG.info("测谎 disabled; dependent 自动过测谎 was disabled as well")
         self._shutdown_on_change()
 
     def _shutdown_on_change(self, _value: str = "") -> None:
@@ -6187,6 +6260,16 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_shutdown_hours_label"):
             return
+        # The 掉线 checkbox cannot be turned off underneath an active 自动重连
+        # selection.  Restore it here as well as in _reconnect_on_change so
+        # a direct click on 掉线 cannot leave an apparently armed reconnect
+        # with no event source.
+        if (hasattr(self, "_reconnect_var")
+                and bool(self._reconnect_var.get())
+                and hasattr(self, "_disconnect_alert_var")
+                and not bool(self._disconnect_alert_var.get())):
+            self._disconnect_alert_var.set(True)
+            LOG.info("自动重连 is selected; kept 掉线 enabled as its required trigger")
         hours = float(self._shutdown_hours_var.get())
         self._shutdown_hours_label.configure(text=f"{hours:.1f}h")
         data = self._shutdown_collect_data()
@@ -6251,6 +6334,35 @@ class UiWorker(threading.Thread):
             setter = getattr(lie_detector, "set_enabled", None)
             if setter is not None:
                 setter(lie_detection_armed)
+        # Keep the displayed 自动重连 selection and the worker's actual armed
+        # state in the same settings application transaction.  In particular,
+        # this path is used after the initial online-license heartbeat
+        # succeeds.  Previously it restored a checked Tk variable and armed
+        # 掉线, but omitted ReconnectWorker.set_enabled(), leaving a visibly
+        # selected 自动重连 that rejected the next confirmed offline event as
+        # "disabled".
+        reconnect = getattr(self, "reconnect_worker", None)
+        reconnect_enabled = bool(data.get("auto_reconnect_enabled", False))
+        if reconnect is not None:
+            reconnect_world = str(
+                data.get("auto_reconnect_world", WORLD_NAMES[0])
+            )
+            if reconnect_world not in WORLD_NAMES:
+                reconnect_world = WORLD_NAMES[0]
+            reconnect_channel = valid_channel(
+                data.get("auto_reconnect_channel", CHANNEL_DEFAULT)
+            ) or CHANNEL_DEFAULT
+            reconnect.set_world(reconnect_world)
+            reconnect.set_channel(reconnect_channel)
+            reconnect.set_enabled(reconnect_enabled)
+            LOG.info(
+                "auto reconnect settings applied: selected=%s worker_enabled=%s "
+                "world=%s channel=%s",
+                reconnect_enabled,
+                reconnect.enabled,
+                reconnect_world,
+                reconnect_channel,
+            )
         # 测谎 / 掉线 are what feed 自动过测谎 and 自动重连: while they are armed and the shared capture is
         # parked (no Start Patrol), the assistant's parked watch grabs the game window on its own, so a
         # lie window is still detected and a 掉线 is still noticed - both workflows are independent of
@@ -7219,6 +7331,16 @@ class UiWorker(threading.Thread):
                 self, "_lie_alert_var"
             ):
                 self._lie_alert_var.set(bool(data["lie_alert_enabled"]))
+            # Restore the dependent selection as an armed session state too.
+            # Previously the checkbox could render as selected from config
+            # while _api_auto_lie_session_armed stayed False, so every real
+            # lie event was silently ignored until the operator toggled it.
+            saved_auto_lie = bool(data.get("auto_lie_api_enabled", False))
+            if hasattr(self, "_api_auto_lie_var"):
+                self._api_auto_lie_var.set(saved_auto_lie)
+            self._api_auto_lie_session_armed = saved_auto_lie
+            if saved_auto_lie and hasattr(self, "_lie_alert_var"):
+                self._lie_alert_var.set(True)
             if hasattr(self, "_sound_alert_var"):
                 self._sound_alert_var.set(bool(
                     data.get("sound_alert_enabled", True)
@@ -7234,6 +7356,11 @@ class UiWorker(threading.Thread):
                     data.get("auto_reconnect_channel", CHANNEL_DEFAULT)
                 ) or CHANNEL_DEFAULT
                 self._reconnect_var.set(saved_enabled)
+                if saved_enabled and hasattr(self, "_disconnect_alert_var"):
+                    # Persisted reconnect configurations from older versions
+                    # may have 掉线 off.  Migrate them live rather than loading
+                    # a reconnect checkbox that can never trigger.
+                    self._disconnect_alert_var.set(True)
                 self._reconnect_world_var.set(saved_world)
                 self._reconnect_channel_var.set(str(saved_channel))
             if hasattr(self, "_api_test_status"):
@@ -7718,9 +7845,19 @@ class UiWorker(threading.Thread):
             return
         self._unlocked_points.add(key)
         cleared = self.patrol_controller.clear_endpoint(layer_name, boundary)
+        band_note = ""
+        if cleared:
+            if self.patrol_controller.layer_has_band(layer_name):
+                band_note = " 已重新计算该层图层带。"
+            else:
+                band_note = (
+                    " 该层已无最左/绳索/最右支持点，"
+                    "图层带已清空；开始运行会提示需先录制支持点。"
+                )
         self._control_status.configure(
             text=(f"已解锁并清除 {layer_name} {boundary} 的录制"
                   + ("。" if cleared else "（无数据）。")
+                  + band_note
                   + " 现在短按即可录制当前位置。")
         )
         self._refresh_patrol_controls()

@@ -1,4 +1,4 @@
-"""Find and apply a newer Maple Assistant package from safe nearby locations."""
+"""Find and apply a newer TodoHelper package from safe nearby locations."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
-import tempfile
+import sys
 import zipfile
 from typing import Iterable, Optional
 
@@ -20,7 +20,8 @@ from versioning import read_version, version_key
 _SKIP_DIRECTORIES = {
     ".git", ".venv", "__pycache__", "work", "node_modules",
 }
-_PACKAGE_NAME = re.compile(r"maple.*assistant", re.IGNORECASE)
+_PACKAGE_NAME = re.compile(r"(?:todohelper|maple.*assistant)", re.IGNORECASE)
+_FROZEN_ENTRY_NAMES = {"todohelper.exe", "mapleassistant.exe"}
 
 
 class UpdateError(RuntimeError):
@@ -32,6 +33,7 @@ class DesktopUpdate:
     path: Path
     version: str
     kind: str  # ``zip`` or ``directory``
+    package_format: str  # ``source`` or ``frozen``
 
 
 @dataclass(frozen=True)
@@ -85,7 +87,7 @@ def _valid_version(text: str) -> Optional[str]:
     return value if re.fullmatch(r"\d+\.\d+\.\d+", value) else None
 
 
-def _zip_version(path: Path) -> Optional[str]:
+def _archive_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
     try:
         with zipfile.ZipFile(path) as archive:
             names = {item.filename.replace("\\", "/"): item for item in archive.infolist()}
@@ -95,19 +97,32 @@ def _zip_version(path: Path) -> Optional[str]:
                 version_name = f"{prefix}/VERSION" if prefix else "VERSION"
                 item = names.get(version_name)
                 if item is not None:
-                    return _valid_version(archive.read(item).decode("ascii", "ignore"))
+                    return _valid_version(archive.read(item).decode("ascii", "ignore")), "source"
+            for name in names:
+                lowered = name.casefold()
+                if PurePosixPath(lowered).name not in _FROZEN_ENTRY_NAMES:
+                    continue
+                prefix = name.rsplit("/", 1)[0] if "/" in name else ""
+                item = names.get(f"{prefix}/VERSION" if prefix else "VERSION")
+                if item is not None:
+                    return _valid_version(archive.read(item).decode("ascii", "ignore")), "frozen"
     except (OSError, zipfile.BadZipFile):
-        return None
-    return None
+        pass
+    return None, None
 
 
-def _directory_version(path: Path) -> Optional[str]:
-    if not (path / "assistant.py").is_file():
-        return None
+def _directory_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
+    package_format = (
+        "source" if (path / "assistant.py").is_file()
+        else "frozen" if any((path / entry).is_file() for entry in _FROZEN_ENTRY_NAMES)
+        else None
+    )
+    if package_format is None:
+        return None, None
     try:
-        return _valid_version((path / "VERSION").read_text(encoding="ascii"))
+        return _valid_version((path / "VERSION").read_text(encoding="ascii")), package_format
     except OSError:
-        return None
+        return None, None
 
 
 def _iter_desktop_entries(roots: Iterable[Path]) -> Iterable[Path]:
@@ -158,6 +173,7 @@ def _iter_local_update_entries(roots: Iterable[Path]) -> Iterable[Path]:
 def find_newer_desktop_update(
     current_version: str, roots: Optional[Iterable[Path]] = None,
     local_roots: Optional[Iterable[Path]] = None,
+    package_format: Optional[str] = None,
 ) -> DesktopUpdate:
     """Find the highest newer package on Desktop or beside this installation."""
 
@@ -173,15 +189,19 @@ def find_newer_desktop_update(
         # are cheaply filtered first, then their internal VERSION is checked.
         if kind == "zip" and not _PACKAGE_NAME.search(entry.name):
             continue
-        version = _zip_version(entry) if kind == "zip" else _directory_version(entry)
-        if version is not None and version_key(version) > current:
-            candidates.append(DesktopUpdate(entry, version, kind))
+        version, candidate_format = (
+            _archive_metadata(entry) if kind == "zip" else _directory_metadata(entry)
+        )
+        if (version is not None and candidate_format is not None
+                and (package_format is None or candidate_format == package_format)
+                and version_key(version) > current):
+            candidates.append(DesktopUpdate(entry, version, kind, candidate_format))
     if not candidates:
         roots_text = ", ".join(
             str(root) for root in (desktop_search_roots + nearby_roots)
         )
         raise UpdateError(
-            f"未找到比 v{current_version} 更新的 Maple 助手安装包。"
+            f"未找到比 v{current_version} 更新的 TodoHelper 安装包。"
             f"已检查: {roots_text or '桌面和安装目录不存在'}"
         )
     return max(
@@ -193,13 +213,19 @@ def find_newer_desktop_update(
 def _extract_zip_source(package: DesktopUpdate, staging: Path) -> Path:
     with zipfile.ZipFile(package.path) as archive:
         names = [item.filename.replace("\\", "/") for item in archive.infolist()]
-        assistant = next(
+        entry = next(
             (name for name in names if name.endswith("/assistant.py") or name == "assistant.py"),
             None,
         )
-        if assistant is None:
-            raise UpdateError("更新压缩包缺少 assistant.py。")
-        prefix = PurePosixPath(assistant).parent
+        if package.package_format == "frozen":
+            entry = next(
+                (name for name in names
+                 if PurePosixPath(name.casefold()).name in _FROZEN_ENTRY_NAMES),
+                None,
+            )
+        if entry is None:
+            raise UpdateError("更新压缩包缺少 TodoHelper 程序入口。")
+        prefix = PurePosixPath(entry).parent
         for item in archive.infolist():
             name = PurePosixPath(item.filename.replace("\\", "/"))
             try:
@@ -215,7 +241,10 @@ def _extract_zip_source(package: DesktopUpdate, staging: Path) -> Path:
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(item) as source, target.open("wb") as output:
                 shutil.copyfileobj(source, output)
-    if not (staging / "assistant.py").is_file():
+    has_entry = ((staging / "assistant.py").is_file()
+                 if package.package_format == "source"
+                 else any((staging / item).is_file() for item in _FROZEN_ENTRY_NAMES))
+    if not has_entry:
         raise UpdateError("更新压缩包结构不正确。")
     return staging
 
@@ -253,9 +282,16 @@ def apply_desktop_update(
     """
 
     destination = Path(install_root).resolve()
-    if not (destination / "assistant.py").is_file():
-        raise UpdateError("当前运行目录无 assistant.py，无法安全更新。")
-    staging = Path(tempfile.mkdtemp(prefix=".maple-update-", dir=destination))
+    installed_format = (
+        "frozen" if any((destination / item).is_file() for item in _FROZEN_ENTRY_NAMES)
+        else "source" if (destination / "assistant.py").is_file() else None
+    )
+    if installed_format is None:
+        raise UpdateError("当前运行目录无 TodoHelper 程序入口，无法安全更新。")
+    if installed_format != package.package_format:
+        raise UpdateError("更新包类型与当前安装不一致；EXE 和普通包请分别更新。")
+    staging = destination / f".todohelper-update-{os.getpid()}"
+    staging.mkdir(parents=True, exist_ok=False)
     try:
         source = _extract_zip_source(package, staging) if package.kind == "zip" else package.path
         source_version = read_version(source / "VERSION")
@@ -367,51 +403,55 @@ def import_user_config(source: Path, destination: Path) -> Path:
     return destination
 
 
-def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
-    """Launch a hidden helper that restarts after this instance exits."""
+def _persistent_helper(install_root: Path) -> Path:
+    helper = Path(install_root).resolve() / "todohelper_update.ps1"
+    if not helper.is_file():
+        raise UpdateError("更新辅助程序缺失，无法安全重启。")
+    return helper
 
-    root = Path(install_root).resolve()
-    launcher = root / "launch_assistant.vbs"
-    if not launcher.is_file():
-        raise UpdateError("更新后找不到 launch_assistant.vbs，无法自动重启。")
-    helper = root / f".maple-restart-{os.getpid()}.vbs"
-    escaped_launcher = str(launcher).replace('"', '""')
-    helper.write_text(
-        "Set shell = CreateObject(\"WScript.Shell\")\r\n"
-        "Set wmi = GetObject(\"winmgmts:\\\\.\\root\\cimv2\")\r\n"
-        f"targetPid = {os.getpid()}\r\n"
-        # Wait for the current Python instance to release its single-instance
-        # mutex, rather than guessing at worker shutdown timing.
-        "For i = 1 To 300\r\n"
-        "  Set processes = wmi.ExecQuery(\"SELECT * FROM Win32_Process WHERE ProcessId = \" & targetPid)\r\n"
-        "  If processes.Count = 0 Then Exit For\r\n"
-        "  WScript.Sleep 100\r\n"
-        "Next\r\n"
-        f"WScript.Sleep {max(300, int(delay_ms))}\r\n"
-        f"shell.Run \"wscript.exe //nologo \"\"{escaped_launcher}\"\"\", 0, False\r\n"
-        "CreateObject(\"Scripting.FileSystemObject\").DeleteFile WScript.ScriptFullName, True\r\n",
-        # Windows Script Host reliably reads UTF-16 even when the Windows
-        # account/path contains Chinese characters.
-        encoding="utf-16",
-    )
+
+def _run_persistent_helper(arguments: list[str], install_root: Path) -> Path:
+    """Start the one shipped update helper; never create a per-run script."""
+
+    helper = _persistent_helper(install_root)
     try:
         subprocess.Popen(
-            ["wscript.exe", "//nologo", str(helper)],
-            cwd=str(root),
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", str(helper), *arguments],
+            cwd=str(Path(install_root).resolve()),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except OSError as exc:
-        try:
-            helper.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise UpdateError(f"无法启动自动重启程序: {exc}") from exc
+        raise UpdateError(f"无法启动更新辅助程序: {exc}") from exc
     return helper
+
+
+def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
+    """Restart through the persistent helper after this process exits."""
+
+    root = Path(install_root).resolve()
+    return _run_persistent_helper(
+        ["-Mode", "Restart", "-TargetPid", str(os.getpid()),
+         "-InstallRoot", str(root)], root
+    )
+
+
+def schedule_package_update(package: DesktopUpdate, install_root: Path) -> Path:
+    """Apply a same-format ZIP only after the running app has exited."""
+
+    if package.kind != "zip":
+        raise UpdateError("请使用 TodoHelper 发布 ZIP 进行自动更新。")
+    root = Path(install_root).resolve()
+    return _run_persistent_helper(
+        ["-Mode", "Update", "-TargetPid", str(os.getpid()),
+         "-InstallRoot", str(root), "-PackagePath", str(package.path),
+         "-PackageFormat", package.package_format], root,
+    )
 
 
 __all__ = [
     "DesktopUpdate", "UpdateError", "UpdateResult", "apply_desktop_update",
     "desktop_roots", "export_user_config", "find_newer_desktop_update",
     "import_user_config", "remove_consumed_update_package",
-    "schedule_hidden_restart",
+    "schedule_hidden_restart", "schedule_package_update",
 ]

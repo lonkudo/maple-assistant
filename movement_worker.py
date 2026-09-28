@@ -70,10 +70,22 @@ ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
 # consume the new direction when it arrives in the old key-up poll slice.
 DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
 # Jump records are X-precise, but the marker can be one or more vertical
-# minimap pixels away while grabbing/climbing a rope.  Keep X at its proven
-# one-pixel range and permit a slightly wider Y approach window.
-JUMP_POINT_X_TOLERANCE = 0.010
-JUMP_POINT_Y_TOLERANCE = 0.020
+# minimap pixels away while grabbing/climbing a rope.  Keep a little more
+# than one X pixel and about two Y pixels: narrower than the earlier loose
+# window, without becoming smaller than the diamond's capture grid.
+JUMP_POINT_X_TOLERANCE = 0.008
+JUMP_POINT_Y_TOLERANCE = 0.015
+# A recorded jump point is a trigger for a LEG, not for every entry into its
+# X/Y zone.  The zone covers about one X pixel and two Y pixels, so a
+# character that jumps, lands, walks back over the same spot, or is climbed past
+# re-enters it constantly - the field report is a 右跳 recorded at layer2 that
+# mounted the rope and then fired the same 右跳 again on another run, throwing
+# the character off the rope it had just grabbed.  One point therefore fires at
+# most once per leg (see ``_jump_point_leg_key``) and once per pass from a climb.
+# This cooldown is only the backstop for a marker that flickers across the zone
+# edge (two shared-capture frames at 5 FPS); it stays short so it can never
+# swallow a genuine crossing on the next leg.
+JUMP_POINT_REFIRE_COOLDOWN_SECONDS = 0.4
 
 # Movement-thread stall watchdog.  When patrol input is armed and this worker
 # has consumed no frame for STALL_WATCHDOG_SECONDS, its own stack is reported
@@ -102,6 +114,12 @@ STATIONARY_ATTACK_X_TOLERANCE = 0.006
 # cadence after the first burst so a spot that a jump cannot reach never turns
 # into an endless jump loop.
 STATIONARY_ATTACK_Y_TOLERANCE = 0.006
+# A single minimap capture can place the diamond one pixel away from its
+# standing position.  It must never make 站桩攻击 jump: require the same
+# out-of-band Y direction in two consecutive captures before a recovery jump
+# is armed.  At the shared 5 FPS cadence this still reacts to a real fall in
+# about 0.2 seconds.
+STATIONARY_ATTACK_Y_CONFIRM_FRAMES = 2
 # Used only to decide whether the marker is still on the anchor platform. It
 # is intentionally wider than the exact launch-position tolerance: minimap
 # pixel jitter must not suppress attacks during final X correction.
@@ -300,9 +318,63 @@ def _layer_point_ys(layer: Any) -> list[float]:
 # through its LOWER edge.
 LAYER_UP_REACH_FACTOR = 0.7
 
+# Last-resort gap for a single-supporter layer (or a ``layer_y``-only layer)
+# whose recording carries no layout at all, so one marker row cannot be derived.
+# The normal gap is ``max(tolerance / 3, 1 / analysis_height)`` - about one
+# marker pixel; see ``_layer_marker_row``.
+LAYER_SINGLE_SUPPORTER_GAP_FALLBACK = 0.002
+
+# Consecutive "no recorded floor detected" frames a climb-arrival confirmation
+# tolerates while the climb still owns Up.  At the shared 5 FPS cadence the
+# operator's own jump arc keeps the marker one marker row above the platform for
+# 1-2 frames (13:58 log: layer2's row 0.653571 / world 3.546 alternates with
+# 0.617857 / world 2.71 on every Alt+Up attempt).  Treating each of those frames
+# as "not arrived" zeroed the streak, so arrival could never be confirmed and the
+# climb restarted forever.  A longer blank run is real evidence and still resets.
+CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED = 3
+
+
+def _layer_marker_row(layer: Any) -> Optional[float]:
+    """One marker row (1 px) in normalised minimap Y, from the recorded layout.
+
+    The operator's convention for a layer that has a single supporter (rope
+    only, left-most only, or right-most only) is the one-sided band
+    ``[y, y + small_gap]``.  ``small_gap`` must never be smaller than one marker
+    row: the yellow diamond's centre quantises to ``1 / analysis_height``
+    (0.007143 on the 114x140 minimap, where every recorded Y is a half-pixel
+    centre such as 0.753571 or 0.510714), so the old fixed 0.002 - 0.28 px -
+    could only match a reading that landed on the recorded row exactly.  The
+    layout travels with every recorded point, so the row comes from the
+    recording instead of a constant.
+    """
+
+    if not isinstance(layer, dict):
+        return None
+    candidates: list[Any] = [
+        layer.get(name)
+        for name in ("left_most_pos", "rope_pos", "right_most_pos")
+    ]
+    jump_points = layer.get("jump_points")
+    if isinstance(jump_points, list):
+        candidates.extend(jump_points)
+    for point in candidates:
+        coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
+        if not isinstance(coordinate, dict):
+            continue
+        layout = coordinate.get("recorded_layout")
+        if not isinstance(layout, dict):
+            continue
+        try:
+            height = float(layout.get("analysis_height"))
+        except (TypeError, ValueError):
+            continue
+        if height >= 1.0:
+            return 1.0 / height
+    return None
+
 
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
-    """Layer band from its recorded point Ys.
+    """Layer band from its saved recording envelope.
 
     band = (uppermost point Y - tolerance * ``LAYER_UP_REACH_FACTOR``,
             lowermost point Y + tolerance / 3).
@@ -317,30 +389,77 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     to ``layer_y`` when the layer has no recorded points (still the mean
     band then).
     """
+    # ``PatrolController`` materialises these bounds whenever a supporter is
+    # recorded, removed, or re-projected.  Runtime must use that one saved
+    # decision rather than independently reassembling a slightly different
+    # band from endpoint samples on each worker path.  The old calculation is
+    # retained only for profiles created before explicit bands were added.
+    saved = layer.get("layer_band") if isinstance(layer, dict) else None
+    # ``None`` is an explicit result of deleting the last supporter.  It is
+    # not a legacy omission and must not fall through to stale ``layer_y``.
+    if isinstance(layer, dict) and "layer_band" in layer and saved is None:
+        return None
+    if isinstance(saved, dict):
+        try:
+            upper = float(saved["y_upper"])
+            lower = float(saved["y_lower"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            if upper <= lower:
+                return upper, lower
     values = _layer_point_ys(layer)
     if not values and isinstance(layer, dict) and "layer_y" in layer:
         values = [float(layer["layer_y"])]
     if not values:
         return None
+    effective_tolerance = max(0.0, float(tolerance))
     if len(values) == 1:
         # A rope-only (or otherwise one-point) layer is a reference point,
         # not a horizontally sampled platform.  Giving it the ordinary
         # +/- tolerance band makes it overlap the actual floor above/below
         # and steals layer identity during a return.  Its narrow, one-sided
-        # band follows the operator's convention: [recorded_y, y + 0.002].
+        # band follows the operator's convention: [recorded_y, y + small_gap].
         # ``jump_points`` are intentionally not part of ``_layer_point_ys``.
+        #
+        # ``small_gap`` is the same "one third below the base" the multi-point
+        # branch uses, but never smaller than one marker row: a narrower band
+        # can only match the exact recorded row, which is what made a character
+        # walking that very floor read "matches no band" (13:16 log: layer1
+        # band (0.753571, 0.755571) while the marker read 0.796429 / 0.767857 /
+        # 0.732143 on that same floor).
         only_y = values[0]
-        return only_y, only_y + 0.002
+        gap = effective_tolerance / 3.0
+        marker_row = _layer_marker_row(layer)
+        if marker_row is not None:
+            gap = max(gap, marker_row)
+        if gap <= 0.0:
+            gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
+        return only_y, only_y + gap
     # The tolerance above the visually highest point covers climb/drop arrival
     # movement, scaled by the operator's upper-band factor.  Only one third is
     # allowed below the confirmed layer base: enough for OpenCV/marker
     # quantization noise without making the band unnecessarily reach toward the
     # layer below.
-    effective_tolerance = max(0.0, float(tolerance))
     return (
         min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
         max(values) + effective_tolerance / 3.0,
     )
+
+
+def _has_layer_y_supporter(layer: Any) -> bool:
+    """Whether a layer has any recorded floor supporter.
+
+    ``layer_y`` is a legacy cached summary, not the recording itself.  A
+    rope-only layer is still a valid floor and must be discoverable from its
+    ``rope_pos`` even if that cache was not written (for example after a
+    partial/manual recording).  Jump points deliberately do not count.
+    """
+
+    if not isinstance(layer, dict):
+        return False
+    tolerance = float(layer.get("y_tolerance", 0.020000))
+    return _layer_y_band(layer, tolerance) is not None
 
 
 def _coherent_observed_world_points(
@@ -387,6 +506,18 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
 
     tolerance applies only above the topmost point, not below the
     lowermost point, so adjacent floors' bands overlap less."""
+    saved = layer.get("layer_band") if isinstance(layer, dict) else None
+    if isinstance(layer, dict) and "layer_band" in layer and saved is None:
+        return None
+    if isinstance(saved, dict):
+        try:
+            upper = float(saved["world_y_upper"])
+            lower = float(saved["world_y_lower"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            if upper <= lower:
+                return upper, lower
     coherent_points = _coherent_observed_world_points(layer)
     values = [world_y for _, world_y in coherent_points]
     if not coherent_points:
@@ -441,6 +572,13 @@ def _layer_world_anchor_at_x(layer: Any, player_x: Optional[float]) -> Optional[
 # nearest-anchor rule switched at the midpoint between floors, released Up while the character was
 # still on the rope, and then horizontal patrol pulled it off").
 LAYER_CURRENT_Y_GRACE = 0.012
+
+# A nearest-recorded-Y answer is a small visual-quantisation fallback, not a
+# substitute for floor identity after a fall.  Five marker rows comfortably
+# covers an unsampled end of a bench/stair platform (the use case for this
+# fallback), while rejecting the 0.1429-wide guess that turned a fall through
+# layer2/layer1 back into layer3 patrol.
+LAYER_NEAREST_FLOOR_MAX_DISTANCE = 0.050
 
 # How long the planned descent to the route's first floor may keep the layer state before the normal
 # recovery takes over again.  The descent owns every vertical move (see ``_resync_route_layer``), so it
@@ -863,6 +1001,19 @@ class ClimbState:
     # band while holding Up (rope-top settle).  Bounds how long the
     # at-arrival stall suppression may hold Up before retrying.
     arrival_frames: int = 0
+    # A return climb can miss a rope and land on a lower recorded floor.
+    # Keep a short confirmation streak so one noisy layer read does not
+    # redirect the rope target, but never leave the return state latched to
+    # the floor the character has already fallen away from.
+    return_descent_floor: Optional[str] = None
+    return_descent_frames: int = 0
+    # Consecutive frames with NO recorded floor detected while a climb owns Up.
+    # Those frames are the character's own jump arc just above the platform row
+    # (13:58 log: marker 0.617857 / world 2.71 while layer2's row is
+    # 0.653571 / 3.546), not evidence against the arrival - so they must not
+    # zero the arrival confirmation.  A long run of them still restarts the
+    # climb, which is what this counter bounds.
+    blank_arrival_frames: int = 0
 
 
 def preserve_persistent_climb(
@@ -885,6 +1036,17 @@ def preserve_persistent_climb(
     # jump-point executor preserves Up itself through its landing check.
     if isinstance(proposed.key, str) and proposed.key.startswith("jump_point_"):
         return proposed
+    if proposed.key in ("jump_climb_left", "jump_climb_right", "jump_climb_up"):
+        # The route planner recomputes from every screenshot and can suggest
+        # the opposite rope side while the previous Alt+Up/Alt+side attempt
+        # is still being verified.  That suggestion is not a fresh recovery
+        # decision.  Keep advancing the existing state machine instead; it
+        # alone may issue a new Alt chord after it has confirmed a failed
+        # grab.  This also keeps the action log honest (``climb`` rather than
+        # a misleading immediate ``jump_climb_left/right``).
+        return MovementDecision(
+            "climb", "Up held; verifying the current rope-climb attempt"
+        )
     if proposed.key in ("left", "right"):
         return MovementDecision(
             None,
@@ -1271,7 +1433,18 @@ def climb(
         # the rope (world-Y tracker noise) and froze it holding Up.
         if rope_x is not None and observation.player is not None:
             x_gap = abs(observation.player.x - rope_x)
-            x_aligned = x_gap <= rope_x_tolerance
+            # Once the marker has supplied an independent upward confirmation
+            # at the rope, minimap scrolling/diamond quantisation can move its
+            # displayed X by another pixel while it climbs.  Keep that rising
+            # session attached with one marker-row of lateral grace; otherwise
+            # the third confirmation resets at the rope lip and the planner
+            # proposes an unnecessary opposite ``jump_climb_left/right``.
+            # Before the first rise the strict tolerance remains in force, so
+            # a character merely standing beside a rope is never attached.
+            attached_x_tolerance = rope_x_tolerance
+            if state.attach_frames:
+                attached_x_tolerance += 0.008
+            x_aligned = x_gap <= attached_x_tolerance
         else:
             x_gap = None
             x_aligned = True
@@ -1794,24 +1967,78 @@ class MovementWorker(threading.Thread):
     """Consume only the newest frame and issue at most one short tap per frame."""
 
     def _next_layer_arrival_band(self) -> tuple[Optional[float], float]:
-        """(marker Y, tolerance) of the NEXT route layer, or (None, 0.02)."""
+        """(marker Y, tolerance) of the floor the climb is heading to.
 
-        if (self._route_layer_index is None
-                or self._route_layer_index + 1 >= len(self._route_layers)):
-            return None, 0.02
-        layer = self.important_positions.get(
-            self._route_layers[self._route_layer_index + 1], {}
-        )
-        if not isinstance(layer, dict) or "layer_y" not in layer:
-            return None, 0.02
-        tolerance = float(layer.get("y_tolerance", 0.020000))
-        band = _layer_y_band(layer, tolerance)
-        if band is None:
-            return float(layer["layer_y"]), tolerance
-        return (
-            (band[0] + band[1]) / 2.0,
-            (band[1] - band[0]) / 2.0,
-        )
+        The NEXT route layer is the normal answer.  A return climb is the
+        exception: the patrol range may start above the floor the character is
+        returning through, so the floor it is actually climbing to is an
+        out-of-range intermediate one (the operator's layer2 while the range
+        starts at layer3).  Asking only for the next ROUTE layer returned
+        ``None`` there, so the arrival check inside the climb state machine could
+        never be true: at the platform top the stall detector saw "world Y
+        stopped advancing", released Up and re-jumped forever (13:58 log:
+        standing on layer2 at world 3.546, looping "CLIMB stalled").
+
+        The band is widened by one marker row on both sides: the marker lands on
+        the platform row with the diamond's own 1 px quantum, and for a
+        single-supporter floor that row is the whole band.
+        """
+
+        candidates: list[str] = []
+        if self._return_mode == "climb-to-route":
+            # A return climb heads for the recorded floor directly above the one
+            # it is climbing from.  That is NOT necessarily the next route layer:
+            # while the character returns through a floor below the patrol range,
+            # the route index still describes the floor it fell from, so its
+            # "next" layer sits one floor too high and its band never matches the
+            # platform the character actually reaches.
+            target = self._return_climb_target_floor()
+            if target is not None:
+                candidates.append(target)
+        if (self._route_layer_index is not None
+                and self._route_layer_index + 1 < len(self._route_layers)):
+            next_route = self._route_layers[self._route_layer_index + 1]
+            if next_route not in candidates:
+                candidates.append(next_route)
+        for name in candidates:
+            layer = self.important_positions.get(name, {})
+            if not _has_layer_y_supporter(layer):
+                continue
+            tolerance = float(layer.get("y_tolerance", 0.020000))
+            band = _layer_y_band(layer, tolerance)
+            if band is None:
+                continue
+            margin = _layer_marker_row(layer) or 0.0
+            low = band[0] - margin
+            high = band[1] + margin
+            return (low + high) / 2.0, (high - low) / 2.0
+        return None, 0.02
+
+    def _return_climb_target_floor(self) -> Optional[str]:
+        """The recorded floor a return climb is climbing toward.
+
+        That is the next recorded floor ABOVE the floor the return is climbing
+        from, capped at the bottom of the patrol range (the return target
+        itself).  It is not necessarily in ``_route_layers`` - see
+        ``_next_layer_arrival_band``.
+        """
+
+        departing = self._return_from_floor
+        if departing is None:
+            return None
+        departing_number = _layer_number(departing)
+        best: Optional[tuple[int, str]] = None
+        for name, layer in self.important_positions.items():
+            if name == departing or not isinstance(layer, dict):
+                continue
+            if not _has_layer_y_supporter(layer):
+                continue
+            number = _layer_number(name)
+            if number <= departing_number or number > self._patrol_range_min:
+                continue
+            if best is None or number < best[0]:
+                best = (number, name)
+        return best[1] if best is not None else None
 
     def _run_climb_step(
         self,
@@ -1901,14 +2128,13 @@ class MovementWorker(threading.Thread):
         drop to layer1 and restart the patrol.  Frames where an attack is
         active are skipped - movement is intentionally paused then.
 
-        A MISSING yellow marker is itself a stuck condition: with no marker
-        the worker sends no keys, the phase cannot advance, and the character
-        freezes wherever it stands (e.g. an in-game UI window covering the
-        top-left minimap after a long session).  Missing-marker frames count
-        toward the same stuck window instead of resetting it, and when the
-        run reaches ``rescue_stuck_frames`` the rescue fires IMMEDIATELY
-        (not waiting for the next 5-minute window) so a covered/missing
-        minimap cannot freeze the patrol forever.
+        A MISSING yellow marker is deliberately *not* a self-rescue condition.
+        It can mean a login/offline page, a minimap-less zone, or a transient
+        capture failure.  The character worker owns that state and starts
+        auto reconnect only after its independent login-page confirmation.
+        Sending Alt+Down without a marker was unsafe: it could issue thirty
+        blind drop chords while reconnect was still deciding whether the game
+        was offline.
 
         A marker present but OFF every recorded layer band has a separate
         consecutive stationary run: the character may have fallen off, but a
@@ -1972,24 +2198,9 @@ class MovementWorker(threading.Thread):
         if pos is None:
             self._rescue_off_route_frames = 0
             self._rescue_off_route_anchor = None
-            # Marker lost while patrol is active: the character cannot move
-            # purposefully at all (no keys are sent, the phase cannot
-            # advance) - count it as stuck instead of resetting, and rescue
-            # once the run is long enough.  The immediate trigger keeps the
-            # 5-minute window from delaying the recovery.
-            self._rescue_stuck_frames += 1
-            self._rescue_max_stuck = max(
-                self._rescue_max_stuck, self._rescue_stuck_frames
-            )
-            if self._rescue_stuck_frames >= self.rescue_stuck_frames:
-                LOG.warning(
-                    "SELF-RESCUE: yellow marker missing for %d frames; "
-                    "dropping to layer1 and restarting patrol",
-                    self._rescue_stuck_frames,
-                )
-                self._rescue_stuck_frames = 0
-                self._rescue_max_stuck = 0
-                self._trigger_rescue()
+            self._rescue_stuck_frames = 0
+            self._rescue_max_stuck = 0
+            self._rescue_last_pos = None
             return
         # Off-route: the marker is present but matches NO recorded layer
         # band (marker-Y check - the pinned world-Y must not be consulted
@@ -2008,7 +2219,7 @@ class MovementWorker(threading.Thread):
             for name in self._route_layers
         }
         has_y_bands = any(
-            isinstance(layer, dict) and "layer_y" in layer
+            _has_layer_y_supporter(layer)
             for layer in route_layers.values()
         )
         off_route = bool(
@@ -3095,20 +3306,44 @@ class MovementWorker(threading.Thread):
         self._stair_jump_skip_frames = 0
         self._stair_jump_completion_lock = threading.Lock()
         self._stair_jump_completion: Optional[bool] = None
-        # A jump point fires once per entry into its X/Y zone and re-arms when
-        # the marker leaves.  It is not tied to a patrol leg, floor, or the
-        # direction inferred from the active route.
+        # A jump point fires once per LEG - one directional traversal of one
+        # route floor - and is armed again by the next leg or the next Start
+        # Patrol pass.  It is NOT re-armed merely because the marker left its
+        # zone: the zone is deliberately loose, so a landing, a walk back over
+        # the same spot, or a climb past the same row re-enters it at once, and
+        # the field report is a 右跳 that mounted the rope at layer2 and then
+        # fired the same 右跳 again on another run - throwing the character off
+        # the rope it had just grabbed.
         self._jump_point_inside_tokens: set[tuple[str, int]] = set()
         # A fired point stays suppressed for its entire Up-hold/landing
         # session.  A jump arc naturally leaves and re-enters the loose Y
         # tolerance; treating that as a new arrival created repeated jumps.
         self._jump_point_suppressed_tokens: set[tuple[str, int]] = set()
+        # token -> (pass_id, leg_key, monotonic time) of its last dispatch.
+        self._jump_point_fired: dict[
+            tuple[str, int], tuple[int, tuple[int, int, str], float]
+        ] = {}
+        # floor -> last logged rope-target answer, so the per-frame target
+        # computation cannot flood the running log.
+        self._rope_target_answers: dict[str, str] = {}
+        # Incremented by every new movement pass (Start Patrol, 站桩 manual
+        # start, each pickup circuit).  A pass change arms every point again.
+        self._jump_point_pass_id = 0
         # A coordinate match is only a candidate.  It becomes dispatched after
         # the dedicated jump worker accepts the request.
         self._jump_point_candidate: Optional[tuple[str, int]] = None
         self._jump_point_up_held = False
         self._jump_point_up_started_at = 0.0
         self._jump_point_y_samples: list[float] = []
+        # First post-jump marker row.  A stable reading alone is not a
+        # landing: a missed jump also settles back on its departing platform.
+        self._jump_point_start_y: Optional[float] = None
+        self._jump_point_last_y: Optional[float] = None
+        self._jump_point_rise_frames = 0
+        # Set only when this recorded point was dispatched while the active
+        # route target was MOVE TO ROPE.  A horizontal stair point must never
+        # manufacture a rope-climb handoff merely because its Y rises.
+        self._jump_point_rope_handoff = False
         # True once the automation input gate has been observed active, so the
         # disarmed->armed edge (Start Patrol) can be detected exactly once.
         self._automation_was_active = False
@@ -3204,6 +3439,8 @@ class MovementWorker(threading.Thread):
         self._stationary_y_jumps = 0
         self._stationary_y_jump_at = float("-inf")
         self._stationary_y_backoff_logged = False
+        self._stationary_y_mismatch_sign = 0
+        self._stationary_y_mismatch_frames = 0
         self._walk_hold_key: Optional[str] = None
         self._walk_hold_z = False
         self._walk_hold_until = 0.0
@@ -3399,6 +3636,11 @@ class MovementWorker(threading.Thread):
         self._fall_last_y: Optional[float] = None
         self._fall_frames = 0
         self._fall_pending = False
+        # While the marker is descending, the world tracker can name a real
+        # lower floor for one frame and then lose it when the minimap scrolls.
+        # Keep that evidence until the fall settles; otherwise the next blank
+        # frame leaves the old route state (for example layer3) active.
+        self._fall_floor_candidate: Optional[str] = None
         # Set once per confirmed fall: every movement key was released (see
         # ``_release_stuck_keys``) so a key whose key-up the game missed
         # during the knock-down cannot pin the character against a wall after
@@ -3811,6 +4053,10 @@ class MovementWorker(threading.Thread):
                 self._jump_point_up_held = False
                 self._jump_point_up_started_at = 0.0
                 self._jump_point_y_samples.clear()
+                self._jump_point_start_y = None
+                self._jump_point_last_y = None
+                self._jump_point_rise_frames = 0
+                self._jump_point_rope_handoff = False
                 if self.climbing_active_event is not None:
                     self.climbing_active_event.clear()
                 LOG.info("JUMP POINT: released prior Up hold for new jump")
@@ -3841,6 +4087,9 @@ class MovementWorker(threading.Thread):
                     self._jump_point_up_held = True
                     self._jump_point_up_started_at = time.monotonic()
                     self._jump_point_y_samples.clear()
+                    self._jump_point_start_y = None
+                    self._jump_point_last_y = None
+                    self._jump_point_rise_frames = 0
                     if self.climbing_active_event is not None:
                         self.climbing_active_event.set()
                 lead = 0.0 if hold_up else max(0.0, self.stair_jump_lead_seconds)
@@ -3871,10 +4120,75 @@ class MovementWorker(threading.Thread):
                     self._jump_point_up_held = False
                     self._jump_point_up_started_at = 0.0
                     self._jump_point_y_samples.clear()
+                    self._jump_point_start_y = None
+                    self._jump_point_last_y = None
+                    self._jump_point_rise_frames = 0
+                    self._jump_point_rope_handoff = False
                     if self.climbing_active_event is not None:
                         self.climbing_active_event.clear()
                 if added_direction_claim:
                     key_up(direction)
+
+    def _jump_point_leg_key(self) -> tuple[int, int, str]:
+        """Identity of the current movement leg: (pass, route floor, phase).
+
+        A leg is one directional traversal of one route floor.  The patrol
+        cycle is deliberately NOT part of the key: walking the same leg a
+        second time is the same leg, and a recorded point must not fire twice
+        on it (that is the repeated 右跳 of the field report).
+        """
+
+        index = -1 if self._route_layer_index is None else int(self._route_layer_index)
+        return (int(self._jump_point_pass_id), index, str(self._route_phase))
+
+    def _begin_jump_point_pass(self, reason: str) -> None:
+        """Start a new movement pass: every recorded jump point is armed again.
+
+        A pass is one Start Patrol session (or one 站桩/pickup circuit).  The
+        operator's rule: points are allowed once per movement pass, never once
+        per application lifetime, so a point that fired on the first run is
+        available on the next Start Patrol.
+        """
+
+        self._jump_point_pass_id += 1
+        self._jump_point_fired.clear()
+        LOG.info(
+            "JUMP POINT pass %d started (%.3fs): recorded points re-armed (%s)",
+            self._jump_point_pass_id,
+            time.monotonic(),
+            reason,
+        )
+
+    def _jump_point_block_reason(
+        self, token: tuple[str, int], *, climbing: bool
+    ) -> Optional[str]:
+        """Why ``token`` must not fire now, or None when it is armed."""
+
+        record = self._jump_point_fired.get(token)
+        if record is None:
+            return None
+        pass_id, leg_key, fired_at = record
+        if climbing and pass_id == self._jump_point_pass_id:
+            # The point already produced its jump in this pass.  Re-firing it
+            # from a climb is the "already on the rope and jumped again" case:
+            # a mount point recorded on the floor row still matches while the
+            # climb is only a few pixels up.
+            return "already used in this pass (climb)"
+        if leg_key == self._jump_point_leg_key():
+            return "already fired on this leg"
+        cooldown = JUMP_POINT_REFIRE_COOLDOWN_SECONDS
+        if time.monotonic() - fired_at < cooldown:
+            return f"within the {cooldown:.1f}s refire cooldown"
+        return None
+
+    def _jump_point_note_fired(self, token: tuple[str, int]) -> None:
+        """Record a dispatched point for its leg/pass and cooldown."""
+
+        self._jump_point_fired[token] = (
+            int(self._jump_point_pass_id),
+            self._jump_point_leg_key(),
+            time.monotonic(),
+        )
 
     def _jump_point_decision(
         self,
@@ -3885,20 +4199,22 @@ class MovementWorker(threading.Thread):
         climbing: bool = False,
         travel_direction: Optional[str] = None,
     ) -> Optional[MovementDecision]:
-        """Return a jump when the marker freshly enters any recorded point.
+        """Return a jump when the marker enters an armed recorded point.
 
         The point layer is not a gate: rope approach frames can have an
-        ambiguous/current layer label.  On a horizontal leg the recorded
-        *direction* remains a gate: 右跳 fires only while travelling right and
-        左跳 only while travelling left.  A rope climb has no horizontal leg to
-        compare against, so there the recorded direction is only a PREFERENCE
-        (it breaks a tie when a 左跳 and a 右跳 both match) and the X/Y window
-        alone decides - the documented rule is that either directional point may
-        fire while climbing.  Gating a rope point on the approach direction made
-        a 右跳 recorded at the rope X invisible during a return climb whose
-        approach had walked left, which is the field failure of a rope jump
-        point that never emits.  Once the marker leaves the zone, that same
-        point is armed again for a later crossing.
+        ambiguous/current layer label.  The recorded *direction* is always a
+        gate: 右跳 fires only while travelling right and 左跳 only while
+        travelling left, including during a rope approach.  A climb with no
+        known horizontal approach direction does not guess.  Allowing either
+        point during a climb made a 左跳 fire while the route phase was right,
+        which then left the rope planner in a misleading ``action=wait`` state.
+
+        A point fires at most ONCE PER LEG (``_jump_point_leg_key``) and is
+        armed again by the next leg or the next Start Patrol pass.  Leaving the
+        zone is not enough to re-arm it: the zone is loose on purpose, so a
+        landing, a walk back over the same spot, or a climb past the same row
+        re-enters it immediately, which produced a second 右跳 while the
+        character was already on the rope.
         """
 
         del layer
@@ -3912,10 +4228,10 @@ class MovementWorker(threading.Thread):
                 if plan is not None and plan.decision.key in ("left", "right")
                 else None
             )
-        # A climb keeps looking even without a usable travel direction: the
-        # marker can sit exactly on the rope X, where the gap is zero and no
-        # approach side was ever recorded.
-        if travel_direction not in ("left", "right") and not climbing:
+        # A directional point must never guess at the rope centre.  The
+        # approach direction is retained by the route/climb state, so if it
+        # is absent this frame simply cannot dispatch a left/right record.
+        if travel_direction not in ("left", "right"):
             return None
 
         matches: list[tuple[tuple[str, int], str, str]] = []
@@ -3931,7 +4247,7 @@ class MovementWorker(threading.Thread):
                 direction = str(point.get("direction", "")).casefold()
                 if direction not in ("left", "right"):
                     continue
-                if not climbing and direction != travel_direction:
+                if direction != travel_direction:
                     continue
                 try:
                     matched = (
@@ -3943,7 +4259,7 @@ class MovementWorker(threading.Thread):
                 if matched:
                     matches.append(((point_layer, index), point_layer, direction))
 
-        if climbing and travel_direction in ("left", "right") and len(matches) > 1:
+        if climbing and len(matches) > 1:
             # Two points can match at once on a rope (a 左跳 and a 右跳 recorded
             # at the same height).  Prefer the recorded direction the character
             # is actually travelling; the stable sort keeps the X-sorted
@@ -3951,9 +4267,10 @@ class MovementWorker(threading.Thread):
             matches.sort(key=lambda match: match[2] != travel_direction)
 
         matched_tokens = {token for token, _name, _direction in matches}
-        # Re-arm a dispatched point only after its jump session is complete
-        # and the marker has actually left the point zone.  This is an entry
-        # detector, not a per-frame or per-airborne-sample trigger.
+        # A fired point stays suppressed until the marker leaves its zone (the
+        # Up-hold/landing session may still be open).  Re-arming on zone exit is
+        # kept for the per-frame entry detector only; the leg record above is
+        # what limits a point to one jump per leg.
         if not self._jump_point_up_held:
             self._jump_point_suppressed_tokens.intersection_update(matched_tokens)
         entered = [
@@ -3961,11 +4278,23 @@ class MovementWorker(threading.Thread):
             if (match[0] not in self._jump_point_inside_tokens
                 and match[0] not in self._jump_point_suppressed_tokens)
         ]
+        armed_entered: list[tuple[tuple[str, int], str, str]] = []
+        for match in entered:
+            reason = self._jump_point_block_reason(match[0], climbing=climbing)
+            if reason is None:
+                armed_entered.append(match)
+                continue
+            # One line per crossing is the point of the change: the operator has
+            # to be able to see that the guard is what stopped the second jump.
+            LOG.info(
+                "JUMP POINT suppressed: %s[%d] %s jump - %s",
+                match[1], match[0][1], match[2], reason,
+            )
         self._jump_point_inside_tokens = matched_tokens
-        if not entered:
+        if not armed_entered:
             return None
 
-        token, point_layer, direction = entered[0]
+        token, point_layer, direction = armed_entered[0]
         self._jump_point_candidate = token
         LOG.info(
             "%s JUMP POINT %s[%d] entered x=%.6f y=%.6f; awaiting jump worker",
@@ -3977,27 +4306,142 @@ class MovementWorker(threading.Thread):
             self.minimum_final_hold_seconds,
         )
 
+    def _handoff_jump_point_rope_climb(
+        self, observation: MinimapObservation
+    ) -> None:
+        """Hand a confirmed point-to-rope grab to ordinary Up-only climbing.
+
+        The recorded point owns the first ``direction + Alt`` chord.  After
+        the first genuine upward marker advance hands control to ordinary
+        climb tracking; that state then performs the stricter attachment
+        verification. From that moment it owns the *existing* Up hold so
+        it can recognise the next floor.  It must not issue a second Alt jump.
+        If the marker then falls back, the ordinary MOVE TO ROPE recovery is
+        free to retry normally.
+        """
+
+        player = observation.player
+        if player is None or not self._jump_point_up_held:
+            return
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if not callable(key_down) or not callable(key_up):
+            return
+        with self._direction_lock:
+            # Add the climb state's ownership claim before releasing the
+            # point's claim, so the physical Up key never flickers up.
+            if key_down("up") is False:
+                return
+            key_up("up")
+        world_y = (
+            observation.world_y_diamonds
+            if observation.structure_confidence >= 0.12 else None
+        )
+        self._climb_state = ClimbState(
+            phase="climbing-up",
+            baseline_y=self._jump_point_start_y,
+            baseline_world_y=world_y,
+            up_held=True,
+            attach_frames=2,
+            last_world_y=world_y,
+            last_marker_y=player.y,
+            recent_y=[player.y],
+        )
+        self._jump_point_up_held = False
+        self._jump_point_up_started_at = 0.0
+        self._jump_point_y_samples.clear()
+        self._jump_point_start_y = None
+        self._jump_point_last_y = None
+        self._jump_point_rise_frames = 0
+        self._jump_point_rope_handoff = False
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
+        LOG.info(
+            "JUMP POINT rope grab confirmed; handed existing Up hold to normal climb tracking"
+        )
+
     def _update_jump_point_landing(self, observation: MinimapObservation) -> None:
         if not self._jump_point_up_held or observation.player is None:
             return
+        current_y = float(observation.player.y)
+        if self._jump_point_start_y is None:
+            # Keep the first capture after the recorded directional jump.  It
+            # is the only reliable baseline for distinguishing a real platform
+            # landing from a failed jump that simply settles back where it
+            # started.
+            self._jump_point_start_y = current_y
+        marker_rise = (
+            self._jump_point_last_y is not None
+            and self._jump_point_last_y - current_y >= 0.003
+        )
+        self._jump_point_last_y = current_y
+        if marker_rise:
+            self._jump_point_rise_frames += 1
+        elif self._jump_point_rise_frames:
+            # A rebound to the departing floor restarts the provisional
+            # evidence before ordinary climb tracking has accepted it.
+            self._jump_point_rise_frames = 0
+        if (self._jump_point_rope_handoff
+                and self._jump_point_rise_frames >= 1):
+            self._handoff_jump_point_rope_climb(observation)
+            return
         # The samples immediately after Alt can still be from the take-off
         # frame.  Keep Up down through that jump session, then accept only a
-        # later stable Y sequence as a landing on a horizontal platform.
+        # later *higher* stable Y sequence as a landing on a horizontal
+        # platform.  Previously three identical departure-floor reads caused
+        # an early Up release; the ordinary rope planner then took over with
+        # ``jump_climb_up`` or an Alt+left/right recovery, overwriting the
+        # recorded left/right jump point.
         if time.monotonic() - self._jump_point_up_started_at < 0.40:
             return
-        self._jump_point_y_samples.append(float(observation.player.y))
+        self._jump_point_y_samples.append(current_y)
         if len(self._jump_point_y_samples) > 3:
             del self._jump_point_y_samples[:-3]
-        if len(self._jump_point_y_samples) == 3 and max(self._jump_point_y_samples) - min(self._jump_point_y_samples) <= 0.001:
+        layer = None
+        if self._jump_point_candidate is not None:
+            layer = self.important_positions.get(self._jump_point_candidate[0])
+        marker_row = _layer_marker_row(layer) if layer is not None else None
+        upward_landing_required = max(0.003, (marker_row or 0.007) * 0.5)
+        settled_on_higher_floor = bool(
+            self._jump_point_start_y is not None
+            and self._jump_point_start_y - current_y >= upward_landing_required
+        )
+        if (len(self._jump_point_y_samples) == 3
+                and max(self._jump_point_y_samples) - min(self._jump_point_y_samples) <= 0.001
+                and settled_on_higher_floor):
+            # End this jump-point session: release OUR claim on Up (one owner
+            # reference) and stop sampling.  When the climb state machine still
+            # holds its own reference the key physically stays down - which is
+            # correct, the climb owns it.  In that case the climb's gate must
+            # also stay set: clearing ``climbing_active_event`` here un-gated
+            # attacks and 小碎步 while the character was still attached to the
+            # rope (13:58 log: owners 2 -> 1 with "JUMP POINT landing Y settled"
+            # while the climb state was holding-up-awaiting-progress).
+            climb_owns_up = bool(
+                self._climb_state.up_held
+                or self._climb_state.phase == "climbing-up"
+            )
             key_up = getattr(self.key_sender, "key_up", None)
             if callable(key_up):
                 key_up("up")
             self._jump_point_up_held = False
             self._jump_point_up_started_at = 0.0
             self._jump_point_y_samples.clear()
-            if self.climbing_active_event is not None:
-                self.climbing_active_event.clear()
-            LOG.info("JUMP POINT landing Y settled; released Up and resumed patrol")
+            self._jump_point_start_y = None
+            self._jump_point_last_y = None
+            self._jump_point_rise_frames = 0
+            self._jump_point_rope_handoff = False
+            if climb_owns_up:
+                LOG.info(
+                    "JUMP POINT landing Y settled; released Up and left it to "
+                    "the climb that still owns it"
+                )
+            else:
+                if self.climbing_active_event is not None:
+                    self.climbing_active_event.clear()
+                LOG.info(
+                    "JUMP POINT landing Y settled; released Up and resumed patrol"
+                )
 
     def perform_queued_stair_jump(self, direction: str) -> bool:
         """Compatibility entry point for older integrations.
@@ -4184,7 +4628,7 @@ class MovementWorker(threading.Thread):
 
         floors = [
             name for name, layer in self.important_positions.items()
-            if isinstance(layer, dict) and "layer_y" in layer
+            if _has_layer_y_supporter(layer)
         ]
         return min(floors, key=_layer_number) if floors else None
 
@@ -4227,6 +4671,17 @@ class MovementWorker(threading.Thread):
                 )
                 return None
             obs = self.last_observation
+            # Do not press Alt+Down blindly when the marker disappears part
+            # way through a rescue.  This is the same ownership boundary as
+            # the early missing-marker return in _rescue_stuck_check(): the
+            # disconnect/login detector decides whether reconnect is needed;
+            # a map without its marker must receive no speculative movement.
+            if obs is None or obs.player is None:
+                LOG.warning(
+                    "self-rescue drop: yellow marker unavailable; aborting "
+                    "descent without sending further Alt+Down"
+                )
+                return None
             # This is a physical descent, so a world-Y estimate must never
             # finish it by itself. Right after reconnect the tracker can
             # still describe the old floor while the marker is visibly far
@@ -4468,7 +4923,11 @@ class MovementWorker(threading.Thread):
         return None
 
     def _nearest_floor_by_marker_y(
-        self, marker_y: float, layers: Optional[dict[str, Any]] = None
+        self,
+        marker_y: float,
+        layers: Optional[dict[str, Any]] = None,
+        *,
+        max_distance: Optional[float] = None,
     ) -> Optional[str]:
         """The recorded floor whose own positions are closest to the marker Y.
 
@@ -4497,6 +4956,13 @@ class MovementWorker(threading.Thread):
             if best is None or distance < best[0]:
                 best = (distance, name)
         if best is None:
+            return None
+        if max_distance is not None and best[0] > max_distance:
+            LOG.info(
+                "LAYER nearest-floor fallback refused: marker y=%.6f is %.4f away from %s "
+                "(maximum %.4f); keeping the floor unresolved",
+                marker_y, best[0], best[1], max_distance,
+            )
             return None
         LOG.info(
             "LAYER nearest-floor fallback: marker y=%.6f matches no band; the nearest recorded floor is "
@@ -4567,7 +5033,16 @@ class MovementWorker(threading.Thread):
                         observation.player.y, bottom, bottom,
                     )
                     return bottom
-                nearest = self._nearest_floor_by_marker_y(observation.player.y, layers)
+                # This is only a nearby marker-quantisation recovery.  An
+                # unbounded nearest choice can report the old route floor
+                # while the character is falling through one or more other
+                # recorded floors, preventing the all-layer resolver from
+                # handing that fall to return recovery.
+                nearest = self._nearest_floor_by_marker_y(
+                    observation.player.y,
+                    layers,
+                    max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
+                )
                 if nearest is not None:
                     return nearest
             return self._current_route_layer_with_grace(observation)
@@ -4584,7 +5059,11 @@ class MovementWorker(threading.Thread):
                 observation.player.y, bottom, bottom,
             )
             return bottom
-        nearest = self._nearest_floor_by_marker_y(observation.player.y, layers)
+        nearest = self._nearest_floor_by_marker_y(
+            observation.player.y,
+            layers,
+            max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
+        )
         if nearest is not None:
             return nearest
         return self._current_route_layer_with_grace(observation)
@@ -4623,13 +5102,38 @@ class MovementWorker(threading.Thread):
     def _layer_band_contains(self, layer_name: str, y: float) -> bool:
         """True when the marker Y is inside the layer's recorded-point band."""
         layer = self.important_positions.get(layer_name)
-        if not isinstance(layer, dict) or "layer_y" not in layer:
+        if not _has_layer_y_supporter(layer):
             return False
         tolerance = float(layer.get("y_tolerance", 0.020000))
         band = _layer_y_band(layer, tolerance)
         if band is None:
             return False
         return bool(band[0] - 1e-9 <= y <= band[1] + 1e-9)
+
+    def _climb_arrival_band_contains(self, layer_name: str, y: float) -> bool:
+        """True when a rope-top marker is within the next floor's arrival band.
+
+        The normal layer matcher is deliberately exact: broadening it would
+        make adjacent floors alias while walking.  A climb arrival is a
+        different question.  The yellow diamond lands in one-pixel rows, so
+        the state machine already gives the *next* floor one marker-row of
+        room in :meth:`_next_layer_arrival_band`.  Route resync must use the
+        same rule; otherwise ``climb()`` can correctly keep Up at the top but
+        the resync confirmation never starts and the character remains stuck
+        in ``holding-up-awaiting-progress``.
+        """
+
+        layer = self.important_positions.get(layer_name)
+        if not _has_layer_y_supporter(layer):
+            return False
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        if band is None:
+            return False
+        margin = _layer_marker_row(layer) or 0.0
+        return bool(
+            band[0] - margin - 1e-9 <= y <= band[1] + margin + 1e-9
+        )
 
     def _on_route_floor(self, y: float) -> bool:
         """True when the marker Y sits inside the CURRENT route layer's band."""
@@ -4770,7 +5274,7 @@ class MovementWorker(threading.Thread):
             marker_expected = bool(
                 expected_name is not None
                 and observation.player is not None
-                and self._layer_band_contains(
+                and self._climb_arrival_band_contains(
                     expected_name, observation.player.y
                 )
             )
@@ -4822,6 +5326,44 @@ class MovementWorker(threading.Thread):
                     world_expected = (
                         abs(observation.world_y_diamonds - expected_world)
                         <= world_tolerance
+                    )
+                    # A successful rope climb can re-anchor the minimap world
+                    # tracker at the platform edge rather than exactly at the
+                    # layer's canonical centre.  The persisted world band is
+                    # the recording-time envelope for that floor, and is
+                    # reliable *only* when the reading has left the departing
+                    # floor's own envelope.  Use it as an arrival fallback so
+                    # a legitimate layer2 landing begins the normal 4-frame
+                    # confirmation instead of waiting forever in the rope
+                    # state.  Keeping the "not current" gate prevents a broad
+                    # world band from accepting the jump before the character
+                    # has actually left layer1.
+                    expected_band = _layer_world_y_band(
+                        expected_layer,
+                        float(expected_layer.get("world_y_tolerance", 0.75)),
+                    )
+                    current_band = (
+                        _layer_world_y_band(
+                            current_layer,
+                            float(current_layer.get("world_y_tolerance", 0.75)),
+                        )
+                        if isinstance(current_layer, dict)
+                        else None
+                    )
+                    world_in_expected_band = bool(
+                        expected_band is not None
+                        and expected_band[0] - 1e-9
+                        <= observation.world_y_diamonds
+                        <= expected_band[1] + 1e-9
+                    )
+                    world_in_current_band = bool(
+                        current_band is not None
+                        and current_band[0] - 1e-9
+                        <= observation.world_y_diamonds
+                        <= current_band[1] + 1e-9
+                    )
+                    world_expected = world_expected or (
+                        world_in_expected_band and not world_in_current_band
                     )
             detected_name = (
                 expected_name
@@ -4896,17 +5438,26 @@ class MovementWorker(threading.Thread):
                     observation.structure_confidence,
                 )
             elif detected_name is None and observation.player is not None:
-                # Nothing matched at all (no band, no world answer): anchor to the NEAREST recorded floor
-                # - the operator's rule for exactly this case ("if the character can't find a layer he
-                # should anchor to the nearest layer").  The three-frame candidate confirmation below
-                # still applies, and the route's own floor is what the patrol keeps whenever the nearest
-                # floor IS the current one.
-                nearest_name = self._nearest_floor_by_marker_y(
-                    observation.player.y,
-                    {name: self.important_positions[name] for name in self._route_layers},
-                )
-                if nearest_name is not None:
-                    detected_name = nearest_name
+                # The patrol range is not the map.  A fall may land on a
+                # recorded floor outside that range (for example layer1
+                # beneath a layer2 -> layer3 route).  Resolve across ALL
+                # recorded floors before considering a nearest-Y fallback;
+                # otherwise one missing world sample makes the route-only
+                # fallback call that landing "layer3" merely because it is
+                # the closest route point.
+                detected_name = self._detect_floor_all(observation)
+                if detected_name is None:
+                    # A nearest-Y answer is useful for a nearby unsampled
+                    # platform edge, but never for a multi-floor gap while
+                    # falling.  The bounded fallback leaves that latter case
+                    # unresolved for fall/return reconciliation instead of
+                    # restarting a distant patrol floor.
+                    detected_name = self._nearest_floor_by_marker_y(
+                        observation.player.y,
+                        {name: self.important_positions[name]
+                         for name in self._route_layers},
+                        max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
+                    )
             # Overlapping-band flicker guard: adjacent floors' recorded
             # Y bands can overlap (span +- tolerance), so a Y-only reading
             # can hit BOTH the current floor and a neighbour (observed:
@@ -4944,11 +5495,33 @@ class MovementWorker(threading.Thread):
                     "its band)", current_name, observation.player.y
                 )
                 detected_name = current_name
+        if (detected_name is not None
+                and detected_name not in self._route_layers
+                and self._fall_frames > 0):
+            self._note_fall_floor_candidate(detected_name)
         if detected_name is None:
             self._clear_layer_resync_candidate()
+            # Fall detection becomes pending after resync in the first stable
+            # frame.  The previously observed lower floor may no longer be
+            # visible now, so use the cached, confirmed candidate instead of
+            # leaving the prior route layer armed.
+            if (self._fall_pending
+                    and self._return_mode is None
+                    and self._fall_floor_candidate is not None):
+                self._maybe_begin_return_if_out_of_range(
+                    observation, confirmed_floor=self._fall_floor_candidate
+                )
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
-                self._climb_state.target_layer_frames = 0
-                self._climb_state.target_layer_since = None
+                # A blank frame is the character's own jump arc just above the
+                # platform row (13:58 log: marker 0.617857 / world 2.71 while
+                # layer2's row is 0.653571 / 3.546).  It is not evidence against
+                # the arrival, and zeroing the confirmation here is what made an
+                # arrival on a platform top impossible to complete.
+                self._climb_state.blank_arrival_frames += 1
+                if (self._climb_state.blank_arrival_frames
+                        >= CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED):
+                    self._climb_state.target_layer_frames = 0
+                    self._climb_state.target_layer_since = None
             return None
         if detected_name not in self._route_layers:
             # Out-of-route floor (e.g. layer1 while the patrol range starts at
@@ -4961,9 +5534,25 @@ class MovementWorker(threading.Thread):
             # must return to layer2 before patrolling).
             self._clear_layer_resync_candidate()
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
-                self._climb_state.target_layer_frames = 0
-                self._climb_state.target_layer_since = None
+                # A recognised floor is real evidence, so a blank-frame run ends
+                # here even though this floor cannot be indexed.
+                self._climb_state.blank_arrival_frames = 0
+                if self._return_mode != "climb-to-route":
+                    self._climb_state.target_layer_frames = 0
+                    self._climb_state.target_layer_since = None
+            # A settled fall has now supplied a real floor outside the route.
+            # Do not keep sending the old route floor's horizontal patrol
+            # while the separate fall reconciler gathers its final samples:
+            # that is how a confirmed layer1 marker continued walking the
+            # layer3 left/right route.  ``_fall_pending`` becomes true only
+            # after the marker stopped descending, so an airborne layer2
+            # reading cannot start a rope return in mid-air.
+            if self._fall_pending and self._return_mode is None:
+                self._maybe_begin_return_if_out_of_range(
+                    observation, confirmed_floor=detected_name
+                )
             return None
+        self._climb_state.blank_arrival_frames = 0
         detected_index = self._route_layers.index(detected_name)
         if self._route_layer_index is None:
             self._clear_layer_resync_candidate()
@@ -5491,6 +6080,7 @@ class MovementWorker(threading.Thread):
             # Each pickup circuit is a new directional traversal.  Its jump
             # points must be available again even if the previous circuit
             # already crossed the same point before returning or falling.
+            self._begin_jump_point_pass("stationary pickup circuit")
             self._jump_point_inside_tokens.clear()
             self._jump_point_suppressed_tokens.clear()
             self._jump_point_candidate = None
@@ -5631,6 +6221,38 @@ class MovementWorker(threading.Thread):
         if marker is None:
             LOG.warning("stationary attack start rejected: yellow marker missing")
             return False
+
+        # A button/Ctrl+` start is a new standing session, not a continuation
+        # of the previous one.  The old temporary point may have borrowed a
+        # recorded route for a pickup circuit or a return climb.  Reusing its
+        # return phase here made a second manual start walk toward that old
+        # route's final layer before honoring the freshly recorded point.
+        #
+        # Do not touch the recorded map configuration: only clear transient
+        # movement state.  ``allow_reanchor=False`` is the automatic resume
+        # path and deliberately skips this block so a reconnect/auto-lie pass
+        # can still return to the existing temporary point.
+        self._release_climb_up()
+        self._release_walk_hold()
+        self._climb_state = ClimbState()
+        self._return_mode = None
+        self._return_from_floor = None
+        self._return_arrival_floor = None
+        self._descending_to_first = False
+        self._descending_since = None
+        self._drop_descent_saw = None
+        self._route_layer_index = None
+        self._route_phase = "left"
+        self._route_patrol_cycle = 1
+        self._forced_phase_entry = None
+        self._held_rope_target = None
+        self._climb_direction_log = None
+        self._clear_layer_resync_candidate()
+        self._reset_fall_tracking()
+        with self._patrol_start_lock:
+            self._pending_patrol_start_floor = None
+            self._pending_patrol_start_above_route = False
+
         self._stationary_attack_anchor = Point(float(marker.x), float(marker.y))
         self._stationary_near_correction_next_at = 0.0
         self._stationary_ui_anchor_layer = None
@@ -5641,10 +6263,18 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_return_active = False
         self._stationary_return_dismount_direction = None
+        # Restart the optional pickup timer for this new manual session.  A
+        # timer that was already due in the previous run must not immediately
+        # launch a left -> right -> anchor traversal on this fresh start.
+        self._stationary_pickup_next_at = (
+            time.monotonic() + self._stationary_pickup_delay()
+            if self.stationary_pickup_enabled else float("inf")
+        )
         # Recorded jump points are allowed once per movement pass, never once
         # per application lifetime.  A manual Start Patrol begins a new pass;
         # retaining these tokens made a point which fired on the first run
         # silently disappear on the second run.
+        self._begin_jump_point_pass("stationary attack manual start")
         self._jump_point_inside_tokens.clear()
         self._jump_point_suppressed_tokens.clear()
         self._jump_point_candidate = None
@@ -5662,6 +6292,10 @@ class MovementWorker(threading.Thread):
         self._stationary_x_settled = True
         self._reset_stationary_y_recovery()
         LOG.info(
+            "STATIONARY ATTACK manual start: cleared prior runtime route and "
+            "pickup state; automatic resumes retain their existing session"
+        )
+        LOG.info(
             "STATIONARY ATTACK temporary anchor saved x=%.6f y=%.6f "
             "x_zone=+/-%.6f x_step_zone=+/-%.6f y_zone=+/-%.6f "
             "(not written to map recording)",
@@ -5677,6 +6311,8 @@ class MovementWorker(threading.Thread):
         self._stationary_y_jumps = 0
         self._stationary_y_jump_at = float("-inf")
         self._stationary_y_backoff_logged = False
+        self._stationary_y_mismatch_sign = 0
+        self._stationary_y_mismatch_frames = 0
 
     def _clear_stationary_route_state(self) -> None:
         """Drop route/vertical state that 站桩攻击 must never carry.
@@ -5733,6 +6369,35 @@ class MovementWorker(threading.Thread):
             self._reset_stationary_y_recovery()
             return MovementDecision(
                 None, "stationary attack temporary safe zone"
+            )
+
+        # A stationary-recovery jump is only useful while the marker remains
+        # on the anchor platform.  Once it is outside this local same-layer
+        # band, a jump cannot recover a fall and must not compete with the
+        # ordinary route-return logic.
+        if abs(gap_y) > STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE:
+            self._reset_stationary_y_recovery()
+            return MovementDecision(
+                None,
+                "stationary Y recovery skipped: marker outside anchor layer band",
+            )
+
+        # Do not turn a one-frame marker flicker into Alt.  In the supplied
+        # field log, y=0.503571 appeared once beside the real anchor
+        # y=0.510714 (exactly one minimap pixel), which launched a needless
+        # recovery jump and the following fall/route-return sequence.
+        mismatch_sign = 1 if gap_y > 0.0 else -1
+        if mismatch_sign == self._stationary_y_mismatch_sign:
+            self._stationary_y_mismatch_frames += 1
+        else:
+            self._stationary_y_mismatch_sign = mismatch_sign
+            self._stationary_y_mismatch_frames = 1
+        if self._stationary_y_mismatch_frames < STATIONARY_ATTACK_Y_CONFIRM_FRAMES:
+            return MovementDecision(
+                None,
+                "stationary Y recovery: confirming displaced marker "
+                f"({self._stationary_y_mismatch_frames}/"
+                f"{STATIONARY_ATTACK_Y_CONFIRM_FRAMES})",
             )
         now = time.monotonic()
         burst = self._stationary_y_jumps < STATIONARY_ATTACK_Y_BURST_JUMPS
@@ -6229,6 +6894,7 @@ class MovementWorker(threading.Thread):
         self._return_arrival_floor = None
         self._clear_layer_resync_candidate()
         self._fall_pending = False
+        self._fall_floor_candidate = None
         self._fall_frames = 0
         self._fall_last_y = None
         self._fall_keys_released = False
@@ -6244,6 +6910,9 @@ class MovementWorker(threading.Thread):
         self._route_patrol_cycle = 1
         self._last_drop_attempt = float("-inf")
         self._patrol_busy_until = 0.0
+        # A Start Patrol is a new movement pass: every recorded jump point is
+        # armed again (the operator's rule), whatever the previous run did.
+        self._begin_jump_point_pass("start patrol")
         with self._stair_jump_completion_lock:
             self._stair_jump_completion = None
         self._stair_jump_skip_frames = 0
@@ -6346,7 +7015,7 @@ class MovementWorker(threading.Thread):
 
         floors = [
             name for name, layer in self.important_positions.items()
-            if isinstance(layer, dict) and "layer_y" in layer
+            if _has_layer_y_supporter(layer)
         ]
         if not floors:
             return None
@@ -6400,7 +7069,7 @@ class MovementWorker(threading.Thread):
         range), so an out-of-range landing is recognized for the return."""
         layers = {
             name: layer for name, layer in self.important_positions.items()
-            if isinstance(layer, dict) and "layer_y" in layer
+            if _has_layer_y_supporter(layer)
         }
         if observation.player is not None:
             name = detect_layer_by_y(observation.player.y, layers)
@@ -6491,7 +7160,7 @@ class MovementWorker(threading.Thread):
 
         layers = {
             name: layer for name, layer in self.important_positions.items()
-            if isinstance(layer, dict) and "layer_y" in layer
+            if _has_layer_y_supporter(layer)
         }
         candidates = _layer_y_candidates(observation.player.y, layers)
         off_anchor = [name for name in candidates if name != anchor_layer]
@@ -6564,7 +7233,7 @@ class MovementWorker(threading.Thread):
             return False
         marker_layers = {
             name: layer for name, layer in self.important_positions.items()
-            if isinstance(layer, dict) and "layer_y" in layer
+            if _has_layer_y_supporter(layer)
         }
         floor = detect_layer_by_y(observation.player.y, marker_layers)
         if floor is None or floor in self._route_layers:
@@ -6592,6 +7261,7 @@ class MovementWorker(threading.Thread):
         self._release_climb_up()
         self._climb_state = ClimbState()
         self._fall_pending = False
+        self._fall_floor_candidate = None
         self._fall_frames = 0
         self._fall_last_y = None
         self._fall_keys_released = False
@@ -6853,19 +7523,58 @@ class MovementWorker(threading.Thread):
                 < _layer_number(stationary_anchor_layer)
             )
 
-        stationary_intermediate_return_floor = stationary_intermediate(floor)
-        arrival_is_route_or_stationary_anchor = bool(
-            floor in self._route_layers
-            or (stationary_anchor_layer is not None
-                and floor == stationary_anchor_layer)
-            or stationary_intermediate_return_floor
-        )
+        def route_intermediate(candidate: Optional[str]) -> bool:
+            """A recorded floor the return climb has just climbed UP to.
+
+            The return target is the bottom of the patrol range, so the floor
+            between the departed one and that target is *outside*
+            ``_route_layers`` while its rope is the way home - the operator's
+            layer2 with the range starting at layer3.  Rejecting it here left the
+            climb stuck at the platform top: the stall detector released Up and
+            re-jumped forever (13:58 log: "CLIMB stalled: world Y stopped
+            advancing" while standing on layer2's own row at world 3.546).
+            Accepting it hands the floor to ``_finish_return``, which already
+            knows how to rebase an out-of-range floor and continue the return
+            from that floor's own rope.
+            """
+
+            return bool(
+                candidate is not None
+                and candidate in self.important_positions
+                and candidate not in self._route_layers
+                and self._return_mode == "climb-to-route"
+                and self._return_from_floor is not None
+                and _layer_number(self._return_from_floor)
+                < _layer_number(candidate)
+                <= self._patrol_range_min
+            )
+
+        def accepted(candidate: Optional[str]) -> bool:
+            return bool(
+                candidate is not None
+                and (candidate in self._route_layers
+                     or candidate == stationary_anchor_layer
+                     or stationary_intermediate(candidate)
+                     or route_intermediate(candidate))
+            )
+
+        if floor is None:
+            # A blank frame during a climb is the character's own jump arc just
+            # above the platform row, not evidence against the arrival.  Zeroing
+            # the streak here made arrival impossible to confirm; a long blank
+            # run still resets it.
+            state.blank_arrival_frames += 1
+            if state.blank_arrival_frames < CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED:
+                return False
+            self._return_arrival_floor = None
+            state.target_layer_frames = 0
+            state.target_layer_since = None
+            return False
+        state.blank_arrival_frames = 0
+
+        arrival_is_route_or_stationary_anchor = accepted(floor)
         if (state.target_layer_since is not None
-                and (self._return_arrival_floor in self._route_layers
-                     or self._return_arrival_floor == stationary_anchor_layer
-                     or stationary_intermediate(
-                         self._return_arrival_floor
-                     ))):
+                and accepted(self._return_arrival_floor)):
             elapsed = time.monotonic() - state.target_layer_since
             if elapsed < self.climb_layer_confirm_seconds:
                 LOG.info(
@@ -6906,6 +7615,68 @@ class MovementWorker(threading.Thread):
             return False
         return True
 
+    def _restart_return_climb_after_descent(
+        self,
+        floor: Optional[str],
+        observation: MinimapObservation,
+    ) -> bool:
+        """Rebase a failed return climb on the lower floor actually reached.
+
+        A return climb is normally allowed to change floors only after it has
+        climbed *up* into its expected destination.  That rule prevented a
+        noisy early reading from swapping rope targets, but also meant that a
+        missed rope could leave the state permanently targeting the departed
+        floor.  The character had already fallen to layer1 while the worker
+        repeatedly tried layer2's rope.
+
+        Two consecutive lower-floor reads are enough to prove a real descent.
+        We then release the old Up hold and start the normal return logic from
+        the landing floor.  This is deliberately a return-climb repair only;
+        it does not involve the stationary recovery-jump detector.
+        """
+
+        departing_floor = self._return_from_floor
+        state = self._climb_state
+        if (
+            floor is None
+            or departing_floor is None
+            or floor == departing_floor
+            or _layer_number(floor) >= _layer_number(departing_floor)
+        ):
+            state.return_descent_floor = None
+            state.return_descent_frames = 0
+            return False
+
+        if floor != state.return_descent_floor:
+            state.return_descent_floor = floor
+            state.return_descent_frames = 0
+        state.return_descent_frames += 1
+        if state.return_descent_frames < 2:
+            LOG.info(
+                "RETURN CLIMB: lower landing candidate %s below %s %d/2",
+                floor,
+                departing_floor,
+                state.return_descent_frames,
+            )
+            return False
+
+        anchor_layer = self._stationary_route_anchor_layer
+        self._release_climb_up()
+        self._climb_state = ClimbState()
+        self._return_from_floor = floor
+        self._return_arrival_floor = None
+        self._reanchor_tracker_to_layer(floor, observation)
+        if floor in self._route_layers:
+            self._route_layer_index = self._route_layers.index(floor)
+        LOG.warning(
+            "RETURN CLIMB: missed the rope from %s and landed on %s; "
+            "restarting the route return%s",
+            departing_floor,
+            floor,
+            " toward %s" % anchor_layer if anchor_layer else "",
+        )
+        return True
+
     def _reset_fall_settle(self) -> None:
         """Clear the landing-reconciliation settle state."""
 
@@ -6929,6 +7700,7 @@ class MovementWorker(threading.Thread):
         """
 
         self._fall_pending = False
+        self._fall_floor_candidate = None
         self._fall_frames = 0
         self._fall_last_y = None
         self._fall_keys_released = False
@@ -6994,7 +7766,7 @@ class MovementWorker(threading.Thread):
             marker_layers = {
                 name: layer
                 for name, layer in self.important_positions.items()
-                if isinstance(layer, dict) and "layer_y" in layer
+                if _has_layer_y_supporter(layer)
             }
             candidates = _layer_y_candidates(
                 observation.player.y, marker_layers
@@ -7057,6 +7829,7 @@ class MovementWorker(threading.Thread):
         if floor is None:
             return False
         self._fall_pending = False
+        self._fall_floor_candidate = None
         self._fall_last_y = None
         self._fall_frames = 0
         self._fall_keys_released = False
@@ -7137,6 +7910,10 @@ class MovementWorker(threading.Thread):
             self._fall_frames = 0
             return
         if y - last >= self._fall_marker_y_gain:
+            if self._fall_frames == 0 and not self._fall_pending:
+                # New descent: evidence from an earlier landing must never
+                # decide this one.
+                self._fall_floor_candidate = None
             self._fall_frames += 1
             # A knock-down mid-action can leave a key stuck in the game (its
             # key-up was lost during the knock): release EVERY movement key
@@ -7247,8 +8024,25 @@ class MovementWorker(threading.Thread):
             )
             self._reanchor_tracker_to_current_layer(observation)
 
+    def _note_fall_floor_candidate(self, floor: str) -> None:
+        """Keep the lowest trustworthy outside-route floor seen in a fall."""
+
+        if floor not in self.important_positions:
+            return
+        current = self._fall_floor_candidate
+        if (current is not None
+                and _layer_number(floor) >= _layer_number(current)):
+            return
+        self._fall_floor_candidate = floor
+        LOG.info(
+            "FALL CANDIDATE: observed %s outside patrol route; holding it "
+            "until descent settles",
+            floor,
+        )
+
     def _maybe_begin_return_if_out_of_range(
-        self, observation: MinimapObservation
+        self, observation: MinimapObservation, *,
+        confirmed_floor: Optional[str] = None,
     ) -> None:
         """Begin return after a caller has confirmed an out-of-range floor.
 
@@ -7273,8 +8067,10 @@ class MovementWorker(threading.Thread):
                     and not self._stationary_return_route_ready)
                 or observation.player is None):
             return
-        floor = self._detect_floor_all(observation)
+        floor = confirmed_floor or self._detect_floor_all(observation)
         if floor is None or floor in self._route_layers:
+            return
+        if floor not in self.important_positions:
             return
         number = _layer_number(floor)
         self._reanchor_tracker_to_layer(floor, observation)
@@ -7284,6 +8080,7 @@ class MovementWorker(threading.Thread):
         )
         self._return_from_floor = floor
         self._return_arrival_floor = None
+        self._fall_floor_candidate = None
         LOG.warning(
             "OUT OF PATROL RANGE: on %s outside patrol range; returning %s "
             "without attacking",
@@ -7291,6 +8088,76 @@ class MovementWorker(threading.Thread):
             "climbing back" if self._return_mode == "climb-to-route"
             else "dropping back",
         )
+
+    def _rope_target_for_floor(
+        self, floor: str
+    ) -> tuple[Optional[float], str]:
+        """Approach X for ``floor``'s rope, and the reason for that answer.
+
+        A recorded ``rope_pos`` is exact.  The legacy profile-wide ``rope.x``
+        (``fixed_target_x``) is NOT a substitute: it belongs to whichever floor
+        first recorded a rope.  Using it for the operator's layer2 - which has no
+        rope recorded, only a 右跳 at x=0.469298 - walked the character left to
+        x=0.5 and off the platform, dropping it to layer1 (13:16 log).
+
+        When the floor has no rope but does have recorded jump points, the
+        nearest one to that legacy rope X is the operator's own way onto the
+        rope: it is used as the approach target, so the walk crosses it in its
+        recorded direction and the point fires the mount jump.
+
+        The answer is logged once per floor and answer (this runs every frame).
+        """
+
+        layer = self.important_positions.get(floor, {})
+        if not isinstance(layer, dict):
+            answer: tuple[Optional[float], str] = (
+                None, "is not a recorded floor",
+            )
+        else:
+            rope = layer.get("rope_pos")
+            if isinstance(rope, dict) and "x" in rope:
+                answer = (float(rope["x"]), "recorded rope")
+            else:
+                hints: list[float] = []
+                for point in layer.get("jump_points", []) or []:
+                    if isinstance(point, dict) and "x" in point:
+                        try:
+                            hints.append(float(point["x"]))
+                        except (TypeError, ValueError):
+                            continue
+                if hints:
+                    target = min(
+                        hints, key=lambda value: abs(value - self.fixed_target_x)
+                    )
+                    answer = (
+                        target,
+                        "has no recorded rope; using its recorded jump point "
+                        f"x={target:.6f} as the rope approach",
+                    )
+                else:
+                    answer = (
+                        None,
+                        "has no recorded rope and no jump point to approach it "
+                        f"(the legacy rope x={self.fixed_target_x:.3f} is not "
+                        "used on a floor that never recorded one)",
+                    )
+        self._note_rope_target_answer(floor, answer)
+        return answer
+
+    def _note_rope_target_answer(
+        self, floor: str, answer: tuple[Optional[float], str]
+    ) -> None:
+        """Log a rope-target answer once per floor and answer, not per frame."""
+
+        value, note = answer
+        text = f"x={value:.6f} ({note})" if value is not None else note
+        if self._rope_target_answers.get(floor) == text:
+            return
+        self._rope_target_answers[floor] = text
+        if value is None:
+            LOG.warning("ROPE TARGET: %s %s", floor, note)
+        elif note != "recorded rope":
+            LOG.info("ROPE TARGET: %s %s", floor, note)
 
     def _route_target(
         self, observation: MinimapObservation
@@ -7363,6 +8230,16 @@ class MovementWorker(threading.Thread):
                 self._climb_state.up_held
                 or self._climb_state.phase != "idle"
             )
+            # If a rope attempt drops the character to a lower recorded
+            # floor, the old rope is no longer reachable.  Rebase the return
+            # there before evaluating a normal upward-arrival confirmation.
+            # This keeps a failed layer2 climb from looping forever after the
+            # marker has already settled on layer1.
+            if (climb_in_progress
+                    and self._restart_return_climb_after_descent(
+                        detected_floor, observation
+                    )):
+                return self._route_target(observation)
             # A noisy floor reading while simply walking to the rope must not
             # be mistaken for an arrival.  It previously changed both the
             # rope X target and the latent patrol phase before any climb had
@@ -7386,12 +8263,14 @@ class MovementWorker(threading.Thread):
             floor = self._return_from_floor
             if floor is None:
                 return None, False, "return-climb-waiting"
-            rope = self.important_positions.get(floor, {}).get("rope_pos", {})
-            rope_x = (
-                float(rope["x"])
-                if isinstance(rope, dict) and "x" in rope
-                else self.fixed_target_x
-            )
+            rope_x, _rope_note = self._rope_target_for_floor(floor)
+            if rope_x is None:
+                # Refuse to press a climb toward the legacy global rope X on a
+                # floor that never recorded a rope: on the operator's layer2 that
+                # walk to x=0.5 went off the platform and dropped the character
+                # to layer1.  Standing still is the honest answer; the
+                # de-duplicated warning above names what is missing.
+                return None, False, "return-climb-no-rope"
             return rope_x, True, "return.climb"
         if not self._route_layers:
             # Nothing recorded on any layer: stand still (Fixed Attack / YOLO
@@ -7675,7 +8554,7 @@ class MovementWorker(threading.Thread):
         if observation.player is None or self.first_layer is None:
             return False
         layer = self.important_positions.get(self.first_layer)
-        if not isinstance(layer, dict) or "layer_y" not in layer:
+        if not _has_layer_y_supporter(layer):
             return False
         tolerance = float(layer.get("y_tolerance", 0.020000))
         band = _layer_y_band(layer, tolerance)
@@ -8085,6 +8964,36 @@ class MovementWorker(threading.Thread):
             elif key_up is not None:
                 key_up("up")
             self._climb_state.up_held = False
+
+    def _yield_climb_to_jump_point(self) -> None:
+        """Stop ordinary rope recovery without releasing a jump-point's Up.
+
+        A directional jump point sends ``direction + Alt`` while holding Up
+        first.  The normal rope planner used to see the same rope on the next
+        capture, open its own climb state, and retry with Alt+Left/Right based
+        on the tiny rope-X gap.  That side correction is valid for a missed
+        *ordinary* rope jump, but it steals a recorded jump-point climb.
+
+        ``key_up`` releases only the climb state's ownership reference.  It
+        deliberately does not use ``force_key_up``: the jump-point session
+        still owns Up until its landing-Y settle detector finishes.
+        """
+
+        state = self._climb_state
+        if state.up_held:
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(key_up):
+                key_up("up")
+        if state.phase != "idle" or state.up_held:
+            LOG.info(
+                "JUMP POINT climb ownership: cancelled ordinary rope recovery; "
+                "keeping jump-point Up held"
+            )
+        self._climb_state = ClimbState()
+        # The jump point still owns the vertical session, therefore this gate
+        # must stay set until _update_jump_point_landing clears it.
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
 
     def _sync_input_session(self) -> None:
         """Drop worker-local holds when the sender starts a new generation."""
@@ -9041,49 +9950,60 @@ class MovementWorker(threading.Thread):
                                 creep,
                             )
                 else:
-                    assert route_target_x is not None
-                    target_y = observation.player.y if observation.player is not None else 0.0
-                    position_target = Point(route_target_x, target_y)
-                    if self._route_phase == "left":
-                        position_plan = move_to_left_most(
-                            observation,
-                            position_target,
-                            horizontal_tolerance=self._current_horizontal_tolerance,
-                            movement_hold_seconds=self.movement_hold_seconds,
-                            minimum_confidence=self.minimum_confidence,
-                        )
-                    else:
-                        position_plan = move_to_right_most(
-                            observation,
-                            position_target,
-                            horizontal_tolerance=self._current_horizontal_tolerance,
-                            movement_hold_seconds=self.movement_hold_seconds,
-                            minimum_confidence=self.minimum_confidence,
-                        )
-                    decision = position_plan.decision
-                    jump_point_decision = self._jump_point_decision(
-                        observation, layer_for_jump, position_plan
-                    )
-                    # Stairs that block the walk: when the marker stalls at a
-                    # recorded jump-trigger X, replace the plain walk hold with
-                    # a walk-and-jump (direction held, Alt tapped mid-hold).
-                    phase_before_stair_check = self._route_phase
-                    stair_decision = self._stair_jump_decision(
-                        observation, route_label, position_plan, time.monotonic()
-                    )
-                    # Exhausting the stair budget can reroute this phase. The
-                    # plan above belongs to the old direction, so do not send
-                    # it after that reroute.
-                    if self._route_phase != phase_before_stair_check:
+                    if route_target_x is None:
+                        # A route transition can briefly leave the endpoint
+                        # unresolved (for example while a recorded jump point
+                        # hands its Up hold to rope climbing).  This is normal
+                        # transient state, never an invariant failure.  Hold
+                        # input for this frame and let the next fresh route
+                        # calculation provide the endpoint.
                         decision = MovementDecision(
-                            None, "boundary unreachable; waiting for rerouted patrol phase"
+                            None, "patrol endpoint unresolved; waiting for fresh route target"
                         )
                         active_target_x = None
-                    elif jump_point_decision is not None:
-                        decision = jump_point_decision
-                    elif stair_decision is not None:
-                        decision = stair_decision
-                    active_target_x = route_target_x
+                    else:
+                        target_y = observation.player.y if observation.player is not None else 0.0
+                        position_target = Point(route_target_x, target_y)
+                        if self._route_phase == "left":
+                            position_plan = move_to_left_most(
+                                observation,
+                                position_target,
+                                horizontal_tolerance=self._current_horizontal_tolerance,
+                                movement_hold_seconds=self.movement_hold_seconds,
+                                minimum_confidence=self.minimum_confidence,
+                            )
+                        else:
+                            position_plan = move_to_right_most(
+                                observation,
+                                position_target,
+                                horizontal_tolerance=self._current_horizontal_tolerance,
+                                movement_hold_seconds=self.movement_hold_seconds,
+                                minimum_confidence=self.minimum_confidence,
+                            )
+                        decision = position_plan.decision
+                        jump_point_decision = self._jump_point_decision(
+                            observation, layer_for_jump, position_plan
+                        )
+                        # Stairs that block the walk: when the marker stalls at a
+                        # recorded jump-trigger X, replace the plain walk hold with
+                        # a walk-and-jump (direction held, Alt tapped mid-hold).
+                        phase_before_stair_check = self._route_phase
+                        stair_decision = self._stair_jump_decision(
+                            observation, route_label, position_plan, time.monotonic()
+                        )
+                        # Exhausting the stair budget can reroute this phase. The
+                        # plan above belongs to the old direction, so do not send
+                        # it after that reroute.
+                        if self._route_phase != phase_before_stair_check:
+                            decision = MovementDecision(
+                                None, "boundary unreachable; waiting for rerouted patrol phase"
+                            )
+                            active_target_x = None
+                        elif jump_point_decision is not None:
+                            decision = jump_point_decision
+                        elif stair_decision is not None:
+                            decision = stair_decision
+                        active_target_x = route_target_x
                 if route_is_rope:
                     # At a rope, a planner may already be proposing an
                     # Alt+direction climb rather than a plain walk. Recover
@@ -9169,6 +10089,28 @@ class MovementWorker(threading.Thread):
                                 break
                         if climb_jump_point is not None:
                             decision = climb_jump_point
+                # A recorded 左跳/右跳 that is currently holding Up owns this
+                # entire jump-to-rope attempt.  Do not let the ordinary rope
+                # recovery reinterpret its tiny live X gap as an Alt+Left or
+                # Alt+Right retry.  Those recovery chords are reserved for a
+                # normal ``jump_climb_*`` (the built-in jump-to-rope target),
+                # never for a directional jump-point record.
+                if (route_is_rope and self._jump_point_up_held
+                        # A new directional point is a deliberate replacement
+                        # for the previous point's session.  It must reach the
+                        # stair-jump worker, which releases the old Up claim
+                        # before pressing the new direction + Alt chord.  The
+                        # old broad guard turned this valid handoff into
+                        # ``MOVE TO ROPE ... action=wait`` forever.
+                        and decision.key not in (
+                            "jump_point_left", "jump_point_right",
+                        )):
+                    self._yield_climb_to_jump_point()
+                    decision = MovementDecision(
+                        None,
+                        "recorded directional jump point owns Up; waiting for landing",
+                    )
+                    active_target_x = None
                 # Other-player safety net: a per-frame scan (no cooldown)
                 # switches channel when other players appear.
                 self._maybe_check_other_players(
@@ -9489,6 +10431,12 @@ class MovementWorker(threading.Thread):
                         )
                         queued = False
                         if walking and callable(request_stair_jump):
+                            if is_jump_point:
+                                # Capture the active target at dispatch time,
+                                # rather than guessing from the next frame's
+                                # route label.  Only a point used to reach a
+                                # rope may hand its Up hold to climb tracking.
+                                self._jump_point_rope_handoff = bool(route_is_rope)
                             try:
                                 queued = bool(request_stair_jump(
                                     direction,
@@ -9507,6 +10455,7 @@ class MovementWorker(threading.Thread):
                                     # at the point.
                                     self._jump_point_inside_tokens.discard(token)
                                 self._jump_point_candidate = None
+                                self._jump_point_rope_handoff = False
                             self._on_stair_jump_complete(False)
                             LOG.warning("stair jump could not enter dedicated worker")
                         else:
@@ -9514,6 +10463,19 @@ class MovementWorker(threading.Thread):
                                 token = self._jump_point_candidate
                                 if token is not None:
                                     self._jump_point_suppressed_tokens.add(token)
+                                    # Once per leg (and once per pass for a
+                                    # climb use): the same record must not jump
+                                    # again on this leg or from the rope it just
+                                    # grabbed.
+                                    self._jump_point_note_fired(token)
+                                    LOG.info(
+                                        "JUMP POINT fired: %s[%d] is now used for "
+                                        "leg pass=%d floor=%s phase=%s",
+                                        token[0], token[1],
+                                        self._jump_point_pass_id,
+                                        self._jump_point_leg_key()[1],
+                                        self._jump_point_leg_key()[2],
+                                    )
                                 self._jump_point_candidate = None
                             self._stair_jump_skip_frames = 5
                             LOG.info(

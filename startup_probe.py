@@ -58,7 +58,7 @@ def _notify(message: str) -> None:
     try:
         import ctypes
 
-        ctypes.windll.user32.MessageBoxW(None, message, "MapleAssistant", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, message, "TodoHelper", 0x10)
     except Exception:
         pass
 

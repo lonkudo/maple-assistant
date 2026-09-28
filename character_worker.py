@@ -313,12 +313,10 @@ class CharacterWorker(Thread):
                 "stopping patrol and triggering reminders",
                 frames, elapsed, self._disconnect_alert_misses,
             )
-            if self._on_disconnect is not None:
-                try:
-                    self._on_disconnect()
-                except Exception:
-                    LOG.warning("disconnect alert could not stop patrol",
-                                exc_info=True)
+            # The reconnect worker only queues an independent task here.  It
+            # must be notified before the patrol teardown, whose key/input
+            # cleanup can briefly wait on an active motion transaction and
+            # used to delay or mask a confirmed reconnect request.
             if self._disconnect_event_callback is not None:
                 try:
                     self._disconnect_event_callback()
@@ -326,6 +324,12 @@ class CharacterWorker(Thread):
                     LOG.warning(
                         "disconnect event callback failed", exc_info=True
                     )
+            if self._on_disconnect is not None:
+                try:
+                    self._on_disconnect()
+                except Exception:
+                    LOG.warning("disconnect alert could not stop patrol",
+                                exc_info=True)
             # MCI playback waits until the MP3 ends. Keep marker detection at
             # full cadence by moving only audio playback to a tiny daemon.
             threading.Thread(

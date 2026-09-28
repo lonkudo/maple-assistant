@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -33,20 +34,60 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from image_io import save_screenshot
+from runtime_paths import application_root
 
 LOG = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent
+# ``__file__`` is adequate for a source checkout, but a compiled Nuitka
+# module does not promise that it points at the directory containing the
+# shipped data.  The reconnect workflow depends on its two visual references,
+# so resolve the actual application root explicitly for both package forms.
+ROOT = application_root(__file__)
+
+
+def _login_reference_paths() -> tuple[Path, ...]:
+    """Return every legitimate install location for the shipped colour crop.
+
+    The reconnect reference is application data, never operator recording
+    data.  A normal package has it beside ``assistant.py``; a Nuitka package
+    has it beside the executable.  Keep the module directory only as a final
+    compatibility fallback for older source-style installs.
+    """
+
+    roots = [ROOT, Path(__file__).resolve().parent]
+    if getattr(sys, "frozen", False):
+        executable_root = Path(sys.executable).resolve().parent
+        roots.append(executable_root)
+
+    # A ZIP may be extracted straight into a folder, or into an outer folder
+    # that contains the package folder.  Do not care what either folder is
+    # called: search the runtime folder and its parents for the *relative*
+    # recording-assets path.  This also keeps manually moved installations
+    # working without configuration changes.
+    search_roots: list[Path] = []
+    for root in roots:
+        resolved = Path(root).resolve()
+        search_roots.extend((resolved, resolved.parent, resolved.parent.parent))
+    candidates: list[Path] = []
+    for root in search_roots:
+        candidates.extend((
+            root / "recording-assets" / LOGIN_TEMPLATE_NAME,
+            root / "screenshots" / LOGIN_TEMPLATE_NAME,
+        ))
+    # Preserve the order while avoiding duplicate path attempts in logs.
+    return tuple(dict.fromkeys(candidates))
+
+
 SCREENSHOTS_DIR = ROOT / "screenshots"
 # A crop of the login page's cream background: it is the COLOUR reference, not a shape.
 LOGIN_TEMPLATE_NAME = "login_page_target.jpg"
 # Where the reference is looked for, in this order.  The release package does not ship the
 # personal screenshots folder, so the same file also travels inside recording-assets (the
 # folder that IS shipped) - otherwise an installed copy would have no colour reference at all.
-LOGIN_REFERENCE_PATHS = (
-    SCREENSHOTS_DIR / LOGIN_TEMPLATE_NAME,
-    ROOT / "recording-assets" / LOGIN_TEMPLATE_NAME,
-)
+# Built after the filename constant so it can cover both normal and frozen
+# application roots.  The recording-assets copy is deliberately first: it is
+# required release data, whereas screenshots are per-machine diagnostics.
+LOGIN_REFERENCE_PATHS = _login_reference_paths()
 # The shipped reference/asset folder (the same one the login colour crop travels in).
 ASSETS_DIR = ROOT / "recording-assets"
 
@@ -1343,6 +1384,7 @@ def load_login_reference(path: Optional[Path] = None) -> Optional[LoginColourRef
     """
 
     import cv2
+    import numpy as np
 
     if path is not None:
         candidates = (Path(path),)
@@ -1351,7 +1393,17 @@ def load_login_reference(path: Optional[Path] = None) -> Optional[LoginColourRef
     for reference_path in candidates:
         if not reference_path.is_file():
             continue
-        image = cv2.imread(str(reference_path), cv2.IMREAD_COLOR)
+        # ``cv2.imread(str(path))`` is not reliably Unicode-safe on Windows:
+        # a valid bundled JPG can become unreadable when a user extracts the
+        # release beneath a Chinese-named folder (for example 新建文件夹).
+        # Read the path through Python's Unicode-aware filesystem API, then
+        # let OpenCV decode the bytes.  The asset lookup remains relative;
+        # this only fixes opening the selected resource.
+        try:
+            encoded = np.fromfile(str(reference_path), dtype=np.uint8)
+            image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        except (OSError, ValueError):
+            image = None
         if image is None:
             LOG.warning("auto reconnect: login page colour reference unreadable: %s",
                         reference_path)
@@ -1654,22 +1706,23 @@ class ReconnectWorker(threading.Thread):
 
     # ------------------------------------------------------------------- triggers
 
-    def notify_disconnect(self) -> None:
-        """The 掉线 event happened (first sign) - check for the login page."""
+    def notify_disconnect(self) -> bool:
+        """Queue one confirmed 掉线 event; return whether this worker accepted it."""
 
         with self._lock:
             if not self._enabled:
                 LOG.info("auto reconnect: disconnect ignored because it is disabled")
-                return
+                return False
             if self._running or self._disconnect_queued or self._testing or self._test_requested:
                 LOG.info("auto reconnect: duplicate disconnect ignored; a reconnect is already queued/running")
-                return
+                return False
             # A successful earlier run must not suppress a genuinely new offline
             # event hours later.  Reset the historical marker for this new cycle.
             self._disconnect_queued = True
             self._login_entered = False
         LOG.info("auto reconnect: disconnect event seen; checking the game window")
         self._wake.set()
+        return True
 
     def trigger_test(self) -> bool:
         """Run the whole sequence once from the panel's temporary 测试重连 button.

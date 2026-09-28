@@ -12,12 +12,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 
 exit /b
 
 :elevated
-title Maple Assistant Installer
+title TodoHelper Installer
 cd /d "%~dp0"
 
 echo.
 echo ============================================
-echo   Maple Assistant Installer
+echo   TodoHelper Installer
 echo ============================================
 echo.
 echo   One-click setup (YOLO monster detection temporarily disabled).

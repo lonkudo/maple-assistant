@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Maple 助手 一键安装脚本（由 安装.bat 调用，用户无需手动运行）。
+    TodoHelper 一键安装脚本（由 安装.bat 调用，用户无需手动运行）。
 
 .DESCRIPTION
     在一台全新的 Windows 电脑上自动完成环境搭建：
@@ -35,7 +35,7 @@ $venvName = ".venv"
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  MapleAssistant 安装程序" -ForegroundColor Cyan
+Write-Host "  TodoHelper 安装程序" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -246,9 +246,9 @@ Set files = CreateObject("Scripting.FileSystemObject")
 root = files.GetParentFolderName(WScript.ScriptFullName)
 pythonwPath = root & "\__VENV_DIR__\Scripts\pythonw.exe"
 ' Launch through a renamed interpreter so the running process is
-' "MapleAssistant.exe" (and the game sees that name) instead of "pythonw.exe".
+' "TodoHelper.exe" (and the game sees that name) instead of "pythonw.exe".
 ' The copy is created on first use and self-heals after an overlay update.
-exePath = root & "\__VENV_DIR__\Scripts\MapleAssistant.exe"
+exePath = root & "\__VENV_DIR__\Scripts\TodoHelper.exe"
 On Error Resume Next
 If Not files.FileExists(exePath) Then files.CopyFile pythonwPath, exePath, True
 If Not files.FileExists(exePath) Then exePath = pythonwPath
@@ -273,7 +273,7 @@ On Error Resume Next
 shellApp.ShellExecute exePath, arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
-    MsgBox "MapleAssistant could not start. Open assistant-launch-status.log in this folder.", 16, "MapleAssistant"
+    MsgBox "TodoHelper could not start. Open assistant-launch-status.log in this folder.", 16, "TodoHelper"
 End If
 On Error GoTo 0
 
