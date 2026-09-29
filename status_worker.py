@@ -1974,10 +1974,9 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
     """Return a copy of ``config`` with the drug panel settings applied.
 
     ``data`` uses the UI's form: key names, integer percents (0..100) for
-    ``hp_threshold``/``mp_threshold``, and MINUTES for the periodic buff
-    ``buff1_interval``/``buff2_interval``/``buff3_interval`` (converted to
-    seconds).  Unsupported or unknown keys are ignored (the existing binding
-    stays).
+    ``hp_threshold``/``mp_threshold``, and seconds for the periodic buff
+    ``buff1_interval``/``buff2_interval``/``buff3_interval``. Unsupported or
+    unknown keys are ignored (the existing binding stays).
     """
 
     kwargs: dict[str, object] = {}
@@ -2011,7 +2010,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         except (TypeError, ValueError):
             continue
         kwargs[field_name] = float(np.clip(percent, 0.0, 100.0)) / 100.0
-    # Periodic buff timers: UI sends minutes, the worker compares seconds.
+    # Periodic buff timers: UI and worker both use seconds.
     for field_name, data_key in (
         ("buff1_interval", "buff1_interval"),
         ("buff2_interval", "buff2_interval"),
@@ -2020,10 +2019,10 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         if data_key not in data:
             continue
         try:
-            minutes = float(data[data_key])
+            seconds = float(data[data_key])
         except (TypeError, ValueError):
             continue
-        kwargs[field_name] = max(0.0, minutes * 60.0)
+        kwargs[field_name] = float(np.clip(seconds, 5.0, 600.0))
     return replace(config, **kwargs)
 
 

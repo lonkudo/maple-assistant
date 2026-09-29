@@ -19,7 +19,7 @@ VK_ESCAPE = 0x1B
 
 
 class WorkflowCancelWorker(threading.Thread):
-    """Cancel active reconnect, auto-lie, and Ctrl+Q workflows on Esc."""
+    """Cancel active reconnect, restart, auto-lie, and Ctrl+Q workflows on Esc."""
 
     POLL_SECONDS = 0.025
 
@@ -47,7 +47,7 @@ class WorkflowCancelWorker(threading.Thread):
             return False
 
     def run(self) -> None:
-        LOG.info("workflow cancel worker started (Esc watches active reconnect, auto-lie, Ctrl+Q trade)")
+        LOG.info("workflow cancel worker started (Esc watches reconnect, restart, auto-lie, Ctrl+Q trade)")
         while not self.stop_event.wait(self.POLL_SECONDS):
             active = []
             for name, is_active, cancel in self.workflows:

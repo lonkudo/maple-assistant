@@ -250,6 +250,10 @@ DOUBLE_CLICK_HOLD_SECONDS = 0.04         # a quick press down/up
 DOUBLE_CLICK_GAP_SECONDS = 0.07          # quick: the two clicks of one pair
 DOUBLE_CLICK_SLOW_GAP_SECONDS = 0.07     # the second pair uses the same quick timing
 DOUBLE_CLICK_GAPS = (DOUBLE_CLICK_GAP_SECONDS, DOUBLE_CLICK_SLOW_GAP_SECONDS)
+# World selection is deliberately a separate gesture: the operator measured
+# that the selected world is more reliable as double-click -> 0.5 s ->
+# double-click again, rather than the old single-click + Enter fallback.
+WORLD_DOUBLE_CLICK_REPEAT_WAIT_SECONDS = 0.5
 # The shipped click timing for every other click (place the cursor, wait, press, hold, release).
 CLICK_SETTLE_SECONDS = 0.03
 CLICK_HOLD_SECONDS = 0.03
@@ -1576,6 +1580,7 @@ class ReconnectWorker(threading.Thread):
         post_login_marker_ready_fn: Optional[Callable[[], bool]] = None,
         automation_event: Optional[threading.Event] = None,
         reconnect_active_event: Optional[threading.Event] = None,
+        restart_active_event: Optional[threading.Event] = None,
     ) -> None:
         super().__init__(name="auto-reconnect-worker", daemon=True)
         self.key_sender = key_sender
@@ -1603,6 +1608,11 @@ class ReconnectWorker(threading.Thread):
         # Raised for the whole run: the focus gate keeps the automation switch cleared while it is
         # set, so patrol/attack cannot resume on the login page.
         self.reconnect_active_event = reconnect_active_event
+        # The memory-leak restart owns the launcher phase before this worker
+        # owns the login page.  Ordinary missing-marker events during that
+        # phase must not queue a second reconnect, but the dedicated handoff
+        # below is intentionally allowed through.
+        self.restart_active_event = restart_active_event
         # 掉线提示窗口 (see OFFLINE_PROMPT_ENTER): one Enter right after the login page is recognized.
         self.dismiss_offline_prompt = OFFLINE_PROMPT_CLICK or OFFLINE_PROMPT_ENTER
         # The precise reason the last click could not be sent (ownership, delivery, ...).  The
@@ -1652,8 +1662,10 @@ class ReconnectWorker(threading.Thread):
         # when the enable checkbox is still off, so the operator can try it before trusting
         # the automatic 掉线 trigger.
         self._test_requested = False
+        self._restart_requested = False
         self._testing = False
         self._running = False
+        self._last_run_succeeded: Optional[bool] = None
         self._cancel_requested = threading.Event()
 
     # ------------------------------------------------------------------ settings
@@ -1710,6 +1722,9 @@ class ReconnectWorker(threading.Thread):
         """Queue one confirmed 掉线 event; return whether this worker accepted it."""
 
         with self._lock:
+            if self.restart_active_event is not None and self.restart_active_event.is_set():
+                LOG.info("auto reconnect: disconnect deferred; 自动重开 owns the launcher phase")
+                return False
             if not self._enabled:
                 LOG.info("auto reconnect: disconnect ignored because it is disabled")
                 return False
@@ -1721,6 +1736,26 @@ class ReconnectWorker(threading.Thread):
             self._disconnect_queued = True
             self._login_entered = False
         LOG.info("auto reconnect: disconnect event seen; checking the game window")
+        self._wake.set()
+        return True
+
+    def trigger_restart_reconnect(self) -> bool:
+        """Accept the one explicit handoff from 自动重开 without changing its selection.
+
+        This is deliberately distinct from :meth:`notify_disconnect`: the
+        restart worker already knows a fresh login page is expected, so it
+        bypasses the checked-state gate but never edits ``_enabled``.  The
+        normal 自动重连 checkbox therefore stays selected (or unselected)
+        exactly as the operator configured it.
+        """
+
+        with self._lock:
+            if self._running or self._disconnect_queued or self._testing or self._test_requested:
+                LOG.info("auto reconnect: restart handoff ignored; reconnect already queued/running")
+                return False
+            self._restart_requested = True
+            self._login_entered = False
+        LOG.info("auto reconnect: 自动重开 handed over the fresh game client")
         self._wake.set()
         return True
 
@@ -1750,6 +1785,12 @@ class ReconnectWorker(threading.Thread):
 
         with self._lock:
             return bool(self._running)
+
+    def last_run_succeeded(self) -> Optional[bool]:
+        """Result of the most recent completed reconnect, if one exists."""
+
+        with self._lock:
+            return self._last_run_succeeded
 
     def request_cancel(self) -> bool:
         """Stop the current reconnect at its next safe wait/checkpoint."""
@@ -1810,24 +1851,30 @@ class ReconnectWorker(threading.Thread):
         enabled, world, channel = self.settings()
         with self._lock:
             testing_requested = self._test_requested
+            restart_requested = self._restart_requested
+            self._restart_requested = False
             # The queued flag protects only the handoff from notify_disconnect()
             # to this loop iteration.  Once consumed, a later real disconnect can
             # be handled after this run completes.
             self._disconnect_queued = False
-        if not enabled and not testing_requested:
+        if not enabled and not testing_requested and not restart_requested:
             return
         testing = self._take_test_request()
+        if restart_requested:
+            LOG.info("auto reconnect: running dedicated 自动重开 handoff (selection remains %s)", enabled)
         with self._lock:
             self._running = True
+            self._last_run_succeeded = None
             self._cancel_requested.clear()
         try:
-            self._run_sequence(world, channel, testing)
+            succeeded = bool(self._run_sequence(world, channel, testing))
         finally:
             with self._lock:
+                self._last_run_succeeded = locals().get("succeeded", False)
                 self._running = False
                 self._testing = False
 
-    def _run_sequence(self, world: str, channel: int, testing: bool) -> None:
+    def _run_sequence(self, world: str, channel: int, testing: bool) -> bool:
         if testing:
             LOG.info("auto reconnect: manual test run (ignoring the enable checkbox)")
         # FIRST, before anything else: the automation must not type into a game that is on the login
@@ -1841,7 +1888,7 @@ class ReconnectWorker(threading.Thread):
         finally:
             self._release_keyboard()
             self._finish_automation(automation_was, succeeded)
-        return
+        return succeeded
 
     def _finish_automation(self, automation_was: bool, succeeded: bool) -> None:
         """Hand the machine back after a run - the automation only resumes on SUCCESS.
@@ -3397,12 +3444,11 @@ class ReconnectWorker(threading.Thread):
             return False
 
     def _select_world(self, world: str) -> bool:
-        """Click the chosen world row and PROVE the channel page appears.
+        """Open the chosen world with two guarded double-click gestures.
 
-        The operator's model of the sequence: page 2 shows the world list (蓝蜗牛 ...), page 3 shows
-        the channels.  A click selects a world; **Enter** confirms it and opens the channels, so both
-        are tried and each is verified by the page - a click that the game ignored is noticed instead
-        of being assumed (the earlier field failure logged in to 蓝蜗牛 while 蘑菇仔 had been chosen).
+        The second gesture is sent 0.5 s after the first only while the world
+        page remains visible.  If the first pair already opened channels, a
+        second pair would land on the channel list and is therefore unsafe.
         """
 
         index = WORLD_NAMES.index(world)
@@ -3410,7 +3456,6 @@ class ReconnectWorker(threading.Thread):
         row_x, row_y = window_client_point(WORLD_ROW_CLIENT, size)
         step_x, step_y = window_client_delta(WORLD_ROW_STEP_CLIENT, size)
         select_window = window_client_box(SELECT_WINDOW_CLIENT_BOX, size)
-        world_list_box = window_client_box(WORLD_LIST_CLIENT_BOX, size)
         client_x = row_x + index * step_x
         client_y = row_y + index * step_y
 
@@ -3426,61 +3471,39 @@ class ReconnectWorker(threading.Thread):
             return False
 
         for attempt in range(1, PAGE_STEP_ATTEMPTS + 1):
-            LOG.info("auto reconnect: world step attempt %d/%d for %s (row %d)", attempt,
+            LOG.info("auto reconnect: world double-click sequence %d/%d for %s (row %d)", attempt,
                      PAGE_STEP_ATTEMPTS, world, index + 1)
-            world_before = self._capture()[0]
-            clicked = self._click_client(client_x, client_y, "world", f"{world} (row {index + 1})")
-            if clicked:
-                if not self._sleep_checked(SELECT_WINDOW_WAIT_SECONDS):
-                    return False
-                after = self._capture()[0]
-                change = max(region_change(world_before, after, world_list_box),
-                             screen_change(world_before, after))
-                LOG.info("auto reconnect: after the %s click the world row changed by %.2f "
-                         "(needs %.2f)", world, change, WORLD_LIST_CHANGE_MIN)
-                if change >= WORLD_LIST_CHANGE_MIN:
-                    # The selection really moved; now Enter may confirm it.
-                    if self._verify_or_pixel(PAGE_CHANNEL, what=f"点击 {world} 世界行",
-                                             before=world_before, timeout=PAGE_WAIT_WORLD_SECONDS,
-                                             first_pause=SELECT_WINDOW_WAIT_SECONDS):
-                        self._report("world", f"{world} (row {index + 1}) 已选择")
-                        return True
-                    if self._enter_until_page(PAGE_CHANNEL, what=f"{world} 世界"):
-                        self._report("world", f"{world} (row {index + 1}) 已确认 (Enter)")
-                        return True
-                    LOG.warning("auto reconnect: the %s click and Enter did not open the channel "
-                                "page", world)
-                else:
-                    # THE measured failure: a click that did not move the highlight, followed by an
-                    # Enter that confirmed the default world (蓝蜗牛 instead of 蘑菇仔).
-                    LOG.warning("auto reconnect: the click on %s (row %d) did NOT move the world "
-                                "selection (%.2f < %.2f) - no Enter is sent, retrying the click",
-                                world, index + 1, change, WORLD_LIST_CHANGE_MIN)
-                    self._report("world", f"点击 {world} 世界行没有改变选择，重试")
-            else:
-                LOG.warning("auto reconnect: the click on world %s could not be sent", world)
-
-            # Fallback: the list is horizontal, so walk right from the current selection - again only
-            # confirming when the highlight actually moves.
-            moved = False
-            for _ in range(index):
-                before_key = self._capture()[0]
-                reason = self._press("right")
-                if reason:
-                    self._report("failed", reason)
-                    return False
-                if not self._sleep_checked(KEY_DELAY_SECONDS):
-                    return False
-                if region_change(before_key, self._capture()[0], world_list_box) \
-                        >= WORLD_LIST_CHANGE_MIN:
-                    moved = True
-            if index and not moved:
-                LOG.warning("auto reconnect: the right-arrow walk did not move the world selection "
-                            "either - the world cannot be chosen reliably")
+            label = f"{world} (row {index + 1}, 双击 1/2)"
+            if not self._double_click_client(client_x, client_y, "world", label):
+                LOG.warning("auto reconnect: the first double-click on world %s could not be sent", world)
                 continue
-            if self._enter_until_page(PAGE_CHANNEL, what=f"{world} 世界（键盘）"):
-                self._report("world", f"{world} (row {index + 1}, keyboard)")
+            if not self._sleep_checked(WORLD_DOUBLE_CLICK_REPEAT_WAIT_SECONDS):
+                return False
+            page, score = self.page_now()
+            if page == PAGE_CHANNEL:
+                self._report("world", f"{world} (row {index + 1}) 已进入频道页")
                 return True
+            # The first pair did not open the world. Send the requested second
+            # pair only while still on the world page, never onto channels.
+            second_before = self._capture()[0]
+            if not self._double_click_client(
+                client_x, client_y, "world", f"{world} (row {index + 1}, 双击 2/2)"
+            ):
+                LOG.warning("auto reconnect: the second double-click on world %s could not be sent", world)
+                continue
+            if self._verify_or_pixel(
+                PAGE_CHANNEL,
+                what=f"双击 {world} 世界行",
+                before=second_before,
+                timeout=PAGE_WAIT_WORLD_SECONDS,
+                first_pause=SELECT_WINDOW_WAIT_SECONDS,
+            ):
+                self._report("world", f"{world} (row {index + 1}) 已进入频道页")
+                return True
+            LOG.warning(
+                "auto reconnect: both double-click pairs did not open %s; page=%s (%.2f)",
+                world, self._page_label(page), score,
+            )
 
         page, score = self.page_now()
         LOG.error("auto reconnect: the world step failed %d times - the page is %s (%.2f); %s",

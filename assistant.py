@@ -306,8 +306,8 @@ def _clear_previous_log_files() -> None:
     """Startup: wipe every log file from previous runs.
 
     Runs after the single-instance check so a second instance never clears
-    a live session's logs.  error.log, work/assistant.log, yolo logs, demo
-    console logs, the dedicated auto_lie.log and target_tracker logs all start fresh each launch, which
+    a live session's logs.  work/assistant.log, yolo logs, demo console logs,
+    the dedicated auto_lie.log and target_tracker logs all start fresh each launch, which
     keeps any pasted diagnostic output attributable to the current run.
     """
 
@@ -352,21 +352,8 @@ def main() -> int:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         handlers=[console_handler],
     )
-    # error.log 只记录错误：文件接收 ERROR 及以上（含 LOG.exception 与
-    # 线程 excepthook 的 logging.critical）。日常 INFO 事件只进运行日志面板
-    # 内存与开发控制台，不再全部落盘。
-    error_log_handler = RotatingFileHandler(
-        Path(__file__).with_name("error.log"),
-        maxBytes=2_000_000,
-        backupCount=2,
-        encoding="utf-8",
-    )
-    error_log_handler.setLevel(logging.ERROR)
-    error_log_handler.setFormatter(_compact_log_formatter())
-    logging.getLogger().addHandler(error_log_handler)
-
-    # INFO 追踪单独落盘 work/assistant.log（error.log 保持只含错误）：
-    # auto-lie:/lie-detect: 等日常事件仍可离线排查（UI 运行日志只是内存副本）。
+    # INFO and ERROR tracking are persisted in work/assistant.log; the UI
+    # running log remains an in-memory convenience view.
     trace_log_path = Path(__file__).resolve().parent / "work" / "assistant.log"
     try:
         trace_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -460,7 +447,8 @@ def main() -> int:
     from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
     from quick_pickup_worker import QuickPickupWorker
-    from reconnect_worker import ReconnectWorker
+    from reconnect_worker import CHANNEL_DEFAULT, ReconnectWorker
+    from auto_restart_worker import AutoRestartWorker
     from trade_worker import TradeWorker
     from workflow_cancel_worker import WorkflowCancelWorker
     from motion_arbiter import MotionArbiter
@@ -512,6 +500,11 @@ def main() -> int:
     # Set while the 自动重连 owns the machine: the focus gate must not re-arm the automation then
     # (otherwise attack/jump start on the login page - the character is not in game yet).
     reconnect_active = threading.Event()
+    # Raised from the high-memory restart trigger until its fresh game client
+    # has been handed to 自动重连.  It is separate from reconnect_active so
+    # the latter can remain the login worker's own lifecycle flag.
+    auto_restart_active = threading.Event()
+    reconnect_or_restart_active = _AnyEvent(reconnect_active, auto_restart_active)
     game_focused = threading.Event()
     patrol_preparing = threading.Event()
     trade_capture_active = threading.Event()
@@ -551,6 +544,8 @@ def main() -> int:
         alt_transition=False,
     )
     config_store = get_config_store(args.config)
+    additional_settings = config_store.read_section("additional_functions")
+    channel_update_events: "queue.Queue[int]" = queue.Queue(maxsize=16)
 
     # Select a WebSocket endpoint once while the dashboard is opening.  A
     # probe does not authenticate or bill (protocol 2.7.0 §4.3), so the lie
@@ -772,7 +767,8 @@ def main() -> int:
 
     def prepare_map_session(*, stationary_reanchor: bool = True, show_overlays: bool = True,
                             show_startup_marker: bool = False,
-                            require_layer: bool = True) -> None:
+                            require_layer: bool = True,
+                            reconnect_restart: bool = False) -> None:
         """Verify the recorded map name and re-anchor transient world Y.
 
         ``stationary_reanchor`` is False for an AUTOMATIC patrol resume: 站桩攻击
@@ -1426,7 +1422,9 @@ def main() -> int:
             )
         structure_tracker.start_session(float(anchor_world_y))
         movement_worker.prepare_patrol_start(
-            anchor_name, above_route=startup_above_route
+            anchor_name,
+            above_route=startup_above_route,
+            reconnect_restart=reconnect_restart,
         )
         logging.info(
             "MAP SESSION detected %s from marker_y=%s%s; re-anchoring "
@@ -1482,6 +1480,7 @@ def main() -> int:
                     stationary_reanchor=False,
                     show_overlays=False,
                     require_layer=False,
+                    reconnect_restart=True,
                 )
             except OSError as exc:
                 # The map session could not be prepared at all (no minimap, no marker, wrong map):
@@ -1655,7 +1654,29 @@ def main() -> int:
         # through the whole sequence).
         automation_event=automation_active,
         reconnect_active_event=reconnect_active,
+        restart_active_event=auto_restart_active,
     )
+
+    def note_player_channel_landed(channel: int) -> None:
+        """Persist one completed player-triggered channel route centrally."""
+
+        selected = max(1, min(60, int(channel)))
+        reconnect_worker.set_channel(selected)
+        settings = config_store.read_section("additional_functions")
+        settings["auto_reconnect_channel"] = selected
+        config_store.write_section("additional_functions", settings)
+        try:
+            channel_update_events.put_nowait(selected)
+        except queue.Full:
+            try:
+                channel_update_events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                channel_update_events.put_nowait(selected)
+            except queue.Full:
+                pass
+        logging.info("player channel route committed current reconnect channel=%d", selected)
 
     # 测试api (附加功能 panel): pick a video, play it at the API's 5 fps and upload each frame's ROI
     # to the RoiTrack backend (see api_lie_video.py).  A new worker per press, because a thread can
@@ -1892,7 +1913,10 @@ def main() -> int:
                 min(2, calibration.get("climb_layer_confirm_frames", 2)), 2
             ),
             climb_layer_confirm_seconds=float(
-                min(0.12, calibration.get("climb_layer_confirm_seconds", 0.12))
+                # The two independent arrival frames are the safety gate.
+                # Do not add a timed hold after them: at 5 FPS the next route
+                # dispatch naturally follows on the next capture.
+                0.0
             ),
             climb_arrival_world_tolerance=float(
                 calibration.get("climb_arrival_world_tolerance", 0.20)
@@ -1950,7 +1974,14 @@ def main() -> int:
             patrol_start_layer=map_profile.get("patrol_start_layer"),
             patrol_end_layer=map_profile.get("patrol_end_layer"),
             # Falling recovery knobs (see rope_calibration.json).
-            fall_detect_frames=five_fps_frames(calibration.get("fall_detect_frames", 3), 2),
+            # Three clear downward marker transitions are sufficient to prove
+            # a real fall at 5 FPS.  The former stored value of 3 was scaled
+            # to 4 for the old 4->5 FPS migration, so a short one-floor fall
+            # could settle after exactly three transitions and never enter
+            # landing reconciliation.
+            fall_detect_frames=five_fps_frames(
+                min(2, calibration.get("fall_detect_frames", 2)), 2
+            ),
             fall_marker_y_gain=float(calibration.get("fall_marker_y_gain", 0.015)),
             # Landing reconciliation (world-Y settle + re-anchor to the true
             # layer after a knock-down) and the world-Y drift watchdog.
@@ -2057,6 +2088,14 @@ def main() -> int:
             other_player_check_interval_seconds=float(
                 calibration.get("other_player_check_interval_seconds", 0.0)
             ),
+            other_player_room_code=str(additional_settings.get("player_room_code", "")),
+            other_player_wait_minutes=float(
+                additional_settings.get("player_channel_wait_minutes", 5.0)
+            ),
+            current_channel=int(
+                additional_settings.get("auto_reconnect_channel", CHANNEL_DEFAULT)
+            ),
+            on_channel_landed=note_player_channel_landed,
             rescue_check_interval_seconds=float(
                 calibration.get("rescue_check_interval_seconds", 300.0)
             ),
@@ -2103,6 +2142,18 @@ def main() -> int:
             refocus_before_release=refocus_before_release,
         )
 
+    # 自动重开 owns only the memory/leak lifecycle.  Once the fresh game
+    # window appears it queues ReconnectWorker's dedicated handoff, rather
+    # than reimplementing any world/channel/login steps here.
+    auto_restart_worker = AutoRestartWorker(
+        stop_event,
+        key_sender,
+        reconnect_worker,
+        restart_active_event=auto_restart_active,
+        stop_patrol=stop_patrol_for_disconnect,
+        result_queue=reconnect_results,
+    )
+
     small_step_worker = SmallStepWorker(
         stop_event,
         automation_active_event=automation_active,
@@ -2131,7 +2182,7 @@ def main() -> int:
         # proves that the login page is visible.
         disconnect_login_page_check=reconnect_worker.login_page_visible_in_frame,
         # No disconnect alert while 自动重连 is running: its login screens have no yellow marker.
-        reconnect_active_event=reconnect_active,
+        reconnect_active_event=reconnect_or_restart_active,
     )
     focus_worker = FocusWorker(
         key_sender,
@@ -2142,7 +2193,7 @@ def main() -> int:
         # A lie pass disarms input but is fed by the same capture: keep the
         # foreground gate honest for the whole pass.
         lie_pass_event=lie_active,
-        reconnect_active_event=reconnect_active,
+        reconnect_active_event=reconnect_or_restart_active,
     )
     core_workers = [
         capture_worker,
@@ -2156,6 +2207,7 @@ def main() -> int:
         *([hotkey_worker] if hotkey_worker is not None else []),
         quick_pickup_worker,
         reconnect_worker,
+        auto_restart_worker,
         trade_worker,
         screen_blinker,
         countdown_worker,
@@ -2183,6 +2235,7 @@ def main() -> int:
             quick_pickup_worker=quick_pickup_worker,
             quick_pickup_results=quick_pickup_results,
             reconnect_worker=reconnect_worker,
+            auto_restart_worker=auto_restart_worker,
             reconnect_results=reconnect_results,
             api_test_video_factory=make_api_test_video_worker,
             api_test_results=api_test_results,
@@ -2217,6 +2270,7 @@ def main() -> int:
             # 掉线 armed: the same watch feeds the character worker, so a disconnect is noticed (and
             # 自动重连 can run) without Start Patrol.
             disconnect_watch_armed_event=disconnect_watch_armed,
+            channel_update_events=channel_update_events,
         )
     )
 
@@ -2238,6 +2292,7 @@ def main() -> int:
         stop_event,
         (
             ("auto reconnect", reconnect_worker.is_active, reconnect_worker.request_cancel),
+            ("auto restart", auto_restart_worker.is_active, auto_restart_worker.request_cancel),
             ("automatic lie pass", auto_lie_is_active, cancel_auto_lie),
             ("Ctrl+Q/Ctrl+W trade", trade_worker.is_trade_active, trade_worker.request_cancel),
         ),

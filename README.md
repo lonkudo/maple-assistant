@@ -46,6 +46,12 @@ The update icon in the title bar searches the Desktop, the running folder, and i
 - **A return climb confirms the floor it actually reaches**, including a recorded floor outside the patrol range, and tolerates the character's own jump arc just above the platform instead of restarting the rope grab forever. See *Returning to the route from a lower floor*.
 - **A floor that never recorded a rope no longer borrows the legacy profile-wide `rope.x`**: its own recorded jump point is used as the rope approach, and when it has neither, the return stands still and logs what is missing instead of walking off the platform.
 
+### Current release behavior (v1.2.52 – v1.2.54)
+
+- **Reconnect drop recovery is reconnect-only.** If an automatic reconnect starts above the recorded route and three ordinary drop attempts produce no downward Y progress, it tries a five-second left edge walk, then (only if that also fails) a five-second right edge walk. Any confirmed downward movement immediately returns it to the ordinary drop-to-route flow. A manual start and a reconnect that does not need to drop never enter this fallback.
+- **World selection is a guarded double-click sequence.** The selected world row (for example 蘑菇仔) receives a double-click, a 0.5-second wait, then a second double-click only if the world page is still visible. If the first double-click has already opened the channel page, the second gesture is skipped so it cannot click a channel accidentally. The obsolete single-click and Enter confirmation fallback are not used for this step.
+- **After automatic lie handling, the assistant clicks the measured confirmation point** rather than sending Enter. The 1080×768 point is `(630, 428)`; other layouts use the 1366×768 reference point `(800, 472)` scaled by client width. The game is focused before this click, and patrol resumes only after the click attempt completes.
+
 ## Configuration
 
 Two configuration files keep personal settings separate from shipped defaults:
@@ -119,7 +125,7 @@ Record each map before enabling a route:
 
 Layers are stored from bottom to top. A patrol route can cover any contiguous range; a map does not need exactly three layers.
 
-Each layer's row has an axis band beside its name. **Right-click the axis** to open its point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳); the menu is only available while patrol is stopped, because recording is locked while it runs. A left click on empty axis space opens the same menu, while a left click on an already-recorded marker selects that layer instead — so the right click is the reliable way to the menu.
+Each layer's row has an axis band beside its name. **Right-click the axis** to open its point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳); the menu is only available while patrol is stopped, because recording is locked while it runs. Left-clicking does not open the point menu; it only follows normal layer/marker selection behavior.
 
 The minimap detector first finds the actual map border and calculates marker coordinates relative to that border. A broad search rectangle may help locate a map, but it is never saved as map geometry. This matters when the minimap size changes between maps or when the UI temporarily covers part of the game window.
 
@@ -197,7 +203,9 @@ The additional-functions panel can enable sound, screen flash, Telegram messages
 
 Disconnect handling deliberately avoids treating every missing minimap marker as a disconnect. At the shared 5 FPS capture rate, the marker must be absent for 50 samples (about ten seconds), **and** the current frame must show either the login-page evidence or the dedicated offline prompt. The prompt check remains valid when the prompt covers the login background. In minimap-less zones, monitoring pauses after the absence threshold and resumes when the marker returns; it does not repeatedly reconnect or stop patrol merely because a minimap is hidden.
 
-Automatic reconnect begins only after this verified offline event and then follows the login-page workflow.
+Automatic reconnect begins only after this verified offline event. It dismisses the offline prompt when present, reaches the login screen, opens the chosen world with the guarded double-click sequence, selects the target channel, and waits for sustained marker recovery before patrol can resume.
+
+**自动重开** is a separate ten-minute system-memory guard. When enabled and Windows memory use reaches 95%, it sends the optional **重开消息**, signs the character out, and waits until the old game process has completely exited before using the existing `launcher3.0` launcher window. While the new client starts, the assistant restores its focus once per second and waits for the login-page detector before handing off to the normal reconnect workflow. Restart progress is shown in the 图层校准与逻辑 status line; its control and 重开消息 button are on their own line in 附加功能. The authorization header always displays the latest system-memory reading, refreshed on this same ten-minute cadence whether 自动重开 is enabled or not.
 
 ## Lie detection and automatic handling
 
@@ -265,7 +273,10 @@ For a minimap-less area, return to a normal map before expecting patrol or disco
 
 ## Development and releases
 
-Behavior changes are released as a new numbered ZIP:
+Create a numbered release only when the operator explicitly requests one. This
+applies to both the normal ZIP and the standalone EXE ZIP; ordinary code
+changes remain in the workspace until a release is requested. When requested,
+the normal release command is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests

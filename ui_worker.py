@@ -31,6 +31,7 @@ from minimap_detector import (
 from patrol_control import CoordinateLayout, PatrolController
 from status_worker import apply_drug_settings, BINDABLE_KEYS, WindowKeySender
 from config_store import config_section_file
+from game_chat import send_game_chat_message
 from countdown_worker import play_mp3
 from licensing import (
     LicenseStatus, activate as activate_license, activate_via_server,
@@ -41,6 +42,7 @@ from reconnect_worker import (
     CHANNEL_MAX,
     CHANNEL_MIN,
     WORLD_NAMES,
+    click_screen,
     valid_channel,
 )
 from timer_state import load_timer_state, save_timer_state, timer_state_path
@@ -63,6 +65,36 @@ LOG = logging.getLogger(__name__)
 # disarmed.  They must not be included here: re-arming general input on
 # Ctrl+Q/Ctrl+W can wake unrelated attack workers while patrol is stopped.
 TYPING_HOTKEY_PREFIXES = ("quick_message:", "quick_pickup:")
+
+# The auto-lie result button has separate measured points for the two fixed
+# game presets.  Wider clients follow the 1366 reference by width, including
+# 1980x1020: (round(800 * 1980 / 1366), round(472 * 1980 / 1366)) = (1160, 684).
+_AUTO_LIE_CONFIRM_1080_SIZE = (1080, 768)
+_AUTO_LIE_CONFIRM_1080_POINT = (630, 428)
+_AUTO_LIE_CONFIRM_REFERENCE_WIDTH = 1366
+_AUTO_LIE_CONFIRM_REFERENCE_POINT = (800, 472)
+# Completing a lie round can leave the API/game transition owning focus for a
+# moment.  A click during that handoff lands on the desktop even when the point
+# is correct, so the confirmation is deliberately gated on a settled game
+# foreground check.
+_AUTO_LIE_CONFIRM_FOCUS_SETTLE_SECONDS = 0.20
+_AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS = 3
+
+
+def _auto_lie_confirm_client_point(
+    client_width: int, client_height: int,
+) -> tuple[int, int]:
+    """Return the measured post-lie confirmation point in game-client pixels."""
+
+    width = max(1, int(client_width))
+    height = max(1, int(client_height))
+    if (width, height) == _AUTO_LIE_CONFIRM_1080_SIZE:
+        return _AUTO_LIE_CONFIRM_1080_POINT
+    scale = width / float(_AUTO_LIE_CONFIRM_REFERENCE_WIDTH)
+    return (
+        int(round(_AUTO_LIE_CONFIRM_REFERENCE_POINT[0] * scale)),
+        int(round(_AUTO_LIE_CONFIRM_REFERENCE_POINT[1] * scale)),
+    )
 
 # 自动过测谎 debouncing.  The lie detector reports a NEW event when it sees the square again after it
 # was gone (and None when it clears), but its detection can flicker frame to frame, so the consumer
@@ -438,10 +470,10 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
     """16x16 monochrome glyph for the running-log action buttons.
 
     ``archive`` = a document sheet (copy the running log); ``user`` = a
-    person silhouette (copy the user settings); ``error`` = an alert
-    triangle with "!" (copy the root error.log); ``server`` = a compact
-    linked-node glyph (copy server_client.log). Drawn with PIL so the
-    glyphs render identically on every Windows theme/font set.
+    person silhouette (copy the user settings); ``server`` = a compact
+    linked-node glyph (copy server_client.log); ``auto_lie`` = a target
+    frame (copy auto_lie.log). Drawn with PIL so the glyphs render
+    identically on every Windows theme/font set.
     """
 
     size = 16
@@ -459,17 +491,16 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
         # Head + shoulders silhouette.
         draw.ellipse((4, 1, 12, 9), outline=ink)
         draw.arc((1, 8, 15, 20), start=180, end=360, fill=ink)
-    elif kind == "error":
-        # Alert triangle with an exclamation mark (copy error.log).
-        draw.polygon(((8, 1), (15, 14), (1, 14)), fill=paper, outline=ink)
-        draw.line((8, 5, 8, 10), fill=ink)
-        draw.point((8, 12), fill=ink)
     elif kind == "server":
         draw.rounded_rectangle((1, 5, 7, 11), radius=1, fill=paper, outline=ink)
         draw.rounded_rectangle((9, 2, 15, 8), radius=1, fill=paper, outline=ink)
         draw.line((7, 7, 9, 5), fill=ink)
         draw.point((3, 8), fill=ink)
         draw.point((11, 5), fill=ink)
+    elif kind == "auto_lie":
+        draw.rectangle((2, 2, 13, 13), outline=ink)
+        draw.ellipse((5, 5, 10, 10), outline=ink)
+        draw.point((7, 7), fill=ink)
     else:
         raise ValueError(f"unknown log icon kind: {kind!r}")
     # The UI is built on an explicit Tk root.  Letting ImageTk choose the
@@ -768,6 +799,7 @@ class UiWorker(threading.Thread):
         quick_pickup_worker: Any = None,
         quick_pickup_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         reconnect_worker: Any = None,
+        auto_restart_worker: Any = None,
         reconnect_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         api_test_video_factory: Optional[Callable[..., Any]] = None,
         api_test_results: Optional["queue.Queue[tuple[str, str]]"] = None,
@@ -796,6 +828,7 @@ class UiWorker(threading.Thread):
         # 掉线 armed: the same parked watch feeds the character worker, so a disconnect is noticed (and
         # 自动重连 can run) even without Start Patrol.
         disconnect_watch_armed_event: Optional[threading.Event] = None,
+        channel_update_events: Optional["queue.Queue[int]"] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -829,6 +862,7 @@ class UiWorker(threading.Thread):
         # 自动重连: armed from the Additional Functions panel, triggered by the 掉线
         # event and confirmed by the login-page template check.
         self.reconnect_worker = reconnect_worker
+        self.auto_restart_worker = auto_restart_worker
         self.reconnect_results = reconnect_results
         # 测试api: one factory that builds a drill thread per press (a thread cannot restart), plus
         # the queue its progress lines arrive on.  The only drill is the video one: the button picks
@@ -861,6 +895,8 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_last_pass_started = 0.0
         # True while an automatic pass has the patrol stood down (see _pause_patrol_for_api_pass).
         self._api_auto_lie_patrol_paused = False
+        self._api_auto_lie_post_confirm_scheduled = False
+        self._api_auto_lie_post_confirm_complete = False
         # The operator's patrol INTENT: set by 开始巡逻, cleared by 停止巡逻 (buttons and the Ctrl+`
         # toggle).  A reconnect restarts the patrol only when this is set - the patrol STATE is useless
         # for that decision, because a disconnect (and the focus gate) stop the patrol, and a Start
@@ -918,6 +954,7 @@ class UiWorker(threading.Thread):
         self.automation_active_event = automation_active_event
         self.lie_watch_armed_event = lie_watch_armed_event
         self.disconnect_watch_armed_event = disconnect_watch_armed_event
+        self.channel_update_events = channel_update_events
         # License verification is an independent boundary: it never changes
         # patrol/trade worker internals, it only decides whether UI actions may
         # enter those workflows.
@@ -940,6 +977,7 @@ class UiWorker(threading.Thread):
         # server has accepted it for this session.
         self._license_online_validation_pending = bool(local_license_status.valid)
         self._license_session_locked = True
+        self._memory_usage_text = "内存：读取中"
         self._license_heartbeat_results: "queue.Queue[tuple[int, LicenseStatus]]" = (
             queue.Queue()
         )
@@ -1760,14 +1798,14 @@ class UiWorker(threading.Thread):
             self._mp_threshold_label = ttk.Label(mp_row, text="30%", width=6)
             self._mp_threshold_label.pack(side="left")
             # Periodic buff rows: a bound key tapped on a timer.  Each row has
-            # its own "every N minutes" slider (default 10 min) that decides
+            # its own 5..600 second slider (default 600 seconds) that decides
             # when the key is triggered.  Unlike HP/MP these are time-based,
             # not bar-percent based.
             buff1_row = ttk.Frame(drug_panel)
             buff1_row.pack(fill="x", pady=(6, 0))
             self._buff1_use_var = tk.BooleanVar(value=False)
             buff1_use_button = ttk.Checkbutton(
-                buff1_row, text="宠物食品", variable=self._buff1_use_var,
+                buff1_row, text="饲料", variable=self._buff1_use_var,
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
@@ -1786,11 +1824,11 @@ class UiWorker(threading.Thread):
             self._buff1_key_button = buff1_key_button
             self._attach_bind_hint(buff1_key_button)
             ttk.Label(buff1_row, text="每").pack(side="left")
-            # Buff refresh period in minutes (default 10): horizontal slider
+            # Buff refresh period in seconds (default 600): horizontal slider
             # in the same progress-bar style as the other panels.
-            self._buff1_interval_var = tk.DoubleVar(value=10.0)
+            self._buff1_interval_var = tk.DoubleVar(value=600.0)
             buff1_interval_slider = ttk.Scale(
-                buff1_row, from_=0.5, to=30.0, orient="horizontal",
+                buff1_row, from_=5.0, to=600.0, orient="horizontal",
                 variable=self._buff1_interval_var,
                 command=self._drug_on_change,
                 length=60,
@@ -1798,7 +1836,7 @@ class UiWorker(threading.Thread):
             buff1_interval_slider.pack(side="left", fill="x",
                                        expand=True, padx=(8, 8))
             self._buff1_interval_label = ttk.Label(
-                buff1_row, text="10.0min", width=8
+                buff1_row, text="600s", width=8
             )
             self._buff1_interval_label.pack(side="left")
             buff2_row = ttk.Frame(drug_panel)
@@ -1824,9 +1862,9 @@ class UiWorker(threading.Thread):
             self._buff2_key_button = buff2_key_button
             self._attach_bind_hint(buff2_key_button)
             ttk.Label(buff2_row, text="每").pack(side="left")
-            self._buff2_interval_var = tk.DoubleVar(value=10.0)
+            self._buff2_interval_var = tk.DoubleVar(value=600.0)
             buff2_interval_slider = ttk.Scale(
-                buff2_row, from_=0.5, to=30.0, orient="horizontal",
+                buff2_row, from_=5.0, to=600.0, orient="horizontal",
                 variable=self._buff2_interval_var,
                 command=self._drug_on_change,
                 length=60,
@@ -1834,7 +1872,7 @@ class UiWorker(threading.Thread):
             buff2_interval_slider.pack(side="left", fill="x",
                                        expand=True, padx=(8, 8))
             self._buff2_interval_label = ttk.Label(
-                buff2_row, text="10.0min", width=8
+                buff2_row, text="600s", width=8
             )
             self._buff2_interval_label.pack(side="left")
             buff3_row = ttk.Frame(drug_panel)
@@ -1860,9 +1898,9 @@ class UiWorker(threading.Thread):
             self._buff3_key_button = buff3_key_button
             self._attach_bind_hint(buff3_key_button)
             ttk.Label(buff3_row, text="每").pack(side="left")
-            self._buff3_interval_var = tk.DoubleVar(value=10.0)
+            self._buff3_interval_var = tk.DoubleVar(value=600.0)
             buff3_interval_slider = ttk.Scale(
-                buff3_row, from_=0.5, to=30.0, orient="horizontal",
+                buff3_row, from_=5.0, to=600.0, orient="horizontal",
                 variable=self._buff3_interval_var,
                 command=self._drug_on_change,
                 length=60,
@@ -1870,7 +1908,7 @@ class UiWorker(threading.Thread):
             buff3_interval_slider.pack(side="left", fill="x",
                                        expand=True, padx=(8, 8))
             self._buff3_interval_label = ttk.Label(
-                buff3_row, text="10.0min", width=8
+                buff3_row, text="600s", width=8
             )
             self._buff3_interval_label.pack(side="left")
             # Restore previously saved drug settings and apply them live.
@@ -2100,8 +2138,9 @@ class UiWorker(threading.Thread):
                 "自动过测谎: selection loaded as %s",
                 "ON" if saved_api_auto_lie else "OFF",
             )
-            # ONE compact line: 自动过测谎 and 自动重连 first (the operator's order), then the world and
-            # the channel they apply to.
+            # Keep restart, lie, and reconnect as separate selections.  自动重开
+            # only hands a newly launched client to 自动重连; it must never
+            # silently alter the reconnect selection itself.
             reconnect_row = ttk.Frame(extra_panel)
             reconnect_row.pack(fill="x", pady=(4, 0))
             self._api_auto_lie_var = tk.BooleanVar(value=saved_api_auto_lie)
@@ -2162,6 +2201,34 @@ class UiWorker(threading.Thread):
             self._reconnect_channel_box.bind(
                 "<FocusOut>", lambda _event: self._reconnect_on_change()
             )
+            self._reconnect_message_var = tk.StringVar(value="")
+            self._reconnect_message_button = ttk.Button(
+                reconnect_row, text="重连消息",
+                command=lambda: self._edit_workflow_message(
+                    "reconnect", "重连消息", self._reconnect_message_var
+                ),
+                takefocus=False,
+            )
+            self._reconnect_message_button.pack(side="left", padx=(6, 0))
+            restart_row = ttk.Frame(extra_panel)
+            restart_row.pack(fill="x", pady=(4, 0))
+            self._auto_restart_var = tk.BooleanVar(value=False)
+            self._auto_restart_check = ttk.Checkbutton(
+                restart_row,
+                text="自动重开",
+                variable=self._auto_restart_var,
+                command=self._shutdown_on_change,
+            )
+            self._auto_restart_check.pack(side="left")
+            self._restart_offline_message_var = tk.StringVar(value="")
+            self._restart_offline_message_button = ttk.Button(
+                restart_row, text="重开消息",
+                command=lambda: self._edit_workflow_message(
+                    "restart_offline", "重开消息", self._restart_offline_message_var
+                ),
+                takefocus=False,
+            )
+            self._restart_offline_message_button.pack(side="left", padx=(6, 0))
             # Clicking a plain label/panel does not necessarily give Tk a
             # different focus owner, so Spinbox <FocusOut> alone never fires.
             # Watch root clicks as well and explicitly commit/blur this one
@@ -2204,6 +2271,38 @@ class UiWorker(threading.Thread):
                 variable=self._player_check_var,
                 command=self._shutdown_on_change,
             ).pack(side="left")
+            self._player_request_message_var = tk.StringVar(value="")
+            self._player_request_message_button = ttk.Button(
+                player_row, text="求让消息",
+                command=lambda: self._edit_workflow_message(
+                    "player_request", "求让消息", self._player_request_message_var
+                ),
+                takefocus=False,
+            )
+            self._player_request_message_button.pack(side="left", padx=(6, 0))
+            self._player_room_code_var = tk.StringVar(value="")
+            self._player_room_code_button = ttk.Button(
+                player_row, text="房间码",
+                command=self._edit_player_room_code,
+                takefocus=False,
+            )
+            self._player_room_code_button.pack(side="left", padx=(6, 0))
+            ttk.Label(player_row, text="换线等待").pack(side="left", padx=(6, 0))
+            self._player_channel_wait_var = tk.StringVar(value="5")
+            player_wait_check = self._register_validator(
+                player_row, self._validate_player_channel_wait
+            )
+            self._player_channel_wait_box = ttk.Spinbox(
+                player_row, from_=1, to=20, width=3,
+                textvariable=self._player_channel_wait_var,
+                validate="key", validatecommand=player_wait_check,
+                command=self._shutdown_on_change,
+            )
+            self._player_channel_wait_box.pack(side="left", padx=(3, 0))
+            self._player_channel_wait_box.bind(
+                "<FocusOut>", lambda _event: self._shutdown_on_change()
+            )
+            ttk.Label(player_row, text="分钟").pack(side="left", padx=(2, 0))
 
             # 自动过测谎 (the local Cutie/YOLO lie pass) is gone: lie detection is done by the
             # remote RoiTrack service through 测试api (see api_lie_video.py), so neither the
@@ -2252,14 +2351,6 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._copy_log_button.pack(side="left", padx=(0, 3))
-            self._log_error_photo = _make_log_icon("error", root)
-            self._copy_error_button = ttk.Button(
-                log_actions,
-                image=self._log_error_photo,
-                command=self._copy_error_log,
-                takefocus=False,
-            )
-            self._copy_error_button.pack(side="left", padx=(0, 3))
             self._log_server_photo = _make_log_icon("server", root)
             self._copy_server_log_button = ttk.Button(
                 log_actions,
@@ -2268,9 +2359,10 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._copy_server_log_button.pack(side="left", padx=(0, 3))
+            self._log_auto_lie_photo = _make_log_icon("auto_lie", root)
             self._copy_auto_lie_log_button = ttk.Button(
                 log_actions,
-                text="测谎日志",
+                image=self._log_auto_lie_photo,
                 command=self._copy_auto_lie_log,
                 takefocus=False,
             )
@@ -2810,6 +2902,7 @@ class UiWorker(threading.Thread):
         # validation can leave the visible header stuck at “正在验证授权” until
         # some unrelated UI change ends the freeze state.
         self._drain_license_heartbeat_results()
+        self._drain_channel_update_events()
 
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
@@ -2970,6 +3063,14 @@ class UiWorker(threading.Thread):
             self._license_session_locked = False
             self._refresh_license_ui()
             self._set_license_visual_lock(False)
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(
+                    text="在线授权验证成功，自动功能已解锁。"
+                )
+            if hasattr(self, "_quick_message_status"):
+                self._quick_message_status.configure(
+                    text="在线授权验证成功，自动功能已解锁。"
+                )
             if was_locked:
                 LOG.info("license heartbeat accepted; automation unlocked")
                 self._shutdown_load_settings()
@@ -2988,6 +3089,7 @@ class UiWorker(threading.Thread):
         status = self._license_status
         label = getattr(self, "_license_label", None)
         if label is not None:
+            memory = getattr(self, "_memory_usage_text", "内存：读取中")
             if getattr(self, "_license_online_validation_pending", False):
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
@@ -2995,7 +3097,7 @@ class UiWorker(threading.Thread):
                 label.configure(
                     text=(
                         f"正在验证在线授权 · {status.edition.upper()} · "
-                        f"到期：{expiry}"
+                        f"到期：{expiry} · {memory}"
                     ),
                     foreground="#9a6700",
                 )
@@ -3004,12 +3106,13 @@ class UiWorker(threading.Thread):
                     status.expires_at
                 )
                 label.configure(
-                    text=f"授权有效 · {status.edition.upper()} · 到期：{expiry}",
+                    text=(f"验证成功 · {status.edition.upper()} · 到期：{expiry} · "
+                          f"{memory}"),
                     foreground="#17803d",
                 )
             else:
                 label.configure(
-                    text=f"未授权 / 已过期：{status.message}",
+                    text=f"未授权 / 已过期：{status.message} · {memory}",
                     foreground="#202020",
                 )
         button = getattr(self, "_license_button", None)
@@ -3516,6 +3619,13 @@ class UiWorker(threading.Thread):
             return False
         return CHANNEL_MIN <= int(text) <= CHANNEL_MAX
 
+    @staticmethod
+    def _validate_player_channel_wait(proposed: str) -> bool:
+        """Tk validator for the 1–20 minute other-player switch delay."""
+
+        text = str(proposed).strip()
+        return text == "" or (text.isdigit() and 1 <= int(text) <= 20)
+
     def _reconnect_channel_commit_on_outside_click(self, event: Any) -> None:
         """Commit the channel when a click leaves its Spinbox without focus.
 
@@ -3705,7 +3815,7 @@ class UiWorker(threading.Thread):
                 from api_lie_video import VideoDrillWindow as window_factory
             except Exception:
                 LOG.exception("api test: the video window could not be imported")
-                self._set_api_test_status("测试api: 无法载入视频窗口（详见 error.log）。")
+                self._set_api_test_status("测试api: 无法载入视频窗口（详见运行日志）。")
                 return
         try:
             window = window_factory(
@@ -3716,7 +3826,7 @@ class UiWorker(threading.Thread):
             )
         except Exception:
             LOG.exception("api test: the video window could not be created")
-            self._set_api_test_status("测试api: 无法创建视频窗口（详见 error.log）。")
+            self._set_api_test_status("测试api: 无法创建视频窗口（详见运行日志）。")
             return
         display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
         key = getattr(self, "_api_test_key", "")
@@ -3729,7 +3839,7 @@ class UiWorker(threading.Thread):
                 window.close()
             except Exception:
                 LOG.debug("video window close failed", exc_info=True)
-            self._set_api_test_status("测试api: 工作线程创建失败（详见 error.log）。")
+            self._set_api_test_status("测试api: 工作线程创建失败（详见运行日志）。")
             return
         self.api_test_worker = worker
         self.api_test_window = window
@@ -3903,7 +4013,6 @@ class UiWorker(threading.Thread):
                     self._set_api_test_status(f"测试api 失败: {detail}")
                     self._play_action_sound(False)
                     self._api_test_idle()
-                    self._append_error_log(f"测试api失败: {detail}", "api test")
                 else:
                     suffix = f": {detail}" if detail else ""
                     self._set_api_test_status(f"测试api - {state}{suffix}")
@@ -4179,7 +4288,10 @@ class UiWorker(threading.Thread):
         # while the api pass was supposed to have the machine).  Resume it as soon as the pass is done.
         if getattr(self, "_api_auto_lie_patrol_paused", False) \
                 and not self._worker_is_running(self._api_lie_pass_worker):
-            self._resume_patrol_after_api_pass()
+            if not self._api_auto_lie_post_confirm_scheduled:
+                self._begin_auto_lie_post_confirm()
+            if self._api_auto_lie_post_confirm_complete:
+                self._resume_patrol_after_api_pass()
         if not self._api_auto_lie_pending:
             return
         # One pass at a time.  A pending event waits for the running one, but not forever: a worker
@@ -4255,6 +4367,8 @@ class UiWorker(threading.Thread):
         """
 
         self._api_auto_lie_patrol_paused = False
+        self._api_auto_lie_post_confirm_scheduled = False
+        self._api_auto_lie_post_confirm_complete = False
         controller = getattr(self, "patrol_controller", None)
         if controller is not None and controller.is_enabled():
             try:
@@ -4292,6 +4406,87 @@ class UiWorker(threading.Thread):
             except Exception:
                 LOG.debug("自动过测谎: the automation switch could not be set", exc_info=True)
         LOG.warning("自动过测谎: the api pass is done - the patrol resumes where it was")
+
+    def _begin_auto_lie_post_confirm(self) -> None:
+        """Click the completed automatic lie dialog's measured confirm point."""
+
+        self._api_auto_lie_post_confirm_scheduled = True
+        self._api_auto_lie_post_confirm_complete = False
+        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        click_confirm = self._click_auto_lie_confirmation
+        try:
+            if click_confirm(sender) is False:
+                LOG.warning("自动过测谎: post-pass confirmation click was refused")
+        except Exception:
+            LOG.warning("自动过测谎: post-pass confirmation click failed", exc_info=True)
+        finally:
+            self._api_auto_lie_post_confirm_complete = True
+        LOG.info("自动过测谎: pass finished; confirmation click sent; patrol may resume")
+
+    @staticmethod
+    def _click_auto_lie_confirmation(sender: Any) -> bool:
+        """Focus and verify the game before clicking the auto-lie confirm point."""
+
+        try:
+            select_window = getattr(sender, "select_window", None)
+            is_foreground = getattr(sender, "is_game_foreground", None)
+            if not callable(select_window):
+                LOG.warning("自动过测谎: post-pass confirmation click skipped; game window selector unavailable")
+                return False
+            focused = False
+            for attempt in range(1, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS + 1):
+                if select_window() is False:
+                    LOG.warning(
+                        "自动过测谎: post-pass confirmation focus attempt %d/%d failed",
+                        attempt, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS,
+                    )
+                    continue
+                time.sleep(_AUTO_LIE_CONFIRM_FOCUS_SETTLE_SECONDS)
+                # A test/dry-run sender may not expose this predicate.  A real
+                # sender must prove that the game, rather than the dashboard or
+                # the departing takeover window, owns foreground before click.
+                if not callable(is_foreground) or is_foreground():
+                    focused = True
+                    LOG.info(
+                        "自动过测谎: game foreground verified before confirmation click "
+                        "(attempt %d/%d)",
+                        attempt, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS,
+                    )
+                    break
+                LOG.warning(
+                    "自动过测谎: game did not retain foreground before confirmation click "
+                    "(attempt %d/%d)",
+                    attempt, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS,
+                )
+            if not focused:
+                LOG.warning("自动过测谎: post-pass confirmation click skipped; game window is not foreground")
+                return False
+            hwnd = int(getattr(sender, "hwnd", 0) or 0)
+            if not hwnd:
+                LOG.warning("自动过测谎: post-pass confirmation click skipped; game handle unavailable")
+                return False
+            import win32gui
+
+            left, top, right, bottom = win32gui.GetClientRect(hwnd)
+            width, height = int(right - left), int(bottom - top)
+            if width <= 0 or height <= 0:
+                LOG.warning("自动过测谎: post-pass confirmation click skipped; invalid client size")
+                return False
+            client_x, client_y = _auto_lie_confirm_client_point(width, height)
+            origin_x, origin_y = win32gui.ClientToScreen(hwnd, (0, 0))
+            screen_x = int(origin_x) + client_x
+            screen_y = int(origin_y) + client_y
+            clicked = click_screen(screen_x, screen_y, keep_focus=hwnd)
+            if clicked:
+                LOG.info(
+                    "自动过测谎: clicked confirmation at client=(%d,%d) "
+                    "screen=(%d,%d) client_size=%dx%d",
+                    client_x, client_y, screen_x, screen_y, width, height,
+                )
+            return bool(clicked)
+        except Exception:
+            LOG.warning("自动过测谎: post-pass confirmation point could not be clicked", exc_info=True)
+            return False
 
     def _drain_api_auto_lie_results(self) -> None:
         """Report the automatic pass into the shared hint area."""
@@ -4445,6 +4640,17 @@ class UiWorker(threading.Thread):
             except queue.Empty:
                 return
             try:
+                if state == "memory":
+                    self._memory_usage_text = f"内存：{detail}"
+                    self._refresh_license_ui()
+                    continue
+                if state == "restart":
+                    # 自动重开 belongs to the game/layer lifecycle, not to
+                    # the Additional Functions control area.  Keep its live
+                    # progress beside the patrol calibration status.
+                    if hasattr(self, "_control_status"):
+                        self._control_status.configure(text=f"自动重开：{detail}")
+                    continue
                 if not hasattr(self, "_reconnect_status"):
                     continue
                 if state == "failed":
@@ -4453,22 +4659,16 @@ class UiWorker(threading.Thread):
                     )
                     self._play_action_sound(False)
                     self._reconnect_test_idle()
-                    # Every failure must be readable from error.log: the worker already logs
-                    # its reason at ERROR level, and this block adds what the panel knows
-                    # (which world/channel the run was for).
-                    self._append_error_log(
-                        f"自动重连失败: {detail}\n"
-                        f"世界={self._reconnect_world_var.get() if hasattr(self, '_reconnect_world_var') else '?'}"
-                        f" 频道={self._reconnect_channel_var.get() if hasattr(self, '_reconnect_channel_var') else '?'}"
-                        f" 已启用={self._reconnect_var.get() if hasattr(self, '_reconnect_var') else '?'}",
-                        "auto reconnect",
-                    )
                 elif state == "done":
                     self._reconnect_status.configure(
                         text=f"自动重连完成: {detail}。"
                     )
                     self._play_action_sound(True)
                     self._reconnect_test_idle()
+                    self._send_configured_workflow_message(
+                        getattr(self, "_reconnect_message_var", None),
+                        "重连消息",
+                    )
                 elif state == "colour":
                     # the temporary 测试重连 button's login-page colour measurement
                     self._reconnect_status.configure(text=f"登录页颜色检测: {detail}")
@@ -4495,6 +4695,105 @@ class UiWorker(threading.Thread):
                     results.task_done()
                 except (AttributeError, ValueError):
                     pass
+
+    def _edit_workflow_message(
+        self, kind: str, title: str, variable: Any,
+    ) -> None:
+        """Edit one event-workflow message without coupling it to quick slots."""
+
+        if not self._license_allowed():
+            self._show_license_refusal()
+            return
+        try:
+            from tkinter import simpledialog
+            current = str(variable.get() or "")
+            value = simpledialog.askstring(
+                title, "留空则不发送消息：", initialvalue=current,
+                parent=self._root,
+            )
+        except Exception:
+            LOG.warning("%s editor could not open", title, exc_info=True)
+            return
+        if value is None:
+            return
+        variable.set(str(value).strip()[:500])
+        self._refresh_workflow_message_button(kind, title, variable)
+        self._shutdown_on_change()
+        LOG.info("%s %s", title, "configured" if variable.get() else "cleared")
+
+    def _edit_player_room_code(self) -> None:
+        """Edit the optional deterministic channel-routing code."""
+
+        if not self._license_allowed():
+            self._show_license_refusal()
+            return
+        try:
+            from tkinter import simpledialog
+            variable = self._player_room_code_var
+            value = simpledialog.askstring(
+                "房间码", "留空则每次随机换线：",
+                initialvalue=str(variable.get() or ""), parent=self._root,
+            )
+        except Exception:
+            LOG.warning("房间码 editor could not open", exc_info=True)
+            return
+        if value is None:
+            return
+        variable.set(str(value).strip()[:128])
+        button = getattr(self, "_player_room_code_button", None)
+        if button is not None:
+            button.configure(text="已设置" if variable.get() else "房间码")
+        self._shutdown_on_change()
+        LOG.info("房间码 %s", "configured" if variable.get() else "cleared")
+
+    def _drain_channel_update_events(self) -> None:
+        """Reflect worker-confirmed channel arrivals in Tk without cross-thread access."""
+
+        events = getattr(self, "channel_update_events", None)
+        if events is None:
+            return
+        latest = None
+        while True:
+            try:
+                latest = events.get_nowait()
+            except queue.Empty:
+                break
+        if latest is None:
+            return
+        channel = valid_channel(latest)
+        if channel is None:
+            return
+        if hasattr(self, "_reconnect_channel_var"):
+            self._reconnect_channel_var.set(str(channel))
+        LOG.info("player channel route landed on %d; 自动重连频道已同步", channel)
+
+    def _refresh_workflow_message_button(
+        self, kind: str, title: str, variable: Any,
+    ) -> None:
+        """Show that an event message is configured without exposing its text."""
+
+        button = getattr(self, f"_{kind}_message_button", None)
+        if button is None:
+            return
+        try:
+            configured = bool(str(variable.get() or "").strip())
+            button.configure(text="已设置" if configured else title)
+        except Exception:
+            LOG.debug("%s button refresh failed", title, exc_info=True)
+
+    def _send_configured_workflow_message(self, variable: Any, label: str) -> bool:
+        """Send a configured workflow message by the normal chat route."""
+
+        try:
+            message = str(variable.get() or "") if variable is not None else ""
+        except Exception:
+            message = ""
+        if not message.strip():
+            return False
+        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        sent = send_game_chat_message(sender, message)
+        LOG.info("%s %s", label, "sent" if sent else "not sent")
+        return sent
 
     def _arm_input_for_hotkey(self, action: str) -> None:
         """Re-arm live input for message and pickup hotkeys only.
@@ -4669,7 +4968,6 @@ class UiWorker(threading.Thread):
         # previously made these controls reappear right-aligned after a run.
         buttons = (
             (self._copy_log_button, (0, 3)),
-            (getattr(self, "_copy_error_button", None), (0, 3)),
             (getattr(self, "_copy_server_log_button", None), (0, 3)),
             (getattr(self, "_copy_auto_lie_log_button", None), (0, 3)),
             (getattr(self, "_import_config_button", None), (0, 3)),
@@ -4705,24 +5003,6 @@ class UiWorker(threading.Thread):
         self._copy_to_clipboard(text)
         LOG.info("运行日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
-    def _copy_error_log(self) -> None:
-        """Exclamation button: copy the root error.log to the clipboard."""
-
-        error_path = Path(__file__).resolve().parent / "error.log"
-        try:
-            raw = error_path.read_bytes()
-        except OSError:
-            text = ""
-        else:
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                text = raw.decode("gbk", errors="replace")
-        if not text.strip():
-            text = "(error.log 为空或不存在)"
-        self._copy_to_clipboard(text)
-        LOG.info("error.log 已复制到剪贴板（%d 行）", text.count("\n") + 1)
-
     def _copy_server_client_log(self) -> None:
         """Linked-nodes button: copy the safe server-client interaction log."""
 
@@ -4754,13 +5034,13 @@ class UiWorker(threading.Thread):
         LOG.info("自动过测谎日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
     def _import_user_config(self) -> None:
-        """Choose a saved user_config.json, load it, then close this instance.
+        """Choose a saved configuration, load it, then restart this instance.
 
         The imported file is only read at startup, and the running instance
         would otherwise write its own in-memory settings back over it while
         still patrolling the old route.  A successful import therefore stops
-        and closes the assistant.  It deliberately does *not* schedule the
-        restart helper: the operator starts it again when ready.
+        and restarts the assistant through the same hidden helper used by the
+        updater.
         """
 
         if not self.user_config_path:
@@ -4772,8 +5052,8 @@ class UiWorker(threading.Thread):
             source = filedialog.askopenfilename(
                 parent=self._root,
                 title="导入用户配置",
-                initialfile="user_config.json",
-                filetypes=(("用户配置", "user_config.json"), ("JSON 文件", "*.json")),
+                initialfile="新配置.json",
+                filetypes=(("用户配置", "新配置.json"), ("JSON 文件", "*.json")),
             )
         except Exception:
             LOG.exception("%s失败：无法打开文件选择窗口", LOG_CONFIG_IMPORT)
@@ -4786,20 +5066,14 @@ class UiWorker(threading.Thread):
         except UpdateError as exc:
             LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, exc)
             return
-        LOG.info(
-            "%s成功：已载入 %s；正在关闭当前助手，请手动重新启动后生效。",
-            LOG_CONFIG_IMPORT, source,
-        )
-        # Same safe input release and delayed UI close as a restart, but no
-        # helper process is launched.  Once the UI closes assistant.py stops
-        # the worker process as well.
-        self._stop_patrol()
-        root = getattr(self, "_root", None)
-        if root is not None:
-            root.after(250, self._on_debug_window_close)
+        if not self._schedule_restart():
+            LOG.warning("%s已载入，但自动重启未能安排；请手动重新启动。", LOG_CONFIG_IMPORT)
+            return
+        LOG.info("%s成功：已载入 %s；正在重启助手以应用新配置。", LOG_CONFIG_IMPORT, source)
+        self._close_for_restart()
 
     def _export_user_config(self) -> None:
-        """Overwrite the Desktop copy used by the in-app updater."""
+        """Export the live configuration to ``桌面\\助手配置\\新配置.json``."""
 
         if not self.user_config_path:
             LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_EXPORT)
@@ -6073,15 +6347,15 @@ class UiWorker(threading.Thread):
             self._mp_key_button.configure(text=self._mp_key_var.get())
         if hasattr(self, "_buff1_interval_label"):
             self._buff1_interval_label.configure(
-                text=f"{self._buff1_interval_var.get():.1f}min"
+                text=f"{int(round(self._buff1_interval_var.get()))}s"
             )
         if hasattr(self, "_buff2_interval_label"):
             self._buff2_interval_label.configure(
-                text=f"{self._buff2_interval_var.get():.1f}min"
+                text=f"{int(round(self._buff2_interval_var.get()))}s"
             )
         if hasattr(self, "_buff3_interval_label"):
             self._buff3_interval_label.configure(
-                text=f"{self._buff3_interval_var.get():.1f}min"
+                text=f"{int(round(self._buff3_interval_var.get()))}s"
             )
         if hasattr(self, "_buff1_key_button"):
             self._buff1_key_button.configure(text=self._buff1_key_var.get())
@@ -6099,9 +6373,10 @@ class UiWorker(threading.Thread):
             "buff1_key": self._buff1_key_var.get().strip(),
             "buff2_key": self._buff2_key_var.get().strip(),
             "buff3_key": self._buff3_key_var.get().strip(),
-            "buff1_interval": round(float(self._buff1_interval_var.get()), 1),
-            "buff2_interval": round(float(self._buff2_interval_var.get()), 1),
-            "buff3_interval": round(float(self._buff3_interval_var.get()), 1),
+            "buff_interval_unit": "seconds",
+            "buff1_interval": int(round(float(self._buff1_interval_var.get()))),
+            "buff2_interval": int(round(float(self._buff2_interval_var.get()))),
+            "buff3_interval": int(round(float(self._buff3_interval_var.get()))),
             "buff1_enabled": bool(self._buff1_use_var.get()),
             "buff2_enabled": bool(self._buff2_use_var.get()),
             "buff3_enabled": bool(self._buff3_use_var.get()),
@@ -6137,12 +6412,20 @@ class UiWorker(threading.Thread):
                 self._buff2_key_var.set(str(data["buff2_key"]))
             if "buff3_key" in data:
                 self._buff3_key_var.set(str(data["buff3_key"]))
-            if "buff1_interval" in data:
-                self._buff1_interval_var.set(float(data["buff1_interval"]))
-            if "buff2_interval" in data:
-                self._buff2_interval_var.set(float(data["buff2_interval"]))
-            if "buff3_interval" in data:
-                self._buff3_interval_var.set(float(data["buff3_interval"]))
+            # Older configuration files stored minutes.  The explicit unit
+            # tag makes the one-time conversion unambiguous, including 5s.
+            legacy_minutes = data.get("buff_interval_unit") != "seconds"
+            for name, variable in (
+                ("buff1_interval", self._buff1_interval_var),
+                ("buff2_interval", self._buff2_interval_var),
+                ("buff3_interval", self._buff3_interval_var),
+            ):
+                if name not in data:
+                    continue
+                interval = float(data[name])
+                if legacy_minutes:
+                    interval *= 60.0
+                variable.set(min(600.0, max(5.0, interval)))
             if "buff1_enabled" in data:
                 self._buff1_use_var.set(bool(data["buff1_enabled"]))
             if "buff2_enabled" in data:
@@ -6187,16 +6470,6 @@ class UiWorker(threading.Thread):
 
         return config_section_file("additional_functions")
 
-    def _append_error_log(self, text: str, tag: str) -> None:
-        """Append a diagnostic block to the root error.log."""
-
-        try:
-            path = Path(__file__).resolve().parent / "error.log"
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(f"[{tag}]\n{text}\n")
-        except Exception:
-            pass
-
     def _shutdown_collect_data(self) -> dict:
         """Current Additional Functions panel values as a settings dict."""
 
@@ -6239,6 +6512,28 @@ class UiWorker(threading.Thread):
             data["auto_reconnect_channel"] = int(
                 valid_channel(self._reconnect_channel_var.get()) or CHANNEL_DEFAULT
             )
+        if hasattr(self, "_auto_restart_var"):
+            data["auto_restart_enabled"] = bool(self._auto_restart_var.get())
+        if hasattr(self, "_restart_offline_message_var"):
+            data["restart_offline_message"] = str(
+                self._restart_offline_message_var.get()
+            ).strip()[:500]
+        if hasattr(self, "_reconnect_message_var"):
+            data["reconnect_message"] = str(self._reconnect_message_var.get()).strip()[:500]
+        if hasattr(self, "_player_request_message_var"):
+            data["player_request_message"] = str(
+                self._player_request_message_var.get()
+            ).strip()[:500]
+        if hasattr(self, "_player_room_code_var"):
+            data["player_room_code"] = str(
+                self._player_room_code_var.get()
+            ).strip()[:128]
+        if hasattr(self, "_player_channel_wait_var"):
+            try:
+                wait_minutes = int(self._player_channel_wait_var.get())
+            except (TypeError, ValueError):
+                wait_minutes = 5
+            data["player_channel_wait_minutes"] = max(1, min(20, wait_minutes))
         # 测试api needs no settings any more: the run length is fixed and the key ships with the app.
         return data
 
@@ -6303,6 +6598,7 @@ class UiWorker(threading.Thread):
                 "lie_alert_enabled": False,
                 "auto_lie_api_enabled": False,
                 "auto_reconnect_enabled": False,
+                "auto_restart_enabled": False,
             })
         worker = getattr(self, "shutdown_worker", None)
         if worker is not None:
@@ -6323,6 +6619,16 @@ class UiWorker(threading.Thread):
             setter = getattr(mover, "set_other_player_check", None)
             if setter is not None:
                 setter(bool(data.get("player_check_enabled", False)))
+            message_setter = getattr(mover, "set_other_player_request_message", None)
+            if message_setter is not None:
+                message_setter(data.get("player_request_message", ""))
+            routing_setter = getattr(mover, "set_other_player_channel_routing", None)
+            if routing_setter is not None:
+                routing_setter(
+                    room_code=data.get("player_room_code", ""),
+                    wait_minutes=data.get("player_channel_wait_minutes", 5.0),
+                    current_channel=data.get("auto_reconnect_channel", CHANNEL_DEFAULT),
+                )
         character = getattr(self, "character_worker", None)
         if character is not None:
             setter = getattr(character, "set_disconnect_alert", None)
@@ -6363,6 +6669,15 @@ class UiWorker(threading.Thread):
                 reconnect_world,
                 reconnect_channel,
             )
+        restart = getattr(self, "auto_restart_worker", None)
+        if restart is not None:
+            try:
+                restart.configure(
+                    enabled=bool(data.get("auto_restart_enabled", False)),
+                    offline_message=data.get("restart_offline_message", ""),
+                )
+            except Exception:
+                LOG.warning("auto restart settings could not be applied", exc_info=True)
         # 测谎 / 掉线 are what feed 自动过测谎 and 自动重连: while they are armed and the shared capture is
         # parked (no Start Patrol), the assistant's parked watch grabs the game window on its own, so a
         # lie window is still detected and a 掉线 is still noticed - both workflows are independent of
@@ -7363,6 +7678,44 @@ class UiWorker(threading.Thread):
                     self._disconnect_alert_var.set(True)
                 self._reconnect_world_var.set(saved_world)
                 self._reconnect_channel_var.set(str(saved_channel))
+            if hasattr(self, "_auto_restart_var"):
+                self._auto_restart_var.set(bool(data.get("auto_restart_enabled", False)))
+            if hasattr(self, "_restart_offline_message_var"):
+                self._restart_offline_message_var.set(
+                    str(data.get("restart_offline_message", "")).strip()[:500]
+                )
+                self._refresh_workflow_message_button(
+                    "restart_offline", "重开消息", self._restart_offline_message_var
+                )
+            if hasattr(self, "_reconnect_message_var"):
+                self._reconnect_message_var.set(
+                    str(data.get("reconnect_message", "")).strip()[:500]
+                )
+                self._refresh_workflow_message_button(
+                    "reconnect", "重连消息", self._reconnect_message_var
+                )
+            if hasattr(self, "_player_request_message_var"):
+                self._player_request_message_var.set(
+                    str(data.get("player_request_message", "")).strip()[:500]
+                )
+                self._refresh_workflow_message_button(
+                    "player_request", "求让消息", self._player_request_message_var
+                )
+            if hasattr(self, "_player_room_code_var"):
+                self._player_room_code_var.set(
+                    str(data.get("player_room_code", "")).strip()[:128]
+                )
+                button = getattr(self, "_player_room_code_button", None)
+                if button is not None:
+                    button.configure(
+                        text="已设置" if self._player_room_code_var.get() else "房间码"
+                    )
+            if hasattr(self, "_player_channel_wait_var"):
+                try:
+                    wait_minutes = int(data.get("player_channel_wait_minutes", 5))
+                except (TypeError, ValueError):
+                    wait_minutes = 5
+                self._player_channel_wait_var.set(str(max(1, min(20, wait_minutes))))
             if hasattr(self, "_api_test_status"):
                 # 测试api has no panel settings; the line only states the backend it will reach.
                 self._set_api_test_status(self._api_test_status_text())

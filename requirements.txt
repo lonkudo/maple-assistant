@@ -3,3 +3,4 @@ Pillow>=10.0
 opencv-python-headless>=4.10,<5
 pywin32>=306; sys_platform == "win32"
 cryptography>=42,<51
+psutil>=5.9

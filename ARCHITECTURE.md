@@ -172,7 +172,13 @@ Stair jump observes sustained position stalls and submits one direction-preservi
 2. the same frame must pass the login-page check supplied by `reconnect_worker.py`, or match its dedicated offline-prompt square;
 3. only then may disconnect alerting, patrol stop, and reconnect begin.
 
-If the absence threshold occurs without either offline evidence — for example in a minimap-less zone — the worker enters a quiet paused state. It resets and resumes normally when the marker returns. `reconnect_worker.py` owns the prompt dismissal, login-page interaction, and confirmation clicks; its frame-only evidence checks are also used for the disconnect gate.
+If the absence threshold occurs without either offline evidence — for example in a minimap-less zone — the worker enters a quiet paused state. It resets and resumes normally when the marker returns. `reconnect_worker.py` owns the prompt dismissal, login-page interaction, world/channel selection, and confirmation clicks; its frame-only evidence checks are also used for the disconnect gate.
+
+World selection is intentionally its own verified gesture. `reconnect_worker.py` sends a double-click to the configured world row, waits 0.5 seconds, checks the page again, and only sends the second double-click if the world page remains visible. A transition to the channel page after the first double-click ends the step immediately; the second gesture must never land on a channel row. This path has no single-click or Enter fallback, because either can confirm the wrong/default world.
+
+The reconnect-only drop-recovery policy belongs to `movement_worker.py`, but is armed by the reconnect restart path in `assistant.py`. It remains inert for a manual patrol start and for a reconnect that begins within the route. After three genuine down-jump attempts without enough positive Y progress, it probes left for five seconds, then right for five seconds only if left did not reveal a drop. A successful descent returns control to normal drop-to-route movement.
+
+`auto_restart_worker.py` is a distinct memory-leak recovery lifecycle. It samples Windows system memory every ten minutes and publishes that reading to the authorization header whether or not restart is enabled. At or above 95% with 自动重开 selected, it stops patrol, sends the optional 重开消息, signs out, terminates the game process tree, and waits without a fixed abandonment timeout until the old game window and process tree are gone. It then focuses the persistent `launcher3.0` dialog and clicks its measured launch point. A newly visible game window is not enough to start reconnect: the worker re-focuses it once per second while waiting for `ReconnectWorker`'s existing login-page colour evidence. Only a confirmed login page receives the dedicated reconnect handoff. If the fresh game remains visible but login/reconnect cannot complete, it is retained rather than killed into a restart loop. Auto-restart reports its lifecycle through the 图层校准与逻辑 status line; the Additional Functions panel contains controls only.
 
 ### Automatic lie handling
 
@@ -188,11 +194,13 @@ event start ── connect/setup in parallel ── 3 s visual settle
 
 The live frame stream uses the shared capture cadence. The temporary detection rectangle and one-shot target marker are display-only overlays and must never become tracking input.
 
+When the pass ends, `ui_worker.py` focuses the game and uses `click_screen()` to press the lie dialog's measured confirmation point. The point is `(630, 428)` on a 1080×768 client; all other clients derive from `(800, 472)` in the 1366×768 reference layout by width scaling. This post-pass acknowledgement is separate from WebSocket completion and must complete (or safely refuse when focus is unavailable) before patrol is resumed.
+
 ### UI, configuration, and optional tools
 
 `ui_worker.py` presents the Chinese desktop interface. It reads and writes only through configuration callbacks supplied by the coordinator. UI redraw work is deferred during resize/drag operations to avoid black component flashes and expensive intermediate layouts. `screen_blinker.py` owns click-through diagnostic overlays: crosshairs and all patrol-point symbols are painted on persistent native canvases, never into capture input.
 
-Each recorded layer row carries an axis band whose point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳) opens on a **right click**. A left click is ambiguous by design — on an already-recorded marker it selects that layer — so the right click is the reliable affordance for the menu. The menu itself is refused while patrol runs, because recording is locked then.
+Each recorded layer row carries an axis band whose point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳) opens only on a **right click**. Left-clicking never opens the menu; it remains reserved for normal selection behavior. The menu itself is refused while patrol runs, because recording is locked then.
 
 One optional control deliberately uses its own unit: the 捡东西 (stand-still pickup circuit) trigger interval is set in **minutes** (`每 … m`, 2.0m to 30.0m). The row converts before it publishes and after it loads, so `stationary_pickup_interval_seconds` and the movement worker’s own bounds stay in seconds; the interval is clamped to the same two minutes at the bottom and thirty at the top in both places, so a hand-edited configuration cannot schedule a sweep every few seconds. The random gap in that row remains a seconds control.
 

@@ -34,10 +34,18 @@ from patrol_control import CoordinateLayout, _layer_present_actions
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
 from channel_switch import channel_switch_procedure
+from channel_routing import normalize_channel, plan_next_channel
 from config_store import config_section_file
+from game_chat import send_game_chat_message
 
 
 LOG = logging.getLogger(__name__)
+
+OTHER_PLAYER_INITIAL_PAUSE_SECONDS = 180.0
+OTHER_PLAYER_REQUEST_MIN_SECONDS = 60.0
+OTHER_PLAYER_REQUEST_MAX_SECONDS = 180.0
+OTHER_PLAYER_MONITOR_SECONDS = 180.0
+OTHER_PLAYER_PRESENCE_POLL_SECONDS = 1.0
 
 
 # Stall recovery is only valid at the rope itself.  Keeping this threshold in
@@ -75,6 +83,12 @@ DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
 # window, without becoming smaller than the diamond's capture grid.
 JUMP_POINT_X_TOLERANCE = 0.008
 JUMP_POINT_Y_TOLERANCE = 0.015
+# A left/right point that lands on a horizontal platform needs only a brief
+# post-Alt guard, then two stable 5-FPS samples before its Up claim releases.
+# A point that really grabbed a rope hands over earlier, on its first upward
+# marker advance, to the normal climb state machine.
+JUMP_POINT_LANDING_GUARD_SECONDS = 0.25
+JUMP_POINT_LANDING_STABLE_FRAMES = 2
 # A recorded jump point is a trigger for a LEG, not for every entry into its
 # X/Y zone.  The zone covers about one X pixel and two Y pixels, so a
 # character that jumps, lands, walks back over the same spot, or is climbed past
@@ -102,6 +116,12 @@ ROUTE_CHECK_AFTER_RECONNECT_SECONDS = 8.0
 # Same structure-confidence gate the floor detection itself uses before it trusts the
 # scroll-compensated world Y (see ``_detect_floor_all`` / ``_on_first_layer``).
 ROUTE_CHECK_MIN_STRUCTURE_CONFIDENCE = 0.12
+
+# Reconnect-only recovery for a character standing on an upper platform that
+# refuses the normal Alt+Down chord.  The minimap Y axis grows downward.
+RECONNECT_DROP_STALLED_ATTEMPTS = 3
+RECONNECT_DROP_Y_PROGRESS = 0.006
+RECONNECT_DROP_EDGE_HOLD_SECONDS = 5.0
 
 # 站桩攻击 records the player's current marker only for the active session.
 # It is never persisted and is independent of the recorded route/layer data.
@@ -3095,6 +3115,11 @@ class MovementWorker(threading.Thread):
         other_player_hp_threshold: float = 0.70,
         other_player_switch_max_attempts: int = 3,
         other_player_switch_settle_seconds: float = 1.0,
+        other_player_request_message: str = "",
+        other_player_room_code: str = "",
+        other_player_wait_minutes: float = 5.0,
+        current_channel: int = 1,
+        on_channel_landed: Any = None,
         status_state_path: Optional[str] = None,
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
@@ -3258,6 +3283,7 @@ class MovementWorker(threading.Thread):
         self._patrol_start_lock = threading.Lock()
         self._pending_patrol_start_floor: Optional[str] = None
         self._pending_patrol_start_above_route = False
+        self._pending_patrol_start_reconnect = False
         # A failed stair approach can force the route to reverse direction.
         # Do not immediately count that new endpoint as reached while the
         # marker is still standing at the blocked position.
@@ -3549,6 +3575,12 @@ class MovementWorker(threading.Thread):
         self.other_player_switch_settle_seconds = max(
             0.0, float(other_player_switch_settle_seconds)
         )
+        self._other_player_request_message = str(other_player_request_message).strip()
+        self._other_player_room_code = str(other_player_room_code or "").strip()[:128]
+        self._other_player_wait_minutes = max(1.0, min(20.0, float(other_player_wait_minutes)))
+        self._current_channel = normalize_channel(current_channel)
+        self._on_channel_landed = on_channel_landed
+        self._other_player_settings_lock = threading.RLock()
         # Shared state paths (overridable for tests): the StatusWorker's
         # HP/MP state file and the Drug panel's settings file.
         self.status_state_path = str(status_state_path) if status_state_path else str(
@@ -3605,6 +3637,17 @@ class MovementWorker(threading.Thread):
         self._debug_last_layer: Optional[str] = None
         self._dispatched_position_logged: Optional[float] = None
         self._last_drop_attempt = float("-inf")
+        # The edge-walk fallback is deliberately scoped to an automatic
+        # reconnect start.  Ordinary Start Patrol and ordinary fall recovery
+        # continue to use their existing drop behaviour unchanged.
+        self._reconnect_drop_recovery_armed = False
+        self._reconnect_drop_attempt_y: Optional[float] = None
+        self._reconnect_drop_attempt_at = float("-inf")
+        self._reconnect_drop_assessed_at = float("-inf")
+        self._reconnect_drop_stalled_attempts = 0
+        self._reconnect_drop_edge_phase: Optional[str] = None
+        self._reconnect_drop_edge_started_at = 0.0
+        self._reconnect_drop_edge_start_y: Optional[float] = None
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
         self._last_send = 0.0
@@ -4222,6 +4265,12 @@ class MovementWorker(threading.Thread):
         if player is None:
             self._jump_point_inside_tokens.clear()
             return None
+        # A falling marker can cross an unrelated point's exact X/Y window.
+        # It is not standing at that point and must not dispatch a directional
+        # Alt jump that suppresses the landing resolver.  Let the fall settle
+        # first; the next patrol leg will re-arm legitimate points.
+        if self._fall_frames > 0 or self._fall_pending:
+            return None
         if travel_direction not in ("left", "right"):
             travel_direction = (
                 plan.decision.key
@@ -4388,15 +4437,16 @@ class MovementWorker(threading.Thread):
         # The samples immediately after Alt can still be from the take-off
         # frame.  Keep Up down through that jump session, then accept only a
         # later *higher* stable Y sequence as a landing on a horizontal
-        # platform.  Previously three identical departure-floor reads caused
-        # an early Up release; the ordinary rope planner then took over with
+        # platform.  A stable departure-floor reading must not cause an early
+        # Up release; otherwise the ordinary rope planner takes over with
         # ``jump_climb_up`` or an Alt+left/right recovery, overwriting the
         # recorded left/right jump point.
-        if time.monotonic() - self._jump_point_up_started_at < 0.40:
+        if (time.monotonic() - self._jump_point_up_started_at
+                < JUMP_POINT_LANDING_GUARD_SECONDS):
             return
         self._jump_point_y_samples.append(current_y)
-        if len(self._jump_point_y_samples) > 3:
-            del self._jump_point_y_samples[:-3]
+        if len(self._jump_point_y_samples) > JUMP_POINT_LANDING_STABLE_FRAMES:
+            del self._jump_point_y_samples[:-JUMP_POINT_LANDING_STABLE_FRAMES]
         layer = None
         if self._jump_point_candidate is not None:
             layer = self.important_positions.get(self._jump_point_candidate[0])
@@ -4406,7 +4456,7 @@ class MovementWorker(threading.Thread):
             self._jump_point_start_y is not None
             and self._jump_point_start_y - current_y >= upward_landing_required
         )
-        if (len(self._jump_point_y_samples) == 3
+        if (len(self._jump_point_y_samples) == JUMP_POINT_LANDING_STABLE_FRAMES
                 and max(self._jump_point_y_samples) - min(self._jump_point_y_samples) <= 0.001
                 and settled_on_higher_floor):
             # End this jump-point session: release OUR claim on Up (one owner
@@ -4513,17 +4563,67 @@ class MovementWorker(threading.Thread):
         LOG.info("other-player channel switch: %s",
                  "on" if enabled else "off")
 
+    def set_other_player_request_message(self, message: object) -> None:
+        """Set the optional one-time message sent before a player switch."""
+
+        self._other_player_request_message = str(message or "").strip()[:500]
+
+    def set_other_player_channel_routing(
+        self, *, room_code: object = "", wait_minutes: object = 5.0,
+        current_channel: object = None, on_channel_landed: Any = None,
+    ) -> None:
+        """Apply persisted routing state without coupling this worker to Tk/config."""
+
+        with self._other_player_settings_lock:
+            self._other_player_room_code = str(room_code or "").strip()[:128]
+            try:
+                minutes = float(wait_minutes)
+            except (TypeError, ValueError):
+                minutes = 5.0
+            self._other_player_wait_minutes = max(1.0, min(20.0, minutes))
+            if current_channel is not None:
+                self._current_channel = normalize_channel(current_channel)
+            if on_channel_landed is not None:
+                self._on_channel_landed = on_channel_landed
+
+    def _other_player_routing_snapshot(self) -> tuple[str, float, int, Any]:
+        with self._other_player_settings_lock:
+            return (
+                self._other_player_room_code,
+                self._other_player_wait_minutes,
+                self._current_channel,
+                self._on_channel_landed,
+            )
+
+    def _note_channel_landed(self, channel: int) -> None:
+        """Commit a fully sent channel route and notify the owning coordinator."""
+
+        with self._other_player_settings_lock:
+            self._current_channel = normalize_channel(channel)
+            callback = self._on_channel_landed
+        if callable(callback):
+            try:
+                callback(self._current_channel)
+            except Exception:
+                LOG.warning("player channel landing callback failed", exc_info=True)
+
+    def _wait_for_player_departure(self, seconds: float) -> bool:
+        """Watch fresh minimap frames; True means the player left before timeout."""
+
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while not self.stop_event.is_set():
+            if self._other_players_on_latest_frame() == 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            self.stop_event.wait(min(OTHER_PLAYER_PRESENCE_POLL_SECONDS, remaining))
+        return False
+
     def _maybe_check_other_players(
         self, now: float, frame: Any, minimap_region: Any
     ) -> None:
-        """Per-frame other-player scan for the automatic channel switch.
-
-        No cooldown: as long as red diamonds (other players) show up on the
-        minimap the channel switch fires on the very next frame.
-        ``_player_switch_active`` guards re-entry while a switch is running;
-        once it finishes the next frame re-checks and switches again if
-        players are still present ("只要有人就换线").
-        """
+        """Per-frame red-marker scan that starts the staged player workflow."""
 
         if not self._other_player_check_enabled:
             return
@@ -4553,36 +4653,58 @@ class MovementWorker(threading.Thread):
             LOG.info("player switch skipped: already switching")
             return
         self._player_switch_active = True
-        LOG.warning("OTHER PLAYER detected on the minimap (%d); "
-                    "switching channel", count)
+        LOG.warning("OTHER PLAYER detected on the minimap (%d); pausing before re-check", count)
         threading.Thread(
             target=self._run_other_player_switch, daemon=True
         ).start()
 
     def _run_other_player_switch(self) -> None:
-        """Background: switch until clean, drop to layer1, restart patrol.
-
-        No cooldown: while the NEW channel still has other players (red
-        diamonds) the switch repeats immediately, up to
-        ``other_player_switch_max_attempts`` per trigger.  Before each
-        switch an HP drug is eaten only when HP is below
-        ``other_player_hp_threshold`` (70%).  Once a channel is clean the
-        character is dropped down to layer1 (it can spawn on ANY layer of
-        the new channel), then the patrol restarts from layer1.
-        """
+        """Run the deliberate request/wait/route-plan player-switch workflow."""
 
         try:
             # The patrol must not fight the menu navigation keys.
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
-            switched = False
-            clean = False
+            # The first three minutes intentionally remain a quiet pause. The
+            # request is one non-repeating message at a random instant in its
+            # final two minutes, so no UI or routing decision leaks in here.
+            request_after = random.uniform(
+                OTHER_PLAYER_REQUEST_MIN_SECONDS, OTHER_PLAYER_REQUEST_MAX_SECONDS
+            )
+            if self.stop_event.wait(request_after):
+                return
+            message = self._other_player_request_message
+            if message:
+                sent = send_game_chat_message(self.key_sender, message)
+                LOG.info("other-player request message %s", "sent" if sent else "not sent")
+            if self.stop_event.wait(OTHER_PLAYER_INITIAL_PAUSE_SECONDS - request_after):
+                return
+            LOG.info("other-player request pause complete; monitoring for %.0fs", OTHER_PLAYER_MONITOR_SECONDS)
+            if self._wait_for_player_departure(OTHER_PLAYER_MONITOR_SECONDS):
+                LOG.warning("other player left during the monitor window; resuming patrol")
+                return
+            room_code, wait_minutes, _channel, _callback = self._other_player_routing_snapshot()
+            LOG.warning(
+                "other player remained for the monitor window; waiting %.1f minute(s) before channel switch",
+                wait_minutes,
+            )
+            # Once this wait begins, disappearance does not revoke the switch
+            # decision. This matches the operator's "keep change too" rule.
+            if self.stop_event.wait(wait_minutes * 60.0):
+                return
             attempts = 0
-            while attempts < self.other_player_switch_max_attempts:
+            while not self.stop_event.is_set():
                 attempts += 1
-                self._drug_if_hp_low()
+                room_code, _wait_minutes, current_channel, _callback = self._other_player_routing_snapshot()
+                route = plan_next_channel(current_channel, room_code)
+                LOG.warning(
+                    "player channel route %d: %d -> %d via %s%s",
+                    attempts, route.current, route.target, route.moves,
+                    " (房间码)" if room_code else " (随机)",
+                )
                 ok = channel_switch_procedure(
                     self.key_sender,
+                    moves=route.moves,
                     on_press=lambda key, sent: LOG.info(
                         "player-switch press %s ok=%s", key, sent
                     ),
@@ -4590,27 +4712,17 @@ class MovementWorker(threading.Thread):
                 if not ok:
                     LOG.warning("player channel switch blocked; aborting")
                     break
-                switched = True
-                # The new channel: still other players -> switch again.
-                time.sleep(self.other_player_switch_settle_seconds)
+                self._note_channel_landed(route.target)
+                if self.stop_event.wait(self.other_player_switch_settle_seconds):
+                    return
                 count = self._other_players_on_latest_frame()
                 if count == 0:
-                    clean = True
                     LOG.warning("player channel switch done (attempt %d); "
                                 "new channel clean", attempts)
                     break
                 LOG.warning("other players still present after switch "
                             "attempt %d (%d); switching again",
                             attempts, count)
-            else:
-                LOG.warning("player channel switch gave up after %d attempts",
-                            self.other_player_switch_max_attempts)
-            if switched and clean:
-                # The character may not respawn at layer1: drop down to it
-                # first, then restart the patrol from a clean layer1 state
-                # (route + world-Y anchor reset).
-                landed_floor = self._drop_to_first_layer()
-                self._restart_patrol_from_first_layer(landed_floor)
         except Exception:
             LOG.exception("player channel switch failed")
         finally:
@@ -5806,7 +5918,10 @@ class MovementWorker(threading.Thread):
                 self._held_rope_target is not None,
             )
 
-    def prepare_patrol_start(self, floor: str, *, above_route: bool = False) -> None:
+    def prepare_patrol_start(
+        self, floor: str, *, above_route: bool = False,
+        reconnect_restart: bool = False,
+    ) -> None:
         """Queue the independently detected startup floor for this worker.
 
         ``above_route`` covers a marker that is visibly above the highest
@@ -5818,6 +5933,7 @@ class MovementWorker(threading.Thread):
         with self._patrol_start_lock:
             self._pending_patrol_start_floor = str(floor)
             self._pending_patrol_start_above_route = bool(above_route)
+            self._pending_patrol_start_reconnect = bool(reconnect_restart)
 
     def set_stationary_attack_enabled(self, enabled: bool) -> None:
         """Select 站桩攻击, which is independent of recorded route data."""
@@ -6878,8 +6994,21 @@ class MovementWorker(threading.Thread):
             self._pending_patrol_start_floor = None
             above_route = self._pending_patrol_start_above_route
             self._pending_patrol_start_above_route = False
+            reconnect_restart = self._pending_patrol_start_reconnect
+            self._pending_patrol_start_reconnect = False
         if floor is None:
             return False
+
+        # A manual start never inherits a reconnect fallback.  An automatic
+        # reconnect start is the sole caller allowed to arm it.
+        self._reconnect_drop_recovery_armed = bool(reconnect_restart)
+        self._reconnect_drop_attempt_y = None
+        self._reconnect_drop_attempt_at = float("-inf")
+        self._reconnect_drop_assessed_at = float("-inf")
+        self._reconnect_drop_stalled_attempts = 0
+        self._reconnect_drop_edge_phase = None
+        self._reconnect_drop_edge_started_at = 0.0
+        self._reconnect_drop_edge_start_y = None
 
         self._release_climb_up()
         self._release_walk_hold()
@@ -7298,6 +7427,125 @@ class MovementWorker(threading.Thread):
         self._route_check_deadline = float(now) + ROUTE_CHECK_AFTER_RECONNECT_SECONDS
         LOG.info("RECONNECT: input returned; checking the patrol route")
 
+    def _note_reconnect_drop_attempt(
+        self, observation: MinimapObservation, now: float,
+    ) -> None:
+        """Remember a real Alt+Down attempt for the reconnect-only fallback."""
+
+        if (not self._reconnect_drop_recovery_armed
+                or self._return_mode != "drop-to-route"
+                or observation.player is None):
+            return
+        self._reconnect_drop_attempt_y = float(observation.player.y)
+        self._reconnect_drop_attempt_at = float(now)
+
+    def _reconnect_drop_recovery_decision(
+        self, observation: MinimapObservation, now: float,
+    ) -> Optional[MovementDecision]:
+        """Return the post-reconnect edge-walk recovery action, when needed.
+
+        This is intentionally not a general stuck/drop routine.  It is armed
+        only by ``prepare_patrol_start(..., reconnect_restart=True)`` and only
+        while the normal return mode is ``drop-to-route``.  A normal descent
+        that gains Y never reaches either edge-walk phase.
+        """
+
+        player = observation.player
+        if (not self._reconnect_drop_recovery_armed
+                or self._return_mode != "drop-to-route"
+                or player is None):
+            return None
+        current_y = float(player.y)
+
+        phase = self._reconnect_drop_edge_phase
+        if phase is not None:
+            start_y = self._reconnect_drop_edge_start_y
+            if (start_y is not None
+                    and current_y >= start_y + RECONNECT_DROP_Y_PROGRESS):
+                LOG.info(
+                    "RECONNECT DROP RECOVERY: Y increased from %.6f to %.6f "
+                    "while moving %s; returning to normal drop",
+                    start_y, current_y, phase,
+                )
+                self._reconnect_drop_stalled_attempts = 0
+                self._reconnect_drop_attempt_y = None
+                self._reconnect_drop_edge_phase = None
+                self._reconnect_drop_edge_start_y = None
+                return None
+            if now < self._reconnect_drop_edge_started_at + RECONNECT_DROP_EDGE_HOLD_SECONDS:
+                remaining = (
+                    self._reconnect_drop_edge_started_at
+                    + RECONNECT_DROP_EDGE_HOLD_SECONDS - now
+                )
+                return MovementDecision(
+                    phase,
+                    f"reconnect drop recovery: holding {phase} to find a drop edge",
+                    max(0.05, remaining),
+                )
+            if phase == "left":
+                self._reconnect_drop_edge_phase = "right"
+                self._reconnect_drop_edge_started_at = now
+                self._reconnect_drop_edge_start_y = current_y
+                LOG.warning(
+                    "RECONNECT DROP RECOVERY: left edge found no descent; "
+                    "holding right for %.1fs",
+                    RECONNECT_DROP_EDGE_HOLD_SECONDS,
+                )
+                return MovementDecision(
+                    "right",
+                    "reconnect drop recovery: left edge did not descend; seeking right edge",
+                    RECONNECT_DROP_EDGE_HOLD_SECONDS,
+                )
+            LOG.warning(
+                "RECONNECT DROP RECOVERY: neither edge produced downward Y progress; "
+                "resuming normal Alt+Down attempts",
+            )
+            self._reconnect_drop_stalled_attempts = 0
+            self._reconnect_drop_attempt_y = None
+            self._reconnect_drop_edge_phase = None
+            self._reconnect_drop_edge_start_y = None
+            return None
+
+        attempt_y = self._reconnect_drop_attempt_y
+        attempt_at = self._reconnect_drop_attempt_at
+        if (attempt_y is None
+                or self._reconnect_drop_assessed_at == attempt_at
+                or now - attempt_at < self.drop_retry_seconds):
+            return None
+        # Each physical drop chord is assessed exactly once, immediately
+        # before the next one would be allowed.  Higher marker Y means the
+        # character genuinely descended; otherwise it is one stalled attempt.
+        self._reconnect_drop_assessed_at = attempt_at
+        if current_y >= attempt_y + RECONNECT_DROP_Y_PROGRESS:
+            self._reconnect_drop_stalled_attempts = 0
+            self._reconnect_drop_attempt_y = None
+            return None
+        self._reconnect_drop_stalled_attempts += 1
+        self._reconnect_drop_attempt_y = None
+        LOG.info(
+            "RECONNECT DROP RECOVERY: Alt+Down attempt %d/%d made no downward Y progress "
+            "(%.6f -> %.6f)",
+            self._reconnect_drop_stalled_attempts,
+            RECONNECT_DROP_STALLED_ATTEMPTS,
+            attempt_y, current_y,
+        )
+        if self._reconnect_drop_stalled_attempts < RECONNECT_DROP_STALLED_ATTEMPTS:
+            return None
+        self._reconnect_drop_edge_phase = "left"
+        self._reconnect_drop_edge_started_at = now
+        self._reconnect_drop_edge_start_y = current_y
+        LOG.warning(
+            "RECONNECT DROP RECOVERY: %d Alt+Down attempts stalled; "
+            "holding left for %.1fs",
+            RECONNECT_DROP_STALLED_ATTEMPTS,
+            RECONNECT_DROP_EDGE_HOLD_SECONDS,
+        )
+        return MovementDecision(
+            "left",
+            "reconnect drop recovery: Alt+Down stalled; seeking left drop edge",
+            RECONNECT_DROP_EDGE_HOLD_SECONDS,
+        )
+
     def _run_pending_route_check(
         self, observation: MinimapObservation, now: float
     ) -> bool:
@@ -7459,6 +7707,15 @@ class MovementWorker(threading.Thread):
             )
             return
         if floor in self._route_layers:
+            # A confirmed return completes the reconnect-only edge recovery,
+            # so it can never leak into a later manual Start Patrol.
+            self._reconnect_drop_recovery_armed = False
+            self._reconnect_drop_attempt_y = None
+            self._reconnect_drop_attempt_at = float("-inf")
+            self._reconnect_drop_assessed_at = float("-inf")
+            self._reconnect_drop_stalled_attempts = 0
+            self._reconnect_drop_edge_phase = None
+            self._reconnect_drop_edge_start_y = None
             # A return climb can reach the route while persistent Up is still
             # owned.  Release it before resetting the climb state; otherwise
             # ``_start_patrol_on`` forgets the ownership flag and the physical
@@ -9836,6 +10093,12 @@ class MovementWorker(threading.Thread):
                         self.drop_chord_hold_seconds,
                     )
                     active_target_x = None
+                    if route_label == "drop-to-route":
+                        reconnect_recovery = self._reconnect_drop_recovery_decision(
+                            observation, time.monotonic()
+                        )
+                        if reconnect_recovery is not None:
+                            decision = reconnect_recovery
                 elif route_is_rope and route_target_x is not None:
                     # JUMP-TO-ROPE vs MOVE-TO-ROPE: the minimap patrol zone
                     # (inside_rope_zone = the inner band) gates the JUMP.
@@ -10376,6 +10639,7 @@ class MovementWorker(threading.Thread):
                                 self.dropping_active_event.clear()
                             continue
                         self._last_drop_attempt = now
+                        self._note_reconnect_drop_attempt(observation, now)
                     elif decision.key in (
                         "climb", "jump_climb_left", "jump_climb_right",
                         "jump_climb_up",

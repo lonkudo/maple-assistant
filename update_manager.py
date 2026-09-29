@@ -347,7 +347,11 @@ def remove_consumed_update_package(package: DesktopUpdate) -> bool:
 
 
 def export_user_config(source: Path, roots: Optional[Iterable[Path]] = None) -> Path:
-    """Overwrite the Desktop copy of ``user_config.json`` with the live one."""
+    """Export the live configuration to ``Desktop\\助手配置\\新配置.json``.
+
+    ``pathlib.Path`` keeps the Unicode directory and filename intact on every
+    supported Windows locale, including Chinese desktop paths.
+    """
 
     source = Path(source).resolve()
     if not source.is_file():
@@ -361,11 +365,13 @@ def export_user_config(source: Path, roots: Optional[Iterable[Path]] = None) -> 
             desktop.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise UpdateError(f"无法创建桌面导出目录: {exc}") from exc
-    target = desktop / "user_config.json"
+    target_directory = desktop / "助手配置"
     try:
+        target_directory.mkdir(parents=True, exist_ok=True)
+        target = target_directory / "新配置.json"
         shutil.copy2(source, target)
     except OSError as exc:
-        raise UpdateError(f"导出 user_config.json 失败: {exc}") from exc
+        raise UpdateError(f"导出配置失败: {exc}") from exc
     return target
 
 
