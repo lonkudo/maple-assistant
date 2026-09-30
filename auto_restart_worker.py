@@ -59,8 +59,8 @@ class AutoRestartWorker(threading.Thread):
     request takes over only after the game client has returned.
     """
 
-    CHECK_SECONDS = 600.0
-    MEMORY_THRESHOLD_PERCENT = 95.0
+    CHECK_SECONDS = 30.0
+    MEMORY_THRESHOLD_PERCENT = 98.0
     # The game and launcher consume input asynchronously.  These are short
     # deliberate settles between lifecycle steps; each wait is cancellable.
     GAME_FOCUS_SETTLE_SECONDS = 0.35
@@ -516,7 +516,7 @@ class AutoRestartWorker(threading.Thread):
 
     def run(self) -> None:
         LOG.info("auto restart worker started (checks system memory every %.0f minutes)", self.CHECK_SECONDS / 60.0)
-        # Give the header one prompt reading, then use the agreed ten-minute
+        # Give the header one prompt reading, then use the shared 30-second
         # cadence.  This still runs when 自动重开 itself is unchecked.
         next_check = time.monotonic()
         while not self.stop_event.is_set():

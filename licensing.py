@@ -65,6 +65,10 @@ class LicenseStatus:
     expires_at: Optional[str] = None
 
 
+class DeviceNotReadyError(ValueError):
+    """Stable device signals are not yet available after Windows startup."""
+
+
 def runtime_root() -> Path:
     """Return the installed package directory for source and Nuitka builds."""
 
@@ -166,7 +170,7 @@ def device_request_code() -> str:
 
     components = machine_fingerprint_components()
     if len(components) < 2:
-        raise ValueError("无法读取足够的设备信息，请以管理员身份重新启动助手。")
+        raise DeviceNotReadyError("设备未就绪，稍后重试")
     document = {"format": "maple-assistant-device-request/v1", "components": components}
     raw = json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return DEVICE_REQUEST_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -177,7 +181,10 @@ def machine_fingerprint_hash() -> str:
 
     components = machine_fingerprint_components()
     if len(components) < 2:
-        raise ValueError("无法读取足够的设备信息，请以管理员身份重新启动助手。")
+        # MachineGuid is normally ready first, while CIM/WMI firmware and
+        # motherboard providers may still be starting just after a reboot.
+        # Do not misreport this as a server or activation-code failure.
+        raise DeviceNotReadyError("设备未就绪，稍后重试")
     material = json.dumps(components, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(
         f"MapleAssistant-online-fingerprint/v1\\0{material}".encode("ascii")
@@ -390,9 +397,12 @@ def activate_via_server(
         return LicenseStatus(
             False, f"server:{exc.code}", exc.message
         )
+    except DeviceNotReadyError:
+        SERVER_LOG.info("activation postponed: device fingerprint is not ready")
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
     except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
         SERVER_LOG.warning("activation failed category=%s", type(exc).__name__)
-        return LicenseStatus(False, "server", f"授权服务器不可用：{exc}")
+        return LicenseStatus(False, "server", "激活验证失败")
     status = _parse_document(document, root)
     if status.valid and status.edition != edition.casefold():
         status = LicenseStatus(False, "edition", "此授权不适用于当前版本。", status.license_id, status.edition)
@@ -440,9 +450,12 @@ def validate_via_server(
             "license heartbeat rejected status=%s code=%s", exc.status, exc.code
         )
         return LicenseStatus(False, f"server:{exc.code}", exc.message)
+    except DeviceNotReadyError:
+        SERVER_LOG.info("license heartbeat postponed: device fingerprint is not ready")
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
     except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
         SERVER_LOG.warning("license heartbeat failed category=%s", type(exc).__name__)
-        return LicenseStatus(False, "server", f"授权服务器不可用：{exc}")
+        return LicenseStatus(False, "server", "激活验证失败")
     status = _parse_document(document, root)
     if status.valid and status.edition != edition.casefold():
         status = LicenseStatus(

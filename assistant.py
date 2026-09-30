@@ -619,7 +619,9 @@ def main() -> int:
             started = time.perf_counter()
             client.connect()
             ack = client.handshake(
-                key, frame_standard=5, image_transport="bgr_jpeg90_base64",
+                # RTF1 §5.2: one binary WebSocket packet carries compact JSON
+                # metadata plus the JPEG bytes.  Do not base64-expand the JPEG.
+                key, frame_standard=5, image_transport="bgr_jpeg90_packed",
                 client_info="maple_assistant_auto_lie",
             )
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -633,7 +635,7 @@ def main() -> int:
             # A stale startup probe must not make the live pass unavailable.
             # This fallback still omits the HTTP health check.
             session = open_backend(
-                key=key, transport="base64", frame_standard=5.0,
+                key=key, transport="rtf1", frame_standard=5.0,
                 health=False, client_info="maple_assistant_auto_lie",
             )
             return session.client, session.note, session.mimic
@@ -1709,6 +1711,7 @@ def main() -> int:
             key=key,
             seconds=seconds,
             fps=fps,
+            transport="rtf1",
             aim_enabled=True,
             window_title=args.window_title,
         )
@@ -1752,6 +1755,7 @@ def main() -> int:
             key="",
             key_sender=key_sender,
             fps=5.0,
+            transport="rtf1",
             # The worker sends its explicit round_end and closes after this
             # 13-second active tracking window.
             duration=AWAIT_SECOND_WINDOW_SEC + AUTO_LIE_TRACK_SECONDS,

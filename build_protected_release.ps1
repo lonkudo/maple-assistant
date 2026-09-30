@@ -36,7 +36,11 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$Version,
-    [string]$Python = ""
+    [string]$Python = "",
+    # Resume the startup-check and archive steps from an already completed
+    # Nuitka assistant.dist. Useful when an external terminal session ended
+    # while the compiler child process was still running.
+    [switch]$ReuseCompiledDist
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,6 +49,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $stage = Join-Path $root "work\protected-stage"
 $out = Join-Path $root "release\TodoHelper-Protected"
+$dataRoot = Join-Path $root "work\protected-data"
 
 # Reports the third-party modules reachable from assistant.py, and which of
 # them the given interpreter cannot import.  Printed as one JSON line.
@@ -275,6 +280,7 @@ if ($packages.Count -gt 0) {
     Write-Host "All requirements are present." -ForegroundColor Green
 }
 
+if (-not $ReuseCompiledDist) {
 Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -296,7 +302,6 @@ try {
     # The source-package installer/launcher files are left out because they
     # expect a .venv that a frozen package does not have (the frozen package
     # gets its own launchers below).
-    $dataRoot = Join-Path $root "work\protected-data"
     Remove-Item -LiteralPath $dataRoot -Recurse -Force -ErrorAction SilentlyContinue
     # The two Chinese launcher names are built from code points.  Windows
     # PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so a Chinese literal here
@@ -365,6 +370,16 @@ try {
     }
 } finally {
     Pop-Location
+}
+} else {
+    $existingDist = Join-Path $out "assistant.dist"
+    if (-not (Test-Path (Join-Path $existingDist "TodoHelper.exe"))) {
+        throw "No completed Nuitka distribution is available to resume."
+    }
+    if (-not (Test-Path $dataRoot)) {
+        throw "Protected build data is unavailable; run the normal build first."
+    }
+    Write-Host "Reusing completed Nuitka distribution for startup check and archive." -ForegroundColor Cyan
 }
 
 $dist = Get-ChildItem -LiteralPath $out -Directory -Filter "assistant.dist" |

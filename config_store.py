@@ -54,6 +54,12 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "fixed_attack": {
         "attack_mode": "fixed", "interval_seconds": 3.0,
         "random_gap_seconds": .1, "attack_key": "ctrl",
+        "combo_attack_enabled": False,
+        "combo_attack_slots": [
+            {"min_count": 1, "max_count": 1, "key": "ctrl"},
+            {"min_count": 1, "max_count": 1, "key": "ctrl"},
+            {"min_count": 1, "max_count": 1, "key": "ctrl"},
+        ],
         "random_jump_enabled": False,
         "random_jump_interval_seconds": 3.0,
         "random_jump_gap_seconds": .1,

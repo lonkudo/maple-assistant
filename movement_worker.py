@@ -202,9 +202,9 @@ STATIONARY_ATTACK_Y_RETRY_SECONDS = 10.0
 # The stand-still pickup run is a complete left -> right -> anchor circuit.
 # It uses the same timing vocabulary as the optional motion controls, but is
 # kept in this worker because it owns the temporary stationary anchor.
-# 捡东西 is configured in MINUTES on its UI row ("m"): its trigger range is
-# 2.0m .. 30.0m, which is these seconds-scale bounds converted.
-STATIONARY_PICKUP_MIN_INTERVAL_SECONDS = 120.0   # 2.0m
+# 捡东西 is configured in MINUTES on its UI row ("m") except for the short
+# end, which is displayed in seconds.  The trigger range is 10s .. 30m.
+STATIONARY_PICKUP_MIN_INTERVAL_SECONDS = 10.0
 STATIONARY_PICKUP_MAX_INTERVAL_SECONDS = 1800.0  # 30.0m
 
 # A saved Left/Right endpoint that sits a fraction of a pixel outside the
@@ -1259,10 +1259,18 @@ def climb(
         # Only the narrow center zone jumps vertically. The wider attachment
         # tolerance must not override a left/right jump chosen by the rope
         # planner (observed gap +0.020 incorrectly becoming Alt+Up).
-        direction = "up" if inside_straight_up_zone else (
-            preferred_direction
-            if preferred_direction in ("left", "right", "up") else "left"
-        )
+        if inside_straight_up_zone:
+            direction = "up"
+        elif rope_x is not None:
+            # A monster hit can move the character after the route planner
+            # chose its earlier side.  Prefer the current rope gap so every
+            # fresh climb jump heads toward the rope.
+            direction = "right" if rope_x - player.x > 0 else "left"
+        else:
+            direction = (
+                preferred_direction
+                if preferred_direction in ("left", "right", "up") else "left"
+            )
         def jump_toward() -> bool:
             return _directional_jump_climb(
                 sender, direction, nudge_duration, climb_duration, persistent_up
@@ -1555,51 +1563,60 @@ def climb(
             rope_x is not None
             and abs(rope_x - player.x) <= straight_up_tolerance
         )
-        if inside_straight_up_zone:
-            # Right under the rope: the retry stays a plain straight jump so
-            # the character always gets TWO plain jump+climb attempts per
-            # cycle before any sideways climb jump is tried.  Lateral
-            # recovery lives in the failed-cycle block below, not here.
+        skip_straight_retry = bool(
+            inside_straight_up_zone
+            and state.phase == "check-primary-up"
+        )
+        if skip_straight_retry:
+            # Directly under the rope gets one Alt+Up attempt only.  If it
+            # fails, fall through immediately to the sideways early-Up hop
+            # below; a second identical jump only added delay on high ropes.
+            LOG.info(
+                "CLIMB under-rope primary Alt+Up failed; trying sideways recovery"
+            )
+            retry_direction = None
+        elif inside_straight_up_zone:
             retry_direction = "up"
-        elif preferred_direction in ("left", "right"):
-            retry_direction = preferred_direction
         elif player is not None and rope_x is not None:
             retry_direction = "right" if rope_x - player.x > 0 else "left"
+        elif preferred_direction in ("left", "right"):
+            retry_direction = preferred_direction
         else:
             retry_direction = (
                 "left" if state.phase in ("check-right", "check-primary-right")
                 else "right"
             )
 
-        def jump_toward_current_rope_side() -> bool:
-            return _directional_jump_climb(
-                sender, retry_direction, nudge_duration, climb_duration, persistent_up
-            )
-        ok = jump_toward_current_rope_side() if action_lock is None else False
-        if action_lock is not None:
-            with action_lock:
-                ok = jump_toward_current_rope_side()
-        if ok:
-            state.baseline_y = player.y
-            state.baseline_world_y = (
-                observation.world_y_diamonds
-                if observation.structure_confidence >= 0.12 else None
-            )
-            state.phase = "check-opposite"
-            state.up_held = persistent_up
-            state.progress_check_frames = 0
-            state.attach_frames = 0
-            state.recent_y = []
-            state.last_world_y = state.baseline_world_y
-            state.last_marker_y = state.baseline_y
-            state.stalled_frames = 0
-            return f"{retry_direction}-retry-toward-rope"
-        return "input-blocked"
+        if retry_direction is not None:
+            def jump_toward_current_rope_side() -> bool:
+                return _directional_jump_climb(
+                    sender, retry_direction, nudge_duration, climb_duration, persistent_up
+                )
+            ok = jump_toward_current_rope_side() if action_lock is None else False
+            if action_lock is not None:
+                with action_lock:
+                    ok = jump_toward_current_rope_side()
+            if ok:
+                state.baseline_y = player.y
+                state.baseline_world_y = (
+                    observation.world_y_diamonds
+                    if observation.structure_confidence >= 0.12 else None
+                )
+                state.phase = "check-opposite"
+                state.up_held = persistent_up
+                state.progress_check_frames = 0
+                state.attach_frames = 0
+                state.recent_y = []
+                state.last_world_y = state.baseline_world_y
+                state.last_marker_y = state.baseline_y
+                state.stalled_frames = 0
+                return f"{retry_direction}-retry-toward-rope"
+            return "input-blocked"
 
     # Both attempts failed.  Recovery depends on where the character is:
     #
-    # - RIGHT UNDER THE ROPE (straight-up zone): two plain jump+climb
-    #   attempts already failed, so this rope bottom hangs above jump reach
+    # - RIGHT UNDER THE ROPE (straight-up zone): the one plain jump+climb
+    #   attempt failed, so this rope bottom hangs above jump reach
     #   here (or a knock-down left the character on a step below it).  Try a
     #   real SIDEWAYS climb jump - Alt+Left / Alt+Right with Up held from the
     #   very start of the jump (the worker alternates the side every failed
@@ -1613,13 +1630,33 @@ def climb(
         and abs(rope_x - player.x) <= straight_up_tolerance
     )
     if under_rope:
-        side = (
-            lateral_hop_side
-            if lateral_hop_side in ("left", "right") else "left"
-        )
+        # Always jump back TOWARD the live rope location.  When the marker is
+        # exactly centred (or quantised to the same minimap pixel), keep the
+        # alternating fallback so consecutive attempts explore both sides.
+        rope_gap = rope_x - player.x
+        if abs(rope_gap) > 1e-9:
+            side = "right" if rope_gap > 0 else "left"
+        else:
+            side = (
+                lateral_hop_side
+                if lateral_hop_side in ("left", "right") else "left"
+            )
+        pre_step_direction = "right" if side == "left" else "left"
         state.lateral_hop_cycles += 1
 
         def climb_jump_side() -> bool:
+            # Move a small step AWAY first, then jump back toward the rope.
+            # This gives the sideways jump a useful launch arc instead of
+            # repeatedly jumping from the exact same under-rope pixel.
+            press = getattr(sender, "press", None)
+            if not callable(press):
+                raise TypeError("lateral climb recovery requires press()")
+            LOG.info(
+                "CLIMB under-rope recovery: small step %s, then Alt+%s with early Up",
+                pre_step_direction, side,
+            )
+            if press(pre_step_direction, duration=nudge_duration) is False:
+                return False
             return _directional_jump_climb(
                 sender, side, nudge_duration, climb_duration, persistent_up
             )
@@ -1642,9 +1679,9 @@ def climb(
             state.last_marker_y = state.baseline_y
             state.stalled_frames = 0
             LOG.warning(
-                "CLIMB under-rope straight jumps failed; sideways climb jump "
-                "%s with early Up (lateral #%d)",
-                side, state.lateral_hop_cycles,
+                "CLIMB under-rope primary jump failed; step %s then sideways "
+                "climb jump %s with early Up (lateral #%d)",
+                pre_step_direction, side, state.lateral_hop_cycles,
             )
             return f"{side}-lateral-toward-rope"
         state.phase = "idle"
@@ -6227,17 +6264,13 @@ class MovementWorker(threading.Thread):
         )
 
     def _abort_stationary_pickup_for_route_return(self) -> None:
-        """Cancel the active pickup round before a fall returns to 桩.
+        """Discard every pickup plan before a confirmed fall returns to 桩.
 
-        A traversal can legitimately leave the anchor layer at a jump point.
-        Continuing its stale left/right target after that fall fights the
-        vertical return state.  Retry once after the anchor layer is restored;
-        two consecutive falls end this round and defer the next try to the
-        regular pickup interval.
+        A drop invalidates both an in-progress left/right leg and a pickup
+        timer that happened to be due.  Return-to-stake is therefore the sole
+        owner until the anchor has been reached and a fresh interval is armed.
         """
 
-        if self._stationary_pickup_phase is None:
-            return
         phase = self._stationary_pickup_phase
         self._stationary_pickup_phase = None
         self._stationary_pickup_return_active = True
@@ -6252,25 +6285,13 @@ class MovementWorker(threading.Thread):
             self._jump_point_up_started_at = 0.0
             self._jump_point_y_samples.clear()
             LOG.info("STATIONARY PICKUP: released jump-point Up for route return")
-        self._stationary_pickup_failures += 1
-        if self._stationary_pickup_failures < 2:
-            self._stationary_pickup_retry_after_return = True
-            self._stationary_pickup_next_at = float("inf")
-            LOG.warning(
-                "STATIONARY PICKUP: aborted %s leg after leaving patrol route; "
-                "will retry once after returning to 桩",
-                phase,
-            )
-            return
-        self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_failures = 0
-        self._stationary_pickup_next_at = (
-            time.monotonic() + self._stationary_pickup_delay()
-        )
+        self._stationary_pickup_retry_after_return = False
+        self._stationary_pickup_next_at = float("inf")
         LOG.warning(
-            "STATIONARY PICKUP: aborted %s leg after the second consecutive "
-            "route fall; this round is cancelled",
-            phase,
+            "STATIONARY PICKUP: cleared %s plan after leaving patrol route; "
+            "returning to 桩 before a fresh interval is armed",
+            phase or "pending",
         )
 
     def set_stationary_facing_direction(self, direction: str) -> None:
@@ -6613,8 +6634,14 @@ class MovementWorker(threading.Thread):
         # starting a new pickup round, otherwise the normal 桩 return takes
         # over mid-leg the moment the marker leaves the exact launch Y.
         pickup_is_active = self._stationary_pickup_phase is not None
+        # A freshly due pickup may only start from a confirmed, settled 桩.
+        # A fall used to retain the previous settled-X flag for a few frames;
+        # if its minimap Y happened to resemble the anchor row, the pickup
+        # circuit could steal movement before route return had started.
+        pickup_may_start = self._stationary_x_settled
         if (pickup_is_active
-                or abs(anchor.y - player.y) <= STATIONARY_ATTACK_Y_TOLERANCE):
+                or (pickup_may_start
+                    and abs(anchor.y - player.y) <= STATIONARY_ATTACK_Y_TOLERANCE)):
             pickup = self._stationary_pickup_decision(anchor, player)
             if pickup is not None:
                 return pickup
@@ -7663,19 +7690,17 @@ class MovementWorker(threading.Thread):
                     self._route_layer_index = self._route_layers.index(floor)
                 self._route_phase = "left"
                 self._reanchor_tracker_to_layer(floor, observation)
-                if self._stationary_pickup_retry_after_return:
-                    # The first failed pickup round gets a fresh left ->
-                    # right -> anchor pass only after normal route recovery
-                    # has really reached the temporary 桩 layer.
-                    self._stationary_pickup_retry_after_return = False
+                if self.stationary_pickup_enabled:
+                    # A confirmed fall discarded the old pickup plan.  Only
+                    # after the normal route return reaches this layer do we
+                    # begin a completely new interval.
                     self._stationary_pickup_next_at = (
                         time.monotonic()
-                        + (STATIONARY_RETURN_ROPE_DISMOUNT_HOLD_SECONDS
-                           if self._stationary_return_dismount_direction else 0.0)
+                        + self._stationary_pickup_delay()
                     )
                     LOG.info(
                         "STATIONARY PICKUP: route return reached 桩; "
-                        "starting the one retry round"
+                        "fresh pickup interval armed"
                     )
                 LOG.warning(
                     "STATIONARY RETURN: reached anchor layer %s; resuming stand-still attack",
@@ -8198,7 +8223,11 @@ class MovementWorker(threading.Thread):
                 and self._stationary_return_route_ready):
             # The falling detector is shared with patrol mode.  Once the
             # marker settles away from the temporary anchor's recorded layer,
-            # hand the vertical work to the ordinary rope return state.
+            # discard any pickup plan immediately, then hand vertical work to
+            # the ordinary rope return state.  This happens even while a
+            # jump-point Up hold delays route selection by a frame or two.
+            self._stationary_x_settled = False
+            self._abort_stationary_pickup_for_route_return()
             self._begin_stationary_return(
                 observation, after_confirmed_fall=True
             )
@@ -9410,7 +9439,12 @@ class MovementWorker(threading.Thread):
         )
         if floor is None or floor == anchor_layer:
             return
-        self._abort_stationary_pickup_for_route_return()
+        # Route return owns movement from this point.  Do not let a due
+        # pickup circuit inherit the former settled-at-stake state while the
+        # character is on a lower/higher floor.
+        self._stationary_x_settled = False
+        if not self._stationary_pickup_return_active:
+            self._abort_stationary_pickup_for_route_return()
         self._reanchor_tracker_to_layer(floor, observation)
         if _layer_number(floor) < _layer_number(anchor_layer):
             mode = "climb-to-route"
@@ -10406,6 +10440,12 @@ class MovementWorker(threading.Thread):
                         <= STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE
                     )
                 )
+                player_in_stationary_attack_zone = bool(
+                    player_on_anchor_layer
+                    and player is not None
+                    and abs(anchor.x - player.x)
+                    <= STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE
+                )
                 stationary_recovery_exclusive = bool(
                     self.stationary_attack_enabled
                     and anchor is not None
@@ -10413,14 +10453,11 @@ class MovementWorker(threading.Thread):
                         # A route climb/drop is always exclusive, including
                         # its idle observations between physical key presses.
                         self._return_mode is not None
-                        # Returning from another layer is not allowed to
-                        # attack simply because the next Y-recovery jump is
-                        # still on its cadence cooldown.
-                        or (player is not None and not player_on_anchor_layer)
-                        # An X correction does NOT block the cadence any more:
-                        # it is itself an attack-bearing arbiter motion, so it
-                        # both excludes the cadence while it runs and delivers
-                        # the attack the character would otherwise lose.
+                        # Returning from another layer or walking toward the
+                        # stake's final approach zone is not allowed to
+                        # attack.  Only the +/-0.02 X zone may use the
+                        # attack-bearing tiny correction motions.
+                        or not player_in_stationary_attack_zone
                         # A pickup leg remains exclusive even when the live
                         # decision has been replaced by its recorded jump
                         # point.  Do not let fixed attack interrupt that jump.

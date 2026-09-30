@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from combo_attack import ComboAttackPlan
+
 
 LOG = logging.getLogger(__name__)
 
@@ -79,6 +81,9 @@ class AttackWorker(threading.Thread):
         # phase ends.  A skipped beat must not impose another whole attack
         # interval before the first near-anchor attack can fire.
         self.attack_resume_event = attack_resume_event
+        # The optional sequence planner is deliberately separate from this
+        # worker: it only selects a key for an already-approved cadence beat.
+        self.combo_attack = ComboAttackPlan()
         self.initial_offset = (
             self.attack_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
@@ -94,7 +99,23 @@ class AttackWorker(threading.Thread):
         self.attack_key = key
         return True
 
-    def attack_once(self) -> bool:
+    def set_combo_attack(self, enabled: bool, slots: object) -> None:
+        """Apply a UI combo plan after rejecting unsupported non-empty keys."""
+
+        scan_map = getattr(self.key_sender, "_SCAN", None)
+        sanitized = []
+        for raw_slot in slots if isinstance(slots, (list, tuple)) else ():
+            slot = dict(raw_slot) if isinstance(raw_slot, dict) else {}
+            raw_key = str(slot.get("key", "-")).strip().casefold()
+            if raw_key not in ("", "-", "none", "null"):
+                if scan_map is not None and raw_key not in scan_map:
+                    LOG.warning("combo attack key %r unsupported; using idle beat", raw_key)
+                    raw_key = "-"
+            slot["key"] = raw_key
+            sanitized.append(slot)
+        self.combo_attack.configure(bool(enabled), sanitized)
+
+    def attack_once(self, attack_key: Optional[str] = None) -> bool:
         """Send a game-recognizable short attack press; never move.
 
         A zero-duration down/up pair is visible in the debug log but can be
@@ -106,6 +127,7 @@ class AttackWorker(threading.Thread):
         ``jump_attack_delay`` (300ms), then tap the configured attack key.
         """
 
+        key = self.attack_key if attack_key is None else attack_key
         if self.jump_attack:
             tap = getattr(self.key_sender, "tap", None)
             if not callable(tap):
@@ -115,19 +137,19 @@ class AttackWorker(threading.Thread):
             if self.stop_event.wait(self.jump_attack_delay):
                 # Stopping mid-bundle: skip the attack half.
                 return False
-            return tap(self.attack_key) is not False
+            return tap(key) is not False
 
         tap = getattr(self.key_sender, "tap", None)
         if callable(tap):
-            return tap(self.attack_key) is not False
+            return tap(key) is not False
 
         key_down = getattr(self.key_sender, "key_down", None)
         key_up = getattr(self.key_sender, "key_up", None)
         if key_down is not None and key_up is not None:
-            claimed = key_down(self.attack_key) is not False
+            claimed = key_down(key) is not False
             if not claimed:
                 return False
-            return key_up(self.attack_key) is not False
+            return key_up(key) is not False
         return False
 
     def next_delay(self) -> float:
@@ -161,6 +183,7 @@ class AttackWorker(threading.Thread):
             can_fire = self.enabled
             attack_lease = False
             handoff_deferred = False
+            selected_key: Optional[str] = None
             if can_fire and (self.automation_active_event is not None
                     and not self.automation_active_event.is_set()):
                 can_fire = False
@@ -173,6 +196,15 @@ class AttackWorker(threading.Thread):
                 LOG.info("attack skipped: patrol direction handoff is active")
                 can_fire = False
                 handoff_deferred = True
+            if can_fire:
+                # Advance only for a beat that passed all non-arbiter gates.
+                # A null slot deliberately consumes this beat without
+                # reserving motion input or emitting a key.
+                selected_key = self.combo_attack.peek_key(self.attack_key)
+                if selected_key is None:
+                    self.combo_attack.consume()
+                    LOG.info("combo attack idle beat")
+                    can_fire = False
             if can_fire and self.motion_arbiter is not None:
                 # Reservation is deliberately atomic.  Checking idle and
                 # tapping separately allowed a queued 小碎步 to start between
@@ -199,10 +231,11 @@ class AttackWorker(threading.Thread):
                 self.motion_arbiter.finish_attack(False)
                 attack_lease = False
             if can_fire:
-                LOG.info("attack repetition: %s", self.attack_key)
+                LOG.info("attack repetition: %s", selected_key)
                 sent = False
                 try:
-                    sent = self.attack_once()
+                    self.combo_attack.consume()
+                    sent = self.attack_once(selected_key)
                 finally:
                     if self.motion_arbiter is not None and attack_lease:
                         self.motion_arbiter.finish_attack(sent)

@@ -71,6 +71,13 @@ an opaque stable fingerprint locally and calls the fixed activation API at
 endpoint. A successful v2 response is Ed25519-verified, checked against the
 local fingerprint, and atomically saved as `license.json`.
 
+Fingerprint collection has its own explicit failure category. Immediately
+after Windows boot, CIM/WMI firmware or motherboard providers may not yet be
+ready; fewer than two stable signals returns **设备未就绪，稍后重试**. A failed
+pinned server request returns **激活验证失败** instead. This prevents a local
+startup race from being presented as a server outage while keeping raw device
+values out of logs.
+
 The activation server is a separate Django repository and owns code issuance,
 device binding, expiry, bans, the PostgreSQL database, and private signing
 material. `LICENSE_SIGNING_PRIVATE_KEY` is an environment-only Base64url
@@ -178,7 +185,7 @@ World selection is intentionally its own verified gesture. `reconnect_worker.py`
 
 The reconnect-only drop-recovery policy belongs to `movement_worker.py`, but is armed by the reconnect restart path in `assistant.py`. It remains inert for a manual patrol start and for a reconnect that begins within the route. After three genuine down-jump attempts without enough positive Y progress, it probes left for five seconds, then right for five seconds only if left did not reveal a drop. A successful descent returns control to normal drop-to-route movement.
 
-`auto_restart_worker.py` is a distinct memory-leak recovery lifecycle. It samples Windows system memory every ten minutes and publishes that reading to the authorization header whether or not restart is enabled. At or above 95% with 自动重开 selected, it stops patrol, sends the optional 重开消息, signs out, terminates the game process tree, and waits without a fixed abandonment timeout until the old game window and process tree are gone. It then focuses the persistent `launcher3.0` dialog and clicks its measured launch point. A newly visible game window is not enough to start reconnect: the worker re-focuses it once per second while waiting for `ReconnectWorker`'s existing login-page colour evidence. Only a confirmed login page receives the dedicated reconnect handoff. If the fresh game remains visible but login/reconnect cannot complete, it is retained rather than killed into a restart loop. Auto-restart reports its lifecycle through the 图层校准与逻辑 status line; the Additional Functions panel contains controls only.
+`auto_restart_worker.py` is a distinct memory-leak recovery lifecycle. It samples Windows system memory every 30 seconds and publishes that reading to the authorization header whether or not restart is enabled. At or above 98% with 自动重开 selected, it stops patrol, sends the optional 重开消息, signs out, terminates the game process tree, and waits without a fixed abandonment timeout until the old game window and process tree are gone. It then focuses the persistent `launcher3.0` dialog and clicks its measured launch point. A newly visible game window is not enough to start reconnect: the worker re-focuses it once per second while waiting for `ReconnectWorker`'s existing login-page colour evidence. Only a confirmed login page receives the dedicated reconnect handoff. If the fresh game remains visible but login/reconnect cannot complete, it is retained rather than killed into a restart loop. Auto-restart reports its lifecycle through the 图层校准与逻辑 status line; the Additional Functions panel contains controls only.
 
 ### Automatic lie handling
 
@@ -188,9 +195,19 @@ At UI/application startup, `assistant.py` performs an inexpensive WebSocket endp
 
 ```text
 event start ── connect/setup in parallel ── 3 s visual settle
-            └──────────────────────────────► frame uploads, at most 13 s
+            └──────────────────────────────► RTF1 frame uploads, at most 13 s
                                                 └► round_end + WebSocket close
 ```
+
+`rtf1_burst.py` owns the application-level RTF1 flow-control window. At frame
+standard 5 it permits three outstanding frame IDs; the automatic pass polls
+available JSON `frame_result` messages before sending the next capture. It
+does not create concurrent WebSocket writers: the pass worker is the only
+socket owner, while capture, cursor execution, and UI remain separate.
+
+The **测试API** video drill uses the same packed-JPEG handshake and sends no
+frames during its three-second visual settle. Its connection log and summary
+record the transport and handshake duration for field verification.
 
 The live frame stream uses the shared capture cadence. The temporary detection rectangle and one-shot target marker are display-only overlays and must never become tracking input.
 

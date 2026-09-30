@@ -672,6 +672,10 @@ def bindable_keys_hint() -> str:
         "home", "insert", "pageup", "pagedown",
     ]
     available = " / ".join(name for name in ordered if name in BINDABLE_KEYS)
+    # ``-`` is shown globally as an available binding token.  Combo Attack
+    # interprets it as its explicit no-attack slot; other panels keep their
+    # existing key-specific validation.
+    available += " / -"
     return (
         "可绑定按键：\n"
         f"{available}\n\n"
@@ -761,11 +765,10 @@ class UiWorker(threading.Thread):
     _FIXED_ATTACK_INTERVAL_MAX = 30.0
     _OPTIONAL_MOTION_INTERVAL_MAX = 60.0
     # 捡东西 (the stand-still pickup circuit) is deliberately configured in
-    # MINUTES: the operator reads and sets that row in "m", and its trigger
-    # range is 2.0m .. 30.0m.  The configuration and the movement worker keep
-    # their seconds-scale keys, so this row converts both ways (x60 when it
-    # publishes, /60 when it loads).
-    _STATIONARY_PICKUP_INTERVAL_MIN_MINUTES = 2.0
+    # MINUTES: the operator reads and sets that row in "m", except values
+    # below one minute are shown as seconds.  Its trigger range is 10s..30m.
+    # The configuration and movement worker keep seconds-scale keys.
+    _STATIONARY_PICKUP_INTERVAL_MIN_MINUTES = 10.0 / 60.0
     _STATIONARY_PICKUP_INTERVAL_MAX_MINUTES = 30.0
     _STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES = 15.0
     _ATTACK_TIMING_SLIDER_LENGTH = 112
@@ -1481,7 +1484,7 @@ class UiWorker(threading.Thread):
             # This slot always exists.  Toggling attack mode only changes
             # enabled state, never the row's geometry.
             stationary_jump_button.pack(side="left", padx=(0, 4))
-            fixed_key_label = ttk.Label(fixed_key_row, text="按键:")
+            fixed_key_label = ttk.Label(fixed_key_row, text="攻击键:")
             self._fixed_key_label = fixed_key_label
             fixed_key_label.pack(
                 side="left", padx=(0, 4)
@@ -1555,6 +1558,77 @@ class UiWorker(threading.Thread):
                 ),
             )
             fixed_gap_plus.pack(side="left", padx=(1, 0))
+
+            # 组合攻击 only configures the independent attack scheduler;
+            # movement, patrol, and input arbitration keep their own roles.
+            combo_row = ttk.Frame(fixed_panel)
+            combo_row.pack(fill="x", pady=(2, 0))
+            self._combo_attack_enabled_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                combo_row, text="组合攻击", width=7,
+                variable=self._combo_attack_enabled_var,
+                command=self._fixed_on_change,
+            ).pack(side="left", padx=(0, 4))
+            self._combo_attack_count_vars = []
+            self._combo_attack_count_entries = []
+            self._combo_attack_key_vars = []
+            self._combo_attack_key_buttons = []
+            for index in range(3):
+                slot = ttk.Frame(combo_row)
+                slot.pack(side="left", padx=(0, 5))
+                minimum_var = tk.IntVar(value=1)
+                maximum_var = tk.IntVar(value=1)
+                self._combo_attack_count_vars.append((minimum_var, maximum_var))
+                # Plain entries deliberately avoid Spinbox's up/down arrows:
+                # the counts are typed ranges, then clamped on focus-out.
+                minimum = ttk.Entry(
+                    slot, width=3, justify="center", textvariable=minimum_var,
+                )
+                minimum.pack(side="left")
+                minimum.bind("<FocusOut>", self._fixed_on_change, add="+")
+                self._combo_attack_count_entries.append(minimum)
+                ttk.Label(slot, text="-").pack(side="left")
+                maximum = ttk.Entry(
+                    slot, width=3, justify="center", textvariable=maximum_var,
+                )
+                maximum.pack(side="left")
+                maximum.bind("<FocusOut>", self._fixed_on_change, add="+")
+                self._combo_attack_count_entries.append(maximum)
+                ttk.Label(slot, text="次").pack(side="left", padx=(1, 2))
+                key_var = tk.StringVar(value="ctrl")
+                self._combo_attack_key_vars.append(key_var)
+                key_button = ttk.Button(slot, text="ctrl", width=5,
+                                        style="Locked.TButton")
+                key_button.configure(
+                    command=lambda button=key_button, var=key_var, slot_index=index:
+                    self._bind_capture_begin(
+                        button, var,
+                        f"_combo_attack_key_{slot_index}_previous",
+                        lambda: self._fixed_on_change(), allow_null=True,
+                    )
+                )
+                key_button.pack(side="left")
+                self._combo_attack_key_buttons.append(key_button)
+                tooltip = HoverTooltip(
+                    key_button,
+                    bindable_keys_hint()
+                    + "\n按 - 可设置为空按键（该次不发送攻击）。",
+                )
+                tooltip.set_enabled(True)
+                self._bind_key_tooltips.append(tooltip)
+            combo_help = ttk.Label(combo_row, text="?", width=2, anchor="e")
+            combo_help.pack(side="left", padx=(0, 2))
+            combo_help_tooltip = HoverTooltip(combo_help, self._combo_attack_hint())
+            combo_help_tooltip.set_enabled(True)
+            self._combo_attack_help_tooltip = combo_help_tooltip
+            self._bind_key_tooltips.append(combo_help_tooltip)
+            # Labels and empty panel space do not claim focus in Tk.  Commit
+            # a typed count when any other UI target is clicked, just like the
+            # reconnect-channel field does.
+            root.bind_all(
+                "<Button-1>", self._combo_attack_commit_on_outside_click,
+                add="+",
+            )
 
             # Facing is a stand-still recovery option, not part of 小碎步.
             # Left and right are mutually exclusive, and the selected side
@@ -2210,6 +2284,17 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._reconnect_message_button.pack(side="left", padx=(6, 0))
+            # The API drill is intentionally exposed again while the RTF1
+            # binary transport is being field-tested.  It opens the existing
+            # video picker and uses the same connection/handshake path as an
+            # automatic lie pass, but confines cursor motion to the video.
+            self._api_test_button = ttk.Button(
+                reconnect_row,
+                text="测试API",
+                command=self._api_test_clicked,
+                takefocus=False,
+            )
+            self._api_test_button.pack(side="left", padx=(6, 0))
             restart_row = ttk.Frame(extra_panel)
             restart_row.pack(fill="x", pady=(4, 0))
             self._auto_restart_var = tk.BooleanVar(value=False)
@@ -2246,11 +2331,8 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            # v1.1.147: the temporary 「测试自动重连」and 「测试api」
-            # release controls, together with their manual-test hint, are
-            # intentionally not constructed.  The actual automatic reconnect
-            # and automatic lie workflows remain enabled above.
-            # These labels deliberately are not packed.
+            # The temporary reconnect tester remains absent.  测试API above
+            # is a real operator-facing drill for the RTF1 upload transport.
             self._api_test_status = ttk.Label(
                 extra_panel, text="",
                 justify="left", wraplength=440,
@@ -3079,8 +3161,10 @@ class UiWorker(threading.Thread):
         LOG.warning("license heartbeat failed: %s", status.code)
         self._lock_licensed_functions()
         if hasattr(self, "_control_status"):
+            hint = (status.message if status.code in {"server", "device_not_ready"}
+                    else f"在线授权验证失败：{status.message}")
             self._control_status.configure(
-                text=f"在线授权验证失败：{status.message}"
+                text=hint
             )
 
     def _refresh_license_ui(self) -> None:
@@ -3111,10 +3195,11 @@ class UiWorker(threading.Thread):
                     foreground="#17803d",
                 )
             else:
-                label.configure(
-                    text=f"未授权 / 已过期：{status.message} · {memory}",
-                    foreground="#202020",
-                )
+                if status.code in {"server", "device_not_ready"}:
+                    text = f"{status.message} · {memory}"
+                else:
+                    text = f"未授权 / 已过期：{status.message} · {memory}"
+                label.configure(text=text, foreground="#202020")
         button = getattr(self, "_license_button", None)
         if button is not None:
             button.configure(text="更换授权" if status.valid else "激活授权")
@@ -3169,6 +3254,8 @@ class UiWorker(threading.Thread):
         status = self._license_status
         if getattr(self, "_license_online_validation_pending", False) or status.code == "checking":
             text = "正在验证在线授权，请稍候。"
+        elif status.code in {"server", "device_not_ready"}:
+            text = status.message
         else:
             text = f"未授权：{status.message} 请先点击「激活授权」。"
         if hasattr(self, "_control_status"):
@@ -5631,6 +5718,11 @@ class UiWorker(threading.Thread):
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
+            "combo_attack_enabled": bool(
+                self._combo_attack_enabled_var.get()
+                if hasattr(self, "_combo_attack_enabled_var") else False
+            ),
+            "combo_attack_slots": self._combo_attack_slots_data(),
             "stationary_jump_enabled": bool(
                 getattr(self, "_stationary_jump_enabled_var", None).get()
                 if hasattr(self, "_stationary_jump_enabled_var") else False
@@ -5664,6 +5756,71 @@ class UiWorker(threading.Thread):
                 self._stationary_pickup_gap_minutes() * 60.0, 1
             ),
         }
+
+    def _combo_attack_slots_data(self) -> list[dict]:
+        """Return the three normalized combo-slot mappings for persistence."""
+
+        result = []
+        count_vars = getattr(self, "_combo_attack_count_vars", ())
+        key_vars = getattr(self, "_combo_attack_key_vars", ())
+        for index in range(3):
+            try:
+                minimum = int(count_vars[index][0].get())
+            except (IndexError, TypeError, ValueError, tk.TclError):
+                minimum = 1
+            try:
+                maximum = int(count_vars[index][1].get())
+            except (IndexError, TypeError, ValueError, tk.TclError):
+                maximum = minimum
+            minimum = max(0, min(999, minimum))
+            maximum = max(0, min(999, maximum))
+            if minimum > maximum:
+                minimum, maximum = maximum, minimum
+            if index < len(count_vars):
+                count_vars[index][0].set(minimum)
+                count_vars[index][1].set(maximum)
+            key = "-"
+            if index < len(key_vars):
+                candidate = str(key_vars[index].get()).strip().casefold()
+                key = candidate if candidate in BINDABLE_KEYS else "-"
+                key_vars[index].set(key)
+            result.append({
+                "min_count": minimum,
+                "max_count": maximum,
+                "key": key,
+            })
+        return result
+
+    def _combo_attack_hint(self) -> str:
+        """Build the live Chinese tooltip for the three combo slots."""
+
+        slots = self._combo_attack_slots_data()
+        pieces = []
+        for slot in slots:
+            key = "不打" if slot["key"] == "-" else slot["key"]
+            pieces.append(
+                f"{key} {slot['min_count']}-{slot['max_count']}次"
+            )
+        return "组合攻击: " + ", ".join(pieces) + ", 绑定 - 代表不打"
+
+    def _combo_attack_commit_on_outside_click(self, event: Any) -> None:
+        """Blur, normalize, and save a typed combo count on outside clicks."""
+
+        root = getattr(self, "_root", None)
+        entries = tuple(getattr(self, "_combo_attack_count_entries", ()))
+        if root is None or not entries:
+            return
+        try:
+            focused = root.focus_get()
+            # Clicking a different entry transfers focus normally.  Its own
+            # FocusOut binding persists the previous value once.
+            if focused not in entries or event.widget is focused:
+                return
+            focused.selection_clear()
+            root.focus_set()
+            self._fixed_on_change()
+        except Exception:
+            LOG.debug("combo attack outside-click commit failed", exc_info=True)
 
     def _fixed_random_gap_seconds(self) -> float:
         """Return the clamped, one-decimal random-gap setting."""
@@ -5847,7 +6004,16 @@ class UiWorker(threading.Thread):
         return round(min(
             self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
             max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES, raw),
-        ), 1)
+        ), 3)
+
+    @staticmethod
+    def _format_stationary_pickup_interval(minutes: float) -> str:
+        """Show the short pickup interval range precisely in seconds."""
+
+        seconds = max(0.0, float(minutes) * 60.0)
+        if seconds < 60.0:
+            return f"{seconds:.0f}s"
+        return f"{float(minutes):.1f}m"
 
     def _stationary_pickup_gap_minutes(self) -> float:
         """Return the 捡东西 random interval in MINUTES (this row's unit)."""
@@ -5978,18 +6144,28 @@ class UiWorker(threading.Thread):
             pickup_interval = self._stationary_pickup_interval_minutes()
             self._stationary_pickup_interval_var.set(pickup_interval)
             self._stationary_pickup_interval_label.configure(
-                text=f"{pickup_interval:.1f}m"
+                text=self._format_stationary_pickup_interval(pickup_interval)
             )
             pickup_gap = self._stationary_pickup_gap_minutes()
             self._stationary_pickup_gap_label.configure(text=f"{pickup_gap:.1f}m")
             self._stationary_pickup_interval_range_label.configure(
-                text=f"({pickup_interval:.1f}m, "
-                     f"{pickup_interval + pickup_gap:.1f}m)"
+                text=(
+                    f"({self._format_stationary_pickup_interval(pickup_interval)}, "
+                    f"{self._format_stationary_pickup_interval(pickup_interval + pickup_gap)})"
+                )
             )
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
             )
+        for button, var in zip(
+            getattr(self, "_combo_attack_key_buttons", ()),
+            getattr(self, "_combo_attack_key_vars", ()),
+        ):
+            button.configure(text=var.get())
+        combo_tooltip = getattr(self, "_combo_attack_help_tooltip", None)
+        if combo_tooltip is not None:
+            combo_tooltip.text = self._combo_attack_hint()
         data = self._fixed_collect_data()
         self._fixed_save_settings(data)
         self._fixed_apply_to_worker(data)
@@ -6026,6 +6202,7 @@ class UiWorker(threading.Thread):
         if not self._license_allowed():
             worker.enabled = False
             worker.jump_attack = False
+            worker.set_combo_attack(False, ())
             step_worker = getattr(self, "small_step_worker", None)
             if step_worker is not None:
                 step_worker.enabled = False
@@ -6059,6 +6236,10 @@ class UiWorker(threading.Thread):
         if not worker.set_key(key):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
                         key, worker.attack_key)
+        worker.set_combo_attack(
+            bool(data.get("combo_attack_enabled", False)),
+            data.get("combo_attack_slots", ()),
+        )
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
             mover.small_step_attack_key = worker.attack_key
@@ -6212,6 +6393,31 @@ class UiWorker(threading.Thread):
                 key = str(data["attack_key"]).strip()
                 if key in BINDABLE_KEYS:
                     self._fixed_attack_key_var.set(key)
+            if hasattr(self, "_combo_attack_enabled_var"):
+                self._combo_attack_enabled_var.set(bool(
+                    data.get("combo_attack_enabled", False)
+                ))
+            slots = data.get("combo_attack_slots", ())
+            if isinstance(slots, list):
+                for index, slot in enumerate(slots[:3]):
+                    if not isinstance(slot, dict):
+                        continue
+                    try:
+                        minimum = int(slot.get("min_count", 1))
+                        maximum = int(slot.get("max_count", minimum))
+                    except (TypeError, ValueError):
+                        minimum, maximum = 1, 1
+                    minimum = max(0, min(999, minimum))
+                    maximum = max(0, min(999, maximum))
+                    if minimum > maximum:
+                        minimum, maximum = maximum, minimum
+                    if index < len(getattr(self, "_combo_attack_count_vars", ())):
+                        self._combo_attack_count_vars[index][0].set(minimum)
+                        self._combo_attack_count_vars[index][1].set(maximum)
+                    raw_key = str(slot.get("key", "-")).strip().casefold()
+                    key = raw_key if raw_key in BINDABLE_KEYS else "-"
+                    if index < len(getattr(self, "_combo_attack_key_vars", ())):
+                        self._combo_attack_key_vars[index].set(key)
             if ("stationary_jump_enabled" in data
                     and hasattr(self, "_stationary_jump_enabled_var")):
                 self._stationary_jump_enabled_var.set(bool(
@@ -6291,6 +6497,7 @@ class UiWorker(threading.Thread):
     def _bind_capture_begin(
         self, button: Any, var: tk.StringVar, previous_attr: str,
         on_change: Optional[Callable[[], None]] = None,
+        *, allow_null: bool = False,
     ) -> None:
         """Unlock a key button: one click arms it for recording.
 
@@ -6303,7 +6510,9 @@ class UiWorker(threading.Thread):
         if getattr(self, "_key_capturing", False):
             return
         self._key_capturing = True
-        self._key_capture_target = (button, var, previous_attr, on_change)
+        self._key_capture_target = (
+            button, var, previous_attr, on_change, bool(allow_null),
+        )
         setattr(self, previous_attr, var.get())
         button.configure(text="请按一个按键…", style="TButton")
         root = getattr(self, "_root", None)
@@ -6316,8 +6525,11 @@ class UiWorker(threading.Thread):
         target = getattr(self, "_key_capture_target", None)
         if target is None:
             return ""
-        button, var, previous_attr, on_change = target
-        key = keysym_to_scan_key(str(getattr(event, "keysym", "")))
+        button, var, previous_attr, on_change, allow_null = target
+        keysym = str(getattr(event, "keysym", ""))
+        key = keysym_to_scan_key(keysym)
+        if allow_null and keysym.casefold() in ("minus", "subtract"):
+            key = "-"
         if key is not None:
             var.set(key)
             if on_change is not None:

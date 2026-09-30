@@ -4,7 +4,7 @@ The drill the 测试api button runs:
 
     pick a video -> open a window showing it (1366x768 preset, focused) -> for every 200 ms:
         read the frame -> crop the ROI (310,118,745,496) -> 372x248 -> jpeg90 -> base64
-        -> WebSocket -> frame_result -> map the answer into our pixels
+        -> RTF1 WebSocket binary packet -> frame_result -> map the answer into our pixels
         -> move the real cursor to it (inside the window's picture only)
         -> draw the ROI, the answer and the aim on the frame -> show it -> log the frame
     ... until the run length is reached, then round_end + summary + logs.
@@ -270,6 +270,7 @@ class VideoDrillWorker(threading.Thread):
         key: str = "",
         seconds: float = DEFAULT_SECONDS,
         fps: float = DEFAULT_FPS,
+        transport: str = "rtf1",
         use_mimic: bool = False,
         loop_video: bool = False,          # the operator's rule: if the video ends, it ends
         aim_enabled: bool = True,
@@ -285,6 +286,9 @@ class VideoDrillWorker(threading.Thread):
         self.key = str(key or "")
         self.seconds = max(1.0, float(seconds))
         self.fps = max(1.0, float(fps))
+        # RTF1 keeps the JPEG as bytes inside one binary WebSocket message.
+        # Base64 remains available only for an explicitly requested legacy run.
+        self.transport = "rtf1" if str(transport).lower() == "rtf1" else "base64"
         self.use_mimic = bool(use_mimic)
         self.loop_video = bool(loop_video)
         self.aim_enabled = bool(aim_enabled)
@@ -516,6 +520,7 @@ class VideoDrillWorker(threading.Thread):
             # Connect FIRST, while the second window is still coming up, so the handshake and the
             # session are ready the moment there is something to send.  2.7.0 §4.1 gives a session
             # 10s without a valid frame, so the wait is clamped below that (see _await_ticks).
+            handshake_started = time.perf_counter()
             try:
                 client, note, mimic = self._open(log)
             except BackendError as exc:
@@ -523,12 +528,19 @@ class VideoDrillWorker(threading.Thread):
                 log.summary({"outcome": "failed", "error": str(exc)})
                 self._report("failed", str(exc))
                 return
+            handshake_ms = (time.perf_counter() - handshake_started) * 1000.0
+            log.connection(
+                "handshake ready before visual settle",
+                transport=self.transport,
+                handshake_ms=round(handshake_ms),
+                no_frames_before_await=True,
+            )
             self._report("backend", note)
             if self.aim_enabled:
                 self._cursor_origin = self._cursor()
             self._start_aim()
 
-            plan = (f"连接已建立，先等 {self.await_seconds:.1f} 秒（第二个窗口）再上传 "
+            plan = (f"RTF1 握手已建立，先等 {self.await_seconds:.1f} 秒（第二个窗口）再上传 "
                     f"{feed_ticks} 帧 @ {self.fps:.0f} fps（{feed_ticks / self.fps:.0f} 秒）"
                     if await_ticks else
                     f"连接已建立，{feed_ticks} 帧 @ {self.fps:.0f} fps（{self.seconds:.0f} 秒）")
@@ -622,8 +634,15 @@ class VideoDrillWorker(threading.Thread):
                                       + (cursor_before[1] - previous_screen[1]) ** 2) ** 0.5)
                     deltas.append(settled_delta)   # how well the cursor reached the last answer
                 try:
-                    client.send_frame_base64(built.jpeg, frame_interval_sec=interval,
-                                             frame_id=round_frame_id)
+                    if self.transport == "rtf1":
+                        client.send_frame_rtf1(
+                            round_frame_id, built.jpeg, frame_interval_sec=interval,
+                        )
+                    else:
+                        client.send_frame_base64(
+                            built.jpeg, frame_interval_sec=interval,
+                            frame_id=round_frame_id,
+                        )
                 except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as exc:
                     # the service reset the connection mid-round (WinError 10054 in the field):
                     # log it, open a new session and keep going instead of dying
@@ -776,6 +795,9 @@ class VideoDrillWorker(threading.Thread):
                 "await_seconds": self.await_seconds,
                 "skipped_before_feeding": await_ticks,
                 "feeding_seconds": round(feed_ticks / self.fps, 1),
+                "image_transport": self.transport,
+                "handshake_before_feed": True,
+                "handshake_ms": round(handshake_ms),
                 "sent": sent, "answered": answered, "holds": holds, "misses": misses,
                 "video_loops": loops,
                 "rounds": rounds, "reconnects": reconnects,
@@ -857,7 +879,7 @@ class VideoDrillWorker(threading.Thread):
         return new_client, new_mimic, note
 
     def _open(self, log: RunLog):
-        session = open_backend(key=self.key, transport="base64", frame_standard=self.fps,
+        session = open_backend(key=self.key, transport=self.transport, frame_standard=self.fps,
                               use_mimic=self.use_mimic, log=log,
                               client_info="maple_assistant_video")
         return session.client, session.note, session.mimic

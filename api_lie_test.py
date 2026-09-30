@@ -41,6 +41,7 @@ from autolie_api.intergration import (
 )
 from autolie_api.logs import RunLog
 from image_io import save_screenshot
+from rtf1_burst import Rtf1BurstSession
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
@@ -415,7 +416,62 @@ class ApiLieTestWorker(threading.Thread):
             # cadence; do not add an unnecessary first 200 ms tick.
             next_at = started - interval
             last_capture_saved = 0.0
-            frame_id = 0
+            burst = Rtf1BurstSession(self.fps)
+            next_frame_id = 1
+
+            def process_burst_results() -> None:
+                """Process every server answer already readable; never block capture."""
+
+                nonlocal last_capture_saved
+                for result in burst.poll(client):
+                    frame_id = result.frame_id
+                    frame, captured_image, captured_rect = result.context
+                    answer = result.answer
+                    point = parse_server_point(answer)
+                    self.stats.results += 1
+                    if point.quota_left is not None:
+                        self.stats.quota_left = point.quota_left
+                    log.detection({
+                        "frame_id": frame_id, "jpeg_bytes": frame.byte_size,
+                        "transport": "rtf1", "x": point.x, "y": point.y,
+                        "x_main": point.x_main, "y_main": point.y_main,
+                        "decision": point.decision, "api_ok": point.api_ok,
+                        "api_skip_reason": point.api_skip_reason,
+                        "timing_ms": point.timing_ms, "quota_left": point.quota_left,
+                        "seconds_left": point.seconds_left,
+                        "round_active": point.round_active,
+                    })
+                    line = f"{frame_id}: {frame.byte_size / 1024:.0f}KB RTF1"
+                    if point.is_hold():
+                        self.stats.holds += 1
+                        line += " hold"
+                    if point.x is not None and point.y is not None:
+                        client_xy = point.to_client(frame.geometry)
+                        screen_xy = point.to_screen(frame.geometry)
+                        self._push_aim(captured_rect, captured_image.shape[1],
+                                       captured_image.shape[0], client_xy[0], client_xy[1])
+                        if self.aim_overlay is not None:
+                            try:
+                                self.aim_overlay(int(round(screen_xy[0])),
+                                                 int(round(screen_xy[1])))
+                            except Exception:
+                                LOG.debug("api test: the aim overlay failed", exc_info=True)
+                        self.stats.last_screen = screen_xy
+                        line += (f" slot=({point.x:.0f},{point.y:.0f}) "
+                                 f"screen=({screen_xy[0]:.0f},{screen_xy[1]:.0f})")
+                    line += f" {point.decision}"
+                    if point.timing_ms is not None:
+                        line += f" {point.timing_ms:.0f}ms"
+                    if point.quota_left is not None:
+                        line += f" quota={point.quota_left}"
+                    self._report("frame", line)
+                    now = time.perf_counter()
+                    if now - last_capture_saved >= CAPTURE_EVERY_SECONDS:
+                        last_capture_saved = now
+                        path = self._save_annotated(captured_image, frame.geometry, point,
+                                                    frame_id, log)
+                        if path is not None:
+                            self._report("capture", str(path))
             for tick in range(1, feed_frames + 1):
                 if self._stop_request.is_set() or self.stop_event.is_set():
                     self._report("stopped", f"第 {tick} 帧前收到停止请求")
@@ -426,92 +482,42 @@ class ApiLieTestWorker(threading.Thread):
                     if not self._sleep_or_stop(delay):
                         self._report("stopped", f"第 {tick} 帧前收到停止请求")
                         break
-                frame_id += 1
+                process_burst_results()
                 image, rect = self._capture()
                 if image is None:
                     self.stats.failures += 1
                     self._report("failed", "截取游戏窗口失败")
                     break
-                frame = build_slot_frame(image, box, frame_id=frame_id,
+                frame = build_slot_frame(image, box, frame_id=next_frame_id,
                                          interval_sec=interval, window_rect=rect,
                                          quality=JPEG_QUALITY)
                 ok, reason = check_caps(frame)
                 if not ok:
                     self.stats.failures += 1
-                    self._report("frame", f"{frame_id}: 超过协议上限（{reason}）")
+                    self._report("frame", f"{next_frame_id}: 超过协议上限（{reason}）")
+                    continue
+                if not burst.submit(client, frame_id=next_frame_id, jpeg=frame.jpeg,
+                                    frame_interval_sec=interval,
+                                    context=(frame, image, rect)):
+                    # A stale screenshot is less useful than the next live one.
+                    self.stats.failures += 1
+                    self._report("frame", f"{next_frame_id}: RTF1 缓冲已满，跳过旧帧")
                     continue
                 self.stats.frames += 1
                 self.stats.bytes_sent += frame.byte_size
-                if self.transport == "rtf1":
-                    client.send_frame_rtf1(frame_id, frame.jpeg, frame_interval_sec=interval)
-                else:
-                    client.send_frame_base64(frame.jpeg, frame_interval_sec=interval,
-                                             frame_id=frame_id)
-                answer = client.wait_result(frame_id, timeout=max(2.0, interval * 4))
-                if answer is None:
-                    self.stats.failures += 1
-                    self._report("frame", f"{frame_id}: 没有回包（超时）")
-                    continue
-                point = parse_server_point(answer)
-                self.stats.results += 1
-                if point.quota_left is not None:
-                    self.stats.quota_left = point.quota_left
-                log.detection({
-                    "frame_id": frame_id,
-                    "jpeg_bytes": frame.byte_size,
-                    "base64_chars": frame.base64_chars,
-                    "x": point.x, "y": point.y,
-                    "x_main": point.x_main, "y_main": point.y_main,
-                    "decision": point.decision,
-                    "api_ok": point.api_ok,
-                    "api_skip_reason": point.api_skip_reason,
-                    "timing_ms": point.timing_ms,
-                    "quota_left": point.quota_left,
-                    "seconds_left": point.seconds_left,
-                    "round_active": point.round_active,
-                    "spaces_agree": point.cross_check_spaces(),
-                    "within_slot": point.within_slot(),
-                })
-                line = f"{frame_id}: {frame.byte_size / 1024:.0f}KB"
-                if point.is_hold():
-                    self.stats.holds += 1
-                    line += " hold"
-                if point.x is not None and point.y is not None:
-                    client_xy = point.to_client(frame.geometry)
-                    screen_xy = point.to_screen(frame.geometry)
-                    # EXECUTE the answer: the cursor is driven to the point the API returned (the vendor
-                    # doc: the mouse/execution layer uses x/y in the 372x248 protocol ROI).  Without
-                    # this the pass only measured the answer and never took control of the lie test.
-                    self._push_aim(rect, image.shape[1], image.shape[0],
-                                   client_xy[0], client_xy[1])
-                    # ... and DRAW it: an overlay crosshair on the game where the pass is aiming, the
-                    # live equivalent of what the 测试api video drill shows in its window.
-                    if self.aim_overlay is not None:
-                        try:
-                            self.aim_overlay(int(round(screen_xy[0])), int(round(screen_xy[1])))
-                        except Exception:
-                            LOG.debug("api test: the aim overlay failed", exc_info=True)
-                    self.stats.last_screen = screen_xy
-                    self.stats.deltas_px.append(
-                        ((client_xy[0] - (box[0] + point.x * frame.geometry.scale_x)) ** 2
-                         + (client_xy[1] - (box[1] + point.y * frame.geometry.scale_y)) ** 2)
-                        ** 0.5)
-                    line += (f" slot=({point.x:.0f},{point.y:.0f}) "
-                             f"client=({client_xy[0]:.0f},{client_xy[1]:.0f}) "
-                             f"screen=({screen_xy[0]:.0f},{screen_xy[1]:.0f})")
-                line += f" {point.decision}"
-                if point.timing_ms is not None:
-                    line += f" {point.timing_ms:.0f}ms"
-                if point.quota_left is not None:
-                    line += f" quota={point.quota_left}"
-                self._report("frame", line)
-                now = time.perf_counter()
-                if now - last_capture_saved >= CAPTURE_EVERY_SECONDS or frame_id == feed_frames:
-                    last_capture_saved = now
-                    path = self._save_annotated(image, frame.geometry, point, frame_id,
-                                                log)
-                    if path is not None:
-                        self._report("capture", str(path))
+                next_frame_id += 1
+
+            # End the frame feed, then drain the bounded server window before
+            # finishing the round.  The same worker remains the socket owner.
+            drain_deadline = time.perf_counter() + max(1.5, interval * 4)
+            while burst.pending_count and time.perf_counter() < drain_deadline:
+                process_burst_results()
+                if burst.pending_count:
+                    time.sleep(0.02)
+            if burst.pending_count:
+                self.stats.failures += burst.pending_count
+                self._report("frame", f"RTF1 结束时仍有 {burst.pending_count} 帧未回包")
+                burst.discard()
 
             try:
                 ended = client.end_round()

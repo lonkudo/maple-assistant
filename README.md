@@ -95,6 +95,12 @@ certificate-pin outcome, HTTP result, and local acceptance/refusal category.
 It never records an activation code, hardware fingerprint, token, or secret.
 The linked-node icon in **运行日志** copies this file to the clipboard.
 
+Immediately after a Windows restart, firmware or motherboard CIM/WMI signals
+can temporarily be unavailable. This is reported as **设备未就绪，稍后重试** and
+is distinct from **激活验证失败**, which means the certificate-pinned request to
+the activation service could not be completed. Technical categories remain in
+`server_client.log`; neither the raw fingerprint nor a secret is logged.
+
 The most recently submitted code and its validation result are stored in the
 `license` section of `user_config.json`. The signed `license.json` document is
 the actual local entitlement. A verified rejected replacement code immediately
@@ -205,7 +211,7 @@ Disconnect handling deliberately avoids treating every missing minimap marker as
 
 Automatic reconnect begins only after this verified offline event. It dismisses the offline prompt when present, reaches the login screen, opens the chosen world with the guarded double-click sequence, selects the target channel, and waits for sustained marker recovery before patrol can resume.
 
-**自动重开** is a separate ten-minute system-memory guard. When enabled and Windows memory use reaches 95%, it sends the optional **重开消息**, signs the character out, and waits until the old game process has completely exited before using the existing `launcher3.0` launcher window. While the new client starts, the assistant restores its focus once per second and waits for the login-page detector before handing off to the normal reconnect workflow. Restart progress is shown in the 图层校准与逻辑 status line; its control and 重开消息 button are on their own line in 附加功能. The authorization header always displays the latest system-memory reading, refreshed on this same ten-minute cadence whether 自动重开 is enabled or not.
+**自动重开** is a separate 30-second system-memory guard. When enabled and Windows memory use reaches 98%, it sends the optional **重开消息**, signs the character out, and waits until the old game process has completely exited before using the existing `launcher3.0` launcher window. While the new client starts, the assistant restores its focus once per second and waits for the login-page detector before handing off to the normal reconnect workflow. Restart progress is shown in the 图层校准与逻辑 status line; its control and 重开消息 button are on their own line in 附加功能. The authorization header always displays the latest system-memory reading, refreshed on this same 30-second cadence whether 自动重开 is enabled or not.
 
 ## Lie detection and automatic handling
 
@@ -214,8 +220,14 @@ The lie detector shares the normal 5 FPS capture cadence. When automatic lie han
 1. Application startup performs a background, no-billing WebSocket endpoint probe and caches the usable endpoint.
 2. On a lie event, the assistant opens a fresh authenticated connection while the game completes its visual transition.
 3. The visual settle period is three seconds from event start.
-4. Cursor-target frames are sent for up to thirteen seconds.
-5. The round is ended with the API’s `round_end` message and the WebSocket is closed normally.
+4. Cursor-target frames are JPEG-quality-90 **RTF1** binary WebSocket packets:
+   a compact JSON metadata section plus raw JPEG bytes, with no Base64 expansion.
+   At 5 FPS, a bounded burst window keeps at most three frames in flight; one
+   worker remains the sole WebSocket reader/writer and matches responses by `frame_id`.
+5. The restored **测试API** video drill performs that same authenticated RTF1
+   handshake at video start, waits the three-second visual-settle period without
+   uploading, then records its handshake timing and transport in its run report.
+6. The round is ended with the API’s `round_end` message and the WebSocket is closed normally.
 
 The purple detection area and one-shot target indication are visual feedback only. They are not used as tracking input and do not block target chasing.
 
@@ -273,10 +285,10 @@ For a minimap-less area, return to a normal map before expecting patrol or disco
 
 ## Development and releases
 
-Create a numbered release only when the operator explicitly requests one. This
-applies to both the normal ZIP and the standalone EXE ZIP; ordinary code
-changes remain in the workspace until a release is requested. When requested,
-the normal release command is:
+**Release policy: never create a release unless the operator explicitly says
+to release it.** This applies to both the normal ZIP and the standalone EXE
+ZIP; ordinary code changes remain in the workspace until a release is
+requested. When requested, the normal release command is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
