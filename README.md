@@ -424,4 +424,33 @@ Releases before `1.1.53` were distributed as replace-in-place ZIPs without
 matching Git checkpoints, so their exact historical source cannot be recovered
 reliably from a version number alone.
 
+### Which SSH key pushes which remote
+
+Two account keys live in `~/.ssh`, and a push must select the **matching** key
+instead of relying on a default identity:
+
+| Key | Account | State |
+| --- | --- | --- |
+| `~/.ssh/forbestop22_key` | `forbestop22` | Accepted by GitHub; this is the working push key. |
+| `~/.ssh/lonkudo_github_ed25519` | `lonkudo` | Not registered with GitHub — it is refused with `Permission denied (publickey)`. Re-add the matching `.pub` file to that account before relying on it. |
+
+Each private key sits beside its own `.pub` file, so the public half can be
+re-registered without regenerating the pair.
+
+```powershell
+$key = ($env:USERPROFILE -replace '\\','/') + "/.ssh/forbestop22_key"
+$env:GIT_SSH_COMMAND = "ssh -i `"$key`" -o IdentitiesOnly=yes"
+git push git@github.com:forbestop22/maple-assistant.git main
+```
+
+The key path must use forward slashes. A Windows-style path is passed through
+`GIT_SSH_COMMAND` with its backslashes stripped (`C:UsersSOTTES.ssh...`), and
+the push then fails with `Permission denied (publickey)` even though the key is
+present.
+
+`forbestop22` has write access to the `forbestop22` mirrors but not to
+`lonkudo/maple-assistant`, which answers
+`ERROR: Permission to lonkudo/maple-assistant.git denied to forbestop22`. Push
+to the mirror, or grant that account access to the canonical repository first.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for component ownership, data flow, and concurrency rules.
