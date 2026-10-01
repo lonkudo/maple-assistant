@@ -84,7 +84,7 @@ for one fingerprint within 24 hours ban that fingerprint.
 
 That fingerprint ban is the only ban the client endpoints apply. The source-IP
 ban is a separate and independent policy owned by the operator website
-(`/lonkudo/` and `/console/api/`); `/api/v1/activate`, `/api/v1/validate`, and
+(`/forbestop/` and `/console/api/`); `/api/v1/activate`, `/api/v1/validate`, and
 `/api/v1/lie-events` never count, clear, or enforce an IP ban. A customer's
 failed attempts therefore cannot ban the public address that other customers
 share, and an address banned on the website never blocks activation or a
@@ -141,7 +141,7 @@ For a normal server update, commit and push the server repository, then on the
 server pull the exact commit, load its `.env`, install changed requirements,
 run Django migrations, and restart Gunicorn only after migrations succeed.
 Keep the previous deployed commit available for rollback. Check the pinned
-`/api/v1/validate` endpoint and `/lonkudo/` after every restart; never test a
+`/api/v1/validate` endpoint and `/forbestop/` after every restart; never test a
 production update by changing a customer's client endpoint.
 
 **Existing clients remain compatible only when the server preserves all of
