@@ -200,6 +200,10 @@ if (Test-Path $apiIn) {
     New-Item -ItemType Directory -Path $apiOut -Force | Out-Null
     Get-ChildItem $apiIn -Recurse -File | Where-Object {
         $_.Name -notlike "test_*" -and
+        # The application receives the upstream credential through its
+        # validated licensing heartbeat.  Never ship the vendor's local
+        # key file in a release, even though vendor source remains read-only.
+        $_.Name -ne "key_secret.txt" -and
         $_.FullName -notlike "*sample_captures*" -and
         $_.FullName -notlike "*__pycache__*" -and
         $_.Extension -ne ".pyc"

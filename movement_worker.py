@@ -123,9 +123,28 @@ RECONNECT_DROP_STALLED_ATTEMPTS = 3
 RECONNECT_DROP_Y_PROGRESS = 0.006
 RECONNECT_DROP_EDGE_HOLD_SECONDS = 5.0
 
+# Landing confirmation for the drop-to-route return (``_drop_landing_floor``).
+# A drop can land the character on a floor whose recorded Y band cannot contain
+# the reading, because the marker stands away from the recorded row - the
+# operator's own map: layer1's points were saved at 0.676829 while the
+# character stands at 0.713415 further down the same platform.  Ordinary patrol
+# already resolves that case with its marker-only fallbacks, so the drop uses
+# them too, but only after real drop evidence (an Alt+Down chord was sent AND
+# the marker actually moved down) and only while the reading is SETTLED: a
+# character falling THROUGH the floor sweeps the marker down the minimap by
+# ``fall_marker_y_gain`` per frame (his 14:38 log ran 0.372 -> 0.397 -> 0.409 ->
+# 0.445 -> 0.482) and must never be read as a landing.  Two settled frames hold
+# the same floor at the shared 5 FPS cadence.
+DROP_ARRIVAL_CONFIRM_FRAMES = 2
+
 # 站桩攻击 records the player's current marker only for the active session.
 # It is never persisted and is independent of the recorded route/layer data.
-STATIONARY_ATTACK_X_TOLERANCE = 0.006
+# The stationary target remains the recorded X.  Its accepted resting window
+# is 0.016 wide (the former +/-0.008 band), shifted 0.002 toward the selected
+# final facing so the short facing tap does not immediately walk the character
+# back through the target.
+STATIONARY_ATTACK_X_TOLERANCE = 0.008
+STATIONARY_ATTACK_FACING_ZONE_SHIFT = 0.002
 # The standing position has a Y half too, and it uses the same anchor band:
 # marker Y moves by a minimap pixel on its own, and a jump spent on that jitter
 # walks the character off its platform (observed in the field).  One single
@@ -170,17 +189,16 @@ STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS = 0.30
 # exclusive recovery), so the beats that landed inside a correction were lost.
 # With the attack inside the correction, a correction can never eat one.
 #
-# The arrival band is the exact temporary anchor.  The small-step bound doubles
-# as the hysteresis band: once a correction has ARRIVED inside the arrival
-# tolerance the character is only moved again after it leaves this band, which
-# keeps a settled anchor from being re-walked by the jitter of a pixel or by the
-# small step of the 朝向 tap itself.
-STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.010
+# The arrival band is the exact temporary anchor.  Inside this wider final
+# approach zone, recovery is owned by the arbiter and carries its own attack;
+# the marker is still considered arrived only inside
+# ``STATIONARY_ATTACK_X_TOLERANCE``.
+STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.020
 # Outside this band the character is plainly away from the stake and must
 # walk back normally.  The short correction-plus-attack motion is reserved
 # for the final approach only; using it for a rope-top or another platform
 # created a visible tiny-step/attack loop before the stake was reached.
-STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.020
+STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.030
 # How long the 朝向 tap holds its direction.  Deliberately as short as the tiny
 # step: the tap is a TURN, not a move, and a longer hold walks the character out
 # of the anchor band (at 0.10s it travels about a minimap pixel, which on a
@@ -188,6 +206,15 @@ STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.020
 # it back, which turns it again and re-arms the facing, i.e. the face/walk
 # twitch.  The operator asked for this 30ms.
 STATIONARY_ATTACK_FACING_HOLD_SECONDS = 0.03
+# A facing tap moves the character a fraction of a minimap pixel.  Turn from
+# the *opposite* side of the accepted band, but keep this much room inside the
+# edge so a coarse minimap step cannot immediately put the marker outside the
+# band before the tap lands.
+STATIONARY_ATTACK_FACING_TURN_INSET = 0.003
+# A facing tap is not trusted until fresh captures prove that it left the
+# marker in the accepted band.  This keeps the fixed cadence out of the same
+# arbiter window as the final turn.
+STATIONARY_ATTACK_FACING_CONFIRM_FRAMES = 2
 # A return climb may be confirmed while the marker is still at the rope top.
 # Before ordinary stake recovery begins, use one deliberate lateral hold toward
 # the temporary anchor so the character steps off the rope instead of issuing
@@ -3497,6 +3524,13 @@ class MovementWorker(threading.Thread):
         # instead of walking back, which the operator rejected in the field.
         self._stationary_x_settled = False
         self._stationary_near_correction_next_at = 0.0
+        # A correction may aim at the facing turn point rather than the exact
+        # anchor.  It is transient state for one queued arbiter step only.
+        self._stationary_step_target_x: Optional[float] = None
+        # Do not resume the independent attack cadence on the same frame as a
+        # facing tap.  Fresh marker reads must first confirm the tap did not
+        # nudge the character out of its accepted standing band.
+        self._stationary_facing_confirm_frames_remaining = 0
         # Y recovery bookkeeping: how many jumps this displacement episode has
         # already spent and when the last one was sent.
         self._stationary_y_jumps = 0
@@ -3685,6 +3719,19 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_edge_phase: Optional[str] = None
         self._reconnect_drop_edge_started_at = 0.0
         self._reconnect_drop_edge_start_y: Optional[float] = None
+        # Drop-to-route landing evidence (see ``_drop_landing_floor``): where
+        # the descent started, how far it has really moved the marker, and the
+        # settled confirmation of a floor whose band cannot contain the reading.
+        self._drop_entry_y: Optional[float] = None
+        self._drop_lowest_y: Optional[float] = None
+        self._drop_last_y: Optional[float] = None
+        self._drop_settled = False
+        self._drop_arrival_candidate: Optional[str] = None
+        self._drop_arrival_frames = 0
+        # The relaxed landing answer for the marker Y it was resolved at, so the
+        # shared fallbacks log their evidence once per reading.
+        self._drop_relaxed_y: Optional[float] = None
+        self._drop_relaxed_floor: Optional[str] = None
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
         self._last_send = 0.0
@@ -5988,6 +6035,8 @@ class MovementWorker(threading.Thread):
             self._stationary_bilateral_frames = 0
             self._stationary_x_settled = False
             self._stationary_near_correction_next_at = 0.0
+            self._stationary_step_target_x = None
+            self._stationary_facing_confirm_frames_remaining = 0
             self._stationary_pickup_phase = None
             self._stationary_pickup_failures = 0
             self._stationary_pickup_retry_after_return = False
@@ -6392,6 +6441,8 @@ class MovementWorker(threading.Thread):
 
         self._stationary_attack_anchor = Point(float(marker.x), float(marker.y))
         self._stationary_near_correction_next_at = 0.0
+        self._stationary_step_target_x = None
+        self._stationary_facing_confirm_frames_remaining = 0
         self._stationary_ui_anchor_layer = None
         self._stationary_route_anchor_layer = None
         self._stationary_return_route_ready = False
@@ -6434,10 +6485,11 @@ class MovementWorker(threading.Thread):
         )
         LOG.info(
             "STATIONARY ATTACK temporary anchor saved x=%.6f y=%.6f "
-            "x_zone=+/-%.6f x_step_zone=+/-%.6f y_zone=+/-%.6f "
+            "x_zone=facing-biased +/-%.6f (shift %.6f) x_step_zone=+/-%.6f y_zone=+/-%.6f "
             "(not written to map recording)",
             marker.x, marker.y,
-            STATIONARY_ATTACK_X_TOLERANCE, STATIONARY_ATTACK_X_HOLD_TOLERANCE,
+            STATIONARY_ATTACK_X_TOLERANCE, STATIONARY_ATTACK_FACING_ZONE_SHIFT,
+            STATIONARY_ATTACK_X_HOLD_TOLERANCE,
             STATIONARY_ATTACK_Y_TOLERANCE,
         )
         return True
@@ -6571,7 +6623,9 @@ class MovementWorker(threading.Thread):
             self.minimum_final_hold_seconds,
         )
 
-    def _request_stationary_step(self, direction: str) -> bool:
+    def _request_stationary_step(
+        self, direction: str, *, target_x: Optional[float] = None,
+    ) -> bool:
         """Queue one tiny 桩 step.
 
         Only one step may be in flight: the marker moves by about a pixel per
@@ -6590,7 +6644,13 @@ class MovementWorker(threading.Thread):
         request = getattr(arbiter, "request_step", None)
         if not callable(request):
             return False
-        return bool(request(direction))
+        self._stationary_step_target_x = (
+            None if target_x is None else float(target_x)
+        )
+        accepted = bool(request(direction))
+        if not accepted:
+            self._stationary_step_target_x = None
+        return accepted
 
     def _stationary_attack_decision(
         self, observation: MinimapObservation
@@ -6645,17 +6705,26 @@ class MovementWorker(threading.Thread):
             pickup = self._stationary_pickup_decision(anchor, player)
             if pickup is not None:
                 return pickup
-        # The arrival band is the exact temporary anchor.  A deliberately
-        # short facing hold can move the marker a few minimap pixels beyond
-        # it, however.  Once the character is already facing the requested
-        # side, accept that small displacement inside the small-step band
-        # rather than immediately walking back through the anchor.  That
-        # avoids the left -> facing-left -> right recovery oscillation.
-        facing_target = self._stationary_facing_target_for_frame()
-        facing_settled_in_safe_zone = bool(
-            distance_x <= STATIONARY_ATTACK_X_HOLD_TOLERANCE
-            and self._stationary_facing_command == facing_target
+        # A recovery walk faces toward the anchor.  When a final facing is
+        # still owed, approach the opposite inner edge of the accepted zone
+        # first, then make the short facing tap back into that zone.  For
+        # example, a left-facing character returning from the left walks to
+        # the right-side turn point, then taps Left.  Turning at the exact
+        # anchor was the source of the face/walk loop: the tap could nudge the
+        # marker over the wrong edge and immediately demand an opposite walk.
+        desired_facing = self._stationary_facing_target_for_frame()
+        facing_owed = self._stationary_facing_command != desired_facing
+        correction_target_x = (
+            self._stationary_facing_turn_x(anchor.x, desired_facing)
+            if facing_owed else anchor.x
         )
+        position_at_turn_point = self._stationary_position_at_target(
+            player.x, correction_target_x,
+        )
+        # The target remains the exact temporary anchor once facing is
+        # satisfied, while its accepted resting window is shifted slightly
+        # toward the selected facing.  A character outside that window still
+        # finishes its arbiter-owned correction.
         # A running 小碎步 owns the position AND the facing for its whole pair:
         # it steps away and back on purpose, so its own step must not be
         # answered by a correction step (with the attack that correction now
@@ -6664,12 +6733,14 @@ class MovementWorker(threading.Thread):
         # 桩: a tolerance band that "holds" a small drift left it standing a
         # pixel or two off the stake, which the operator rejected.
         micro_step_in_flight = self._micro_step_in_flight()
-        if (distance_x <= STATIONARY_ATTACK_X_TOLERANCE
-                or facing_settled_in_safe_zone
+        if ((not facing_owed and self._stationary_anchor_x_accepted(anchor.x, player.x))
+                or (facing_owed and position_at_turn_point)
                 or micro_step_in_flight):
             # Arrived: the anchor band is reached, so the position is settled
             # from here on.
-            self._stationary_x_settled = True
+            self._stationary_x_settled = not bool(
+                self._stationary_facing_confirm_frames_remaining
+            )
             self._stationary_near_correction_next_at = 0.0
         else:
             # Outside the final approach zone, walk normally and do not
@@ -6679,7 +6750,12 @@ class MovementWorker(threading.Thread):
             # ever walking across the layer.  Only the last +/-0.02 X uses
             # the short, attack-carrying correction below.
             self._stationary_x_settled = False
-            direction = "right" if gap_x > 0 else "left"
+            # When a final facing is owed, the correction is aimed at its
+            # opposite-side turn point rather than necessarily at X itself.
+            # Use that live goal for direction: a marker already just to one
+            # side of X can otherwise be walked the wrong way before turning.
+            correction_gap_x = correction_target_x - player.x
+            direction = "right" if correction_gap_x > 0 else "left"
             if distance_x > STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE:
                 self._stationary_near_correction_next_at = 0.0
                 return MovementDecision(
@@ -6692,7 +6768,8 @@ class MovementWorker(threading.Thread):
                 return MovementDecision(
                     None, "stationary X correction settling"
                 )
-            if not self._request_stationary_step(direction):
+            if not self._request_stationary_step(
+                    direction, target_x=correction_target_x):
                 # Refused or not yet available (a correction still in flight,
                 # gate shut, focus dip).  Retry on the next capture instead of
                 # waiting out the correction interval: the correction is an
@@ -6711,6 +6788,13 @@ class MovementWorker(threading.Thread):
             )
         # X is settled.  The standing Y is this session's launch position, not a
         # recorded map layer.
+        if self._stationary_facing_confirm_frames_remaining:
+            self._stationary_facing_confirm_frames_remaining -= 1
+            if self._stationary_facing_confirm_frames_remaining > 0:
+                self._stationary_x_settled = False
+                return MovementDecision(None, "stationary facing settling")
+            self._stationary_x_settled = True
+            LOG.info("stationary facing confirmed by fresh marker reads")
         decision = self._stationary_y_recovery_decision(anchor, player)
         if decision.key is not None:
             # A recovery jump owns this frame; turn the character afterwards.
@@ -6857,11 +6941,15 @@ class MovementWorker(threading.Thread):
             finally:
                 key_up(direction)
         # The character faces the selected side now.  The obligation is cleared
-        # only here, after the key really went down and up, and the step the tap
-        # itself made is accepted as settled so that the tight arrival band
-        # cannot answer it with an opposite walk.
+        # only here, after the key really went down and up.  Its small movement
+        # is deliberately NOT accepted as settled yet: two fresh marker reads
+        # must prove it remained inside the standing band before the normal
+        # attack cadence may resume.
         self._stationary_facing_command = direction
-        self._stationary_x_settled = True
+        self._stationary_x_settled = False
+        self._stationary_facing_confirm_frames_remaining = (
+            STATIONARY_ATTACK_FACING_CONFIRM_FRAMES
+        )
         self._patrol_facing = direction
         LOG.info(
             "stationary facing correction executed: %s (hold %.2fs)",
@@ -6902,10 +6990,81 @@ class MovementWorker(threading.Thread):
         player = getattr(observation, "player", None)
         if anchor is None or player is None:
             return False
-        gap_x = anchor.x - player.x
-        if abs(gap_x) <= STATIONARY_ATTACK_X_TOLERANCE:
+        target_x = self._stationary_step_target_x
+        if target_x is None:
+            target_x = anchor.x
+        gap_x = float(target_x) - player.x
+        if self._stationary_position_at_target(player.x, float(target_x)):
             return False
         return ("right" if gap_x > 0 else "left") == direction
+
+    @staticmethod
+    def _stationary_position_at_target(player_x: float, target_x: float) -> bool:
+        """Whether the marker is close enough to the current finite step goal."""
+
+        # One minimap pixel is commonly around 0.008 X.  A step is only 30ms,
+        # so its goal must tolerate a fraction of that pixel or it will ping-
+        # pong across the intended turning side.
+        return abs(float(player_x) - float(target_x)) <= 0.003
+
+    @staticmethod
+    def _stationary_facing_turn_x(anchor_x: float, direction: str) -> float:
+        """Return the inner opposite-side turning point for a final facing tap."""
+
+        direction = str(direction).casefold()
+        shift = (
+            -STATIONARY_ATTACK_FACING_ZONE_SHIFT
+            if direction == "left" else STATIONARY_ATTACK_FACING_ZONE_SHIFT
+        )
+        edge = (
+            float(anchor_x) + STATIONARY_ATTACK_X_TOLERANCE + shift
+            if direction == "left"
+            else float(anchor_x) - STATIONARY_ATTACK_X_TOLERANCE + shift
+        )
+        return (
+            edge - STATIONARY_ATTACK_FACING_TURN_INSET
+            if direction == "left"
+            else edge + STATIONARY_ATTACK_FACING_TURN_INSET
+        )
+
+    def _stationary_anchor_x_accepted(self, anchor_x: float, player_x: float) -> bool:
+        """Whether X is in the face-biased resting zone around the stake.
+
+        The correction target is always ``anchor_x``.  Only the acceptance
+        window moves: left-facing uses ``[X-0.010, X+0.006]`` and right-facing
+        uses ``[X-0.006, X+0.010]``.  This absorbs the known facing-tap nudge
+        without making either edge a movement target.
+        """
+
+        facing = self._stationary_facing_target_for_frame()
+        shift = (
+            -STATIONARY_ATTACK_FACING_ZONE_SHIFT
+            if facing == "left" else STATIONARY_ATTACK_FACING_ZONE_SHIFT
+        )
+        lower = float(anchor_x) - STATIONARY_ATTACK_X_TOLERANCE + shift
+        upper = float(anchor_x) + STATIONARY_ATTACK_X_TOLERANCE + shift
+        return lower <= float(player_x) <= upper
+
+    def _stationary_attack_ready_for_player(
+        self, anchor: Point, player: Point,
+    ) -> bool:
+        """Whether the independent fixed cadence may safely resume.
+
+        Final recovery owns attacks through its arbiter STEP motions.  The
+        independent cadence must remain quiet until the marker, target facing,
+        and post-facing confirmation all agree; otherwise it races the final
+        tiny correction and can make the character appear frozen.
+        """
+
+        if (not self._stationary_x_settled
+                or self._stationary_facing_confirm_frames_remaining > 0):
+            return False
+        if not self._stationary_anchor_x_accepted(anchor.x, player.x):
+            return False
+        return (
+            self._stationary_facing_command
+            == self._stationary_facing_target_for_frame()
+        )
 
     def _stationary_correction_hold(self) -> float:
         """How long the anchor correction holds its direction for the live gap.
@@ -6968,7 +7127,12 @@ class MovementWorker(threading.Thread):
                 )
                 return False
             if not self._stationary_step_still_needed(direction):
+                self._stationary_step_target_x = None
                 return False
+            # The finite target has served its purpose.  A following capture
+            # decides whether another correction is needed; it must not reuse
+            # a turn point from this already-running motion.
+            self._stationary_step_target_x = None
             self._release_walk_hold()
             if key_down(direction) is False:
                 return False
@@ -7036,6 +7200,9 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_edge_phase = None
         self._reconnect_drop_edge_started_at = 0.0
         self._reconnect_drop_edge_start_y = None
+        # A fresh start owns a fresh descent: no landing evidence from the run
+        # that just ended may prove this one has moved down.
+        self._reset_drop_arrival()
 
         self._release_climb_up()
         self._release_walk_hold()
@@ -7572,6 +7739,162 @@ class MovementWorker(threading.Thread):
             "reconnect drop recovery: Alt+Down stalled; seeking left drop edge",
             RECONNECT_DROP_EDGE_HOLD_SECONDS,
         )
+
+    def _reset_drop_arrival(self) -> None:
+        """Forget the drop-to-route landing evidence (movement thread only)."""
+
+        self._drop_entry_y = None
+        self._drop_lowest_y = None
+        self._drop_last_y = None
+        self._drop_settled = False
+        self._drop_arrival_candidate = None
+        self._drop_arrival_frames = 0
+        self._drop_relaxed_y = None
+        self._drop_relaxed_floor = None
+
+    def _note_drop_descent(self, observation: MinimapObservation) -> None:
+        """Remember where the current drop-to-route descent started and got to.
+
+        The entry Y is taken from the first frame of the descent and is NOT
+        reset by a transient missing marker (the caller only resets when the
+        return mode itself has ended), so one lost reading cannot restart the
+        measured descent.
+        """
+
+        player = observation.player
+        if player is None:
+            # No fresh reading: keep the evidence and the settle flag as they
+            # are rather than claiming the marker settled.
+            self._drop_settled = False
+            return
+        y = float(player.y)
+        if self._drop_entry_y is None:
+            self._drop_entry_y = y
+        if self._drop_lowest_y is None or y > self._drop_lowest_y:
+            self._drop_lowest_y = y
+        # A falling marker sweeps down the minimap by ``fall_marker_y_gain``
+        # per frame; a character standing on a landing moves less than that.
+        self._drop_settled = bool(
+            self._drop_last_y is None
+            or abs(y - self._drop_last_y) < self._fall_marker_y_gain
+        )
+        self._drop_last_y = y
+
+    def _drop_descended(self) -> bool:
+        """True when the drop has really moved the marker down from its start.
+
+        A descent may never be finished from a reading that only repeats where
+        it began, and never before one Alt+Down chord was actually sent: the
+        world-Y origin is deliberately anchored to the route's TOP floor while
+        the character is still above it, so the very first reading of a fresh
+        "start above the route" must not be allowed to declare an arrival.
+        """
+
+        if self._last_drop_attempt == float("-inf"):
+            return False
+        entry = self._drop_entry_y
+        lowest = self._drop_lowest_y
+        if entry is None or lowest is None:
+            return False
+        return bool(lowest - entry >= RECONNECT_DROP_Y_PROGRESS)
+
+    def _drop_landing_floor(
+        self, observation: MinimapObservation
+    ) -> Optional[str]:
+        """The floor the drop-to-route descent has landed on, or ``None``.
+
+        The marker's own recorded band is direct evidence and is still accepted
+        immediately.  A landing away from the recorded row matches no band at
+        all, and that is where the character used to stay in the drop phase
+        forever, sending one Alt+Down chord after another while already standing
+        on a patrol floor.  The same marker-only answers ordinary patrol uses
+        for that reading resolve it here:
+
+        1. at/below the bottom recorded floor - nothing is recorded lower, so
+           the descent cannot continue; the floor is handed to ``_finish_return``
+           (patrol it, or climb back when the patrol range starts above it);
+        2. the bounded nearest recorded patrol floor ("if the character can't
+           find a layer he should anchor to the nearest layer").
+
+        Both need real drop evidence first, and the answer must hold while the
+        marker is settled: reading a floor that the character is merely falling
+        THROUGH would restart patrol in mid-air.  The world-Y tracker is
+        deliberately never consulted here (see the caller).
+        """
+
+        player = observation.player
+        if player is None:
+            return None
+        marker_y = float(player.y)
+        route_layers = {
+            name: self.important_positions[name]
+            for name in self._route_layers
+            if name in self.important_positions
+        }
+        # 1) The marker's own recorded band is direct evidence of the visible
+        #    floor and is still accepted at once, exactly as before.
+        floor = detect_layer_by_y(marker_y, route_layers)
+        if floor is not None:
+            self._drop_arrival_candidate = None
+            self._drop_arrival_frames = 0
+            return floor
+        # 2) The relaxed answers below need real drop evidence: an Alt+Down
+        #    chord was sent, the marker really moved down from where the descent
+        #    started, and the reading is no longer sweeping (a character falling
+        #    THROUGH the floor moves by ``fall_marker_y_gain`` per frame and must
+        #    never be read as a landing).  With no recorded patrol floor there is
+        #    nothing to anchor to, so the drop keeps its previous behaviour.
+        if (not route_layers
+                or not self._drop_descended()
+                or not self._drop_settled):
+            self._drop_arrival_candidate = None
+            self._drop_arrival_frames = 0
+            self._drop_relaxed_y = None
+            self._drop_relaxed_floor = None
+            return None
+        if (self._drop_relaxed_y is None
+                or abs(marker_y - self._drop_relaxed_y) > 1e-9):
+            # Resolve once per reading: the shared fallbacks log their evidence
+            # when they answer, and a standing character repeats the same Y.
+            landing = self._bottom_floor_for_marker_y(marker_y)
+            if landing is None or landing not in self.important_positions:
+                landing = self._nearest_floor_by_marker_y(
+                    marker_y,
+                    route_layers,
+                    max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
+                )
+            self._drop_relaxed_y = marker_y
+            self._drop_relaxed_floor = landing
+        landing = self._drop_relaxed_floor
+        if landing is None:
+            self._drop_arrival_candidate = None
+            self._drop_arrival_frames = 0
+            return None
+        if landing == self._drop_arrival_candidate:
+            self._drop_arrival_frames += 1
+        else:
+            self._drop_arrival_candidate = landing
+            self._drop_arrival_frames = 1
+        if self._drop_arrival_frames < DROP_ARRIVAL_CONFIRM_FRAMES:
+            return None
+        self._drop_arrival_candidate = None
+        self._drop_arrival_frames = 0
+        entry_y = self._drop_entry_y
+        lowest_y = self._drop_lowest_y
+        moved = (
+            float(lowest_y) - float(entry_y)
+            if entry_y is not None and lowest_y is not None else 0.0
+        )
+        LOG.warning(
+            "DROP TO ROUTE: accepting %s as the landing floor (marker y=%.6f "
+            "matches no patrol-floor band; the drop moved the marker %.6f down "
+            "and the reading held for %d frames); restarting patrol",
+            landing,
+            marker_y,
+            moved,
+            DROP_ARRIVAL_CONFIRM_FRAMES,
+        )
+        return landing
 
     def _run_pending_route_check(
         self, observation: MinimapObservation, now: float
@@ -9367,7 +9690,7 @@ class MovementWorker(threading.Thread):
             if not first_claimed:
                 return False
             try:
-                if not self._wait_for_patrol_motion(0.15):
+                if not self._wait_for_patrol_motion(0.10):
                     return False
             finally:
                 key_up(first)
@@ -9389,7 +9712,7 @@ class MovementWorker(threading.Thread):
             # Post-attack recovery is intentionally long.  The second
             # direction is only useful after the cast animation can no longer
             # consume it as a movement input.
-            if not self._wait_for_patrol_motion(0.80):
+            if not self._wait_for_patrol_motion(0.70):
                 return False
             if not self._patrol_input_allowed():
                 return False
@@ -9397,7 +9720,7 @@ class MovementWorker(threading.Thread):
             if not second_claimed:
                 return False
             try:
-                if not self._wait_for_patrol_motion(0.15):
+                if not self._wait_for_patrol_motion(0.10):
                     return False
             finally:
                 key_up(second)
@@ -9407,7 +9730,7 @@ class MovementWorker(threading.Thread):
             self._stationary_facing_command = final_direction
             self._stationary_x_settled = True
         LOG.info(
-            "small-step complete: %s -> attack -> wait 0.80s -> %s; facing target=%s",
+            "small-step complete: %s -> attack -> wait 0.70s -> %s; facing target=%s",
             first, second, resume_direction or "right",
         )
         return True
@@ -9940,23 +10263,23 @@ class MovementWorker(threading.Thread):
                     route_target_x = self._stabilize_rope_target(
                         route_target_x, route_is_rope, route_label
                     )
+                if (route_label != "drop-to-route"
+                        and self._return_mode != "drop-to-route"):
+                    # The landing evidence belongs to one descent only.  The
+                    # mode check keeps it across a ``waiting-marker`` frame: one
+                    # lost reading must not restart the measured descent.
+                    self._reset_drop_arrival()
                 if route_label == "drop-to-route":
                     # Return drop: keep dropping (Alt+Down) until the marker
-                    # directly re-enters the patrol floor range, then restart
-                    # patrol.  Do not accept the world-Y tracker here: at a
-                    # fresh Start above the route it is deliberately anchored
-                    # to the route's top layer, and would otherwise end the
-                    # drop before one Alt+Down was sent.
+                    # re-enters the patrol floor range, then restart patrol.
+                    # The landing test is deliberately marker-only - the world-Y
+                    # tracker is never accepted here, because at a fresh Start
+                    # above the route it is anchored to the route's top layer
+                    # and would otherwise end the drop before one Alt+Down was
+                    # sent (see ``_drop_landing_floor``).
                     if self._return_mode == "drop-to-route":
-                        marker_layers = {
-                            name: self.important_positions[name]
-                            for name in self._route_layers
-                            if name in self.important_positions
-                        }
-                        floor = (
-                            detect_layer_by_y(observation.player.y, marker_layers)
-                            if observation.player is not None else None
-                        )
+                        self._note_drop_descent(observation)
+                        floor = self._drop_landing_floor(observation)
                         if floor is not None:
                             self._finish_return(floor, observation)
                             route_target_x, route_is_rope, route_label = (
@@ -10455,9 +10778,19 @@ class MovementWorker(threading.Thread):
                         self._return_mode is not None
                         # Returning from another layer or walking toward the
                         # stake's final approach zone is not allowed to
-                        # attack.  Only the +/-0.02 X zone may use the
-                        # attack-bearing tiny correction motions.
+                        # attack.  Only the +/-0.03 X zone may use the
+                        # attack-bearing arbiter correction motions.
                         or not player_in_stationary_attack_zone
+                        # Being inside the final zone is not enough: a
+                        # pending anchor step or the opposite-side facing tap
+                        # owns its own attack.  Hold the normal cadence until
+                        # fresh marker reads confirm the standing position and
+                        # requested facing, otherwise both paths race for the
+                        # arbiter and can look like a character freeze.
+                        or player is None
+                        or not self._stationary_attack_ready_for_player(
+                            anchor, player,
+                        )
                         # A pickup leg remains exclusive even when the live
                         # decision has been replaced by its recorded jump
                         # point.  Do not let fixed attack interrupt that jump.
@@ -10517,8 +10850,8 @@ class MovementWorker(threading.Thread):
                     if self.stationary_attack_resume_event is not None:
                         self.stationary_attack_resume_event.set()
                     LOG.info(
-                        "STATIONARY ATTACK: recovery complete; resuming attack "
-                        "during near-anchor correction"
+                        "STATIONARY ATTACK: anchor and facing confirmed; "
+                        "resuming normal attack cadence"
                     )
                 # Publish the patrol state so the YOLO attack worker blocks
                 # attacks during the active climbing operation: jump attempts,

@@ -130,6 +130,17 @@ destroys it when the application exits. It is never written to
 credential remains separate from both signed-license validation and the vendor
 WebSocket adapter.
 
+Each successful heartbeat also returns the server-issued eight-character
+**设备码**. The authorization line always displays that code (and left-clicking
+it copies it). The client preserves the online device state across ordinary
+local signature checks, so a routine UI permission check cannot erase it.
+Completed automatic API passes and completed `测试API` drills are reported to
+the licensing server immediately as successful usage events. The response's
+additive `autolie_fingerprint_usage` object updates the same authorization line
+at once with the total, success, failure, and remaining usage values. The
+durable local queue remains only for retrying an unavailable server; it does
+not intentionally delay a completed report.
+
 ### Server deployment, updates, and client compatibility
 
 The server lives in the separate `maple-assistant-server` repository. A remote

@@ -93,10 +93,53 @@ different codes over time.
 request body is sent, and never falls back to plain HTTP. Safe milestones are
 written to the dedicated `server-client` logger, which `assistant.py` persists
 as `server_client.log`. This log records no activation code, fingerprint,
-token, or secret. It does not alter the existing auto-lie WebSocket adapter. A
-future online-session component will obtain a short-lived in-memory product key
-only after server authentication; that component must remain separate from both
-license verification and vendor `autolie_api/` code.
+token, or secret.
+
+`auto_lie_secret.py` is the in-process credential boundary. A successful
+activation or three-hour license heartbeat may contain an optional auto-lie
+credential. `licensing.py` hands it to this module only after the pinned TLS
+request and signed license response have been accepted; the module keeps it in
+memory and replaces or clears it atomically. `assistant.py` reads this runtime
+value only while opening the auto-lie WebSocket. No configuration, local
+license, client log, or release package stores it. The server encrypts its
+operator-managed copy at rest in PostgreSQL. This path is additive to the
+versioned activation response so older clients can safely ignore it, and it
+does not modify vendor `autolie_api/` code.
+
+### Immediate auto-lie usage synchronization
+
+`lie_accounting.py` is a durable post-pass boundary, never part of the live
+WebSocket/cursor stream. A completed automatic pass or completed `测试API`
+drill is persisted and sent immediately with the successful outcome. If the
+licensing server is unavailable, the same event UUID is retained and retried
+later, so retries remain idempotent without delaying normal operation.
+
+The server keeps its established `device` response for compatibility and adds
+`autolie_fingerprint_usage` containing only current auto-lie permission,
+remaining balance, and usage counters. `licensing._with_server_device()`
+merges that additive object into the live `LicenseStatus`; `UiWorker` applies
+it on its Tk thread and redraws the always-visible 设备码/usage line immediately.
+Routine local license checks retain this online state for the same license,
+rather than erasing heartbeat data that local signed documents cannot contain.
+
+### Server deployment compatibility boundary
+
+The desktop application and `maple-assistant-server` are independently
+deployable only across their stable, versioned API contract. A compatible
+server replacement retains the TLS private key (therefore the client pin),
+`LICENSE_SIGNING_PRIVATE_KEY`, PostgreSQL database, `/api/v1/activate`, and
+`/api/v1/validate`. Response additions are optional; removals, renamed fields,
+new mandatory fields, signing-key rotation, or TLS-key rotation require a
+coordinated desktop release.
+
+On a server failure, restoring the previous compatible server code against the
+same database and keys restores existing clients. Online validation runs
+immediately at desktop launch, so a newly started client locks while the server
+is unavailable. A client already running from a successful validation stays
+active only until its next three-hour heartbeat; that failed validation locks
+automation. Server schema updates should be additive and code rollbacks should
+remain compatible with the migrated schema rather than attempting a destructive
+database downgrade.
 
 ### Shared capture pipeline
 
@@ -115,12 +158,17 @@ This shared model prevents conflicting focus changes, reduces capture overhead, 
 
 `minimap_detector.py` locates the actual minimap border and detects the yellow character marker. All normalized map coordinates are calculated from the detected border, not from a fixed screen region.
 
-There are two distinct concepts:
+There are three distinct concepts:
 
 - **Search region:** a broad area used to find a candidate minimap.
 - **Verified geometry:** an OpenCV-confirmed border that is safe to record and use for normalized coordinates.
+- **Measured canvas:** the map panel's own inner rectangle inside that border. Whenever it can be measured (or is recalled from earlier in the session) it is the marker/patrol analysis region and the yellow diagnostic rectangle; when it cannot be, no canvas is claimed at all.
 
 A broad search region is never promoted to saved geometry. This protects patrol calibration when the minimap changes size, the UI overlays the game, or a candidate search rectangle is larger than the map itself.
+
+The canvas is measured from the captured pixels, not derived from the window: `_measure_inner_canvas()` takes the frame's detected window, builds its border contour tree, and accepts the largest rectangle nested directly inside the window's border that is inset on every side and covers a plausible share of the window. A fixed height, a fixed bottom offset, and a proportion of the window are all deliberately rejected — the game does not rescale this HUD uniformly between client widths, so a proportion that happens to fit one client is wrong on the next. Rectangles nested deeper than the window's border are map artwork or a panel drawn inside the canvas and are never adopted, because one of them would cut the character marker out of the analysis region. Two further passes (a fainter Canny threshold, then a gap-bridged edge map) cover a faint border and a border broken by map artwork, and the plain pass is preferred because closing an edge map can merge the canvas with the artwork and widen the box.
+
+The resolution order is: the separate inner-border detector's measurement (including its held previous result) → an inner contour the outer pass already found → this pixel measurement → the canvas measured earlier in the same session, held through a few pixels of jitter so the coordinate frame does not move under a standing character, and cleared by `reset_geometry()` with the rest of the session geometry → and otherwise no canvas at all. That last case is deliberately honest rather than generous: `MinimapDetection.canvas_measured` is false, `assistant.py` flashes only the minimap frame, and it logs that no yellow marker/patrol region was drawn. A rectangle that claims the whole minimap window (or the broad search region) as the map canvas is worse than no rectangle.
 
 Recorded points contain minimap-relative X/Y values. Layer recognition uses recorded Y anchors and asymmetric layer bands: the top of a layer is more tolerant than its confirmed base. World-Y tracking provides continuity between frames and is re-anchored only by explicit recovery logic, not by ordinary movement such as stepping onto a bench.
 
@@ -135,6 +183,7 @@ Patrol has these core rules:
 - Routes are an inclusive range of recorded layers, from bottom to top.
 - The assistant can start on any layer. It either patrols that layer or follows the recorded route back into range.
 - Crossing a recorded endpoint advances the route phase only after the intended direction reaches or passes its target.
+- A return drop ends on landing evidence read from the marker, never on the world-Y tracker: the marker's own recorded band, or — when the landing is away from the recorded row and therefore matches no band — the at/below-bottom-floor and bounded nearest-floor answers ordinary patrol already uses. Both relaxed answers require an Alt+Down chord to have really moved the marker down and the reading to hold for two consecutive settled frames, so a character falling *through* a floor is never read as landed. The world-Y tracker is excluded here because at a fresh start above the route its origin is anchored to the route's top floor while the character is still above it.
 - A missing route produces a safe wait state rather than accidental movement.
 - Stand-still attack captures its temporary position at each manual patrol start and does not require recorded layer membership.
 
@@ -216,6 +265,8 @@ When the pass ends, `ui_worker.py` focuses the game and uses `click_screen()` to
 ### UI, configuration, and optional tools
 
 `ui_worker.py` presents the Chinese desktop interface. It reads and writes only through configuration callbacks supplied by the coordinator. UI redraw work is deferred during resize/drag operations to avoid black component flashes and expensive intermediate layouts. `screen_blinker.py` owns click-through diagnostic overlays: crosshairs and all patrol-point symbols are painted on persistent native canvases, never into capture input.
+
+A diagnostic region is converted from captured-pixel coordinates to screen coordinates by `_capture_pixel_to_screen()`: scaling through the logical client rectangle is correct only while the captured bitmap matches it, and when the bitmap is DPI-virtualized (a different width/height) its pixels are already screen pixels relative to the capture origin. That conversion is display-only. The logical window rectangle that game input and the auto-lie cursor workflow use is never derived from it — changing the shared rectangle to fix an overlay was what made earlier builds unstable.
 
 Each recorded layer row carries an axis band whose point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳) opens only on a **right click**. Left-clicking never opens the menu; it remains reserved for normal selection behavior. The menu itself is refused while patrol runs, because recording is locked then.
 

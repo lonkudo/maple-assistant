@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 from minimap_detector import hud_scale_for
 from runtime_paths import application_root
+from auto_lie_secret import get_server_secret
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -589,18 +590,14 @@ def main() -> int:
 
         from autolie_api.connect import open_backend
         from autolie_api.endpoints import ws_endpoints
-        from autolie_api.key_store import load_product_key, mask_key
+        from autolie_api.key_store import mask_key
         from autolie_api.ws_client import RoiTrackWsClient
+        from auto_lie_secret import get_server_secret
 
-        key, source = load_product_key("")
+        key = get_server_secret()
+        source = "授权服务器（仅运行内存）"
         if not key:
-            # The local mimic is created directly by the normal helper and
-            # has no remote probe/health path to avoid.
-            session = open_backend(
-                key="", transport="base64", frame_standard=5.0,
-                health=False, client_info="maple_assistant_auto_lie",
-            )
-            return session.client, session.note, session.mimic
+            raise RuntimeError("auto-lie credential is unavailable; wait for validated heartbeat")
         with auto_lie_endpoint_lock:
             endpoint = auto_lie_endpoint.get("value")
             preflight_error = str(auto_lie_endpoint.get("error") or "")
@@ -1074,18 +1071,30 @@ def main() -> int:
         # detected minimap frame, yellow is the marker/patrol analysis area,
         # and blue is the HP/MP status capture area.
         if show_overlays or show_startup_marker:
+            regions = [("minimap", detection.window_box, 0x0000FF00)]
+            if detection.canvas_measured:
+                regions.append(("marker/patrol", detection.analysis_box, 0x0000FFFF))
+            else:
+                # The yellow rectangle is the map canvas.  When no border could
+                # be measured and none was remembered, drawing it over the whole
+                # detected/search area would claim the minimap window as the
+                # canvas, so it is simply left out.
+                logging.warning(
+                    "DETECTION OVERLAY: the map canvas is neither measurable in "
+                    "this frame nor remembered for this client size (%s); only "
+                    "the detected minimap frame is drawn, not a yellow "
+                    "marker/patrol region",
+                    detection.analysis_box,
+                )
+            regions.append(("hp/mp", status_box, 0x00FF0000))
             screen_blinker.show_detection_regions(
                 fresh_frame.window_rect,
                 fresh_frame.image.size,
-                (
-                    ("minimap", detection.window_box, 0x0000FF00),
-                    ("marker/patrol", detection.analysis_box, 0x0000FFFF),
-                    ("hp/mp", status_box, 0x00FF0000),
-                ),
+                tuple(regions),
             )
             logging.info(
-                "DETECTION OVERLAY: flashing minimap (green), marker/patrol "
-                "(yellow), and HP/MP (blue) regions"
+                "DETECTION OVERLAY: flashing %s regions",
+                ", ".join(name for name, _box, _colour in regions),
             )
 
         # Detect the floor on the fresh frame BEFORE setting the transient
@@ -1688,7 +1697,7 @@ def main() -> int:
     # The service expects one short live round: after the separate 3-second
     # settle, send frames for no more than 13 seconds, then round_end and
     # close the WebSocket.
-    AUTO_LIE_TRACK_SECONDS = 13.0
+    AUTO_LIE_TRACK_SECONDS = 17.0
 
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
                                    fps=5.0):
@@ -1697,8 +1706,7 @@ def main() -> int:
         A new worker per press (a thread cannot restart).  ``display`` carries the frames the UI
         thread must draw; the worker reads back ``worker.image_rect`` (the picture rectangle) to
         confine the mouse to the video area.  The key is not a panel setting any more: it ships
-        with the application (LIE_PRODUCT_KEY -> autolie_api/key_secret.txt), and with no key at all
-        the local mimic is used, so the button is always safe to press.
+        from the validated licensing heartbeat and remains only in this process's memory.
         """
 
         from api_lie_video import VideoDrillWorker
@@ -1752,7 +1760,7 @@ def main() -> int:
             results=api_auto_lie_results,
             stop_event=stop_event,
             window_title=args.window_title,
-            key="",
+            key=get_server_secret(),
             key_sender=key_sender,
             fps=5.0,
             transport="rtf1",

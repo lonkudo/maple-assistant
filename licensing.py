@@ -8,7 +8,7 @@ key, which must never be copied into a release package.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Any, Optional
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json
+from auto_lie_secret import clear_server_secret, set_server_secret
 
 
 SERVER_LOG = logging.getLogger("server-client")
@@ -63,6 +64,12 @@ class LicenseStatus:
     license_id: str = ""
     edition: str = ""
     expires_at: Optional[str] = None
+    equipment_id: str = ""
+    auto_lie_allowed: bool = True
+    remaining_auto_lie_count: Optional[int] = None
+    lie_detect_total: int = 0
+    lie_detect_success_total: int = 0
+    lie_detect_failed_total: int = 0
 
 
 class DeviceNotReadyError(ValueError):
@@ -372,11 +379,56 @@ def _persist_document(document: dict[str, Any], status: LicenseStatus, root: Opt
     return status
 
 
+def _with_server_device(status: LicenseStatus, answer: Any) -> LicenseStatus:
+    """Attach device state and retain the server key in memory only."""
+
+    device = answer.get("device") if isinstance(answer, dict) else None
+    usage = answer.get("autolie_fingerprint_usage") if isinstance(answer, dict) else None
+    auto_lie = answer.get("auto_lie") if isinstance(answer, dict) else None
+    secret = auto_lie.get("secret_key") if isinstance(auto_lie, dict) else ""
+    # Every successful heartbeat is authoritative: a missing key means the
+    # server is not configured for it, not permission to retain an old one.
+    if set_server_secret(secret):
+        SERVER_LOG.info("auto-lie credential refreshed from validated heartbeat")
+    else:
+        SERVER_LOG.warning("auto-lie credential unavailable in validated heartbeat")
+    if not isinstance(device, dict) and not isinstance(usage, dict):
+        return status
+    # The full device document remains the compatibility response.  The
+    # smaller usage object is emitted on every lie-event reply so the desktop
+    # can refresh the header immediately without depending on its shape.
+    server_state = dict(device) if isinstance(device, dict) else {}
+    if isinstance(usage, dict):
+        server_state.update(usage)
+    equipment_id = str(server_state.get("equipment_id", status.equipment_id)).strip()
+    remaining = server_state.get("remaining_auto_lie_count", status.remaining_auto_lie_count)
+    if not isinstance(remaining, int) or isinstance(remaining, bool):
+        remaining = status.remaining_auto_lie_count
+
+    def _counter(name: str, current: int) -> int:
+        value = server_state.get(name, current)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return current
+
+    return replace(
+        status,
+        equipment_id=equipment_id if len(equipment_id) == 8 else status.equipment_id,
+        auto_lie_allowed=bool(server_state.get("auto_lie_allowed", status.auto_lie_allowed)),
+        remaining_auto_lie_count=remaining,
+        lie_detect_total=_counter("lie_detect_total", status.lie_detect_total),
+        lie_detect_success_total=_counter("lie_detect_success_total", status.lie_detect_success_total),
+        lie_detect_failed_total=_counter("lie_detect_failed_total", status.lie_detect_failed_total),
+    )
+
+
 def activate_via_server(
     code: str, root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
 ) -> LicenseStatus:
     """Activate against the built-in, certificate-pinned licensing endpoint."""
 
+    clear_server_secret()
     try:
         SERVER_LOG.info("activation requested edition=%s", edition.casefold())
         answer = post_json(
@@ -409,7 +461,7 @@ def activate_via_server(
     if not status.valid:
         SERVER_LOG.warning("activation response rejected category=%s", status.code)
         return status
-    persisted = _persist_document(document, status, root)
+    persisted = _with_server_device(_persist_document(document, status, root), answer)
     if persisted.valid:
         SERVER_LOG.info("activation accepted license_id=%s edition=%s", persisted.license_id, persisted.edition)
     else:
@@ -428,6 +480,8 @@ def validate_via_server(
     license.
     """
 
+    # Do not let an old in-memory key survive a failed/invalid revalidation.
+    clear_server_secret()
     local = verify_license(root, edition=edition)
     if not local.valid:
         return local
@@ -465,10 +519,55 @@ def validate_via_server(
     if not status.valid:
         SERVER_LOG.warning("license heartbeat response rejected category=%s", status.code)
         return status
-    persisted = _persist_document(document, status, root)
+    persisted = _with_server_device(_persist_document(document, status, root), answer)
     if persisted.valid:
         SERVER_LOG.info("license heartbeat accepted license_id=%s", persisted.license_id)
     return persisted
+
+
+def report_lie_event_via_server(
+    event_id: str, outcome: str, occurred_at: str,
+    root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
+) -> LicenseStatus:
+    """Send completed-event accounting after the live auto-lie pass is over.
+
+    The caller deliberately schedules this later.  This function never takes
+    part in the live WebSocket/cursor path.
+    """
+
+    local = verify_license(root, edition=edition)
+    if not local.valid or not local.license_id:
+        return local
+    try:
+        SERVER_LOG.info("lie accounting requested event=%s", str(event_id)[:8])
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/lie-events",
+            {
+                "fingerprint": machine_fingerprint_hash(),
+                "license_id": local.license_id,
+                "event_id": str(event_id),
+                "outcome": str(outcome),
+                "occurred_at": str(occurred_at),
+            },
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
+        status = _with_server_device(local, answer)
+        SERVER_LOG.info("lie accounting accepted event=%s", str(event_id)[:8])
+        return status
+    except PinnedTlsResponseError as exc:
+        status = _with_server_device(local, getattr(exc, "data", {}))
+        if exc.code in {"AUTO_LIE_QUOTA_BANNED", "FINGERPRINT_BANNED"}:
+            return replace(
+                status, valid=False, code="server:auto_lie_banned",
+                message="自动过测谎已被服务器停用。", auto_lie_allowed=False,
+            )
+        return replace(status, code=f"server:{exc.code}", message=exc.message)
+    except DeviceNotReadyError:
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
+    except (ValueError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("lie accounting failed category=%s", type(exc).__name__)
+        return replace(local, code="server", message="激活验证失败")
 
 
 __all__ = [
@@ -476,5 +575,5 @@ __all__ = [
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
     "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
-    "validate_via_server",
+    "report_lie_event_via_server", "validate_via_server",
 ]

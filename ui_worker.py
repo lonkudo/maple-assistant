@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import collections
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -37,6 +37,7 @@ from licensing import (
     LicenseStatus, activate as activate_license, activate_via_server,
     revoke_license, validate_via_server, verify_license,
 )
+from lie_accounting import LieAccountingWorker
 from reconnect_worker import (
     CHANNEL_DEFAULT,
     CHANNEL_MAX,
@@ -53,6 +54,7 @@ from update_manager import (
     schedule_hidden_restart, schedule_package_update,
 )
 from runtime_paths import application_root, package_format
+from auto_lie_secret import get_server_secret, has_server_secret
 
 
 LOG = logging.getLogger(__name__)
@@ -880,9 +882,8 @@ class UiWorker(threading.Thread):
         self._api_test_video_dir = ""              # last folder, remembered for the picker
         self._api_test_display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
         self._api_test_keep_focus_at = 0.0
-        # No panel key: the product key ships with the application, so this stays empty and
-        # load_product_key falls back to LIE_PRODUCT_KEY then autolie_api/key_secret.txt.
-        self._api_test_key = ""
+        # The upstream credential is not a panel/config value.  A validated
+        # heartbeat places it in the process-only auto_lie_secret store.
         # v0423: 自动过测谎 - the api pass runs by itself when the game's lie window appears.  The lie
         # detector calls `on_lie_event_for_api()` from its own thread, which only raises a flag; the Tk
         # thread services it in `_poll` (nothing Tk is touched off-thread).
@@ -986,6 +987,17 @@ class UiWorker(threading.Thread):
         )
         self._license_heartbeat_started = False
         self._license_heartbeat_generation = 0
+        # Completed auto-lie passes are accounted for later, never on the
+        # time-sensitive WebSocket/cursor path.  The worker persists its own
+        # queue so an app restart cannot silently discard a completed event.
+        self._lie_accounting_results: "queue.Queue[LicenseStatus]" = queue.Queue(maxsize=32)
+        self._lie_accounting_worker = LieAccountingWorker(
+            self.stop_event,
+            self._lie_accounting_results,
+            application_root() / "lie_accounting_pending.json",
+        )
+        self._lie_accounting_started = False
+        self._accounted_auto_lie_worker_id: Optional[int] = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -1041,6 +1053,9 @@ class UiWorker(threading.Thread):
             # applied only after every panel has been built and laid out.
             root.withdraw()
             self._root = root
+            if not self._lie_accounting_started:
+                self._lie_accounting_worker.start()
+                self._lie_accounting_started = True
             app_version = version_label()
             root.title(f"TodoHelper {app_version}")
             screen_width = root.winfo_screenwidth()
@@ -1116,6 +1131,7 @@ class UiWorker(threading.Thread):
             license_bar.pack(fill="x", pady=(4, 0))
             self._license_label = ttk.Label(license_bar, anchor="w")
             self._license_label.pack(side="left", fill="x", expand=True)
+            self._license_label.bind("<Button-1>", self._copy_equipment_id)
             self._license_button = ttk.Button(
                 license_bar, text="激活授权", command=self._activate_license
             )
@@ -2984,6 +3000,7 @@ class UiWorker(threading.Thread):
         # validation can leave the visible header stuck at “正在验证授权” until
         # some unrelated UI change ends the freeze state.
         self._drain_license_heartbeat_results()
+        self._drain_lie_accounting_results()
         self._drain_channel_update_events()
 
         # While a move/resize modal loop is running the client is frozen
@@ -3093,7 +3110,28 @@ class UiWorker(threading.Thread):
 
         if getattr(self, "_license_session_locked", False):
             return False
-        self._license_status = verify_license()
+        local_status = verify_license()
+        previous = getattr(self, "_license_status", None)
+        # Local signature checks intentionally know nothing about the online
+        # device record.  Preserve the heartbeat's equipment ID and usage
+        # data when they refer to the same signed license, otherwise a normal
+        # UI gate would erase the value immediately after it was received.
+        if (
+            local_status.valid
+            and isinstance(previous, LicenseStatus)
+            and previous.valid
+            and previous.license_id == local_status.license_id
+        ):
+            local_status = replace(
+                local_status,
+                equipment_id=previous.equipment_id,
+                auto_lie_allowed=previous.auto_lie_allowed,
+                remaining_auto_lie_count=previous.remaining_auto_lie_count,
+                lie_detect_total=previous.lie_detect_total,
+                lie_detect_success_total=previous.lie_detect_success_total,
+                lie_detect_failed_total=previous.lie_detect_failed_total,
+            )
+        self._license_status = local_status
         return bool(self._license_status.valid)
 
     def _start_license_heartbeat(self) -> None:
@@ -3143,19 +3181,27 @@ class UiWorker(threading.Thread):
         if status.valid:
             was_locked = self._license_session_locked
             self._license_session_locked = False
-            self._refresh_license_ui()
-            self._set_license_visual_lock(False)
-            if hasattr(self, "_control_status"):
-                self._control_status.configure(
-                    text="在线授权验证成功，自动功能已解锁。"
-                )
-            if hasattr(self, "_quick_message_status"):
-                self._quick_message_status.configure(
-                    text="在线授权验证成功，自动功能已解锁。"
-                )
+            # Loading persisted controls may restore the saved Auto Lie
+            # checkbutton.  Do that first, then apply the server entitlement
+            # so a quota-disabled device cannot be switched back on by config.
             if was_locked:
                 LOG.info("license heartbeat accepted; automation unlocked")
                 self._shutdown_load_settings()
+            self._refresh_license_ui()
+            self._set_license_visual_lock(False)
+            self._apply_auto_lie_entitlement(status)
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(
+                    text=("在线授权验证成功，自动功能已解锁。"
+                          if status.auto_lie_allowed
+                          else "在线授权验证成功，自动过测谎已被服务器停用。")
+                )
+            if hasattr(self, "_quick_message_status"):
+                self._quick_message_status.configure(
+                    text=("在线授权验证成功，自动功能已解锁。"
+                          if status.auto_lie_allowed
+                          else "在线授权验证成功，自动过测谎已被服务器停用。")
+                )
             self._refresh_patrol_controls()
             return
         LOG.warning("license heartbeat failed: %s", status.code)
@@ -3167,6 +3213,35 @@ class UiWorker(threading.Thread):
                 text=hint
             )
 
+    def _drain_lie_accounting_results(self) -> None:
+        """Apply immediate server accounting after a completed lie pass.
+
+        The pass has already ended by the time an item reaches this queue.
+        A quota refusal therefore disables only future work; it never adds
+        latency or cancellation to the live cursor stream.
+        """
+
+        latest: Optional[LicenseStatus] = None
+        while True:
+            try:
+                latest = self._lie_accounting_results.get_nowait()
+            except queue.Empty:
+                break
+        if latest is None:
+            return
+        self._license_status = latest
+        self._license_online_validation_pending = False
+        if latest.valid:
+            self._apply_auto_lie_entitlement(latest)
+            self._refresh_license_ui()
+            LOG.info("auto-lie accounting synchronized")
+            return
+        LOG.warning("auto-lie accounting rejected: %s", latest.code)
+        self._lock_licensed_functions()
+        self._refresh_license_ui()
+        if hasattr(self, "_control_status"):
+            self._control_status.configure(text=latest.message)
+
     def _refresh_license_ui(self) -> None:
         """Render the non-fatal authorization state in the always-visible UI."""
 
@@ -3174,14 +3249,17 @@ class UiWorker(threading.Thread):
         label = getattr(self, "_license_label", None)
         if label is not None:
             memory = getattr(self, "_memory_usage_text", "内存：读取中")
+            device_text = (
+                f"设备：{status.equipment_id}（左键复制）"
+                if status.equipment_id else "设备：等待服务器返回"
+            )
             if getattr(self, "_license_online_validation_pending", False):
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
                 label.configure(
                     text=(
-                        f"正在验证在线授权 · {status.edition.upper()} · "
-                        f"到期：{expiry} · {memory}"
+                        f"正在验证在线授权 · {device_text} · 到期：{expiry} · {memory}"
                     ),
                     foreground="#9a6700",
                 )
@@ -3189,20 +3267,73 @@ class UiWorker(threading.Thread):
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
+                auto_lie = ""
+                if not status.auto_lie_allowed:
+                    auto_lie = " · 自动测谎已停用"
+                # 测谎 statistics follow the always-visible authorization hint:
+                # the server counts every accounted lie event per device and
+                # already returns the three totals in the activation, heartbeat
+                # and lie-accounting response (licensing._with_server_device),
+                # so the operator reads them where the account state is shown
+                # instead of in a panel of its own.  Wording matches the
+                # operator console's 测谎：总 / 成功 / 失败 column.
+                lie_stats = (
+                    f" · 测谎：总 {status.lie_detect_total}"
+                    f" / 成功 {status.lie_detect_success_total}"
+                    f" / 失败 {status.lie_detect_failed_total}"
+                )
+                lie_quota = (
+                    f" · 剩余 {status.remaining_auto_lie_count}"
+                    if status.remaining_auto_lie_count is not None else ""
+                )
                 label.configure(
-                    text=(f"验证成功 · {status.edition.upper()} · 到期：{expiry} · "
-                          f"{memory}"),
+                    text=(f"验证成功 · {device_text} · 到期：{expiry} · "
+                          f"{memory}{lie_stats}{lie_quota}{auto_lie}"),
                     foreground="#17803d",
                 )
             else:
                 if status.code in {"server", "device_not_ready"}:
-                    text = f"{status.message} · {memory}"
+                    text = f"{status.message} · {device_text} · {memory}"
                 else:
-                    text = f"未授权 / 已过期：{status.message} · {memory}"
+                    text = f"未授权 / 已过期：{status.message} · {device_text} · {memory}"
                 label.configure(text=text, foreground="#202020")
         button = getattr(self, "_license_button", None)
         if button is not None:
             button.configure(text="更换授权" if status.valid else "激活授权")
+
+    def _copy_equipment_id(self, _event: Any = None) -> None:
+        """Copy the public server-issued device ID from the authorization bar."""
+
+        equipment_id = str(getattr(self._license_status, "equipment_id", "")).strip()
+        if len(equipment_id) != 8:
+            return
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(equipment_id)
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="设备码已复制。")
+            LOG.info("equipment ID copied to clipboard")
+        except Exception:
+            LOG.debug("equipment ID copy failed", exc_info=True)
+
+    def _apply_auto_lie_entitlement(self, status: LicenseStatus) -> None:
+        """Disable future auto-lie passes after a server accounting refusal.
+
+        A live pass is deliberately left alone; accounting happens after a
+        completed event, so only subsequent windows are disarmed.
+        """
+
+        if bool(getattr(status, "auto_lie_allowed", True)):
+            return
+        if hasattr(self, "_api_auto_lie_var"):
+            self._api_auto_lie_var.set(False)
+        self._api_auto_lie_session_armed = False
+        if hasattr(self, "_api_test_status"):
+            self._api_test_status.configure(text="自动过测谎：服务器已停用此设备。")
+        LOG.warning("auto-lie disabled by server device status")
 
     @staticmethod
     def _format_license_expiry(value: str) -> str:
@@ -3479,6 +3610,7 @@ class UiWorker(threading.Thread):
                      self._license_status.edition)
             self._set_license_visual_lock(False)
             self._shutdown_load_settings()
+            self._apply_auto_lie_entitlement(self._license_status)
             self._control_status.configure(text="授权已保存，自动功能已解锁。")
         else:
             self._refresh_license_ui()
@@ -3859,21 +3991,13 @@ class UiWorker(threading.Thread):
     def _api_test_backend_text(self) -> str:
         """Which backend 测试api will use, with the key's *source* (never the key itself).
 
-        The key is not configured in the panel: it travels with the application
-        (``autolie_api/key_secret.txt``), and ``LIE_PRODUCT_KEY`` overrides it for a future
-        release.  With neither, the local mimic is used so the button still works.
+        The key is never stored in the package.  It arrives only in a validated
+        heartbeat response and remains in process memory until app exit.
         """
 
-        try:
-            from autolie_api.key_store import load_product_key
-
-            key, source = load_product_key(getattr(self, "_api_test_key", ""))
-        except Exception:
-            LOG.debug("api test: the key source could not be resolved", exc_info=True)
-            key, source = "", "无"
-        if not str(key or "").strip():
-            return "本地模拟后端（不需要密钥）"
-        return f"真实后端（密钥来源：{source}）"
+        if not has_server_secret():
+            return "等待在线授权下发测谎密钥"
+        return "真实后端（密钥来源：授权服务器，仅运行内存）"
 
     def _api_test_status_text(self) -> str:
         video = getattr(self, "api_test_video", "")
@@ -3916,7 +4040,14 @@ class UiWorker(threading.Thread):
             self._set_api_test_status("测试api: 无法创建视频窗口（详见运行日志）。")
             return
         display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
-        key = getattr(self, "_api_test_key", "")
+        key = get_server_secret()
+        if not key:
+            try:
+                window.close()
+            except Exception:
+                pass
+            self._set_api_test_status("测试api: 等待在线授权下发测谎密钥。")
+            return
         try:
             worker = factory(video=video, results=self.api_test_results, display=display,
                              seconds=seconds, key=key)
@@ -4092,6 +4223,10 @@ class UiWorker(threading.Thread):
                 elif state == "done":
                     self._set_api_test_status(f"测试api 完成: {detail}")
                     self._play_action_sound(True)
+                    # A completed manual API drill uses the same upstream
+                    # service as an in-game pass.  Count it immediately so
+                    # the authorization bar reflects the server response.
+                    self._enqueue_auto_lie_accounting("api-test")
                     self._api_test_idle()
                 elif state == "stopped":
                     self._set_api_test_status(f"测试api 已停止: {detail}")
@@ -4270,6 +4405,11 @@ class UiWorker(threading.Thread):
 
         if not self._license_allowed():
             LOG.info("自动过测谎: ignored because license is not valid")
+            return
+        if not has_server_secret():
+            LOG.warning("自动过测谎: server credential is unavailable; pass was not started")
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(text="自动过测谎: 等待在线授权下发测谎密钥。")
             return
         if not hasattr(self, "_api_auto_lie_var"):
             LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
@@ -4604,6 +4744,32 @@ class UiWorker(threading.Thread):
         LOG.info("自动过测谎: worker result %s", text)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text=f"自动过测谎: {text}")
+        # One automatic pass produces exactly one durable accounting event.
+        if state not in {"done", "failed"}:
+            return
+        worker_id = id(worker)
+        if self._accounted_auto_lie_worker_id == worker_id:
+            return
+        self._accounted_auto_lie_worker_id = worker_id
+        self._enqueue_auto_lie_accounting("automatic")
+
+    def _enqueue_auto_lie_accounting(self, source: str) -> None:
+        """Durably report one completed API use as success without delay.
+
+        Both the automatic game pass and the manual video drill use this
+        isolated post-pass path.  It never blocks their live WebSocket work.
+        """
+
+        try:
+            event_id = self._lie_accounting_worker.enqueue("success")
+            LOG.info(
+                "自动过测谎: %s completed; immediate success accounting event=%s",
+                source, event_id[:8],
+            )
+        except Exception:
+            # The completed pass must remain independent from a local
+            # persistence problem; a later run can still operate normally.
+            LOG.warning("自动过测谎: immediate accounting could not be queued", exc_info=True)
 
     def auto_lie_pass_active(self) -> bool:
         """Whether an automatic API lie pass may be stopped by Esc."""

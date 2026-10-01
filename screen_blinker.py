@@ -33,6 +33,32 @@ def _shade(rgb: tuple[int, int, int], amount: int) -> tuple[int, int, int]:
     return tuple(max(0, min(255, channel + amount)) for channel in rgb)
 
 
+def _capture_pixel_to_screen(
+    window_rect: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+    x: int,
+    y: int,
+) -> tuple[int, int]:
+    """Map a captured bitmap pixel to the display-only overlay position.
+
+    Game input keeps Windows' logical client rectangle.  GDI capture can be
+    DPI-virtualized, however, producing a physical bitmap with different
+    width/height.  Scaling its pixels through that logical rectangle makes
+    diagnostic overlays visibly too large.  In that mismatch case the bitmap
+    pixels are already screen pixels relative to the captured client origin.
+    """
+
+    left, top, right, bottom = window_rect
+    image_width, image_height = image_size
+    logical_width, logical_height = right - left, bottom - top
+    if abs(logical_width - image_width) > 1 or abs(logical_height - image_height) > 1:
+        return left + int(x), top + int(y)
+    return (
+        left + round(x * logical_width / image_width),
+        top + round(y * logical_height / image_height),
+    )
+
+
 class ScreenBlinker(threading.Thread):
     """Show a short red full-screen overlay twice for each queued alert.
 
@@ -111,10 +137,12 @@ class ScreenBlinker(threading.Thread):
         screen_regions: list[tuple[str, tuple[int, int, int, int], int]] = []
         for name, box, color in regions:
             box_left, box_top, box_right, box_bottom = box
-            x1 = left + round(box_left * client_width / image_width)
-            y1 = top + round(box_top * client_height / image_height)
-            x2 = left + round(box_right * client_width / image_width)
-            y2 = top + round(box_bottom * client_height / image_height)
+            x1, y1 = _capture_pixel_to_screen(
+                window_rect, image_size, box_left, box_top
+            )
+            x2, y2 = _capture_pixel_to_screen(
+                window_rect, image_size, box_right, box_bottom
+            )
             if x2 > x1 and y2 > y1:
                 screen_regions.append((name, (x1, y1, x2, y2), int(color)))
         if not screen_regions:
@@ -163,10 +191,12 @@ class ScreenBlinker(threading.Thread):
                 analysis_right,
                 analysis_top + round(lower * analysis_height),
             )
-            x1 = client_left + round(pixel_box[0] * client_width / image_width)
-            y1 = client_top + round(pixel_box[1] * client_height / image_height)
-            x2 = client_left + round(pixel_box[2] * client_width / image_width)
-            y2 = client_top + round(pixel_box[3] * client_height / image_height)
+            x1, y1 = _capture_pixel_to_screen(
+                window_rect, image_size, pixel_box[0], pixel_box[1]
+            )
+            x2, y2 = _capture_pixel_to_screen(
+                window_rect, image_size, pixel_box[2], pixel_box[3]
+            )
             if x2 <= x1 or y2 <= y1:
                 continue
             base = _LAYER_COLORS_RGB[index % len(_LAYER_COLORS_RGB)]
@@ -221,10 +251,13 @@ class ScreenBlinker(threading.Thread):
                 continue
             pixel_x = analysis_left + round(point_x * analysis_width)
             pixel_y = analysis_top + round(point_y * analysis_height)
+            screen_x, screen_y = _capture_pixel_to_screen(
+                window_rect, image_size, pixel_x, pixel_y
+            )
             screen_points.append((
                 str(kind),
-                client_left + round(pixel_x * client_width / image_width),
-                client_top + round(pixel_y * client_height / image_height),
+                screen_x,
+                screen_y,
             ))
         if not screen_points:
             return

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
+import logging
 import threading
 import time
 from typing import Any, Mapping, Optional, Protocol, Sequence
@@ -15,6 +16,8 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 import cv2
 import numpy as np
 from PIL import Image
+
+LOG = logging.getLogger(__name__)
 
 
 Box = tuple[int, int, int, int]
@@ -33,6 +36,23 @@ def hud_scale_for(client_width: int) -> float:
     """Return the HUD scale factor for a client of ``client_width`` px."""
 
     return min(1.0, float(client_width) / HUD_REFERENCE_WIDTH)
+
+
+def minimap_search_box(
+    fallback_region: NormalizedBox, client_width: int, *, include_header: bool = True
+) -> tuple[float, float, float, float]:
+    """Return the broad client-pixel minimap search box.
+
+    The minimap window begins at the client top edge.  The measured minimap
+    geometry remains dynamic; this is only its sufficiently broad search
+    region, expressed in the same captured-pixel coordinate space.
+    """
+
+    scale = hud_scale_for(client_width)
+    left, top, right, bottom = fallback_region
+    if include_header:
+        return (left * scale, 0.0, right * scale, max(bottom, 400) * scale)
+    return (left * scale, top * scale, right * scale, bottom * scale)
 
 
 def _clamp_box(box: Box, width: int, height: int) -> Box:
@@ -85,6 +105,12 @@ class MinimapDetection:
     confidence: float
     source: str
     map_name: Optional[str] = None
+    # True only when ``analysis_box``/``canvas_box`` are a MEASURED inner canvas
+    # (or a previously measured one reused).  It is display-only: the yellow
+    # marker/patrol overlay is not painted for a region that could not be
+    # measured, so a diagnostic rectangle can never claim the whole minimap
+    # window as the map canvas.  Nothing about input or auto-lie reads it.
+    canvas_measured: bool = False
 
     @property
     def window_size(self) -> tuple[int, int]:
@@ -107,6 +133,31 @@ def is_verified_border(detection: MinimapDetection) -> bool:
     return detection.source.startswith("opencv")
 
 
+# The minimap window is a panel: the map canvas sits inside it, below a header
+# strip (map name / buttons) and above a thin footer.  Those are NOT a fixed
+# height and NOT a fixed offset from the window's bottom - the game does not
+# rescale this HUD uniformly (measured canvas: ~262x152 at 1366, ~89x118 at
+# 1080x768, and a 195x255 window whose canvas is 182x148 on the older client) -
+# so the canvas is measured from the captured pixels themselves.  The inner
+# border is drawn as a rectangle: its contour is the measurement, and these
+# bounds only reject a candidate that cannot be a canvas of this window.
+INNER_CANVAS_MIN_WIDTH_SHARE = 0.50
+INNER_CANVAS_MIN_HEIGHT_SHARE = 0.15
+INNER_CANVAS_MIN_AREA_SHARE = 0.20
+# The window's own border is 1-3 px thick; a canvas candidate must be strictly
+# inside it, so the measurement can never return the window itself.
+INNER_CANVAS_EDGE_MARGIN = 1
+# Adopting a newly measured canvas that only jitters by a few pixels would shift
+# every normalized marker coordinate with it.  Keep the remembered one instead.
+INNER_CANVAS_JITTER_TOLERANCE = 3
+
+
+def _box_text(box: Box) -> str:
+    """``(left, top, right, bottom)`` for a log line."""
+
+    return "(%d, %d, %d, %d)" % tuple(int(value) for value in box)
+
+
 def _is_fallback_search_geometry(box: Box, image_size: tuple[int, int]) -> bool:
     """Return whether a saved box is the old broad fallback search region.
 
@@ -118,7 +169,9 @@ def _is_fallback_search_geometry(box: Box, image_size: tuple[int, int]) -> bool:
 
     width, _height = image_size
     scale = hud_scale_for(width)
-    expected = (0, round(50 * scale), round(400 * scale), round(320 * scale))
+    expected = tuple(round(value) for value in minimap_search_box(
+        (0, 50, 400, 320), width
+    ))
     tolerance = max(3, round(4 * scale))
     return (
         box[0] <= tolerance
@@ -242,6 +295,7 @@ class MinimapDetector:
         transient_hold_seconds: float = 1.0,
         box_history: int = 5,
         box_jump_ratio: float = 0.25,
+        include_header: bool = True,
     ) -> None:
         # The game HUD is fixed pixel above ~1366px client width: the minimap
         # occupies the same absolute pixels at any window resolution in that
@@ -252,6 +306,7 @@ class MinimapDetector:
         self.fallback_region = fallback_region
         self.map_name_reader = map_name_reader
         self.dedicated_crop = bool(dedicated_crop)
+        self.include_header = bool(include_header)
         self.opencv_size = (
             (max(96, int(opencv_size[0])), max(96, int(opencv_size[1])))
             if opencv_size is not None else None
@@ -292,14 +347,36 @@ class MinimapDetector:
         self._last_good: Optional[MinimapDetection] = None
         self._last_good_image_size: Optional[tuple[int, int]] = None
         self._last_good_at = float("-inf")
+        # The canvas measured from the captured border earlier in this map
+        # session.  It is what a frame with an unreadable inner border reuses,
+        # so the map coordinate frame never falls back to the whole window.
+        self._measured_canvas: Optional[Box] = None
+        self._measured_canvas_size: Optional[tuple[int, int]] = None
+        self._last_canvas_log: Optional[str] = None
         self._state_lock = threading.Lock()
+        # The outer minimap window is useful for finding the widget, but its
+        # header is not map coordinate space.  Maintain a separate detector
+        # that starts below that header and dynamically measures the canvas.
+        self._canvas_detector: Optional[MinimapDetector] = None
+        if self.include_header and self.dedicated_crop:
+            self._canvas_detector = MinimapDetector(
+                fallback_region=fallback_region,
+                map_name_reader=None,
+                dedicated_crop=True,
+                opencv_size=self.opencv_size,
+                transient_hold_seconds=transient_hold_seconds,
+                box_history=box_history,
+                box_jump_ratio=box_jump_ratio,
+                include_header=False,
+            )
 
     def _scaled_fallback_region(self, client_width: int) -> tuple[float, float, float, float]:
         """Scale the reference fallback region to the current client width."""
 
-        scale = hud_scale_for(client_width)
-        left, top, right, bottom = self.fallback_region
-        return (left * scale, top * scale, right * scale, bottom * scale)
+        return minimap_search_box(
+            self.fallback_region, client_width,
+            include_header=self.include_header,
+        )
 
     def reset_geometry(self) -> None:
         """Forget the previous map's minimap frame before a patrol starts.
@@ -320,6 +397,11 @@ class MinimapDetector:
             self._last_good = None
             self._last_good_image_size = None
             self._last_good_at = float("-inf")
+            self._measured_canvas = None
+            self._measured_canvas_size = None
+            self._last_canvas_log = None
+        if self._canvas_detector is not None:
+            self._canvas_detector.reset_geometry()
 
     def seed_geometry(
         self, detection: MinimapDetection, image_size: tuple[int, int]
@@ -378,6 +460,182 @@ class MinimapDetector:
             self._last_good_image_size = image_size
             self._last_good_at = time.monotonic()
         return detection
+
+    def _measure_inner_canvas(
+        self, image: Image.Image, window_box: Box
+    ) -> Optional[Box]:
+        """Measure the map canvas from the captured pixels inside the window.
+
+        The canvas is the map panel's own inner rectangle: the largest closed
+        border contour that is strictly inside the minimap window and covers a
+        substantial part of it.  Its top and bottom come from that border, so
+        the header and footer are excluded by measurement, never by a fixed
+        height, a fixed bottom offset or a proportion of the window.
+
+        Returns ``None`` when the frame shows no usable inner border; the
+        caller then reuses the last verified canvas rather than inventing one.
+        """
+
+        window_box = _clamp_box(window_box, *image.size)
+        left, top, right, bottom = window_box
+        width, height = right - left, bottom - top
+        if width < 16 or height < 16:
+            return None
+        try:
+            gray = cv2.cvtColor(
+                np.asarray(image.crop(window_box).convert("RGB")),
+                cv2.COLOR_RGB2GRAY,
+            )
+        except (ValueError, OSError):
+            return None
+        margin = INNER_CANVAS_EDGE_MARGIN
+        # The plain threshold is the faithful measurement, so a NESTED canvas
+        # rectangle it finds wins immediately.  A fainter border and a border
+        # broken by map artwork are consulted otherwise, because closing the
+        # edge map can merge the canvas with the artwork and widen the box.
+        passes = (
+            (cv2.Canny(gray, 45, 140), None),
+            (cv2.Canny(gray, 30, 90), None),
+            (cv2.Canny(gray, 45, 140), "close"),
+        )
+        loose: Optional[Box] = None
+        for edges, mode in passes:
+            if mode == "close":
+                edges = cv2.morphologyEx(
+                    edges, cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1)),
+                )
+                edges = cv2.morphologyEx(
+                    edges, cv2.MORPH_CLOSE,
+                    cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
+                )
+            nested, candidate = self._canvas_candidate_from_edges(
+                edges, width, height, margin
+            )
+            if nested and candidate is not None:
+                return (
+                    left + candidate[0],
+                    top + candidate[1],
+                    left + candidate[2],
+                    top + candidate[3],
+                )
+            if candidate is not None and (
+                loose is None
+                or self._box_area(candidate) > self._box_area(loose)
+            ):
+                loose = candidate
+        if loose is None:
+            return None
+        return (
+            left + loose[0],
+            top + loose[1],
+            left + loose[2],
+            top + loose[3],
+        )
+
+    @staticmethod
+    def _box_area(box: Box) -> int:
+        return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+    @staticmethod
+    def _canvas_candidate_from_edges(
+        edges: np.ndarray, width: int, height: int, margin: int
+    ) -> tuple[bool, Optional[Box]]:
+        """Best canvas rectangle in one edge map: ``(nested, box)``.
+
+        The map canvas is the rectangle nested DIRECTLY inside the window's own
+        border, so when that border is in the edge map only first-level
+        rectangles are considered: anything nested deeper is map artwork or a
+        panel drawn inside the canvas, and adopting one would cut the character
+        marker out of the analysis region.  A frame whose edge map has no window
+        border can only offer a looser answer, which the caller accepts only
+        when no pass produced a nested canvas.
+        """
+
+        contours, hierarchy = cv2.findContours(
+            edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if hierarchy is None:
+            return False, None
+        parents = hierarchy[0][:, 3]
+
+        def rect_of(contour: np.ndarray) -> Box:
+            x, y, contour_width, contour_height = cv2.boundingRect(contour)
+            return (x, y, x + contour_width, y + contour_height)
+
+        def depth_of(index: int) -> int:
+            value = 0
+            parent = int(parents[index])
+            while parent != -1:
+                index, parent = parent, int(parents[parent])
+                value += 1
+            return value
+
+        boxes = [rect_of(contour) for contour in contours]
+        depths = [depth_of(index) for index in range(len(contours))]
+        has_window_border = any(
+            depths[index] == 0
+            and boxes[index][0] <= margin
+            and boxes[index][1] <= margin
+            and boxes[index][2] >= width - margin
+            and boxes[index][3] >= height - margin
+            for index in range(len(contours))
+        )
+        best: Optional[tuple[int, Box]] = None
+        for index, box in enumerate(boxes):
+            if has_window_border and depths[index] != 1:
+                continue
+            x, y, right, bottom = box
+            candidate_width, candidate_height = right - x, bottom - y
+            if candidate_width < width * INNER_CANVAS_MIN_WIDTH_SHARE:
+                continue
+            if candidate_height < height * INNER_CANVAS_MIN_HEIGHT_SHARE:
+                continue
+            if (x < margin or y < margin
+                    or right > width - margin or bottom > height - margin):
+                # This is the window's own border (or the search region), not
+                # an inner canvas: the canvas is inset on every side.
+                continue
+            share = (candidate_width * candidate_height) / float(width * height)
+            if share < INNER_CANVAS_MIN_AREA_SHARE:
+                continue
+            if best is None or share > best[0]:
+                best = (share, box)
+        if best is None:
+            return has_window_border, None
+        return has_window_border, best[1]
+
+    def _verified_canvas(self, image_size: tuple[int, int]) -> Optional[Box]:
+        """The canvas measured earlier in this map session, if there is one."""
+
+        with self._state_lock:
+            if (self._measured_canvas is None
+                    or self._measured_canvas_size != image_size):
+                return None
+            return self._measured_canvas
+
+    def _remember_canvas(self, box: Box, image_size: tuple[int, int]) -> Box:
+        """Remember a measured canvas, keeping the frame stable while it jitters."""
+
+        with self._state_lock:
+            remembered = self._measured_canvas
+            if (remembered is not None
+                    and self._measured_canvas_size == image_size
+                    and max(
+                        abs(box[index] - remembered[index]) for index in range(4)
+                    ) <= INNER_CANVAS_JITTER_TOLERANCE):
+                return remembered
+            self._measured_canvas = box
+            self._measured_canvas_size = image_size
+            return box
+
+    def _note_canvas(self, message: str) -> None:
+        """Log the canvas decision once per distinct outcome, not per frame."""
+
+        if self._last_canvas_log == message:
+            return
+        self._last_canvas_log = message
+        LOG.info("INNER CANVAS: %s", message)
 
     def _analysis_crop(self, image: Image.Image) -> tuple[Image.Image, Optional[Box]]:
         """Return the image OpenCV analyzes plus its offset inside the frame.
@@ -623,6 +881,19 @@ class MinimapDetector:
 
         candidates: list[tuple[float, Box, float]] = []
         rectangles: list[tuple[Box, float]] = []
+
+        def is_origin_minimap_border(
+            x: int, y: int, candidate_width: int, candidate_height: int
+        ) -> bool:
+            """Accept a substantial top-left frame despite Canny area noise."""
+
+            return (
+                self.include_header
+                and self.dedicated_crop
+                and x <= 3 and y <= 3
+                and candidate_width >= minimum_side
+                and candidate_height >= minimum_side
+            )
         # The minimap is a large fraction of the search region (measured
         # ~380x250 in a 400x280 box).  Tiny contours - a UI button, the map
         # name strip, a minimap child rectangle - are NOT the minimap border:
@@ -646,7 +917,10 @@ class MinimapDetector:
                 continue
             rectangle_area = float(candidate_width * candidate_height)
             rectangularity = abs(float(cv2.contourArea(contour))) / rectangle_area
-            if rectangularity < 0.72:
+            origin_minimap_border = is_origin_minimap_border(
+                x, y, candidate_width, candidate_height
+            )
+            if rectangularity < 0.72 and not origin_minimap_border:
                 continue
             aspect = candidate_width / candidate_height
             # Expanded minimaps can become much wider without changing height.
@@ -674,6 +948,10 @@ class MinimapDetector:
             # minimap geometry and must win deterministically.
             area_ratio = rectangle_area / float(width * height)
             score = rectangularity * 0.65 + min(area_ratio / 0.20, 1.0) * 0.35
+            if origin_minimap_border:
+                # The full minimap frame encloses an inner canvas with a
+                # cleaner Canny contour.  Prefer the full coordinate frame.
+                score += 0.50
             candidates.append((score, candidate_box, rectangularity))
 
         if not candidates:
@@ -756,6 +1034,62 @@ class MinimapDetector:
         window_box, analysis_box, canvas_box = self._stabilize_boxes(
             window_box, analysis_box, canvas_box
         )
+        # Detectors without the separate canvas pass (a tight minimap crop, or
+        # the canvas pass itself) use the detected border as both regions, which
+        # is the historical behaviour and is measured geometry.
+        canvas_measured = True
+        if self._canvas_detector is not None:
+            canvas_detection = self._canvas_detector.detect(image)
+            canvas_measured = False
+            if canvas_detection.source.startswith("opencv"):
+                # This box begins below the title/header strip and ends at
+                # the actual map-panel border.  It is the only coordinate
+                # frame used for marker, patrol, rope, and layer logic.
+                analysis_box = canvas_detection.window_box
+                canvas_box = canvas_detection.canvas_box
+                canvas_measured = True
+            elif canvas_box != window_box:
+                # The outer pass sometimes already found an inner contour;
+                # retain that measured candidate rather than enlarging the
+                # analysis area back to the complete minimap window.
+                analysis_box = canvas_box
+                canvas_measured = True
+            else:
+                # Neither pass produced a closed inner border on this frame.
+                # Measure it from the captured pixels; when even that fails,
+                # reuse the canvas measured earlier in this session.  The
+                # analysis region is NEVER enlarged back to the whole minimap
+                # window just because the inner border is hard to read.
+                measured = self._measure_inner_canvas(image, window_box)
+                if measured is not None:
+                    analysis_box = self._remember_canvas(measured, original_size)
+                    canvas_box = analysis_box
+                    canvas_measured = True
+                    self._note_canvas("measured " + _box_text(analysis_box))
+                else:
+                    remembered = self._verified_canvas(original_size)
+                    if remembered is not None:
+                        analysis_box = remembered
+                        canvas_box = remembered
+                        canvas_measured = True
+                        self._note_canvas(
+                            "reused " + _box_text(remembered)
+                            + " (this frame's inner border is not readable)"
+                        )
+                    else:
+                        # Nothing has ever been measured for this client size:
+                        # keep the historical analysis region and mark the
+                        # canvas unmeasured, so the diagnostic yellow rectangle
+                        # is simply not drawn instead of covering the window.
+                        canvas_measured = False
+                        self._note_canvas(
+                            "not measurable and none remembered; the analysis "
+                            "region stays the detected minimap window and no "
+                            "yellow marker region is drawn"
+                        )
+            if not canvas_measured:
+                analysis_box = window_box
+                canvas_box = window_box
         # The MAP NAME is a fixed strip ABOVE the minimap (measured ~64px
         # tall): its crop must read that strip from the ORIGINAL image, not
         # the search crop (which starts below it at y=50).  The name crop is
@@ -781,6 +1115,11 @@ class MinimapDetector:
             )
         map_name = self._read_map_name(image, map_name_box)
         confidence = float(np.clip(0.55 + rectangularity * 0.45, 0.0, 1.0))
+        if is_origin_minimap_border(
+            window_box[0], window_box[1],
+            window_box[2] - window_box[0], window_box[3] - window_box[1],
+        ):
+            confidence = max(confidence, 0.85)
         return self._remember_good(MinimapDetection(
             window_box=window_box,
             analysis_box=analysis_box,
@@ -789,6 +1128,7 @@ class MinimapDetector:
             confidence=confidence,
             source="opencv",
             map_name=map_name,
+            canvas_measured=canvas_measured,
         ), original_size)
 
     def _read_map_name(self, image: Image.Image, box: Box) -> Optional[str]:
@@ -842,6 +1182,9 @@ class MinimapDetector:
             map_name_box=map_name_box,
             confidence=0.0,
             source="fallback",
+            # The fallback region is a broad SEARCH area, not the minimap and
+            # not a canvas: nothing here was measured from a border.
+            canvas_measured=False,
         )
 
 
