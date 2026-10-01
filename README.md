@@ -19,7 +19,10 @@ Normal package:
 2. Run `安装.bat` once. Approve the single Windows permission prompt when requested.
 3. Run `启动助手.bat`.
 
-There is no separate CPU/CUDA edition: automatic lie handling uses the configured remote API rather than a local model runtime.
+TodoHelper has one product edition. Licenses no longer select NORMAL or NP:
+the server issues one unified license type and the desktop does not gate
+features by an edition label. Legacy signed NORMAL/NP documents remain valid
+only for compatibility.
 
 Standalone package:
 
@@ -140,6 +143,11 @@ additive `autolie_fingerprint_usage` object updates the same authorization line
 at once with the total, success, failure, and remaining usage values. The
 durable local queue remains only for retrying an unavailable server; it does
 not intentionally delay a completed report.
+
+The operator console shows an activation code's **设备绑定** as this public
+equipment ID rather than a fingerprint fragment. The device list has an
+operator-only **备注** field: setting, replacing, or clearing it never reaches
+the desktop client or license document.
 
 ### Server deployment, updates, and client compatibility
 

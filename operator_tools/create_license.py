@@ -21,7 +21,6 @@ from licensing import LICENSE_FORMAT, activation_code, machine_binding_from_requ
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--private-key", type=Path, required=True)
-    parser.add_argument("--edition", choices=("normal", "np"), default="normal")
     parser.add_argument("--expires", help="UTC ISO timestamp, e.g. 2027-01-01T00:00:00Z")
     parser.add_argument("--permanent", action="store_true")
     parser.add_argument("--license-id", default="")
@@ -46,7 +45,7 @@ def main() -> int:
         "format": LICENSE_FORMAT,
         "license_id": args.license_id.strip() or secrets.token_urlsafe(10),
         "issued_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "edition": args.edition,
+        "edition": "normal",
         "permanent": bool(args.permanent),
         "expires_at": None if args.permanent else args.expires,
         "machine_binding": binding,

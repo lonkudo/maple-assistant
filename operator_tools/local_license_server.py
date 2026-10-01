@@ -57,7 +57,7 @@ def _new_code() -> str:
     return "MAL-" + secrets.token_urlsafe(8).replace("_", "A").replace("-", "B")
 
 
-def issue(database_path: Path, edition: str, permanent: bool, expires_at: str | None) -> str:
+def issue(database_path: Path, permanent: bool, expires_at: str | None) -> str:
     if permanent == bool(expires_at):
         raise ValueError("Choose exactly one of permanent or expires_at.")
     code = _new_code()
@@ -65,7 +65,7 @@ def issue(database_path: Path, edition: str, permanent: bool, expires_at: str | 
     with _connect(database_path) as database:
         database.execute(
             "INSERT INTO licenses (activation_code, license_id, edition, permanent, expires_at, issued_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (code, str(uuid.uuid4()), edition, int(permanent), expires_at, issued),
+            (code, str(uuid.uuid4()), "normal", int(permanent), expires_at, issued),
         )
     return code
 
@@ -154,7 +154,6 @@ def main() -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
     issue_parser = subcommands.add_parser("issue")
     issue_parser.add_argument("--db", type=Path, required=True)
-    issue_parser.add_argument("--edition", choices=("normal", "np"), default="normal")
     issue_parser.add_argument("--permanent", action="store_true")
     issue_parser.add_argument("--expires")
     serve_parser = subcommands.add_parser("serve")
@@ -164,7 +163,7 @@ def main() -> int:
     serve_parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if args.command == "issue":
-        print(issue(args.db, args.edition, args.permanent, args.expires))
+        print(issue(args.db, args.permanent, args.expires))
         return 0
     server = ThreadingHTTPServer((args.host, args.port), _handler(args.db, args.private_key))
     print(f"Local licensing server listening at http://{args.host}:{args.port}")

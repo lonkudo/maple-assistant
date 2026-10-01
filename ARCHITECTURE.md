@@ -122,6 +122,20 @@ it on its Tk thread and redraws the always-visible 设备码/usage line immediat
 Routine local license checks retain this online state for the same license,
 rather than erasing heartbeat data that local signed documents cannot contain.
 
+### Unified license edition and device notes
+
+Licensing no longer has NORMAL/NP product behavior. New server-issued records
+use the single compatible `normal` wire value, while the desktop accepts older
+signed NORMAL/NP values without exposing an edition choice or enforcing a
+feature split. This keeps previously issued documents valid while making all
+future activation and feature gates identical.
+
+The operator console maps an activation code's stored fingerprint binding to
+the corresponding opaque `equipment_id` before displaying it. Raw fingerprint
+hashes stay off the operator-facing code table. `FingerprintSecurityState.memo`
+is an operator-only, bounded text field; device actions can set, replace, or
+clear it, and it is never returned to clients.
+
 ### Server deployment compatibility boundary
 
 The desktop application and `maple-assistant-server` are independently

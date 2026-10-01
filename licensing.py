@@ -46,8 +46,10 @@ PUBLIC_KEY_FILE = "license_public_key.json"
 LICENSE_FILE = "license.json"
 ACTIVATION_SERVER_ENDPOINT = "https://211.149.169.194:8443"
 ACTIVATION_SERVER_PIN_FILE = "activation_server_pin.json"
-EDITION_NORMAL = "normal"
-EDITION_NP = "np"
+# The signed legacy document keeps an edition field for wire compatibility,
+# but TodoHelper now has one product edition.  Existing normal/NP documents
+# remain valid; neither value changes available features.
+_LEGACY_EDITION_VALUES = {"normal", "np"}
 _FINGERPRINT_CACHE_SECONDS = 300.0
 _fingerprint_cache_lock = threading.Lock()
 _fingerprint_cache_at = 0.0
@@ -280,7 +282,7 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
         return LicenseStatus(False, "format", "授权文件版本不受支持。")
     license_id = str(payload.get("license_id", "")).strip()
     edition = str(payload.get("edition", "")).strip().casefold()
-    if not license_id or edition not in (EDITION_NORMAL, EDITION_NP):
+    if not license_id or edition not in _LEGACY_EDITION_VALUES:
         return LicenseStatus(False, "fields", "授权文件内容不完整。")
     if document_format == "maple-assistant-license/v2":
         try:
@@ -313,7 +315,7 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
     )
 
 
-def verify_license(root: Optional[Path] = None, *, edition: str = EDITION_NORMAL) -> LicenseStatus:
+def verify_license(root: Optional[Path] = None) -> LicenseStatus:
     """Verify the installed license without throwing into the application."""
 
     try:
@@ -323,8 +325,6 @@ def verify_license(root: Optional[Path] = None, *, edition: str = EDITION_NORMAL
     except (OSError, ValueError):
         return LicenseStatus(False, "unreadable", "授权文件无法读取。")
     status = _parse_document(document, root)
-    if status.valid and status.edition != edition.casefold():
-        return LicenseStatus(False, "edition", "此授权不适用于当前版本。", status.license_id, status.edition)
     return status
 
 
@@ -348,7 +348,7 @@ def document_from_activation(code: str) -> dict[str, Any]:
     return document
 
 
-def activate(code: str, root: Optional[Path] = None, *, edition: str = EDITION_NORMAL) -> LicenseStatus:
+def activate(code: str, root: Optional[Path] = None) -> LicenseStatus:
     """Validate an offline activation token and atomically persist it."""
 
     try:
@@ -356,8 +356,6 @@ def activate(code: str, root: Optional[Path] = None, *, edition: str = EDITION_N
     except ValueError as exc:
         return LicenseStatus(False, "activation", str(exc))
     status = _parse_document(document, root)
-    if status.valid and status.edition != edition.casefold():
-        status = LicenseStatus(False, "edition", "此授权不适用于当前版本。", status.license_id, status.edition)
     if not status.valid:
         return status
     return _persist_document(document, status, root)
@@ -423,21 +421,18 @@ def _with_server_device(status: LicenseStatus, answer: Any) -> LicenseStatus:
     )
 
 
-def activate_via_server(
-    code: str, root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
-) -> LicenseStatus:
+def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus:
     """Activate against the built-in, certificate-pinned licensing endpoint."""
 
     clear_server_secret()
     try:
-        SERVER_LOG.info("activation requested edition=%s", edition.casefold())
+        SERVER_LOG.info("activation requested")
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/activate",
             {
                 "activation_code": "".join(str(code).upper().split()),
                 "fingerprint": machine_fingerprint_hash(),
-                "edition": edition.casefold(),
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
@@ -456,22 +451,18 @@ def activate_via_server(
         SERVER_LOG.warning("activation failed category=%s", type(exc).__name__)
         return LicenseStatus(False, "server", "激活验证失败")
     status = _parse_document(document, root)
-    if status.valid and status.edition != edition.casefold():
-        status = LicenseStatus(False, "edition", "此授权不适用于当前版本。", status.license_id, status.edition)
     if not status.valid:
         SERVER_LOG.warning("activation response rejected category=%s", status.code)
         return status
     persisted = _with_server_device(_persist_document(document, status, root), answer)
     if persisted.valid:
-        SERVER_LOG.info("activation accepted license_id=%s edition=%s", persisted.license_id, persisted.edition)
+        SERVER_LOG.info("activation accepted license_id=%s", persisted.license_id)
     else:
         SERVER_LOG.warning("activation could not be saved category=%s", persisted.code)
     return persisted
 
 
-def validate_via_server(
-    root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
-) -> LicenseStatus:
+def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
     """Revalidate the saved entitlement through the pinned activation server.
 
     This is deliberately separate from local signature verification.  A
@@ -482,13 +473,13 @@ def validate_via_server(
 
     # Do not let an old in-memory key survive a failed/invalid revalidation.
     clear_server_secret()
-    local = verify_license(root, edition=edition)
+    local = verify_license(root)
     if not local.valid:
         return local
     if not local.license_id:
         return LicenseStatus(False, "server", "授权文件缺少在线验证信息。")
     try:
-        SERVER_LOG.info("license heartbeat requested edition=%s", edition.casefold())
+        SERVER_LOG.info("license heartbeat requested")
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/validate",
@@ -511,11 +502,6 @@ def validate_via_server(
         SERVER_LOG.warning("license heartbeat failed category=%s", type(exc).__name__)
         return LicenseStatus(False, "server", "激活验证失败")
     status = _parse_document(document, root)
-    if status.valid and status.edition != edition.casefold():
-        status = LicenseStatus(
-            False, "edition", "此授权不适用于当前版本。",
-            status.license_id, status.edition,
-        )
     if not status.valid:
         SERVER_LOG.warning("license heartbeat response rejected category=%s", status.code)
         return status
@@ -527,7 +513,7 @@ def validate_via_server(
 
 def report_lie_event_via_server(
     event_id: str, outcome: str, occurred_at: str,
-    root: Optional[Path] = None, *, edition: str = EDITION_NORMAL,
+    root: Optional[Path] = None,
 ) -> LicenseStatus:
     """Send completed-event accounting after the live auto-lie pass is over.
 
@@ -535,7 +521,7 @@ def report_lie_event_via_server(
     part in the live WebSocket/cursor path.
     """
 
-    local = verify_license(root, edition=edition)
+    local = verify_license(root)
     if not local.valid or not local.license_id:
         return local
     try:
@@ -571,7 +557,7 @@ def report_lie_event_via_server(
 
 
 __all__ = [
-    "ACTIVATION_PREFIX", "EDITION_NORMAL", "EDITION_NP", "LICENSE_FORMAT",
+    "ACTIVATION_PREFIX", "LICENSE_FORMAT",
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
     "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",

@@ -976,8 +976,8 @@ class UiWorker(threading.Thread):
             if local_license_status.valid else local_license_status
         )
         # Keep the UI honest while the immediate pinned validation is in
-        # flight.  A locally signed document is useful context (edition and
-        # expiry), but it is not an active online entitlement until the
+        # flight.  A locally signed document is useful context (expiry), but
+        # it is not an active online entitlement until the
         # server has accepted it for this session.
         self._license_online_validation_pending = bool(local_license_status.valid)
         self._license_session_locked = True
@@ -3408,7 +3408,7 @@ class UiWorker(threading.Thread):
             from tkinter import messagebox
             messagebox.showinfo(
                 "授权状态",
-                f"授权有效\n版本：{status.edition.upper()}\n到期：{expiry}",
+                f"授权有效\n到期：{expiry}",
                 parent=root,
             )
         except Exception:
@@ -3606,8 +3606,7 @@ class UiWorker(threading.Thread):
         if self._license_status.valid:
             self._license_session_locked = False
             self._refresh_license_ui()
-            LOG.info("license activated id=%s edition=%s", self._license_status.license_id,
-                     self._license_status.edition)
+            LOG.info("license activated id=%s", self._license_status.license_id)
             self._set_license_visual_lock(False)
             self._shutdown_load_settings()
             self._apply_auto_lie_entitlement(self._license_status)
