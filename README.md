@@ -52,6 +52,11 @@ The update icon in the title bar searches the Desktop, the running folder, and i
 - **World selection is a guarded double-click sequence.** The selected world row (for example 蘑菇仔) receives a double-click, a 0.5-second wait, then a second double-click only if the world page is still visible. If the first double-click has already opened the channel page, the second gesture is skipped so it cannot click a channel accidentally. The obsolete single-click and Enter confirmation fallback are not used for this step.
 - **After automatic lie handling, the assistant clicks the measured confirmation point** rather than sending Enter. The 1080×768 point is `(630, 428)`; other layouts use the 1366×768 reference point `(800, 472)` scaled by client width. The game is focused before this click, and patrol resumes only after the click attempt completes.
 
+### Current release behavior (v1.2.78 – v1.2.88)
+
+- **A return drop recognises the patrol floor it landed on even when the marker reads outside that floor's recorded band.** The drop used to end only on a strict band match over the patrol floors, so a character standing on the patrol floor whose recorded points sit elsewhere on the same platform kept sending Alt+Down. The landing now also accepts the at/below-bottom-floor and bounded nearest-floor answers ordinary patrol uses, once an Alt+Down chord has really moved the marker down and the reading has held for two settled frames. The world-Y tracker is never used for the landing. See *Dropping back into the route from a higher floor*.
+- **The map canvas (the yellow marker/patrol rectangle) is measured from the captured minimap, never estimated from the minimap window.** The old fallback derived the canvas from the outer frame's proportions (a fixed header height and bottom offset), and when the inner border was unreadable it widened the region back to the whole minimap window. It is now the border rectangle nested directly inside the window's border, measured per frame; an unreadable frame reuses the canvas measured earlier in the session, and when none exists the yellow rectangle is not drawn at all instead of covering the window. See *The map canvas and the detection overlay*.
+
 ## Configuration
 
 Two configuration files keep personal settings separate from shipped defaults:
@@ -76,6 +81,15 @@ their SHA-256 hashes, binds one code to one device on first activation, and
 starts a time-limited expiry then. A device may own multiple separately issued
 codes; each individual code can bind to only one device. Ten failed activations
 for one fingerprint within 24 hours ban that fingerprint.
+
+That fingerprint ban is the only ban the client endpoints apply. The source-IP
+ban is a separate and independent policy owned by the operator website
+(`/lonkudo/` and `/console/api/`); `/api/v1/activate`, `/api/v1/validate`, and
+`/api/v1/lie-events` never count, clear, or enforce an IP ban. A customer's
+failed attempts therefore cannot ban the public address that other customers
+share, and an address banned on the website never blocks activation or a
+heartbeat. Neither ban can be cleared by the other, and the website policy is
+inert until its reverse-proxy address header is configured on the server side.
 
 The activation address is built into the desktop client:
 `https://211.149.169.194:8443`. Customers enter only their activation code;
@@ -108,9 +122,45 @@ locks automation and removes that signed document, so the rejected state also
 persists after restart. A connection, TLS, or server-configuration failure is
 reported separately and does not erase a previously saved entitlement.
 
-Online auto-lie session/key delivery remains deliberately separate from the
-existing auto-lie adapter until the versioned server-client session protocol is
-completed.
+After a successful online activation or heartbeat, the server may include the
+auto-lie credential in that already pinned, authenticated response. The client
+keeps it only in process memory, refreshes it on the three-hour heartbeat, and
+destroys it when the application exits. It is never written to
+`user_config.json`, `license.json`, a release ZIP, or a client log. The
+credential remains separate from both signed-license validation and the vendor
+WebSocket adapter.
+
+### Server deployment, updates, and client compatibility
+
+The server lives in the separate `maple-assistant-server` repository. A remote
+server agent should work there only; it must not copy desktop code, release
+ZIPs, `license.json`, activation inventories, or any private key into that
+repository. Its authoritative update guide is that repository's `README.md`.
+
+For a normal server update, commit and push the server repository, then on the
+server pull the exact commit, load its `.env`, install changed requirements,
+run Django migrations, and restart Gunicorn only after migrations succeed.
+Keep the previous deployed commit available for rollback. Check the pinned
+`/api/v1/validate` endpoint and `/lonkudo/` after every restart; never test a
+production update by changing a customer's client endpoint.
+
+**Existing clients remain compatible only when the server preserves all of
+these contracts:** the same HTTPS address and TLS key/pin, the same
+`LICENSE_SIGNING_PRIVATE_KEY`, the existing PostgreSQL data, and the existing
+versioned `/api/v1/activate` and `/api/v1/validate` response fields. New
+response fields must be additive and optional. In particular, an older client
+ignores the optional `auto_lie` response object; it must never be made a
+requirement for license validation.
+
+If a new server deployment fails, roll back the server code while retaining the
+database, TLS key, and signing key. The desktop application validates online
+immediately at launch, so a newly started client becomes grey and locked while
+the service is unavailable. A client already running from a successful
+validation remains active only until its next three-hour heartbeat; a failed
+heartbeat locks automation. Therefore restore the compatible server promptly
+rather than asking customers to replace their client files. Do not roll back
+the database schema by hand; prefer an additive migration followed by a code
+rollback that still understands the newer schema.
 
 ## Interface layout
 
@@ -135,7 +185,33 @@ Each layer's row has an axis band beside its name. **Right-click the axis** to o
 
 The minimap detector first finds the actual map border and calculates marker coordinates relative to that border. A broad search rectangle may help locate a map, but it is never saved as map geometry. This matters when the minimap size changes between maps or when the UI temporarily covers part of the game window.
 
+Inside that border the detector also measures the **map canvas** — the map panel's own inner rectangle, below the minimap header and above its footer. It is measured from the captured pixels: the canvas is the border rectangle nested directly inside the window's border, inset on every side, and it is never a fixed height, a fixed bottom offset, or a proportion of the window, because the game does not rescale this HUD uniformly between client widths. A frame whose inner border cannot be read (map artwork covering it) reuses the canvas measured earlier in the same session; when nothing has been measured yet for that client size, no canvas is claimed at all. See *The map canvas and the detection overlay*.
+
 At patrol start, the assistant focuses the game, uses the recorded minimap geometry, identifies the current layer, and either starts that layer’s route or begins the recorded return path. The selected layer is visible in the UI, and optional minimap overlays can show the recorded layer bands for inspection.
+
+### The map canvas and the detection overlay
+
+The startup detection overlay flashes three regions, and only the first is the minimap window itself:
+
+| Colour | Region | Source |
+| --- | --- | --- |
+| Green | the minimap window | the measured outer border |
+| Yellow | the map canvas: the marker and patrol analysis region | the measured inner border |
+| Blue | the HP/MP status capture area | fixed HUD geometry |
+
+The yellow rectangle is the canvas the assistant actually reads the character marker from, so it must not wander into the minimap header or footer. It is resolved in this order:
+
+1. the separate inner-border detector's own measurement (including its held previous result);
+2. an inner contour the outer minimap pass already found;
+3. the pixel measurement described below;
+4. the canvas measured earlier in the same session — a few pixels of frame-to-frame jitter keep the remembered box, so the coordinate frame does not shift while the character stands still;
+5. otherwise **no yellow rectangle is drawn at all**, and the log says so. Enlarging it back to the whole minimap window is never an option: a rectangle that claims the window (or the broad search region) as the map canvas is worse than no rectangle.
+
+The pixel measurement (`minimap_detector._measure_inner_canvas`) takes the detected window from the same frame, finds its border contour tree, and accepts the largest rectangle nested directly inside that border which is inset on every side, at least half the window's width, at least 15% of its height and at least 20% of its area. Rectangles nested deeper are map artwork or a panel drawn inside the canvas, and adopting one would cut the character marker out of the analysis region. A faint border and a border broken by artwork are covered by two further passes over the same crop; the plain pass is preferred because closing an edge map can merge the canvas with the artwork.
+
+The log states which branch produced the rectangle, once per distinct outcome: `INNER CANVAS: measured (6, 90, 188, 238)`, `INNER CANVAS: reused (6, 90, 188, 238) (this frame's inner border is not readable)`, or `INNER CANVAS: not measurable and none remembered; the analysis region stays the detected minimap window and no yellow marker region is drawn`.
+
+Everything above is display and analysis geometry. The overlay rectangles are converted from capture pixels to screen pixels only for painting (`screen_blinker._capture_pixel_to_screen`), and the logical window rectangle used by game input and the auto-lie cursor workflow is unchanged.
 
 ### Directional jump points
 
@@ -179,6 +255,17 @@ A frame in which no recorded floor matches while a climb owns Up is the characte
 A floor without a recorded rope no longer inherits the legacy profile-wide `rope.x`. The climb target is that floor's own recorded rope, or — when there is none — its recorded jump point nearest that legacy X, which is the operator's own way onto the rope: `ROPE TARGET: layer2 has no recorded rope; using its recorded jump point x=0.469298 as the rope approach`. The legacy `rope.x` walked the character to a rope that floor never recorded (on layer2 it went off the platform and dropped to layer1). When a floor has neither a rope nor a jump point, the return stands still and logs it instead of walking to the legacy X.
 
 A return is still a return: the patrol range selected in the layer panel decides which floors may be patrolled, and an out-of-range floor can only ever be used as the way home. A floor used as a waypoint needs its rope — or at least the jump point that mounts it — recorded.
+
+### Dropping back into the route from a higher floor
+
+A return drop (a reconnect or a fall that left the character above the patrol range) ends only when the landing floor is recognised, and it is recognised from the marker:
+
+- The marker's own recorded band is direct evidence and is accepted immediately, exactly as before.
+- A landing away from the recorded row matches no band at all — the operator's own map: layer1's points were saved at 0.676829 while the character stands at 0.713415 further down the same platform. The same marker-only answers ordinary patrol already uses resolve it: first the bottom recorded floor when the marker reads at or below its band (nothing is recorded lower, so the descent cannot continue; `_finish_return` then either patrols that floor or climbs back when the patrol range starts above it), then the bounded nearest recorded patrol floor (`if the character can't find a layer he should anchor to the nearest layer`).
+- Both relaxed answers need real drop evidence first: at least one Alt+Down chord actually sent, and the marker moved down by at least `RECONNECT_DROP_Y_PROGRESS` (0.006) from where the descent began. They also need the reading to be **settled**: a character falling *through* the floor sweeps the marker down the minimap (the 14:38 log ran 0.372 → 0.397 → 0.409 → 0.445 → 0.482, about 0.027 per frame) and must never be read as a landing. The answer must hold for two consecutive settled frames (`DROP_ARRIVAL_CONFIRM_FRAMES`).
+- The scroll-compensated world-Y tracker is deliberately **never** consulted for the landing: at a fresh start above the route its origin is anchored to the route's *top* floor while the character is still above it, so it would end the drop before the first Alt+Down chord.
+
+The landing evidence belongs to one descent. It is cleared on a fresh patrol start and once the return mode ends, and it survives a frame in which the marker is momentarily lost so one missing reading cannot restart the measured descent. The log names the floor and the evidence: `DROP TO ROUTE: accepting layer3 as the landing floor (marker y=0.408000 matches no patrol-floor band; the drop moved the marker 0.078000 down and the reading held for 2 frames); restarting patrol`.
 
 ### Attack modes
 
