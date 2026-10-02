@@ -34,7 +34,11 @@ from patrol_control import CoordinateLayout, _layer_present_actions
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
 from channel_switch import channel_switch_procedure
-from channel_routing import normalize_channel, plan_next_channel
+from channel_routing import (
+    choose_next_channel,
+    normalize_channel,
+    plan_channel_route,
+)
 from config_store import config_section_file
 from game_chat import send_game_chat_message
 
@@ -46,6 +50,68 @@ OTHER_PLAYER_REQUEST_MIN_SECONDS = 60.0
 OTHER_PLAYER_REQUEST_MAX_SECONDS = 180.0
 OTHER_PLAYER_MONITOR_SECONDS = 180.0
 OTHER_PLAYER_PRESENCE_POLL_SECONDS = 1.0
+# A red diamond can be missed for a single frame (the other player walks behind
+# a platform, the diamond is clipped by the minimap edge, one capture is late).
+# Treating that one frame as "the player left" ended the whole workflow before
+# the channel switch - the operator's "the switch channel procedure failed to
+# launch" - so the departure needs several consecutive empty polls.
+OTHER_PLAYER_DEPARTURE_CONFIRM_POLLS = 3
+# A red marker must be seen again on the NEXT capture before the switch starts.
+# One frame of red - a damage number, a hit flash, a ragged terrain edge - is not
+# another player; the operator's rule stays "any red diamond means another
+# player", and a player's marker persists across captures.
+OTHER_PLAYER_TRIGGER_CONFIRM_FRAMES = 2
+# A channel change counts as successful only when the other players' red diamonds
+# are gone from this many CONSECUTIVE fresh captures.  The operator's reason: a
+# monster can hit the character during the change, so "the menu keys were sent"
+# is not evidence that the channel really changed.  When the marker is still
+# there, the workflow switches to the next channel of the route instead.
+OTHER_PLAYER_SWITCH_CLEAN_FRAMES = 4
+# The channel-change signature: the client shows its loading screen (the minimap
+# and the character's marker go away entirely) for one to two seconds, then the
+# marker comes back on the new channel.  That is what proves the change really
+# happened - a route whose keys were swallowed shows no such stretch.
+OTHER_PLAYER_SWITCH_RELOAD_FRAMES = 2
+# Two confirmed captures of another player's marker on the NEW channel before the
+# workflow moves on (one frame can be a clipped or partial detection).
+OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES = 2
+# How long the post-switch evidence may take: the operator measures a 1-2 s black
+# screen, plus the map load, plus four clean captures, so the budget must be
+# comfortably longer than the loading itself.
+OTHER_PLAYER_SWITCH_VERIFY_SECONDS = 12.0
+# A failed attempt does NOT mean the character moved: the operator's own case is
+# "channel12 + 房间码 -> hash -> 35" not happening at all, so the character is
+# still on 12 and the SAME plan (12 -> 35) must be run again.  The landed channel
+# is therefore committed only after the verification passes.  After this many
+# failures on one target the channel itself is probably occupied rather than
+# unreached, so the workflow moves on to the next channel of the route.
+OTHER_PLAYER_SWITCH_SAME_TARGET_ATTEMPTS = 3
+# A manual Esc ends the whole procedure from anywhere in it ("from now on if
+# manual esc is pressed during this procedure then it is stopped").  The workflow
+# injects Esc itself (the selector sequence starts and ends with one), so an Esc
+# observation within this window of its own tap is ignored.
+OTHER_PLAYER_ESC_IGNORE_SECONDS = 0.5
+# Poll fast enough that no physical press is missed - and read the pressed-since
+# latch as well as the down bit, so even a shorter press than one poll interval
+# is caught.
+OTHER_PLAYER_ESC_POLL_SECONDS = 0.05
+VK_ESCAPE = 0x1B
+
+# Every DURATION in ``_run_other_player_switch`` (the quiet request window, the
+# initial pause, the departure monitor and the 换线等待 timer) is multiplied by
+# this factor, so the real timings live in the constants above and a shortened
+# field test only changes this one value.
+#
+#   1.0  = shipping behaviour (request in 1-3 min, pause 3 min, monitor 3 min,
+#          换线等待 in real minutes) - restored after the 2026-10 field test
+#   0.03 = the shortened field-test value used while "检测到其他玩家自动切换频道"
+#          was being fixed (request 1.8-5.4 s, pause 5.4 s, monitor 5.4 s,
+#          换线等待 as minutes x 1.8 s: the default 5 becomes 9 s, so the channel
+#          change is reached in about 20 s)
+#
+# The trigger log prints the effective seconds, so a field run always shows
+# which timings were actually used.
+OTHER_PLAYER_TIME_SCALE = 1.0
 
 
 # Stall recovery is only valid at the rope itself.  Keeping this threshold in
@@ -81,7 +147,12 @@ DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
 # minimap pixels away while grabbing/climbing a rope.  Keep a little more
 # than one X pixel and about two Y pixels: narrower than the earlier loose
 # window, without becoming smaller than the diamond's capture grid.
-JUMP_POINT_X_TOLERANCE = 0.008
+# A minimap marker advances in discrete rows.  At this map scale the recorded
+# X can sit between consecutive rows (for example 0.486842 between 0.478070
+# and 0.495614), so +/-0.008 can miss a genuine crossing in both frames.
+# +/-0.010 remains narrower than the old loose jump gate while covering one
+# recorded marker step in either direction.
+JUMP_POINT_X_TOLERANCE = 0.010
 JUMP_POINT_Y_TOLERANCE = 0.015
 # A left/right point that lands on a horizontal platform needs only a brief
 # post-Alt guard, then two stable 5-FPS samples before its Up claim releases.
@@ -140,39 +211,69 @@ DROP_ARRIVAL_CONFIRM_FRAMES = 2
 # 站桩攻击 records the player's current marker only for the active session.
 # It is never persisted and is independent of the recorded route/layer data.
 # The stationary target remains the recorded X.  Its accepted resting window
-# is 0.016 wide (the former +/-0.008 band), shifted 0.002 toward the selected
-# final facing so the short facing tap does not immediately walk the character
-# back through the target.
-STATIONARY_ATTACK_X_TOLERANCE = 0.008
-STATIONARY_ATTACK_FACING_ZONE_SHIFT = 0.002
+# is 0.030 wide (+/-0.015) and is shifted 0.0075 toward the selected final
+# facing, so the short facing tap does not immediately walk the character back
+# through the target.
+#
+# The width matters on a coarse minimap: the marker only ever shows whole
+# columns, so a window narrower than one column makes the 桩 column the ONLY
+# acceptable reading and every neighbouring column a correction.  The 15:37
+# field log was exactly that on a 67 px canvas (one column = 0.014925 against
+# the former 0.016 window): the character was pushed one column past its 桩,
+# corrected, pushed past it again, hunting there forever.  +/-0.015 covers one
+# 0.014925 column on the facing side, and 0.0075 keeps the far side (where the
+# facing tap is about to nudge it) inside one column too.
+STATIONARY_ATTACK_X_TOLERANCE = 0.015
+STATIONARY_ATTACK_FACING_ZONE_SHIFT = 0.0075
 # The standing position has a Y half too, and it uses the same anchor band:
 # marker Y moves by a minimap pixel on its own, and a jump spent on that jitter
-# walks the character off its platform (observed in the field).  One single
-# jump is also not enough when the character really is displaced - the attempt
-# is re-armed while the mismatch lasts, one jump per window, with a slower
-# cadence after the first burst so a spot that a jump cannot reach never turns
-# into an endless jump loop.
+# walks the character off its platform (observed in the field).  A jump is
+# therefore only ever sent for a Y gap that has HELD for several frames, and
+# only once per arrival at the 桩 (see STATIONARY_ATTACK_SMALL_GAP_FRAMES).
 STATIONARY_ATTACK_Y_TOLERANCE = 0.006
-# A single minimap capture can place the diamond one pixel away from its
-# standing position.  It must never make 站桩攻击 jump: require the same
-# out-of-band Y direction in two consecutive captures before a recovery jump
-# is armed.  At the shared 5 FPS cadence this still reacts to a real fall in
-# about 0.2 seconds.
-STATIONARY_ATTACK_Y_CONFIRM_FRAMES = 2
 # Used only to decide whether the marker is still on the anchor platform. It
 # is intentionally wider than the exact launch-position tolerance: minimap
 # pixel jitter must not suppress attacks during final X correction.
+#
+# It is also the operator's definition of a SMALL Y gap: the marker is on the
+# anchor's own layer and within this window of its launch position - a marker
+# row or two off the 桩 - as opposed to the bench's other standing row (0.0316
+# away), which is a fall that never jumps and is left to the recorded jump
+# point.
 STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE = 0.020
+STATIONARY_ATTACK_SMALL_Y_GAP = STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE
+# The operator's rule for a small Y gap that will not go away by itself: while
+# the marker stays inside the accepted X of its temporary anchor and its Y sits
+# a marker row or two off the launch position for this many frames (about one
+# second at the shared 5 FPS cadence), try ONE Alt jump.  A jump that puts the
+# marker back on the anchor row ends the episode.  A jump that does not is
+# ABANDONED - the character keeps attacking from where it stands instead of
+# jumping forever - and no further jump is sent until it leaves the 桩 and comes
+# back, which is when a fresh attempt is allowed.
+STATIONARY_ATTACK_SMALL_GAP_FRAMES = 5
+# After the single jump, the gap must survive this many further settled frames
+# before the attempt counts as failed: the character's own jump arc keeps the
+# marker away from its launch row for a moment, and that is not evidence.
+STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES = 4
 # Stationary recovery begins close to its anchor.  A normal patrol hold is
 # deliberately long, but it makes a near-anchor correction overshoot before
 # the next capture arrives.  Keep this distinct, short hold for stand-still
 # mode only.
 STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS = 0.12
-# Inside the small-step band the correction is the tiny step that finishes the
-# last pixels onto the 桩.  It is the SAME arbiter motion as the longer walk
-# back - a direction hold followed by the attack that belongs to the correction
-# (see ``perform_stationary_step``) - so only the hold below differs.
-STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.03
+# Inside the small-step band the correction is the step that finishes the last
+# pixels onto the 桩.  It is the SAME arbiter motion as the longer walk back - a
+# direction hold followed by the attack that belongs to the correction (see
+# ``perform_stationary_step``) - so only the hold below differs.
+#
+# The operator raised the near hold from 0.03 s to 0.10 s after his own field
+# log: `stationary correction executed: left (hold 0.03s) + attack a` ran again
+# and again at pos=(0.557018, 0.310526) with the marker exactly one column
+# (0.008772 = 1/114) right of the 桩, and the character never moved - a 30 ms
+# hold is below the game's own movement granularity, so the correction was
+# swallowed in-game instead of walking.  About 0.10 s travels one marker column,
+# which is the size of the gap a correction is asked to close, so the correction
+# now really steps and the next capture confirms it.
+STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.10
 # Space between two corrections.  The operator asked for a gap of about 300ms
 # between them: corrections pressed back to back read as continuous walking.  A
 # correction now carries its own attack, so this spacing is also the attack rate
@@ -180,14 +281,16 @@ STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.03
 # that every correction needs the longer hold, that is roughly one attack per
 # 0.3s until the marker is back on the band.
 STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS = 0.30
-# X recovery around the temporary 桩.  Every correction - the tiny 30ms step and
+# X recovery around the temporary 桩.  Every correction - the near step and
 # the longer walk back - is ONE arbiter motion that carries ONE attack at its
 # end (see ``perform_stationary_step``).  That combination is what the operator
 # asked for after the field run showed the character correcting its position
 # with no attack at all: sent as an ordinary walk hold, the correction either
 # deferred the fixed cadence (direction handoff) or blocked it outright (the
 # exclusive recovery), so the beats that landed inside a correction were lost.
-# With the attack inside the correction, a correction can never eat one.
+# With the attack inside the correction, a correction can never eat one - and
+# the motion itself must never be swallowed: it is queued as one finite arbiter
+# motion, so no direction handoff and no attack grace can cut its hold short.
 #
 # The arrival band is the exact temporary anchor.  Inside this wider final
 # approach zone, recovery is owned by the arbiter and carries its own attack;
@@ -199,12 +302,23 @@ STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.020
 # for the final approach only; using it for a rope-top or another platform
 # created a visible tiny-step/attack loop before the stake was reached.
 STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.030
-# How long the 朝向 tap holds its direction.  Deliberately as short as the tiny
-# step: the tap is a TURN, not a move, and a longer hold walks the character out
-# of the anchor band (at 0.10s it travels about a minimap pixel, which on a
-# small minimap is already outside the band) - the correction then has to walk
-# it back, which turns it again and re-arms the facing, i.e. the face/walk
-# twitch.  The operator asked for this 30ms.
+# How long the 朝向 tap holds its direction.  Unlike the anchor correction
+# (0.10 s, which must really walk about one marker column) the tap is a TURN,
+# not a move, and a longer hold walks the character out of the anchor band (at
+# 0.10 s it travels about a minimap pixel, which on a small minimap is already
+# outside the band) - the correction then has to walk it back, which turns it
+# again and re-arms the facing, i.e. the face/walk twitch.  The operator asked
+# for this 30ms, and it stays 30ms.
+#
+# The 朝向 guarantee therefore cannot come from the hold length.  It comes from
+# the delivery path: the turn is queued as ONE arbiter motion (``FACING:<dir>``,
+# see ``perform_stationary_facing``), the obligation is cleared only inside that
+# callback after the direction key really went down AND up, and every path that
+# does not deliver it - a shut safe-stage gate before or after the attack grace,
+# an unsafe key sender, a direction key that never went down, a stop that cut
+# the hold short - is logged and leaves the facing owed, so the next settled
+# capture re-queues the turn instead of silently standing there facing the wrong
+# way.
 STATIONARY_ATTACK_FACING_HOLD_SECONDS = 0.03
 # A facing tap moves the character a fraction of a minimap pixel.  Turn from
 # the *opposite* side of the accepted band, but keep this much room inside the
@@ -223,9 +337,6 @@ STATIONARY_RETURN_ROPE_DISMOUNT_HOLD_SECONDS = 0.40
 # 双向 alternates the final stationary facing after this many settled
 # minimap frames. At the shared 5 FPS capture cadence this is about 16s.
 STATIONARY_ATTACK_BILATERAL_FACING_FRAMES = 80
-STATIONARY_ATTACK_Y_JUMP_GAP_SECONDS = 1.5
-STATIONARY_ATTACK_Y_BURST_JUMPS = 4
-STATIONARY_ATTACK_Y_RETRY_SECONDS = 10.0
 # The stand-still pickup run is a complete left -> right -> anchor circuit.
 # It uses the same timing vocabulary as the optional motion controls, but is
 # kept in this worker because it owns the temporary stationary anchor.
@@ -233,6 +344,11 @@ STATIONARY_ATTACK_Y_RETRY_SECONDS = 10.0
 # end, which is displayed in seconds.  The trigger range is 10s .. 30m.
 STATIONARY_PICKUP_MIN_INTERVAL_SECONDS = 10.0
 STATIONARY_PICKUP_MAX_INTERVAL_SECONDS = 1800.0  # 30.0m
+# A pickup leg bounds a stall the same way the patrol route bounds an
+# unreachable endpoint (``ENDPOINT_NO_PROGRESS_FRAMES``): a leg that stops
+# closing the distance - a wall in the way, or a marker frozen by an animation -
+# is treated as reached instead of walking into the edge for the whole circuit.
+STATIONARY_PICKUP_LEG_NO_PROGRESS_FRAMES = 38
 
 # A saved Left/Right endpoint that sits a fraction of a pixel outside the
 # walkable platform (wall/platform edge, or a residual projection error) can
@@ -343,12 +459,25 @@ class PositionMovementPlan:
     decision: MovementDecision
 
 
+# Detection-only supporter key.  站桩攻击 owns one temporary standing point which
+# is a supporter of its selected layer for as long as the session lasts.  It is
+# written on a runtime *copy* of that layer (see
+# ``MovementWorker._stationary_supported_layer``) so every band/point helper
+# treats it exactly like a recorded point, while the saved profile, the map
+# recording and ``user_config.json`` stay untouched.
+RUNTIME_SUPPORTER_KEY = "_runtime_supporter"
+
+
 def _layer_point_ys(layer: Any) -> list[float]:
     values = []
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
         point = layer.get(point_name)
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
+    if isinstance(layer, dict):
+        runtime = layer.get(RUNTIME_SUPPORTER_KEY)
+        if isinstance(runtime, dict) and "y" in runtime:
+            values.append(float(runtime["y"]))
     return values
 
 
@@ -507,6 +636,51 @@ def _has_layer_y_supporter(layer: Any) -> bool:
         return False
     tolerance = float(layer.get("y_tolerance", 0.020000))
     return _layer_y_band(layer, tolerance) is not None
+
+
+def _runtime_supporter_layer_band(
+    layer: Any, supporter_y: float,
+) -> Optional[tuple[float, float]]:
+    """Layer band that includes this session's temporary 站桩 point.
+
+    The temporary standing point is a supporter in exactly the sense a
+    recording is, so it joins the layer's own envelope: the operator's bench
+    keeps its bottom row (0.310526) and the row he stands on (0.278947) inside
+    one floor instead of the marker dropping to "no floor" while the character
+    has not left the bench at all.
+
+    It also brings the operator's own same-layer window with it - the accepted
+    ``y_tolerance`` (0.020) plus one marker row, because the diamond quantises
+    to one row and a standing character's own step and jump arc are read a
+    couple of rows above the point it stands on.  That is what lets the
+    temporary point decide the band's UPPER edge: the recorded envelope keeps
+    its documented reach (``LAYER_UP_REACH_FACTOR``) and the point's window
+    wins whenever it reaches higher.  Below, the point gets the ordinary one
+    third of the tolerance, and the recorded side keeps its own rule, so the
+    band still does not reach down into the floor below.
+
+    A layer with no recording at all keeps the documented one-sided
+    single-supporter envelope, with the temporary point as that supporter.
+    """
+
+    if not isinstance(layer, dict):
+        return None
+    tolerance = max(0.0, float(layer.get("y_tolerance", 0.020000)))
+    row = _layer_marker_row(layer) or LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
+    values = _layer_point_ys(layer)
+    if not values and "layer_y" in layer:
+        try:
+            values = [float(layer["layer_y"])]
+        except (TypeError, ValueError):
+            values = []
+    point_y = float(supporter_y)
+    if not values:
+        return point_y, point_y + max(tolerance / 3.0, row)
+    recorded_upper = min(values) - tolerance * LAYER_UP_REACH_FACTOR
+    recorded_lower = max(values) + tolerance / 3.0
+    point_upper = point_y - (tolerance + row)
+    point_lower = point_y + tolerance / 3.0
+    return min(recorded_upper, point_upper), max(recorded_lower, point_lower)
 
 
 def _coherent_observed_world_points(
@@ -3014,6 +3188,17 @@ class MovementWorker(threading.Thread):
                         )
                         return False
                     self._walk_hold_key = decision.key
+                    # Name the owner of every walk direction.  The key ledger
+                    # in ``status_worker`` logs "key-down=left owners=1" without
+                    # saying which worker asked for it, and the movement
+                    # decision itself is not printed on a walk frame - so a
+                    # field report of "something emits left while the character
+                    # walks right" could not be attributed.  The reason names the
+                    # path: an ordinary anchor walk, a pickup leg, a return leg.
+                    LOG.info(
+                        "walk hold %s down (reason=%s)",
+                        decision.key, decision.reason,
+                    )
                 # Automatic pickup no longer sends Z.  Ctrl+Z is the sole
                 # pickup input and belongs to QuickPickupWorker, so movement
                 # holds only the requested direction.
@@ -3184,6 +3369,7 @@ class MovementWorker(threading.Thread):
         other_player_wait_minutes: float = 5.0,
         current_channel: int = 1,
         on_channel_landed: Any = None,
+        on_other_player_stop: Any = None,
         status_state_path: Optional[str] = None,
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
@@ -3494,6 +3680,9 @@ class MovementWorker(threading.Thread):
         self._stationary_bilateral_target = "right"
         self._stationary_bilateral_frames = 0
         self._stationary_attack_anchor: Optional[Point] = None
+        # Session-only extra Y supporter for a temporary stationary point.
+        # It deliberately never enters the saved recording/profile.
+        self._stationary_runtime_layer_support: Optional[tuple[str, Point]] = None
         self.stationary_pickup_enabled = False
         self.stationary_pickup_interval_seconds = 900.0  # 15.0m
         self.stationary_pickup_jitter_seconds = 0.0
@@ -3505,6 +3694,11 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_failures = 0
         self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_return_active = False
+        # One pickup leg's progress toward its recorded endpoint: which leg,
+        # the closest distance seen, and how many frames it has not improved.
+        self._stationary_pickup_leg_key: Optional[tuple[str, float]] = None
+        self._stationary_pickup_leg_best = 0.0
+        self._stationary_pickup_leg_frames = 0
         # One longer lateral step after a return climb confirms that the
         # character has actually detached from the rope top before normal
         # stand-still recovery or pickup retry resumes.
@@ -3531,13 +3725,20 @@ class MovementWorker(threading.Thread):
         # facing tap.  Fresh marker reads must first confirm the tap did not
         # nudge the character out of its accepted standing band.
         self._stationary_facing_confirm_frames_remaining = 0
-        # Y recovery bookkeeping: how many jumps this displacement episode has
-        # already spent and when the last one was sent.
-        self._stationary_y_jumps = 0
-        self._stationary_y_jump_at = float("-inf")
-        self._stationary_y_backoff_logged = False
-        self._stationary_y_mismatch_sign = 0
-        self._stationary_y_mismatch_frames = 0
+        # The direction whose 朝向 tap is queued but not yet delivered (None
+        # when nothing is in flight).  A tap can be drained by the arbiter
+        # (safe-stage gate, focus dip) without ever reaching its callback, and
+        # that must not be silent: this lets the movement loop log the drop and
+        # re-queue the turn on the spot.
+        self._stationary_facing_requested: Optional[str] = None
+        # Small-Y-gap bookkeeping for one arrival at the 桩: how many frames the
+        # gap has held, whether the single Alt jump has been spent, and whether
+        # that jump failed (the attempt is then abandoned until the character
+        # leaves the 桩 and comes back).  See
+        # ``_stationary_small_gap_jump_decision``.
+        self._stationary_y_small_gap_frames = 0
+        self._stationary_y_jump_spent = False
+        self._stationary_y_jump_abandoned = False
         self._walk_hold_key: Optional[str] = None
         self._walk_hold_z = False
         self._walk_hold_until = 0.0
@@ -3629,6 +3830,34 @@ class MovementWorker(threading.Thread):
         )
         self._last_other_player_check = float("-inf")
         self._player_switch_active = False
+        # Confirmation counter for the per-frame red-marker scan.
+        self._other_player_trigger_frames = 0
+        # A running 有人自动换线 workflow is cancelled by a fresh patrol start
+        # (see ``reset_other_player_switch``): it must not keep pressing menu
+        # keys inside the operator's new patrol, and the detection must be able
+        # to arm again immediately instead of waiting out the old workflow's
+        # minutes-long pauses.
+        self._other_player_switch_cancel = threading.Event()
+        # True while THIS workflow is the one that disabled patrol; its exit may
+        # then switch patrol back on.  A manual Start Patrol or Stop Patrol
+        # clears it, so a finished workflow can never override the operator.
+        self._other_player_switch_owns_patrol = False
+        # Workflow identity: a cancelled workflow that exits after a newer one
+        # started must not clear the newer one's active flag.
+        self._other_player_switch_generation = 0
+        # When this workflow last injected Esc itself, so the manual-Esc stop
+        # cannot mistake its own menu tap for the operator.
+        self._other_player_esc_sent_at = float("-inf")
+        self._other_player_esc_logged = False
+        # True while the workflow is injecting its own channel-selector keys.
+        self._other_player_injecting = False
+        # A manual Esc also switches the feature OFF: without that the next red
+        # diamond immediately starts a NEW round, with its 求让消息 and its
+        # minutes of waiting - "otherwise we only go into new round of
+        # switching".  The coordinator hands this to the UI, which clears the
+        # field and persists it.
+        self._on_other_player_stop = on_other_player_stop
+        self._other_player_stop_reported = False
         self.other_player_drug_taps = max(1, int(other_player_drug_taps))
         self.other_player_drug_gap_seconds = max(
             0.1, float(other_player_drug_gap_seconds)
@@ -3873,10 +4102,67 @@ class MovementWorker(threading.Thread):
 
         self.stair_jump_worker = worker
 
-    def arm_patrol_input(self) -> None:
-        """Permit a fresh patrol session after its sender has been reset."""
+    def arm_patrol_input(self, reason: str = "patrol start") -> None:
+        """Permit a fresh patrol session after its sender has been reset.
+
+        A patrol start is also the point where every 有人自动换线 state from the
+        previous session is dropped: the operator's "manual start patrol will
+        clear all previous state and redo again".  Without it a switch that was
+        still pausing kept ``_player_switch_active`` set for minutes, so after a
+        manual restart the feature never triggered again, and the stale workflow
+        would later press menu keys inside the new patrol.
+
+        It also clears ``_patrol_abort_event``, which the other-player switch
+        sets while it owns patrol (see ``_stop_patrol_for_other_player_switch``);
+        without that the character would stay motionless with patrol nominally
+        running after the switch handed control back.
+        """
 
         self._patrol_abort_event.clear()
+        self.reset_other_player_switch(reason)
+
+    def _stop_patrol_for_other_player_switch(self) -> None:
+        """Stop patrol the way Stop Patrol does - but without disarming input.
+
+        The channel switch needs the keyboard for esc/enter/arrows, so it must
+        not run the UI's full stop (which disables input).  It must clear the
+        movement state just as thoroughly, because the operator's field report
+        was a character that "keeps moving right" when the switch stopped
+        patrol: the direction held at that moment was never released and no
+        abort invalidated the delayed movement.
+
+        The order matters twice:
+
+        * the walk hold is released through the sender FIRST, while its ledger
+          still owns the key, because ``_hold_manager`` deliberately stops
+          emitting key-ups once ``_patrol_abort_event`` is set (that scrub is the
+          UI stop path's job, and this path keeps input armed);
+        * a direction the ledger has forgotten but the game still holds is then
+          released explicitly with ``force_key_up``.
+        """
+
+        self._release_walk_hold()
+        if self.pickup_active_event is not None:
+            self.pickup_active_event.clear()
+        self._release_climb_up()
+        self._climb_state = ClimbState()
+        self._return_mode = None
+        self._return_from_floor = None
+        self._return_arrival_floor = None
+        self._descending_to_first = False
+        self._patrol_abort_event.set()
+        force_key_up = getattr(self.key_sender, "force_key_up", None)
+        if callable(force_key_up):
+            for key in ("left", "right", "up", "down"):
+                try:
+                    force_key_up(key, reason="other-player channel switch")
+                except Exception:
+                    LOG.debug("could not force-release %s", key, exc_info=True)
+        LOG.info(
+            "other-player switch: patrol movement cleared (held direction "
+            "released, climb/return latches dropped, delayed movement "
+            "invalidated); input stays armed for the menu keys"
+        )
 
     def disarm_patrol_input(self) -> None:
         """Immediately invalidate delayed movement without sending a key.
@@ -3889,6 +4175,10 @@ class MovementWorker(threading.Thread):
         """
 
         self._patrol_abort_event.set()
+        # Stop Patrol is the operator's own stop.  A 有人自动换线 workflow that
+        # disabled patrol earlier must not switch it back on when it finishes.
+        with self._other_player_settings_lock:
+            self._other_player_switch_owns_patrol = False
         if self.direction_transition_event is not None:
             self.direction_transition_event.clear()
         if self.climbing_active_event is not None:
@@ -4641,9 +4931,15 @@ class MovementWorker(threading.Thread):
             self._yolo_detection_active = active
 
     def set_other_player_check(self, enabled: bool) -> None:
-        """Enable/disable the automatic channel switch on other players."""
+        """Enable/disable the automatic channel switch on other players.
+
+        Switching the field off also ends a workflow that is already running: the
+        operator's un-tick means "stop doing this", not "finish the round first".
+        """
 
         self._other_player_check_enabled = bool(enabled)
+        if not enabled:
+            self.reset_other_player_switch("the 检测到其他玩家自动切换频道 field was switched off")
         LOG.info("other-player channel switch: %s",
                  "on" if enabled else "off")
 
@@ -4692,17 +4988,391 @@ class MovementWorker(threading.Thread):
                 LOG.warning("player channel landing callback failed", exc_info=True)
 
     def _wait_for_player_departure(self, seconds: float) -> bool:
-        """Watch fresh minimap frames; True means the player left before timeout."""
+        """Watch fresh minimap frames; True means the player left before timeout.
+
+        The departure must be seen for ``OTHER_PLAYER_DEPARTURE_CONFIRM_POLLS``
+        consecutive polls: one frame without a red diamond is noise (a platform
+        in front of the other player, a clipped diamond, a late capture) and
+        used to cancel the whole workflow before it ever switched the channel.
+        A frame whose minimap is not visible at all (menu, loading, a covered
+        HUD) is not counted either way - it says nothing about the other player.
+
+        Returns False as soon as the workflow is cancelled, so a fresh patrol
+        start ends the monitor within one poll instead of holding the switch
+        state for the rest of its window.
+        """
 
         deadline = time.monotonic() + max(0.0, float(seconds))
-        while not self.stop_event.is_set():
-            if self._other_players_on_latest_frame() == 0:
+        absent_polls = 0
+        next_presence_poll = 0.0
+        while not self._other_player_switch_must_end():
+            now = time.monotonic()
+            # 捡东西-style presence sampling stays at its own cadence, but the
+            # wait itself is short so a manual Esc is seen within one poll
+            # interval instead of up to a second later.
+            if now >= next_presence_poll:
+                next_presence_poll = now + OTHER_PLAYER_PRESENCE_POLL_SECONDS
+                if not self._player_marker_visible():
+                    absent_polls = 0
+                elif self._other_players_on_latest_frame() == 0:
+                    absent_polls += 1
+                    if absent_polls >= OTHER_PLAYER_DEPARTURE_CONFIRM_POLLS:
+                        LOG.info(
+                            "other player left: no red marker for %d consecutive polls",
+                            absent_polls,
+                        )
+                        return True
+                else:
+                    absent_polls = 0
+            remaining = deadline - now
+            if remaining <= 0.0:
+                return False
+            self._other_player_switch_cancel.wait(
+                min(OTHER_PLAYER_ESC_POLL_SECONDS, remaining)
+            )
+        return False
+
+    def _other_player_switch_cancelled(self) -> bool:
+        """Whether this workflow must abandon (app stop or a fresh patrol start)."""
+
+        return bool(
+            self.stop_event.is_set() or self._other_player_switch_cancel.is_set()
+        )
+
+    def _read_escape_state(self) -> int:
+        """Raw ``GetAsyncKeyState`` for Esc, or 0 when it cannot be read.
+
+        Reading it also CONSUMES the "pressed since the last call" latch, which
+        is what makes a press shorter than one poll interval visible.
+        """
+
+        try:
+            import ctypes
+
+            return int(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE))
+        except Exception:
+            return 0
+
+    def _prime_escape_latch(self) -> None:
+        """Discard a stale "Esc was pressed" latch before the workflow waits.
+
+        Without this, an Esc the operator pressed at any earlier time - long
+        before the switch - would still be latched and would stop the workflow on
+        its first poll.
+        """
+
+        self._read_escape_state()
+
+    def _manual_escape_pressed(self) -> bool:
+        """Whether the operator pressed Esc physically.
+
+        Three signals decide this, and the first two are guards against our own
+        injected input:
+
+        * the workflow's channel-selector sequence is running
+          (``_other_player_injecting``) - every Esc state in that window is ours,
+          because the sequence begins and ends with an injected Esc;
+        * an Esc was observed within ``OTHER_PLAYER_ESC_IGNORE_SECONDS`` of our
+          own tap, which covers the tail after the sequence;
+        * otherwise the operator: the down bit (Esc is held right now) or the
+          pressed-since-the-last-call latch, which also reports a press that
+          began and ended between two polls - a human Esc tap is often shorter
+          than the poll interval.
+
+        The latch is consumed on every call, so our own tap cannot leak into a
+        later poll.
+        """
+
+        state = self._read_escape_state()
+        if self._other_player_injecting:
+            return False
+        if self._keyboard_owned_elsewhere():
+            return False
+        if not state & 0x8001:          # down bit | pressed-since-last-call bit
+            return False
+        return (
+            time.monotonic() - self._other_player_esc_sent_at
+            >= OTHER_PLAYER_ESC_IGNORE_SECONDS
+        )
+
+    def _keyboard_owned_elsewhere(self) -> bool:
+        """Whether another workflow currently owns the keyboard exclusively.
+
+        A reconnect (or the lie workflow) takes the keyboard with
+        ``begin_exclusive`` and presses its own keys - including Esc, to dismiss
+        the offline prompt - while it owns it.  An Esc seen then is not the
+        operator either, so it must not stop this workflow.  This workflow never
+        takes the keyboard exclusively itself, so any owner is somebody else.
+        """
+
+        return bool(getattr(self.key_sender, "_exclusive_owner", None))
+
+    def _other_player_switch_must_end(self) -> bool:
+        """Whether the workflow must abandon: stop, patrol start, or manual Esc.
+
+        A manual Esc is the operator taking the character back mid-procedure, so
+        it also drops this workflow's patrol ownership: patrol stays stopped for
+        him instead of walking off the moment the menu closes.
+        """
+
+        if self._other_player_switch_cancelled():
+            return True
+        if not self._manual_escape_pressed():
+            return False
+        if not self._other_player_esc_logged:
+            self._other_player_esc_logged = True
+            LOG.warning(
+                "other-player workflow: manual Esc pressed; stopping the "
+                "procedure, clearing the 检测到其他玩家自动切换频道 selection "
+                "(patrol stays stopped - press Start Patrol to resume)"
+            )
+        with self._other_player_settings_lock:
+            self._other_player_switch_owns_patrol = False
+            report_stop = not self._other_player_stop_reported
+            self._other_player_stop_reported = True
+        if report_stop:
+            callback = self._on_other_player_stop
+            if callable(callback):
+                try:
+                    callback("manual Esc")
+                except Exception:
+                    LOG.warning(
+                        "could not report the other-player stop to the UI",
+                        exc_info=True,
+                    )
+        self._other_player_switch_cancel.set()
+        return True
+
+    def _other_player_pause(self, seconds: float) -> bool:
+        """Wait like ``stop_event.wait``, but abandon when the workflow must end.
+
+        The workflow's pauses are minutes long as shipped.  Without this the
+        operator could restart patrol while a switch was still sleeping, and
+        every later other-player sighting would be ignored until that old
+        workflow finished (the reported "开始巡逻后这个功能再也不会触发").
+        """
+
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self._other_player_switch_must_end():
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
-            self.stop_event.wait(min(OTHER_PLAYER_PRESENCE_POLL_SECONDS, remaining))
+            self._other_player_switch_cancel.wait(
+                min(OTHER_PLAYER_ESC_POLL_SECONDS, remaining)
+            )
+
+    def _player_marker_visible(self) -> bool:
+        """Whether the latest analysed frame really showed the character.
+
+        A channel change covers the minimap - the selector menu, the loading
+        screen, a scoreboard - and a hidden minimap shows no red diamond either,
+        so an "empty" reading from such a frame proves nothing.  Counting those
+        frames as "no other players" is what declared a channel clean while it
+        still had players ("switched to another channel that still has other
+        player but stopped switching").  Every presence/absence verdict is
+        therefore made only on frames whose own yellow marker was found.
+        """
+
+        observation = getattr(self, "last_observation", None)
+        return getattr(observation, "player", None) is not None
+
+    def _wait_for_switch_evidence(self, seconds: float) -> str:
+        """What the frames after a channel route prove about the new channel.
+
+        The operator's definition of a successful change: "switching -> screen
+        black for 1s-2s then marker showed, success switch; if success switch and
+        this new channel have no red diamond then this is an empty channel,
+        resume patrol; if not keep switching".
+
+        Three answers, and only fresh captures whose own yellow marker was found
+        count as evidence (a covered minimap shows no red diamond either):
+
+        * ``"clean"`` - the map went black/away for
+          ``OTHER_PLAYER_SWITCH_RELOAD_FRAMES`` captures (the loading screen),
+          came back, and then showed no other player's marker for
+          ``OTHER_PLAYER_SWITCH_CLEAN_FRAMES`` consecutive captures: an empty
+          channel, so patrol resumes;
+        * ``"occupied"`` - the map reloaded (the change happened) but another
+          player's marker stayed for ``OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES``
+          captures: keep switching;
+        * ``"no-change"`` - no reload was ever seen inside the budget, so the
+          character never left its channel (a monster hit, a swallowed key):
+          plan the same target again.
+        """
+
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        last_frame = None
+        absent_run = 0
+        reload_seen = False
+        clean_run = 0
+        occupied_run = 0
+        occupied_seen = False
+        while not self._other_player_switch_must_end():
+            frame = getattr(self, "_last_frame", None)
+            if frame is not None and frame is not last_frame:
+                last_frame = frame
+                if not self._player_marker_visible():
+                    # Black loading screen (or a menu covering the map): no
+                    # evidence about other players, but several such captures in
+                    # a row are the channel-change signature.
+                    absent_run += 1
+                    if absent_run >= OTHER_PLAYER_SWITCH_RELOAD_FRAMES and not reload_seen:
+                        reload_seen = True
+                        LOG.info(
+                            "player channel switch: the map went away for %d "
+                            "captures (loading screen); waiting for the marker",
+                            absent_run,
+                        )
+                    clean_run = 0
+                    occupied_run = 0
+                else:
+                    absent_run = 0
+                    if reload_seen:
+                        if self._other_players_on_latest_frame() == 0:
+                            occupied_run = 0
+                            clean_run += 1
+                            if clean_run >= OTHER_PLAYER_SWITCH_CLEAN_FRAMES:
+                                return "clean"
+                        else:
+                            clean_run = 0
+                            occupied_seen = True
+                            occupied_run += 1
+                            if occupied_run >= OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES:
+                                return "occupied"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            self._other_player_switch_cancel.wait(
+                min(OTHER_PLAYER_ESC_POLL_SECONDS, remaining)
+            )
+        if not reload_seen:
+            return "no-change"
+        return "occupied" if occupied_seen else "clean"
+
+    def _other_player_present(self, seconds: float = 1.0) -> bool:
+        """Whether another player is on the minimap right now.
+
+        The 求让消息 must never be spoken into an empty channel: the operator's
+        report was "there's no other player now, however the 求让消息 is sent and
+        the following, which is wrong".  Two consecutive visible-map readings
+        decide, so a single noisy capture neither skips the message for a player
+        who is there nor blocks it for one who has already left.  Frames with a
+        covered minimap are no evidence at all, and running out of budget counts
+        as "nobody there" - speaking is only worth it when the player is seen.
+        """
+
+        absent = 0
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while not self._other_player_switch_must_end():
+            if self._player_marker_visible():
+                if self._other_players_on_latest_frame() > 0:
+                    return True
+                absent += 1
+                if absent >= OTHER_PLAYER_DEPARTURE_CONFIRM_POLLS:
+                    return False
+            else:
+                absent = 0
+            if time.monotonic() >= deadline:
+                break
+            self._other_player_switch_cancel.wait(
+                min(OTHER_PLAYER_ESC_POLL_SECONDS, 0.2)
+            )
         return False
+
+    def _other_player_wait_while_present(self, seconds: float, label: str) -> str:
+        """Wait, but give up the moment the other player leaves.
+
+        Returns ``"elapsed"``, ``"departed"`` or ``"ended"``.  The quiet pause
+        before the switch used to run blind for its whole window, so a player who
+        left during it still received the 求让消息 and the rest of the ceremony -
+        the operator's "there's no other player now, however the 求让消息 is
+        sent".  The 换线等待 after the monitor deliberately keeps its old rule
+        (once it starts, a disappearance does not revoke the decision).
+        """
+
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        absent_polls = 0
+        next_presence_poll = 0.0
+        while True:
+            if self._other_player_switch_must_end():
+                return "ended"
+            now = time.monotonic()
+            if now >= next_presence_poll:
+                next_presence_poll = now + OTHER_PLAYER_PRESENCE_POLL_SECONDS
+                if not self._player_marker_visible():
+                    absent_polls = 0
+                elif self._other_players_on_latest_frame() == 0:
+                    absent_polls += 1
+                    if absent_polls >= OTHER_PLAYER_DEPARTURE_CONFIRM_POLLS:
+                        LOG.warning(
+                            "other player left during the %s; no channel switch "
+                            "is needed, resuming patrol",
+                            label,
+                        )
+                        return "departed"
+                else:
+                    absent_polls = 0
+            remaining = deadline - now
+            if remaining <= 0.0:
+                return "elapsed"
+            self._other_player_switch_cancel.wait(
+                min(OTHER_PLAYER_ESC_POLL_SECONDS, remaining)
+            )
+
+    def _wait_for_sendable_input(self, seconds: float) -> bool:
+        """Wait (bounded) until the keyboard sender is armed again.
+
+        The workflow waits minutes before it switches, and in that time the input
+        layer can be disarmed on its own - the automatic lie pass clears
+        ``automation_active`` for its duration, a focus dip runs the stop path -
+        and then every menu key would be refused and the switch would abort
+        silently.  A short bounded wait turns that into either a successful
+        switch or an explicit log line.
+        """
+
+        enabled = getattr(self.key_sender, "input_is_enabled", None)
+        if not callable(enabled):
+            return True
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while not self._other_player_switch_must_end():
+            try:
+                if enabled():
+                    return True
+            except Exception:
+                LOG.debug("could not read the input state", exc_info=True)
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            self._other_player_switch_cancel.wait(
+                min(OTHER_PLAYER_ESC_POLL_SECONDS, 0.2)
+            )
+        return False
+
+    def reset_other_player_switch(self, reason: str) -> None:
+        """Forget every 有人自动换线 state for a fresh patrol start.
+
+        A patrol start - the operator's Start Patrol, or the automatic restart
+        after a reconnect - takes the character back.  An in-flight workflow
+        must then stop before it presses menu keys inside the new patrol, the
+        detection must be able to arm again immediately rather than waiting out
+        the old workflow's multi-minute pauses, and the old workflow must not
+        switch patrol back on when it finally exits.  This is the operator's
+        rule: "manual start patrol will clear all previous state and redo
+        again".
+        """
+
+        with self._other_player_settings_lock:
+            was_active = self._player_switch_active
+            self._other_player_switch_cancel.set()
+            self._player_switch_active = False
+            self._other_player_switch_owns_patrol = False
+        LOG.warning(
+            "other-player switch state cleared (%s)%s",
+            reason,
+            " - the in-flight workflow abandons at its next step" if was_active else "",
+        )
 
     def _maybe_check_other_players(
         self, now: float, frame: Any, minimap_region: Any
@@ -4714,18 +5384,45 @@ class MovementWorker(threading.Thread):
         if self._player_switch_active:
             return
         count = self._other_players_on_minimap(frame, minimap_region)
-        if count > 0:
-            self._trigger_other_player_switch(count)
+        if count <= 0:
+            self._other_player_trigger_frames = 0
+            return
+        self._other_player_trigger_frames += 1
+        if self._other_player_trigger_frames < OTHER_PLAYER_TRIGGER_CONFIRM_FRAMES:
+            LOG.info(
+                "other-player marker seen (%d) on confirmation frame %d/%d; "
+                "waiting for the next capture",
+                count, self._other_player_trigger_frames,
+                OTHER_PLAYER_TRIGGER_CONFIRM_FRAMES,
+            )
+            return
+        self._other_player_trigger_frames = 0
+        self._trigger_other_player_switch(count)
 
     def _other_players_on_minimap(
         self, frame: Any, minimap_region: Any
     ) -> int:
-        """Count red diamonds (other players) in the current minimap crop."""
+        """Count red diamonds (other players) in the current minimap crop.
+
+        Every detection is logged with its pixel box: a false positive once
+        changed the channel with nobody on the map, and only the box and the
+        colour of the matched blob make that diagnosable from a field log.
+        """
 
         try:
             image = _image_from_frame(frame)
-            minimap, _box = _crop(image, minimap_region)
-            return len(detect_red_diamonds(minimap))
+            minimap, box = _crop(image, minimap_region)
+            detections = detect_red_diamonds(minimap)
+            if detections:
+                LOG.info(
+                    "other-player scan: %d red marker(s) in minimap crop %s: %s",
+                    len(detections), box,
+                    ", ".join(
+                        f"box={d.pixel_box} size={d.pixel_size} conf={d.confidence:.2f}"
+                        for d in detections[:4]
+                    ),
+                )
+            return len(detections)
         except Exception:
             LOG.warning("other-player scan failed", exc_info=True)
             return 0
@@ -4736,83 +5433,304 @@ class MovementWorker(threading.Thread):
         if self._player_switch_active:
             LOG.info("player switch skipped: already switching")
             return
-        self._player_switch_active = True
+        with self._other_player_settings_lock:
+            self._player_switch_active = True
+            # This workflow is fresh: it must not inherit the cancel that ended
+            # the previous one, and it becomes the current generation.
+            self._other_player_switch_cancel.clear()
+            self._other_player_switch_generation += 1
+            self._other_player_switch_owns_patrol = False
+            self._other_player_esc_sent_at = float("-inf")
+            self._other_player_esc_logged = False
+            self._other_player_injecting = False
+            self._other_player_stop_reported = False
+            self._other_player_trigger_frames = 0
         LOG.warning("OTHER PLAYER detected on the minimap (%d); pausing before re-check", count)
         threading.Thread(
             target=self._run_other_player_switch, daemon=True
         ).start()
 
     def _run_other_player_switch(self) -> None:
-        """Run the deliberate request/wait/route-plan player-switch workflow."""
+        """Run the deliberate request/wait/route-plan player-switch workflow.
 
+        Every pause goes through ``_other_player_pause`` and every decision
+        point re-checks ``_other_player_switch_cancelled``, so a fresh patrol
+        start (``reset_other_player_switch``) ends this workflow promptly instead
+        of leaving the feature armed-but-ignored until the workflow would have
+        finished minutes later.
+        """
+
+        with self._other_player_settings_lock:
+            generation = self._other_player_switch_generation
+        # Discard any stale "Esc was pressed" latch from before this workflow, so
+        # an old press cannot stop it on the first poll.
+        self._prime_escape_latch()
+        abandoned = False
+        # Patrol is handed back after a verified channel change, and also when no
+        # switch turned out to be needed (the other player left): the operator's
+        # rule is that a CLEARED mission must not start patrol, while a mission
+        # that became unnecessary simply hands the patrol back.
+        succeeded = False
+        nothing_to_do = False
         try:
-            # The patrol must not fight the menu navigation keys.
+            # The patrol must not fight the menu navigation keys.  Remember that
+            # THIS workflow stopped it, so its exit may switch it back on - but
+            # only while the operator has not taken patrol back meanwhile.
             if self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(False)
-            # The first three minutes intentionally remain a quiet pause. The
-            # request is one non-repeating message at a random instant in its
-            # final two minutes, so no UI or routing decision leaks in here.
+                with self._other_player_settings_lock:
+                    if self._other_player_switch_generation == generation:
+                        self._other_player_switch_owns_patrol = True
+                # Clearing the movement state is what stops the character
+                # instead of leaving it walking the direction it held.
+                self._stop_patrol_for_other_player_switch()
+            # The quiet pause is three minutes as shipped, and the request is
+            # one non-repeating message at a random instant in its final two
+            # minutes, so no UI or routing decision leaks in here.
+            # ``OTHER_PLAYER_TIME_SCALE`` multiplies every duration in this
+            # workflow; it is 1.0 in a shipped build and is currently shortened
+            # for the operator's own test.
             request_after = random.uniform(
                 OTHER_PLAYER_REQUEST_MIN_SECONDS, OTHER_PLAYER_REQUEST_MAX_SECONDS
+            ) * OTHER_PLAYER_TIME_SCALE
+            LOG.warning(
+                "other-player workflow timings (time scale %.2f): request in "
+                "%.1fs, quiet pause %.1fs total, departure monitor %.1fs, "
+                "换线等待 %.1fs per configured minute",
+                OTHER_PLAYER_TIME_SCALE,
+                request_after,
+                OTHER_PLAYER_INITIAL_PAUSE_SECONDS * OTHER_PLAYER_TIME_SCALE,
+                OTHER_PLAYER_MONITOR_SECONDS * OTHER_PLAYER_TIME_SCALE,
+                60.0 * OTHER_PLAYER_TIME_SCALE,
             )
-            if self.stop_event.wait(request_after):
+            # Neither the quiet pause nor the message may run blind: the operator's
+            # "there's no other player now, however the 求让消息 is sent and the
+            # following, which is wrong".  A departure during this phase means no
+            # switch is needed at all.
+            outcome = self._other_player_wait_while_present(
+                request_after, "求让消息 pause"
+            )
+            if outcome == "ended":
+                abandoned = True
+                return
+            if outcome == "departed":
+                nothing_to_do = True
                 return
             message = self._other_player_request_message
             if message:
+                if not self._other_player_present():
+                    LOG.warning(
+                        "no other player on the minimap; the 求让消息 is not sent "
+                        "and the channel switch is cancelled"
+                    )
+                    nothing_to_do = True
+                    return
                 sent = send_game_chat_message(self.key_sender, message)
                 LOG.info("other-player request message %s", "sent" if sent else "not sent")
-            if self.stop_event.wait(OTHER_PLAYER_INITIAL_PAUSE_SECONDS - request_after):
+            pause_left = (
+                OTHER_PLAYER_INITIAL_PAUSE_SECONDS * OTHER_PLAYER_TIME_SCALE
+                - request_after
+            )
+            outcome = self._other_player_wait_while_present(pause_left, "quiet pause")
+            if outcome == "ended":
+                abandoned = True
                 return
-            LOG.info("other-player request pause complete; monitoring for %.0fs", OTHER_PLAYER_MONITOR_SECONDS)
-            if self._wait_for_player_departure(OTHER_PLAYER_MONITOR_SECONDS):
+            if outcome == "departed":
+                nothing_to_do = True
+                return
+            monitor_seconds = OTHER_PLAYER_MONITOR_SECONDS * OTHER_PLAYER_TIME_SCALE
+            LOG.info("other-player request pause complete; monitoring for %.0fs",
+                     monitor_seconds)
+            departed = self._wait_for_player_departure(monitor_seconds)
+            if self._other_player_switch_must_end():
+                abandoned = True
+                return
+            if departed:
                 LOG.warning("other player left during the monitor window; resuming patrol")
+                nothing_to_do = True
                 return
             room_code, wait_minutes, _channel, _callback = self._other_player_routing_snapshot()
+            wait_seconds = wait_minutes * 60.0 * OTHER_PLAYER_TIME_SCALE
             LOG.warning(
-                "other player remained for the monitor window; waiting %.1f minute(s) before channel switch",
-                wait_minutes,
+                "other player remained for the monitor window; waiting %.1f minute(s) "
+                "before channel switch (%.1fs with test scale %.2f)",
+                wait_minutes, wait_seconds, OTHER_PLAYER_TIME_SCALE,
             )
             # Once this wait begins, disappearance does not revoke the switch
             # decision. This matches the operator's "keep change too" rule.
-            if self.stop_event.wait(wait_minutes * 60.0):
+            if self._other_player_pause(wait_seconds):
+                abandoned = True
                 return
             attempts = 0
-            while not self.stop_event.is_set():
+            # The channel the character is REALLY on is only known after a
+            # verified switch, so it is held here and committed (see
+            # ``_note_channel_landed``) after the verification passes.  A failed
+            # attempt therefore re-plans from the same channel and produces the
+            # same target again - the operator's own case: "channel12 + 房间码 ->
+            # hash -> 35", and when it fails the character is still on 12, so the
+            # plan 12 -> 35 is run again instead of moving on to 35's successor.
+            room_code, _wait_minutes, current_channel, _callback = (
+                self._other_player_routing_snapshot()
+            )
+            target_channel = choose_next_channel(current_channel, room_code)
+            failures_on_target = 0
+            while not self._other_player_switch_must_end():
                 attempts += 1
-                room_code, _wait_minutes, current_channel, _callback = self._other_player_routing_snapshot()
-                route = plan_next_channel(current_channel, room_code)
+                route = plan_channel_route(current_channel, target_channel)
                 LOG.warning(
                     "player channel route %d: %d -> %d via %s%s",
                     attempts, route.current, route.target, route.moves,
                     " (房间码)" if room_code else " (随机)",
                 )
-                ok = channel_switch_procedure(
-                    self.key_sender,
-                    moves=route.moves,
-                    on_press=lambda key, sent: LOG.info(
-                        "player-switch press %s ok=%s", key, sent
-                    ),
-                )
+                failed_keys: list[str] = []
+
+                def _note_press(key: str, sent: bool) -> None:
+                    LOG.info("player-switch press %s ok=%s", key, sent)
+                    if key == "esc":
+                        # Remember our own Esc so the manual-Esc detector cannot
+                        # mistake this injected tap for the operator.
+                        self._other_player_esc_sent_at = time.monotonic()
+                    if not sent:
+                        failed_keys.append(key)
+
+                if not self._wait_for_sendable_input(5.0):
+                    LOG.warning(
+                        "player channel switch skipped: the keyboard is not "
+                        "armed (focus lost, or another workflow owns input); "
+                        "staying on channel %d",
+                        route.current,
+                    )
+                    break
+                # The sequence injects Esc itself.  Every Esc observation while
+                # it runs - and for the ignore window after it - is ours, so the
+                # manual-Esc detector must not see any of it: the previous
+                # version stamped the time only AFTER each press returned, so a
+                # poll landing inside the 60 ms Esc hold saw a "down" key with an
+                # old timestamp and stopped the workflow on its own key
+                # ("i didn't press esc manually but the selection was cleared").
+                self._other_player_injecting = True
+                try:
+                    ok = channel_switch_procedure(
+                        self.key_sender,
+                        moves=route.moves,
+                        on_press=_note_press,
+                    )
+                finally:
+                    self._other_player_injecting = False
+                    self._other_player_esc_sent_at = time.monotonic()
                 if not ok:
-                    LOG.warning("player channel switch blocked; aborting")
+                    LOG.warning(
+                        "player channel switch blocked at key %s; aborting "
+                        "(the game window is not foreground, input is disarmed, "
+                        "or another workflow owns the keyboard)",
+                        failed_keys[-1] if failed_keys else "?",
+                    )
                     break
+                # A fully sent route IS a channel change, and the number shown on
+                # the UI must follow it - the operator's "the channel changed on
+                # UI too with a successful changing (there may be a new other
+                # player, but a success change)".  Whether the new channel is
+                # CLEAN is a separate question, answered by the verification
+                # below, and only that answer decides the next plan.
                 self._note_channel_landed(route.target)
-                if self.stop_event.wait(self.other_player_switch_settle_seconds):
+                if self._other_player_pause(self.other_player_switch_settle_seconds):
+                    abandoned = True
                     return
-                count = self._other_players_on_latest_frame()
-                if count == 0:
-                    LOG.warning("player channel switch done (attempt %d); "
-                                "new channel clean", attempts)
+                # The channel change is proven by the client's own loading
+                # screen: the map goes away for a moment and the marker comes
+                # back on the new channel.  Only then does the marker's presence
+                # or absence mean anything, and only after a reload is the change
+                # treated as done - the operator's "screen black for 1s-2s then
+                # marker showed, success switch".
+                evidence = self._wait_for_switch_evidence(
+                    OTHER_PLAYER_SWITCH_VERIFY_SECONDS
+                )
+                if self._other_player_switch_must_end():
+                    abandoned = True
+                    return
+                if evidence == "clean":
+                    current_channel = route.target
+                    succeeded = True
+                    LOG.warning(
+                        "player channel switch %d done: the map reloaded and "
+                        "channel %d has no other player; resuming patrol",
+                        attempts, route.target,
+                    )
                     break
-                LOG.warning("other players still present after switch "
-                            "attempt %d (%d); switching again",
-                            attempts, count)
+                if evidence == "occupied":
+                    # The change happened; the new channel is simply occupied, so
+                    # the next channel of the route is tried from here.
+                    current_channel = route.target
+                    failures_on_target = 0
+                    LOG.warning(
+                        "player channel switch %d reached channel %d, but another "
+                        "player is there; switching on",
+                        attempts, route.target,
+                    )
+                    target_channel = choose_next_channel(route.target, room_code)
+                    continue
+                # "no-change": no loading screen followed the route, so the
+                # character never left its channel (a monster hit, or a swallowed
+                # key).  The landing number is already shown, and the plan is run
+                # again from the channel the character is really on.
+                failures_on_target += 1
+                if failures_on_target >= OTHER_PLAYER_SWITCH_SAME_TARGET_ATTEMPTS:
+                    # Several attempts on the same target.  The change may have
+                    # happened after all and that channel itself is occupied, so
+                    # move on in the route instead of hammering it.
+                    LOG.warning(
+                        "channel %d was not reached cleanly in %d attempts; "
+                        "moving on to the next channel of the route",
+                        target_channel, failures_on_target,
+                    )
+                    target_channel = choose_next_channel(target_channel, room_code)
+                    failures_on_target = 0
+                else:
+                    LOG.warning(
+                        "switch attempt %d showed no loading screen: the character "
+                        "never left channel %d, so %d -> %d is planned again",
+                        attempts, current_channel, current_channel, target_channel,
+                    )
         except Exception:
             LOG.exception("player channel switch failed")
         finally:
-            if self.patrol_controller is not None:
+            with self._other_player_settings_lock:
+                owns_patrol = bool(
+                    self._other_player_switch_owns_patrol
+                    and self._other_player_switch_generation == generation
+                )
+                self._other_player_switch_owns_patrol = False
+                # A cancelled workflow that exits after a newer one started must
+                # not clear the newer workflow's active flag.
+                if self._other_player_switch_generation == generation:
+                    self._player_switch_active = False
+            if abandoned:
+                LOG.warning(
+                    "other-player workflow abandoned: a new patrol start took "
+                    "over (patrol state left to the operator)"
+                )
+            if owns_patrol and (succeeded or nothing_to_do) and self.patrol_controller is not None:
                 self.patrol_controller.set_enabled(True)
-            self._player_switch_active = False
+                # This workflow invalidated delayed movement when it took the
+                # patrol; handing it back means a fresh, armed session.
+                self.arm_patrol_input("other-player switch handed patrol back")
+                LOG.warning(
+                    "other-player switch: %s; patrol resumed",
+                    "an empty channel was found"
+                    if succeeded else
+                    "the other player left, so no switch was needed",
+                )
+            elif owns_patrol and self.patrol_controller is not None:
+                # The operator's rule: "the character doesn't even start patrol
+                # when the mission is cleared - it should start only when the
+                # mission succeeds".  A refused key press, a channel that never
+                # came back clean, or an abandoned round all leave the character
+                # standing until Start Patrol is pressed (which also clears this
+                # feature's state).
+                LOG.warning(
+                    "other-player workflow ended without a successful channel "
+                    "change; patrol stays stopped (press Start Patrol to resume)"
+                )
 
     def _bottom_recorded_layer(self) -> Optional[str]:
         """Return the physical bottom recorded floor, independent of route.
@@ -5136,12 +6054,14 @@ class MovementWorker(threading.Thread):
         logic's business.
 
         The distance is ``_layer_y_distance`` (to the nearest RECORDED position), the same measure the
-        candidate ranking uses, so the two never disagree.
+        candidate ranking uses, so the two never disagree.  The session's temporary 站桩 point counts as
+        a recorded position of its own layer for that measure; otherwise the row the operator stands on
+        is refused as "away from" the very layer whose supporter it is.
         """
 
-        source = layers if layers is not None else {
-            name: self.important_positions.get(name) for name in self._route_layers
-        }
+        source = layers if layers is not None else self._stationary_detection_layers(
+            self._route_layers
+        )
         best: Optional[tuple[float, str]] = None
         for name, layer in source.items():
             if not isinstance(layer, dict):
@@ -5180,7 +6100,7 @@ class MovementWorker(threading.Thread):
         bottom_floor = self._bottom_recorded_layer()
         if bottom_floor is None:
             return None
-        layer = self.important_positions.get(bottom_floor)
+        layer = self._stationary_supported_layer(bottom_floor)
         if not isinstance(layer, dict):
             return None
         band = _layer_y_band(layer, float(layer.get("y_tolerance", 0.020000)))
@@ -5189,7 +6109,16 @@ class MovementWorker(threading.Thread):
         return bottom_floor
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
-        layers = {name: self.important_positions[name] for name in self._route_layers}
+        layers = self._stationary_detection_layers(self._route_layers)
+        # The temporary stationary point is a session-only layer supporter.
+        # Give its widened band precedence over the persisted profile so the
+        # row the operator stands on cannot become "no layer" while the
+        # character has not left that floor.
+        support = self._stationary_runtime_layer_support
+        if (observation.player is not None and support is not None
+                and support[0] in layers
+                and self._layer_band_contains(support[0], observation.player.y)):
+            return support[0]
         marker_candidates = (
             _layer_y_candidates(observation.player.y, layers)
             if observation.player is not None else []
@@ -5298,10 +6227,7 @@ class MovementWorker(threading.Thread):
     def _layer_band_contains(self, layer_name: str, y: float) -> bool:
         """True when the marker Y is inside the layer's recorded-point band."""
         layer = self.important_positions.get(layer_name)
-        if not _has_layer_y_supporter(layer):
-            return False
-        tolerance = float(layer.get("y_tolerance", 0.020000))
-        band = _layer_y_band(layer, tolerance)
+        band = self._stationary_runtime_layer_band(layer_name)
         if band is None:
             return False
         return bool(band[0] - 1e-9 <= y <= band[1] + 1e-9)
@@ -5389,7 +6315,8 @@ class MovementWorker(threading.Thread):
                 else None
             )
             seen = _layer_y_candidates(
-                observation.player.y, self.important_positions
+                observation.player.y,
+                self._stationary_detection_layers(self.important_positions),
             )
             seen_route = [name for name in seen if name in self._route_layers]
             if seen_route and current is not None and seen_route[0] != current:
@@ -5413,6 +6340,13 @@ class MovementWorker(threading.Thread):
             # layer2 repeating instead of advancing to layer3.
             self._clear_layer_resync_candidate()
             return self._detect_floor_all(observation)
+        support = self._stationary_runtime_layer_support
+        if (support is not None and observation.player is not None
+                and self._layer_band_contains(support[0], observation.player.y)):
+            # The session-only stationary supporter is direct marker evidence.
+            # It must beat a stale world-Y estimate on a two-height bench.
+            self._clear_layer_resync_candidate()
+            return support[0]
         climb_input_active = (
             self._climb_state.up_held
             or self._climb_state.phase == "climbing-up"
@@ -5484,10 +6418,7 @@ class MovementWorker(threading.Thread):
             marker_unambiguous = marker_expected and not marker_current
             marker_route_name = detect_layer_by_y(
                 observation.player.y,
-                {
-                    name: self.important_positions[name]
-                    for name in self._route_layers
-                },
+                self._stationary_detection_layers(self._route_layers),
             )
             marker_lower_fall = bool(
                 marker_route_name is not None
@@ -5570,7 +6501,8 @@ class MovementWorker(threading.Thread):
         else:
             detected_name = self._detected_layer(observation)
             marker_candidates_all = _layer_y_candidates(
-                observation.player.y, self.important_positions
+                observation.player.y,
+                self._stationary_detection_layers(self.important_positions),
             )
             # Only the floors the PATROL RANGE uses may make the marker reading "ambiguous".  A recorded
             # floor the range does not use (a leftover/stale layer in the profile, or another map's
@@ -6026,11 +6958,13 @@ class MovementWorker(threading.Thread):
         if self.stationary_attack_enabled != enabled:
             self.stationary_attack_enabled = enabled
             self._stationary_attack_anchor = None
+            self._stationary_runtime_layer_support = None
             self._stationary_ui_anchor_layer = None
             self._stationary_route_anchor_layer = None
             self._stationary_return_route_ready = False
             self._stationary_route_validation_error = ""
             self._stationary_facing_command = None
+            self._stationary_facing_requested = None
             self._stationary_bilateral_target = "right"
             self._stationary_bilateral_frames = 0
             self._stationary_x_settled = False
@@ -6041,6 +6975,7 @@ class MovementWorker(threading.Thread):
             self._stationary_pickup_failures = 0
             self._stationary_pickup_retry_after_return = False
             self._stationary_pickup_return_active = False
+            self._clear_stationary_pickup_leg_progress()
             self._stationary_return_dismount_direction = None
             self._reset_stationary_y_recovery()
             LOG.info(
@@ -6059,6 +6994,68 @@ class MovementWorker(threading.Thread):
         if direction not in ("left", "right", "both"):
             direction = "right"
         return layer, anchor, direction
+
+    def _stationary_runtime_layer_band(
+        self, layer_name: str,
+    ) -> Optional[tuple[float, float]]:
+        """Return a saved layer band widened by this session's temporary stake.
+
+        A temporary anchor must participate in floor recognition without
+        becoming a saved recording.  This preserves a bench's two physical
+        standing rows (for example its top and its normal recorded bottom), and
+        lets the temporary point decide the band's upper edge.  See
+        ``_runtime_supporter_layer_band``.
+        """
+
+        layer = self._stationary_supported_layer(layer_name)
+        if not isinstance(layer, dict):
+            return None
+        return _layer_y_band(layer, float(layer.get("y_tolerance", 0.020000)))
+
+    def _stationary_supported_layer(self, layer_name: str) -> Any:
+        """Detection-only view of *layer_name* that includes the session 站桩 point.
+
+        The temporary standing point is a real layer supporter for as long as
+        this session lasts.  Floor recognition, band membership and the
+        nearest-recorded-position distance must all see it, or the row the
+        operator is standing on reads as "no floor" while the character has not
+        moved - the field log showed exactly that: the marker at 0.257895 was
+        refused as "0.0526 away from layer1" even though the temporary anchor
+        was a supporter of that same layer.
+
+        The view is a copy.  The saved profile, the map recording and
+        ``user_config.json`` are never touched, and the copy only exists for
+        the duration of one detection call.
+        """
+
+        layer = self.important_positions.get(layer_name)
+        support = self._stationary_runtime_layer_support
+        if (not isinstance(layer, dict) or support is None
+                or support[0] != layer_name):
+            return layer
+        anchor_y = float(support[1].y)
+        band = _runtime_supporter_layer_band(layer, anchor_y)
+        if band is None:
+            return layer
+        view = dict(layer)
+        saved = layer.get("layer_band")
+        view_band = dict(saved) if isinstance(saved, dict) else {"version": 1}
+        view_band["y_upper"] = round(band[0], 6)
+        view_band["y_lower"] = round(band[1], 6)
+        view["layer_band"] = view_band
+        view[RUNTIME_SUPPORTER_KEY] = {"y": anchor_y}
+        return view
+
+    def _stationary_detection_layers(
+        self, names: Iterable[str],
+    ) -> dict[str, Any]:
+        """The named layers, each seen with this session's 站桩 supporter."""
+
+        return {
+            name: self._stationary_supported_layer(name)
+            for name in names
+            if name in self.important_positions
+        }
 
     def configure_stationary_return_route(self) -> bool:
         """Make the anchor's existing layer the one-layer stationary route.
@@ -6119,11 +7116,28 @@ class MovementWorker(threading.Thread):
                 ) - anchor.y),
             )
         self._stationary_ui_anchor_layer = anchor_layer
+        self._stationary_runtime_layer_support = (anchor_layer, anchor)
         LOG.info(
             "STATIONARY ATTACK: temporary anchor x=%.6f y=%.6f is marked "
             "on existing %s in the layer UI",
             anchor.x, anchor.y, anchor_layer,
         )
+        runtime_band = self._stationary_runtime_layer_band(anchor_layer)
+        if runtime_band is not None:
+            saved_band = _layer_y_band(
+                self.important_positions.get(anchor_layer) or {},
+                float((self.important_positions.get(anchor_layer) or {}).get(
+                    "y_tolerance", 0.020000
+                )),
+            )
+            LOG.info(
+                "STATIONARY ATTACK: temporary anchor y=%.6f joined %s as a "
+                "runtime supporter; band y=[%.6f, %.6f] (recorded band was %s; "
+                "the anchor decides the upper edge when it reaches highest; "
+                "not saved)",
+                anchor.y, anchor_layer, runtime_band[0], runtime_band[1],
+                ("[%.6f, %.6f]" % saved_band) if saved_band is not None else "none",
+            )
         previous_start, previous_end = self.patrol_controller.patrol_range()
         try:
             # The standing point defines this mode's route.  It does not
@@ -6233,6 +7247,7 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_failures = 0
         self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_return_active = False
+        self._clear_stationary_pickup_leg_progress()
         self._stationary_return_dismount_direction = None
         self._stationary_pickup_next_at = (
             time.monotonic() + self._stationary_pickup_delay()
@@ -6279,6 +7294,7 @@ class MovementWorker(threading.Thread):
             if now < self._stationary_pickup_next_at:
                 return None
             self._stationary_pickup_phase = "left"
+            self._clear_stationary_pickup_leg_progress()
             # Each pickup circuit is a new directional traversal.  Its jump
             # points must be available again even if the previous circuit
             # already crossed the same point before returning or falling.
@@ -6290,27 +7306,127 @@ class MovementWorker(threading.Thread):
                      self._stationary_route_anchor_layer)
         phase = self._stationary_pickup_phase
         target = left_x if phase == "left" else right_x if phase == "right" else anchor.x
-        if abs(target - player.x) <= self._current_horizontal_tolerance:
+        travel = self._stationary_pickup_leg_travel(phase, anchor.x, player.x)
+        if self._stationary_pickup_leg_arrived(phase, target, player.x, travel):
             if phase == "left":
                 self._stationary_pickup_phase = "right"
-                LOG.info("STATIONARY PICKUP: left edge reached; crossing right")
+                LOG.info(
+                    "STATIONARY PICKUP: left edge reached (x=%.6f left_x=%.6f); "
+                    "crossing right", player.x, left_x,
+                )
                 target = right_x
+                travel = "right"
             elif phase == "right":
                 self._stationary_pickup_phase = "anchor"
-                LOG.info("STATIONARY PICKUP: right edge reached; returning to anchor")
+                LOG.info(
+                    "STATIONARY PICKUP: right edge reached (x=%.6f right_x=%.6f); "
+                    "returning to anchor", player.x, right_x,
+                )
                 target = anchor.x
+                travel = self._stationary_pickup_leg_travel(
+                    self._stationary_pickup_phase, anchor.x, player.x
+                )
             else:
                 self._stationary_pickup_phase = None
                 self._stationary_pickup_failures = 0
                 self._stationary_pickup_next_at = now + self._stationary_pickup_delay()
-                LOG.info("STATIONARY PICKUP: anchor restored; next run scheduled")
+                self._clear_stationary_pickup_leg_progress()
+                LOG.info(
+                    "STATIONARY PICKUP: anchor restored (x=%.6f anchor_x=%.6f); "
+                    "next run scheduled", player.x, anchor.x,
+                )
                 return None
-        direction = "right" if target > player.x else "left"
+        # One leg walks ONE way.  The direction is the leg's own travel
+        # direction, never re-derived from the live gap: the old
+        # "right if target > player.x else left" turned the character around
+        # whenever the marker had already stepped over its endpoint, which is
+        # how the pickup ping-ponged in the 12:30 field log (phase "right",
+        # recorded right_x=0.46, marker at 0.469298 -> walked left again).
         return MovementDecision(
-            direction,
-            f"stationary pickup {self._stationary_pickup_phase} {direction}",
+            travel,
+            f"stationary pickup {self._stationary_pickup_phase} {travel}",
             self.movement_hold_seconds,
         )
+
+    @staticmethod
+    def _stationary_pickup_leg_travel(
+        phase: Optional[str], anchor_x: float, player_x: float,
+    ) -> str:
+        """Which way one pickup leg walks.
+
+        The recorded left endpoint is reached by walking left, the right
+        endpoint by walking right, and the 桩 by walking toward it.
+        """
+
+        if phase == "left":
+            return "left"
+        if phase == "right":
+            return "right"
+        return "right" if float(anchor_x) >= float(player_x) else "left"
+
+    def _stationary_pickup_leg_arrived(
+        self, phase: Optional[str], target: float, player_x: float, travel: str,
+    ) -> bool:
+        """Whether a pickup leg has reached its endpoint.
+
+        Inside the arrival band the endpoint counts as reached - and so does an
+        endpoint the marker has stepped OVER.  The yellow diamond advances in
+        whole minimap columns (0.0088 on the operator's 114 px minimap, and up
+        to 0.0175 while it is moving) while the arrival band is a fraction of
+        one column, so a target that falls between two sampled columns can
+        never satisfy it: the character walks past, the old direction logic
+        turned it around, and it ping-ponged across the missed endpoint for as
+        long as the pickup ran (the 12:30 log: ~0.434 to ~0.496, four reversals
+        in four seconds).  A leg that stops closing the distance - a wall, or a
+        marker frozen by an animation - is bounded exactly the way the patrol
+        route bounds an unreachable endpoint.
+        """
+
+        distance = abs(float(player_x) - float(target))
+        if distance <= self._current_horizontal_tolerance:
+            self._clear_stationary_pickup_leg_progress()
+            return True
+        if travel == "left" and player_x <= target:
+            LOG.info(
+                "STATIONARY PICKUP: %s endpoint stepped over (x=%.6f target=%.6f); "
+                "counting it as reached", phase, player_x, target,
+            )
+            self._clear_stationary_pickup_leg_progress()
+            return True
+        if travel == "right" and player_x >= target:
+            LOG.info(
+                "STATIONARY PICKUP: %s endpoint stepped over (x=%.6f target=%.6f); "
+                "counting it as reached", phase, player_x, target,
+            )
+            self._clear_stationary_pickup_leg_progress()
+            return True
+        key = (str(phase), round(float(target), 6))
+        if key != self._stationary_pickup_leg_key:
+            self._stationary_pickup_leg_key = key
+            self._stationary_pickup_leg_best = distance
+            self._stationary_pickup_leg_frames = 0
+            return False
+        if distance < self._stationary_pickup_leg_best - 1e-9:
+            self._stationary_pickup_leg_best = distance
+            self._stationary_pickup_leg_frames = 0
+            return False
+        self._stationary_pickup_leg_frames += 1
+        if self._stationary_pickup_leg_frames < STATIONARY_PICKUP_LEG_NO_PROGRESS_FRAMES:
+            return False
+        LOG.warning(
+            "STATIONARY PICKUP: %s leg made no progress toward x=%.6f for %d "
+            "frames (distance=%.6f); treating the endpoint as reached",
+            phase, target, self._stationary_pickup_leg_frames, distance,
+        )
+        self._clear_stationary_pickup_leg_progress()
+        return True
+
+    def _clear_stationary_pickup_leg_progress(self) -> None:
+        """Forget the pickup leg's progress tracker."""
+
+        self._stationary_pickup_leg_key = None
+        self._stationary_pickup_leg_best = 0.0
+        self._stationary_pickup_leg_frames = 0
 
     def _abort_stationary_pickup_for_route_return(self) -> None:
         """Discard every pickup plan before a confirmed fall returns to 桩.
@@ -6323,6 +7439,7 @@ class MovementWorker(threading.Thread):
         phase = self._stationary_pickup_phase
         self._stationary_pickup_phase = None
         self._stationary_pickup_return_active = True
+        self._clear_stationary_pickup_leg_progress()
         # A pickup jump can leave Up held for a rope.  This failed pickup is
         # now handing ownership to the route-return climb, so remove that
         # previous jump session before the return state decides its own Up.
@@ -6358,6 +7475,7 @@ class MovementWorker(threading.Thread):
         # corrected for its old selection. The next settled frame queues the
         # new target through the arbiter.
         self._stationary_facing_command = None
+        self._stationary_facing_requested = None
         LOG.info("stationary facing selection changed to %s", direction)
 
     def stationary_attack_anchor_position(self) -> Optional[Point]:
@@ -6440,6 +7558,7 @@ class MovementWorker(threading.Thread):
             self._pending_patrol_start_above_route = False
 
         self._stationary_attack_anchor = Point(float(marker.x), float(marker.y))
+        self._stationary_runtime_layer_support = None
         self._stationary_near_correction_next_at = 0.0
         self._stationary_step_target_x = None
         self._stationary_facing_confirm_frames_remaining = 0
@@ -6450,6 +7569,7 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_failures = 0
         self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_return_active = False
+        self._clear_stationary_pickup_leg_progress()
         self._stationary_return_dismount_direction = None
         # Restart the optional pickup timer for this new manual session.  A
         # timer that was already due in the previous run must not immediately
@@ -6475,6 +7595,7 @@ class MovementWorker(threading.Thread):
         # Treat the current facing as settled until a genuine recovery walk or
         # a later 朝向 selection creates a new facing obligation.
         self._stationary_facing_command = self._stationary_facing_target_for_frame()
+        self._stationary_facing_requested = None
         self._stationary_bilateral_target = "right"
         self._stationary_bilateral_frames = 0
         self._stationary_x_settled = True
@@ -6495,13 +7616,17 @@ class MovementWorker(threading.Thread):
         return True
 
     def _reset_stationary_y_recovery(self) -> None:
-        """Forget this displacement episode's Y-recovery jump bookkeeping."""
+        """Forget this arrival's small-Y-gap bookkeeping.
 
-        self._stationary_y_jumps = 0
-        self._stationary_y_jump_at = float("-inf")
-        self._stationary_y_backoff_logged = False
-        self._stationary_y_mismatch_sign = 0
-        self._stationary_y_mismatch_frames = 0
+        Called when the marker is back on the anchor row (the gap is fixed), when
+        the character is plainly away from the 桩, on a fresh Start Patrol, and
+        when the mode is toggled - each of those begins a NEW arrival, and a new
+        arrival is allowed one fresh Alt jump.
+        """
+
+        self._stationary_y_small_gap_frames = 0
+        self._stationary_y_jump_spent = False
+        self._stationary_y_jump_abandoned = False
 
     def _clear_stationary_route_state(self) -> None:
         """Drop route/vertical state that 站桩攻击 must never carry.
@@ -6536,24 +7661,40 @@ class MovementWorker(threading.Thread):
     def _stationary_y_recovery_decision(
         self, anchor: Point, player: Point
     ) -> MovementDecision:
-        """Keep jumping while the standing Y is wrong.
+        """What to do about the standing Y while X is on the 桩.
 
-        X is recovered by walking and comes first.  Y cannot be walked back:
-        it needs the Alt jump.  The marker-Y jitter band decides whether the
-        character is displaced at all, and the attempt re-arms while the
-        mismatch lasts - one jump per `STATIONARY_ATTACK_Y_JUMP_GAP_SECONDS`,
-        slowing to `STATIONARY_ATTACK_Y_RETRY_SECONDS` after the first burst -
-        so a character that really is below its spot (a jump cannot climb
-        back) never jumps forever.
+        X is recovered by walking and comes first, so this runs only once the
+        marker is inside the accepted X of its temporary anchor.
+
+        Two cases, in this order:
+
+        1. the marker is back inside ``STATIONARY_ATTACK_Y_TOLERANCE`` of the
+           launch row - the gap is fixed, the arrival's bookkeeping resets and
+           the character simply attacks;
+        2. the marker is still on the anchor's own layer but off its standing
+           row - the bench's other row (bottom 0.310526 with the anchor on its
+           top at 0.278947) is the operator's own case, and a marker row or two
+           of jitter is the same thing written smaller.  When that gap has held
+           for ``STATIONARY_ATTACK_SMALL_GAP_FRAMES`` frames, ONE Alt jump is
+           tried.  A jump that reaches the anchor row ends the episode; one that
+           does not is abandoned until the character leaves the 桩 and comes back
+           (see ``_stationary_small_gap_jump_decision``).  The earlier build
+           excluded the wider row change from jumping at all, and the field log
+           showed what that costs: the character stood at
+           pos=(0.539474, 0.310526) with gap=+0.000000, sent no jump, and only
+           repeated attacks from the wrong row.
+
+        A reading outside the anchor layer's band is left to the ordinary
+        route/fall logic.
         """
 
         gap_y = anchor.y - player.y
         if abs(gap_y) <= STATIONARY_ATTACK_Y_TOLERANCE:
-            if self._stationary_y_jumps:
+            if self._stationary_y_jump_spent:
                 LOG.info(
-                    "stationary Y recovery: back on the launch position "
-                    "(y=%.6f anchor_y=%.6f after %d jumps)",
-                    player.y, anchor.y, self._stationary_y_jumps,
+                    "stationary Y gap fixed: back on the launch position "
+                    "(y=%.6f anchor_y=%.6f) after the single recovery jump",
+                    player.y, anchor.y,
                 )
             self._reset_stationary_y_recovery()
             return MovementDecision(
@@ -6561,65 +7702,108 @@ class MovementWorker(threading.Thread):
             )
 
         # A stationary-recovery jump is only useful while the marker remains
-        # on the anchor platform.  Once it is outside this local same-layer
-        # band, a jump cannot recover a fall and must not compete with the
-        # ordinary route-return logic.
-        if abs(gap_y) > STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE:
-            self._reset_stationary_y_recovery()
-            return MovementDecision(
-                None,
-                "stationary Y recovery skipped: marker outside anchor layer band",
-            )
-
-        # Do not turn a one-frame marker flicker into Alt.  In the supplied
-        # field log, y=0.503571 appeared once beside the real anchor
-        # y=0.510714 (exactly one minimap pixel), which launched a needless
-        # recovery jump and the following fall/route-return sequence.
-        mismatch_sign = 1 if gap_y > 0.0 else -1
-        if mismatch_sign == self._stationary_y_mismatch_sign:
-            self._stationary_y_mismatch_frames += 1
-        else:
-            self._stationary_y_mismatch_sign = mismatch_sign
-            self._stationary_y_mismatch_frames = 1
-        if self._stationary_y_mismatch_frames < STATIONARY_ATTACK_Y_CONFIRM_FRAMES:
-            return MovementDecision(
-                None,
-                "stationary Y recovery: confirming displaced marker "
-                f"({self._stationary_y_mismatch_frames}/"
-                f"{STATIONARY_ATTACK_Y_CONFIRM_FRAMES})",
-            )
-        now = time.monotonic()
-        burst = self._stationary_y_jumps < STATIONARY_ATTACK_Y_BURST_JUMPS
-        wait_seconds = (
-            STATIONARY_ATTACK_Y_JUMP_GAP_SECONDS if burst
-            else STATIONARY_ATTACK_Y_RETRY_SECONDS
+        # on the anchor platform.  The anchor layer's own runtime band (the
+        # saved recording plus this session's temporary anchor) decides that:
+        # the bench's two standing rows are one physical floor, so both of them
+        # are inside the band and both earn the single jump attempt.
+        anchor_layer = (
+            self._stationary_route_anchor_layer
+            or self._stationary_ui_anchor_layer
         )
-        elapsed = now - self._stationary_y_jump_at
-        if elapsed < wait_seconds:
+        runtime_band = (
+            self._stationary_runtime_layer_band(anchor_layer)
+            if anchor_layer else None
+        )
+        in_anchor_band = bool(
+            runtime_band is not None
+            and runtime_band[0] - 1e-9 <= player.y <= runtime_band[1] + 1e-9
+        )
+        if not in_anchor_band:
+            if runtime_band is not None or abs(gap_y) > STATIONARY_ATTACK_SMALL_Y_GAP:
+                self._reset_stationary_y_recovery()
+                return MovementDecision(
+                    None,
+                    "stationary Y recovery skipped: marker outside anchor "
+                    "layer band",
+                )
+            # No band is known at all (the session could not select an anchor
+            # layer), so the anchor's own same-layer window is the only
+            # evidence and a small gap still earns the single attempt.
+
+        # X is on the 桩 and the Y is off its row: the operator's single-jump
+        # rule.
+        return self._stationary_small_gap_jump_decision(anchor, player, gap_y)
+
+    def _stationary_small_gap_jump_decision(
+        self, anchor: Point, player: Point, gap_y: float,
+    ) -> MovementDecision:
+        """One Alt jump for a Y gap at the 桩 that will not go away by itself.
+
+        The operator's rule: while the marker stays inside the accepted X of its
+        temporary anchor and its Y stays off the launch row for
+        ``STATIONARY_ATTACK_SMALL_GAP_FRAMES`` frames (any row of the anchor's own
+        layer counts - the bench's bottom row is 0.0316 below its top), try ONE
+        Alt jump.  A jump that puts the marker back on the anchor row ends the
+        episode.  A jump that does not is ABANDONED - the character keeps
+        attacking from where it stands instead of jumping forever - and no
+        further jump is sent until it leaves the 桩 and comes back, which is when
+        a fresh attempt is allowed.
+        """
+
+        self._stationary_y_small_gap_frames += 1
+        if self._stationary_y_jump_abandoned:
             return MovementDecision(
                 None,
-                f"stationary Y recovery: waiting {wait_seconds - elapsed:.1f}s "
-                f"for the next jump (y={player.y:.6f} anchor_y={anchor.y:.6f})",
+                "stationary Y gap: this arrival already spent its jump "
+                f"(marker y={player.y:.6f} anchor_y={anchor.y:.6f}); waiting for "
+                "the next arrival at the 桩",
             )
-        if not burst and not self._stationary_y_backoff_logged:
-            self._stationary_y_backoff_logged = True
+        if self._stationary_y_jump_spent:
+            # The jump is in flight or has just landed.  The character's own
+            # jump arc keeps the marker off its launch row for a moment, so the
+            # gap must survive a few more settled frames before the attempt
+            # counts as failed.
+            settle_frames = (
+                self._stationary_y_small_gap_frames
+                - STATIONARY_ATTACK_SMALL_GAP_FRAMES
+            )
+            if settle_frames <= STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES:
+                return MovementDecision(
+                    None,
+                    "stationary Y gap: waiting for the Alt jump to settle "
+                    f"({settle_frames}/"
+                    f"{STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES})",
+                )
+            self._stationary_y_jump_abandoned = True
             LOG.warning(
-                "STATIONARY ATTACK Y recovery: %d jumps did not restore "
-                "anchor_y=%.6f (player_y=%.6f); retrying one jump every %.1fs",
-                self._stationary_y_jumps, anchor.y, player.y,
-                STATIONARY_ATTACK_Y_RETRY_SECONDS,
+                "STATIONARY Y gap: the Alt jump did not restore "
+                "anchor_y=%.6f (marker y=%.6f); abandoning this attempt - no "
+                "further jump until the character leaves the 桩 and comes back",
+                anchor.y, player.y,
             )
-        self._stationary_y_jumps += 1
-        self._stationary_y_jump_at = now
+            return MovementDecision(
+                None,
+                "stationary Y gap: the jump did not restore the anchor "
+                "row; abandoning this attempt",
+            )
+        if self._stationary_y_small_gap_frames < STATIONARY_ATTACK_SMALL_GAP_FRAMES:
+            return MovementDecision(
+                None,
+                "stationary Y gap "
+                f"({self._stationary_y_small_gap_frames}/"
+                f"{STATIONARY_ATTACK_SMALL_GAP_FRAMES} frames): waiting before "
+                "the single recovery jump",
+            )
+        self._stationary_y_jump_spent = True
         LOG.info(
-            "STATIONARY ATTACK Y recovery jump %d: player_y=%.6f anchor_y=%.6f "
-            "gap_y=%+.6f",
-            self._stationary_y_jumps, player.y, anchor.y, gap_y,
+            "STATIONARY Y gap: X is on the 桩 and the marker has held "
+            "y=%.6f (anchor_y=%.6f, gap %+.6f) for %d frames; trying ONE Alt jump",
+            player.y, anchor.y, gap_y, STATIONARY_ATTACK_SMALL_GAP_FRAMES,
         )
         return MovementDecision(
             "stationary_jump",
-            f"stationary Y recovery jump {self._stationary_y_jumps} "
-            f"(player_y={player.y:.6f} anchor_y={anchor.y:.6f})",
+            f"stationary Y gap recovery jump (marker y={player.y:.6f} "
+            f"anchor_y={anchor.y:.6f})",
             self.minimum_final_hold_seconds,
         )
 
@@ -6682,6 +7866,16 @@ class MovementWorker(threading.Thread):
             )
         gap_x = anchor.x - player.x
         distance_x = abs(gap_x)
+        if distance_x > STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE:
+            # Plainly away from the 桩 in X (a pickup leg, a return walk, a
+            # knock-down): this arrival at the 桩 is over, so the next time the
+            # character walks back onto it a fresh small-Y-gap attempt is
+            # allowed - the operator's "the next time we go back to stationary
+            # attack pos, we try again".  A correction step inside the final
+            # approach deliberately does NOT count as leaving, or an abandoned
+            # attempt would earn a second jump without the character ever
+            # leaving its post.
+            self._reset_stationary_y_recovery()
         # 捡东西 owns the whole left -> right -> anchor circuit.  Do this
         # before normal anchor recovery so crossing either side cannot be
         # pulled back to 桩 mid-run.  A wrong-Y observation still goes through
@@ -6841,9 +8035,25 @@ class MovementWorker(threading.Thread):
             )
         pending = getattr(self.motion_arbiter, "facing_pending", None)
         if callable(pending) and pending(direction):
+            self._stationary_facing_requested = direction
             return MovementDecision(
                 None, f"stationary facing {direction} queued",
             )
+        if self._stationary_facing_requested == direction:
+            # The turn was queued and the arbiter no longer holds it, yet the
+            # facing is still owed: it was drained (safe-stage gate shut, focus
+            # dip, stop) before it could turn the character.  Say so and put it
+            # back on the queue now - a 朝向 obligation may never be swallowed
+            # silently, and the hold cannot be lengthened to compensate (a
+            # longer hold walks the character out of its band).
+            LOG.info(
+                "stationary facing %s: the queued turn was dropped before it "
+                "was delivered; re-queueing it",
+                direction,
+            )
+        # Any other in-flight tap is moot now (the target facing changed), so it
+        # must not be reported as a dropped turn later.
+        self._stationary_facing_requested = None
         request = getattr(self.motion_arbiter, "request_facing", None)
         if not callable(request):
             return settled_decision
@@ -6857,6 +8067,7 @@ class MovementWorker(threading.Thread):
                 f"stationary facing {direction} waiting for the walk to settle",
             )
         if request(direction):
+            self._stationary_facing_requested = direction
             return MovementDecision(
                 None, f"stationary facing {direction} queued",
             )
@@ -6905,6 +8116,13 @@ class MovementWorker(threading.Thread):
         ordinary walk out of the tap.  It returns False (the arbiter then drains
         the token) whenever the character is not in a state where the tap can
         stick; movement keeps the facing owed and queues it again.
+
+        The hold is deliberately short (``STATIONARY_ATTACK_FACING_HOLD_SECONDS``
+        = 30 ms): the tap is a TURN, and a longer hold walks the character out
+        of the anchor band.  The 朝向 guarantee is therefore carried by this
+        delivery path, not by the hold: the obligation is cleared only after the
+        direction key really went down and up, and every other exit is logged
+        and leaves the facing owed so the next settled capture re-queues it.
         """
 
         direction = str(direction).casefold()
@@ -6917,6 +8135,11 @@ class MovementWorker(threading.Thread):
         key_down = getattr(self.key_sender, "key_down", None)
         key_up = getattr(self.key_sender, "key_up", None)
         if key_down is None or key_up is None:
+            LOG.warning(
+                "stationary facing %s: the key sender has no direction hold; "
+                "the turn stays owed",
+                direction,
+            )
             return False
         with self._direction_lock, self._hold_lock:
             if (not self._patrol_input_allowed()
@@ -6933,10 +8156,20 @@ class MovementWorker(threading.Thread):
                 return False
             self._release_walk_hold()
             if key_down(direction) is False:
+                LOG.warning(
+                    "stationary facing %s: the direction key never went down "
+                    "(focus or input state); the turn stays owed",
+                    direction,
+                )
                 return False
             try:
                 if not self._wait_for_patrol_motion(
                         STATIONARY_ATTACK_FACING_HOLD_SECONDS):
+                    LOG.warning(
+                        "stationary facing %s: the turn was cut short by a "
+                        "stop/abort after the key went down; the turn stays owed",
+                        direction,
+                    )
                     return False
             finally:
                 key_up(direction)
@@ -6946,6 +8179,7 @@ class MovementWorker(threading.Thread):
         # must prove it remained inside the standing band before the normal
         # attack cadence may resume.
         self._stationary_facing_command = direction
+        self._stationary_facing_requested = None
         self._stationary_x_settled = False
         self._stationary_facing_confirm_frames_remaining = (
             STATIONARY_ATTACK_FACING_CONFIRM_FRAMES
@@ -7031,8 +8265,11 @@ class MovementWorker(threading.Thread):
         """Whether X is in the face-biased resting zone around the stake.
 
         The correction target is always ``anchor_x``.  Only the acceptance
-        window moves: left-facing uses ``[X-0.010, X+0.006]`` and right-facing
-        uses ``[X-0.006, X+0.010]``.  This absorbs the known facing-tap nudge
+        window moves: left-facing uses ``[X-0.0225, X+0.0075]`` and right-facing
+        uses ``[X-0.0075, X+0.0225]`` (``STATIONARY_ATTACK_X_TOLERANCE`` 0.015
+        either side of the anchor, shifted 0.0075 toward the selected facing).
+        This absorbs the known facing-tap nudge and one whole marker column of
+        quantisation - a column is 0.014925 on the operator's 67 px minimap -
         without making either edge a movement target.
         """
 
@@ -7053,13 +8290,24 @@ class MovementWorker(threading.Thread):
         Final recovery owns attacks through its arbiter STEP motions.  The
         independent cadence must remain quiet until the marker, target facing,
         and post-facing confirmation all agree; otherwise it races the final
-        tiny correction and can make the character appear frozen.
+        tiny correction and can make the character appear frozen.  The single Alt
+        jump for a persistent Y gap is the same kind of owner: while it is in
+        flight the cadence stays quiet so the jump and the attack cannot swallow
+        each other.
         """
 
         if (not self._stationary_x_settled
                 or self._stationary_facing_confirm_frames_remaining > 0):
             return False
         if not self._stationary_anchor_x_accepted(anchor.x, player.x):
+            return False
+        if self._stationary_y_jump_spent and not self._stationary_y_jump_abandoned:
+            # The single Alt jump for a persistent Y gap owns this window.  The
+            # field log showed the failure of letting both run: the character
+            # stood off its anchor row while the fixed cadence kept pressing the
+            # attack key, so the jump and the attack swallowed each other.  Hold
+            # the cadence until the jump has either fixed the row or been
+            # abandoned; attacks resume immediately after either outcome.
             return False
         return (
             self._stationary_facing_command
@@ -7069,10 +8317,13 @@ class MovementWorker(threading.Thread):
     def _stationary_correction_hold(self) -> float:
         """How long the anchor correction holds its direction for the live gap.
 
-        Inside the small-step band the correction is the operator's tiny step;
-        further out the same motion becomes the longer walk back.  Both carry
-        the attack that belongs to the correction (see
-        ``perform_stationary_step``), so the hold is the only thing that differs.
+        Inside the small-step band the correction is the near step that closes
+        the last marker column onto the 桩; further out the same motion becomes
+        the longer walk back.  Both carry the attack that belongs to the
+        correction (see ``perform_stationary_step``), so the hold is the only
+        thing that differs - and both hold long enough for the game to actually
+        move the character, because a hold below the game's own movement
+        granularity is swallowed and the correction then repeats forever.
         """
 
         anchor = self._stationary_attack_anchor
@@ -7127,6 +8378,18 @@ class MovementWorker(threading.Thread):
                 )
                 return False
             if not self._stationary_step_still_needed(direction):
+                # Never a silent drop: the arbiter reports "anchor correction
+                # NOT delivered; event drained" for this, and the operator must
+                # be able to see WHY the queued correction was dropped.
+                live_player = getattr(self.last_observation, "player", None)
+                LOG.info(
+                    "stationary correction %s dropped: the marker already "
+                    "reached its step target (player_x=%s target_x=%s)",
+                    direction,
+                    (f"{live_player.x:.6f}" if live_player is not None else "unknown"),
+                    (f"{self._stationary_step_target_x:.6f}"
+                     if self._stationary_step_target_x is not None else "anchor"),
+                )
                 self._stationary_step_target_x = None
                 return False
             # The finite target has served its purpose.  A following capture
@@ -7389,9 +8652,18 @@ class MovementWorker(threading.Thread):
 
     def _detect_floor_all(self, observation: MinimapObservation) -> Optional[str]:
         """Detect the floor over ALL recorded layers (not just the patrol
-        range), so an out-of-range landing is recognized for the return."""
+        range), so an out-of-range landing is recognized for the return.
+
+        This is the per-frame answer the running log prints, so it must see the
+        session's temporary 站桩 supporter too: the row the operator stands on
+        is a real supporter of its layer and cannot be answered with "no floor"
+        plus a nearest-floor refusal.
+        """
         layers = {
-            name: layer for name, layer in self.important_positions.items()
+            name: layer
+            for name, layer in self._stationary_detection_layers(
+                self.important_positions
+            ).items()
             if _has_layer_y_supporter(layer)
         }
         if observation.player is not None:
@@ -7423,7 +8695,7 @@ class MovementWorker(threading.Thread):
         if observation.player is not None:
             bottom_floor = self._bottom_recorded_layer()
             bottom_layer = (
-                self.important_positions.get(bottom_floor, {})
+                self._stationary_supported_layer(bottom_floor)
                 if bottom_floor is not None else {}
             )
             band = (
@@ -7482,7 +8754,10 @@ class MovementWorker(threading.Thread):
             return anchor_layer if anchor_match else self._detect_floor_all(observation)
 
         layers = {
-            name: layer for name, layer in self.important_positions.items()
+            name: layer
+            for name, layer in self._stationary_detection_layers(
+                self.important_positions
+            ).items()
             if _has_layer_y_supporter(layer)
         }
         candidates = _layer_y_candidates(observation.player.y, layers)
@@ -9728,6 +11003,7 @@ class MovementWorker(threading.Thread):
             # The pair ends facing the selected 朝向, so the stand-still facing
             # obligation is satisfied and the (net zero) step is accepted.
             self._stationary_facing_command = final_direction
+            self._stationary_facing_requested = None
             self._stationary_x_settled = True
         LOG.info(
             "small-step complete: %s -> attack -> wait 0.70s -> %s; facing target=%s",
@@ -10941,6 +12217,69 @@ class MovementWorker(threading.Thread):
                     target_text = (f"{active_target_x:.6f}"
                                    if active_target_x is not None else "----")
                     gap_text = f"{gap:+.6f}" if gap is not None else "----"
+                    # A stationary anchor has no movement key once it is
+                    # settled, but it is not idle: the independent attack
+                    # worker has been explicitly re-armed.  Calling that
+                    # state "wait" made the field log look as if the attack
+                    # handoff had failed even while Ctrl/A were firing.  A
+                    # correction in flight is reported as what it is - the
+                    # arbiter step that carries its own attack - instead of
+                    # "wait": the field log showed "action=wait" on the very
+                    # frames whose correction was executing.
+                    #
+                    # The Y-gap states say what they are as well.  Reporting
+                    # them as a healthy "attack" was the other field problem:
+                    # the character stood off its anchor row (bench bottom
+                    # 0.310526 against anchor 0.278947) while the log claimed a
+                    # normal attack every frame, so the single jump attempt and
+                    # the attack that were swallowing each other could not be
+                    # told apart.  ``y-gap n/5`` is the wait, ``jump`` is the
+                    # Alt tap (the decision key already prints as
+                    # ``stationary_jump``), ``y-gap settle n/4`` is the landing
+                    # verdict window, and ``y-gap hold`` means this arrival's
+                    # one attempt is spent or abandoned and the attacks are
+                    # back on.
+                    action_text = decision.key
+                    if action_text is None and route_label == "stationary-attack":
+                        correction_match = re.match(
+                            r"stationary X correction (left|right)",
+                            decision.reason,
+                        )
+                        facing_match = re.match(
+                            r"stationary facing (left|right)",
+                            decision.reason,
+                        )
+                        gap_match = re.match(
+                            r"stationary Y gap \((?P<frame>\d+)/(?P<total>\d+) "
+                            r"frames\)",
+                            decision.reason,
+                        )
+                        settle_match = re.match(
+                            r"stationary Y gap: waiting for the Alt jump to "
+                            r"settle \((?P<frame>\d+)/(?P<total>\d+)\)",
+                            decision.reason,
+                        )
+                        if correction_match is not None:
+                            action_text = f"step {correction_match.group(1)}"
+                        elif facing_match is not None:
+                            action_text = f"turn {facing_match.group(1)}"
+                        elif gap_match is not None:
+                            action_text = (
+                                f"y-gap {gap_match.group('frame')}/"
+                                f"{gap_match.group('total')}"
+                            )
+                        elif settle_match is not None:
+                            action_text = (
+                                f"y-gap settle {settle_match.group('frame')}/"
+                                f"{settle_match.group('total')}"
+                            )
+                        elif decision.reason.startswith("stationary Y gap"):
+                            action_text = "y-gap hold"
+                        elif decision.reason == (
+                                "stationary attack temporary safe zone"):
+                            action_text = "attack"
+                    if action_text is None:
+                        action_text = "wait"
                     LOG.info(
                         "%s| pos=(%.6f, %.6f) | target=%s | gap=%s | action=%s",
                         stage,
@@ -10948,7 +12287,7 @@ class MovementWorker(threading.Thread):
                         observation.player.y,
                         target_text,
                         gap_text,
-                        decision.key or "wait",
+                        action_text,
                     )
                 else:
                     LOG.warning("movement waiting: %s", decision.reason)

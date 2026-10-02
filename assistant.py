@@ -388,17 +388,8 @@ def main() -> int:
     # the noisy patrol log.  It contains the detector-to-pass handoff, the
     # prepared WebSocket connection, every worker outcome and all API-worker
     # progress/errors; it deliberately does not add keys, activation codes or
-    # raw frames.  UI lifecycle messages retain their normal logger, so the
-    # filter also recognises their stable Chinese feature prefix.
-    class _AutoLieLogFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            if record.name in {"auto-lie", "api_lie_test"}:
-                return True
-            try:
-                return "自动过测谎" in record.getMessage()
-            except Exception:
-                return False
-
+    # raw frames.  These named loggers do not propagate to the root logger:
+    # automatic lie activity belongs in auto_lie.log, not assistant.log.
     auto_lie_log_handler = RotatingFileHandler(
         Path(__file__).with_name("auto_lie.log"),
         maxBytes=1_000_000,
@@ -407,9 +398,17 @@ def main() -> int:
     )
     auto_lie_log_handler.setLevel(logging.INFO)
     auto_lie_log_handler.setFormatter(_compact_log_formatter())
-    auto_lie_log_handler.addFilter(_AutoLieLogFilter())
-    logging.getLogger().addHandler(auto_lie_log_handler)
     auto_lie_logger = logging.getLogger("auto-lie")
+    for auto_lie_log_name in (
+        "auto-lie",
+        "api_auto_lie",
+        "api_lie_test",
+        "autolie_api",
+    ):
+        scoped_logger = logging.getLogger(auto_lie_log_name)
+        scoped_logger.setLevel(logging.INFO)
+        scoped_logger.addHandler(auto_lie_log_handler)
+        scoped_logger.propagate = False
 
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
         logging.critical(
@@ -547,6 +546,9 @@ def main() -> int:
     config_store = get_config_store(args.config)
     additional_settings = config_store.read_section("additional_functions")
     channel_update_events: "queue.Queue[int]" = queue.Queue(maxsize=16)
+    # A stopped 检测到其他玩家自动切换频道 workflow asks the UI to clear its own
+    # selection, so the feature cannot start a new round by itself.
+    other_player_stop_events: "queue.Queue[str]" = queue.Queue(maxsize=8)
 
     # Select a WebSocket endpoint once while the dashboard is opening.  A
     # probe does not authenticate or bill (protocol 2.7.0 §4.3), so the lie
@@ -1689,6 +1691,28 @@ def main() -> int:
                 pass
         logging.info("player channel route committed current reconnect channel=%d", selected)
 
+    def note_other_player_stop(reason: str) -> None:
+        """Ask the UI to clear the 其他玩家自动换线 selection after a manual stop.
+
+        A manual Esc (or the workflow's own stop) must switch the feature OFF:
+        leaving the field ticked let the next red diamond start a completely new
+        round, with its 求让消息 and its waiting - the operator's "otherwise we
+        only go into new round of switching".
+        """
+
+        try:
+            other_player_stop_events.put_nowait(str(reason or "stopped"))
+        except queue.Full:
+            try:
+                other_player_stop_events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                other_player_stop_events.put_nowait(str(reason or "stopped"))
+            except queue.Full:
+                pass
+        logging.warning("other-player switch stopped (%s); asking the UI to clear the field", reason)
+
     # 测试api (附加功能 panel): pick a video, play it at the API's 5 fps and upload each frame's ROI
     # to the RoiTrack backend (see api_lie_video.py).  A new worker per press, because a thread can
     # only be started once.  api_lie_test.py (the older single-frame screen drill) has no panel
@@ -2108,6 +2132,7 @@ def main() -> int:
                 additional_settings.get("auto_reconnect_channel", CHANNEL_DEFAULT)
             ),
             on_channel_landed=note_player_channel_landed,
+            on_other_player_stop=note_other_player_stop,
             rescue_check_interval_seconds=float(
                 calibration.get("rescue_check_interval_seconds", 300.0)
             ),
@@ -2283,6 +2308,7 @@ def main() -> int:
             # 自动重连 can run) without Start Patrol.
             disconnect_watch_armed_event=disconnect_watch_armed,
             channel_update_events=channel_update_events,
+            other_player_stop_events=other_player_stop_events,
         )
     )
 

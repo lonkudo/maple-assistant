@@ -62,6 +62,61 @@ YELLOW_MIN_SOLID_CORE_SPAN = 3
 # anti-aliased pixels is a legitimate marker, anything thinner is not.
 YELLOW_MIN_MARKER_SPAN = YELLOW_MIN_SOLID_CORE_SPAN
 
+# Colour family of ANOTHER player's red diamond.  The operator measures it as the
+# same shape as his own marker - a small solid block (2x2, rotated 45 degrees) -
+# so the red detector is deliberately built the same way as the yellow one.
+#
+# Two calibration mistakes are recorded here because both cost field runs:
+#
+#  * the first version seeded from one shade with a narrow window
+#    (|red - 227| <= 25), so a client drawing (255,0,0) - or any shade more than
+#    25 away from (227,0,0) - produced no seed pixel at all and the marker
+#    vanished: "the red diamond disappeared although this map has another red
+#    diamond";
+#  * the correction then accepted any "saturated red" (red >= 170 with green and
+#    blue <= 90), which also matches ordinary map art.  The operator's own
+#    wrong_init.jpg proves it: inside the minimap scan region sits a 2x4 platform
+#    blob with mean RGB (171,70,42) (max (192,93,92)), the detector called it
+#    another player, and the channel was changed with nobody on the map.
+#
+# The family below is red enough to be the marker and clean enough not to be
+# terrain: green and blue must be nearly absent, and red must dominate them three
+# to one.  A marker shade - (255,0,0), (227,0,0), (200,0,0), (190,20,20) - passes;
+# the measured map art, orange decorations and washed-out pinks do not.
+RED_CORE_RED_FLOOR = 190
+RED_CORE_GREEN_CEILING = 45
+RED_CORE_BLUE_CEILING = 45
+RED_BODY_RED_FLOOR = 165
+RED_BODY_GREEN_CEILING = 60
+RED_BODY_BLUE_CEILING = 60
+RED_MIN_CHANNEL_RATIO = 3.0
+RED_MIN_SATURATION = 0.60
+# Smallest accepted marker: the operator's 2x2 rotated block, and the three
+# strongly red pixels that survive when one of its four pixels is anti-aliased.
+RED_MIN_MARKER_PIXELS = 3
+RED_MIN_MARKER_SPAN = 2
+# A filled marker block is compact (3 px in a 2x2 box scores 0.75); a red digit
+# glyph of a damage number, a thin red run, or a ragged terrain edge is not.
+RED_MIN_COMPACTNESS = 0.50
+
+
+def _red_family_mask(
+    red, green, blue, *, min_red, max_green, max_blue,
+) -> np.ndarray:
+    """Saturated red pixels, the colour family of another player's diamond."""
+
+    value = np.maximum(np.maximum(red, green), blue)
+    span = value - np.minimum(np.minimum(red, green), blue)
+    return (
+        (red >= min_red)
+        & (green <= max_green)
+        & (blue <= max_blue)
+        & (red >= green * RED_MIN_CHANNEL_RATIO)
+        & (red >= blue * RED_MIN_CHANNEL_RATIO)
+        & (span >= 1)
+        & (span >= RED_MIN_SATURATION * np.maximum(value, 1))
+    )
+
 
 def _solid_core_mask(mask: np.ndarray, span: int) -> np.ndarray:
     """True where a whole ``span`` x ``span`` block of ``mask`` is set."""
@@ -286,41 +341,64 @@ def detect_yellow_diamond(minimap_rgb: np.ndarray) -> Optional[MarkerDetection]:
 def detect_red_diamonds(minimap_rgb: np.ndarray) -> list[MarkerDetection]:
     """Return ALL red diamond markers (other players) on the minimap.
 
-    Other players render as red diamonds with a center color of #e30000
-    (227, 0, 0).  The yellow player diamond is never matched (yellow has
-    high green/blue; red requires both near zero).  Each connected red
-    component within diamond-like size/aspect limits becomes one detection;
-    unlike the yellow marker there is no "best one" - every player counts.
+    The operator's rule: "no matter which one - if a red diamond exists, another
+    player exists", and his client draws that marker exactly like his own yellow
+    one - a small solid block (2x2 red square, rotated 45 degrees).  So this
+    detector is built like ``detect_yellow_diamond``: a colour-FAMILY mask
+    establishes the candidates, the shape and compactness gates keep red map art
+    out, and every surviving marker counts - there is no "best one".
+
+    The old test seeded from one measured shade with a narrow window
+    (``abs(red - 227) <= 25``).  The field report was "the red diamond
+    disappeared although this map has another red diamond": a client drawing the
+    marker at (255, 0, 0), or any shade more than 25 away from (227, 0, 0),
+    produced no seed pixel at all, so the whole marker vanished and the
+    other-player detection with it.  The family below accepts any strongly
+    saturated red, which covers every client shade while still rejecting the
+    orange/yellow platform decorations (they need a high green channel) and
+    brown/desaturated terrain.
     """
 
     rgb = minimap_rgb.astype(np.int16)
     red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
-    # #e30000 center with tolerance; green/blue must stay near zero so
-    # yellow/orange platform decorations are never mistaken for players.
-    red_center = (
-        (np.abs(red - 227) <= 25)
-        & (green <= 60)
-        & (blue <= 60)
+    red_center = _red_family_mask(
+        red, green, blue,
+        min_red=RED_CORE_RED_FLOOR,
+        max_green=RED_CORE_GREEN_CEILING,
+        max_blue=RED_CORE_BLUE_CEILING,
     )
-    red_body = (red >= 190) & (green <= 70) & (blue <= 70)
+    # The wider body mask only widens the measured pixel box with the marker's
+    # anti-aliased outer pixels; the candidate must still contain core pixels.
+    red_body = _red_family_mask(
+        red, green, blue,
+        min_red=RED_BODY_RED_FLOOR,
+        max_green=RED_BODY_GREEN_CEILING,
+        max_blue=RED_BODY_BLUE_CEILING,
+    )
     height, width = red_center.shape
     min_dimension = min(width, height)
-    expected_span = max(4, int(round(min_dimension * 0.05)))
+    # The marker is a 2x2 block like the player's own, not the 6-7 px component
+    # the first version expected.
+    expected_span = 3
     max_span = max(20, int(round(min_dimension * 0.18)))
     max_pixels = max(320, max_span * max_span)
     body_components = _components(red_body, min_pixels=3)
     detections: list[MarkerDetection] = []
-    for component in _components(red_center, min_pixels=3):
+    # Three strongly red pixels is the smallest thing that can be the operator's
+    # 2x2 rotated marker once one anti-aliased pixel is dimmer than the core
+    # family; a lone fleck is rejected by the span and compactness gates below.
+    for component in _components(red_center, min_pixels=RED_MIN_MARKER_PIXELS):
         ys, xs = component[:, 0], component[:, 1]
         strict_left, strict_top = int(xs.min()), int(ys.min())
         strict_right, strict_bottom = int(xs.max()) + 1, int(ys.max()) + 1
         span_x, span_y = strict_right - strict_left, strict_bottom - strict_top
         count = len(component)
-        if count > max_pixels or span_x > max_span or span_y > max_span:
+        if (count > max_pixels or span_x > max_span or span_y > max_span
+                or span_x < RED_MIN_MARKER_SPAN or span_y < RED_MIN_MARKER_SPAN):
             continue
         aspect = span_x / max(1, span_y)
         compact = count / max(1, span_x * span_y)
-        if 0.45 <= aspect <= 2.2 and compact >= 0.20 and span_x >= 2 and span_y >= 2:
+        if 0.45 <= aspect <= 2.2 and compact >= RED_MIN_COMPACTNESS:
             shape_score = max(0.0, 1.0 - abs(aspect - 1.0) / 2.0)
             span = max(span_x, span_y)
             size_score = max(

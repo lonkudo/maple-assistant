@@ -58,6 +58,10 @@ from auto_lie_secret import get_server_secret, has_server_secret
 
 
 LOG = logging.getLogger(__name__)
+# Automatic lie workflow diagnostics are deliberately isolated from the
+# regular patrol/application log.  The application configures this named
+# logger to write only to auto_lie.log.
+AUTO_LIE_LOG = logging.getLogger("auto-lie")
 
 # Hotkey actions that TYPE into the game: they need live input armed, so they re-arm it themselves
 # when the auto-reconnect (or a failed run) left it off.  Recording/selection chords do not type and
@@ -834,6 +838,8 @@ class UiWorker(threading.Thread):
         # 自动重连 can run) even without Start Patrol.
         disconnect_watch_armed_event: Optional[threading.Event] = None,
         channel_update_events: Optional["queue.Queue[int]"] = None,
+        # A stopped 其他玩家自动换线 workflow asks for its own field to be cleared.
+        other_player_stop_events: Optional["queue.Queue[str]"] = None,
     ) -> None:
         super().__init__(name="ui-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -959,6 +965,7 @@ class UiWorker(threading.Thread):
         self.lie_watch_armed_event = lie_watch_armed_event
         self.disconnect_watch_armed_event = disconnect_watch_armed_event
         self.channel_update_events = channel_update_events
+        self.other_player_stop_events = other_player_stop_events
         # License verification is an independent boundary: it never changes
         # patrol/trade worker internals, it only decides whether UI actions may
         # enter those workflows.
@@ -2224,7 +2231,7 @@ class UiWorker(threading.Thread):
                 self._load_reconnect_settings()
             )
             saved_api_auto_lie = self._load_api_auto_lie_setting()
-            LOG.info(
+            AUTO_LIE_LOG.info(
                 "自动过测谎: selection loaded as %s",
                 "ON" if saved_api_auto_lie else "OFF",
             )
@@ -3002,6 +3009,7 @@ class UiWorker(threading.Thread):
         self._drain_license_heartbeat_results()
         self._drain_lie_accounting_results()
         self._drain_channel_update_events()
+        self._drain_other_player_stop_events()
 
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
@@ -4336,13 +4344,13 @@ class UiWorker(threading.Thread):
         if (armed and hasattr(self, "_lie_alert_var")
                 and not bool(self._lie_alert_var.get())):
             self._lie_alert_var.set(True)
-            LOG.info("自动过测谎 enabled 测谎 automatically (required prerequisite)")
+            AUTO_LIE_LOG.info("自动过测谎 enabled 测谎 automatically (required prerequisite)")
         try:
             data = self._shutdown_collect_data()
             self._shutdown_save_settings(data)
             self._shutdown_apply_to_worker(data)
         except Exception:
-            LOG.warning("自动过测谎 setting could not be saved", exc_info=True)
+            AUTO_LIE_LOG.warning("自动过测谎 setting could not be saved", exc_info=True)
         if hasattr(self, "_api_test_status"):
             if not armed:
                 self._api_test_status.configure(text="自动过测谎: 未启用。")
@@ -4357,11 +4365,11 @@ class UiWorker(threading.Thread):
                     text="自动过测谎: 已启用 - 未开始巡逻时也会自动抓取窗口检测并接管。"
                 )
         if armed and not self._lie_detection_armed():
-            LOG.warning(
+            AUTO_LIE_LOG.warning(
                 "自动过测谎 is armed but 测谎 (lie detection) is OFF: no lie window can be detected, so "
                 "the automatic pass can never start - tick 测谎 as well"
             )
-        LOG.info("自动过测谎 %s", "armed" if armed else "disarmed")
+        AUTO_LIE_LOG.info("自动过测谎 %s", "armed" if armed else "disarmed")
 
     def _lie_detection_armed(self) -> bool:
         """Whether the 测谎 checkbox is ticked (it is what enables the detector)."""
@@ -4392,7 +4400,7 @@ class UiWorker(threading.Thread):
         try:
             self._api_auto_lie_events.put_nowait(match)
         except queue.Full:
-            LOG.warning("自动过测谎: event queue is full; newest detector event was dropped")
+            AUTO_LIE_LOG.warning("自动过测谎: event queue is full; newest detector event was dropped")
 
     def _handle_lie_event_for_api(self, match: object = None) -> None:
         """Handle one queued lie event on the UI thread.
@@ -4403,18 +4411,18 @@ class UiWorker(threading.Thread):
         """
 
         if not self._license_allowed():
-            LOG.info("自动过测谎: ignored because license is not valid")
+            AUTO_LIE_LOG.info("自动过测谎: ignored because license is not valid")
             return
         if not has_server_secret():
-            LOG.warning("自动过测谎: server credential is unavailable; pass was not started")
+            AUTO_LIE_LOG.warning("自动过测谎: server credential is unavailable; pass was not started")
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(text="自动过测谎: 等待在线授权下发测谎密钥。")
             return
         if not hasattr(self, "_api_auto_lie_var"):
-            LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
+            AUTO_LIE_LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
             return
         if not self._api_auto_lie_var.get():
-            LOG.warning(
+            AUTO_LIE_LOG.warning(
                 "自动过测谎: lie event ignored - the 自动过测谎 selection is OFF "
                 "(tick it to pass automatically)"
             )
@@ -4423,7 +4431,7 @@ class UiWorker(threading.Thread):
             # The detector may see the same popup in several consecutive
             # frames before the user enables this session.  It is expected,
             # not an operator-facing warning.
-            LOG.debug("自动过测谎: lie event ignored until enabled during this session")
+            AUTO_LIE_LOG.debug("自动过测谎: lie event ignored until enabled during this session")
             return
         now = time.monotonic()
         if match is None:
@@ -4439,7 +4447,7 @@ class UiWorker(threading.Thread):
             # square only flickers, the window is still on screen), so a second pass would spend a
             # second api round for the same test.  The operator's rule: "the first alarm will be
             # accepted, then the autolie_api takes over, the second one will be ignored".
-            LOG.warning("自动过测谎: a pass is ALREADY handling this lie window - this event is "
+            AUTO_LIE_LOG.warning("自动过测谎: a pass is ALREADY handling this lie window - this event is "
                         "ignored (one pass per window; a pass is running)")
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(
@@ -4448,7 +4456,7 @@ class UiWorker(threading.Thread):
             return
         since_last = now - getattr(self, "_api_auto_lie_last_pass_started", 0.0)
         if since_last < AUTO_LIE_MIN_PASS_GAP_SECONDS:
-            LOG.warning(
+            AUTO_LIE_LOG.warning(
                 "自动过测谎: a lie window appeared %.0fs after the previous pass started (minimum "
                 "%.0fs apart) - NO pass is started for it (the quota is protected this way, not by "
                 "silently ignoring windows)", since_last, AUTO_LIE_MIN_PASS_GAP_SECONDS,
@@ -4462,7 +4470,7 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_pending = True
         self._api_auto_lie_pending_since = now
         self._api_auto_lie_wait_logged = False
-        LOG.warning(
+        AUTO_LIE_LOG.warning(
             "自动过测谎: a new lie window armed a pass (bbox %s, previous pass %.0fs ago)",
             match, since_last,
         )
@@ -4484,7 +4492,7 @@ class UiWorker(threading.Thread):
             try:
                 return bool(state())
             except Exception:
-                LOG.warning("自动过测谎: worker.running() failed", exc_info=True)
+                AUTO_LIE_LOG.warning("自动过测谎: worker.running() failed", exc_info=True)
                 return True
         return bool(state)
 
@@ -4525,13 +4533,13 @@ class UiWorker(threading.Thread):
         if self._worker_is_running(self._api_lie_pass_worker):
             if not getattr(self, "_api_auto_lie_wait_logged", False):
                 self._api_auto_lie_wait_logged = True
-                LOG.info("自动过测谎: a pass is still running; this lie event waits for it")
+                AUTO_LIE_LOG.info("自动过测谎: a pass is still running; this lie event waits for it")
             waited = time.monotonic() - getattr(
                 self, "_api_auto_lie_pending_since", time.monotonic()
             )
             if waited >= AUTO_LIE_PENDING_MAX_SECONDS:
                 self._api_auto_lie_pending = False
-                LOG.warning(
+                AUTO_LIE_LOG.warning(
                     "自动过测谎: dropping a lie event that waited %.0fs for the running pass",
                     waited,
                 )
@@ -4539,7 +4547,7 @@ class UiWorker(threading.Thread):
         factory = getattr(self, "api_auto_lie_factory", None)
         if factory is None:
             self._api_auto_lie_pending = False
-            LOG.warning(
+            AUTO_LIE_LOG.warning(
                 "自动过测谎: this build has no api pass factory - the lie event is dropped"
             )
             if hasattr(self, "_api_test_status"):
@@ -4551,7 +4559,7 @@ class UiWorker(threading.Thread):
         )
         if since_last < AUTO_LIE_MIN_PASS_GAP_SECONDS:
             self._api_auto_lie_pending = False
-            LOG.info(
+            AUTO_LIE_LOG.info(
                 "自动过测谎: pass skipped - the previous pass started %.0fs ago "
                 "(minimum %.0fs apart)",
                 since_last, AUTO_LIE_MIN_PASS_GAP_SECONDS,
@@ -4561,7 +4569,7 @@ class UiWorker(threading.Thread):
         try:
             worker = factory()
         except Exception as exc:
-            LOG.warning("自动过测谎 could not start", exc_info=True)
+            AUTO_LIE_LOG.warning("自动过测谎 could not start", exc_info=True)
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
             return
@@ -4573,11 +4581,11 @@ class UiWorker(threading.Thread):
         try:
             worker.start()
         except Exception as exc:
-            LOG.warning("自动过测谎 worker could not be started", exc_info=True)
+            AUTO_LIE_LOG.warning("自动过测谎 worker could not be started", exc_info=True)
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
             return
-        LOG.info("自动过测谎: pass %d started for a lie window", self._api_auto_lie_runs)
+        AUTO_LIE_LOG.info("自动过测谎: pass %d started for a lie window", self._api_auto_lie_runs)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(
                 text=f"自动过测谎: 测谎窗口出现，正在处理（第 {self._api_auto_lie_runs} 次）…"
@@ -4600,16 +4608,16 @@ class UiWorker(threading.Thread):
             try:
                 controller.set_enabled(False)
                 self._api_auto_lie_patrol_paused = True
-                LOG.warning("自动过测谎: patrol paused for the api pass (it resumes when the pass "
+                AUTO_LIE_LOG.warning("自动过测谎: patrol paused for the api pass (it resumes when the pass "
                             "finishes)")
             except Exception:
-                LOG.warning("自动过测谎: the patrol could not be paused for the pass", exc_info=True)
+                AUTO_LIE_LOG.warning("自动过测谎: the patrol could not be paused for the pass", exc_info=True)
         event = getattr(self, "automation_active_event", None)
         if event is not None:
             try:
                 event.clear()
             except Exception:
-                LOG.debug("自动过测谎: the automation switch could not be cleared", exc_info=True)
+                AUTO_LIE_LOG.debug("自动过测谎: the automation switch could not be cleared", exc_info=True)
 
     def _resume_patrol_after_api_pass(self) -> None:
         """Put the patrol back after the automatic api pass finished."""
@@ -4624,14 +4632,14 @@ class UiWorker(threading.Thread):
                 controller.set_enabled(True)
                 self._refresh_patrol_controls()
             except Exception:
-                LOG.warning("自动过测谎: the patrol could not be resumed", exc_info=True)
+                AUTO_LIE_LOG.warning("自动过测谎: the patrol could not be resumed", exc_info=True)
         event = getattr(self, "automation_active_event", None)
         if event is not None:
             try:
                 event.set()
             except Exception:
-                LOG.debug("自动过测谎: the automation switch could not be set", exc_info=True)
-        LOG.warning("自动过测谎: the api pass is done - the patrol resumes where it was")
+                AUTO_LIE_LOG.debug("自动过测谎: the automation switch could not be set", exc_info=True)
+        AUTO_LIE_LOG.warning("自动过测谎: the api pass is done - the patrol resumes where it was")
 
     def _begin_auto_lie_post_confirm(self) -> None:
         """Click the completed automatic lie dialog's measured confirm point."""
@@ -4642,12 +4650,12 @@ class UiWorker(threading.Thread):
         click_confirm = self._click_auto_lie_confirmation
         try:
             if click_confirm(sender) is False:
-                LOG.warning("自动过测谎: post-pass confirmation click was refused")
+                AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click was refused")
         except Exception:
-            LOG.warning("自动过测谎: post-pass confirmation click failed", exc_info=True)
+            AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click failed", exc_info=True)
         finally:
             self._api_auto_lie_post_confirm_complete = True
-        LOG.info("自动过测谎: pass finished; confirmation click sent; patrol may resume")
+        AUTO_LIE_LOG.info("自动过测谎: pass finished; confirmation click sent; patrol may resume")
 
     @staticmethod
     def _click_auto_lie_confirmation(sender: Any) -> bool:
@@ -4657,12 +4665,12 @@ class UiWorker(threading.Thread):
             select_window = getattr(sender, "select_window", None)
             is_foreground = getattr(sender, "is_game_foreground", None)
             if not callable(select_window):
-                LOG.warning("自动过测谎: post-pass confirmation click skipped; game window selector unavailable")
+                AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click skipped; game window selector unavailable")
                 return False
             focused = False
             for attempt in range(1, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS + 1):
                 if select_window() is False:
-                    LOG.warning(
+                    AUTO_LIE_LOG.warning(
                         "自动过测谎: post-pass confirmation focus attempt %d/%d failed",
                         attempt, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS,
                     )
@@ -4673,30 +4681,30 @@ class UiWorker(threading.Thread):
                 # the departing takeover window, owns foreground before click.
                 if not callable(is_foreground) or is_foreground():
                     focused = True
-                    LOG.info(
+                    AUTO_LIE_LOG.info(
                         "自动过测谎: game foreground verified before confirmation click "
                         "(attempt %d/%d)",
                         attempt, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS,
                     )
                     break
-                LOG.warning(
+                AUTO_LIE_LOG.warning(
                     "自动过测谎: game did not retain foreground before confirmation click "
                     "(attempt %d/%d)",
                     attempt, _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS,
                 )
             if not focused:
-                LOG.warning("自动过测谎: post-pass confirmation click skipped; game window is not foreground")
+                AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click skipped; game window is not foreground")
                 return False
             hwnd = int(getattr(sender, "hwnd", 0) or 0)
             if not hwnd:
-                LOG.warning("自动过测谎: post-pass confirmation click skipped; game handle unavailable")
+                AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click skipped; game handle unavailable")
                 return False
             import win32gui
 
             left, top, right, bottom = win32gui.GetClientRect(hwnd)
             width, height = int(right - left), int(bottom - top)
             if width <= 0 or height <= 0:
-                LOG.warning("自动过测谎: post-pass confirmation click skipped; invalid client size")
+                AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click skipped; invalid client size")
                 return False
             client_x, client_y = _auto_lie_confirm_client_point(width, height)
             origin_x, origin_y = win32gui.ClientToScreen(hwnd, (0, 0))
@@ -4704,14 +4712,14 @@ class UiWorker(threading.Thread):
             screen_y = int(origin_y) + client_y
             clicked = click_screen(screen_x, screen_y, keep_focus=hwnd)
             if clicked:
-                LOG.info(
+                AUTO_LIE_LOG.info(
                     "自动过测谎: clicked confirmation at client=(%d,%d) "
                     "screen=(%d,%d) client_size=%dx%d",
                     client_x, client_y, screen_x, screen_y, width, height,
                 )
             return bool(clicked)
         except Exception:
-            LOG.warning("自动过测谎: post-pass confirmation point could not be clicked", exc_info=True)
+            AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation point could not be clicked", exc_info=True)
             return False
 
     def _drain_api_auto_lie_results(self) -> None:
@@ -4733,14 +4741,14 @@ class UiWorker(threading.Thread):
                 break
         if not (isinstance(latest, tuple) and len(latest) == 2):
             if latest is not None:
-                LOG.warning("自动过测谎 result ignored: unexpected item %r", latest)
+                AUTO_LIE_LOG.warning("自动过测谎 result ignored: unexpected item %r", latest)
             return
         state, detail = latest
         text = f"{state}: {detail}" if detail else str(state)
         # Keep the independent auto_lie.log useful after the handoff too:
         # progress/results originate in the worker queue, rather than all
         # being emitted by the worker's general-purpose logger.
-        LOG.info("自动过测谎: worker result %s", text)
+        AUTO_LIE_LOG.info("自动过测谎: worker result %s", text)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text=f"自动过测谎: {text}")
         # One automatic pass produces exactly one durable accounting event.
@@ -4761,14 +4769,14 @@ class UiWorker(threading.Thread):
 
         try:
             event_id = self._lie_accounting_worker.enqueue("success")
-            LOG.info(
+            AUTO_LIE_LOG.info(
                 "自动过测谎: %s completed; immediate success accounting event=%s",
                 source, event_id[:8],
             )
         except Exception:
             # The completed pass must remain independent from a local
             # persistence problem; a later run can still operate normally.
-            LOG.warning("自动过测谎: immediate accounting could not be queued", exc_info=True)
+            AUTO_LIE_LOG.warning("自动过测谎: immediate accounting could not be queued", exc_info=True)
 
     def auto_lie_pass_active(self) -> bool:
         """Whether an automatic API lie pass may be stopped by Esc."""
@@ -4793,10 +4801,10 @@ class UiWorker(threading.Thread):
                 return False
             self._api_auto_lie_pending = False
             stop()
-            LOG.warning("自动过测谎: cancellation requested by Esc")
+            AUTO_LIE_LOG.warning("自动过测谎: cancellation requested by Esc")
             return True
         except Exception:
-            LOG.debug("自动过测谎: Esc cancellation failed", exc_info=True)
+            AUTO_LIE_LOG.debug("自动过测谎: Esc cancellation failed", exc_info=True)
             return False
 
     def _save_reconnect_settings(self, enabled: bool, world: str, channel: int) -> None:
@@ -4999,7 +5007,16 @@ class UiWorker(threading.Thread):
         LOG.info("房间码 %s", "configured" if variable.get() else "cleared")
 
     def _drain_channel_update_events(self) -> None:
-        """Reflect worker-confirmed channel arrivals in Tk without cross-thread access."""
+        """Reflect worker-confirmed channel arrivals in Tk without cross-thread access.
+
+        Setting the spinbox variable is not enough: the 自动重连 status line, the
+        reconnect worker and the saved configuration are all refreshed by
+        ``_reconnect_on_change``, so without it the field an operator watches for
+        "which channel am I on" kept showing the old channel after a successful
+        landing ("the current channel on UI is not changing with successful
+        landing").  The handler is only run while the session is authorized, so a
+        transient license read cannot turn the landing into a refusal.
+        """
 
         events = getattr(self, "channel_update_events", None)
         if events is None:
@@ -5017,7 +5034,86 @@ class UiWorker(threading.Thread):
             return
         if hasattr(self, "_reconnect_channel_var"):
             self._reconnect_channel_var.set(str(channel))
+        licensed = bool(
+            getattr(self, "_license_status", None)
+            and self._license_status.valid
+        )
+        if licensed:
+            try:
+                # Applies the channel to the reconnect worker, persists it and
+                # refreshes the 自动重连 status line.
+                self._reconnect_on_change()
+            except Exception:
+                LOG.exception("could not apply the landed channel to the UI")
+        else:
+            LOG.info(
+                "player channel route landed on %d; the field shows it, but the "
+                "reconnect worker is locked until the license is valid", channel
+            )
         LOG.info("player channel route landed on %d; 自动重连频道已同步", channel)
+
+    def _drain_other_player_stop_events(self) -> None:
+        """Stop the mission and clear the 其他玩家自动换线 field when its workflow ended.
+
+        Runs on Tk's thread (the worker only posted a reason).  Two things happen,
+        both requested by the operator:
+
+        * **Stop Patrol runs too.**  Ending the mission only stopped *patrol*; the
+          automation switch stayed armed, so the attacks kept firing and the game
+          window kept being brought to the foreground ("esc don't clear patrol
+          state, the game window still keeps foregrounding and attack never
+          stop").  ``_stop_patrol`` is the operator's own Stop: it clears
+          ``automation_active`` immediately and scrubs the keys in the
+          background, which is what actually silences the attack worker and the
+          focusing that goes with it.
+        * **The field is cleared**, so the feature cannot start another round -
+          with its 求让消息 and its waiting - on the next red diamond.  The
+          settings are saved and applied exactly as if the operator had un-ticked
+          it himself.
+        """
+
+        events = getattr(self, "other_player_stop_events", None)
+        if events is None:
+            return
+        reason = None
+        while True:
+            try:
+                reason = events.get_nowait()
+            except queue.Empty:
+                break
+        if reason is None:
+            return
+        # The worker only posts this for a stop the operator caused (manual Esc).
+        # Patrol and the automation are cleared exactly like the Stop button, and
+        # the dashboard reflects it instead of looking busy.
+        try:
+            self._stop_patrol()
+        except Exception:
+            LOG.exception("could not stop patrol after the other-player mission ended")
+        if not hasattr(self, "_player_check_var"):
+            return
+        was_selected = bool(self._player_check_var.get())
+        if was_selected:
+            self._player_check_var.set(False)
+            try:
+                # The checkbox's own handler: derive the settings with the box
+                # now off, persist them, and push them to the movement worker.
+                self._shutdown_on_change()
+            except Exception:
+                LOG.exception("could not clear the other-player switch field")
+        LOG.warning(
+            "其他玩家自动换线 stopped (%s); patrol and the automation were cleared and "
+            "the 检测到其他玩家自动切换频道 field is now %s",
+            reason,
+            "cleared" if was_selected else "already off",
+        )
+        if hasattr(self, "_control_status"):
+            try:
+                self._control_status.configure(
+                    text=f"检测到其他玩家自动换线 已停止（{reason}），巡逻已停止，开关已取消"
+                )
+            except Exception:
+                LOG.debug("could not show the other-player stop status", exc_info=True)
 
     def _refresh_workflow_message_button(
         self, kind: str, title: str, variable: Any,
@@ -6924,7 +7020,7 @@ class UiWorker(threading.Thread):
             self._api_auto_lie_session_armed = False
             self._api_auto_lie_pending = False
             self.request_cancel_auto_lie_pass()
-            LOG.info("测谎 disabled; dependent 自动过测谎 was disabled as well")
+            AUTO_LIE_LOG.info("测谎 disabled; dependent 自动过测谎 was disabled as well")
         self._shutdown_on_change()
 
     def _shutdown_on_change(self, _value: str = "") -> None:
