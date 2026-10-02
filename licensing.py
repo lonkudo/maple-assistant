@@ -386,19 +386,45 @@ def _persist_document(document: dict[str, Any], status: LicenseStatus, root: Opt
     return status
 
 
-def _with_server_device(status: LicenseStatus, answer: Any) -> LicenseStatus:
-    """Attach device state and retain the server key in memory only."""
+def _with_server_device(
+    status: LicenseStatus, answer: Any, *, authoritative_credentials: bool = True,
+) -> LicenseStatus:
+    """Attach device state and retain the server key in memory only.
+
+    ``authoritative_credentials`` is True for the replies that own the
+    credential - activation and the heartbeat.  There, a reply that does not
+    mention the credential at all still means "this server has none configured
+    for this device", which is the historical rule.  It is False for the
+    post-pass accounting reply: an older server never sends the field there, and
+    treating that silence as "no credential" erased the in-memory key after
+    every completed pass, disarming 自动过测谎 until the next three-hourly
+    heartbeat (the field symptom: "server credential is unavailable; pass was
+    not started" for every following lie window).
+
+    A reply that *does* carry ``auto_lie`` is always authoritative, whichever
+    endpoint it came from: an empty ``secret_key`` is the server saying this
+    device has no passes left, and a non-empty one is the credential itself.
+    """
 
     device = answer.get("device") if isinstance(answer, dict) else None
     usage = answer.get("autolie_fingerprint_usage") if isinstance(answer, dict) else None
     auto_lie = answer.get("auto_lie") if isinstance(answer, dict) else None
-    secret = auto_lie.get("secret_key") if isinstance(auto_lie, dict) else ""
-    # Every successful heartbeat is authoritative: a missing key means the
-    # server is not configured for it, not permission to retain an old one.
-    if set_server_secret(secret):
-        SERVER_LOG.info("auto-lie credential refreshed from validated heartbeat")
-    else:
+    if isinstance(auto_lie, dict):
+        secret = str(auto_lie.get("secret_key") or "").strip()
+        set_server_secret(secret)
+        if secret:
+            SERVER_LOG.info("auto-lie credential refreshed from server reply")
+        else:
+            SERVER_LOG.warning(
+                "auto-lie credential withheld by the server (empty auto_lie.secret_key)"
+            )
+    elif authoritative_credentials:
+        # Do not let an old in-memory key survive an authoritative reply that
+        # carries no credential at all.
+        clear_server_secret()
         SERVER_LOG.warning("auto-lie credential unavailable in validated heartbeat")
+    else:
+        SERVER_LOG.debug("auto-lie credential left untouched (this reply carries none)")
     if not isinstance(device, dict) and not isinstance(usage, dict):
         return status
     # The full device document remains the compatibility response.  The
@@ -575,11 +601,13 @@ def report_lie_event_via_server(
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
-        status = _with_server_device(local, answer)
+        status = _with_server_device(local, answer, authoritative_credentials=False)
         SERVER_LOG.info("lie accounting accepted event=%s", str(event_id)[:8])
         return status
     except PinnedTlsResponseError as exc:
-        status = _with_server_device(local, getattr(exc, "data", {}))
+        status = _with_server_device(
+            local, getattr(exc, "data", {}), authoritative_credentials=False,
+        )
         if exc.code in {"AUTO_LIE_QUOTA_BANNED", "FINGERPRINT_BANNED"}:
             return replace(
                 status, valid=False, code="server:auto_lie_banned",

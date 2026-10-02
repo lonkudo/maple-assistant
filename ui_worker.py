@@ -54,7 +54,7 @@ from update_manager import (
     schedule_hidden_restart, schedule_package_update,
 )
 from runtime_paths import application_root, package_format
-from auto_lie_secret import get_server_secret, has_server_secret
+from auto_lie_secret import clear_server_secret, get_server_secret, has_server_secret
 
 
 LOG = logging.getLogger(__name__)
@@ -114,6 +114,12 @@ def _auto_lie_confirm_client_point(
 # report was "the lie event happened, but the autolie_api is not taking over", with no line in the log
 # saying why.  Quota is protected by the minimum gap between passes instead, and every skip is logged.
 AUTO_LIE_MIN_PASS_GAP_SECONDS = 10.0
+# A lie window that arrives without an in-memory credential must not simply be
+# lost: the panel asks for an immediate heartbeat and lets the detector's next
+# event start the pass as soon as the key lands.  These two bound that request so
+# a failing server cannot turn every scan into its own heartbeat.
+AUTO_LIE_SECRET_RETRY_SECONDS = 10.0
+AUTO_LIE_SECRET_MAX_ATTEMPTS = 3
 # A repeating debug-UI poll failure logs a full traceback this often; the ones in between are DEBUG.
 POLL_FAILURE_LOG_SECONDS = 10.0
 # A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
@@ -931,6 +937,10 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_quota_logged = False
         self._api_auto_lie_pending_since = 0.0
         self._api_auto_lie_wait_logged = False
+        # On-demand credential re-arm: how many immediate heartbeats this lie
+        # window has already asked for, and when the last one was requested.
+        self._api_auto_lie_secret_attempts = 0
+        self._api_auto_lie_secret_requested_at = 0.0
         # Debounce state: whether the window currently on screen has already been handled, when
         # the square was last seen to be gone, and when the last pass started.
         self._api_auto_lie_event_active = False
@@ -2656,6 +2666,12 @@ class UiWorker(threading.Thread):
         # 剩余 / 总 / 成功 / 失败 / 昨日 numbers and the 自动过测谎 gate are current.
         # It greys itself for LICENSE_REFRESH_COOLDOWN_SECONDS afterwards.
         self._update_button = _button("↻", self._request_license_heartbeat)
+        # Keep the hint available while the button is greyed by its cooldown:
+        # that is exactly when the operator wonders what the ↻ glyph does.
+        self._update_button_tooltip = HoverTooltip(
+            self._update_button, "刷新测谎次数"
+        )
+        self._update_button_tooltip.set_enabled(True)
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
         self._help_button.bind("<Enter>", self._help_hover_show)
@@ -3553,6 +3569,12 @@ class UiWorker(threading.Thread):
                 self._api_auto_lie_var.set(False)
             self._api_auto_lie_session_armed = False
             self._api_auto_lie_quota_locked = True
+            # The credential goes with the balance: the server withholds it at
+            # the same moment (an empty auto_lie.secret_key), so keeping the RAM
+            # copy would just let a window keep asking for a pass it can no
+            # longer pay for.  A later positive balance re-arms it from the
+            # server's next reply.
+            clear_server_secret()
             if check is not None:
                 try:
                     check.state(["disabled"])
@@ -3565,8 +3587,10 @@ class UiWorker(threading.Thread):
             if not getattr(self, "_api_auto_lie_quota_logged", False):
                 self._api_auto_lie_quota_logged = True
                 LOG.warning(
-                    "auto-lie quota exhausted (剩余 0); 自动过测谎 unselected and "
-                    "greyed until a heartbeat reports a positive balance"
+                    "auto-lie quota exhausted (剩余 0); 自动过测谎 unselected, greyed "
+                    "and its in-memory lie credential dropped until a heartbeat "
+                    "reports a positive balance; a lie window now asks for an "
+                    "immediate heartbeat instead of a pass"
                 )
             return
         if not getattr(self, "_api_auto_lie_quota_locked", False):
@@ -4686,10 +4710,14 @@ class UiWorker(threading.Thread):
             AUTO_LIE_LOG.info("自动过测谎: ignored because license is not valid")
             return
         if not has_server_secret():
-            AUTO_LIE_LOG.warning("自动过测谎: server credential is unavailable; pass was not started")
-            if hasattr(self, "_api_test_status"):
-                self._api_test_status.configure(text="自动过测谎: 等待在线授权下发测谎密钥。")
+            # Do not lose the window: ask for an immediate heartbeat and let the
+            # detector's next event (it fires on every scan) start the pass as
+            # soon as the key lands.  The request itself is bounded, so a server
+            # that keeps answering without a credential cannot turn every scan
+            # into its own heartbeat.
+            self._request_auto_lie_credential(match)
             return
+        self._api_auto_lie_secret_attempts = 0
         if not hasattr(self, "_api_auto_lie_var"):
             AUTO_LIE_LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
             return
@@ -4746,6 +4774,56 @@ class UiWorker(threading.Thread):
             "自动过测谎: a new lie window armed a pass (bbox %s, previous pass %.0fs ago)",
             match, since_last,
         )
+
+    def _request_auto_lie_credential(self, match: object = None) -> None:
+        """Ask for an immediate heartbeat when a lie window has no credential.
+
+        The credential is delivered by the activation/heartbeat reply and lives
+        in RAM only, so a window that arrives before that reply - just after a
+        start or an automatic restart, during a heartbeat round trip, or after a
+        failed heartbeat - used to be dropped outright, and the next chance to
+        arm it could be three hours away.  The detector re-reports the window on
+        every scan, so requesting the heartbeat here is enough: the next event
+        starts the pass as soon as the key lands.
+
+        The request is rate-limited and capped per window, because the detector
+        runs at the capture cadence and a server that keeps answering without a
+        credential must not be polled 5 times a second.
+        """
+
+        now = time.monotonic()
+        if match is None:
+            # The square is gone: the next window starts with a fresh budget.
+            self._api_auto_lie_secret_attempts = 0
+            return
+        attempts = int(getattr(self, "_api_auto_lie_secret_attempts", 0))
+        if attempts > AUTO_LIE_SECRET_MAX_ATTEMPTS:
+            return
+        if attempts >= AUTO_LIE_SECRET_MAX_ATTEMPTS:
+            # Log the give-up exactly once per window.
+            self._api_auto_lie_secret_attempts = attempts + 1
+            AUTO_LIE_LOG.warning(
+                "自动过测谎: 本窗口已请求 %d 次心跳仍拿不到测谎密钥，不再请求；"
+                "等待下一次心跳，或检查服务器是否已配置密钥",
+                attempts,
+            )
+            return
+        since = now - float(getattr(self, "_api_auto_lie_secret_requested_at", 0.0))
+        if attempts and since < AUTO_LIE_SECRET_RETRY_SECONDS:
+            return
+        self._api_auto_lie_secret_attempts = attempts + 1
+        self._api_auto_lie_secret_requested_at = now
+        request = getattr(self, "_license_heartbeat_request", None)
+        if request is not None:
+            request.set()
+        AUTO_LIE_LOG.warning(
+            "自动过测谎: 测谎窗口出现时本机没有测谎密钥；已请求立即心跳（第 %d/%d 次）",
+            attempts + 1, AUTO_LIE_SECRET_MAX_ATTEMPTS,
+        )
+        if hasattr(self, "_api_test_status"):
+            self._api_test_status.configure(
+                text="自动过测谎: 正在向授权服务器重新获取测谎密钥…"
+            )
 
     @staticmethod
     def _worker_is_running(worker: Any) -> bool:
