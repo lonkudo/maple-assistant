@@ -896,6 +896,11 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_events: "queue.Queue[object]" = queue.Queue(maxsize=16)
         self._api_auto_lie_pending = False
         self._api_auto_lie_session_armed = False
+        # The server-issued lie-pass quota: when 剩余 reaches 0 the checkbox is
+        # unselected and greyed until a heartbeat reports a positive balance
+        # again (an unmetered balance never locks it).
+        self._api_auto_lie_quota_locked = False
+        self._api_auto_lie_quota_logged = False
         self._api_auto_lie_pending_since = 0.0
         self._api_auto_lie_wait_logged = False
         # Debounce state: whether the window currently on screen has already been handled, when
@@ -2307,17 +2312,20 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._reconnect_message_button.pack(side="left", padx=(6, 0))
-            # The API drill is intentionally exposed again while the RTF1
-            # binary transport is being field-tested.  It opens the existing
-            # video picker and uses the same connection/handshake path as an
-            # automatic lie pass, but confines cursor motion to the video.
-            self._api_test_button = ttk.Button(
-                reconnect_row,
-                text="测试API",
-                command=self._api_test_clicked,
-                takefocus=False,
-            )
-            self._api_test_button.pack(side="left", padx=(6, 0))
+            # The 测试API drill button is hidden from the panel by operator
+            # request.  The drill itself is untouched: it still opens the video
+            # picker and uses the automatic pass's connection/handshake path,
+            # and every reader of the widget already goes through
+            # ``getattr(self, "_api_test_button", None)``, so leaving the
+            # attribute unset is safe.  To bring the button back, uncomment the
+            # three statements below.
+            # self._api_test_button = ttk.Button(
+            #     reconnect_row,
+            #     text="测试API",
+            #     command=self._api_test_clicked,
+            #     takefocus=False,
+            # )
+            # self._api_test_button.pack(side="left", padx=(6, 0))
             restart_row = ttk.Frame(extra_panel)
             restart_row.pack(fill="x", pady=(4, 0))
             self._auto_restart_var = tk.BooleanVar(value=False)
@@ -2354,8 +2362,9 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            # The temporary reconnect tester remains absent.  测试API above
-            # is a real operator-facing drill for the RTF1 upload transport.
+            # The invisible status sink is still needed: the automatic lie pass
+            # reports its progress and errors through it.  The 测试API button
+            # above is commented out, so only the automatic pass writes here.
             self._api_test_status = ttk.Label(
                 extra_panel, text="",
                 justify="left", wraplength=440,
@@ -3135,9 +3144,12 @@ class UiWorker(threading.Thread):
                 equipment_id=previous.equipment_id,
                 auto_lie_allowed=previous.auto_lie_allowed,
                 remaining_auto_lie_count=previous.remaining_auto_lie_count,
+                remaining_auto_lie_unlimited=previous.remaining_auto_lie_unlimited,
                 lie_detect_total=previous.lie_detect_total,
                 lie_detect_success_total=previous.lie_detect_success_total,
                 lie_detect_failed_total=previous.lie_detect_failed_total,
+                lie_detect_today=previous.lie_detect_today,
+                lie_detect_yesterday=previous.lie_detect_yesterday,
             )
         self._license_status = local_status
         return bool(self._license_status.valid)
@@ -3198,6 +3210,7 @@ class UiWorker(threading.Thread):
             self._refresh_license_ui()
             self._set_license_visual_lock(False)
             self._apply_auto_lie_entitlement(status)
+            self._apply_lie_quota_gate(status)
             if hasattr(self, "_control_status"):
                 self._control_status.configure(
                     text=("在线授权验证成功，自动功能已解锁。"
@@ -3241,6 +3254,10 @@ class UiWorker(threading.Thread):
         self._license_online_validation_pending = False
         if latest.valid:
             self._apply_auto_lie_entitlement(latest)
+            # Every completed pass is reported to the server and the reply carries
+            # the fresh balance, so this is also where a device that just spent
+            # its last pass gets disarmed.
+            self._apply_lie_quota_gate(latest)
             self._refresh_license_ui()
             LOG.info("auto-lie accounting synchronized")
             return
@@ -3283,20 +3300,15 @@ class UiWorker(threading.Thread):
                 # already returns the three totals in the activation, heartbeat
                 # and lie-accounting response (licensing._with_server_device),
                 # so the operator reads them where the account state is shown
-                # instead of in a panel of its own.  Wording matches the
-                # operator console's 测谎：总 / 成功 / 失败 column.
-                lie_stats = (
-                    f" · 测谎：总 {status.lie_detect_total}"
-                    f" / 成功 {status.lie_detect_success_total}"
-                    f" / 失败 {status.lie_detect_failed_total}"
-                )
-                lie_quota = (
-                    f" · 剩余 {status.remaining_auto_lie_count}"
-                    if status.remaining_auto_lie_count is not None else ""
-                )
+                # The usage tail the operator asked for: 剩余 first, then today's
+                # 总 / 成功 / 失败 and yesterday's.  The server counts each local
+                # calendar day (the heartbeat just after midnight already shows
+                # the new day's numbers), so the header always answers "how much
+                # is left, and what did it do today".
+                lie_stats = self._lie_usage_text(status)
                 label.configure(
                     text=(f"验证成功 · {device_text} · 到期：{expiry} · "
-                          f"{memory}{lie_stats}{lie_quota}{auto_lie}"),
+                          f"{memory}{lie_stats}{auto_lie}"),
                     foreground="#17803d",
                 )
             else:
@@ -3326,6 +3338,107 @@ class UiWorker(threading.Thread):
             LOG.info("equipment ID copied to clipboard")
         except Exception:
             LOG.debug("equipment ID copy failed", exc_info=True)
+
+    @staticmethod
+    def _lie_usage_text(status: LicenseStatus) -> str:
+        """The authorization bar's usage tail: remaining + today + yesterday.
+
+        Shape the operator asked for - ``剩余 10 / 总 1 / 成功 1 / 失败 0`` - with
+        yesterday's triple beside today's.  ``总/成功/失败`` are TODAY's counted
+        passes (the server sends per-period counters now); a server that predates
+        them falls back to the lifetime totals, so the line never loses numbers.
+        An unmetered device shows 无限 instead of a count.
+        """
+
+        if status.remaining_auto_lie_unlimited:
+            remaining = "无限"
+        elif status.remaining_auto_lie_count is not None:
+            remaining = str(status.remaining_auto_lie_count)
+        else:
+            remaining = "—"
+        today = status.lie_detect_today or {}
+        yesterday = status.lie_detect_yesterday or {}
+
+        def _triple(triple: dict, fallback: tuple[int, int, int]) -> str:
+            def _value(name: str, default: int) -> int:
+                try:
+                    return max(0, int(triple.get(name, default) or 0))
+                except (TypeError, ValueError):
+                    return default
+
+            return (f"总 {_value('total', fallback[0])}"
+                    f" / 成功 {_value('success', fallback[1])}"
+                    f" / 失败 {_value('failed', fallback[2])}")
+
+        lifetime = (
+            status.lie_detect_total,
+            status.lie_detect_success_total,
+            status.lie_detect_failed_total,
+        )
+        text = f" · 剩余 {remaining} / {_triple(today, lifetime)}"
+        if yesterday:
+            text += f" / 昨日 {_triple(yesterday, (0, 0, 0))}"
+        return text
+
+    def _apply_lie_quota_gate(self, status: LicenseStatus) -> None:
+        """Disarm and grey 自动过测谎 while the device has no lie passes left.
+
+        The operator's rule: "if 剩余 turns 0 then make the 自动过测谎 unselected
+        immediately and grey the selection until a new heartbeat tells that the
+        remaining is bigger than 0", and an unlimited balance passes the check
+        untouched.  Only the *selection* is touched here - a pass that is already
+        running is left alone, exactly like the server-side entitlement refusal.
+        """
+
+        unlimited = bool(getattr(status, "remaining_auto_lie_unlimited", False))
+        remaining = getattr(status, "remaining_auto_lie_count", None)
+        if not unlimited and isinstance(remaining, int) and not isinstance(remaining, bool):
+            exhausted = remaining <= 0
+        else:
+            # Unlimited, or a server that does not report a balance at all: the
+            # quota gate has nothing to say.
+            exhausted = False
+        check = getattr(self, "_api_auto_lie_check", None)
+        if exhausted:
+            if hasattr(self, "_api_auto_lie_var"):
+                self._api_auto_lie_var.set(False)
+            self._api_auto_lie_session_armed = False
+            self._api_auto_lie_quota_locked = True
+            if check is not None:
+                try:
+                    check.state(["disabled"])
+                except Exception:
+                    LOG.debug("could not grey 自动过测谎", exc_info=True)
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(
+                    text="自动过测谎：剩余次数已用完，等待服务器补充。"
+                )
+            if not getattr(self, "_api_auto_lie_quota_logged", False):
+                self._api_auto_lie_quota_logged = True
+                LOG.warning(
+                    "auto-lie quota exhausted (剩余 0); 自动过测谎 unselected and "
+                    "greyed until a heartbeat reports a positive balance"
+                )
+            return
+        if not getattr(self, "_api_auto_lie_quota_locked", False):
+            return
+        # The balance came back: the field becomes selectable again (the operator
+        # ticks it himself, so a paid feature is never enabled behind his back).
+        self._api_auto_lie_quota_locked = False
+        self._api_auto_lie_quota_logged = False
+        if check is not None:
+            try:
+                check.state(["!disabled"])
+            except Exception:
+                LOG.debug("could not re-enable 自动过测谎", exc_info=True)
+        if hasattr(self, "_api_test_status"):
+            self._api_test_status.configure(
+                text="自动过测谎：剩余次数已恢复，可重新勾选。"
+            )
+        LOG.warning(
+            "auto-lie quota restored (剩余 %s); 自动过测谎 can be selected again",
+            "无限" if unlimited else remaining,
+        )
 
     def _apply_auto_lie_entitlement(self, status: LicenseStatus) -> None:
         """Disable future auto-lie passes after a server accounting refusal.
@@ -3388,6 +3501,15 @@ class UiWorker(threading.Thread):
                         widget.configure(state="normal")
             except Exception:
                 continue
+        # Unlocking the product must not undo the lie-pass quota gate: an
+        # exhausted device stays greyed after a licence refresh.
+        if not locked and getattr(self, "_api_auto_lie_quota_locked", False):
+            check = getattr(self, "_api_auto_lie_check", None)
+            if check is not None:
+                try:
+                    check.state(["disabled"])
+                except Exception:
+                    LOG.debug("could not re-grey 自动过测谎", exc_info=True)
 
     def _show_license_refusal(self) -> None:
         status = self._license_status
@@ -3618,6 +3740,7 @@ class UiWorker(threading.Thread):
             self._set_license_visual_lock(False)
             self._shutdown_load_settings()
             self._apply_auto_lie_entitlement(self._license_status)
+            self._apply_lie_quota_gate(self._license_status)
             self._control_status.configure(text="授权已保存，自动功能已解锁。")
         else:
             self._refresh_license_ui()

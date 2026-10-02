@@ -8,7 +8,7 @@ key, which must never be copied into a release package.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -69,9 +69,18 @@ class LicenseStatus:
     equipment_id: str = ""
     auto_lie_allowed: bool = True
     remaining_auto_lie_count: Optional[int] = None
+    # ``True`` when the server reports an unmetered balance (it sends a null
+    # count).  The header then shows 无限 and the quota gate must not disarm the
+    # automatic lie pass.
+    remaining_auto_lie_unlimited: bool = False
     lie_detect_total: int = 0
     lie_detect_success_total: int = 0
     lie_detect_failed_total: int = 0
+    # Per-period counters the server adds next to the lifetime totals: the header
+    # shows today's 总/成功/失败 and yesterday's.  Each entry is
+    # ``{"total": int, "success": int, "failed": int}``.
+    lie_detect_today: dict[str, int] = field(default_factory=dict)
+    lie_detect_yesterday: dict[str, int] = field(default_factory=dict)
 
 
 class DeviceNotReadyError(ValueError):
@@ -410,14 +419,42 @@ def _with_server_device(status: LicenseStatus, answer: Any) -> LicenseStatus:
         except (TypeError, ValueError):
             return current
 
+    def _triple(name: str, current: dict[str, int]) -> dict[str, int]:
+        """Read one additive ``{"total", "success", "failed"}`` usage object.
+
+        An older server omits it, in which case the previous value (usually an
+        empty object, i.e. unknown) is kept rather than inventing zeros.
+        """
+
+        value = server_state.get(name)
+        if not isinstance(value, dict):
+            return current
+        answer: dict[str, int] = {}
+        for key in ("total", "success", "failed"):
+            try:
+                answer[key] = max(0, int(value.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                answer[key] = 0
+        return answer
+
+    # A null count is the server's "unmetered" answer.  Only the server's own
+    # explicit flag is trusted: an older server never sends it, and inferring
+    # "unlimited" from a missing count would silently disarm the quota gate.
+    unlimited = bool(server_state.get("remaining_auto_lie_unlimited", False))
+
     return replace(
         status,
         equipment_id=equipment_id if len(equipment_id) == 8 else status.equipment_id,
         auto_lie_allowed=bool(server_state.get("auto_lie_allowed", status.auto_lie_allowed)),
         remaining_auto_lie_count=remaining,
+        remaining_auto_lie_unlimited=bool(unlimited),
         lie_detect_total=_counter("lie_detect_total", status.lie_detect_total),
         lie_detect_success_total=_counter("lie_detect_success_total", status.lie_detect_success_total),
         lie_detect_failed_total=_counter("lie_detect_failed_total", status.lie_detect_failed_total),
+        lie_detect_today=_triple("lie_detect_today", status.lie_detect_today),
+        lie_detect_yesterday=_triple(
+            "lie_detect_yesterday", status.lie_detect_yesterday
+        ),
     )
 
 
