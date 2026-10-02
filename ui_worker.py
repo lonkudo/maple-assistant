@@ -143,6 +143,34 @@ _LAYER_AXIS_Y = 28
 # row: app title on the left, then ？/－/□/× on the right at the same level.
 _CAPTION_HEIGHT = 34
 
+# The caption ↻ button no longer hunts for a newer package.  It forces one
+# entitlement heartbeat now and refreshes the status shown in the UI, then
+# stays greyed for this long: a burst of clicks must not hammer the activation
+# service (ten failed validations inside 24 hours ban the fingerprint).
+LICENSE_REFRESH_COOLDOWN_SECONDS = 60.0
+# "Aggressive" means a failure is retried inside the same press instead of
+# waiting for the three-hour timer.  Only a transport failure qualifies - the
+# heartbeat never reached the server, so nothing was counted against this
+# device.  A typed refusal is final in both directions: retrying it would spend
+# the ten failures that ban a fingerprint.
+LICENSE_REFRESH_RETRY_ATTEMPTS = 3
+LICENSE_REFRESH_RETRY_SECONDS = 1.0
+
+
+def license_refresh_retryable(status: LicenseStatus) -> bool:
+    """True when a failed heartbeat may be retried without risking a ban.
+
+    ``validate_via_server`` reports a typed ``server:<CODE>`` refusal when the
+    activation service answered and rejected this device - that answer already
+    counted as a failed attempt for the fingerprint, and ten of them inside 24
+    hours ban it, so it is never retried.  The generic ``server`` code means no
+    usable answer arrived at all (network, timeout, TLS, unparsable body), and
+    ``device_not_ready`` means the local fingerprint was not ready so no request
+    was sent: both are transport-level and safe to repeat immediately.
+    """
+
+    return status.code in {"server", "device_not_ready"}
+
 # 测试api on a video: the operator's measured run length is ~30s at the API's 5 fps, and the panel
 # no longer offers a box for it (the 密钥 button is gone too: the product key ships inside the
 # application, see autolie_api/key_store.py).
@@ -999,6 +1027,13 @@ class UiWorker(threading.Thread):
         )
         self._license_heartbeat_started = False
         self._license_heartbeat_generation = 0
+        # Manual refresh (the caption ↻ button).  The heartbeat thread sleeps on
+        # this event between its three-hour rounds, so setting it validates
+        # immediately instead of waiting for the timer; the flag asks that
+        # thread for the short retry burst.
+        self._license_heartbeat_request = threading.Event()
+        self._license_refresh_aggressive = False
+        self._license_refresh_cooldown_job: Any = None
         # Completed auto-lie passes are accounted for later, never on the
         # time-sensitive WebSocket/cursor path.  The worker persists its own
         # queue so an app restart cannot silently discard a completed event.
@@ -2616,7 +2651,11 @@ class UiWorker(threading.Thread):
         self._caption_max_button = _button("□", self._caption_toggle_maximize)
         self._caption_min_button = _button("－", self._caption_minimize)
         self._help_button = _button("?", None)
-        self._update_button = _button("↻", self._check_desktop_update)
+        # ↻ is a status refresh, not a package hunt: the operator asked for an
+        # immediate heartbeat with the activation server so the header's
+        # 剩余 / 总 / 成功 / 失败 / 昨日 numbers and the 自动过测谎 gate are current.
+        # It greys itself for LICENSE_REFRESH_COOLDOWN_SECONDS afterwards.
+        self._update_button = _button("↻", self._request_license_heartbeat)
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
         self._help_button.bind("<Enter>", self._help_hover_show)
@@ -2667,7 +2706,13 @@ class UiWorker(threading.Thread):
             root.after(250, self._on_debug_window_close)
 
     def _check_desktop_update(self) -> None:
-        """Find and apply the highest newer nearby/Desktop release on request."""
+        """Find and apply the highest newer nearby/Desktop release on request.
+
+        The caption ↻ button no longer calls this - it forces a status
+        heartbeat instead, because the operator updates packages by hand.  The
+        workflow is kept intact so an explicit update action can be wired to it
+        again without rewriting anything.
+        """
 
         install_root = application_root(__file__)
         current = read_version(install_root / "VERSION")
@@ -3164,14 +3209,32 @@ class UiWorker(threading.Thread):
         def heartbeat_loop() -> None:
             while not self.stop_event.is_set():
                 generation = self._license_heartbeat_generation
+                # A manual refresh (the caption ↻) consumes its flag here: the
+                # same round is then allowed the short retry burst.
+                aggressive = bool(self._license_refresh_aggressive)
+                self._license_refresh_aggressive = False
                 status = validate_via_server()
+                for _ in range(
+                    (LICENSE_REFRESH_RETRY_ATTEMPTS - 1) if aggressive else 0
+                ):
+                    if not license_refresh_retryable(status):
+                        break
+                    if self.stop_event.wait(LICENSE_REFRESH_RETRY_SECONDS):
+                        return
+                    status = validate_via_server()
+                if aggressive:
+                    LOG.info(
+                        "手动刷新：心跳完成（%s）",
+                        "有效" if status.valid else status.code,
+                    )
                 try:
                     self._license_heartbeat_results.put_nowait((generation, status))
                 except Exception:
                     LOG.warning("license heartbeat result could not be queued", exc_info=True)
                 # The first iteration intentionally happens immediately.
                 # Subsequent online checks are every three hours, as agreed.
-                if self.stop_event.wait(3 * 60 * 60):
+                # The caption ↻ cuts that wait short.
+                if self._wait_for_next_heartbeat(3 * 60 * 60):
                     return
 
         threading.Thread(
@@ -3179,6 +3242,89 @@ class UiWorker(threading.Thread):
             name="license-heartbeat",
             daemon=True,
         ).start()
+
+    def _wait_for_next_heartbeat(self, seconds: float) -> bool:
+        """Sleep until the next scheduled heartbeat.
+
+        Returns True when the thread must end (shutdown).  A pending manual
+        refresh ends the wait instead, and records that the next round is an
+        aggressive one, so a press is never lost while a heartbeat is in
+        flight.
+        """
+
+        deadline = time.monotonic() + seconds
+        while True:
+            if self.stop_event.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._license_heartbeat_request.wait(min(remaining, 0.5)):
+                self._license_heartbeat_request.clear()
+                self._license_refresh_aggressive = True
+                return False
+
+    def _request_license_heartbeat(self) -> None:
+        """Caption ↻: refresh the online status now, then grey out for a minute.
+
+        The operator's rule: the button no longer updates the package, it does
+        an aggressive heartbeat with the remote and updates the current status.
+        The press therefore requests an immediate validation (the three-hour
+        timer is bypassed and a transport failure is retried right away) and
+        disables the button for ``LICENSE_REFRESH_COOLDOWN_SECONDS``, which also
+        caps how often a click storm can reach the activation server.
+        """
+
+        button = getattr(self, "_update_button", None)
+        if button is not None:
+            try:
+                if str(button.cget("state")) == "disabled":
+                    LOG.info("手动刷新：冷却中，忽略本次点击。")
+                    return
+            except Exception:
+                LOG.debug("caption refresh button state unreadable", exc_info=True)
+        self._license_refresh_aggressive = True
+        # The header says "正在验证在线授权…" until the result lands, exactly as
+        # the startup heartbeat does.
+        self._license_online_validation_pending = True
+        self._license_heartbeat_request.set()
+        LOG.info("手动刷新：已请求立即向授权服务器发送心跳。")
+        self._refresh_license_ui()
+        self._begin_license_refresh_cooldown(button)
+
+    def _begin_license_refresh_cooldown(self, button: Any) -> None:
+        """Grey the caption refresh button and re-enable it after the cooldown."""
+
+        root = getattr(self, "_root", None)
+        if button is not None:
+            try:
+                button.configure(state="disabled", disabledforeground="#a3a3a3")
+            except Exception:
+                LOG.debug("caption refresh button could not be greyed", exc_info=True)
+        if root is None:
+            return
+        previous = getattr(self, "_license_refresh_cooldown_job", None)
+        if previous is not None:
+            try:
+                root.after_cancel(previous)
+            except Exception:
+                LOG.debug("stale refresh cooldown could not be cancelled", exc_info=True)
+        self._license_refresh_cooldown_job = root.after(
+            int(LICENSE_REFRESH_COOLDOWN_SECONDS * 1000),
+            self._end_license_refresh_cooldown,
+        )
+
+    def _end_license_refresh_cooldown(self) -> None:
+        """Re-enable the caption refresh button once its cooldown elapsed."""
+
+        self._license_refresh_cooldown_job = None
+        button = getattr(self, "_update_button", None)
+        if button is None:
+            return
+        try:
+            button.configure(state="normal")
+        except Exception:
+            LOG.debug("caption refresh button could not be re-enabled", exc_info=True)
 
     def _drain_license_heartbeat_results(self) -> None:
         """Apply online validation results on Tk's owning thread."""
@@ -3194,7 +3340,10 @@ class UiWorker(threading.Thread):
         generation, status = latest
         # A manual activation may complete while the initial heartbeat is in
         # flight.  Its older result must never undo the explicit success.
+        # The pending indicator still stops: a newer state is already in place,
+        # and leaving it on would freeze the header on "正在验证在线授权…".
         if generation != self._license_heartbeat_generation:
+            self._license_online_validation_pending = False
             return
         self._license_status = status
         self._license_online_validation_pending = False
