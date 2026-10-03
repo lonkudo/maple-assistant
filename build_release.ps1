@@ -160,6 +160,13 @@ $assetsIn = Join-Path $root "recording-assets"
 if (Test-Path $assetsIn) {
     Copy-Item $assetsIn (Join-Path $out "recording-assets") -Recurse
 }
+# --- teach-assets（教学图片）----------------------------------------------------
+# Teaching pages are intentionally data-only: UiWorker opens just one page at
+# a time.  Ship the source folder unchanged so its runtime path is stable.
+$teachIn = Join-Path $root "teach-assets"
+if (Test-Path $teachIn) {
+    Copy-Item $teachIn (Join-Path $out "teach-assets") -Recurse
+}
 # 自动重连 的登录页颜色参考图：screenshots 是本机个人目录，不随包分发，所以参考图
 # 也放进 recording-assets，安装后的副本才有颜色参考（reconnect_worker 会依次查找
 # screenshots\login_page_target.jpg 和 recording-assets\login_page_target.jpg）。

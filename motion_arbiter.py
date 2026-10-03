@@ -46,6 +46,7 @@ FACING = "facing"
 # queued or running, and the attack it taps is what the character would
 # otherwise lose while correcting its position.
 STEP = "step"
+COUNTERATTACK = "counterattack"
 
 # A tap can be refused by the input layer (game window not foreground, input
 # disarmed, focus stolen mid-tap).  A jump/micro-step is stale by then and is
@@ -118,6 +119,7 @@ class MotionArbiter(threading.Thread):
         # that carries its own attack tap, so it is serialized here instead of
         # being sent as an ordinary walk beside the fixed cadence.
         self._step_callback: Any = None
+        self._counterattack_callback: Any = None
         # A confirmed stair stall borrows patrol's current direction and taps
         # Alt.  It is queued only to serialize against attacks; it is not an
         # ordinary directional arbiter motion.
@@ -303,6 +305,27 @@ class MotionArbiter(threading.Thread):
             self._cv.notify_all()
             return True
 
+    def request_counterattack(self, direction: str, key: str) -> bool:
+        """Queue one HP-hit counter: step away, then tap its dedicated key."""
+
+        direction = str(direction).casefold()
+        key = str(key).casefold()
+        if direction not in ("left", "right") or not key or key == "-":
+            return False
+        token = f"{COUNTERATTACK}:{direction}:{key}"
+        with self._cv:
+            if not self._automation_allowed_locked():
+                self._set_refusal_locked("automation inactive (stop or patrol off)")
+                return False
+            # HP may fall across several frames for one hit.  One queued
+            # retaliation is enough; never stack delayed walks.
+            if any(item.startswith(f"{COUNTERATTACK}:") for item in self._queued):
+                return True
+            self._pending.append(token)
+            self._queued.add(token)
+            self._cv.notify_all()
+            return True
+
     def step_pending(self) -> bool:
         """Whether an anchor correction is queued or running.
 
@@ -380,6 +403,12 @@ class MotionArbiter(threading.Thread):
 
         with self._cv:
             self._step_callback = callback
+
+    def set_counterattack_callback(self, callback: Any) -> None:
+        """Install MovementWorker's isolated 被撞反击 implementation."""
+
+        with self._cv:
+            self._counterattack_callback = callback
 
     def set_stair_jump_callback(self, callback: Any) -> None:
         """Install MovementWorker's direction-preserving stair-jump action."""
@@ -553,6 +582,8 @@ class MotionArbiter(threading.Thread):
             return self.facing_motion_seconds
         if token.startswith(f"{STEP}:"):
             return self.step_motion_seconds
+        if token.startswith(f"{COUNTERATTACK}:"):
+            return self.step_motion_seconds
         return self.buff_motion_seconds
 
     def _pop_locked(self, token: str) -> list[Any]:
@@ -590,6 +621,7 @@ class MotionArbiter(threading.Thread):
         # here as well as at registration because it may have been queued just
         # before the automation gate was cleared.
         is_stair_jump = token.startswith(f"{STAIR_JUMP}:")
+        is_counterattack = token.startswith(f"{COUNTERATTACK}:")
         waiting_since = time.monotonic()
         wait_warned_at = 0.0
         with self._cv:
@@ -599,7 +631,8 @@ class MotionArbiter(threading.Thread):
                     self._cv.notify_all()
                     self._notify_buff_completion(callbacks, False)
                     return
-                if not is_stair_jump and not self._motion_gate_allows_locked():
+                if (not is_stair_jump and not is_counterattack
+                        and not self._motion_gate_allows_locked()):
                     if token.startswith("buff:"):
                         # A buff stays registered through climb/drop/landing
                         # and wakes itself as soon as ordinary travel returns.
@@ -691,7 +724,8 @@ class MotionArbiter(threading.Thread):
                 callbacks = self._pop_locked(token)
                 self._cv.notify_all()
                 dropped = True
-            elif not is_stair_jump and not self._motion_gate_allows_locked():
+            elif (not is_stair_jump and not is_counterattack
+                  and not self._motion_gate_allows_locked()):
                 self._executing_token = None
                 if token.startswith("buff:"):
                     self._cv.notify_all()
@@ -784,6 +818,35 @@ class MotionArbiter(threading.Thread):
                 self.stop_event.wait(self._duration_for(token))
             else:
                 LOG.warning("motion arbiter %s NOT delivered; event drained", token)
+            return
+        elif token.startswith(f"{COUNTERATTACK}:"):
+            _, direction, key = token.split(":", 2)
+            with self._cv:
+                callback = self._counterattack_callback
+            if not callable(callback):
+                with self._cv:
+                    callbacks = self._pop_locked(token)
+                    self._executing_token = None
+                    self._cv.notify_all()
+                self._notify_buff_completion(callbacks, False)
+                LOG.warning("motion arbiter dropped counterattack: movement unavailable")
+                return
+            try:
+                tap_ok = callback(direction, key) is not False
+            except Exception:
+                LOG.exception("motion arbiter counterattack failed")
+                tap_ok = False
+            with self._cv:
+                self._pop_locked(token)
+                self._executing_token = None
+                if tap_ok:
+                    self._busy_until = time.monotonic() + self._duration_for(token)
+                self._cv.notify_all()
+            if tap_ok:
+                LOG.info("motion arbiter executed %s", token)
+                self.stop_event.wait(self._duration_for(token))
+            else:
+                LOG.info("motion arbiter counterattack not delivered; event drained")
             return
         elif (token.startswith(f"{FACING}:")
                 or token.startswith(f"{STEP}:")):

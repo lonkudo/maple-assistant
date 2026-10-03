@@ -85,6 +85,10 @@ _AUTO_LIE_CONFIRM_REFERENCE_POINT = (800, 472)
 # foreground check.
 _AUTO_LIE_CONFIRM_FOCUS_SETTLE_SECONDS = 0.20
 _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS = 3
+# The black-room failure signature is the yellow minimap marker staying gone
+# after the prompt click.  A grace period avoids counting a normal transition.
+_AUTO_LIE_FAILURE_GRACE_SECONDS = 3.0
+_AUTO_LIE_FAILURE_MISSING_FRAMES = 15
 
 
 def _auto_lie_confirm_client_point(
@@ -357,13 +361,24 @@ def monitor_work_area_for_pointer(
         return (0, 0, 1920, 1080)
 
 
+_HOVER_TOOLTIP_MAX_WIDTH = 480
+
+
 class HoverTooltip:
     """Small cursor-adjacent tooltip that also works on disabled ttk buttons."""
 
-    def __init__(self, widget: Any, text: str, delay_ms: int = 250) -> None:
+    def __init__(
+        self, widget: Any, text: str, delay_ms: int = 250,
+        wraplength: int = _HOVER_TOOLTIP_MAX_WIDTH,
+    ) -> None:
         self.widget = widget
         self.text = text
         self.delay_ms = max(0, int(delay_ms))
+        # Every hover hint has one consistent maximum width. Individual
+        # callers may request a narrower hint, but never an unbounded one.
+        self.wraplength = min(
+            _HOVER_TOOLTIP_MAX_WIDTH, max(0, int(wraplength))
+        )
         self.enabled = False
         self._after_id: Any = None
         self._window: Any = None
@@ -402,7 +417,7 @@ class HoverTooltip:
             # Wrap instead of growing the tooltip to the full text length
             # (the bindable-hotkeys hint is long and would otherwise extend
             # off-screen / over the UI).
-            wraplength=360,
+            wraplength=self.wraplength,
         )
         label.pack()
         window.update_idletasks()
@@ -547,6 +562,24 @@ def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
     # implicit default root can create ``pyimage`` in a different Tcl
     # interpreter, after which ttk rejects it and the whole UI (and hotkey
     # worker) shuts down during startup.
+    return ImageTk.PhotoImage(image, master=master)
+
+
+def _make_teaching_icon(master: Any) -> ImageTk.PhotoImage:
+    """Return a clearly legible book glyph for the caption action row."""
+
+    size = 20
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    ink = (45, 70, 95, 255)
+    paper = (216, 232, 244, 255)
+    # A closed-book silhouette reads reliably at caption-bar scale.  The
+    # previous open-page silhouette was visually too close to a chess piece.
+    draw.rounded_rectangle((3, 2, 16, 17), radius=1, fill=paper, outline=ink, width=2)
+    draw.line((6, 3, 6, 16), fill=ink, width=2)  # book spine
+    draw.line((9, 6, 14, 6), fill=ink, width=1)
+    draw.line((9, 9, 14, 9), fill=ink, width=1)
+    draw.line((9, 12, 13, 12), fill=ink, width=1)
     return ImageTk.PhotoImage(image, master=master)
 
 
@@ -738,9 +771,11 @@ def recorded_coordinate_text(x: float, y: float) -> str:
 
 
 def machine_name_button_text(name: str) -> str:
-    """Display the saved marker, or the edit hint when it is empty."""
+    """Keep the compact device-name editor's action label stable."""
 
-    return str(name).strip() or "修改名称"
+    # The actual device name can contain arbitrary operator text.  Keep this
+    # narrow settings-row action label fixed instead of exposing it there.
+    return "设备名称"
 
 
 def normalize_quick_messages(value: Any, limit: int = 20) -> list[str]:
@@ -985,9 +1020,6 @@ class UiWorker(threading.Thread):
         self.telegram_notifier = telegram_notifier
         self._telegram_bot_token = ""
         self._telegram_chat_id = ""
-        self._machine_name_press_job: Any = None
-        self._machine_name_hold_fired = False
-        self._machine_name_entry: Any = None
         self._quick_messages: list[str] = []
         self._quick_message_press_job: Any = None
         self._quick_message_hold_fired = False
@@ -1055,6 +1087,7 @@ class UiWorker(threading.Thread):
         )
         self._lie_accounting_started = False
         self._accounted_auto_lie_worker_id: Optional[int] = None
+        self._auto_lie_marker_verification: Optional[dict[str, Any]] = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._root: Any = None
@@ -1159,6 +1192,23 @@ class UiWorker(threading.Thread):
                 # Fallback when the custom caption cannot be installed: keep
                 # the native caption and float a small ? at the top-right of
                 # the content so the help dialog stays reachable.
+                self._teaching_photo = _make_teaching_icon(root)
+                self._teaching_button = tk.Button(
+                    root,
+                    image=self._teaching_photo,
+                    width=3,
+                    height=1,
+                    relief="raised",
+                    bd=1,
+                    cursor="hand2",
+                    command=self._show_teaching_viewer,
+                )
+                self._teaching_button.place(
+                    relx=1.0, x=-37, y=6, anchor="ne"
+                )
+                teaching_tooltip = HoverTooltip(self._teaching_button, "教学")
+                teaching_tooltip.set_enabled(True)
+                self._bind_key_tooltips.append(teaching_tooltip)
                 self._help_button = tk.Button(
                     root,
                     text="?",
@@ -1187,8 +1237,58 @@ class UiWorker(threading.Thread):
             license_bar = ttk.Frame(container)
             license_bar.pack(fill="x", pady=(4, 0))
             self._license_label = ttk.Label(license_bar, anchor="w")
-            self._license_label.pack(side="left", fill="x", expand=True)
+            # Keep the authorization state and its usage counters contiguous.
+            # An expanding label here pushed the counters into a detached
+            # right-side island with a large blank gap between them.
+            self._license_label.pack(side="left")
             self._license_label.bind("<Button-1>", self._copy_equipment_id)
+            self._license_memory_label = ttk.Label(license_bar, anchor="w")
+            self._license_memory_label.pack(side="left")
+            # Keep usage values as separate labels so total/success/failure
+            # remain readable at a glance instead of becoming one grey string.
+            self._license_lie_stats = ttk.Frame(license_bar)
+            self._license_lie_stats.pack(side="left", padx=(5, 6))
+            self._license_lie_prefix = ttk.Label(self._license_lie_stats, text="")
+            self._license_lie_remaining = ttk.Label(
+                self._license_lie_stats, text="", foreground="#777777"
+            )
+            self._license_lie_today_prefix = ttk.Label(
+                self._license_lie_stats, text=""
+            )
+            self._license_lie_total = ttk.Label(
+                self._license_lie_stats, text="", foreground="#777777"
+            )
+            self._license_lie_success = ttk.Label(
+                self._license_lie_stats, text="", foreground="#17803d"
+            )
+            self._license_lie_failed = ttk.Label(
+                self._license_lie_stats, text="", foreground="#b42318"
+            )
+            self._license_lie_yesterday_prefix = ttk.Label(
+                self._license_lie_stats, text=""
+            )
+            self._license_lie_yesterday_total = ttk.Label(
+                self._license_lie_stats, text="", foreground="#777777"
+            )
+            self._license_lie_yesterday_success = ttk.Label(
+                self._license_lie_stats, text="", foreground="#17803d"
+            )
+            self._license_lie_yesterday_failed = ttk.Label(
+                self._license_lie_stats, text="", foreground="#b42318"
+            )
+            for stat_label in (
+                self._license_lie_prefix,
+                self._license_lie_remaining,
+                self._license_lie_today_prefix,
+                self._license_lie_total,
+                self._license_lie_success,
+                self._license_lie_failed,
+                self._license_lie_yesterday_prefix,
+                self._license_lie_yesterday_total,
+                self._license_lie_yesterday_success,
+                self._license_lie_yesterday_failed,
+            ):
+                stat_label.pack(side="left")
             self._license_button = ttk.Button(
                 license_bar, text="激活授权", command=self._activate_license
             )
@@ -1632,16 +1732,51 @@ class UiWorker(threading.Thread):
             )
             fixed_gap_plus.pack(side="left", padx=(1, 0))
 
+            # 被撞反击 is an event path separate from normal cadence/combo
+            # attack.  A confirmed HP drop asks the arbiter to step away from
+            # the hit and then tap this independently bound key.
+            counterattack_row = ttk.Frame(fixed_panel)
+            counterattack_row.pack(fill="x", pady=(2, 0))
+            self._counterattack_enabled_var = tk.BooleanVar(value=False)
+            counterattack_button = ttk.Checkbutton(
+                counterattack_row, text="被撞反击", width=7,
+                variable=self._counterattack_enabled_var,
+                command=self._fixed_on_change,
+            )
+            counterattack_button.pack(side="left", padx=(0, 4))
+            counterattack_hint = HoverTooltip(
+                counterattack_button,
+                "建议在怪物少的地图使用，否则频繁被撞影响正常输出。",
+            )
+            counterattack_hint.set_enabled(True)
+            self._bind_key_tooltips.append(counterattack_hint)
+            ttk.Label(counterattack_row, text="攻击键:").pack(
+                side="left", padx=(0, 4)
+            )
+            self._counterattack_key_var = tk.StringVar(value="ctrl")
+            counterattack_key_button = ttk.Button(
+                counterattack_row, text=self._counterattack_key_var.get(),
+                width=5, style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    counterattack_key_button, self._counterattack_key_var,
+                    "_counterattack_key_previous", self._fixed_on_change,
+                ),
+            )
+            counterattack_key_button.pack(side="left")
+            self._counterattack_key_button = counterattack_key_button
+            self._attach_bind_hint(counterattack_key_button)
+
             # 组合攻击 only configures the independent attack scheduler;
             # movement, patrol, and input arbitration keep their own roles.
             combo_row = ttk.Frame(fixed_panel)
             combo_row.pack(fill="x", pady=(2, 0))
             self._combo_attack_enabled_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
+            combo_attack_button = ttk.Checkbutton(
                 combo_row, text="组合攻击", width=7,
                 variable=self._combo_attack_enabled_var,
                 command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 4))
+            )
+            combo_attack_button.pack(side="left", padx=(0, 4))
             self._combo_attack_count_vars = []
             self._combo_attack_count_entries = []
             self._combo_attack_key_vars = []
@@ -1689,12 +1824,12 @@ class UiWorker(threading.Thread):
                 )
                 tooltip.set_enabled(True)
                 self._bind_key_tooltips.append(tooltip)
-            combo_help = ttk.Label(combo_row, text="?", width=2, anchor="e")
-            combo_help.pack(side="left", padx=(0, 2))
-            combo_help_tooltip = HoverTooltip(combo_help, self._combo_attack_hint())
-            combo_help_tooltip.set_enabled(True)
-            self._combo_attack_help_tooltip = combo_help_tooltip
-            self._bind_key_tooltips.append(combo_help_tooltip)
+            combo_attack_tooltip = HoverTooltip(
+                combo_attack_button, self._combo_attack_hint()
+            )
+            combo_attack_tooltip.set_enabled(True)
+            self._combo_attack_tooltip = combo_attack_tooltip
+            self._bind_key_tooltips.append(combo_attack_tooltip)
             # Labels and empty panel space do not claim focus in Tk.  Commit
             # a typed count when any other UI target is clicked, just like the
             # reconnect-channel field does.
@@ -1802,11 +1937,18 @@ class UiWorker(threading.Thread):
             step_row.pack(fill="x", pady=(4, 0))
             self._small_step_row = step_row
             self._small_step_enabled_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
+            small_step_button = ttk.Checkbutton(
                 step_row, text="小碎步", width=5,
                 variable=self._small_step_enabled_var,
                 command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 4))
+            )
+            small_step_button.pack(side="left", padx=(0, 4))
+            small_step_hint = HoverTooltip(
+                small_step_button,
+                "可以用来防止空打（空打指的是站桩连续攻击近一分钟后伤害会消失）。",
+            )
+            small_step_hint.set_enabled(True)
+            self._bind_key_tooltips.append(small_step_hint)
             step_interval_group = ttk.Frame(step_row)
             step_interval_group.pack(side="right")
             ttk.Label(step_interval_group, text="每").pack(side="left")
@@ -2161,6 +2303,11 @@ class UiWorker(threading.Thread):
                 command=self._countdown_on_change,
             )
             self._countdown_check.pack(side="left")
+            countdown_hint = HoverTooltip(
+                self._countdown_check, "当剩余时间归零的时候进行警报"
+            )
+            countdown_hint.set_enabled(True)
+            self._bind_key_tooltips.append(countdown_hint)
 
             # 循环 的 间隔/剩余 progress bars sit on the SAME line as the
             # 掉线/测谎/循环 checkboxes (column 1 is 500px wide to fit).
@@ -2220,51 +2367,72 @@ class UiWorker(threading.Thread):
             reminder_row.pack(fill="x", pady=(4, 0))
             ttk.Label(reminder_row, text="提醒:").pack(side="left")
             self._sound_alert_var = tk.BooleanVar(value=True)
-            ttk.Checkbutton(
+            sound_check = ttk.Checkbutton(
                 reminder_row,
                 text="声音",
                 variable=self._sound_alert_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left", padx=(4, 8))
+            )
+            sound_check.pack(side="left", padx=(4, 8))
 
             self._screen_blink_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
+            blink_check = ttk.Checkbutton(
                 reminder_row,
                 text="闪烁",
                 variable=self._screen_blink_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left", padx=(0, 8))
+            )
+            blink_check.pack(side="left", padx=(0, 8))
 
             self._telegram_enabled_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
+            telegram_check = ttk.Checkbutton(
                 reminder_row,
                 text="消息",
                 variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left")
+            )
+            telegram_check.pack(side="left")
+            for widget, hint_text in (
+                (sound_check, "发出dingdong的声音"),
+                (blink_check, "屏幕闪烁红色，适用于没声音的电脑"),
+                (telegram_check, "telegram消息推送提醒"),
+            ):
+                tooltip = HoverTooltip(widget, hint_text)
+                tooltip.set_enabled(True)
+                self._bind_key_tooltips.append(tooltip)
             telegram_row = ttk.Frame(extra_panel)
             telegram_row.pack(fill="x", pady=(4, 0))
             self._telegram_machine_row = telegram_row
-            ttk.Label(telegram_row, text="设备名称").pack(side="left")
+            telegram_label = ttk.Label(telegram_row, text="消息推送配置")
+            telegram_label.pack(side="left")
             self._telegram_machine_var = tk.StringVar(value="")
             self._telegram_machine_button = ttk.Button(
-                telegram_row, text="修改名称", width=14
+                telegram_row,
+                text="设备名称",
+                width=14,
+                command=self._edit_machine_name,
             )
             self._telegram_machine_button.pack(side="left", padx=(4, 8))
-            self._telegram_machine_button.bind(
-                "<ButtonPress-1>", self._machine_name_press
-            )
-            self._telegram_machine_button.bind(
-                "<ButtonRelease-1>", self._machine_name_release
-            )
             self._telegram_token_button = ttk.Button(
-                telegram_row, text="修改BOT token",
+                telegram_row, text="设置BOT token",
                 command=self._telegram_change_token,
             )
             self._telegram_token_button.pack(side="left")
+            telegram_setup_hint = (
+                "配置bot需要开启网络代理，需要获取telegram bot key，"
+                "具体查看右上角教程，学习如何配置"
+            )
+            for widget in (
+                telegram_label,
+                self._telegram_machine_button,
+                self._telegram_token_button,
+            ):
+                tooltip = HoverTooltip(widget, telegram_setup_hint)
+                tooltip.set_enabled(True)
+                self._bind_key_tooltips.append(tooltip)
             self._telegram_status = ttk.Label(
                 extra_panel,
-                text="消息提醒: 未启用；BOT token 仅保存在本机用户配置。",
+                text="",
                 justify="left",
                 wraplength=440,
             )
@@ -2293,11 +2461,18 @@ class UiWorker(threading.Thread):
             self._api_auto_lie_var = tk.BooleanVar(value=saved_api_auto_lie)
             self._api_auto_lie_check = ttk.Checkbutton(
                 reconnect_row,
-                text="自动过测谎",
+                text="自动测谎",
                 variable=self._api_auto_lie_var,
                 command=self._api_auto_lie_on_change,
             )
             self._api_auto_lie_check.pack(side="left")
+            auto_lie_hint = HoverTooltip(
+                self._api_auto_lie_check,
+                "开启后扣减测谎次数，测谎程序自动接管鼠标，不需要操作，"
+                "中途可以按esc中断，但是仍然扣费，如要手动操作，请不要开启",
+            )
+            auto_lie_hint.set_enabled(True)
+            self._bind_key_tooltips.append(auto_lie_hint)
             self._reconnect_var = tk.BooleanVar(value=saved_reconnect_enabled)
             self._reconnect_check = ttk.Checkbutton(
                 reconnect_row,
@@ -2306,6 +2481,11 @@ class UiWorker(threading.Thread):
                 command=self._reconnect_on_change,
             )
             self._reconnect_check.pack(side="left")
+            reconnect_hint = HoverTooltip(
+                self._reconnect_check, "掉线的时候自动重连游戏"
+            )
+            reconnect_hint.set_enabled(True)
+            self._bind_key_tooltips.append(reconnect_hint)
             # The selection is part of user_config: it is persisted the moment the operator leaves the
             # widget, not only when the whole panel writes its configuration (his request).
             self._reconnect_check.bind(
@@ -2381,6 +2561,12 @@ class UiWorker(threading.Thread):
                 command=self._shutdown_on_change,
             )
             self._auto_restart_check.pack(side="left")
+            restart_hint = HoverTooltip(
+                self._auto_restart_check,
+                "当内存达到98%的时候，主动发送重开消息，然后重开游戏。",
+            )
+            restart_hint.set_enabled(True)
+            self._bind_key_tooltips.append(restart_hint)
             self._restart_offline_message_var = tk.StringVar(value="")
             self._restart_offline_message_button = ttk.Button(
                 restart_row, text="重开消息",
@@ -2424,12 +2610,20 @@ class UiWorker(threading.Thread):
             player_row = ttk.Frame(extra_panel)
             player_row.pack(fill="x", pady=(4, 0))
             self._player_check_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
+            player_check_button = ttk.Checkbutton(
                 player_row,
-                text="检测到其他玩家自动切换频道",
+                text="有人换线",
                 variable=self._player_check_var,
                 command=self._shutdown_on_change,
-            ).pack(side="left")
+            )
+            player_check_button.pack(side="left")
+            self._player_check_hint = HoverTooltip(
+                player_check_button,
+                "",
+                wraplength=_HOVER_TOOLTIP_MAX_WIDTH,
+            )
+            self._player_check_hint.set_enabled(True)
+            self._bind_key_tooltips.append(self._player_check_hint)
             self._player_request_message_var = tk.StringVar(value="")
             self._player_request_message_button = ttk.Button(
                 player_row, text="求让消息",
@@ -2446,22 +2640,36 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._player_room_code_button.pack(side="left", padx=(6, 0))
-            ttk.Label(player_row, text="换线等待").pack(side="left", padx=(6, 0))
-            self._player_channel_wait_var = tk.StringVar(value="5")
+            player_wait_label = ttk.Label(player_row, text="多等")
+            player_wait_label.pack(side="left", padx=(6, 0))
+            self._player_channel_wait_var = tk.StringVar(value="300")
             player_wait_check = self._register_validator(
                 player_row, self._validate_player_channel_wait
             )
             self._player_channel_wait_box = ttk.Spinbox(
-                player_row, from_=1, to=20, width=3,
+                player_row, from_=0, to=1200, width=4,
                 textvariable=self._player_channel_wait_var,
                 validate="key", validatecommand=player_wait_check,
                 command=self._shutdown_on_change,
             )
             self._player_channel_wait_box.pack(side="left", padx=(3, 0))
             self._player_channel_wait_box.bind(
-                "<FocusOut>", lambda _event: self._shutdown_on_change()
+                "<FocusOut>", self._player_channel_wait_on_blur
             )
-            ttk.Label(player_row, text="分钟").pack(side="left", padx=(2, 0))
+            ttk.Label(player_row, text="秒").pack(side="left", padx=(2, 0))
+            self._player_wait_tooltips = []
+            for widget in (player_wait_label, self._player_channel_wait_box):
+                tooltip = HoverTooltip(
+                    widget, "", wraplength=_HOVER_TOOLTIP_MAX_WIDTH
+                )
+                tooltip.set_enabled(True)
+                self._bind_key_tooltips.append(tooltip)
+                self._player_wait_tooltips.append(tooltip)
+            self._refresh_player_wait_hint()
+            root.bind_all(
+                "<Button-1>", self._player_channel_wait_commit_on_outside_click,
+                add="+",
+            )
 
             # 自动过测谎 (the local Cutie/YOLO lie pass) is gone: lie detection is done by the
             # remote RoiTrack service through 测试api (see api_lie_video.py), so neither the
@@ -2648,12 +2856,16 @@ class UiWorker(threading.Thread):
         title.pack(side="left", padx=(10, 0))
         self._caption_title = title
 
-        def _button(text: str, command: Any) -> Any:
+        def _button(
+            text: str, command: Any, image: Any = None, width: int = 3
+        ) -> Any:
             button = tk.Button(
                 bar, text=text, command=command, relief="flat",
                 bd=0, bg="#f0f0f0", activebackground="#dcdcdc",
-                width=3, cursor="hand2",
+                width=width, height=1, padx=0, pady=0, cursor="hand2",
             )
+            if image is not None:
+                button.configure(image=image, compound="center")
             button.pack(side="right", fill="y")
             return button
 
@@ -2661,6 +2873,38 @@ class UiWorker(threading.Thread):
         self._caption_max_button = _button("□", self._caption_toggle_maximize)
         self._caption_min_button = _button("－", self._caption_minimize)
         self._help_button = _button("?", None)
+        # Use a canvas instead of a PhotoImage inside a one-line Button.
+        # Button image bounds are clipped inconsistently by Windows DPI
+        # scaling; a canvas gives the teaching book its full 30px slot.
+        self._teaching_button = tk.Canvas(
+            bar, width=30, height=_CAPTION_HEIGHT,
+            bg="#f0f0f0", highlightthickness=0, cursor="hand2",
+        )
+        self._teaching_button.pack(side="right", fill="y")
+        book_ink = "#2d465f"
+        self._teaching_button.create_rectangle(
+            8, 8, 23, 25, fill="#d8e8f4", outline=book_ink, width=2
+        )
+        self._teaching_button.create_line(12, 9, 12, 24, fill=book_ink, width=2)
+        self._teaching_button.create_line(15, 13, 21, 13, fill=book_ink)
+        self._teaching_button.create_line(15, 17, 21, 17, fill=book_ink)
+        self._teaching_button.bind(
+            "<Button-1>", lambda _event: self._show_teaching_viewer()
+        )
+        self._teaching_button.bind(
+            "<Enter>",
+            lambda _event: self._teaching_button.configure(bg="#dcdcdc"),
+            add="+",
+        )
+        self._teaching_button.bind(
+            "<Leave>",
+            lambda _event: self._teaching_button.configure(bg="#f0f0f0"),
+            add="+",
+        )
+        self._teaching_button_tooltip = HoverTooltip(
+            self._teaching_button, "教学"
+        )
+        self._teaching_button_tooltip.set_enabled(True)
         # ↻ is a status refresh, not a package hunt: the operator asked for an
         # immediate heartbeat with the activation server so the header's
         # 剩余 / 总 / 成功 / 失败 / 昨日 numbers and the 自动过测谎 gate are current.
@@ -2672,6 +2916,13 @@ class UiWorker(threading.Thread):
             self._update_button, "刷新测谎次数"
         )
         self._update_button_tooltip.set_enabled(True)
+        # ``side=right`` adds each later child to the left.  Re-pack these two
+        # controls as refresh then teaching so their visible order is book,
+        # refresh, help, minimize, maximize, close.
+        self._teaching_button.pack_forget()
+        self._update_button.pack_forget()
+        self._update_button.pack(side="right", fill="y")
+        self._teaching_button.pack(side="right", fill="y")
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
         self._help_button.bind("<Enter>", self._help_hover_show)
@@ -2696,6 +2947,110 @@ class UiWorker(threading.Thread):
             widget.bind("<ButtonPress-1>", _press)
             widget.bind("<B1-Motion>", _motion)
             widget.bind("<ButtonRelease-1>", _release)
+
+    @staticmethod
+    def _teaching_asset_paths() -> list[Path]:
+        """Return packaged teaching images without preloading them.
+
+        ``teach-assets`` is a packaged data folder, so source and installed
+        copies resolve the same relative location.
+        """
+
+        root = application_root(__file__)
+        for folder in (root / "teach-assets",):
+            if not folder.is_dir():
+                continue
+            images = [
+                path for path in folder.iterdir()
+                if path.is_file() and path.suffix.casefold() in {
+                    ".jpg", ".jpeg", ".png", ".bmp", ".webp",
+                }
+            ]
+            if images:
+                def natural_key(path: Path) -> list[object]:
+                    return [
+                        int(piece) if piece.isdigit() else piece.casefold()
+                        for piece in re.split(r"(\d+)", path.name)
+                    ]
+                return sorted(images, key=natural_key)
+        return []
+
+    def _show_teaching_viewer(self) -> None:
+        """Open a small on-demand image viewer for packaged teaching pages."""
+
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        existing = getattr(self, "_teaching_viewer", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                return
+        except Exception:
+            pass
+
+        pages = self._teaching_asset_paths()
+        if not pages:
+            try:
+                from tkinter import messagebox
+                messagebox.showinfo(
+                    "教学", "未找到教学图片。请确认 teach-assets 文件夹已随安装包提供。",
+                    parent=root,
+                )
+            except Exception:
+                LOG.warning("teaching images are unavailable")
+            return
+
+        import tkinter as tk
+
+        viewer = tk.Toplevel(root)
+        viewer.title("TodoHelper 教学")
+        viewer.transient(root)
+        viewer.resizable(False, False)
+        self._teaching_viewer = viewer
+        state = {"index": 0, "photo": None}
+        image_label = tk.Label(viewer, background="#f0f0f0")
+        image_label.pack(padx=8, pady=(8, 4))
+        footer = tk.Frame(viewer)
+        footer.pack(fill="x", padx=8, pady=(0, 8))
+        previous = tk.Button(footer, text="上一张")
+        next_page = tk.Button(footer, text="下一张")
+        page_label = tk.Label(footer, anchor="center")
+        previous.pack(side="left")
+        page_label.pack(side="left", fill="x", expand=True, padx=8)
+        next_page.pack(side="right")
+
+        def render(index: int) -> None:
+            index = max(0, min(len(pages) - 1, index))
+            state["index"] = index
+            path = pages[index]
+            try:
+                with Image.open(path) as source:
+                    image = source.convert("RGB")
+                # Keep the viewer lightweight: only the visible page is in
+                # memory and oversized documentation images are downscaled.
+                image.thumbnail((900, 640), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(image, master=viewer)
+                state["photo"] = photo
+                image_label.configure(image=photo, text="")
+                page_label.configure(text=f"{index + 1} / {len(pages)}")
+                previous.configure(state="normal" if index else "disabled")
+                next_page.configure(
+                    state="normal" if index < len(pages) - 1 else "disabled"
+                )
+            except Exception as exc:
+                image_label.configure(image="", text=f"无法读取教学图片：{path.name}")
+                page_label.configure(text=f"{index + 1} / {len(pages)}")
+                LOG.warning("could not open teaching image %s: %s", path, exc)
+
+        previous.configure(command=lambda: render(state["index"] - 1))
+        next_page.configure(command=lambda: render(state["index"] + 1))
+        viewer.bind("<Left>", lambda _event: render(state["index"] - 1))
+        viewer.bind("<Right>", lambda _event: render(state["index"] + 1))
+        viewer.bind("<Escape>", lambda _event: viewer.destroy())
+        viewer.protocol("WM_DELETE_WINDOW", viewer.destroy)
+        render(0)
 
     def _schedule_restart(self) -> bool:
         """Start the hidden restart helper; False when it could not start.
@@ -2978,6 +3333,9 @@ class UiWorker(threading.Thread):
         """Persist the reminder deadline and UI geometry, then destroy."""
         root = self._root
         if root is not None:
+            # Closing normally is an interrupted pass outcome.  The queue gets
+            # a bounded best-effort transmit chance without delaying gameplay.
+            self._lie_accounting_worker.settle_for_shutdown(timeout=0.5)
             self._save_countdown_resume_state()
             try:
                 _save_window_geometry(self._geometry_for_save(root))
@@ -3131,6 +3489,7 @@ class UiWorker(threading.Thread):
             self._drain_api_test_results,
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
+            self._service_auto_lie_marker_verification,
         ):
             try:
                 step()
@@ -3439,52 +3798,60 @@ class UiWorker(threading.Thread):
         label = getattr(self, "_license_label", None)
         if label is not None:
             memory = getattr(self, "_memory_usage_text", "内存：读取中")
+            self._render_memory_usage(memory)
             device_text = (
                 f"设备：{status.equipment_id}（左键复制）"
                 if status.equipment_id else "设备：等待服务器返回"
             )
             if getattr(self, "_license_online_validation_pending", False):
+                self._render_lie_usage(None)
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
                 label.configure(
                     text=(
-                        f"正在验证在线授权 · {device_text} · 到期：{expiry} · {memory}"
+                        f"正在验证在线授权 · {device_text} · 到期：{expiry}"
                     ),
                     foreground="#9a6700",
                 )
             elif status.valid:
+                self._render_lie_usage(status)
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
                 auto_lie = ""
                 if not status.auto_lie_allowed:
                     auto_lie = " · 自动测谎已停用"
-                # 测谎 statistics follow the always-visible authorization hint:
-                # the server counts every accounted lie event per device and
-                # already returns the three totals in the activation, heartbeat
-                # and lie-accounting response (licensing._with_server_device),
-                # so the operator reads them where the account state is shown
-                # The usage tail the operator asked for: 剩余 first, then today's
-                # 总 / 成功 / 失败 and yesterday's.  The server counts each local
-                # calendar day (the heartbeat just after midnight already shows
-                # the new day's numbers), so the header always answers "how much
-                # is left, and what did it do today".
-                lie_stats = self._lie_usage_text(status)
                 label.configure(
-                    text=(f"验证成功 · {device_text} · 到期：{expiry} · "
-                          f"{memory}{lie_stats}{auto_lie}"),
+                    text=f"验证成功 · {device_text} · 到期：{expiry}{auto_lie}",
                     foreground="#17803d",
                 )
             else:
+                self._render_lie_usage(None)
                 if status.code in {"server", "device_not_ready"}:
-                    text = f"{status.message} · {device_text} · {memory}"
+                    text = f"{status.message} · {device_text}"
                 else:
-                    text = f"未授权 / 已过期：{status.message} · {device_text} · {memory}"
+                    text = f"未授权 / 已过期：{status.message} · {device_text}"
                 label.configure(text=text, foreground="#202020")
         button = getattr(self, "_license_button", None)
         if button is not None:
             button.configure(text="更换授权" if status.valid else "激活授权")
+
+    def _render_memory_usage(self, text: str) -> None:
+        """Render header memory separately so critical memory is visible."""
+
+        label = getattr(self, "_license_memory_label", None)
+        if label is None:
+            return
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", str(text))
+        try:
+            critical = match is not None and float(match.group(1)) > 95.0
+        except (TypeError, ValueError):
+            critical = False
+        label.configure(
+            text=f" · {text}",
+            foreground="#b42318" if critical else "#17803d",
+        )
 
     def _copy_equipment_id(self, _event: Any = None) -> None:
         """Copy the public server-issued device ID from the authorization bar."""
@@ -3504,16 +3871,28 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.debug("equipment ID copy failed", exc_info=True)
 
-    @staticmethod
-    def _lie_usage_text(status: LicenseStatus) -> str:
-        """The authorization bar's usage tail: remaining + today + yesterday.
+    def _render_lie_usage(self, status: Optional[LicenseStatus]) -> None:
+        """Render the compact colored daily auto-lie usage summary.
 
-        Shape the operator asked for - ``剩余 10 / 总 1 / 成功 1 / 失败 0`` - with
-        yesterday's triple beside today's.  ``总/成功/失败`` are TODAY's counted
-        passes (the server sends per-period counters now); a server that predates
-        them falls back to the lifetime totals, so the line never loses numbers.
-        An unmetered device shows 无限 instead of a count.
+        The server returns today/yesterday as independent counters.  Keeping
+        outcome categories in distinct labels makes total grey, success green,
+        and failed red without changing the authorization label's color.
         """
+
+        fields = (
+            "_license_lie_prefix", "_license_lie_remaining",
+            "_license_lie_today_prefix", "_license_lie_total",
+            "_license_lie_success", "_license_lie_failed",
+            "_license_lie_yesterday_prefix", "_license_lie_yesterday_total",
+            "_license_lie_yesterday_success", "_license_lie_yesterday_failed",
+        )
+        widgets = [getattr(self, name, None) for name in fields]
+        if not all(widgets):
+            return
+        if status is None:
+            for widget in widgets:
+                widget.configure(text="")
+            return
 
         if status.remaining_auto_lie_unlimited:
             remaining = "无限"
@@ -3521,29 +3900,38 @@ class UiWorker(threading.Thread):
             remaining = str(status.remaining_auto_lie_count)
         else:
             remaining = "—"
-        today = status.lie_detect_today or {}
-        yesterday = status.lie_detect_yesterday or {}
 
-        def _triple(triple: dict, fallback: tuple[int, int, int]) -> str:
-            def _value(name: str, default: int) -> int:
+        def _values(source: object, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+            source = source if isinstance(source, dict) else {}
+            parsed: list[int] = []
+            for name, default in zip(("total", "success", "failed"), fallback):
                 try:
-                    return max(0, int(triple.get(name, default) or 0))
+                    parsed.append(max(0, int(source.get(name, default) or 0)))
                 except (TypeError, ValueError):
-                    return default
-
-            return (f"总 {_value('total', fallback[0])}"
-                    f" / 成功 {_value('success', fallback[1])}"
-                    f" / 失败 {_value('failed', fallback[2])}")
+                    parsed.append(default)
+            return tuple(parsed)  # type: ignore[return-value]
 
         lifetime = (
             status.lie_detect_total,
             status.lie_detect_success_total,
             status.lie_detect_failed_total,
         )
-        text = f" · 剩余 {remaining} / {_triple(today, lifetime)}"
-        if yesterday:
-            text += f" / 昨日 {_triple(yesterday, (0, 0, 0))}"
-        return text
+        today_total, today_success, today_failed = _values(
+            status.lie_detect_today, lifetime
+        )
+        yesterday_total, yesterday_success, yesterday_failed = _values(
+            status.lie_detect_yesterday, (0, 0, 0)
+        )
+        self._license_lie_prefix.configure(text=" · 测谎 (剩余, ")
+        self._license_lie_remaining.configure(text=remaining)
+        self._license_lie_today_prefix.configure(text=") (今日, ")
+        self._license_lie_total.configure(text=str(today_total))
+        self._license_lie_success.configure(text=f", {today_success}")
+        self._license_lie_failed.configure(text=f", {today_failed})")
+        self._license_lie_yesterday_prefix.configure(text=" (昨日, ")
+        self._license_lie_yesterday_total.configure(text=str(yesterday_total))
+        self._license_lie_yesterday_success.configure(text=f", {yesterday_success}")
+        self._license_lie_yesterday_failed.configure(text=f", {yesterday_failed})")
 
     def _apply_lie_quota_gate(self, status: LicenseStatus) -> None:
         """Disarm and grey 自动过测谎 while the device has no lie passes left.
@@ -3638,7 +4026,9 @@ class UiWorker(threading.Thread):
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             local = parsed.astimezone(timezone(timedelta(hours=8)))
-            return local.strftime("%Y-%m-%d %H-%M (GMT+8)")
+            # The stored expiry remains a timezone-aware UTC instant.  This
+            # compact display intentionally hides the redundant year/zone.
+            return local.strftime("%m-%d %H-%M")
         except (TypeError, ValueError):
             return str(value)
 
@@ -3683,6 +4073,11 @@ class UiWorker(threading.Thread):
                     check.state(["disabled"])
                 except Exception:
                     LOG.debug("could not re-grey 自动过测谎", exc_info=True)
+        # The generic authorization unlock enables every product widget.  Put
+        # the attack-mode constraint back afterwards, otherwise a saved
+        # 巡逻攻击 session exposes station-only controls until mode is changed.
+        if not locked:
+            self._fixed_refresh_rows()
 
     def _show_license_refusal(self) -> None:
         status = self._license_status
@@ -4143,10 +4538,70 @@ class UiWorker(threading.Thread):
 
     @staticmethod
     def _validate_player_channel_wait(proposed: str) -> bool:
-        """Tk validator for the 1–20 minute other-player switch delay."""
+        """Tk validator for the 0–1200 second other-player switch delay."""
 
         text = str(proposed).strip()
-        return text == "" or (text.isdigit() and 1 <= int(text) <= 20)
+        return text == "" or (text.isdigit() and 0 <= int(text) <= 1200)
+
+    def _normalized_player_channel_wait_seconds(self) -> int:
+        """Read the editable delay as a durable 0–1200 second value."""
+
+        variable = getattr(self, "_player_channel_wait_var", None)
+        try:
+            value = int(variable.get()) if variable is not None else 300
+        except Exception:
+            value = 300
+        return max(0, min(1200, value))
+
+    def _refresh_player_wait_hint(self) -> None:
+        """Keep every channel-wait hint synchronized to the displayed value."""
+
+        seconds = self._normalized_player_channel_wait_seconds()
+        # Deliberately choose the first line break.  Automatic wrapping used
+        # to leave the number at the end of a short line, which is hard to
+        # read.  The number, unit and action stay on this short first line.
+        hint = (
+            f"确定换线以后，再等 {seconds}\u00a0秒换线；\n"
+            "用来实现组队的前后脚离开；房间码相同且当前处于同一频道，"
+            "则随机频道相同。"
+        )
+        check_hint = getattr(self, "_player_check_hint", None)
+        if check_hint is not None:
+            check_hint.text = (
+                "当有人来时 30~60 秒随机后发送一条求让消息，继续等待至 3 分钟；"
+                f"期间玩家离开则终止；如果没有离开，再多等 {seconds} 秒后换线。"
+            )
+        for tooltip in getattr(self, "_player_wait_tooltips", ()):
+            tooltip.text = hint
+
+    def _player_channel_wait_commit(self) -> None:
+        """Normalize, save, and apply the wait field after it loses focus."""
+
+        seconds = self._normalized_player_channel_wait_seconds()
+        variable = getattr(self, "_player_channel_wait_var", None)
+        if variable is not None:
+            variable.set(str(seconds))
+        self._refresh_player_wait_hint()
+        self._shutdown_on_change()
+
+    def _player_channel_wait_on_blur(self, _event: Any = None) -> None:
+        self._player_channel_wait_commit()
+
+    def _player_channel_wait_commit_on_outside_click(self, event: Any) -> None:
+        """Commit the wait field even when a label/panel is clicked."""
+
+        box = getattr(self, "_player_channel_wait_box", None)
+        root = getattr(self, "_root", None)
+        if box is None or root is None:
+            return
+        try:
+            if event.widget is box or root.focus_get() is not box:
+                return
+            box.selection_clear()
+            root.focus_set()
+            self._player_channel_wait_commit()
+        except Exception:
+            LOG.debug("other-player channel wait outside-click commit failed", exc_info=True)
 
     def _reconnect_channel_commit_on_outside_click(self, event: Any) -> None:
         """Commit the channel when a click leaves its Spinbox without focus.
@@ -4923,6 +5378,9 @@ class UiWorker(threading.Thread):
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
             return
+        setter = getattr(worker, "set_on_backend_ready", None)
+        if callable(setter):
+            setter(self._begin_auto_lie_accounting_event)
         self._pause_patrol_for_api_pass()
         self._api_lie_pass_worker = worker
         self._api_auto_lie_last_pass_started = time.monotonic()
@@ -5101,14 +5559,97 @@ class UiWorker(threading.Thread):
         AUTO_LIE_LOG.info("自动过测谎: worker result %s", text)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text=f"自动过测谎: {text}")
-        # One automatic pass produces exactly one durable accounting event.
+        # Handshake readiness already created the durable pending event.  A
+        # normal completion or interruption remains pending until heartbeat;
+        # only black-room marker loss is reported as an explicit failure.
         if state not in {"done", "failed"}:
             return
         worker_id = id(worker)
         if self._accounted_auto_lie_worker_id == worker_id:
             return
         self._accounted_auto_lie_worker_id = worker_id
-        self._enqueue_auto_lie_accounting("automatic")
+        event_id = str(getattr(worker, "accounting_event_id", "") or "")
+        if event_id:
+            self._arm_auto_lie_marker_verification(event_id)
+
+    def _begin_auto_lie_accounting_event(self) -> Optional[str]:
+        """Persist the server lifecycle record when the WS handshake is ready."""
+
+        try:
+            event_id = self._lie_accounting_worker.begin_event()
+            AUTO_LIE_LOG.info(
+                "自动过测谎: WebSocket ready; start accounting queued event=%s",
+                event_id[:8],
+            )
+            return event_id
+        except Exception:
+            AUTO_LIE_LOG.warning(
+                "自动过测谎: could not persist handshake accounting event",
+                exc_info=True,
+            )
+            return None
+
+    def _arm_auto_lie_marker_verification(self, event_id: str) -> None:
+        """Watch fresh minimap reads for the post-takeover black-room state."""
+
+        self._auto_lie_marker_verification = {
+            "event_id": str(event_id),
+            "not_before": time.monotonic() + _AUTO_LIE_FAILURE_GRACE_SECONDS,
+            "last_sequence": -1,
+            "missing": 0,
+        }
+        AUTO_LIE_LOG.info(
+            "自动过测谎: black-room marker verification armed event=%s",
+            str(event_id)[:8],
+        )
+
+    def _service_auto_lie_marker_verification(self) -> None:
+        """Report only persistent post-pass marker loss as a true failure."""
+
+        state = self._auto_lie_marker_verification
+        if not state or time.monotonic() < float(state["not_before"]):
+            return
+        snapshot = self.last_snapshot
+        if snapshot is None:
+            return
+        sequence = int(getattr(snapshot, "sequence", -1))
+        if sequence <= int(state["last_sequence"]):
+            return
+        state["last_sequence"] = sequence
+        if float(getattr(snapshot, "marker_confidence", 0.0)) > 0.0:
+            self._auto_lie_marker_verification = None
+            try:
+                self._lie_accounting_worker.finalize_event(
+                    str(state["event_id"]), "success",
+                )
+                AUTO_LIE_LOG.info(
+                    "自动过测谎: marker returned; success queued event=%s",
+                    str(state["event_id"])[:8],
+                )
+            except Exception:
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎: could not queue marker-return success event=%s",
+                    str(state["event_id"])[:8], exc_info=True,
+                )
+            return
+        state["missing"] = int(state["missing"]) + 1
+        if int(state["missing"]) < _AUTO_LIE_FAILURE_MISSING_FRAMES:
+            return
+        event_id = str(state["event_id"])
+        self._auto_lie_marker_verification = None
+        try:
+            self._lie_accounting_worker.finalize_event(
+                event_id, "failed_marker_missing",
+            )
+            AUTO_LIE_LOG.warning(
+                "自动过测谎: black-room marker loss confirmed; failure queued event=%s",
+                event_id[:8],
+            )
+        except Exception:
+            AUTO_LIE_LOG.warning(
+                "自动过测谎: could not queue black-room failure event=%s",
+                event_id[:8], exc_info=True,
+            )
 
     def _enqueue_auto_lie_accounting(self, source: str) -> None:
         """Durably report one completed API use as success without delay.
@@ -5118,7 +5659,8 @@ class UiWorker(threading.Thread):
         """
 
         try:
-            event_id = self._lie_accounting_worker.enqueue("success")
+            event_id = self._lie_accounting_worker.begin_event()
+            self._lie_accounting_worker.finalize_event(event_id, "success")
             AUTO_LIE_LOG.info(
                 "自动过测谎: %s completed; immediate success accounting event=%s",
                 source, event_id[:8],
@@ -5452,15 +5994,15 @@ class UiWorker(threading.Thread):
             except Exception:
                 LOG.exception("could not clear the other-player switch field")
         LOG.warning(
-            "其他玩家自动换线 stopped (%s); patrol and the automation were cleared and "
-            "the 检测到其他玩家自动切换频道 field is now %s",
+            "有人换线 stopped (%s); patrol and the automation were cleared and "
+            "the 有人换线 field is now %s",
             reason,
             "cleared" if was_selected else "already off",
         )
         if hasattr(self, "_control_status"):
             try:
                 self._control_status.configure(
-                    text=f"检测到其他玩家自动换线 已停止（{reason}），巡逻已停止，开关已取消"
+                    text=f"有人换线 已停止（{reason}），巡逻已停止，开关已取消"
                 )
             except Exception:
                 LOG.debug("could not show the other-player stop status", exc_info=True)
@@ -6329,6 +6871,14 @@ class UiWorker(threading.Thread):
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
+            "counterattack_enabled": bool(
+                self._counterattack_enabled_var.get()
+                if hasattr(self, "_counterattack_enabled_var") else False
+            ),
+            "counterattack_key": (
+                self._counterattack_key_var.get().strip()
+                if hasattr(self, "_counterattack_key_var") else "ctrl"
+            ),
             "combo_attack_enabled": bool(
                 self._combo_attack_enabled_var.get()
                 if hasattr(self, "_combo_attack_enabled_var") else False
@@ -6769,12 +7319,16 @@ class UiWorker(threading.Thread):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
             )
+        if hasattr(self, "_counterattack_key_button"):
+            self._counterattack_key_button.configure(
+                text=self._counterattack_key_var.get()
+            )
         for button, var in zip(
             getattr(self, "_combo_attack_key_buttons", ()),
             getattr(self, "_combo_attack_key_vars", ()),
         ):
             button.configure(text=var.get())
-        combo_tooltip = getattr(self, "_combo_attack_help_tooltip", None)
+        combo_tooltip = getattr(self, "_combo_attack_tooltip", None)
         if combo_tooltip is not None:
             combo_tooltip.text = self._combo_attack_hint()
         data = self._fixed_collect_data()
@@ -6827,6 +7381,9 @@ class UiWorker(threading.Thread):
                 pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
                 if callable(pickup_setter):
                     pickup_setter(False, 0.0, 0.0)
+                counterattack_setter = getattr(mover, "set_counterattack", None)
+                if callable(counterattack_setter):
+                    counterattack_setter(False, "ctrl")
             return
         mode = str(data.get("attack_mode", "fixed"))
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
@@ -6854,6 +7411,12 @@ class UiWorker(threading.Thread):
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
             mover.small_step_attack_key = worker.attack_key
+            counterattack_setter = getattr(mover, "set_counterattack", None)
+            if callable(counterattack_setter):
+                counterattack_setter(
+                    bool(data.get("counterattack_enabled", False)),
+                    str(data.get("counterattack_key", "ctrl")).strip(),
+                )
             stationary_setter = getattr(
                 mover, "set_stationary_attack_enabled", None
             )
@@ -7004,6 +7567,14 @@ class UiWorker(threading.Thread):
                 key = str(data["attack_key"]).strip()
                 if key in BINDABLE_KEYS:
                     self._fixed_attack_key_var.set(key)
+            if hasattr(self, "_counterattack_enabled_var"):
+                self._counterattack_enabled_var.set(bool(
+                    data.get("counterattack_enabled", False)
+                ))
+            if hasattr(self, "_counterattack_key_var"):
+                key = str(data.get("counterattack_key", "ctrl")).strip()
+                if key in BINDABLE_KEYS and key != "-":
+                    self._counterattack_key_var.set(key)
             if hasattr(self, "_combo_attack_enabled_var"):
                 self._combo_attack_enabled_var.set(bool(
                     data.get("combo_attack_enabled", False)
@@ -7084,6 +7655,10 @@ class UiWorker(threading.Thread):
             LOG.warning("ignored malformed fixed attack settings",
                         exc_info=True)
             return
+        # Settings load can start directly in 巡逻攻击.  Apply the same
+        # stationary-only lock used by a later mode click, otherwise those
+        # controls render enabled until the operator switches modes once.
+        self._fixed_refresh_rows()
         self._fixed_on_change()
         LOG.info("fixed attack settings loaded from %s",
                  self._fixed_settings_path())
@@ -7352,11 +7927,9 @@ class UiWorker(threading.Thread):
                 self._player_room_code_var.get()
             ).strip()[:128]
         if hasattr(self, "_player_channel_wait_var"):
-            try:
-                wait_minutes = int(self._player_channel_wait_var.get())
-            except (TypeError, ValueError):
-                wait_minutes = 5
-            data["player_channel_wait_minutes"] = max(1, min(20, wait_minutes))
+            data["player_channel_wait_seconds"] = (
+                self._normalized_player_channel_wait_seconds()
+            )
         # 测试api needs no settings any more: the run length is fixed and the key ships with the app.
         return data
 
@@ -7391,6 +7964,7 @@ class UiWorker(threading.Thread):
         hours = float(self._shutdown_hours_var.get())
         self._shutdown_hours_label.configure(text=f"{hours:.1f}h")
         data = self._shutdown_collect_data()
+        self._refresh_player_wait_hint()
         self._shutdown_save_settings(data)
         self._shutdown_apply_to_worker(data)
         self._shutdown_refresh_grey()
@@ -7449,7 +8023,7 @@ class UiWorker(threading.Thread):
             if routing_setter is not None:
                 routing_setter(
                     room_code=data.get("player_room_code", ""),
-                    wait_minutes=data.get("player_channel_wait_minutes", 5.0),
+                    wait_seconds=data.get("player_channel_wait_seconds", 300.0),
                     current_channel=data.get("auto_reconnect_channel", CHANNEL_DEFAULT),
                 )
         character = getattr(self, "character_worker", None)
@@ -7568,61 +8142,28 @@ class UiWorker(threading.Thread):
                 except Exception:
                     pass
 
-    def _machine_name_press(self, _event: Any = None) -> None:
-        """Arm the 1s edit gesture; a short click intentionally does nothing."""
+    def _edit_machine_name(self) -> None:
+        """Set or clear the Telegram device name from an explicit click."""
 
-        self._machine_name_hold_fired = False
-        if self._root is not None:
-            self._machine_name_press_job = self._root.after(
-                1000, self._machine_name_begin_edit
-            )
-
-    def _machine_name_release(self, _event: Any = None) -> None:
-        if self._root is not None and self._machine_name_press_job is not None:
-            try:
-                self._root.after_cancel(self._machine_name_press_job)
-            except Exception:
-                pass
-        self._machine_name_press_job = None
-        self._machine_name_hold_fired = False
-
-    def _machine_name_begin_edit(self) -> None:
-        self._machine_name_press_job = None
-        self._machine_name_hold_fired = True
-        if self._machine_name_entry is not None:
-            return
-        button = getattr(self, "_telegram_machine_button", None)
-        row = getattr(self, "_telegram_machine_row", None)
-        token_button = getattr(self, "_telegram_token_button", None)
-        if button is None or row is None:
-            return
-        button.pack_forget()
-        entry = self._ttk.Entry(
-            row, textvariable=self._telegram_machine_var, width=14
-        )
-        self._machine_name_entry = entry
-        entry.pack(side="left", padx=(4, 8), before=token_button)
-        entry.bind("<FocusOut>", self._machine_name_finish_edit)
-        entry.bind("<Return>", self._machine_name_finish_edit)
-        entry.focus_set()
-        entry.selection_range(0, "end")
-
-    def _machine_name_finish_edit(self, _event: Any = None) -> None:
-        entry = self._machine_name_entry
-        if entry is None:
-            return
-        self._machine_name_entry = None
         try:
-            entry.destroy()
-        except Exception:
-            pass
-        name = self._telegram_machine_var.get().strip()
-        self._telegram_machine_var.set(name)
+            from tkinter import simpledialog
+
+            name = simpledialog.askstring(
+                "设备名称",
+                "设置消息推送显示的设备名称；留空则清除设置。",
+                initialvalue=self._telegram_machine_var.get(),
+                parent=self._root,
+            )
+        except Exception as exc:
+            self._telegram_status.configure(
+                text=f"消息提醒: 无法打开设备名称输入框 - {exc}"
+            )
+            return
+        if name is None:
+            return
+        self._telegram_machine_var.set(name.strip()[:100])
         self._telegram_machine_button.configure(
-            text=machine_name_button_text(name)
-        )
-        self._telegram_machine_button.pack(
-            side="left", padx=(4, 8), before=self._telegram_token_button
+            text=machine_name_button_text(self._telegram_machine_var.get())
         )
         self._shutdown_on_change()
 
@@ -7912,15 +8453,14 @@ class UiWorker(threading.Thread):
             LOG.debug("window content refit failed", exc_info=True)
 
     def _telegram_change_token(self) -> None:
-        """Ask for a token, then let the notifier validate it asynchronously."""
+        """Edit the token with the same set/clear semantics as event messages."""
 
         try:
             from tkinter import simpledialog
 
             token = simpledialog.askstring(
-                "修改BOT token",
-                "粘贴 Telegram BOT token。\n"
-                "请先在 Telegram 给这个 BOT 发送一条消息，系统会自动识别聊天。",
+                "设置BOT token",
+                "粘贴 Telegram BOT token；留空则清除设置。",
                 parent=self._root,
                 show="*",
             )
@@ -7934,7 +8474,21 @@ class UiWorker(threading.Thread):
         self._telegram_bot_token = token.strip()
         self._telegram_chat_id = ""
         self._telegram_status.configure(text="消息提醒: 正在验证 BOT 配置...")
+        self._refresh_telegram_token_button()
         self._shutdown_on_change()
+
+    def _refresh_telegram_token_button(self) -> None:
+        """Use the same configured-state affordance as 求让消息 / 重连消息."""
+
+        button = getattr(self, "_telegram_token_button", None)
+        if button is None:
+            return
+        try:
+            button.configure(
+                text="已设置" if self._telegram_bot_token.strip() else "设置BOT token"
+            )
+        except Exception:
+            LOG.debug("Telegram token button refresh failed", exc_info=True)
 
     def _refresh_telegram_status(self) -> None:
         """Show notifier health and persist an auto-discovered chat ID."""
@@ -7952,6 +8506,7 @@ class UiWorker(threading.Thread):
             if discovered and discovered != self._telegram_chat_id:
                 self._telegram_chat_id = discovered
                 self._shutdown_save_settings(self._shutdown_collect_data())
+            self._refresh_telegram_token_button()
         except Exception as exc:
             # Status display itself must be non-fatal too.
             self._telegram_status.configure(
@@ -8535,10 +9090,21 @@ class UiWorker(threading.Thread):
                     )
             if hasattr(self, "_player_channel_wait_var"):
                 try:
-                    wait_minutes = int(data.get("player_channel_wait_minutes", 5))
+                    # Configs from before the seconds UI stored whole minutes.
+                    # Migrate them on load rather than turning an old five-minute
+                    # preference into a five-second switch.
+                    if "player_channel_wait_seconds" in data:
+                        wait_seconds = int(data["player_channel_wait_seconds"])
+                    else:
+                        wait_seconds = int(
+                            data.get("player_channel_wait_minutes", 5)
+                        ) * 60
                 except (TypeError, ValueError):
-                    wait_minutes = 5
-                self._player_channel_wait_var.set(str(max(1, min(20, wait_minutes))))
+                    wait_seconds = 300
+                self._player_channel_wait_var.set(
+                    str(max(0, min(1200, wait_seconds)))
+                )
+                self._refresh_player_wait_hint()
             if hasattr(self, "_api_test_status"):
                 # 测试api has no panel settings; the line only states the backend it will reach.
                 self._set_api_test_status(self._api_test_status_text())
@@ -8564,6 +9130,7 @@ class UiWorker(threading.Thread):
                         self._telegram_machine_var.get()
                     )
                 )
+                self._refresh_telegram_token_button()
             if hasattr(self, "_quick_messages"):
                 self._quick_messages = normalize_quick_messages(
                     data.get("quick_messages", [])

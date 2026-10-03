@@ -80,8 +80,9 @@ YELLOW_MIN_MARKER_SPAN = YELLOW_MIN_SOLID_CORE_SPAN
 #    another player, and the channel was changed with nobody on the map.
 #
 # The family below is red enough to be the marker and clean enough not to be
-# terrain: green and blue must be nearly absent, and red must dominate them three
-# to one.  A marker shade - (255,0,0), (227,0,0), (200,0,0), (190,20,20) - passes;
+# terrain: green must stay nearly absent, and red must dominate it three to one.
+# Blue is held to a stricter ratio of its own - see RED_MIN_RED_BLUE_RATIO.
+# A marker shade - (255,0,0), (227,0,0), (200,0,0), (190,20,20) - passes;
 # the measured map art, orange decorations and washed-out pinks do not.
 RED_CORE_RED_FLOOR = 190
 RED_CORE_GREEN_CEILING = 45
@@ -90,6 +91,16 @@ RED_BODY_RED_FLOOR = 165
 RED_BODY_GREEN_CEILING = 60
 RED_BODY_BLUE_CEILING = 60
 RED_MIN_CHANNEL_RATIO = 3.0
+# ... and how far red must dominate BLUE specifically.
+#
+# The operator's own picture of a map with NO other player
+# (red_markder_missing.jpg, a 150%-scaled desktop capture) calibrates this: the
+# red things in it that the old 3.0 ratio accepted as another player are a
+# magenta-red UI red of (203, 0, 32), where red is only ~6x its blue, and pinkish
+# glyph reds of (209, 29, 36) and (192, 5, 44), where red is ~5x and ~4x their
+# blue.  Every shade the client draws the marker in is a true red-orange:
+# (255, 0, 0), (227, 0, 0), (200, 0, 0) and (190, 20, 20) all sit at 9x or more.
+RED_MIN_RED_BLUE_RATIO = 8.0
 RED_MIN_SATURATION = 0.60
 # Smallest accepted marker: the operator's 2x2 rotated block, and the three
 # strongly red pixels that survive when one of its four pixels is anti-aliased.
@@ -112,7 +123,7 @@ def _red_family_mask(
         & (green <= max_green)
         & (blue <= max_blue)
         & (red >= green * RED_MIN_CHANNEL_RATIO)
-        & (red >= blue * RED_MIN_CHANNEL_RATIO)
+        & (red >= blue * RED_MIN_RED_BLUE_RATIO)
         & (span >= 1)
         & (span >= RED_MIN_SATURATION * np.maximum(value, 1))
     )

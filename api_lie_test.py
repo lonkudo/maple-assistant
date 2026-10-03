@@ -108,6 +108,7 @@ class ApiLieTestWorker(threading.Thread):
         aim_overlay: Optional[Callable[[int, int], None]] = None,
         on_capture_start: Optional[Callable[[], None]] = None,
         on_capture_stop: Optional[Callable[[], None]] = None,
+        on_backend_ready: Optional[Callable[[], Optional[str]]] = None,
         backend_opener: Optional[Callable[[RunLog], tuple[Any, str, Any]]] = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -141,6 +142,7 @@ class ApiLieTestWorker(threading.Thread):
         self.aim_overlay = aim_overlay
         self._on_capture_start = on_capture_start
         self._on_capture_stop = on_capture_stop
+        self._on_backend_ready = on_backend_ready
         # The automatic pass supplies a UI-start probe cache here.  Keeping
         # this optional preserves the standalone drill's normal probe path.
         self._backend_opener = backend_opener
@@ -154,10 +156,16 @@ class ApiLieTestWorker(threading.Thread):
         self.backend_note = ""
         self.key_source = ""
         self.log_folder = None
+        self.accounting_event_id: Optional[str] = None
 
     # ------------------------------------------------------------------ control
     def request_stop(self) -> None:
         self._stop_request.set()
+
+    def set_on_backend_ready(self, callback: Optional[Callable[[], Optional[str]]]) -> None:
+        """Install the non-blocking handshake lifecycle hook before start."""
+
+        self._on_backend_ready = callback
 
     def _sleep_or_stop(self, seconds: float) -> bool:
         """Wait for a visual settle period, but let Esc end it immediately."""
@@ -379,6 +387,15 @@ class ApiLieTestWorker(threading.Thread):
                 return
             self.backend_note = str(note)
             self._report("backend", f"{note}")
+            # The desktop accounting lifecycle starts at a ready WebSocket
+            # handshake, before visual settle / the first RTF1 upload.  The
+            # callback only persists and queues background work; it never
+            # touches the live capture or cursor path.
+            if self._on_backend_ready is not None:
+                try:
+                    self.accounting_event_id = self._on_backend_ready()
+                except Exception:
+                    LOG.warning("api test: handshake accounting setup failed", exc_info=True)
 
             # Open the socket before capturing the first image.  The shared
             # capture is already enabled, so this leaves the full visual

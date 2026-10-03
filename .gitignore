@@ -48,3 +48,18 @@ activation_service/.env
 activation_service/__pycache__/
 activation_service/**/__pycache__/
 activation_service/staticfiles/
+
+# Local recordings, extracted frames and diagnostic dumps.  These are
+# machine-local artefacts produced by the developer tools, never sources.
+*.mp4
+detect_video/
+detect_video.zip
+try_detect.mp4
+auto_lie.log.*
+yolo-detection/*.jpg
+_compare_cpu_v0321/
+test_roi_video_tracker.py.head
+
+# Machine-bound personal entitlement and the runtime accounting outbox.
+license.json
+lie_accounting_pending.json

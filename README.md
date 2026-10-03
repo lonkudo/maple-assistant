@@ -60,6 +60,67 @@ The update icon in the title bar searches the Desktop, the running folder, and i
 - **A return drop recognises the patrol floor it landed on even when the marker reads outside that floor's recorded band.** The drop used to end only on a strict band match over the patrol floors, so a character standing on the patrol floor whose recorded points sit elsewhere on the same platform kept sending Alt+Down. The landing now also accepts the at/below-bottom-floor and bounded nearest-floor answers ordinary patrol uses, once an Alt+Down chord has really moved the marker down and the reading has held for two settled frames. The world-Y tracker is never used for the landing. See *Dropping back into the route from a higher floor*.
 - **The map canvas (the yellow marker/patrol rectangle) is measured from the captured minimap, never estimated from the minimap window.** The old fallback derived the canvas from the outer frame's proportions (a fixed header height and bottom offset), and when the inner border was unreadable it widened the region back to the whole minimap window. It is now the border rectangle nested directly inside the window's border, measured per frame; an unreadable frame reuses the canvas measured earlier in the session, and when none exists the yellow rectangle is not drawn at all instead of covering the window. See *The map canvas and the detection overlay*.
 
+### Current release behavior (v1.2.104)
+
+This release carries the changes below: the channel-change proof, the 频道 field
+that follows it, the narrower red-marker colour family, the hit reaction
+**被撞反击**, 多等 entered in seconds, and the map re-anchor that precedes a
+resumed patrol.
+
+- **A channel change is proven by the map reloading, not by a time budget.** The
+  yellow marker must go away (`OTHER_PLAYER_SWITCH_RELOAD_FRAMES` captures — the
+  client's loading screen hides the whole minimap) and then come back on the new
+  channel; that disappearance and return *is* the success test. The old
+  twelve-second evidence budget, which also required four clean or two occupied
+  captures before it would answer, is gone: the field log of 2026-10-03 shows
+  three attempts on channel 41 all answering *no loading screen* and spending
+  13 s per attempt on a verdict that came from a timer instead of from the map.
+  A marker that stays visible for `OTHER_PLAYER_SWITCH_RELOAD_IDLE_FRAMES`
+  (about five seconds of captures) means the change never started, so the same
+  target is planned again immediately.
+- **The 频道 field follows a *proven* change.** The channel is committed once the
+  map has reloaded onto it — not when the menu keys were merely sent, which is how
+  the field showed `41` while the character had not been confirmed to leave `29`.
+  It is committed whether or not the new channel has another player; somebody
+  being there only decides the next action (switch on to the next channel of the
+  route, or resume patrol on an empty one).
+- **The other player's red marker is recognised by colour, not by size or shape.**
+  The marker keeps its own shape rule (the client's 2×2 block, a diamond when the
+  block is drawn rotated), and the colour family now requires red to dominate
+  *blue* eight to one (`RED_MIN_RED_BLUE_RATIO`) instead of three to one. The
+  operator's own picture of a map with nobody on it (`red_markder_missing.jpg`, a
+  150%-scaled desktop capture) measures the reds that used to pass: a magenta-red
+  UI red of `(203, 0, 32)`, where red is only about 6× its blue, and pinkish glyph
+  reds of `(209, 29, 36)` and `(192, 5, 44)` (about 5× and 4×). Every shade the
+  client draws the marker in — `(255,0,0)`, `(227,0,0)`, `(200,0,0)`,
+  `(190,20,20)` — sits at 9.5× or more, so the narrower ratio keeps the marker
+  while the pink and magenta reds that used to register as another player do not.
+  See *Switching channel when another player is present*.
+- **被撞反击 answers a confirmed hit with one short step and one attack.** The
+  HP bar, not a timer, is the trigger: only an action-grade reading that really
+  fell between two frames starts a reaction, and the direction comes from the
+  character marker's own X movement in that same capture — the character is
+  knocked back, so it steps the other way and taps its own bound key once. A
+  single step that leaves X unclear (< 0.003) is skipped rather than guessed,
+  the reaction is serialized with jump/buff/climb so it can never overlap them,
+  and only one reaction can be queued at a time, so several frames of one hit
+  cannot stack delayed walks. Its hover hint warns that it is meant for maps with
+  few monsters. See *被撞反击 (hit reaction)*.
+- **多等 is entered in seconds.** The other-player channel switch waits the
+  configured number of **seconds** (0–1200) after a proven need to leave, which is
+  what makes the last-minute 组队 hand-over possible; the old field stored whole
+  minutes. A configuration written before this change is migrated on load
+  (`player_channel_wait_minutes` × 60), so an existing five-minute preference does
+  not silently become a five-second one. See *Switching channel when another player
+  is present*.
+- **A resumed patrol starts from a freshly anchored map session.** After a proven
+  channel change onto an empty channel, the coordinator re-runs the same
+  map/layer preparation the reconnect path uses before the patrol is handed back,
+  so a character that spawns above the recorded range drops back into the route
+  first instead of walking horizontally with stale layer state. If that
+  preparation cannot be completed, the patrol stays stopped and the log says so.
+  See *Switching channel when another player is present*.
+
 ## Configuration
 
 Two configuration files keep personal settings separate from shipped defaults:
@@ -137,12 +198,23 @@ Each successful heartbeat also returns the server-issued eight-character
 **设备码**. The authorization line always displays that code (and left-clicking
 it copies it). The client preserves the online device state across ordinary
 local signature checks, so a routine UI permission check cannot erase it.
-Completed automatic API passes and completed `测试API` drills are reported to
-the licensing server immediately as successful usage events. The response's
-additive `autolie_fingerprint_usage` object updates the same authorization line
-at once with the total, success, failure, and remaining usage values. The
-durable local queue remains only for retrying an unavailable server; it does
-not intentionally delay a completed report.
+When the automatic API WebSocket handshake is ready, the client first stores a
+UUID in its durable local outbox, then asynchronously reports `STARTED` after a
+random 0–30 second spread. It reports terminal success after marker recovery,
+or `failed_marker_missing` only when the character is verified in the black
+room. Both terminal reports use their own 0–30 second spread and never block
+the live capture or cursor workflow. A normal application close queues success
+for any still-pending event and gives the sender at most 500 ms; an unsent row
+remains in the outbox for the next start. During a pending event, the server
+returns all three counters: `total` has increased while `success` and `failed`
+retain their previous values.
+
+The response's additive `autolie_fingerprint_usage` object updates the same
+authorization line at once with total, success, failure, and remaining usage.
+The server treats an unfinalized row as success only after a two-minute
+server-time grace period at that device's next heartbeat, or after ten minutes
+through the stale-row cleanup. Both rules use server receipt time, so a fresh
+delayed report cannot be inferred complete early.
 
 The operator console shows an activation code's **设备绑定** as this public
 equipment ID rather than a fingerprint fragment. The device list has an
@@ -180,6 +252,32 @@ heartbeat locks automation. Therefore restore the compatible server promptly
 rather than asking customers to replace their client files. Do not roll back
 the database schema by hand; prefer an additive migration followed by a code
 rollback that still understands the newer schema.
+
+### Server-agent instruction: auto-lie lifecycle deployment
+
+The server agent must deploy the client lifecycle support together: pull the
+server commit, load the existing `.env`, run `python manage.py migrate`, then
+restart Gunicorn. This applies migrations `0007_lie_event_lifecycle`,
+`0009_lie_event_pending_index`, and `0010_activationcode_auto_lie_quota`; the
+second merges the repository's two existing `0007` migration branches and adds
+the indexed stale-pending lookup, and the third adds the optional per-code
+auto-lie quota the operator console edits. Do not replace the database, TLS key,
+signing key, or auto-lie secret.
+
+Install one server-side periodic command, not one job per device. Run it every
+five minutes with the ten-minute cutoff:
+
+```bash
+cd /path/to/maple-assistant-server
+. .venv/bin/activate
+set -a; . ./.env; set +a
+python manage.py settle_stale_lie_events --minutes 10
+```
+
+The scheduler selects only indexed rows still marked `pending` whose
+server-side `recorded_at` is at least ten minutes old. It settles each row and
+device independently; it cannot create, scan, or settle events the client has
+not yet reported.
 
 ## Interface layout
 
@@ -296,9 +394,49 @@ The landing evidence belongs to one descent. It is cleared on a fresh patrol sta
 
 HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input.
 
+### 被撞反击 (hit reaction)
+
+**被撞反击** is an event reaction, not a cadence: it is a checkbox with its own
+**攻击键** binding on the 巡逻攻击 row (stored as `counterattack_enabled` and
+`counterattack_key` in `fixed_attack_settings.json`, the key defaults to `ctrl`).
+It works in both 巡逻攻击 and 站桩攻击 while patrol input is armed, and switching the
+attack mode off disables it with the rest of the combat controls.
+
+1. **The HP bar is the trigger.** `status_worker.py` owns the reading: only an
+   action-grade sample (confidence at or above the action threshold) that is
+   *lower* than the previous action-grade sample counts as a hit. A one-frame bar
+   wobble in a weak read therefore cannot press a direction key.
+2. **The direction comes from the same capture, not from "now".** The status and
+   minimap analyses run on independent threads, so the reaction is matched back to
+   the marker X recorded for that exact capture sequence (a twelve-sample window).
+   A hit whose frame has no marker pair, or whose X moved less than 0.003 between
+   the two frames, is skipped and logged instead of guessed.
+3. **The character steps against the knockback and attacks once.** The step is
+   0.10 s in the opposite direction to the recorded displacement (the marker
+   jumped right, so the character steps left — back toward whatever hit it), and
+   the bound key is tapped immediately after the step, in the same atomic motion.
+4. **It never overlaps anything else.** The reaction is queued through
+   `motion_arbiter.py` as its own motion type, so it cannot run during a climb,
+   drop, stair jump, buff, 小碎步, or an anchor correction; the step releases the
+   ordinary walk hold first. Only one reaction may be queued at a time, so the
+   several frames of one hit produce one reaction rather than a queue of delayed
+   walks. The tap is also registered as an attack, so the fixed cadence does not
+   add a second beat on top of it.
+
+The log names each outcome: `被撞反击 queued: HP 4210->4188 frame=81234 X +0.014286 -> left + ctrl`, `被撞反击 executed: left 0.10s + ctrl`, `被撞反击 skipped: HP 4210->4188 frame=81234 X direction unclear (Δx=+0.001190)`, and `被撞反击 skipped: vertical recovery is active`.
+
+The hover hint on the checkbox is the operator-facing warning: 建议在怪物少的地图使用，否则频繁被撞影响正常输出。
+
 ### Position correction while standing
 
 站桩攻击 holds the recorded spot with one atomic motion per correction: a short direction hold — the tiny step inside the inner band, a longer walk when the character is further out — followed immediately by one attack. The attack belongs to the correction, so a correction can never be the moment a beat is lost; corrections repeat about 300 ms apart until the marker is back inside the arrival band (±0.006X). A drift is always walked back: the character never settles a pixel or two away from its 桩. The small-step band ends at ±0.010X, and the correction interval only spaces the corrections — it does not create a gap in which a beat is skipped.
+
+When a normal return walk starts outside the final approach band, it first waits
+for an already-running attack animation to finish. Sending its initial Left or
+Right during that animation can be ignored by the game; the old hold manager
+then kept extending a direction the game had never accepted, while return
+protection suppressed every later attack. The clean-tick gate prevents that
+stationary-return freeze without changing the ordinary walking path.
 
 Two related rules protect that motion:
 
@@ -313,11 +451,75 @@ Two related rules protect that motion:
 
 The additional-functions panel can enable sound, screen flash, Telegram messages, disconnect alerts, lie-detection alerts, timer alarms, and other-player channel switching.
 
+Every optional alert control has a hover explanation: **循环** raises an alarm
+when its remaining time reaches zero; **声音** plays the dingdong sound;
+**闪烁** flashes the screen red for machines without usable audio; **消息** sends
+a Telegram notification; **自动重连** reconnects after a verified disconnect;
+and **自动测谎** hands the mouse to the automatic lie workflow and consumes one
+lie-detection use even if it is interrupted with Esc. Leave 自动测谎 off when
+manual lie handling is intended.
+
+Telegram uses one bot token per TodoHelper configuration, but multiple helpers
+may use the same token and send to the same chat. Give each helper a distinct
+**设备名称** through its normal left-click setting dialog so alerts identify the
+originating machine. The token button shows **已设置** when configured. Network
+delivery first uses the Windows system HTTP proxy, then probes the usual local
+HTTP proxy ports (`7890`, `7891`, `7897`, `1080`, `10808`, `10809`, `8888`,
+`8889`), and finally tries a direct Telegram connection. Therefore a local
+Clash/Mihomo/V2Ray/ShadowSocks-style HTTP proxy is sufficient; no proxy setting
+is required inside TodoHelper.
+
+The book icon in the title bar opens the lightweight teaching viewer. It loads
+the JPG pages in `teach-assets/` on demand, in natural filename order; the
+release builder copies that folder unchanged into every normal and standalone
+package.
+
 Disconnect handling deliberately avoids treating every missing minimap marker as a disconnect. At the shared 5 FPS capture rate, the marker must be absent for 50 samples (about ten seconds), **and** the current frame must show either the login-page evidence or the dedicated offline prompt. The prompt check remains valid when the prompt covers the login background. In minimap-less zones, monitoring pauses after the absence threshold and resumes when the marker returns; it does not repeatedly reconnect or stop patrol merely because a minimap is hidden.
 
 Automatic reconnect begins only after this verified offline event. It dismisses the offline prompt when present, reaches the login screen, opens the chosen world with the guarded double-click sequence, selects the target channel, and waits for sustained marker recovery before patrol can resume.
 
 **自动重开** is a separate 30-second system-memory guard. When enabled and Windows memory use reaches 98%, it sends the optional **重开消息**, signs the character out, and waits until the old game process has completely exited before using the existing `launcher3.0` launcher window. While the new client starts, the assistant restores its focus once per second and waits for the login-page detector before handing off to the normal reconnect workflow. Restart progress is shown in the 图层校准与逻辑 status line; its control and 重开消息 button are on their own line in 附加功能. The authorization header always displays the latest system-memory reading, refreshed on this same 30-second cadence whether 自动重开 is enabled or not.
+
+### Switching channel when another player is present (有人换线)
+
+With **有人换线** selected, a red diamond on the minimap counts as another player,
+and the next capture must show it again before anything happens, so one hit flash
+or a ragged terrain edge cannot start the workflow. This is the only part of the
+assistant that changes channel by itself.
+
+1. It stops the patrol and watches inside a three-minute presence window, sending
+   the optional **求让消息** at a random 30–60 second point in it. The other player
+   leaving during that window ends the whole workflow — no message is spoken into
+   an empty channel, and the patrol is handed back.
+2. If the player is still there, it waits the configured **多等** time — entered in
+   **seconds** on its own row (0–1200, default 300) — then runs the channel route:
+   the recorded **房间码** turns the current channel into a deterministic next
+   channel, and without a code the route is random. The row's hover hint is what
+   waits for: 确定换线以后，再等 N 秒换线, which is how a 组队 pair leaves one after
+   the other.
+3. The change is proven by the client's own loading screen: the minimap and the
+   yellow marker disappear, then the marker comes back on the new channel. That is
+   the moment the 频道 field and the saved channel follow the change — whether or
+   not somebody is on the new channel.
+4. Another player on the new channel means the route switches on to the next
+   channel; an empty one resumes the patrol — but only after the coordinator has
+   re-anchored a fresh map/layer session, the same preparation the reconnect path
+   uses, so a character that landed above the recorded range drops back into the
+   route before any horizontal walking starts. If that preparation fails, the
+   patrol stays stopped and the log states it. A route whose keys were swallowed
+   (the marker never left its channel) plans the same target again, and after
+   three such attempts on one target the route moves on.
+
+The running log names each step: `player channel switch: the map went away for 2
+capture(s) - the channel change is in progress; waiting for the marker to come
+back`, `player channel switch: the marker is back on the new channel - the change
+succeeded`, `player channel switch 3 done: the map reloaded onto channel 22 and it
+has no other player; resuming patrol`, and `switch attempt 2 never left channel 29
+(the marker stayed visible); 29 -> 50 is planned again`.
+
+Esc cancels the workflow. A cancelled or failed workflow leaves the patrol stopped
+and the character standing until **开始运行** is pressed; only a mission that became
+unnecessary (the other player left) hands the patrol back on its own.
 
 ## Lie detection and automatic handling
 
@@ -334,6 +536,14 @@ The lie detector shares the normal 5 FPS capture cadence. When automatic lie han
    handshake at video start, waits the three-second visual-settle period without
    uploading, then records its handshake timing and transport in its run report.
 6. The round is ended with the API’s `round_end` message and the WebSocket is closed normally.
+7. Accounting follows the lifecycle, not the video: a pass reports `STARTED` once
+   its handshake is ready, then `success` when the minimap marker is seen again
+   after the pass. The failure outcome `failed_marker_missing` is written only when
+   the character is really in the black room — the marker stays absent for fifteen
+   fresh captures after a three-second grace period. An interrupted pass (Esc, or
+   closing the app) leaves the event pending instead of inventing a failure. The
+   manual **测试API** drill keeps the older immediate-success accounting, because
+   it is an operator-run check rather than a live pass.
 
 The purple detection area and one-shot target indication are visual feedback only. They are not used as tracking input and do not block target chasing.
 
@@ -424,6 +634,10 @@ and must not be moved after publication.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.2.104` | `release/v1.2.104` | Reload-proven channel switch, 被撞反击, 多等 in seconds, post-switch map re-anchor. |
+| `1.2.103` | — | The lie credential survives a completed pass. |
+| `1.2.96` | `release/v1.2.96` | Version-bump checkpoint commit only. |
+| `1.2.95` | `release/v1.2.95` | Synchronized auto-lie usage and device status. |
 | `1.1.65` | `release/v1.1.65` | Climb-aware jump-point triggering and compact arrows. |
 | `1.1.69` | `release/v1.1.69` | First protected EXE package; corrected Tk runtime packaging. |
 | `1.1.64` | `release/v1.1.64` | 64-bit native marker-canvas handle repair. |

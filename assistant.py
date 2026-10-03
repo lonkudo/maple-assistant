@@ -546,7 +546,7 @@ def main() -> int:
     config_store = get_config_store(args.config)
     additional_settings = config_store.read_section("additional_functions")
     channel_update_events: "queue.Queue[int]" = queue.Queue(maxsize=16)
-    # A stopped 检测到其他玩家自动切换频道 workflow asks the UI to clear its own
+    # A stopped 有人换线 workflow asks the UI to clear its own
     # selection, so the feature cannot start a new round by itself.
     other_player_stop_events: "queue.Queue[str]" = queue.Queue(maxsize=8)
 
@@ -1691,6 +1691,34 @@ def main() -> int:
                 pass
         logging.info("player channel route committed current reconnect channel=%d", selected)
 
+    def prepare_patrol_after_other_player_channel() -> bool:
+        """Re-anchor the map after a clean player-triggered channel landing.
+
+        A channel can spawn the character above the recorded patrol range.
+        Reuse the reconnect preparation path: it reads the fresh marker and
+        arms ``drop-to-route`` when the marker is above the top recorded band,
+        before MovementWorker is allowed to resume horizontal patrol.
+        """
+
+        try:
+            prepare_map_session(
+                stationary_reanchor=False,
+                show_overlays=False,
+                require_layer=False,
+                reconnect_restart=True,
+            )
+            logging.warning(
+                "OTHER-PLAYER CHANNEL RESUME: map session refreshed; "
+                "above-route spawn will drop before patrol"
+            )
+            return True
+        except OSError as exc:
+            logging.warning(
+                "OTHER-PLAYER CHANNEL RESUME refused: could not prepare the "
+                "fresh map/layer session (%s)", exc,
+            )
+            return False
+
     def note_other_player_stop(reason: str) -> None:
         """Ask the UI to clear the 其他玩家自动换线 selection after a manual stop.
 
@@ -1719,9 +1747,9 @@ def main() -> int:
     # button any more; it stays as an offline tool for work/ scripts and the test suite.
     api_test_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=256)
     # The service expects one short live round: after the separate 3-second
-    # settle, send frames for no more than 13 seconds, then round_end and
+    # settle, send frames for no more than 15 seconds, then round_end and
     # close the WebSocket.
-    AUTO_LIE_TRACK_SECONDS = 17.0
+    AUTO_LIE_TRACK_SECONDS = 15.0
 
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
                                    fps=5.0):
@@ -1789,7 +1817,7 @@ def main() -> int:
             fps=5.0,
             transport="rtf1",
             # The worker sends its explicit round_end and closes after this
-            # 13-second active tracking window.
+            # 15-second active tracking window.
             duration=AWAIT_SECOND_WINDOW_SEC + AUTO_LIE_TRACK_SECONDS,
             await_seconds=AWAIT_SECOND_WINDOW_SEC,
             # The answer must be EXECUTED, not just measured: the pass drives the cursor to the point
@@ -2125,14 +2153,18 @@ def main() -> int:
                 calibration.get("other_player_check_interval_seconds", 0.0)
             ),
             other_player_room_code=str(additional_settings.get("player_room_code", "")),
-            other_player_wait_minutes=float(
-                additional_settings.get("player_channel_wait_minutes", 5.0)
+            other_player_wait_seconds=float(
+                additional_settings.get(
+                    "player_channel_wait_seconds",
+                    float(additional_settings.get("player_channel_wait_minutes", 5.0)) * 60.0,
+                )
             ),
             current_channel=int(
                 additional_settings.get("auto_reconnect_channel", CHANNEL_DEFAULT)
             ),
             on_channel_landed=note_player_channel_landed,
             on_other_player_stop=note_other_player_stop,
+            on_other_player_resume=prepare_patrol_after_other_player_channel,
             rescue_check_interval_seconds=float(
                 calibration.get("rescue_check_interval_seconds", 300.0)
             ),
@@ -2148,6 +2180,13 @@ def main() -> int:
     motion_arbiter.set_step_callback(
         movement_worker.perform_stationary_step
     )
+    motion_arbiter.set_counterattack_callback(
+        movement_worker.perform_counterattack
+    )
+    # Status reads the HP bar while MovementWorker owns the minimap X history
+    # and the arbiter-backed reaction.  Wire them only after both workers
+    # exist; neither worker imports or controls the other directly.
+    status_worker.hp_drop_callback = movement_worker.notify_hp_drop
     stair_jump_worker = StairJumpWorker(
         stop_event,
         automation_active_event=automation_active,

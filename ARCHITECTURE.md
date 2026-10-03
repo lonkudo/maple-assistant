@@ -106,13 +106,46 @@ operator-managed copy at rest in PostgreSQL. This path is additive to the
 versioned activation response so older clients can safely ignore it, and it
 does not modify vendor `autolie_api/` code.
 
-### Immediate auto-lie usage synchronization
+### Asynchronous auto-lie lifecycle accounting
 
-`lie_accounting.py` is a durable post-pass boundary, never part of the live
-WebSocket/cursor stream. A completed automatic pass or completed `测试API`
-drill is persisted and sent immediately with the successful outcome. If the
-licensing server is unavailable, the same event UUID is retained and retried
-later, so retries remain idempotent without delaying normal operation.
+`lie_accounting.py` is a durable accounting boundary, never part of the live
+WebSocket/cursor stream. Once the authenticated WebSocket handshake is ready,
+the adapter persists a UUID locally and asynchronously queues a `STARTED`
+report with a random 0–30 second spread. The upload stream never waits for that
+request. After the 15-second tracking window, marker recovery queues `success`;
+only a verified black-room marker loss queues `failed_marker_missing`. Terminal
+reports use their own 0–30 second spread, but are never scheduled before
+`STARTED` has been acknowledged.
+
+The outbox makes retries idempotent by UUID. A normal close queues success for
+unfinished events, gives the sender a bounded 500 ms chance, and preserves any
+unsent update for next launch. A forced termination cannot run client code;
+the server therefore settles only rows older than two minutes at the same
+device's heartbeat, and rows older than ten minutes in one indexed periodic
+cleanup. Both windows use server `recorded_at`, never the client occurrence
+time, so a newly received start cannot be inferred complete while its delayed
+terminal report is still expected. Each event is settled independently; the
+cleanup is one server job, not one timer per client.
+
+Two details keep the outbox honest across versions and outages. A transport
+failure (`server` or `device_not_ready`) is not a verdict: the row is kept and
+its due time moves 60 s out, and a start that has not been accepted yet blocks
+its own final report — the ordering rule is enforced by the data, not by the
+caller's timing. A row persisted by a pre-lifecycle release (a completed event
+with no `started_due_at`) is migrated on load into a start followed by its prior
+`success`, so an update cannot orphan an older pending event.
+
+The terminal outcome is evidence-based, and the failure evidence belongs to the
+UI layer because the marker is read there: `ui_worker.py` arms a verification
+window when the pass worker reports a result with an accounting event, ignores
+the first `_AUTO_LIE_FAILURE_GRACE_SECONDS` (3 s) so a normal transition is not
+counted, queues `success` on the first fresh snapshot that has a marker
+(`marker_confidence > 0`), and queues `failed_marker_missing` only after
+`_AUTO_LIE_FAILURE_MISSING_FRAMES` (15) consecutive fresh snapshots without one
+— the black-room state. An interrupted pass (Esc, application close) is not a
+failure and stays pending for the server's own settlement. The manual **测试API**
+drill is an operator-run check of the same upstream service, so it keeps the
+immediate begin-and-finalize-`success` accounting instead of the live lifecycle.
 
 The server keeps its established `device` response for compatibility and adds
 `autolie_fingerprint_usage` containing only current auto-lie permission,
@@ -214,13 +247,23 @@ Horizontal directions are mutually exclusive with each other, as are vertical di
 3. arm the new direction;
 4. restore pickup ownership only when walking is active.
 
-`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, stationary-facing taps, and the 站桩 anchor correction. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
+`motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, stationary-facing taps, the 站桩 anchor correction, and the **被撞反击** hit reaction. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
+
+The hit reaction is a motion type of its own (`COUNTERATTACK`) rather than a walk beside the cadence, for the same reason as the anchor correction: it carries its own attack tap, and it must not land on top of an attack, jump, buff, or climb. Like the stair jump it is exempt from the arbiter's shared motion gate — it is queued by evidence that already happened (an HP loss read from the shared capture), so a gate meant to keep ordinary travel from fighting itself would only delay the answer. `request_counterattack()` refuses to stack: one queued reaction is enough for a hit that spans several frames. `perform_counterattack()` is called under the arbiter's direction/hold locks, releases the ordinary walk hold, holds the step for `COUNTERATTACK_STEP_HOLD_SECONDS` (0.10 s), taps the independently bound key, then records the new facing and calls `note_attack()` so the fixed cadence cannot add a second beat.
 
 The anchor correction is the one motion that also carries an attack (see the combat section). It is exclusive in the usual way — while it is queued or running, the fixed cadence cannot reserve a beat, so the correction’s own attack can never be doubled — but it is exempt from the arbiter’s shared post-attack grace, because that grace is measured from the correction’s own attack and would stretch a correction the operator expects roughly every 300 ms into one per second.
 
 While the optional 小碎步 pair is queued or running the movement loop queues nothing behind it: neither an anchor correction nor a 朝向 tap. The pair moves the character on purpose (away from, then back to the selected 朝向) and records the facing itself when it completes, so anything queued during it executed as an extra step straight after the pair. The facing obligation stays owed, so a pair that is dropped is corrected on the next settled capture.
 
 Attack and buff workers ask whether a conflicting motion is active before sending input. Movement does not wait while holding the arbiter’s internal lock; this avoids a stalled worker deadlock at a direction handoff.
+
+The initial long stationary-return walk has one additional, bounded gate. If an
+attack is already inside the game-side animation window when the marker first
+falls outside the final approach zone, `movement_worker.py` waits for that
+specific animation to end before sending its first Left/Right. The stationary
+recovery event has already prevented later attack beats. This avoids the game
+swallowing that initial walk key while the hold manager continues to renew a
+worker-side hold that never reached the game.
 
 ### Combat and consumables
 
@@ -233,6 +276,12 @@ That facing tap is a 30 ms turn, deliberately as short as the tiny anchor step: 
 The anchor correction is one atomic motion per correction, shaped as “direction hold, then the attack belonging to that correction”. The hold is the tiny step inside the small-step band (±0.010X of the anchor) and the longer walk when the character is further out; both carry exactly one attack. The design reason is direct field evidence: as an ordinary walk hold the correction either deferred the fixed cadence (direction handoff) or blocked it (exclusive recovery), so the character corrected its position and attacked nothing. Corrections are spaced about 300 ms apart and repeat until the marker is inside the arrival band (±0.006X). That band is not widened to “hold” a small drift: a position that is off the band is always walked back, because tolerating it left the character standing a pixel or two away from its 桩.
 
 Stair jump observes sustained position stalls and submits one direction-preserving recovery jump. It uses a post-trigger frame cooldown and a movement-progress reset, preventing a single long stall from producing a burst of jumps. Recorded jump points are separate from this recovery rule: they are deliberate X/Y triggers, have their own once-per-leg pass record, and can fire while a rope climb is active.
+
+**被撞反击** is an event path beside the fixed cadence, not a mode of it, and its two halves deliberately live in two workers:
+
+- **`status_worker.py` owns the fact of a hit.** The HP reading is trusted only at action-grade confidence, and a hit is a *decrease* between two such samples, so a one-frame wobble in a weak OCR/colour read cannot press a direction key. The worker publishes `(previous_hp, current_hp, frame_sequence)` through a callback and does nothing else with it — it never chooses a direction and never sends input.
+- **`movement_worker.py` owns the direction and the input.** `notify_hp_drop()` queues the hit, and `_consume_counterattack_events()` answers it on the movement thread, which is the only thread holding the marker history: the reaction looks up the marker X recorded for that exact capture sequence in a twelve-sample window and uses the displacement between the hit frame and the frame before it. Status and minimap analysis are independent threads, so "the X right now" would be the wrong sample; the frame-matched pair is what makes the direction belong to the hit. A missing pair, or a displacement below `COUNTERATTACK_X_DIRECTION_MIN_DELTA` (0.003), is skipped and logged rather than guessed.
+- **The wiring is coordinator-owned.** `assistant.py` sets `status_worker.hp_drop_callback` and `motion_arbiter.set_counterattack_callback()` only after both workers exist, and `ui_worker.py` applies the checkbox state through `MovementWorker.set_counterattack()`. Status and movement therefore share the hit without importing or controlling each other (concurrency rule 5).
 
 ### Alerts, disconnects, and reconnect
 
@@ -250,6 +299,19 @@ The reconnect-only drop-recovery policy belongs to `movement_worker.py`, but is 
 
 `auto_restart_worker.py` is a distinct memory-leak recovery lifecycle. It samples Windows system memory every 30 seconds and publishes that reading to the authorization header whether or not restart is enabled. At or above 98% with 自动重开 selected, it stops patrol, sends the optional 重开消息, signs out, terminates the game process tree, and waits without a fixed abandonment timeout until the old game window and process tree are gone. It then focuses the persistent `launcher3.0` dialog and clicks its measured launch point. A newly visible game window is not enough to start reconnect: the worker re-focuses it once per second while waiting for `ReconnectWorker`'s existing login-page colour evidence. Only a confirmed login page receives the dedicated reconnect handoff. If the fresh game remains visible but login/reconnect cannot complete, it is retained rather than killed into a restart loop. Auto-restart reports its lifecycle through the 图层校准与逻辑 status line; the Additional Functions panel contains controls only.
 
+### Other-player detection and the channel switch
+
+`movement_worker.py` owns the 有人换线 workflow: the per-frame red-marker scan (`_maybe_check_other_players`), the staged request/wait phase, and the switch loop. `channel_routing.py` plans a route (pure functions), `channel_switch.py` sends it, and the coordinator is told only about a channel the character is really on.
+
+Detection and proof are deliberately separate concerns:
+
+- **Detection is a colour-family question with the marker's own shape floor.** `marker_detector.detect_red_diamonds()` accepts only strongly red pixels — `red ≥ 190`, green and blue below their ceilings, saturation ≥ 0.60 — whose red dominates green three to one and **blue eight to one** (`RED_MIN_RED_BLUE_RATIO`). The shape model is deliberately not part of the tightening: the operator's marker is a 2×2 block (a square, or a diamond when the client draws it rotated), so the gate stays "minimum 3 pixels, span ≥ 2, aspect 0.45–2.2, compactness ≥ 0.50" and only the colour range moved. The calibration is the operator's own picture of a map with nobody on it (`red_markder_missing.jpg`, a 150 %-scaled desktop capture): its reds are a magenta-red UI red of `(203, 0, 32)` and pinkish glyph reds of `(209, 29, 36)` and `(192, 5, 44)`, and the client's marker shades `(255, 0, 0)`, `(227, 0, 0)`, `(200, 0, 0)` and `(190, 20, 20)` all sit at 9.5× or more. Those false reds sit in marker-sized blobs (5×5 to 8×8 in that capture), so a size or aspect gate cannot separate them from a real marker without risking the marker itself; the shape model therefore stays untouched and the separation is made where the two populations are furthest apart — the red-to-blue ratio.
+- **A channel change is proven by the map, not by a timer.** `_wait_for_switch_reload()` treats the marker's absence for `OTHER_PLAYER_SWITCH_RELOAD_FRAMES` captures (the client's loading screen hides the whole minimap) followed by its return as the only success test. The old `_wait_for_switch_evidence()` wrapped that same signature in a twelve-second budget and additionally required four clean or two occupied captures before it answered, so a verdict came from elapsed time rather than from the map: the field log of 2026-10-03 shows three attempts on one channel all reporting "no loading screen" at 13 s each while the UI had already been committed to the target. The only remaining bound is a hang guard counted in fresh captures (`OTHER_PLAYER_SWITCH_RELOAD_IDLE_FRAMES`): a marker that never goes away means the change never started, and the same target is re-planned at once instead of after a spent budget.
+- **Committing the channel and asking whether the new channel is occupied are separate steps.** `_note_channel_landed()` commits to `user_config.json`, to the reconnect worker and to the 频道 field through the coordinator's `note_player_channel_landed()` immediately after the reload is proven and before the occupancy question, so the field follows a successful change whether or not somebody is on the new channel, and a route that never took the character off its channel never commits at all. `_wait_for_new_channel_occupancy()` then answers exactly one thing — switch on to the next channel of the route (two confirmed captures of a red marker) or resume patrol (four consecutive clean captures) — with the post-reload settle (`other_player_switch_settle_seconds`) giving the new map time to draw its markers.
+- **Ownership and exit.** The workflow runs on its own thread, stands the patrol down through the patrol controller, and injects keys only through the shared sender, so no stale held direction keeps the character walking while the menu keys are sent. A fresh patrol start cancels it (`reset_other_player_switch`) and Esc cancels it through `WorkflowCancelWorker`. A workflow that ends without a proven change leaves the patrol stopped; only a cleared mission (an empty channel reached, or the other player gone) hands it back. A failed attempt is re-planned from the channel the character is really on, so the same target is retried `OTHER_PLAYER_SWITCH_SAME_TARGET_ATTEMPTS` times before the route moves on.
+- **Timing is one presence window plus a configured wait, both in seconds.** `OTHER_PLAYER_INITIAL_PAUSE_SECONDS` (180 s) is the whole presence phase: the 求让消息 goes out at a random `OTHER_PLAYER_REQUEST_MIN_SECONDS`–`OTHER_PLAYER_REQUEST_MAX_SECONDS` (30–60 s) point inside it, and the workflow then watches only to the three-minute boundary, so a departure at any time ends it. The 多等 delay is the operator's own value in **real seconds** (`player_channel_wait_seconds`, 0–1200, default 300) — the unit that makes the 组队 hand-over work — and `OTHER_PLAYER_TIME_SCALE` (1.0 shipped) multiplies every duration in the workflow so a shortened field test changes one constant instead of the timing code. The UI stores seconds and migrates a pre-change `player_channel_wait_minutes` value by ×60 on load, so an old five-minute preference cannot silently become a five-second switch.
+- **A resumed patrol is prepared, never merely switched on.** After a proven change onto an empty channel the workflow asks the coordinator (`on_other_player_resume` → `prepare_patrol_after_other_player_channel()`) to re-run the reconnect map/layer preparation before `patrol_controller.set_enabled(True)`. A channel can spawn the character above the recorded range, and that preparation is what arms the existing above-route `drop-to-route` path from a fresh marker reading. If it cannot be completed, the patrol stays stopped with a warning instead of walking on stale route state; a cleared mission (the other player left, no switch needed) needs no preparation and hands patrol back directly.
+
 ### Automatic lie handling
 
 `api_lie_test.py` is the local client adapter. `autolie_api/` is vendor reference material and must remain unchanged.
@@ -258,7 +320,7 @@ At UI/application startup, `assistant.py` performs an inexpensive WebSocket endp
 
 ```text
 event start ── connect/setup in parallel ── 3 s visual settle
-            └──────────────────────────────► RTF1 frame uploads, at most 13 s
+            └──────────────────────────────► RTF1 frame uploads, at most 15 s
                                                 └► round_end + WebSocket close
 ```
 
@@ -280,11 +342,31 @@ When the pass ends, `ui_worker.py` focuses the game and uses `click_screen()` to
 
 `ui_worker.py` presents the Chinese desktop interface. It reads and writes only through configuration callbacks supplied by the coordinator. UI redraw work is deferred during resize/drag operations to avoid black component flashes and expensive intermediate layouts. `screen_blinker.py` owns click-through diagnostic overlays: crosshairs and all patrol-point symbols are painted on persistent native canvases, never into capture input.
 
+`HoverTooltip` is the shared, cursor-adjacent hover-message component. The
+alert selections use it to explain their visible effects, and the automatic-lie
+selection additionally explains its mouse ownership, Esc interruption, and
+accounting behavior. Tooltips have a shared maximum width and wrap only at that
+limit.
+
+Telegram setup is also UI-owned but delivery is isolated in
+`telegram_notifier.py`. A normal left click on **设备名称** opens a set/clear
+dialog; setting a bot token updates the button to **已设置**. The notifier uses
+the Windows system HTTP proxy first, then probes common local HTTP proxy ports,
+then attempts a direct connection. Its selected proxy is cached, invalidated,
+and detected again after a transport failure, so proxy configuration never
+blocks the UI or gameplay workers. The title-bar teaching viewer independently
+loads one JPG at a time from packaged `teach-assets/`; `build_release.ps1`
+copies that folder unchanged for both package formats.
+
 A diagnostic region is converted from captured-pixel coordinates to screen coordinates by `_capture_pixel_to_screen()`: scaling through the logical client rectangle is correct only while the captured bitmap matches it, and when the bitmap is DPI-virtualized (a different width/height) its pixels are already screen pixels relative to the capture origin. That conversion is display-only. The logical window rectangle that game input and the auto-lie cursor workflow use is never derived from it — changing the shared rectangle to fix an overlay was what made earlier builds unstable.
 
 Each recorded layer row carries an axis band whose point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳) opens only on a **right click**. Left-clicking never opens the menu; it remains reserved for normal selection behavior. The menu itself is refused while patrol runs, because recording is locked then.
 
 One optional control deliberately uses its own unit: the 捡东西 (stand-still pickup circuit) trigger interval is set in **minutes** (`每 … m`, 2.0m to 30.0m). The row converts before it publishes and after it loads, so `stationary_pickup_interval_seconds` and the movement worker’s own bounds stay in seconds; the interval is clamped to the same two minutes at the bottom and thirty at the top in both places, so a hand-edited configuration cannot schedule a sweep every few seconds. The random gap in that row remains a seconds control.
+
+The other-player 多等 delay is the mirror image of that rule: it is a **seconds** control (its validator accepts 0–1200 and `_normalized_player_channel_wait_seconds()` clamps to the same range), published as `player_channel_wait_seconds` and consumed by the movement worker in real seconds. A configuration written before the seconds UI stored whole minutes, so loading migrates it by ×60 rather than reading the old number as seconds — a stored five meant five minutes, and reading it as five seconds would have turned the operator's hand-over delay into a no-op. The field commits on blur and on an outside click, because clicking a label or a panel does not move Tk focus, and its hint text is rebuilt from the displayed value so the row never explains a different number than it shows.
+
+Combat panel state is applied in both directions. The 被撞反击 checkbox and its 攻击键 button live on the 巡逻攻击 row and publish `counterattack_enabled` / `counterattack_key` into `fixed_attack_settings.json`; the mode handler pushes them through `MovementWorker.set_counterattack()` for 巡逻攻击 and 站桩攻击 and clears them when no attack mode is active. The stationary-only lock is re-applied after a settings load and after an authorization unlock, because the generic unlock enables every product widget and previously left a saved 巡逻攻击 session exposing 跳打/朝向 controls until the operator switched modes once.
 
 Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`.
 
@@ -297,11 +379,14 @@ Personal settings are stored in `user_config.json`; application defaults are sto
 | `user_config.json` | UI/config callbacks | User choices, keys, patrol layers, message list, alerts. |
 | `system_config.json` | Application defaults | Internal defaults and non-personal settings. |
 | `hotkey.json` | Hotkey worker | Ordered hotkey bindings. |
+| `fixed_attack_settings.json` | UI / fixed-attack panel | Interval, attack key, combo slots, 跳打/小碎步/朝向, 被撞反击 enable + key. |
 | `work/` | Runtime workers | Recoverable patrol/timer/session state. |
+| `lie_accounting_pending.json` | `lie_accounting.py` | Durable auto-lie event outbox: one row per unresolved `started`/terminal report. |
 | `error.log` | Error reporting | Critical unexpected-error record. |
 | `server_client.log` | Licensing transport | Safe activation connection, pin, HTTP, and local verification events; never secrets. |
 | `assistant-launch-error.log` | `startup_probe.py` | Hidden-launch failures, including the missing dependency that triggered the automatic install. |
 | `assistant-launch-status.log` | `startup_probe.py` | Launcher milestones: probe reached, repair started/finished, normal exit. |
+| `teach-assets/` | UI teaching viewer | Shipped JPG pages, loaded one at a time in natural filename order; copied unchanged into both packages. |
 | `autolie_api/` | Vendor | Reference protocol implementation; read-only. |
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.

@@ -9,6 +9,7 @@ the sender remains responsible for checking/focusing the configured window.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field, replace
 import json
 import logging
@@ -46,9 +47,10 @@ from game_chat import send_game_chat_message
 LOG = logging.getLogger(__name__)
 
 OTHER_PLAYER_INITIAL_PAUSE_SECONDS = 180.0
-OTHER_PLAYER_REQUEST_MIN_SECONDS = 60.0
-OTHER_PLAYER_REQUEST_MAX_SECONDS = 180.0
-OTHER_PLAYER_MONITOR_SECONDS = 180.0
+# The request occurs inside one total three-minute presence window: 30--60
+# seconds after detection, then wait only until that three-minute boundary.
+OTHER_PLAYER_REQUEST_MIN_SECONDS = 30.0
+OTHER_PLAYER_REQUEST_MAX_SECONDS = 60.0
 OTHER_PLAYER_PRESENCE_POLL_SECONDS = 1.0
 # A red diamond can be missed for a single frame (the other player walks behind
 # a platform, the diamond is clipped by the minimap edge, one capture is late).
@@ -64,21 +66,32 @@ OTHER_PLAYER_TRIGGER_CONFIRM_FRAMES = 2
 # A channel change counts as successful only when the other players' red diamonds
 # are gone from this many CONSECUTIVE fresh captures.  The operator's reason: a
 # monster can hit the character during the change, so "the menu keys were sent"
-# is not evidence that the channel really changed.  When the marker is still
-# there, the workflow switches to the next channel of the route instead.
+# is not evidence that the channel really changed.  This is now the OCCUPANCY
+# question asked AFTER a proven change (keep switching, or resume patrol), never
+# the proof that the change happened.
 OTHER_PLAYER_SWITCH_CLEAN_FRAMES = 4
-# The channel-change signature: the client shows its loading screen (the minimap
-# and the character's marker go away entirely) for one to two seconds, then the
-# marker comes back on the new channel.  That is what proves the change really
-# happened - a route whose keys were swallowed shows no such stretch.
+# The channel-change signature, and the ONLY success test: the client's loading
+# screen takes the map - and with it the player's own yellow marker - away for a
+# moment, and the marker comes back on the new channel.  The operator's rule:
+# "if now check if the marker is missing (proves switching) then reshow (proves
+# success switching)".  The old build wrapped this in a 12-second evidence budget
+# that had to see the reload plus four clean or two occupied captures before it
+# answered, and the field log of 2026-10-03 shows what that cost: three attempts
+# on channel 41 all reported "no loading screen ... the character never left
+# channel 29" while the UI had already been committed to 41, so the run spent
+# 13 s per attempt and never switched at all.
 OTHER_PLAYER_SWITCH_RELOAD_FRAMES = 2
+# Hang guard, not evidence: a marker that is still visible for this many fresh
+# captures after the route means the change never started (a swallowed key), so
+# the same target is planned again.  A real loading screen hides the marker
+# within a second, so this only ends a wait that would otherwise never end.
+OTHER_PLAYER_SWITCH_RELOAD_IDLE_FRAMES = 25
 # Two confirmed captures of another player's marker on the NEW channel before the
 # workflow moves on (one frame can be a clipped or partial detection).
 OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES = 2
-# How long the post-switch evidence may take: the operator measures a 1-2 s black
-# screen, plus the map load, plus four clean captures, so the budget must be
-# comfortably longer than the loading itself.
-OTHER_PLAYER_SWITCH_VERIFY_SECONDS = 12.0
+# The new channel has to draw its map before other players' markers can be seen,
+# so the occupancy question gets its own short window after a proven change.
+OTHER_PLAYER_SWITCH_OCCUPANCY_SECONDS = 4.0
 # A failed attempt does NOT mean the character moved: the operator's own case is
 # "channel12 + 房间码 -> hash -> 35" not happening at all, so the character is
 # still on 12 and the SAME plan (12 -> 35) must be run again.  The landed channel
@@ -97,17 +110,13 @@ OTHER_PLAYER_ESC_IGNORE_SECONDS = 0.5
 OTHER_PLAYER_ESC_POLL_SECONDS = 0.05
 VK_ESCAPE = 0x1B
 
-# Every DURATION in ``_run_other_player_switch`` (the quiet request window, the
-# initial pause, the departure monitor and the 换线等待 timer) is multiplied by
+# Every DURATION in ``_run_other_player_switch`` (the request/presence window
+# and the 多等 timer) is multiplied by
 # this factor, so the real timings live in the constants above and a shortened
 # field test only changes this one value.
 #
-#   1.0  = shipping behaviour (request in 1-3 min, pause 3 min, monitor 3 min,
-#          换线等待 in real minutes) - restored after the 2026-10 field test
-#   0.03 = the shortened field-test value used while "检测到其他玩家自动切换频道"
-#          was being fixed (request 1.8-5.4 s, pause 5.4 s, monitor 5.4 s,
-#          换线等待 as minutes x 1.8 s: the default 5 becomes 9 s, so the channel
-#          change is reached in about 20 s)
+#   1.0  = shipping behaviour (request in 30-60 s, total presence window 3 min,
+#          then 多等 in configured real seconds).
 #
 # The trigger log prints the effective seconds, so a field run always shows
 # which timings were actually used.
@@ -363,6 +372,11 @@ ENDPOINT_ARRIVAL_NEAR_MARGIN = 4.0
 # self-rescue restarts the whole patrol.  A real walk always CLOSES the
 # distance, so only a frame run without progress counts.
 ENDPOINT_NO_PROGRESS_FRAMES = 38
+
+# 被撞反击 is a turn/reaction, not a patrol walk.  It stays short and is
+# executed by MotionArbiter so it never overlaps attack, jump, buff, or climb.
+COUNTERATTACK_STEP_HOLD_SECONDS = 0.10
+COUNTERATTACK_X_DIRECTION_MIN_DELTA = 0.003
 
 
 class KeySender(Protocol):
@@ -3090,6 +3104,35 @@ class MovementWorker(threading.Thread):
             return False
         if decision.key not in ("left", "right"):
             return _send_tap(self.key_sender, decision)
+        # A fixed-attack beat can already be in Maple's animation window on
+        # the frame where 站桩 recovery first discovers that the character is
+        # outside its final approach zone.  If Left/Right is sent during that
+        # window, Maple may consume it as part of the attack animation.  The
+        # hold manager then quite reasonably believes the key is down and
+        # merely extends that invisible hold on each fresh minimap frame,
+        # leaving the character frozen while every later attack is blocked by
+        # the return event.  The event set by the movement loop prevents a
+        # *new* attack; wait only for the one that was already in flight, then
+        # issue the first normal return walk on a clean input tick.
+        if (self.stationary_attack_enabled
+                and decision.reason
+                == "stationary return walking to final approach zone"):
+            attack_motion_active = getattr(
+                self.motion_arbiter, "attack_motion_active", None
+            )
+            if callable(attack_motion_active) and attack_motion_active():
+                deadline = time.monotonic() + 1.0
+                while (attack_motion_active()
+                       and time.monotonic() < deadline):
+                    if not self._wait_for_patrol_motion(0.02):
+                        return False
+                if attack_motion_active():
+                    LOG.info(
+                        "stationary return walk waiting for active attack "
+                        "to finish before %s",
+                        decision.key,
+                    )
+                    return False
         if not _sender_is_safe(self.key_sender):
             LOG.warning("movement suppressed: target window is not safely selected")
             return False
@@ -3366,10 +3409,11 @@ class MovementWorker(threading.Thread):
         other_player_switch_settle_seconds: float = 1.0,
         other_player_request_message: str = "",
         other_player_room_code: str = "",
-        other_player_wait_minutes: float = 5.0,
+        other_player_wait_seconds: float = 300.0,
         current_channel: int = 1,
         on_channel_landed: Any = None,
         on_other_player_stop: Any = None,
+        on_other_player_resume: Any = None,
         status_state_path: Optional[str] = None,
         drug_settings_path: Optional[str] = None,
         stair_jump_enabled: bool = True,
@@ -3877,9 +3921,15 @@ class MovementWorker(threading.Thread):
         )
         self._other_player_request_message = str(other_player_request_message).strip()
         self._other_player_room_code = str(other_player_room_code or "").strip()[:128]
-        self._other_player_wait_minutes = max(1.0, min(20.0, float(other_player_wait_minutes)))
+        self._other_player_wait_seconds = max(
+            0.0, min(1200.0, float(other_player_wait_seconds))
+        )
         self._current_channel = normalize_channel(current_channel)
         self._on_channel_landed = on_channel_landed
+        # The coordinator performs a fresh map/layer session after a clean
+        # landing.  It can therefore use the normal above-route drop logic
+        # before this worker re-enables patrol movement.
+        self._on_other_player_resume = on_other_player_resume
         self._other_player_settings_lock = threading.RLock()
         # Shared state paths (overridable for tests): the StatusWorker's
         # HP/MP state file and the Drug panel's settings file.
@@ -3963,6 +4013,14 @@ class MovementWorker(threading.Thread):
         self._drop_relaxed_floor: Optional[str] = None
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
+        # StatusWorker reports a confirmed HP decrease with the shared capture
+        # sequence.  The small sequence-indexed marker window lets us decide
+        # direction from that SAME capture moment rather than whichever X
+        # happens to be current when the status thread catches up.
+        self.counterattack_enabled = False
+        self.counterattack_key = "ctrl"
+        self._counterattack_marker_window: deque[tuple[int, float]] = deque(maxlen=12)
+        self._counterattack_events: "queue.Queue[tuple[int, int, int]]" = queue.Queue(maxsize=8)
         self._last_send = 0.0
         self._aligned_frames = 0
         self._last_climb_attempt = float("-inf")
@@ -4939,7 +4997,7 @@ class MovementWorker(threading.Thread):
 
         self._other_player_check_enabled = bool(enabled)
         if not enabled:
-            self.reset_other_player_switch("the 检测到其他玩家自动切换频道 field was switched off")
+            self.reset_other_player_switch("the 有人换线 field was switched off")
         LOG.info("other-player channel switch: %s",
                  "on" if enabled else "off")
 
@@ -4949,7 +5007,7 @@ class MovementWorker(threading.Thread):
         self._other_player_request_message = str(message or "").strip()[:500]
 
     def set_other_player_channel_routing(
-        self, *, room_code: object = "", wait_minutes: object = 5.0,
+        self, *, room_code: object = "", wait_seconds: object = 300.0,
         current_channel: object = None, on_channel_landed: Any = None,
     ) -> None:
         """Apply persisted routing state without coupling this worker to Tk/config."""
@@ -4957,10 +5015,10 @@ class MovementWorker(threading.Thread):
         with self._other_player_settings_lock:
             self._other_player_room_code = str(room_code or "").strip()[:128]
             try:
-                minutes = float(wait_minutes)
+                seconds = float(wait_seconds)
             except (TypeError, ValueError):
-                minutes = 5.0
-            self._other_player_wait_minutes = max(1.0, min(20.0, minutes))
+                seconds = 300.0
+            self._other_player_wait_seconds = max(0.0, min(1200.0, seconds))
             if current_channel is not None:
                 self._current_channel = normalize_channel(current_channel)
             if on_channel_landed is not None:
@@ -4970,13 +5028,18 @@ class MovementWorker(threading.Thread):
         with self._other_player_settings_lock:
             return (
                 self._other_player_room_code,
-                self._other_player_wait_minutes,
+                self._other_player_wait_seconds,
                 self._current_channel,
                 self._on_channel_landed,
             )
 
     def _note_channel_landed(self, channel: int) -> None:
-        """Commit a fully sent channel route and notify the owning coordinator."""
+        """Commit a PROVEN channel change and notify the owning coordinator.
+
+        Called only once the map has reloaded onto ``channel`` (the marker left
+        and came back).  A route whose keys were swallowed never reaches this, so
+        the UI field cannot show a channel the character is not on.
+        """
 
         with self._other_player_settings_lock:
             self._current_channel = normalize_channel(channel)
@@ -5123,7 +5186,7 @@ class MovementWorker(threading.Thread):
             self._other_player_esc_logged = True
             LOG.warning(
                 "other-player workflow: manual Esc pressed; stopping the "
-                "procedure, clearing the 检测到其他玩家自动切换频道 selection "
+                "procedure, clearing the 有人换线 selection "
                 "(patrol stays stopped - press Start Patrol to resume)"
             )
         with self._other_player_settings_lock:
@@ -5178,78 +5241,102 @@ class MovementWorker(threading.Thread):
         observation = getattr(self, "last_observation", None)
         return getattr(observation, "player", None) is not None
 
-    def _wait_for_switch_evidence(self, seconds: float) -> str:
-        """What the frames after a channel route prove about the new channel.
+    def _wait_for_switch_reload(self) -> str:
+        """Wait for the channel change's own signature: marker gone, then back.
 
         The operator's definition of a successful change: "switching -> screen
-        black for 1s-2s then marker showed, success switch; if success switch and
-        this new channel have no red diamond then this is an empty channel,
-        resume patrol; if not keep switching".
+        black for 1s-2s then marker showed, success switch".  The player's own
+        yellow marker is what proves it, because the client hides the whole map
+        (and with it the marker) while the new channel loads:
 
-        Three answers, and only fresh captures whose own yellow marker was found
-        count as evidence (a covered minimap shows no red diamond either):
-
-        * ``"clean"`` - the map went black/away for
-          ``OTHER_PLAYER_SWITCH_RELOAD_FRAMES`` captures (the loading screen),
-          came back, and then showed no other player's marker for
-          ``OTHER_PLAYER_SWITCH_CLEAN_FRAMES`` consecutive captures: an empty
-          channel, so patrol resumes;
-        * ``"occupied"`` - the map reloaded (the change happened) but another
-          player's marker stayed for ``OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES``
-          captures: keep switching;
-        * ``"no-change"`` - no reload was ever seen inside the budget, so the
-          character never left its channel (a monster hit, a swallowed key):
-          plan the same target again.
+        * ``"reloaded"`` - the marker was absent for
+          ``OTHER_PLAYER_SWITCH_RELOAD_FRAMES`` captures (the loading screen) and
+          then came back: the character really is on the new channel.  This is
+          the ONLY success test; whether the new channel is empty is asked
+          separately by ``_wait_for_new_channel_occupancy``;
+        * ``"no-change"`` - the marker never went away: the route's keys were
+          swallowed (a monster hit, a closed menu), so the character never left
+          its channel and the same target is planned again.  This is a hang guard
+          measured in fresh captures, not an evidence budget;
+        * ``"ended"`` - the workflow was cancelled (a fresh patrol start, a
+          manual Esc) while waiting.
         """
 
-        deadline = time.monotonic() + max(0.0, float(seconds))
         last_frame = None
         absent_run = 0
+        visible_run = 0
         reload_seen = False
-        clean_run = 0
-        occupied_run = 0
-        occupied_seen = False
         while not self._other_player_switch_must_end():
             frame = getattr(self, "_last_frame", None)
             if frame is not None and frame is not last_frame:
                 last_frame = frame
                 if not self._player_marker_visible():
-                    # Black loading screen (or a menu covering the map): no
-                    # evidence about other players, but several such captures in
-                    # a row are the channel-change signature.
+                    # A covered minimap: no evidence about other players, but
+                    # several such captures in a row are the change's signature.
+                    visible_run = 0
                     absent_run += 1
                     if absent_run >= OTHER_PLAYER_SWITCH_RELOAD_FRAMES and not reload_seen:
                         reload_seen = True
                         LOG.info(
                             "player channel switch: the map went away for %d "
-                            "captures (loading screen); waiting for the marker",
+                            "capture(s) - the channel change is in progress; "
+                            "waiting for the marker to come back",
                             absent_run,
                         )
-                    clean_run = 0
-                    occupied_run = 0
                 else:
                     absent_run = 0
                     if reload_seen:
-                        if self._other_players_on_latest_frame() == 0:
-                            occupied_run = 0
-                            clean_run += 1
-                            if clean_run >= OTHER_PLAYER_SWITCH_CLEAN_FRAMES:
-                                return "clean"
-                        else:
-                            clean_run = 0
-                            occupied_seen = True
-                            occupied_run += 1
-                            if occupied_run >= OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES:
-                                return "occupied"
+                        LOG.info(
+                            "player channel switch: the marker is back on the "
+                            "new channel - the change succeeded"
+                        )
+                        return "reloaded"
+                    visible_run += 1
+                    if visible_run >= OTHER_PLAYER_SWITCH_RELOAD_IDLE_FRAMES:
+                        return "no-change"
+            self._other_player_switch_cancel.wait(OTHER_PLAYER_ESC_POLL_SECONDS)
+        return "ended"
+
+    def _wait_for_new_channel_occupancy(self) -> bool:
+        """Whether the channel the character just reached has another player.
+
+        Asked only after the change is already proven, so the answer decides one
+        thing: keep switching to the next channel of the route (``True``) or
+        resume patrol on an empty channel (``False``).  The new channel's map
+        needs a moment to draw its markers, hence the short window; running out
+        of it answers with what was actually seen.  It never gates the channel
+        commit - the operator's rule is that the field follows a successful
+        change whether or not somebody is there.
+        """
+
+        deadline = time.monotonic() + OTHER_PLAYER_SWITCH_OCCUPANCY_SECONDS
+        last_frame = None
+        occupied_run = 0
+        clean_run = 0
+        occupied_seen = False
+        while not self._other_player_switch_must_end():
+            frame = getattr(self, "_last_frame", None)
+            if frame is not None and frame is not last_frame:
+                last_frame = frame
+                if self._player_marker_visible():
+                    if self._other_players_on_latest_frame() > 0:
+                        clean_run = 0
+                        occupied_run += 1
+                        occupied_seen = True
+                        if occupied_run >= OTHER_PLAYER_SWITCH_OCCUPIED_FRAMES:
+                            return True
+                    else:
+                        occupied_run = 0
+                        clean_run += 1
+                        if clean_run >= OTHER_PLAYER_SWITCH_CLEAN_FRAMES:
+                            return False
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
             self._other_player_switch_cancel.wait(
                 min(OTHER_PLAYER_ESC_POLL_SECONDS, remaining)
             )
-        if not reload_seen:
-            return "no-change"
-        return "occupied" if occupied_seen else "clean"
+        return occupied_seen
 
     def _other_player_present(self, seconds: float = 1.0) -> bool:
         """Whether another player is on the minimap right now.
@@ -5288,7 +5375,7 @@ class MovementWorker(threading.Thread):
         before the switch used to run blind for its whole window, so a player who
         left during it still received the 求让消息 and the rest of the ceremony -
         the operator's "there's no other player now, however the 求让消息 is
-        sent".  The 换线等待 after the monitor deliberately keeps its old rule
+        sent".  The 多等 period after the monitor deliberately keeps its old rule
         (once it starts, a disappearance does not revoke the decision).
         """
 
@@ -5484,9 +5571,9 @@ class MovementWorker(threading.Thread):
                 # Clearing the movement state is what stops the character
                 # instead of leaving it walking the direction it held.
                 self._stop_patrol_for_other_player_switch()
-            # The quiet pause is three minutes as shipped, and the request is
-            # one non-repeating message at a random instant in its final two
-            # minutes, so no UI or routing decision leaks in here.
+            # One three-minute presence window: request at a random 30--60s
+            # point, then continue watching only until the three-minute
+            # boundary.  A departure at any point ends the workflow.
             # ``OTHER_PLAYER_TIME_SCALE`` multiplies every duration in this
             # workflow; it is 1.0 in a shipped build and is currently shortened
             # for the operator's own test.
@@ -5495,13 +5582,11 @@ class MovementWorker(threading.Thread):
             ) * OTHER_PLAYER_TIME_SCALE
             LOG.warning(
                 "other-player workflow timings (time scale %.2f): request in "
-                "%.1fs, quiet pause %.1fs total, departure monitor %.1fs, "
-                "换线等待 %.1fs per configured minute",
+                "%.1fs, presence window %.1fs total, "
+                "多等 uses configured seconds",
                 OTHER_PLAYER_TIME_SCALE,
                 request_after,
                 OTHER_PLAYER_INITIAL_PAUSE_SECONDS * OTHER_PLAYER_TIME_SCALE,
-                OTHER_PLAYER_MONITOR_SECONDS * OTHER_PLAYER_TIME_SCALE,
-                60.0 * OTHER_PLAYER_TIME_SCALE,
             )
             # Neither the quiet pause nor the message may run blind: the operator's
             # "there's no other player now, however the 求让消息 is sent and the
@@ -5538,23 +5623,12 @@ class MovementWorker(threading.Thread):
             if outcome == "departed":
                 nothing_to_do = True
                 return
-            monitor_seconds = OTHER_PLAYER_MONITOR_SECONDS * OTHER_PLAYER_TIME_SCALE
-            LOG.info("other-player request pause complete; monitoring for %.0fs",
-                     monitor_seconds)
-            departed = self._wait_for_player_departure(monitor_seconds)
-            if self._other_player_switch_must_end():
-                abandoned = True
-                return
-            if departed:
-                LOG.warning("other player left during the monitor window; resuming patrol")
-                nothing_to_do = True
-                return
-            room_code, wait_minutes, _channel, _callback = self._other_player_routing_snapshot()
-            wait_seconds = wait_minutes * 60.0 * OTHER_PLAYER_TIME_SCALE
+            room_code, configured_wait_seconds, _channel, _callback = self._other_player_routing_snapshot()
+            wait_seconds = configured_wait_seconds * OTHER_PLAYER_TIME_SCALE
             LOG.warning(
-                "other player remained for the monitor window; waiting %.1f minute(s) "
+                "other player remained for the three-minute presence window; waiting %.1fs "
                 "before channel switch (%.1fs with test scale %.2f)",
-                wait_minutes, wait_seconds, OTHER_PLAYER_TIME_SCALE,
+                configured_wait_seconds, wait_seconds, OTHER_PLAYER_TIME_SCALE,
             )
             # Once this wait begins, disappearance does not revoke the switch
             # decision. This matches the operator's "keep change too" rule.
@@ -5562,14 +5636,16 @@ class MovementWorker(threading.Thread):
                 abandoned = True
                 return
             attempts = 0
-            # The channel the character is REALLY on is only known after a
-            # verified switch, so it is held here and committed (see
-            # ``_note_channel_landed``) after the verification passes.  A failed
-            # attempt therefore re-plans from the same channel and produces the
-            # same target again - the operator's own case: "channel12 + 房间码 ->
-            # hash -> 35", and when it fails the character is still on 12, so the
-            # plan 12 -> 35 is run again instead of moving on to 35's successor.
-            room_code, _wait_minutes, current_channel, _callback = (
+            # The channel the character is REALLY on is only known after the map
+            # has reloaded on it, so it is held here and committed (see
+            # ``_note_channel_landed``) once the missing-then-back marker
+            # signature proves the change.  An attempt that never took the
+            # character off its channel therefore re-plans from the same channel
+            # and produces the same target again - the operator's own case:
+            # "channel12 + 房间码 -> hash -> 35", and when it fails the character
+            # is still on 12, so the plan 12 -> 35 is run again instead of moving
+            # on to 35's successor.
+            room_code, _configured_wait_seconds, current_channel, _callback = (
                 self._other_player_routing_snapshot()
             )
             target_channel = choose_next_channel(current_channel, room_code)
@@ -5626,52 +5702,58 @@ class MovementWorker(threading.Thread):
                         failed_keys[-1] if failed_keys else "?",
                     )
                     break
-                # A fully sent route IS a channel change, and the number shown on
-                # the UI must follow it - the operator's "the channel changed on
-                # UI too with a successful changing (there may be a new other
-                # player, but a success change)".  Whether the new channel is
-                # CLEAN is a separate question, answered by the verification
-                # below, and only that answer decides the next plan.
-                self._note_channel_landed(route.target)
-                if self._other_player_pause(self.other_player_switch_settle_seconds):
-                    abandoned = True
-                    return
                 # The channel change is proven by the client's own loading
-                # screen: the map goes away for a moment and the marker comes
-                # back on the new channel.  Only then does the marker's presence
-                # or absence mean anything, and only after a reload is the change
-                # treated as done - the operator's "screen black for 1s-2s then
-                # marker showed, success switch".
-                evidence = self._wait_for_switch_evidence(
-                    OTHER_PLAYER_SWITCH_VERIFY_SECONDS
-                )
-                if self._other_player_switch_must_end():
+                # screen: the map (and with it the player's own yellow marker)
+                # goes away, then the marker comes back on the new channel.  The
+                # operator's rule is exactly that - missing proves the switch,
+                # reshow proves it succeeded - so nothing else gates the commit.
+                outcome = self._wait_for_switch_reload()
+                if outcome == "ended":
                     abandoned = True
                     return
-                if evidence == "clean":
+                if outcome == "reloaded":
+                    # A PROVEN change commits the channel and the UI field right
+                    # away, whether or not the new channel has another player:
+                    # "it should change as soon as a success switching is done
+                    # (no matter there is other player or not)".  The old build
+                    # committed on a merely SENT route, so the field showed the
+                    # target channel while the character was still on the old one
+                    # (the field log's 11:23 attempts all reported "no loading
+                    # screen" and still committed 41).
+                    self._note_channel_landed(route.target)
                     current_channel = route.target
+                    failures_on_target = 0
+                    # Let the new channel finish drawing its map before asking
+                    # whether somebody is on it.  This settle is the only thing
+                    # the knob is used for now; the change itself is already
+                    # proven by the reload above.
+                    if self._other_player_pause(self.other_player_switch_settle_seconds):
+                        abandoned = True
+                        return
+                    if self._other_player_switch_must_end():
+                        abandoned = True
+                        return
+                    if self._wait_for_new_channel_occupancy():
+                        # The change happened; the new channel is simply
+                        # occupied, so the next channel of the route is tried
+                        # from here.
+                        LOG.warning(
+                            "player channel switch %d reached channel %d, but "
+                            "another player is there; switching on",
+                            attempts, route.target,
+                        )
+                        target_channel = choose_next_channel(route.target, room_code)
+                        continue
                     succeeded = True
                     LOG.warning(
-                        "player channel switch %d done: the map reloaded and "
-                        "channel %d has no other player; resuming patrol",
+                        "player channel switch %d done: the map reloaded onto "
+                        "channel %d and it has no other player; resuming patrol",
                         attempts, route.target,
                     )
                     break
-                if evidence == "occupied":
-                    # The change happened; the new channel is simply occupied, so
-                    # the next channel of the route is tried from here.
-                    current_channel = route.target
-                    failures_on_target = 0
-                    LOG.warning(
-                        "player channel switch %d reached channel %d, but another "
-                        "player is there; switching on",
-                        attempts, route.target,
-                    )
-                    target_channel = choose_next_channel(route.target, room_code)
-                    continue
-                # "no-change": no loading screen followed the route, so the
-                # character never left its channel (a monster hit, or a swallowed
-                # key).  The landing number is already shown, and the plan is run
+                # "no-change": the marker never went away, so the character never
+                # left its channel (a monster hit, or a swallowed key).  The UI
+                # field is deliberately NOT committed here, and the plan is run
                 # again from the channel the character is really on.
                 failures_on_target += 1
                 if failures_on_target >= OTHER_PLAYER_SWITCH_SAME_TARGET_ATTEMPTS:
@@ -5687,8 +5769,8 @@ class MovementWorker(threading.Thread):
                     failures_on_target = 0
                 else:
                     LOG.warning(
-                        "switch attempt %d showed no loading screen: the character "
-                        "never left channel %d, so %d -> %d is planned again",
+                        "switch attempt %d never left channel %d (the marker "
+                        "stayed visible); %d -> %d is planned again",
                         attempts, current_channel, current_channel, target_channel,
                     )
         except Exception:
@@ -5710,16 +5792,39 @@ class MovementWorker(threading.Thread):
                     "over (patrol state left to the operator)"
                 )
             if owns_patrol and (succeeded or nothing_to_do) and self.patrol_controller is not None:
-                self.patrol_controller.set_enabled(True)
-                # This workflow invalidated delayed movement when it took the
-                # patrol; handing it back means a fresh, armed session.
-                self.arm_patrol_input("other-player switch handed patrol back")
-                LOG.warning(
-                    "other-player switch: %s; patrol resumed",
-                    "an empty channel was found"
-                    if succeeded else
-                    "the other player left, so no switch was needed",
-                )
+                resume_ready = True
+                if succeeded:
+                    # A clean channel can place the character above the
+                    # route.  Do not resume ordinary walking until the
+                    # coordinator has created a fresh layer session; that
+                    # session reuses reconnect's above-route drop state.
+                    callback = self._on_other_player_resume
+                    if callable(callback):
+                        try:
+                            resume_ready = callback() is not False
+                        except Exception:
+                            LOG.warning(
+                                "other-player channel resume preparation failed",
+                                exc_info=True,
+                            )
+                            resume_ready = False
+                if not resume_ready:
+                    LOG.warning(
+                        "other-player switch found a clean channel, but the "
+                        "fresh map/layer session was unavailable; patrol stays "
+                        "stopped instead of walking with stale route state"
+                    )
+                else:
+                    self.patrol_controller.set_enabled(True)
+                    # This workflow invalidated delayed movement when it took the
+                    # patrol; handing it back means a fresh, armed session.
+                    self.arm_patrol_input("other-player switch handed patrol back")
+                    LOG.warning(
+                        "other-player switch: %s; patrol resumed",
+                        "an empty channel was found"
+                        if succeeded else
+                        "the other player left, so no switch was needed",
+                    )
             elif owns_patrol and self.patrol_controller is not None:
                 # The operator's rule: "the character doesn't even start patrol
                 # when the mission is cleared - it should start only when the
@@ -11130,6 +11235,135 @@ class MovementWorker(threading.Thread):
             and decision is not None
             and decision.key in ("left", "right")
         )
+
+    def set_counterattack(self, enabled: bool, key: str) -> None:
+        """Apply the independent 被撞反击 UI configuration."""
+
+        value = str(key).strip().casefold()
+        self.counterattack_enabled = bool(enabled and value and value != "-")
+        self.counterattack_key = value or "ctrl"
+        LOG.info(
+            "被撞反击 %s key=%s",
+            "enabled" if self.counterattack_enabled else "disabled",
+            self.counterattack_key,
+        )
+
+    def notify_hp_drop(
+        self, previous_hp: int, current_hp: int, frame_sequence: int = -1,
+    ) -> None:
+        """Record an HP decrease for its matching capture-frame X window.
+
+        Status and minimap analysis run independently, so this never reads a
+        potentially later ``last_observation``.  The movement loop consumes it
+        only after it has retained the marker X for the same frame sequence.
+        """
+
+        if not self.counterattack_enabled or not self._patrol_input_allowed():
+            return
+        if frame_sequence < 0:
+            return
+        try:
+            self._counterattack_events.put_nowait(
+                (int(frame_sequence), int(previous_hp), int(current_hp))
+            )
+        except queue.Full:
+            # Keep only fresh hit reactions; an old one must never walk later.
+            try:
+                self._counterattack_events.get_nowait()
+                self._counterattack_events.put_nowait(
+                    (int(frame_sequence), int(previous_hp), int(current_hp))
+                )
+            except queue.Empty:
+                pass
+
+    def _consume_counterattack_events(self) -> None:
+        """Queue reactions whose exact HP-drop frame has a marker pair."""
+
+        while True:
+            try:
+                frame_sequence, previous_hp, current_hp = (
+                    self._counterattack_events.get_nowait()
+                )
+            except queue.Empty:
+                return
+            try:
+                if self._movement_busy_now():
+                    LOG.info("被撞反击 skipped: vertical recovery is active")
+                    continue
+                samples = list(self._counterattack_marker_window)
+                matching_index = next(
+                    (index for index, (sequence, _x) in enumerate(samples)
+                     if sequence == frame_sequence),
+                    None,
+                )
+                if matching_index is None or matching_index == 0:
+                    LOG.info(
+                        "被撞反击 skipped: no matching minimap X window for frame %d",
+                        frame_sequence,
+                    )
+                    continue
+                previous_x = samples[matching_index - 1][1]
+                current_x = samples[matching_index][1]
+                delta_x = float(current_x) - float(previous_x)
+                if abs(delta_x) < COUNTERATTACK_X_DIRECTION_MIN_DELTA:
+                    LOG.info(
+                        "被撞反击 skipped: HP %d->%d frame=%d X direction unclear (Δx=%+.6f)",
+                        previous_hp, current_hp, frame_sequence, delta_x,
+                    )
+                    continue
+                direction = "left" if delta_x > 0 else "right"
+                request = getattr(self.motion_arbiter, "request_counterattack", None)
+                if callable(request) and request(direction, self.counterattack_key):
+                    LOG.info(
+                        "被撞反击 queued: HP %d->%d frame=%d X %+.6f -> %s + %s",
+                        previous_hp, current_hp, frame_sequence, delta_x,
+                        direction, self.counterattack_key,
+                    )
+            finally:
+                try:
+                    self._counterattack_events.task_done()
+                except ValueError:
+                    pass
+
+    def perform_counterattack(self, direction: str, attack_key: str) -> bool:
+        """Arbiter callback: step away from the hit, then tap its own key."""
+
+        direction = str(direction).casefold()
+        attack_key = str(attack_key).casefold()
+        if (direction not in ("left", "right")
+                or not attack_key
+                or not self.counterattack_enabled
+                or not self._patrol_input_allowed()
+                or self._movement_busy_now()
+                or not _sender_is_safe(self.key_sender)):
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        tap = getattr(self.key_sender, "tap", None)
+        if not callable(key_down) or not callable(key_up) or not callable(tap):
+            return False
+        with self._direction_lock, self._hold_lock:
+            if not self._patrol_input_allowed() or self._movement_busy_now():
+                return False
+            self._release_walk_hold()
+            if key_down(direction) is False:
+                return False
+            try:
+                if not self._wait_for_patrol_motion(COUNTERATTACK_STEP_HOLD_SECONDS):
+                    return False
+            finally:
+                key_up(direction)
+            if not self._patrol_input_allowed() or tap(attack_key) is False:
+                return False
+            self._patrol_facing = direction
+            note_attack = getattr(self.motion_arbiter, "note_attack", None)
+            if callable(note_attack):
+                note_attack()
+        LOG.info(
+            "被撞反击 executed: %s %.2fs + %s", direction,
+            COUNTERATTACK_STEP_HOLD_SECONDS, attack_key,
+        )
+        return True
         self._climb_state = ClimbState()
         if self.pickup_active_event is not None:
             self.pickup_active_event.clear()
@@ -12209,6 +12443,11 @@ class MovementWorker(threading.Thread):
                 else:
                     self._motion_arbiter_stage = None
                 self.last_observation, self.last_decision = observation, decision
+                if observation.player is not None:
+                    self._counterattack_marker_window.append(
+                        (int(getattr(frame, "sequence", -1)), float(observation.player.x))
+                    )
+                self._consume_counterattack_events()
                 if observation.player is not None:
                     gap = ((active_target_x - observation.player.x)
                            if active_target_x is not None else None)

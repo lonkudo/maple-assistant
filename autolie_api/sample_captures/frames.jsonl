@@ -1,0 +1,12 @@
+{"file": "frame_0001_fid1.jpg", "sent_fid": 1, "recv_fid": 1, "roi": [206.4516129032258, 157.51732696278785], "decision": "track", "pending": false}
+{"file": "frame_0002_fid2.jpg", "sent_fid": 2, "recv_fid": 0, "roi": [206.4516129032258, 157.51732696278785], "decision": "hold_prev", "pending": true}
+{"file": "frame_0003_fid3.jpg", "sent_fid": 3, "recv_fid": 2, "roi": [219.3548387096774, 160.47934533715699], "decision": "track", "pending": false}
+{"file": "frame_0004_fid4.jpg", "sent_fid": 4, "recv_fid": 3, "roi": [225.8064516129032, 162.41841755067173], "decision": "track", "pending": false}
+{"file": "frame_0005_fid5.jpg", "sent_fid": 5, "recv_fid": 4, "roi": [232.25806451612902, 163.02840673714908], "decision": "track", "pending": false}
+{"file": "frame_0006_fid6.jpg", "sent_fid": 6, "recv_fid": 5, "roi": [238.70967741935482, 162.21300901649005], "decision": "track", "pending": false}
+{"file": "frame_0007_fid7.jpg", "sent_fid": 7, "recv_fid": 6, "roi": [245.16129032258064, 160.10095775981688], "decision": "track", "pending": false}
+{"file": "frame_0008_fid8.jpg", "sent_fid": 8, "recv_fid": 7, "roi": [251.61290322580643, 157.02569942076303], "decision": "track", "pending": false}
+{"file": "frame_0009_fid9.jpg", "sent_fid": 9, "recv_fid": 8, "roi": [258.06451612903226, 153.472749672267], "decision": "track", "pending": false}
+{"file": "frame_0010_fid10.jpg", "sent_fid": 10, "recv_fid": 9, "roi": [264.51612903225805, 150.0030411573368], "decision": "track", "pending": false}
+{"file": "frame_0011_fid11.jpg", "sent_fid": 11, "recv_fid": 10, "roi": [270.96774193548384, 147.16436455850905], "decision": "track", "pending": false}
+{"file": "frame_0012_fid12.jpg", "sent_fid": 12, "recv_fid": 11, "roi": [277.41935483870964, 145.40488449390116], "decision": "track", "pending": false}

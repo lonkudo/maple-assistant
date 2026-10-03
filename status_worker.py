@@ -1593,6 +1593,7 @@ class StatusWorker(threading.Thread):
         potion_verify_retries: int = 1,
         status_state_path: Optional[str] = None,
         motion_arbiter: Any = None,
+        hp_drop_callback: Any = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
         self.frame_queue = frame_queue
@@ -1623,6 +1624,10 @@ class StatusWorker(threading.Thread):
         # movement worker so the channel-switch safety net can gate its
         # potion on the current health.
         self.status_state_path = status_state_path
+        # Status detection owns the fact of an HP decrease.  A separate
+        # movement callback owns marker direction and input, keeping the two
+        # paths decoupled.
+        self.hp_drop_callback = hp_drop_callback
         self._low_count = {"hp": 0, "mp": 0}
         self._last_potion = {"hp": float("-inf"), "mp": float("-inf")}
         self._potion_verification: dict[str, Optional[dict[str, float | int]]] = {
@@ -1876,6 +1881,24 @@ class StatusWorker(threading.Thread):
         LOG.debug("status hp=%s mp=%s exp=%s confidence=%.2f",
                   reading.hp, reading.mp, reading.exp, reading.confidence)
         config = self.detector.config
+        # Ignore weak OCR/colour reads: a one-frame bar wobble must never
+        # produce a direction press.  A real decrease between action-grade
+        # samples is reported once; the movement side decides if an X
+        # direction can be inferred safely.
+        if (
+            reading.confidence >= config.minimum_action_confidence
+            and reading.hp is not None
+            and self._last_hp is not None
+            and reading.hp < self._last_hp
+            and callable(self.hp_drop_callback)
+        ):
+            try:
+                self.hp_drop_callback(
+                    int(self._last_hp), int(reading.hp),
+                    int(getattr(frame, "sequence", -1)),
+                )
+            except Exception:
+                LOG.exception("HP-drop callback failed")
         if reading.confidence < config.minimum_action_confidence:
             # Potions are the highest priority: a low-confidence read must NOT
             # block eating when a bar is below its threshold - a near-empty
