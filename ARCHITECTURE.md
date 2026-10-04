@@ -85,8 +85,11 @@ Ed25519 private key. Its matching public key is the `license_public_key.json`
 file shipped with the desktop release. The desktop repository must never
 contain the server database, plaintext activation inventory, signing private
 key, TLS private key, operator token, or auto-lie product secret. Its binding
-policy is one code to one fingerprint; a fingerprint may activate multiple
-different codes over time.
+policy is one code to one fingerprint and one *current* code per equipment:
+activating a new code detaches the earlier binding, while that earlier code keeps
+its expiry and its own remaining auto-lie balance for a later rebind. The
+remaining balance is code-owned and the device column the desktop is shown is
+only the aggregate of the equipment's active codes.
 
 `pinned_tls.py` is a transport-only component. It reads the public pin from
 `activation_server_pin.json`, checks the server TLS public-key hash before a

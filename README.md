@@ -213,8 +213,12 @@ It must never be copied into a desktop release.
 Server-issued activation codes are exactly 256 characters long (`MAL-` plus
 252 cryptographically random hexadecimal characters). The server retains only
 their SHA-256 hashes, binds one code to one device on first activation, and
-starts a time-limited expiry then. A device may own multiple separately issued
-codes; each individual code can bind to only one device. Ten failed activations
+starts a time-limited expiry then. An individual code can bind to only one
+device, and a device holds exactly **one current code**: activating a new code
+detaches the earlier binding, while that earlier code keeps its expiry and its
+own remaining auto-lie balance, so it can be rebound later without a new grant.
+The remaining balance therefore belongs to the code and travels with it; the
+device row is only the aggregate the desktop is shown. Ten failed activations
 for one fingerprint within 24 hours ban that fingerprint.
 
 That fingerprint ban is the only ban the client endpoints apply. The source-IP
