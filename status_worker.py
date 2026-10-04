@@ -252,6 +252,38 @@ class WindowKeySender:
         if input_enabled:
             self._input_enabled.set()
         self.hwnd: Optional[int] = None
+        # Window recreation is distinct from a focus change.  The login/client
+        # transition can keep the same title while replacing its HWND, and the
+        # new white/black surface is not a valid lie-test scene.
+        self._last_observed_game_hwnd: Optional[int] = None
+        self._window_handle_generation = 0
+        self._window_handle_lock = threading.Lock()
+
+    def _remember_game_window_handle(self, hwnd: int) -> int:
+        """Publish a recreated game HWND without treating first discovery as one."""
+
+        hwnd = int(hwnd)
+        with self._window_handle_lock:
+            previous = self._last_observed_game_hwnd
+            if previous is not None and previous != hwnd:
+                self._window_handle_generation += 1
+                LOG.info(
+                    "WINDOW HANDLE: game window recreated old=%s new=%s generation=%d",
+                    previous, hwnd, self._window_handle_generation,
+                )
+            self._last_observed_game_hwnd = hwnd
+            self.hwnd = hwnd
+            return self._window_handle_generation
+
+    def observe_game_window_handle(self) -> int:
+        """Refresh the game HWND and return its recreation generation."""
+
+        try:
+            self._find_target_window(required=False)
+        except Exception:
+            LOG.debug("game HWND observation failed", exc_info=True)
+        with self._window_handle_lock:
+            return self._window_handle_generation
 
     def enable_input(self) -> None:
         """Allow workers to emit keyboard events after explicit UI activation."""
@@ -614,7 +646,7 @@ class WindowKeySender:
         try:
             exact = win32gui.FindWindow(None, self.window_title)
             if exact and win32gui.IsWindowVisible(exact):
-                self.hwnd = exact
+                self._remember_game_window_handle(exact)
                 LOG.info("WINDOW SELECT: found exact-title hwnd=%s", exact)
                 return exact
         except Exception:
@@ -660,7 +692,7 @@ class WindowKeySender:
         LOG.info("WINDOW SELECT: fallback title scan found %d matching window(s)",
                  len(matches))
         if len(matches) == 1:
-            self.hwnd = matches[0]
+            self._remember_game_window_handle(matches[0])
             return matches[0]
         if not required:
             return 0
@@ -823,7 +855,7 @@ class WindowKeySender:
             if foreground and win32gui.IsWindow(foreground):
                 foreground_title = win32gui.GetWindowText(foreground)
                 if self.window_title.casefold() in foreground_title.casefold():
-                    self.hwnd = foreground
+                    self._remember_game_window_handle(foreground)
                     return True
             if not self.hwnd or not win32gui.IsWindow(self.hwnd):
                 self._find_target_window()

@@ -156,7 +156,22 @@ def capture_window(
     if not hwnd:
         raise WindowCaptureError(f"未找到游戏窗口：{window_title}")
     if win32gui.IsIconic(hwnd):
-        raise WindowCaptureError(f"游戏窗口已最小化：{window_title}")
+        # A minimized game cannot produce a meaningful client capture.  Make
+        # the recovery deterministic instead of leaving every downstream
+        # worker running against an indefinitely stale frame: restore it to a
+        # maximized, visible window, then resume the same capture attempt.
+        LOG.warning("CAPTURE RECOVERY: game window minimized; maximizing %s", window_title)
+        try:
+            win32gui.ShowWindowAsync(hwnd, win32con.SW_MAXIMIZE)
+            # ShowWindowAsync posts the window-state change.  Give Windows one
+            # short turn to apply it before querying the client rectangle.
+            time.sleep(0.10)
+        except Exception as exc:
+            raise WindowCaptureError(
+                f"游戏窗口最小化且无法最大化：{window_title}"
+            ) from exc
+        if win32gui.IsIconic(hwnd):
+            raise WindowCaptureError(f"游戏窗口仍处于最小化状态：{window_title}")
 
     client_left, client_top, client_right, client_bottom = win32gui.GetClientRect(hwnd)
     screen_left, screen_top = win32gui.ClientToScreen(hwnd, (client_left, client_top))

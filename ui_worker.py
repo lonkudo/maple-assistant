@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import queue
+import random
 import re
 import sys
 import threading
@@ -129,6 +130,10 @@ POLL_FAILURE_LOG_SECONDS = 10.0
 # A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
 # never keep the pending flag set (and this method retrying) for the rest of the session.
 AUTO_LIE_PENDING_MAX_SECONDS = 90.0
+# A recreated game HWND first shows white/black login/loading surfaces. Those
+# can contain a uniform square matching the lie HUD colour, but cannot be a
+# playable lie window. Suppress only auto-lie starts for this short transition.
+AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS = 60.0
 
 # The debug UI uses two columns (controls + debug/YOLO); the initial
 # window (including the in-window caption bar when active) is compact by
@@ -165,6 +170,31 @@ LICENSE_REFRESH_COOLDOWN_SECONDS = 60.0
 # the ten failures that ban a fingerprint.
 LICENSE_REFRESH_RETRY_ATTEMPTS = 3
 LICENSE_REFRESH_RETRY_SECONDS = 1.0
+# A failed online heartbeat immediately locks new UI actions. It receives one
+# scheduled confirmation before running automation is stopped, so a brief
+# service outage does not cut off an already-running safe session.
+LICENSE_HEARTBEAT_FAILURE_RETRY_SECONDS = 10 * 60
+_GMT8 = timezone(timedelta(hours=8))
+
+
+def seconds_until_next_gmt8_midnight_refresh() -> float:
+    """Return the delay until the next GMT+8 daily refresh window.
+
+    The server calculates the visible daily auto-lie totals in GMT+8.  A
+    normal entitlement heartbeat is intentionally infrequent, so add this
+    calendar boundary wake-up rather than leaving a running dashboard showing
+    yesterday's figures until its next three-hour check.  A short random
+    delay prevents every active desktop from calling the server at 00:00:00.
+    """
+
+    now = datetime.now(_GMT8)
+    next_midnight = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return max(
+        1.0,
+        (next_midnight - now).total_seconds() + random.uniform(0.0, 60.0),
+    )
 
 
 def license_refresh_retryable(status: LicenseStatus) -> bool:
@@ -962,7 +992,9 @@ class UiWorker(threading.Thread):
         # v0423: 自动过测谎 - the api pass runs by itself when the game's lie window appears.  The lie
         # detector calls `on_lie_event_for_api()` from its own thread, which only raises a flag; the Tk
         # thread services it in `_poll` (nothing Tk is touched off-thread).
-        self._api_auto_lie_events: "queue.Queue[object]" = queue.Queue(maxsize=16)
+        self._api_auto_lie_events: "queue.Queue[object]" = queue.Queue(maxsize=2)
+        self._api_auto_lie_event_enqueue_lock = threading.Lock()
+        self._api_auto_lie_match_queued = False
         self._api_auto_lie_pending = False
         self._api_auto_lie_session_armed = False
         # The server-issued lie-pass quota: when 剩余 reaches 0 the checkbox is
@@ -981,6 +1013,19 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_event_active = False
         self._api_auto_lie_clear_since = 0.0
         self._api_auto_lie_last_pass_started = 0.0
+        # Establish the current HWND generation while the UI starts. A later
+        # game recreation must differ from this baseline; waiting until the
+        # first suspicious square would make that recreated handle look like
+        # the initial state and fail to arm the safety window.
+        _sender = getattr(self.status_worker, "key_sender", None)
+        _observe_handle = getattr(_sender, "observe_game_window_handle", None)
+        try:
+            self._api_auto_lie_handle_generation: Optional[int] = (
+                int(_observe_handle()) if callable(_observe_handle) else 0
+            )
+        except Exception:
+            self._api_auto_lie_handle_generation = 0
+        self._api_auto_lie_new_window_block_until = 0.0
         # True while an automatic pass has the patrol stood down (see _pause_patrol_for_api_pass).
         self._api_auto_lie_patrol_paused = False
         self._api_auto_lie_post_confirm_scheduled = False
@@ -1045,6 +1090,11 @@ class UiWorker(threading.Thread):
         # patrol/trade worker internals, it only decides whether UI actions may
         # enter those workflows.
         local_license_status = verify_license()
+        saved_equipment_id = self._load_saved_equipment_id()
+        if saved_equipment_id:
+            local_license_status = replace(
+                local_license_status, equipment_id=saved_equipment_id
+            )
         # A local signature proves the document was issued by us, but does not
         # prove the online entitlement is still live.  Start locked and let
         # the immediate pinned heartbeat unlock the dashboard only after the
@@ -1053,7 +1103,7 @@ class UiWorker(threading.Thread):
             LicenseStatus(
                 False, "checking", "正在验证在线授权…",
                 local_license_status.license_id, local_license_status.edition,
-                local_license_status.expires_at,
+                local_license_status.expires_at, local_license_status.equipment_id,
             )
             if local_license_status.valid else local_license_status
         )
@@ -1069,6 +1119,7 @@ class UiWorker(threading.Thread):
         )
         self._license_heartbeat_started = False
         self._license_heartbeat_generation = 0
+        self._license_heartbeat_consecutive_failures = 0
         # Manual refresh (the caption ↻ button).  The heartbeat thread sleeps on
         # this event between its three-hour rounds, so setting it validates
         # immediately instead of waiting for the timer; the flag asks that
@@ -3554,9 +3605,8 @@ class UiWorker(threading.Thread):
         # data when they refer to the same signed license, otherwise a normal
         # UI gate would erase the value immediately after it was received.
         if (
-            local_status.valid
-            and isinstance(previous, LicenseStatus)
-            and previous.valid
+            isinstance(previous, LicenseStatus)
+            and local_status.license_id
             and previous.license_id == local_status.license_id
         ):
             local_status = replace(
@@ -3606,10 +3656,20 @@ class UiWorker(threading.Thread):
                     self._license_heartbeat_results.put_nowait((generation, status))
                 except Exception:
                     LOG.warning("license heartbeat result could not be queued", exc_info=True)
-                # The first iteration intentionally happens immediately.
-                # Subsequent online checks are every three hours, as agreed.
-                # The caption ↻ cuts that wait short.
-                if self._wait_for_next_heartbeat(3 * 60 * 60):
+                # The first iteration happens immediately. A failed result
+                # keeps the dashboard grey and receives one confirmation ten
+                # minutes later; an accepted result resumes the normal
+                # three-hour cadence. The caption ↻ always cuts this wait.
+                regular_wait_seconds = (
+                    3 * 60 * 60 if status.valid
+                    else LICENSE_HEARTBEAT_FAILURE_RETRY_SECONDS
+                )
+                # Always validate at the next GMT+8 day boundary so the UI
+                # receives fresh today/yesterday counters right after 00:00.
+                wait_seconds = min(
+                    regular_wait_seconds, seconds_until_next_gmt8_midnight_refresh()
+                )
+                if self._wait_for_next_heartbeat(wait_seconds):
                     return
 
         threading.Thread(
@@ -3720,9 +3780,12 @@ class UiWorker(threading.Thread):
         if generation != self._license_heartbeat_generation:
             self._license_online_validation_pending = False
             return
+        status = self._preserve_server_identity(status)
         self._license_status = status
         self._license_online_validation_pending = False
         if status.valid:
+            self._license_heartbeat_consecutive_failures = 0
+            self._remember_equipment_id(status.equipment_id)
             was_locked = self._license_session_locked
             self._license_session_locked = False
             # Loading persisted controls may restore the saved Auto Lie
@@ -3749,8 +3812,15 @@ class UiWorker(threading.Thread):
                 )
             self._refresh_patrol_controls()
             return
-        LOG.warning("license heartbeat failed: %s", status.code)
-        self._lock_licensed_functions()
+        self._license_heartbeat_consecutive_failures += 1
+        LOG.warning(
+            "license heartbeat failed: %s (consecutive=%d)", status.code,
+            self._license_heartbeat_consecutive_failures,
+        )
+        if self._license_heartbeat_consecutive_failures >= 2:
+            self._lock_licensed_functions()
+        else:
+            self._lock_license_ui_only()
         if hasattr(self, "_control_status"):
             hint = (status.message if status.code in {"server", "device_not_ready"}
                     else f"在线授权验证失败：{status.message}")
@@ -3803,7 +3873,7 @@ class UiWorker(threading.Thread):
             # device-readiness state, not a pending server response.  Showing
             # both messages together was contradictory and made it look as if
             # the server was at fault.
-            device_text = None if status.code == "device_not_ready" else (
+            device_text = (
                 f"设备：{status.equipment_id}（左键复制）"
                 if status.equipment_id else "设备：等待服务器返回"
             )
@@ -3831,13 +3901,14 @@ class UiWorker(threading.Thread):
                     foreground="#17803d",
                 )
             else:
-                self._render_lie_usage(None)
-                if status.code in {"server", "device_not_ready"}:
-                    text = status.message
-                    if device_text:
-                        text += f" · {device_text}"
+                self._render_lie_usage(status)
+                expiry = "永久" if status.expires_at is None else self._format_license_expiry(
+                    status.expires_at
+                )
+                if status.code == "expired":
+                    text = f"授权已过期 · {device_text} · 到期：{expiry}"
                 else:
-                    text = f"未授权 / 已过期：{status.message} · {device_text}"
+                    text = f"未授权：{status.message} · {device_text}"
                 label.configure(text=text, foreground="#202020")
         button = getattr(self, "_license_button", None)
         if button is not None:
@@ -4166,6 +4237,82 @@ class UiWorker(threading.Thread):
 
         return config_section_file("license")
 
+    @classmethod
+    def _load_saved_equipment_id(cls) -> str:
+        """Return the last server-issued public device code, if available."""
+
+        try:
+            data = json.loads(cls._license_settings_path().read_text(encoding="utf-8"))
+            value = str(data.get("equipment_id", "")).strip()
+            return value if len(value) == 8 else ""
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return ""
+
+    def _remember_equipment_id(self, equipment_id: object) -> None:
+        """Keep the non-secret public device code visible after local expiry."""
+
+        value = str(equipment_id or "").strip()
+        if len(value) != 8:
+            return
+        try:
+            path = self._license_settings_path()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            if data.get("equipment_id") == value:
+                return
+            data["equipment_id"] = value
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            LOG.debug("could not remember public equipment ID", exc_info=True)
+
+    def _preserve_server_identity(self, status: LicenseStatus) -> LicenseStatus:
+        """Keep known public device/usage state across a failed heartbeat."""
+
+        previous = getattr(self, "_license_status", None)
+        if not isinstance(previous, LicenseStatus):
+            return status
+        equipment_id = status.equipment_id or previous.equipment_id
+        if not equipment_id:
+            equipment_id = self._load_saved_equipment_id()
+        if status.valid:
+            # A successful heartbeat is authoritative for entitlement and
+            # quota values. Retain only a public ID an older server omitted.
+            return replace(
+                status,
+                equipment_id=equipment_id if len(str(equipment_id)) == 8 else "",
+            )
+        return replace(
+            status,
+            equipment_id=equipment_id if len(str(equipment_id)) == 8 else "",
+            remaining_auto_lie_count=(
+                status.remaining_auto_lie_count
+                if status.remaining_auto_lie_count is not None
+                else previous.remaining_auto_lie_count
+            ),
+            remaining_auto_lie_unlimited=(
+                status.remaining_auto_lie_unlimited
+                or previous.remaining_auto_lie_unlimited
+            ),
+            lie_detect_total=max(status.lie_detect_total, previous.lie_detect_total),
+            lie_detect_success_total=max(
+                status.lie_detect_success_total, previous.lie_detect_success_total
+            ),
+            lie_detect_failed_total=max(
+                status.lie_detect_failed_total, previous.lie_detect_failed_total
+            ),
+            lie_detect_today=(status.lie_detect_today or previous.lie_detect_today),
+            lie_detect_yesterday=(
+                status.lie_detect_yesterday or previous.lie_detect_yesterday
+            ),
+        )
+
     def _save_license_attempt(
         self, activation_code: str, status: Optional[LicenseStatus] = None
     ) -> None:
@@ -4192,6 +4339,9 @@ class UiWorker(threading.Thread):
                     "last_validation_message": str(status.message),
                     "last_validation_at": datetime.now(timezone.utc).isoformat(),
                 })
+                equipment_id = str(status.equipment_id or "").strip()
+                if len(equipment_id) == 8:
+                    data["equipment_id"] = equipment_id
             path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -4199,8 +4349,15 @@ class UiWorker(threading.Thread):
         except OSError:
             LOG.warning("could not save activation attempt to user_config", exc_info=True)
 
+    def _lock_license_ui_only(self) -> None:
+        """Immediately grey all product controls without interrupting work."""
+
+        self._license_session_locked = True
+        self._set_license_visual_lock(True)
+        self._refresh_license_ui()
+
     def _lock_licensed_functions(self) -> None:
-        """Immediately stop and lock every licensed automation surface."""
+        """Stop every automation worker after the retry heartbeat also fails."""
 
         self._license_session_locked = True
         self._patrol_intent = False
@@ -4251,6 +4408,29 @@ class UiWorker(threading.Thread):
                 reconnect.request_cancel()
             except Exception:
                 LOG.debug("license lock could not stop auto reconnect", exc_info=True)
+        restart = getattr(self, "auto_restart_worker", None)
+        if restart is not None:
+            try:
+                restart.configure(enabled=False)
+                restart.request_cancel()
+            except Exception:
+                LOG.debug("license lock could not stop auto restart", exc_info=True)
+        countdown = getattr(self, "countdown_worker", None)
+        if countdown is not None:
+            try:
+                countdown.set_enabled(False)
+            except Exception:
+                LOG.debug("license lock could not stop countdown", exc_info=True)
+        for worker, method in (
+            (getattr(self, "screen_blinker", None), "set_enabled"),
+            (getattr(self, "telegram_notifier", None), "set_enabled"),
+        ):
+            callback = getattr(worker, method, None)
+            if callable(callback):
+                try:
+                    callback(False)
+                except Exception:
+                    LOG.debug("license lock could disable %s", method, exc_info=True)
         for worker, method in (
             (getattr(self, "trade_worker", None), "request_cancel"),
             (getattr(self, "lie_detector_worker", None), "set_enabled"),
@@ -4325,9 +4505,14 @@ class UiWorker(threading.Thread):
         # in user_config.json.
         self._save_license_attempt(code)
         if str(code).strip().upper().startswith("MAL-"):
-            self._license_status = activate_via_server(code)
+            activation_status = activate_via_server(code)
         else:
-            self._license_status = activate_license(code)
+            activation_status = activate_license(code)
+        # An explicit replacement attempt must not hide a device ID that was
+        # already known for this installation.  Current servers return it on
+        # every rejection; this fallback also keeps the header correct while
+        # an older server is being upgraded.
+        self._license_status = self._preserve_server_identity(activation_status)
         self._save_license_attempt(code, self._license_status)
         if self._license_status.valid:
             self._license_session_locked = False
@@ -5176,10 +5361,41 @@ class UiWorker(threading.Thread):
     def on_lie_event_for_api(self, match: object = None) -> None:
         """Queue one detector event; safe to call from the detector thread."""
 
+        # The detector can see a matching block on every capture. Coalesce
+        # repeated present events until Tk has inspected one; otherwise a
+        # loading screen can fill the queue before the UI has one chance to
+        # apply the window-recreation guard.
+        if match is not None:
+            with self._api_auto_lie_event_enqueue_lock:
+                if self._api_auto_lie_match_queued:
+                    return
+                try:
+                    self._api_auto_lie_events.put_nowait(match)
+                    self._api_auto_lie_match_queued = True
+                except queue.Full:
+                    return
+            return
         try:
-            self._api_auto_lie_events.put_nowait(match)
+            self._api_auto_lie_events.put_nowait(None)
         except queue.Full:
-            AUTO_LIE_LOG.warning("自动过测谎: event queue is full; newest detector event was dropped")
+            return
+
+    def _auto_lie_blocked_for_recreated_window(self) -> bool:
+        """Silently suppress a false lie square during a game HWND transition."""
+
+        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        observe = getattr(sender, "observe_game_window_handle", None)
+        if not callable(observe):
+            return False
+        generation = int(observe())
+        if self._api_auto_lie_handle_generation is None:
+            self._api_auto_lie_handle_generation = generation
+        elif generation != self._api_auto_lie_handle_generation:
+            self._api_auto_lie_handle_generation = generation
+            self._api_auto_lie_new_window_block_until = (
+                time.monotonic() + AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS
+            )
+        return time.monotonic() < self._api_auto_lie_new_window_block_until
 
     def _handle_lie_event_for_api(self, match: object = None) -> None:
         """Handle one queued lie event on the UI thread.
@@ -5189,6 +5405,8 @@ class UiWorker(threading.Thread):
         legitimate lie window fail before the API worker is created.
         """
 
+        if match is not None and self._auto_lie_blocked_for_recreated_window():
+            return
         if not self._license_allowed():
             AUTO_LIE_LOG.info("自动过测谎: ignored because license is not valid")
             return
@@ -5342,6 +5560,9 @@ class UiWorker(threading.Thread):
                     match = events.get_nowait()
                 except queue.Empty:
                     break
+                if match is not None:
+                    with self._api_auto_lie_event_enqueue_lock:
+                        self._api_auto_lie_match_queued = False
                 self._handle_lie_event_for_api(match)
                 try:
                     events.task_done()
