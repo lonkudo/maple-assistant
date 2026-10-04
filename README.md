@@ -760,16 +760,20 @@ version to its exact source snapshot; use `git show release/vX.Y.Z` when
 investigating an older build. Tags are created after the release ZIP is built,
 and must not be moved after publication.
 
-A version stays untagged while its source and its built package differ. The
+A version stays untagged while its source and its built package differ. The first
 `release/TodoHelper-1.2.112.zip` package was staged before
-`COUNTERATTACK_COOLDOWN_FRAMES` was raised from 2 to 3, so the working tree is one
-constant ahead of that ZIP: `1.2.112` is listed without a tag, and the tag belongs
-to the commit whose package is actually shipped (a rebuilt `1.2.112`, or the next
-patch version).
+`COUNTERATTACK_COOLDOWN_FRAMES` was raised from 2 to 3, so `1.2.112` was left
+untagged; both packages were then rebuilt from the commit this table tags —
+`release/TodoHelper-1.2.112.zip` by `release_now.ps1` and
+`release/TodoHelper-release-1.2.112.zip` by `build_protected_release.ps1`, in that
+order, because the normal release prunes `TodoHelper-*.zip` and would otherwise
+remove a standalone package built first. The `1.2.105` – `1.2.111` packages were
+superseded and pruned, so their exact sources are not recoverable from a version
+number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
-| `1.2.112` | — | 被撞反击 as an attack-slot replacement, RTF1 back-pressure, a failed pass that never clicks the lie dialog, and a finite balance that wins over the unlimited marker. |
+| `1.2.112` | `release/v1.2.112` | 被撞反击 as an attack-slot replacement, RTF1 back-pressure, a failed pass that never clicks the lie dialog, and a finite balance that wins over the unlimited marker; normal and standalone EXE packages rebuilt from this commit. |
 | `1.2.105` – `1.2.111` | — | Intermediate builds of the same work. |
 | `1.2.104` | `release/v1.2.104` | Reload-proven channel switch, 被撞反击, 多等 in seconds, post-switch map re-anchor. |
 | `1.2.103` | — | The lie credential survives a completed pass. |
