@@ -434,8 +434,17 @@ def _with_server_device(
     if isinstance(usage, dict):
         server_state.update(usage)
     equipment_id = str(server_state.get("equipment_id", status.equipment_id)).strip()
-    remaining = server_state.get("remaining_auto_lie_count", status.remaining_auto_lie_count)
-    if not isinstance(remaining, int) or isinstance(remaining, bool):
+    # A numeric balance and the old unlimited marker must never coexist in the
+    # desktop state.  In particular, an activation can replace the initial
+    # empty placeholder with a finite grant; treating a stale ``true`` flag as
+    # authoritative made that grant render as "无限" until the next restart.
+    has_remaining = "remaining_auto_lie_count" in server_state
+    reported_remaining = server_state.get("remaining_auto_lie_count")
+    if isinstance(reported_remaining, int) and not isinstance(reported_remaining, bool):
+        remaining = reported_remaining
+    elif has_remaining and reported_remaining is None:
+        remaining = None
+    else:
         remaining = status.remaining_auto_lie_count
 
     def _counter(name: str, current: int) -> int:
@@ -466,7 +475,11 @@ def _with_server_device(
     # A null count is the server's "unmetered" answer.  Only the server's own
     # explicit flag is trusted: an older server never sends it, and inferring
     # "unlimited" from a missing count would silently disarm the quota gate.
-    unlimited = bool(server_state.get("remaining_auto_lie_unlimited", False))
+    unlimited = bool(
+        has_remaining
+        and reported_remaining is None
+        and server_state.get("remaining_auto_lie_unlimited") is True
+    )
 
     return replace(
         status,

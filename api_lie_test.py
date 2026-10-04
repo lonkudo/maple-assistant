@@ -58,6 +58,13 @@ DEFAULT_SECONDS = 5.0
 DEFAULT_AWAIT_SECONDS = 0.0
 # How often an annotated frame is written while the drill runs (so it does not fill the disk).
 CAPTURE_EVERY_SECONDS = 1.0
+# A full negotiated RTF1 window is normal brief back-pressure.  It is not a
+# failed capture and must not produce one "buffer full" message per 5-fps
+# tick.  The measured service inference time is tens of milliseconds; if it
+# has returned nothing for this long, stop before its 10-second no-frame idle
+# timeout closes the WebSocket underneath us.
+FRAME_RESULT_STALL_SECONDS = 2.5
+BACKPRESSURE_REPORT_SECONDS = 1.0
 TEST_KEY = "LIE-LOCAL-TEST"
 MIMIC_NOTE = "本地模拟后端"
 
@@ -157,6 +164,9 @@ class ApiLieTestWorker(threading.Thread):
         self.key_source = ""
         self.log_folder = None
         self.accounting_event_id: Optional[str] = None
+        # The UI may click the game's completion button only after a complete
+        # frame-feed round.  A transport failure must leave that dialog alone.
+        self.completed_successfully = False
 
     # ------------------------------------------------------------------ control
     def request_stop(self) -> None:
@@ -289,9 +299,13 @@ class ApiLieTestWorker(threading.Thread):
             LOG.exception("api test: the mouse aim could not be started")
             self._aim = None
 
-    def _push_aim(self, rect, image_width: int, image_height: int,
-                  client_x: float, client_y: float) -> None:
-        """Move the cursor to one answer (client pixels -> the client rectangle on screen)."""
+    def _push_aim(self, screen_x: float, screen_y: float) -> None:
+        """Move the cursor to the server answer's final desktop point.
+
+        The live overlay uses this same physical point.  Do not send it back
+        through a client-rectangle mapping: DPI virtualization can make a
+        captured bitmap and Windows' logical client dimensions differ.
+        """
 
         if not self.aim_enabled:
             return
@@ -300,9 +314,9 @@ class ApiLieTestWorker(threading.Thread):
         if self._aim is None:
             return
         try:
-            if rect is not None and len(rect) == 4:
-                self._aim.set_region(int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
-            self._aim.push_target(float(client_x), float(client_y), 1.0, "api")
+            self._aim.push_screen_target(
+                float(screen_x), float(screen_y), 1.0, "api", immediate=True
+            )
         except Exception:
             LOG.debug("api test: the aim push failed", exc_info=True)
 
@@ -353,6 +367,7 @@ class ApiLieTestWorker(threading.Thread):
                 return
             self._running = True
         self._stop_request.clear()
+        self.completed_successfully = False
         if self._on_capture_start is not None:
             try:
                 self._on_capture_start()
@@ -435,6 +450,8 @@ class ApiLieTestWorker(threading.Thread):
             last_capture_saved = 0.0
             burst = Rtf1BurstSession(self.fps)
             next_frame_id = 1
+            backpressure_since: Optional[float] = None
+            last_backpressure_report = 0.0
 
             def process_burst_results() -> None:
                 """Process every server answer already readable; never block capture."""
@@ -463,10 +480,8 @@ class ApiLieTestWorker(threading.Thread):
                         self.stats.holds += 1
                         line += " hold"
                     if point.x is not None and point.y is not None:
-                        client_xy = point.to_client(frame.geometry)
                         screen_xy = point.to_screen(frame.geometry)
-                        self._push_aim(captured_rect, captured_image.shape[1],
-                                       captured_image.shape[0], client_xy[0], client_xy[1])
+                        self._push_aim(screen_xy[0], screen_xy[1])
                         if self.aim_overlay is not None:
                             try:
                                 self.aim_overlay(int(round(screen_xy[0])),
@@ -500,6 +515,29 @@ class ApiLieTestWorker(threading.Thread):
                         self._report("stopped", f"第 {tick} 帧前收到停止请求")
                         break
                 process_burst_results()
+                # Keep the server's advertised window full, but do not build
+                # and repeatedly reject a new JPEG while it is draining.  A
+                # frame ID must remain contiguous, so the next accepted
+                # upload keeps the same ID.
+                if not burst.has_capacity:
+                    now = time.perf_counter()
+                    if backpressure_since is None:
+                        backpressure_since = now
+                    stalled_for = now - backpressure_since
+                    if stalled_for >= FRAME_RESULT_STALL_SECONDS:
+                        raise ConnectionError(
+                            "RTF1 后端 %.1f 秒未返回帧结果，已中止本次接管"
+                            % stalled_for
+                        )
+                    if now - last_backpressure_report >= BACKPRESSURE_REPORT_SECONDS:
+                        self._report(
+                            "frame",
+                            f"RTF1 队列已满，等待后端返回（{burst.pending_count}/"
+                            f"{burst.max_in_flight}）",
+                        )
+                        last_backpressure_report = now
+                    continue
+                backpressure_since = None
                 image, rect = self._capture()
                 if image is None:
                     self.stats.failures += 1
@@ -516,9 +554,9 @@ class ApiLieTestWorker(threading.Thread):
                 if not burst.submit(client, frame_id=next_frame_id, jpeg=frame.jpeg,
                                     frame_interval_sec=interval,
                                     context=(frame, image, rect)):
-                    # A stale screenshot is less useful than the next live one.
-                    self.stats.failures += 1
-                    self._report("frame", f"{next_frame_id}: RTF1 缓冲已满，跳过旧帧")
+                    # This should only be possible if the negotiated window
+                    # changed between the capacity check and send.  Keep the
+                    # frame ID intact and let the next tick drain it.
                     continue
                 self.stats.frames += 1
                 self.stats.bytes_sent += frame.byte_size
@@ -548,8 +586,20 @@ class ApiLieTestWorker(threading.Thread):
                          "quota_left": self.stats.quota_left,
                          "last_screen": self.stats.last_screen})
             log.close()
+            self.completed_successfully = True
             self._report("logs", str(log.folder))
             self._report("done", self.stats.describe())
+        except ConnectionError as exc:
+            # A server-side close is a failed takeover, not a completed lie
+            # window.  In particular, do not let the caller press the game's
+            # completion button merely because this thread has ended.
+            LOG.warning("api test backend connection interrupted: %s", exc)
+            try:
+                log.connection("connection interrupted", error=str(exc))
+                log.summary({"outcome": "connection_interrupted", "error": str(exc)})
+            finally:
+                log.close()
+            self._report("failed", f"后端连接中断：{exc}")
         except Exception as exc:
             LOG.exception("api test crashed")
             try:

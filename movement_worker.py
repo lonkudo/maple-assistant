@@ -359,6 +359,12 @@ STATIONARY_PICKUP_MAX_INTERVAL_SECONDS = 1800.0  # 30.0m
 # is treated as reached instead of walking into the edge for the whole circuit.
 STATIONARY_PICKUP_LEG_NO_PROGRESS_FRAMES = 38
 
+# A hit reaction / cast can consume the first ordinary far-return direction
+# even though the input ledger accepted it. Do not keep extending that
+# invisible hold while stationary recovery suppresses normal attacks. At 5 FPS
+# this is one second without progress, then the direction is sent anew.
+STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES = 5
+
 # A saved Left/Right endpoint that sits a fraction of a pixel outside the
 # walkable platform (wall/platform edge, or a residual projection error) can
 # never satisfy the arrival band, so the walk holds its key until the self-
@@ -377,6 +383,18 @@ ENDPOINT_NO_PROGRESS_FRAMES = 38
 # executed by MotionArbiter so it never overlaps attack, jump, buff, or climb.
 COUNTERATTACK_STEP_HOLD_SECONDS = 0.10
 COUNTERATTACK_X_DIRECTION_MIN_DELTA = 0.003
+# Ignore the five captures immediately after a retaliation decision.  A single
+# monster hit can lower HP across adjacent reads; those reads must not queue a
+# row of delayed counterattacks.
+COUNTERATTACK_COOLDOWN_FRAMES = 3
+# HP can be recognized a few captures after the actual collision.  Retain a
+# short history so a push against the planned patrol direction is not hidden
+# by the character immediately resuming its ordinary walk.
+COUNTERATTACK_IMPACT_LOOKBACK_FRAMES = 4
+# HP-bar parsing and minimap marker recognition consume the same capture
+# stream but finish at different moments.  A nearby marker sequence is still
+# the same hit moment when the exact marker was not recognized.
+COUNTERATTACK_MARKER_SEQUENCE_TOLERANCE = 2
 
 
 class KeySender(Protocol):
@@ -3104,6 +3122,46 @@ class MovementWorker(threading.Thread):
             return False
         if decision.key not in ("left", "right"):
             return _send_tap(self.key_sender, decision)
+        stationary_far_return = bool(
+            self.stationary_attack_enabled
+            and decision.reason == "stationary return walking to final approach zone"
+        )
+        if stationary_far_return:
+            anchor = self._stationary_attack_anchor
+            player = getattr(getattr(self, "last_observation", None), "player", None)
+            if anchor is not None and player is not None:
+                distance = abs(float(anchor.x) - float(player.x))
+                if (self._stationary_return_watch_direction != decision.key
+                        or self._stationary_return_watch_best_distance is None):
+                    self._stationary_return_watch_direction = decision.key
+                    self._stationary_return_watch_best_distance = distance
+                    self._stationary_return_watch_frames = 0
+                elif distance < self._stationary_return_watch_best_distance - 0.001:
+                    self._stationary_return_watch_best_distance = distance
+                    self._stationary_return_watch_frames = 0
+                else:
+                    self._stationary_return_watch_frames += 1
+                    if (self._stationary_return_watch_frames
+                            >= STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES):
+                        LOG.warning(
+                            "STATIONARY RETURN walk made no X progress toward "
+                            "anchor for %d frames (distance=%.6f); releasing and "
+                            "re-arming %s",
+                            self._stationary_return_watch_frames,
+                            distance,
+                            decision.key,
+                        )
+                        self._release_walk_hold()
+                        self._stationary_return_watch_best_distance = distance
+                        self._stationary_return_watch_frames = 0
+            else:
+                self._stationary_return_watch_direction = None
+                self._stationary_return_watch_best_distance = None
+                self._stationary_return_watch_frames = 0
+        else:
+            self._stationary_return_watch_direction = None
+            self._stationary_return_watch_best_distance = None
+            self._stationary_return_watch_frames = 0
         # A fixed-attack beat can already be in Maple's animation window on
         # the frame where 站桩 recovery first discovers that the character is
         # outside its final approach zone.  If Left/Right is sent during that
@@ -3700,6 +3758,10 @@ class MovementWorker(threading.Thread):
         # UI keeps this aligned with the configured fixed-attack key.  The
         # atomic 小碎步 owns two explicit taps between its two directions.
         self.small_step_attack_key = "ctrl"
+        # Shared with AttackWorker after construction.  A stationary hit uses
+        # this to replace one already-planned attack key, never to inject a
+        # competing counterattack movement transaction.
+        self.attack_slot = None
         # Published from the movement loop.  Queued jump/buff/small-step
         # input is only allowed while a normal horizontal patrol or rope
         # approach decision is live.
@@ -3786,6 +3848,12 @@ class MovementWorker(threading.Thread):
         self._walk_hold_key: Optional[str] = None
         self._walk_hold_z = False
         self._walk_hold_until = 0.0
+        # Far stationary returns use an ordinary held direction rather than
+        # an arbiter step. Track whether the marker actually closes on the
+        # temporary anchor so a swallowed key-down cannot freeze recovery.
+        self._stationary_return_watch_direction: Optional[str] = None
+        self._stationary_return_watch_best_distance: Optional[float] = None
+        self._stationary_return_watch_frames = 0
         # Rope-approach stall recovery: when the character ends up ON the
         # rope mid-height, the walk toward the rope never advances X - the
         # worker must NOT keep pressing left/right+Z forever.  Track the
@@ -4019,8 +4087,10 @@ class MovementWorker(threading.Thread):
         # happens to be current when the status thread catches up.
         self.counterattack_enabled = False
         self.counterattack_key = "ctrl"
-        self._counterattack_marker_window: deque[tuple[int, float]] = deque(maxlen=12)
+        self._counterattack_marker_window: deque[tuple[int, float, Optional[str]]] = deque(maxlen=12)
+        self._counterattack_marker_lock = threading.Lock()
         self._counterattack_events: "queue.Queue[tuple[int, int, int]]" = queue.Queue(maxsize=8)
+        self._counterattack_cooldown_until_frame = -1
         self._last_send = 0.0
         self._aligned_frames = 0
         self._last_climb_attempt = float("-inf")
@@ -8518,7 +8588,9 @@ class MovementWorker(threading.Thread):
             # direction (the same order the 小碎步 uses for its middle attack).
             # The UI publishes the configured fixed-attack key on
             # ``small_step_attack_key`` for these atomic step motions.
-            attack_key = str(getattr(self, "small_step_attack_key", "ctrl"))
+            attack_key = self._consume_attack_slot(
+                str(getattr(self, "small_step_attack_key", "ctrl"))
+            )
             if (not self._patrol_input_allowed()
                     or tap(attack_key) is False):
                 LOG.warning(
@@ -11079,7 +11151,9 @@ class MovementWorker(threading.Thread):
             # Maple can otherwise swallow that direction as continuation of
             # the attack animation.
             tap = getattr(self.key_sender, "tap", None)
-            attack_key = str(getattr(self, "small_step_attack_key", "ctrl"))
+            attack_key = self._consume_attack_slot(
+                str(getattr(self, "small_step_attack_key", "ctrl"))
+            )
             if not callable(tap):
                 LOG.info("small-step skipped: input sender cannot tap attack key")
                 return False
@@ -11248,6 +11322,18 @@ class MovementWorker(threading.Thread):
             self.counterattack_key,
         )
 
+    def set_attack_slot(self, attack_slot: object) -> None:
+        """Attach the shared next-attack replacement slot."""
+
+        self.attack_slot = attack_slot
+
+    def _consume_attack_slot(self, default_key: str) -> str:
+        """Use a pending hit key for this approved movement attack beat."""
+
+        consume = getattr(self.attack_slot, "consume", None)
+        key = consume(default_key) if callable(consume) else default_key
+        return str(key or default_key).casefold()
+
     def notify_hp_drop(
         self, previous_hp: int, current_hp: int, frame_sequence: int = -1,
     ) -> None:
@@ -11261,6 +11347,26 @@ class MovementWorker(threading.Thread):
         if not self.counterattack_enabled or not self._patrol_input_allowed():
             return
         if frame_sequence < 0:
+            return
+        # The cooldown starts at the HP-drop decision itself, not after the
+        # arbiter happens to execute it.  A multi-frame damage animation must
+        # therefore remain one counterattack opportunity even when its first
+        # frame has no usable minimap direction yet.
+        if frame_sequence <= self._counterattack_cooldown_until_frame:
+            LOG.info(
+                "被撞反击 skipped: HP-drop cooldown through frame %d (current %d)",
+                self._counterattack_cooldown_until_frame, frame_sequence,
+            )
+            return
+        self._counterattack_cooldown_until_frame = (
+            frame_sequence + COUNTERATTACK_COOLDOWN_FRAMES
+        )
+        # StatusWorker can arrive just after MovementWorker has published the
+        # same shared-capture marker sample. Resolve it now and enqueue the
+        # arbiter action immediately, rather than paying another capture tick.
+        if self._queue_counterattack_from_samples(
+            frame_sequence, previous_hp, current_hp,
+        ):
             return
         try:
             self._counterattack_events.put_nowait(
@@ -11276,8 +11382,97 @@ class MovementWorker(threading.Thread):
             except queue.Empty:
                 pass
 
+    def _queue_counterattack_from_samples(
+        self, frame_sequence: int, previous_hp: int, current_hp: int,
+    ) -> bool:
+        """Resolve one hit from published X history and queue its reaction.
+
+        Returns ``False`` only when the matching minimap frame has not been
+        published yet, so the caller may retry on the next movement tick.
+        """
+
+        if self.stationary_attack_enabled:
+            replace = getattr(self.attack_slot, "replace_next", None)
+            if callable(replace) and replace(self.counterattack_key):
+                LOG.info(
+                    "被撞反击 queued as next stationary attack slot: HP %d->%d "
+                    "frame=%d key=%s",
+                    previous_hp, current_hp, frame_sequence,
+                    self.counterattack_key,
+                )
+            else:
+                LOG.warning("被撞反击 skipped: stationary attack slot unavailable")
+            return True
+        if self._movement_busy_now():
+            LOG.info("被撞反击 skipped: vertical recovery is active")
+            return True
+        with self._counterattack_marker_lock:
+            samples = list(self._counterattack_marker_window)
+        matching_index = next(
+            (index for index, (sequence, _x, _direction) in enumerate(samples)
+             if sequence == frame_sequence),
+            None,
+        )
+        if matching_index is None and samples:
+            nearby = [
+                (abs(sequence - frame_sequence), index)
+                for index, (sequence, _x, _direction) in enumerate(samples)
+                if abs(sequence - frame_sequence) <= COUNTERATTACK_MARKER_SEQUENCE_TOLERANCE
+            ]
+            if nearby:
+                _distance, matching_index = min(nearby)
+                matched_sequence = samples[matching_index][0]
+                LOG.info(
+                    "被撞反击: HP frame %d used nearby minimap frame %d",
+                    frame_sequence, matched_sequence,
+                )
+        if matching_index is None or matching_index == 0:
+            return False
+        previous_x = samples[matching_index - 1][1]
+        current_x = samples[matching_index][1]
+        delta_x = float(current_x) - float(previous_x)
+        planned_direction = samples[matching_index][2]
+        if planned_direction in ("left", "right"):
+            start = max(1, matching_index - COUNTERATTACK_IMPACT_LOOKBACK_FRAMES)
+            opposing = []
+            for index in range(start, matching_index + 1):
+                movement = float(samples[index][1]) - float(samples[index - 1][1])
+                if ((planned_direction == "left" and movement > 0)
+                        or (planned_direction == "right" and movement < 0)):
+                    opposing.append(movement)
+            delta_x = max(opposing, key=abs) if opposing else 0.0
+        request = getattr(self.motion_arbiter, "request_counterattack", None)
+        if abs(delta_x) < COUNTERATTACK_X_DIRECTION_MIN_DELTA:
+            # The patrol walk can cancel the visible displacement of a hit.
+            # Preserve the hit reaction by stepping opposite to the planned
+            # walk, then use the counter key for the inserted attack slot.
+            compensated_direction = (
+                "right" if planned_direction == "left"
+                else "left" if planned_direction == "right"
+                else "none"
+            )
+            hit_x = float(current_x)
+            if callable(request) and request(
+                    compensated_direction, self.counterattack_key, hit_x):
+                LOG.info(
+                    "被撞反击 queued immediately: HP %d->%d frame=%d compensated "
+                    "walk %s (Δx=%+.6f) -> %s + %s",
+                    previous_hp, current_hp, frame_sequence,
+                    planned_direction or "none", delta_x,
+                    compensated_direction, self.counterattack_key,
+                )
+            return True
+        direction = "left" if delta_x > 0 else "right"
+        if callable(request) and request(direction, self.counterattack_key):
+            LOG.info(
+                "被撞反击 queued immediately: HP %d->%d frame=%d X %+.6f -> %s + %s",
+                previous_hp, current_hp, frame_sequence, delta_x, direction,
+                self.counterattack_key,
+            )
+        return True
+
     def _consume_counterattack_events(self) -> None:
-        """Queue reactions whose exact HP-drop frame has a marker pair."""
+        """Retry only hits whose marker frame was not yet published."""
 
         while True:
             try:
@@ -11287,63 +11482,67 @@ class MovementWorker(threading.Thread):
             except queue.Empty:
                 return
             try:
-                if self._movement_busy_now():
-                    LOG.info("被撞反击 skipped: vertical recovery is active")
-                    continue
-                samples = list(self._counterattack_marker_window)
-                matching_index = next(
-                    (index for index, (sequence, _x) in enumerate(samples)
-                     if sequence == frame_sequence),
-                    None,
-                )
-                if matching_index is None or matching_index == 0:
+                if not self._queue_counterattack_from_samples(
+                    frame_sequence, previous_hp, current_hp,
+                ):
                     LOG.info(
                         "被撞反击 skipped: no matching minimap X window for frame %d",
                         frame_sequence,
                     )
                     continue
-                previous_x = samples[matching_index - 1][1]
-                current_x = samples[matching_index][1]
-                delta_x = float(current_x) - float(previous_x)
-                if abs(delta_x) < COUNTERATTACK_X_DIRECTION_MIN_DELTA:
-                    LOG.info(
-                        "被撞反击 skipped: HP %d->%d frame=%d X direction unclear (Δx=%+.6f)",
-                        previous_hp, current_hp, frame_sequence, delta_x,
-                    )
-                    continue
-                direction = "left" if delta_x > 0 else "right"
-                request = getattr(self.motion_arbiter, "request_counterattack", None)
-                if callable(request) and request(direction, self.counterattack_key):
-                    LOG.info(
-                        "被撞反击 queued: HP %d->%d frame=%d X %+.6f -> %s + %s",
-                        previous_hp, current_hp, frame_sequence, delta_x,
-                        direction, self.counterattack_key,
-                    )
             finally:
                 try:
                     self._counterattack_events.task_done()
                 except ValueError:
                     pass
 
-    def perform_counterattack(self, direction: str, attack_key: str) -> bool:
+    def perform_counterattack(
+        self, direction: str, attack_key: str, hit_x: Optional[float] = None,
+    ) -> bool:
         """Arbiter callback: step away from the hit, then tap its own key."""
 
         direction = str(direction).casefold()
         attack_key = str(attack_key).casefold()
-        if (direction not in ("left", "right")
+        if (direction not in ("left", "right", "none")
                 or not attack_key
                 or not self.counterattack_enabled
                 or not self._patrol_input_allowed()
                 or self._movement_busy_now()
                 or not _sender_is_safe(self.key_sender)):
             return False
-        key_down = getattr(self.key_sender, "key_down", None)
-        key_up = getattr(self.key_sender, "key_up", None)
         tap = getattr(self.key_sender, "tap", None)
-        if not callable(key_down) or not callable(key_up) or not callable(tap):
+        if not callable(tap):
             return False
         with self._direction_lock, self._hold_lock:
             if not self._patrol_input_allowed() or self._movement_busy_now():
+                return False
+            if direction == "none":
+                if tap(attack_key) is False:
+                    return False
+                note_attack = getattr(self.motion_arbiter, "note_attack", None)
+                if callable(note_attack):
+                    note_attack()
+                LOG.info("被撞反击 executed: attack only + %s", attack_key)
+                return True
+            # A walking patrol can fully compensate a small knockback before
+            # the arbiter reaches this reaction.  For that case, walk back
+            # toward the marker X captured at the HP-drop frame.  The
+            # originally inferred direction remains the safe fallback when
+            # the marker has not moved a whole minimap column yet.
+            if hit_x is not None:
+                player = getattr(self.last_observation, "player", None)
+                live_x = getattr(player, "x", None)
+                if live_x is not None:
+                    gap_to_hit = float(hit_x) - float(live_x)
+                    if abs(gap_to_hit) >= COUNTERATTACK_X_DIRECTION_MIN_DELTA:
+                        direction = "right" if gap_to_hit > 0 else "left"
+                        LOG.info(
+                            "被撞反击: returning toward hit X %.6f from %.6f -> %s",
+                            hit_x, live_x, direction,
+                        )
+            key_down = getattr(self.key_sender, "key_down", None)
+            key_up = getattr(self.key_sender, "key_up", None)
+            if not callable(key_down) or not callable(key_up):
                 return False
             self._release_walk_hold()
             if key_down(direction) is False:
@@ -12444,9 +12643,15 @@ class MovementWorker(threading.Thread):
                     self._motion_arbiter_stage = None
                 self.last_observation, self.last_decision = observation, decision
                 if observation.player is not None:
-                    self._counterattack_marker_window.append(
-                        (int(getattr(frame, "sequence", -1)), float(observation.player.x))
+                    planned_direction = (
+                        decision.key if decision is not None
+                        and decision.key in ("left", "right") else None
                     )
+                    with self._counterattack_marker_lock:
+                        self._counterattack_marker_window.append(
+                            (int(getattr(frame, "sequence", -1)),
+                             float(observation.player.x), planned_direction)
+                        )
                 self._consume_counterattack_events()
                 if observation.player is not None:
                     gap = ((active_target_x - observation.player.x)

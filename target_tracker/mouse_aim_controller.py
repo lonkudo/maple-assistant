@@ -97,13 +97,15 @@ VK_F8 = 0x77
 
 @dataclass(frozen=True)
 class _TargetSample:
-    """调用方推送的最新目标点（视频像素坐标系）。"""
+    """调用方推送的最新目标点（视频或桌面像素坐标系）。"""
 
     x: float
     y: float
     confidence: float
     state: str
     pushed_at: float
+    screen_space: bool = False
+    immediate: bool = False
 
 
 def widget_image_region(label, image_width: int, image_height: int):
@@ -382,6 +384,36 @@ class MouseAimController:
                 pushed_at=monotonic(),
             )
 
+    def push_screen_target(
+        self,
+        screen_x: float,
+        screen_y: float,
+        confidence: float = 1.0,
+        state: str = "",
+        *,
+        immediate: bool = False,
+    ) -> None:
+        """Push a target already expressed in physical desktop pixels.
+
+        This avoids re-mapping a target through the video's client rectangle.
+        It is intended for a producer that has already completed the same
+        capture-pixel-to-screen conversion used by its display overlay.  An
+        ``immediate`` target intentionally bypasses the viewer's dead band and
+        speed limit, which is appropriate for a short automated cursor pass
+        but not for the interactive video viewer.
+        """
+
+        with self._lock:
+            self._target = _TargetSample(
+                x=float(screen_x),
+                y=float(screen_y),
+                confidence=float(confidence),
+                state=str(state),
+                pushed_at=monotonic(),
+                screen_space=True,
+                immediate=bool(immediate),
+            )
+
     def set_region(self, left: int, top: int, right: int, bottom: int) -> None:
         """设置视频画面在屏幕上的矩形区域（屏幕像素坐标）。"""
         if right <= left or bottom <= top:
@@ -479,12 +511,18 @@ class MouseAimController:
         if monotonic() - sample.pushed_at > self._target_stale_seconds:
             return
 
-        mapped = self.map_to_screen(sample.x, sample.y)
-        if mapped is None:
-            return  # region 尚未就绪：不动
-
-        screen_x, screen_y = self._clamp_to_screen(*mapped)
-        if self._dead_band_px > 0.0:
+        if sample.screen_space:
+            # The caller has already made the physical screen conversion.
+            # Applying the client-region mapping here would re-scale it when
+            # GDI's captured bitmap and Windows' logical client rectangle
+            # differ under DPI virtualization.
+            screen_x, screen_y = sample.x, sample.y
+        else:
+            mapped = self.map_to_screen(sample.x, sample.y)
+            if mapped is None:
+                return  # region 尚未就绪：不动
+            screen_x, screen_y = self._clamp_to_screen(*mapped)
+        if not sample.immediate and self._dead_band_px > 0.0:
             # 悬停：光标已经在目标上就不再下发移动指令。用真实光标位置判断
             # （而不是上一次下发的坐标），这样用户手动挪开、或游戏自己移动
             # 光标之后会自动重新对齐。
@@ -497,7 +535,7 @@ class MouseAimController:
                     return
         with self._lock:
             previous = self._last_cursor
-        if previous is not None:
+        if previous is not None and not sample.immediate:
             delta_x = screen_x - previous[0]
             delta_y = screen_y - previous[1]
             distance = (delta_x * delta_x + delta_y * delta_y) ** 0.5

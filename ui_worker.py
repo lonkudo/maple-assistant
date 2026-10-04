@@ -3799,7 +3799,11 @@ class UiWorker(threading.Thread):
         if label is not None:
             memory = getattr(self, "_memory_usage_text", "内存：读取中")
             self._render_memory_usage(memory)
-            device_text = (
+            # A fingerprint that Windows has not finished exposing is a local
+            # device-readiness state, not a pending server response.  Showing
+            # both messages together was contradictory and made it look as if
+            # the server was at fault.
+            device_text = None if status.code == "device_not_ready" else (
                 f"设备：{status.equipment_id}（左键复制）"
                 if status.equipment_id else "设备：等待服务器返回"
             )
@@ -3829,7 +3833,9 @@ class UiWorker(threading.Thread):
             else:
                 self._render_lie_usage(None)
                 if status.code in {"server", "device_not_ready"}:
-                    text = f"{status.message} · {device_text}"
+                    text = status.message
+                    if device_text:
+                        text += f" · {device_text}"
                 else:
                     text = f"未授权 / 已过期：{status.message} · {device_text}"
                 label.configure(text=text, foreground="#202020")
@@ -3865,6 +3871,25 @@ class UiWorker(threading.Thread):
         try:
             root.clipboard_clear()
             root.clipboard_append(equipment_id)
+            label = getattr(self, "_license_label", None)
+            if label is not None:
+                label.configure(
+                    text=str(label.cget("text")).replace("（左键复制）", "（已复制）")
+                )
+            previous_job = getattr(self, "_equipment_copy_restore_job", None)
+            if previous_job is not None:
+                try:
+                    root.after_cancel(previous_job)
+                except Exception:
+                    pass
+            # Render from the authoritative status again after the brief copy
+            # confirmation, so a heartbeat received in the meantime is never
+            # replaced with stale caption text.
+            self._equipment_copy_restore_job = root.after(
+                1500,
+                lambda: (setattr(self, "_equipment_copy_restore_job", None),
+                         self._refresh_license_ui()),
+            )
             if hasattr(self, "_control_status"):
                 self._control_status.configure(text="设备码已复制。")
             LOG.info("equipment ID copied to clipboard")
@@ -3894,10 +3919,13 @@ class UiWorker(threading.Thread):
                 widget.configure(text="")
             return
 
-        if status.remaining_auto_lie_unlimited:
-            remaining = "无限"
-        elif status.remaining_auto_lie_count is not None:
+        # A finite server balance always wins over the marker.  This keeps a
+        # just-validated limited activation from displaying the initial
+        # unlimited placeholder if an older response left that marker behind.
+        if status.remaining_auto_lie_count is not None:
             remaining = str(status.remaining_auto_lie_count)
+        elif status.remaining_auto_lie_unlimited:
+            remaining = "无限"
         else:
             remaining = "—"
 
@@ -5327,10 +5355,26 @@ class UiWorker(threading.Thread):
         # while the api pass was supposed to have the machine).  Resume it as soon as the pass is done.
         if getattr(self, "_api_auto_lie_patrol_paused", False) \
                 and not self._worker_is_running(self._api_lie_pass_worker):
-            if not self._api_auto_lie_post_confirm_scheduled:
+            completed = bool(getattr(
+                self._api_lie_pass_worker, "completed_successfully", False
+            ))
+            if completed and not self._api_auto_lie_post_confirm_scheduled:
                 self._begin_auto_lie_post_confirm()
-            if self._api_auto_lie_post_confirm_complete:
+            if completed and self._api_auto_lie_post_confirm_complete:
                 self._resume_patrol_after_api_pass()
+            elif not completed and not getattr(self, "_api_auto_lie_failed_handled", False):
+                # A WebSocket failure does not prove that the lie dialog has
+                # completed.  Clicking its fixed confirmation point, or
+                # resuming patrol beneath it, would operate the wrong game
+                # state.  Leave it for the operator to cancel/retry safely.
+                self._api_auto_lie_failed_handled = True
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎: pass ended before completion; confirmation click and patrol resume are skipped"
+                )
+                if hasattr(self, "_api_test_status"):
+                    self._api_test_status.configure(
+                        text="自动过测谎: 后端中断，未点击确认也未恢复运行；请按 Esc 处理。"
+                    )
         if not self._api_auto_lie_pending:
             return
         # One pass at a time.  A pending event waits for the running one, but not forever: a worker
@@ -5411,6 +5455,7 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_patrol_paused = False
         self._api_auto_lie_post_confirm_scheduled = False
         self._api_auto_lie_post_confirm_complete = False
+        self._api_auto_lie_failed_handled = False
         controller = getattr(self, "patrol_controller", None)
         if controller is not None and controller.is_enabled():
             try:

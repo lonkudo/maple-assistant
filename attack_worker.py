@@ -47,6 +47,7 @@ class AttackWorker(threading.Thread):
         jump_attack: bool = False,
         jump_attack_delay: float = 0.3,
         attack_resume_event: Optional[threading.Event] = None,
+        attack_slot: Any = None,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
@@ -81,6 +82,10 @@ class AttackWorker(threading.Thread):
         # phase ends.  A skipped beat must not impose another whole attack
         # interval before the first near-anchor attack can fire.
         self.attack_resume_event = attack_resume_event
+        # A one-use key replacement shared with stationary recovery.  It does
+        # not schedule an attack; it only changes the key for an approved
+        # cadence beat, so a hit cannot race a movement correction.
+        self.attack_slot = attack_slot
         # The optional sequence planner is deliberately separate from this
         # worker: it only selects a key for an already-approved cadence beat.
         self.combo_attack = ComboAttackPlan()
@@ -200,7 +205,12 @@ class AttackWorker(threading.Thread):
                 # Advance only for a beat that passed all non-arbiter gates.
                 # A null slot deliberately consumes this beat without
                 # reserving motion input or emitting a key.
-                selected_key = self.combo_attack.peek_key(self.attack_key)
+                normal_key = self.combo_attack.peek_key(self.attack_key)
+                slot = self.attack_slot
+                consume = getattr(slot, "consume", None)
+                selected_key = (
+                    consume(normal_key) if callable(consume) else normal_key
+                )
                 if selected_key is None:
                     self.combo_attack.consume()
                     LOG.info("combo attack idle beat")

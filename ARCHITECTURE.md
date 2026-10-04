@@ -155,6 +155,20 @@ it on its Tk thread and redraws the always-visible 设备码/usage line immediat
 Routine local license checks retain this online state for the same license,
 rather than erasing heartbeat data that local signed documents cannot contain.
 
+That merge deliberately resolves the two representations of the balance in one
+order: a numeric `remaining_auto_lie_count` in the response wins outright, the
+count is cleared only when the response carries the key with a null value, and
+`remaining_auto_lie_unlimited` is believed only together with that null. The
+desktop state therefore cannot hold a finite balance and the unlimited marker at
+once, which previously let a stale `true` flag render a genuinely limited grant
+as 无限 until the next restart; `UiWorker._render_lie_usage()` prints the count
+before the marker for the same reason. The authorization caption treats
+`device_not_ready` as a purely local device-readiness state, so it shows that
+message alone instead of pairing it with 设备：等待服务器返回, and clicking the
+device code renders （已复制） for 1.5 s before re-rendering from the authoritative
+status — a heartbeat that arrives during that second is not overwritten by stale
+caption text.
+
 ### Unified license edition and device notes
 
 Licensing no longer has NORMAL/NP product behavior. New server-issued records
@@ -249,7 +263,11 @@ Horizontal directions are mutually exclusive with each other, as are vertical di
 
 `motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, stationary-facing taps, the 站桩 anchor correction, and the **被撞反击** hit reaction. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
 
-The hit reaction is a motion type of its own (`COUNTERATTACK`) rather than a walk beside the cadence, for the same reason as the anchor correction: it carries its own attack tap, and it must not land on top of an attack, jump, buff, or climb. Like the stair jump it is exempt from the arbiter's shared motion gate — it is queued by evidence that already happened (an HP loss read from the shared capture), so a gate meant to keep ordinary travel from fighting itself would only delay the answer. `request_counterattack()` refuses to stack: one queued reaction is enough for a hit that spans several frames. `perform_counterattack()` is called under the arbiter's direction/hold locks, releases the ordinary walk hold, holds the step for `COUNTERATTACK_STEP_HOLD_SECONDS` (0.10 s), taps the independently bound key, then records the new facing and calls `note_attack()` so the fixed cadence cannot add a second beat.
+Patrol hit reactions are a motion type of their own (`COUNTERATTACK`) rather than a walk beside the cadence, so the short recovery hold and its bound counterattack key cannot overlap a jump, buff, climb, or ordinary attack. `request_counterattack()` refuses to stack, and the arbiter carries the optional hit X in its own token (`COUNTERATTACK:<direction>:<key>[:<hit_x>]`), so the reaction that finally executes still knows where the hit happened. For a clear knockback the direction is retained. For a walking-compensated hit (`abs(ΔX) < 0.003`) the token carries the marker X captured at the HP-drop frame, and `perform_counterattack()` re-derives the direction from the live marker against that saved X when it executes; the planned-walk opposite direction is the fallback, and a reaction whose marker has not moved a whole minimap column is sent as `direction="none"`, which taps the key without stepping. The reaction holds for `COUNTERATTACK_STEP_HOLD_SECONDS` (0.10 s), taps the independent key, then calls `note_attack()`.
+
+Three details keep one hit equal to one reaction. The cooldown is claimed where the hit is *decided* (`COUNTERATTACK_COOLDOWN_FRAMES` = 3 frames), not where the arbiter happens to run it, so a damage animation that lowers HP across adjacent reads cannot queue a row of delayed reactions. The reaction is resolved immediately from marker samples the movement worker has already published, with `COUNTERATTACK_MARKER_SEQUENCE_TOLERANCE` (2 captures) absorbing the fact that HP parsing and marker detection finish at slightly different moments; only a hit whose sample has genuinely not been published yet stays queued for the next movement tick. And when the marker moved less than 0.003, `COUNTERATTACK_IMPACT_LOOKBACK_FRAMES` (4 captures) is searched for motion *against* the planned patrol direction, which is the only surviving evidence of a knockback the character's own walk cancelled.
+
+The 站桩 half of the reaction owns no movement at all. `attack_slot.py` is a thread-safe, one-use key replacement created by the coordinator and handed to both sides: `AttackWorker` consumes it for the next cadence beat, and `MovementWorker._consume_attack_slot()` consumes it for the anchor correction and for 小碎步's middle attack. A stationary hit therefore only calls `replace_next()`, and whichever approved beat was going to happen anyway spends the counterattack key instead of the default one; an unconsumed replacement is retained rather than overwritten. This is what removed the competing movement transaction that used to fight the anchor correction for the same hit.
 
 The anchor correction is the one motion that also carries an attack (see the combat section). It is exclusive in the usual way — while it is queued or running, the fixed cadence cannot reserve a beat, so the correction’s own attack can never be doubled — but it is exempt from the arbiter’s shared post-attack grace, because that grace is measured from the correction’s own attack and would stretch a correction the operator expects roughly every 300 ms into one per second.
 
@@ -264,6 +282,16 @@ specific animation to end before sending its first Left/Right. The stationary
 recovery event has already prevented later attack beats. This avoids the game
 swallowing that initial walk key while the hold manager continues to renew a
 worker-side hold that never reached the game.
+
+That gate only covers the first key-down of one return. A key-down swallowed
+later in the same walk — by a hit reaction or by a cast — is caught by a progress
+watch that belongs to the walk itself: while the 站桩 return walks toward its
+temporary anchor, the worker tracks the marker's distance to that anchor, and
+after `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (5 captures, about one second
+at the shared cadence) without a 0.001 X improvement it releases the walk hold and
+arms the same direction again. The watch is reset by any progress, by a change of
+direction, and whenever the decision is no longer a far stationary return, so an
+ordinary patrol hold is never interrupted by it.
 
 ### Combat and consumables
 
@@ -280,8 +308,8 @@ Stair jump observes sustained position stalls and submits one direction-preservi
 **被撞反击** is an event path beside the fixed cadence, not a mode of it, and its two halves deliberately live in two workers:
 
 - **`status_worker.py` owns the fact of a hit.** The HP reading is trusted only at action-grade confidence, and a hit is a *decrease* between two such samples, so a one-frame wobble in a weak OCR/colour read cannot press a direction key. The worker publishes `(previous_hp, current_hp, frame_sequence)` through a callback and does nothing else with it — it never chooses a direction and never sends input.
-- **`movement_worker.py` owns the direction and the input.** `notify_hp_drop()` queues the hit, and `_consume_counterattack_events()` answers it on the movement thread, which is the only thread holding the marker history: the reaction looks up the marker X recorded for that exact capture sequence in a twelve-sample window and uses the displacement between the hit frame and the frame before it. Status and minimap analysis are independent threads, so "the X right now" would be the wrong sample; the frame-matched pair is what makes the direction belong to the hit. A missing pair, or a displacement below `COUNTERATTACK_X_DIRECTION_MIN_DELTA` (0.003), is skipped and logged rather than guessed.
-- **The wiring is coordinator-owned.** `assistant.py` sets `status_worker.hp_drop_callback` and `motion_arbiter.set_counterattack_callback()` only after both workers exist, and `ui_worker.py` applies the checkbox state through `MovementWorker.set_counterattack()`. Status and movement therefore share the hit without importing or controlling each other (concurrency rule 5).
+- **`movement_worker.py` owns the direction and input.** It records the exact hit-frame marker X in a twelve-sample window — now as `(sequence, x, planned patrol direction)` under `_counterattack_marker_lock`, because the status thread resolves the reaction from that window instead of only the movement thread — and claims the three-frame HP-drop cooldown when the hit is decided. `_queue_counterattack_from_samples()` is called immediately from `notify_hp_drop()`, so a hit whose marker sample is already published is queued without paying another capture tick; the sample may sit up to `COUNTERATTACK_MARKER_SEQUENCE_TOLERANCE` (2) captures from the HP frame, and only a genuinely unpublished sample leaves the hit on the retry queue. The evidence for the direction is the displacement across the hit frame, or, when that is below `COUNTERATTACK_X_DIRECTION_MIN_DELTA` (0.003), the largest motion over `COUNTERATTACK_IMPACT_LOOKBACK_FRAMES` (4) captures that opposed the planned walk. In stationary mode it places only the bound key into the shared one-use `AttackSlot` (`attack_slot.py`, `replace_next()`), so the next cadence, anchor-correction, or 小碎步 attack spends that key instead of the default one and no counterattack movement is created at all. On patrol, a clear displacement keeps the inferred direction; a compensated hit queues `request_counterattack(direction, key, hit_x)` so the later reaction can step back toward the saved X, and the token is sent with `direction="none"` when no direction survives — the key is then tapped without a step.
+- **The wiring is coordinator-owned.** `assistant.py` creates the single `AttackSlot`, passes it to `AttackWorker` and to `MovementWorker.set_attack_slot()`, sets `status_worker.hp_drop_callback` and `motion_arbiter.set_counterattack_callback()` only after both workers exist, and `ui_worker.py` applies the checkbox state through `MovementWorker.set_counterattack()`. Status and movement therefore share the hit without importing or controlling each other (concurrency rule 5), and the one-use slot is the only piece of state the two attack paths may share.
 
 ### Alerts, disconnects, and reconnect
 
@@ -330,11 +358,26 @@ available JSON `frame_result` messages before sending the next capture. It
 does not create concurrent WebSocket writers: the pass worker is the only
 socket owner, while capture, cursor execution, and UI remain separate.
 
+A full window is treated as back-pressure rather than loss. `api_lie_test.py`
+checks `has_capacity` before capturing, so it neither encodes a JPEG it must
+reject nor advances `frame_id` past a frame the server never saw (IDs must stay
+contiguous); while it waits it reports `pending_count/max_in_flight` at most once
+per second, and a stall of `FRAME_RESULT_STALL_SECONDS` (2.5 s) raises a
+`ConnectionError` to end the pass before the service's own ten-second no-frame
+timeout closes the socket. That error path sets no `completed_successfully`, which
+is exactly what the UI layer gates on: `UiWorker` schedules the dialog's measured
+confirmation click and the patrol resume only for a pass that completed its
+frame feed, and leaves a transport-failed pass to the operator
+(`自动过测谎: pass ended before completion; confirmation click and patrol resume are
+skipped`).
+
 The **测试API** video drill uses the same packed-JPEG handshake and sends no
 frames during its three-second visual settle. Its connection log and summary
 record the transport and handshake duration for field verification.
 
 The live frame stream uses the shared capture cadence. The temporary detection rectangle and one-shot target marker are display-only overlays and must never become tracking input.
+
+A server answer is fed to the real cursor as a physical desktop point. `api_lie_test.py` converts the answer with `point.to_screen()`, the same conversion its overlay draws with, and pushes it through `MouseAimController.push_screen_target(..., immediate=True)`. Sending it as client pixels would re-map an already-correct screen coordinate through the video's client rectangle, which is wrong under DPI virtualization because the captured bitmap and Windows' logical client size differ; `immediate=True` also bypasses the interactive viewer's dead band and speed limit, both of which are hover affordances rather than part of an automated pass.
 
 When the pass ends, `ui_worker.py` focuses the game and uses `click_screen()` to press the lie dialog's measured confirmation point. The point is `(630, 428)` on a 1080×768 client; all other clients derive from `(800, 472)` in the 1366×768 reference layout by width scaling. This post-pass acknowledgement is separate from WebSocket completion and must complete (or safely refuse when focus is unavailable) before patrol is resumed.
 

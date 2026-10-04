@@ -305,14 +305,17 @@ class MotionArbiter(threading.Thread):
             self._cv.notify_all()
             return True
 
-    def request_counterattack(self, direction: str, key: str) -> bool:
-        """Queue one HP-hit counter: step away, then tap its dedicated key."""
+    def request_counterattack(
+        self, direction: str, key: str, hit_x: float | None = None,
+    ) -> bool:
+        """Queue one HP-hit counter, optionally without an inferred step."""
 
         direction = str(direction).casefold()
         key = str(key).casefold()
-        if direction not in ("left", "right") or not key or key == "-":
+        if direction not in ("left", "right", "none") or not key or key == "-":
             return False
-        token = f"{COUNTERATTACK}:{direction}:{key}"
+        target = "" if hit_x is None else f":{float(hit_x):.6f}"
+        token = f"{COUNTERATTACK}:{direction}:{key}{target}"
         with self._cv:
             if not self._automation_allowed_locked():
                 self._set_refusal_locked("automation inactive (stop or patrol off)")
@@ -820,7 +823,9 @@ class MotionArbiter(threading.Thread):
                 LOG.warning("motion arbiter %s NOT delivered; event drained", token)
             return
         elif token.startswith(f"{COUNTERATTACK}:"):
-            _, direction, key = token.split(":", 2)
+            parts = token.split(":", 3)
+            _, direction, key = parts[:3]
+            hit_x = float(parts[3]) if len(parts) == 4 else None
             with self._cv:
                 callback = self._counterattack_callback
             if not callable(callback):
@@ -832,7 +837,7 @@ class MotionArbiter(threading.Thread):
                 LOG.warning("motion arbiter dropped counterattack: movement unavailable")
                 return
             try:
-                tap_ok = callback(direction, key) is not False
+                tap_ok = callback(direction, key, hit_x) is not False
             except Exception:
                 LOG.exception("motion arbiter counterattack failed")
                 tap_ok = False

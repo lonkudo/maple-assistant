@@ -443,6 +443,7 @@ def main() -> int:
         WindowKeySender,
     )
     from attack_worker import AttackWorker
+    from attack_slot import AttackSlot
     from small_step_worker import SmallStepWorker
     from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
@@ -1528,6 +1529,7 @@ def main() -> int:
     # The fixed-rate attack worker always exists so the UI can toggle it
     # live (Fixed Attack panel).  Without --enable-attack it starts disabled
     # and only waits; the panel flips ``enabled`` when the mode is selected.
+    attack_slot = AttackSlot()
     attack_worker = AttackWorker(
         key_sender,
         stop_event,
@@ -1537,6 +1539,7 @@ def main() -> int:
         motion_arbiter=motion_arbiter,
         direction_transition_event=direction_transition_active,
         attack_resume_event=stationary_attack_resume,
+        attack_slot=attack_slot,
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
@@ -2173,6 +2176,7 @@ def main() -> int:
             ),
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
+    movement_worker.set_attack_slot(attack_slot)
     motion_arbiter.set_facing_callback(movement_worker.perform_stationary_facing)
     # 站桩攻击's final correction onto the 桩: one tiny step, deliberately
     # concurrent with the fixed attack cadence (see

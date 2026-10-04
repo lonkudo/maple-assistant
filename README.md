@@ -96,16 +96,14 @@ resumed patrol.
   `(190,20,20)` — sits at 9.5× or more, so the narrower ratio keeps the marker
   while the pink and magenta reds that used to register as another player do not.
   See *Switching channel when another player is present*.
-- **被撞反击 answers a confirmed hit with one short step and one attack.** The
-  HP bar, not a timer, is the trigger: only an action-grade reading that really
-  fell between two frames starts a reaction, and the direction comes from the
-  character marker's own X movement in that same capture — the character is
-  knocked back, so it steps the other way and taps its own bound key once. A
-  single step that leaves X unclear (< 0.003) is skipped rather than guessed,
-  the reaction is serialized with jump/buff/climb so it can never overlap them,
-  and only one reaction can be queued at a time, so several frames of one hit
-  cannot stack delayed walks. Its hover hint warns that it is meant for maps with
-  few monsters. See *被撞反击 (hit reaction)*.
+- **被撞反击 answers a confirmed hit with its own attack key.** The HP bar, not
+  a timer, is the trigger. Stationary mode replaces the next approved normal,
+  tiny-step, or return-walk attack slot without adding a second movement. On
+  patrol, a clear knockback keeps the short reaction step; when normal walking
+  masks the displacement (< 0.003 X), the hit-frame X is retained and the short
+  step returns toward that saved position before tapping the counterattack key.
+  The three-frame cooldown prevents one damage animation from stacking reactions.
+  See *被撞反击 (hit reaction)*.
 - **多等 is entered in seconds.** The other-player channel switch waits the
   configured number of **seconds** (0–1200) after a proven need to leave, which is
   what makes the last-minute 组队 hand-over possible; the old field stored whole
@@ -120,6 +118,79 @@ resumed patrol.
   first instead of walking horizontally with stale layer state. If that
   preparation cannot be completed, the patrol stays stopped and the log says so.
   See *Switching channel when another player is present*.
+
+### Current release behavior (v1.2.105 – v1.2.112)
+
+These releases harden the two event paths that must never steal a beat from the
+operator: the 被撞反击 reaction and the automatic lie pass.
+
+- **被撞反击 replaces an approved attack beat instead of adding a movement.** A
+  shared, one-use `AttackSlot` (`attack_slot.py`) is created by the coordinator and
+  held by both the cadence worker and the movement worker. In 站桩攻击 a confirmed
+  hit only puts its bound key into that slot; the next attack beat that was going
+  to happen anyway — the fixed cadence, the anchor correction that carries the
+  stationary return, or 小碎步's middle attack — spends it instead of the default
+  key. The character therefore never receives a second movement transaction for
+  one hit, which is what used to fight the anchor correction. An unconsumed hit is
+  retained (a second hit does not overwrite the first) and is consumed exactly
+  once.
+- **The cooldown belongs to the HP drop, not to the arbiter's execution.** The
+  three-frame window (`COUNTERATTACK_COOLDOWN_FRAMES`) starts when the HP fall is
+  decided, so a damage animation that lowers HP across adjacent reads produces one
+  reaction rather than a row of delayed ones.
+- **A hit is answered on the spot, from published marker history.** The HP bar and
+  the minimap are analysed on independent threads, so the reaction is resolved from
+  the marker samples the movement worker has already published: the matching
+  capture sequence, or — when the two threads landed a fraction of a capture apart
+  — the nearest sample within `COUNTERATTACK_MARKER_SEQUENCE_TOLERANCE` (2
+  captures), logged as `被撞反击: HP frame … used nearby minimap frame …`.
+- **A knockback hidden by ordinary walking is still answered.** When the marker
+  moved less than 0.003 in X at the hit frame, the lookback of four captures
+  (`COUNTERATTACK_IMPACT_LOOKBACK_FRAMES`) is searched for motion *against* the
+  planned patrol direction — the push the character was walking into. When that is
+  found, the reaction steps the other way; when it is not, the reaction still
+  happens, carrying the hit-frame X so `perform_counterattack()` can step back
+  toward the saved position before tapping its key, or tap the key alone
+  (`direction="none"`) when the marker has not moved a whole minimap column.
+- **A far stationary return re-arms its direction after one second without
+  progress.** A 站桩 return that walks a long way back to its 桩 sends an ordinary
+  held direction; when a hit reaction or a cast makes the game ignore that
+  key-down, the hold used to be renewed invisibly while stationary recovery
+  suppressed every later attack. After
+  `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (5 captures, about one second) with
+  the marker not closing on the anchor, the hold is released and the direction is
+  armed again.
+- **The RTF1 pass waits for the server instead of discarding frames.** A full
+  negotiated window is brief back-pressure, not a failure: the pass stops capturing
+  while the window drains, keeps the next `frame_id` intact (frame IDs must stay
+  contiguous), and reports `RTF1 队列已满，等待后端返回（n/max）` once per second.
+  Silence longer than `FRAME_RESULT_STALL_SECONDS` (2.5 s) aborts the pass before
+  the service's own ten-second no-frame timeout can close the socket underneath
+  it.
+- **A pass that ends on a transport failure is not a completed lie.** The pass
+  worker publishes `completed_successfully`, and `ui_worker.py` schedules the
+  dialog's measured confirmation click and the patrol resume only after a complete
+  frame-feed round. A backend interruption therefore leaves both the game dialog
+  and the patrol alone: the run is logged as `connection_interrupted`, the status
+  line says 自动过测谎: 后端中断，未点击确认也未恢复运行；请按 Esc 处理。, and the operator
+  cancels or retries it safely.
+- **The drill moves the cursor to the same physical point as its overlay.** The
+  answer point is pushed in desktop pixels
+  (`MouseAimController.push_screen_target`) with `immediate=True`, so it is neither
+  re-mapped through the client rectangle — DPI virtualization can make a captured
+  bitmap and Windows' logical client size differ — nor filtered by the viewer's
+  dead band and speed limit.
+- **A finite auto-lie balance always beats the unlimited marker.** The desktop
+  state treats a numeric `remaining_auto_lie_count` as authoritative, clears a
+  finite balance only when the server sends null for it, and trusts
+  `remaining_auto_lie_unlimited` only together with that null. A just-activated
+  limited grant therefore shows its number immediately instead of 无限 until the
+  next restart, and the usage line prints the count before the marker.
+- **设备未就绪 is a local device state, not a server answer.** The authorization
+  line no longer prints 设备：等待服务器返回 beside 设备未就绪，稍后重试, and clicking the
+  设备码 shows （已复制） for 1.5 s before re-rendering from the authoritative status, so
+  a heartbeat that arrives inside that second is not replaced by stale caption
+  text.
 
 ## Configuration
 
@@ -211,6 +282,11 @@ retain their previous values.
 
 The response's additive `autolie_fingerprint_usage` object updates the same
 authorization line at once with total, success, failure, and remaining usage.
+A numeric remaining balance is authoritative: it replaces the previous value even
+when an earlier answer left the unlimited marker behind, and the marker itself is
+believed only when the response carries a null count *and* its unlimited flag. A
+just-activated limited grant therefore shows its number immediately rather than
+无限, and the usage line prints the count before the marker.
 The server treats an unfinalized row as success only after a two-minute
 server-time grace period at that device's next heartbeat, or after ten minutes
 through the stale-row cleanup. Both rules use server receipt time, so a fresh
@@ -258,11 +334,29 @@ rollback that still understands the newer schema.
 The server agent must deploy the client lifecycle support together: pull the
 server commit, load the existing `.env`, run `python manage.py migrate`, then
 restart Gunicorn. This applies migrations `0007_lie_event_lifecycle`,
-`0009_lie_event_pending_index`, and `0010_activationcode_auto_lie_quota`; the
-second merges the repository's two existing `0007` migration branches and adds
-the indexed stale-pending lookup, and the third adds the optional per-code
-auto-lie quota the operator console edits. Do not replace the database, TLS key,
-signing key, or auto-lie secret.
+`0009_lie_event_pending_index`, `0010_activationcode_auto_lie_quota`,
+`0011_code_owned_autolie_quota`, and `0012_one_current_code_per_equipment`.
+The last two move remaining auto-lie quota ownership to the currently bound
+activation code and enforce one current activation code per equipment. Do not
+replace the database, TLS key, signing key, or auto-lie secret.
+
+Before restarting, the server agent must back up PostgreSQL and verify the
+migration plan against production:
+
+```bash
+cd /path/to/maple-assistant-server
+. .venv/bin/activate
+set -a; . ./.env; set +a
+python manage.py showmigrations licensing
+python manage.py migrate --plan
+python manage.py migrate
+sudo systemctl restart maple-assistant-server
+```
+
+Then confirm `/api/v1/validate` and `/forbestop/` through the existing pinned
+HTTPS endpoint. If a rollback is needed, roll back only the application commit
+while retaining the migrated database and all existing keys; these migrations
+are additive and the previous compatible server must understand the result.
 
 Install one server-side periodic command, not one job per device. Run it every
 five minutes with the ten-minute cutoff:
@@ -406,15 +500,14 @@ attack mode off disables it with the rest of the combat controls.
    action-grade sample (confidence at or above the action threshold) that is
    *lower* than the previous action-grade sample counts as a hit. A one-frame bar
    wobble in a weak read therefore cannot press a direction key.
-2. **The direction comes from the same capture, not from "now".** The status and
-   minimap analyses run on independent threads, so the reaction is matched back to
-   the marker X recorded for that exact capture sequence (a twelve-sample window).
-   A hit whose frame has no marker pair, or whose X moved less than 0.003 between
-   the two frames, is skipped and logged instead of guessed.
-3. **The character steps against the knockback and attacks once.** The step is
-   0.10 s in the opposite direction to the recorded displacement (the marker
-   jumped right, so the character steps left — back toward whatever hit it), and
-   the bound key is tapped immediately after the step, in the same atomic motion.
+2. **The hit-frame X is retained.** Status and minimap analyses run on independent
+   threads, so the reaction uses the marker X recorded for that exact capture
+   sequence in a twelve-sample window. In stationary mode this only replaces the
+   next existing attack slot with the bound counterattack key; it adds no step.
+3. **Patrol returns toward a compensated hit before attacking.** A clear X
+   displacement keeps the existing 0.10 s step against the knockback. When patrol
+   movement masks the displacement (< 0.003 X), the later reaction instead steps
+   toward the saved hit X, then taps the bound key in the same atomic motion.
 4. **It never overlaps anything else.** The reaction is queued through
    `motion_arbiter.py` as its own motion type, so it cannot run during a climb,
    drop, stair jump, buff, 小碎步, or an anchor correction; the step releases the
@@ -422,8 +515,18 @@ attack mode off disables it with the rest of the combat controls.
    several frames of one hit produce one reaction rather than a queue of delayed
    walks. The tap is also registered as an attack, so the fixed cadence does not
    add a second beat on top of it.
+5. **In 站桩攻击 the reaction owns no movement at all.** The hit is placed into the
+   shared one-use `AttackSlot` (`attack_slot.py`), and the next approved beat —
+   the fixed cadence, the anchor correction that carries the stationary return,
+   or 小碎步's middle attack — spends that key instead of its own. Nothing is
+   queued behind a correction, and an unconsumed hit is kept until a beat uses it.
 
-The log names each outcome: `被撞反击 queued: HP 4210->4188 frame=81234 X +0.014286 -> left + ctrl`, `被撞反击 executed: left 0.10s + ctrl`, `被撞反击 skipped: HP 4210->4188 frame=81234 X direction unclear (Δx=+0.001190)`, and `被撞反击 skipped: vertical recovery is active`.
+The three-frame cooldown begins when the HP fall is decided, preventing the four-frame game invincibility sequence from producing repeated reactions. The log names each outcome:
+`被撞反击 queued as next stationary attack slot: HP 4210->4188 frame=81234 key=ctrl`,
+`被撞反击 queued immediately: HP 4210->4188 frame=81234 compensated walk left (Δx=+0.000595) -> right + ctrl`,
+`被撞反击: returning toward hit X 0.469048 from 0.462000 -> right`,
+`被撞反击 executed: attack only + ctrl`, and
+`被撞反击 skipped: HP-drop cooldown through frame 81237 (current 81235)`.
 
 The hover hint on the checkbox is the operator-facing warning: 建议在怪物少的地图使用，否则频繁被撞影响正常输出。
 
@@ -437,6 +540,15 @@ Right during that animation can be ignored by the game; the old hold manager
 then kept extending a direction the game had never accepted, while return
 protection suppressed every later attack. The clean-tick gate prevents that
 stationary-return freeze without changing the ordinary walking path.
+
+That gate covers the first key-down of a far return only. A key-down swallowed
+later in the same walk — a hit reaction or a cast can consume it — is caught by
+the progress watch instead: after `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (5
+captures, about one second at 5 FPS) in which the marker does not close on the
+temporary anchor, the walk hold is released and the same direction is armed
+again (`STATIONARY RETURN walk made no X progress toward anchor for 5 frames
+(distance=…); releasing and re-arming left`). A direction that is really walking
+keeps its hold: 0.001 X of progress restarts the watch.
 
 Two related rules protect that motion:
 
@@ -532,11 +644,17 @@ The lie detector shares the normal 5 FPS capture cadence. When automatic lie han
    a compact JSON metadata section plus raw JPEG bytes, with no Base64 expansion.
    At 5 FPS, a bounded burst window keeps at most three frames in flight; one
    worker remains the sole WebSocket reader/writer and matches responses by `frame_id`.
-5. The restored **测试API** video drill performs that same authenticated RTF1
+5. A full window is back-pressure, not a failure. The pass stops capturing while
+   the server returns frame results, keeps the next `frame_id` intact because the
+   IDs must stay contiguous, and reports `RTF1 队列已满，等待后端返回（n/max）` once per
+   second. Silence beyond `FRAME_RESULT_STALL_SECONDS` (2.5 s) aborts the pass
+   before the service's ten-second no-frame timeout closes the socket, and the run
+   is recorded as `connection_interrupted`.
+6. The restored **测试API** video drill performs that same authenticated RTF1
    handshake at video start, waits the three-second visual-settle period without
    uploading, then records its handshake timing and transport in its run report.
-6. The round is ended with the API’s `round_end` message and the WebSocket is closed normally.
-7. Accounting follows the lifecycle, not the video: a pass reports `STARTED` once
+7. The round is ended with the API’s `round_end` message and the WebSocket is closed normally.
+8. Accounting follows the lifecycle, not the video: a pass reports `STARTED` once
    its handshake is ready, then `success` when the minimap marker is seen again
    after the pass. The failure outcome `failed_marker_missing` is written only when
    the character is really in the black room — the marker stays absent for fifteen
@@ -544,6 +662,12 @@ The lie detector shares the normal 5 FPS capture cadence. When automatic lie han
    closing the app) leaves the event pending instead of inventing a failure. The
    manual **测试API** drill keeps the older immediate-success accounting, because
    it is an operator-run check rather than a live pass.
+9. The dialog's measured confirmation point is pressed, and patrol resumed, only
+   after a **complete** frame-feed round (`completed_successfully`). A pass that
+   ended on a transport failure is not a completed lie: neither the click nor the
+   patrol resume happens, the log records `自动过测谎: pass ended before completion;
+   confirmation click and patrol resume are skipped`, and the status line asks the
+   operator to handle it with Esc.
 
 The purple detection area and one-shot target indication are visual feedback only. They are not used as tracking input and do not block target chasing.
 
@@ -632,8 +756,17 @@ version to its exact source snapshot; use `git show release/vX.Y.Z` when
 investigating an older build. Tags are created after the release ZIP is built,
 and must not be moved after publication.
 
+A version stays untagged while its source and its built package differ. The
+`release/TodoHelper-1.2.112.zip` package was staged before
+`COUNTERATTACK_COOLDOWN_FRAMES` was raised from 2 to 3, so the working tree is one
+constant ahead of that ZIP: `1.2.112` is listed without a tag, and the tag belongs
+to the commit whose package is actually shipped (a rebuilt `1.2.112`, or the next
+patch version).
+
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.2.112` | — | 被撞反击 as an attack-slot replacement, RTF1 back-pressure, a failed pass that never clicks the lie dialog, and a finite balance that wins over the unlimited marker. |
+| `1.2.105` – `1.2.111` | — | Intermediate builds of the same work. |
 | `1.2.104` | `release/v1.2.104` | Reload-proven channel switch, 被撞反击, 多等 in seconds, post-switch map re-anchor. |
 | `1.2.103` | — | The lie credential survives a completed pass. |
 | `1.2.96` | `release/v1.2.96` | Version-bump checkpoint commit only. |
