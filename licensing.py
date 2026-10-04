@@ -517,8 +517,13 @@ def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus
         SERVER_LOG.warning(
             "activation rejected by server status=%s code=%s", exc.status, exc.code
         )
-        return LicenseStatus(
-            False, f"server:{exc.code}", exc.message
+        # Rejected activation replies still carry the safe public device
+        # summary.  Keep it: a known device must not lose its equipment ID
+        # merely because the submitted replacement code was rejected.
+        return _with_server_device(
+            LicenseStatus(False, f"server:{exc.code}", exc.message),
+            exc.data,
+            authoritative_credentials=False,
         )
     except DeviceNotReadyError:
         SERVER_LOG.info("activation postponed: device fingerprint is not ready")
@@ -570,7 +575,14 @@ def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
         SERVER_LOG.warning(
             "license heartbeat rejected status=%s code=%s", exc.status, exc.code
         )
-        return LicenseStatus(False, f"server:{exc.code}", exc.message)
+        # An expired/revoked heartbeat is still an authenticated server
+        # response about this device, so retain its equipment identity for
+        # the header instead of rendering it as unknown.
+        return _with_server_device(
+            LicenseStatus(False, f"server:{exc.code}", exc.message),
+            exc.data,
+            authoritative_credentials=False,
+        )
     except DeviceNotReadyError:
         SERVER_LOG.info("license heartbeat postponed: device fingerprint is not ready")
         return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
