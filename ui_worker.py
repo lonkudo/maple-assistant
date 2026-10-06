@@ -50,9 +50,10 @@ from reconnect_worker import (
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
 from update_manager import (
-    UpdateError, export_user_config, import_user_config,
+    UpdateError, export_user_config,
     find_newer_desktop_update,
-    schedule_hidden_restart, schedule_package_update,
+    schedule_config_import_restart, schedule_hidden_restart,
+    schedule_package_update,
 )
 from runtime_paths import application_root, package_format
 from auto_lie_secret import clear_server_secret, get_server_secret, has_server_secret
@@ -6887,14 +6888,16 @@ class UiWorker(threading.Thread):
             LOG.info("%s已取消", LOG_CONFIG_IMPORT)
             return
         try:
-            import_user_config(Path(source), Path(self.user_config_path))
+            schedule_config_import_restart(
+                Path(source), application_root(__file__)
+            )
         except UpdateError as exc:
             LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, exc)
             return
-        if not self._schedule_restart():
-            LOG.warning("%s已载入，但自动重启未能安排；请手动重新启动。", LOG_CONFIG_IMPORT)
-            return
-        LOG.info("%s成功：已载入 %s；正在重启助手以应用新配置。", LOG_CONFIG_IMPORT, source)
+        LOG.info(
+            "%s成功：已排队 %s；当前实例退出后将写入并自动重启。",
+            LOG_CONFIG_IMPORT, source,
+        )
         self._close_for_restart()
 
     def _export_user_config(self) -> None:

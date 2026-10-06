@@ -426,6 +426,30 @@ def import_user_config(source: Path, destination: Path) -> Path:
     return destination
 
 
+def validate_user_config_import(source: Path, destination: Optional[Path] = None) -> Path:
+    """Validate a selected import without touching the live configuration.
+
+    Import/restart is a two-process operation: the currently running helper
+    must not replace its own live file while shutdown callbacks can still save
+    a panel.  The restart helper performs the actual replacement after this
+    process has exited.  This preflight retains immediate, useful validation
+    for the selected file without creating that write race.
+    """
+
+    source = Path(source).resolve()
+    if not source.is_file():
+        raise UpdateError("找不到要导入的 user_config.json。")
+    if destination is not None and source == Path(destination).resolve():
+        raise UpdateError("所选文件已经是当前 user_config.json。")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UpdateError(f"配置文件不是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise UpdateError("配置文件格式错误：根内容必须是 JSON 对象。")
+    return source
+
+
 def _persistent_helper(install_root: Path) -> Path:
     helper = Path(install_root).resolve() / "todohelper_update.ps1"
     if not helper.is_file():
@@ -459,6 +483,22 @@ def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
     )
 
 
+def schedule_config_import_restart(source: Path, install_root: Path) -> Path:
+    """Queue a validated import for the post-exit restart helper.
+
+    The old singleton exits before the helper changes ``user_config.json``;
+    therefore a departing instance cannot retain or rewrite the destination
+    while the imported file is installed.
+    """
+
+    root = Path(install_root).resolve()
+    source = validate_user_config_import(source, root / "user_config.json")
+    return _run_persistent_helper(
+        ["-Mode", "Restart", "-TargetPid", str(os.getpid()),
+         "-InstallRoot", str(root), "-ConfigSource", str(source)], root
+    )
+
+
 def schedule_package_update(package: DesktopUpdate, install_root: Path) -> Path:
     """Apply a same-format ZIP only after the running app has exited."""
 
@@ -476,5 +516,6 @@ __all__ = [
     "DesktopUpdate", "UpdateError", "UpdateResult", "apply_desktop_update",
     "desktop_roots", "export_user_config", "find_newer_desktop_update",
     "import_user_config", "remove_consumed_update_package",
-    "schedule_hidden_restart", "schedule_package_update",
+    "schedule_config_import_restart", "schedule_hidden_restart",
+    "schedule_package_update", "validate_user_config_import",
 ]

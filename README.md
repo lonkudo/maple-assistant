@@ -34,7 +34,7 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
-The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer compatible release ZIP. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format.
+The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer compatible release ZIP. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. The same helper owns **导入配置**: the selected JSON is validated first, the running assistant exits, then the helper atomically replaces `user_config.json` and launches the new instance. This prevents the departing instance from retaining or overwriting its own live configuration during import.
 
 ### Current release behavior (v1.2.2)
 
@@ -201,7 +201,7 @@ Two configuration files keep personal settings separate from shipped defaults:
 | `user_config.json` | Your keys, layers, patrol route, alerts, quick messages, and personal settings. |
 | `system_config.json` | Application defaults and internal behavior settings. |
 
-Use **导入配置** and **导出配置** in the running-log panel to move your personal configuration between installations. Import and export actions are recorded in the log.
+Use **导入配置** and **导出配置** in the running-log panel to move your personal configuration between installations. Import validates the selected JSON and then restarts the assistant; the replacement is performed only after the old process has fully exited, so its configuration file is never self-locked or overwritten by shutdown callbacks. Export writes `桌面\\助手配置\\新配置.json`. Import and export actions are recorded in the log.
 
 ## Licensing and activation service
 

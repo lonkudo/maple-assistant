@@ -14,6 +14,7 @@ param(
     [Parameter(Mandatory = $true)] [int]$TargetPid,
     [Parameter(Mandatory = $true)] [string]$InstallRoot,
     [string]$PackagePath = "",
+    [string]$ConfigSource = "",
     [ValidateSet("source", "frozen")] [string]$PackageFormat = "source"
 )
 
@@ -65,6 +66,47 @@ function Copy-Package([string]$source, [string]$destination) {
     }
 }
 
+function Install-ImportedConfig([string]$sourcePath, [string]$destinationRoot) {
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Imported configuration is missing: $sourcePath"
+    }
+    try {
+        $payload = Get-Content -LiteralPath $sourcePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $payload -or $payload -is [System.Array]) {
+            throw "root must be a JSON object"
+        }
+    } catch {
+        throw "Imported configuration is not valid JSON: $($_.Exception.Message)"
+    }
+    $target = Join-Path $destinationRoot "user_config.json"
+    $temporary = Join-Path $destinationRoot (".user_config.json." + [guid]::NewGuid().ToString("N") + ".importing")
+    Copy-Item -LiteralPath $sourcePath -Destination $temporary -Force
+    try {
+        $lastError = $null
+        for ($i = 0; $i -lt 150; $i++) {
+            try {
+                # File.Replace preserves the all-or-nothing handoff when the
+                # destination already exists.  The old TodoHelper process was
+                # waited out above, so this retry only covers a short-lived
+                # external handle such as antivirus indexing.
+                if (Test-Path -LiteralPath $target -PathType Leaf) {
+                    [System.IO.File]::Replace($temporary, $target, $null)
+                } else {
+                    [System.IO.File]::Move($temporary, $target)
+                }
+                Write-UpdateLog "imported user configuration after previous instance exited"
+                return
+            } catch {
+                $lastError = $_
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        throw "Could not replace user configuration after shutdown: $($lastError.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
 try {
     Write-UpdateLog "helper started mode=$Mode pid=$TargetPid"
     Wait-ForTarget $TargetPid
@@ -80,6 +122,9 @@ try {
         } finally {
             Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+    if ($ConfigSource) {
+        Install-ImportedConfig $ConfigSource $root
     }
     $launcher = Join-Path $root "launch_assistant.vbs"
     if (-not (Test-Path -LiteralPath $launcher)) { throw "Launcher missing after update." }
