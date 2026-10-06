@@ -115,10 +115,12 @@ does not modify vendor `autolie_api/` code.
 WebSocket/cursor stream. Once the authenticated WebSocket handshake is ready,
 the adapter persists a UUID locally and asynchronously queues a `STARTED`
 report with a random 0–30 second spread. The upload stream never waits for that
-request. After the 15-second tracking window, marker recovery queues `success`;
-only a verified black-room marker loss queues `failed_marker_missing`. Terminal
-reports use their own 0–30 second spread, but are never scheduled before
-`STARTED` has been acknowledged.
+request. The live stream is outcome-controlled rather than fixed to a frame
+count: after the feed begins, the UI observes the game from 10 to 40 seconds.
+Two consecutive fresh captures containing a sufficiently covered 40×40 blue
+success box queue `success`; only a verified black-room marker loss queues
+`failed_marker_missing`. Terminal reports use their own 0–30 second spread,
+but are never scheduled before `STARTED` has been acknowledged.
 
 The outbox makes retries idempotent by UUID. A normal close queues success for
 unfinished events, gives the sender a bounded 500 ms chance, and preserves any
@@ -139,16 +141,21 @@ with no `started_due_at`) is migrated on load into a start followed by its prior
 `success`, so an update cannot orphan an older pending event.
 
 The terminal outcome is evidence-based, and the failure evidence belongs to the
-UI layer because the marker is read there: `ui_worker.py` arms a verification
-window when the pass worker reports a result with an accounting event, ignores
-the first `_AUTO_LIE_FAILURE_GRACE_SECONDS` (3 s) so a normal transition is not
-counted, queues `success` on the first fresh snapshot that has a marker
-(`marker_confidence > 0`), and queues `failed_marker_missing` only after
-`_AUTO_LIE_FAILURE_MISSING_FRAMES` (15) consecutive fresh snapshots without one
-— the black-room state. An interrupted pass (Esc, application close) is not a
-failure and stays pending for the server's own settlement. The manual **测试API**
-drill is an operator-run check of the same upstream service, so it keeps the
-immediate begin-and-finalize-`success` accounting instead of the live lifecycle.
+UI layer because the marker is read there. `ui_worker.py` arms the observer on
+`feed_started`, waits ten seconds for the lie dialog to reach its terminal
+state, then accepts `success` only after two consecutive fresh blue-box matches
+at at least 0.90 coverage. It queues `failed_marker_missing` only after
+`_AUTO_LIE_FAILURE_MISSING_FRAMES` (15) consecutive fresh snapshots without a
+marker — the black-room state. A server-initiated socket close is transport
+state, not a verdict: capture and observation continue through the 40-second
+deadline. If the socket is closed and neither visual result arrives by then,
+the agreed fallback queues `success` without a confirmation click, resumes the
+previously paused patrol, and ignores the stale detector square until it clears.
+That clear event resets the one-window guard so the next real lie dialog is not
+disarmed. An interrupted pass (Esc, application close) is not a failure and
+stays pending for the server's own settlement. The manual **测试API** drill is an
+operator-run check of the same upstream service, so it keeps the immediate
+begin-and-finalize-`success` accounting instead of the live lifecycle.
 
 The server keeps its established `device` response for compatibility and adds
 `autolie_fingerprint_usage` containing only current auto-lie permission,
@@ -251,7 +258,27 @@ Patrol has these core rules:
 - A missing route produces a safe wait state rather than accidental movement.
 - Stand-still attack captures its temporary position at each manual patrol start and does not require recorded layer membership.
 
+Endpoint turnover is a short movement-owned transaction. `_advance_route_endpoint()`
+immediately releases the old held direction and records the one expected
+opposite direction. It sets `direction_transition_event`, which blocks attack
+and other competing input, through the 100 ms neutral interval. `_send_walk_hold()`
+is the only sender that may satisfy that pending direction; it waits only for a
+pre-existing attack (bounded to 300 ms per fresh frame), sends the new key, then
+holds the gate for a 60 ms post-send guard. The gate is cleared immediately
+afterwards, and a watchdog clears a stranded pending turnover on lifecycle
+interruption. This arrangement prevents overlapping directions and attack
+swallowing without making the endpoint gate a long patrol pause.
+
 Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
+
+An attached rope climb has a separate raw-position watchdog. `ClimbState`
+retains its last marker X and Y; four consecutive fresh captures with neither
+coordinate changing, outside a next-layer arrival confirmation, indicate that
+the physical Up hold was likely interrupted even though the climb state remains
+attached. The movement worker releases the stale Up claim and performs one
+`Alt+Left` persistent climb jump, then resumes normal attachment verification.
+This is deliberately earlier than the world-Y stall fallback and is suppressed
+at rope-top arrival, where a stationary marker is normal.
 
 ### Input, focus, and motion arbitration
 
@@ -290,7 +317,7 @@ That gate only covers the first key-down of one return. A key-down swallowed
 later in the same walk — by a hit reaction or by a cast — is caught by a progress
 watch that belongs to the walk itself: while the 站桩 return walks toward its
 temporary anchor, the worker tracks the marker's distance to that anchor, and
-after `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (5 captures, about one second
+after `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (3 captures, about 0.6 seconds
 at the shared cadence) without a 0.001 X improvement it releases the walk hold and
 arms the same direction again. The watch is reset by any progress, by a change of
 direction, and whenever the decision is no longer a far stationary return, so an

@@ -152,12 +152,12 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   happens, carrying the hit-frame X so `perform_counterattack()` can step back
   toward the saved position before tapping its key, or tap the key alone
   (`direction="none"`) when the marker has not moved a whole minimap column.
-- **A far stationary return re-arms its direction after one second without
+- **A far stationary return re-arms its direction after about 0.6 seconds without
   progress.** A 站桩 return that walks a long way back to its 桩 sends an ordinary
   held direction; when a hit reaction or a cast makes the game ignore that
   key-down, the hold used to be renewed invisibly while stationary recovery
   suppressed every later attack. After
-  `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (5 captures, about one second) with
+  `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (3 captures, about 0.6 seconds) with
   the marker not closing on the anchor, the hold is released and the direction is
   armed again.
 - **The RTF1 pass waits for the server instead of discarding frames.** A full
@@ -167,13 +167,13 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   Silence longer than `FRAME_RESULT_STALL_SECONDS` (2.5 s) aborts the pass before
   the service's own ten-second no-frame timeout can close the socket underneath
   it.
-- **A pass that ends on a transport failure is not a completed lie.** The pass
-  worker publishes `completed_successfully`, and `ui_worker.py` schedules the
-  dialog's measured confirmation click and the patrol resume only after a complete
-  frame-feed round. A backend interruption therefore leaves both the game dialog
-  and the patrol alone: the run is logged as `connection_interrupted`, the status
-  line says 自动过测谎: 后端中断，未点击确认也未恢复运行；请按 Esc 处理。, and the operator
-  cancels or retries it safely.
+- **A server-close is not a visual verdict.** Once feeding starts, the UI watches
+  from 10 through 40 seconds for two consecutive 40×40 blue success-box matches
+  or the black-room missing-marker failure. A closed socket leaves that observer
+  running. If it is still visually unresolved at 40 seconds, the pass is recorded
+  as success without clicking a fixed confirmation point; patrol resumes and the
+  old detector square is ignored until it clears, after which the next real lie
+  window can arm normally.
 - **The drill moves the cursor to the same physical point as its overlay.** The
   answer point is pushed in desktop pixels
   (`MouseAimController.push_screen_target`) with `immediate=True`, so it is neither
@@ -459,9 +459,27 @@ A one-row band is a reference row, not the whole floor: on a floor whose canvas 
 - Patrol, rope return, recovery, small-step, buffs, and special motions use coordinated input ownership so a stale key cannot keep the character moving.
 - If patrol has no recorded route, the assistant remains in a safe stand-still state and combat functions can still operate.
 
+At a patrol endpoint, TodoHelper performs a movement-owned turnover. As soon as
+the marker reaches the left-most or right-most arrival band, it releases the
+old direction, reserves a 100 ms neutral input interval, then sends the one
+opposite direction selected by the next route phase. Attack input is blocked
+only through that neutral interval and a 60 ms post-send guard. A pre-existing
+attack is allowed a short bounded time to finish; if it is still active, the
+reverse is retried from the next minimap frame instead of competing with it.
+This keeps endpoint turns responsive while preventing attack, jump, or stale
+walk input from swallowing the reverse.
+
 ### Returning to the route from a lower floor
 
 A return climb heads for the recorded floor directly above the floor it is climbing from, capped at the bottom of the patrol range — not for the next route layer, which sits one floor too high while the character is below the range (v1.2.21). The arrival test uses that floor's band widened by one marker row on both sides.
+
+While the character is already attached to a rope, TodoHelper also watches the
+raw minimap position. If both X and Y remain unchanged for four fresh captures
+away from a confirmed platform arrival, it treats the climb as stuck (for
+example, an Up hold released during a focus interruption) and restarts it with
+an `Alt+Left` climb jump. The rule does not run during next-layer arrival
+confirmation, where an unchanged marker is expected while stepping off the
+rope.
 
 A recorded floor **outside** the patrol range that the climb has climbed up to is a real arrival, not a stall: the return rebases on it (`RETURN TO ROUTE: still on layer2 outside range; climbing back`) and continues from that floor's own rope. This is what ends the loop where the character stood on layer2 at the platform top, world Y stopped advancing, and the climb detector released Up and re-jumped forever.
 
@@ -547,10 +565,10 @@ stationary-return freeze without changing the ordinary walking path.
 
 That gate covers the first key-down of a far return only. A key-down swallowed
 later in the same walk — a hit reaction or a cast can consume it — is caught by
-the progress watch instead: after `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (5
-captures, about one second at 5 FPS) in which the marker does not close on the
+the progress watch instead: after `STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES` (3
+captures, about 0.6 seconds at 5 FPS) in which the marker does not close on the
 temporary anchor, the walk hold is released and the same direction is armed
-again (`STATIONARY RETURN walk made no X progress toward anchor for 5 frames
+again (`STATIONARY RETURN walk made no X progress toward anchor for 3 frames
 (distance=…); releasing and re-arming left`). A direction that is really walking
 keeps its hold: 0.001 X of progress restarts the watch.
 
@@ -657,21 +675,24 @@ The lie detector shares the normal 5 FPS capture cadence. When automatic lie han
 6. The restored **测试API** video drill performs that same authenticated RTF1
    handshake at video start, waits the three-second visual-settle period without
    uploading, then records its handshake timing and transport in its run report.
-7. The round is ended with the API’s `round_end` message and the WebSocket is closed normally.
-8. Accounting follows the lifecycle, not the video: a pass reports `STARTED` once
-   its handshake is ready, then `success` when the minimap marker is seen again
-   after the pass. The failure outcome `failed_marker_missing` is written only when
-   the character is really in the black room — the marker stays absent for fifteen
-   fresh captures after a three-second grace period. An interrupted pass (Esc, or
-   closing the app) leaves the event pending instead of inventing a failure. The
-   manual **测试API** drill keeps the older immediate-success accounting, because
-   it is an operator-run check rather than a live pass.
-9. The dialog's measured confirmation point is pressed, and patrol resumed, only
-   after a **complete** frame-feed round (`completed_successfully`). A pass that
-   ended on a transport failure is not a completed lie: neither the click nor the
-   patrol resume happens, the log records `自动过测谎: pass ended before completion;
-   confirmation click and patrol resume are skipped`, and the status line asks the
-   operator to handle it with Esc.
+7. The live pass is ended by the outcome rather than a fixed 15-second frame
+   window. From ten seconds after feeding begins through the 40-second deadline,
+   the assistant looks for two consecutive captures containing the blue 40×40
+   success area at 90% coverage or more. A confirmed success stops the stream,
+   clicks the measured confirmation point, and resumes the patrol.
+8. Accounting follows that lifecycle, not the video: a pass reports `STARTED`
+   once its handshake is ready. The failure outcome `failed_marker_missing` is
+   written only when the character is really in the black room — the marker stays
+   absent for fifteen fresh captures. Esc or closing the app leaves the event
+   pending instead of inventing a failure; the manual **测试API** drill keeps its
+   immediate-success accounting because it is an operator-run check rather than
+   a live pass.
+9. A server-closed WebSocket does not immediately end the result check. The
+   assistant retains capture through the same 40-second window. If no visual
+   success or black-room failure appears by that deadline, it records success by
+   policy, resumes patrol, and does **not** send an unsafe fixed confirmation
+   click. The detector then ignores the old square until it disappears, which
+   prevents duplicate billing while allowing the next real lie window to start.
 
 The purple detection area and one-shot target indication are visual feedback only. They are not used as tracking input and do not block target chasing.
 

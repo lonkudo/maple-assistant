@@ -5,8 +5,11 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import logging
+import os
 from pathlib import Path
 import threading
+import time
 from typing import Any, Optional
 
 
@@ -14,6 +17,10 @@ USER_CONFIG_NAME = "user_config.json"
 USER_CONFIG_VERSION_KEY = "user_config_updated_at"
 SYSTEM_CONFIG_NAME = "system_config.json"
 LEGACY_UNIFIED_NAME = "config.json"
+_CONFIG_REPLACE_ATTEMPTS = 15
+_CONFIG_REPLACE_RETRY_SECONDS = 0.20
+
+LOG = logging.getLogger(__name__)
 
 SECTION_FILES = {
     "minimap_calibration": "minimap_calibration.json",
@@ -178,14 +185,48 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _replace_with_retry(temporary: Path, destination: Path) -> None:
+    """Atomically replace a file, tolerating short Windows sharing locks.
+
+    Import/restart can briefly overlap the departing instance, Explorer's
+    preview handler, or antivirus.  ``os.replace`` (used by ``Path.replace``)
+    then raises WinError 5 even though the target becomes writable a moment
+    later.  Retrying keeps atomic replacement while avoiding a startup crash.
+    """
+
+    last_error: Optional[PermissionError] = None
+    for attempt in range(_CONFIG_REPLACE_ATTEMPTS):
+        try:
+            temporary.replace(destination)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 < _CONFIG_REPLACE_ATTEMPTS:
+                time.sleep(_CONFIG_REPLACE_RETRY_SECONDS)
+    assert last_error is not None
+    raise last_error
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    # A per-process temporary avoids collisions with a previous instance that
+    # may still be closing.  It is always cleaned after a failed replacement,
+    # so the user never has to recover a visible ``user_config.json.tmp``.
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
-    temporary.replace(path)
+    try:
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _replace_with_retry(temporary, path)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def _user_content(data: dict[str, Any]) -> dict[str, Any]:
@@ -284,7 +325,16 @@ class ConfigStore:
             if not user_config_version(self.user_path):
                 changed = True
             if changed:
-                _write_user_json(self.user_path, data, _read_json(self.user_path))
+                try:
+                    _write_user_json(self.user_path, data, _read_json(self.user_path))
+                except PermissionError:
+                    # A valid imported config can still be used this launch.
+                    # Do not make the whole helper fail merely because a short
+                    # external Windows lock outlived the bounded retry window.
+                    LOG.warning(
+                        "用户配置暂时被其他程序占用；已保留当前文件并继续启动，"
+                        "下次保存会再次写入"
+                    )
 
     def _document_for_section(self, section: str) -> dict[str, Any]:
         if section in SYSTEM_SECTIONS:

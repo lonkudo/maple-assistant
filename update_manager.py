@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import zipfile
 from typing import Iterable, Optional
 
@@ -22,6 +24,8 @@ _SKIP_DIRECTORIES = {
 }
 _PACKAGE_NAME = re.compile(r"(?:todohelper|maple.*assistant)", re.IGNORECASE)
 _FROZEN_ENTRY_NAMES = {"todohelper.exe", "mapleassistant.exe"}
+_CONFIG_IMPORT_REPLACE_ATTEMPTS = 15
+_CONFIG_IMPORT_REPLACE_RETRY_SECONDS = 0.20
 
 
 class UpdateError(RuntimeError):
@@ -395,11 +399,24 @@ def import_user_config(source: Path, destination: Path) -> Path:
         raise UpdateError(f"配置文件不是有效 JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise UpdateError("配置文件格式错误：根内容必须是 JSON 对象。")
-    temporary = destination.with_suffix(destination.suffix + ".importing")
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.importing"
+    )
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, temporary)
-        temporary.replace(destination)
+        last_error: Optional[PermissionError] = None
+        for attempt in range(_CONFIG_IMPORT_REPLACE_ATTEMPTS):
+            try:
+                temporary.replace(destination)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                if attempt + 1 < _CONFIG_IMPORT_REPLACE_ATTEMPTS:
+                    time.sleep(_CONFIG_IMPORT_REPLACE_RETRY_SECONDS)
+        if last_error is not None:
+            raise last_error
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)

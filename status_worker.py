@@ -276,9 +276,19 @@ class WindowKeySender:
             return self._window_handle_generation
 
     def observe_game_window_handle(self) -> int:
-        """Refresh the game HWND and return its recreation generation."""
+        """Return the selected game HWND generation, refreshing only after it vanishes."""
 
         try:
+            import win32gui
+
+            # A live selected handle is authoritative.  Do not continuously
+            # rediscover windows by title: a launcher or another related
+            # foreground window may share title text, but it is not a game
+            # restart and must never arm the auto-lie transition guard.
+            current = self.hwnd
+            if current and win32gui.IsWindow(current) and win32gui.IsWindowVisible(current):
+                with self._window_handle_lock:
+                    return self._window_handle_generation
             self._find_target_window(required=False)
         except Exception:
             LOG.debug("game HWND observation failed", exc_info=True)
@@ -756,7 +766,18 @@ class WindowKeySender:
                         if win32gui.IsIconic(hwnd):
                             # ShowWindow sends a synchronous message to the game
                             # and can freeze Tk while the game thread is busy.
-                            win32gui.ShowWindowAsync(hwnd, win32con.SW_RESTORE)
+                            try:
+                                import ctypes
+
+                                # ShowWindowAsync belongs to User32.  It is not
+                                # exposed by every pywin32 build, so calling it
+                                # as ``win32gui.ShowWindowAsync`` can fail just
+                                # when focus recovery is needed most.
+                                ctypes.windll.user32.ShowWindowAsync(
+                                    int(hwnd), int(win32con.SW_RESTORE)
+                                )
+                            except Exception:
+                                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                             time.sleep(0.05)
                         try:
                             win32gui.SetForegroundWindow(hwnd)
@@ -852,11 +873,6 @@ class WindowKeySender:
         try:
             import win32gui
             foreground = win32gui.GetForegroundWindow()
-            if foreground and win32gui.IsWindow(foreground):
-                foreground_title = win32gui.GetWindowText(foreground)
-                if self.window_title.casefold() in foreground_title.casefold():
-                    self._remember_game_window_handle(foreground)
-                    return True
             if not self.hwnd or not win32gui.IsWindow(self.hwnd):
                 self._find_target_window()
             return foreground == self.hwnd

@@ -23,6 +23,10 @@ from minimap_detector import hud_scale_for
 LOG = logging.getLogger(__name__)
 # A repeating capture failure logs a full traceback this often; the ones in between are DEBUG.
 CAPTURE_FAILURE_LOG_SECONDS = 10.0
+# The game can be captured by the main frame worker and a parked-watch worker
+# at the same time.  A minimized-window recovery must be one operation, not two
+# racing restore/maximize requests.
+_WINDOW_RECOVERY_LOCK = threading.Lock()
 
 
 WindowRect = Tuple[int, int, int, int]
@@ -33,6 +37,28 @@ CaptureFunction = Callable[[str], tuple[Image.Image, WindowRect]]
 
 class WindowCaptureError(RuntimeError):
     """Raised when the requested window cannot be captured."""
+
+
+def _show_window_async(hwnd: int, command: int, win32gui: Any) -> None:
+    """Request a window-state change without relying on a pywin32-only name.
+
+    ``ShowWindowAsync`` is a User32 API, but many pywin32 builds expose only
+    ``ShowWindow``.  Calling it through ``ctypes`` is therefore the portable
+    async route; the synchronous pywin32 call is a last-resort fallback.
+    Success is verified separately with ``IsIconic`` because both APIs can
+    return a previous visibility state rather than an error indication.
+    """
+
+    try:
+        import ctypes
+
+        ctypes.windll.user32.ShowWindowAsync(int(hwnd), int(command))
+        return
+    except Exception:
+        show_window = getattr(win32gui, "ShowWindow", None)
+        if not callable(show_window):
+            raise
+        show_window(hwnd, command)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,12 +186,19 @@ def capture_window(
         # the recovery deterministic instead of leaving every downstream
         # worker running against an indefinitely stale frame: restore it to a
         # maximized, visible window, then resume the same capture attempt.
-        LOG.warning("CAPTURE RECOVERY: game window minimized; maximizing %s", window_title)
         try:
-            win32gui.ShowWindowAsync(hwnd, win32con.SW_MAXIMIZE)
-            # ShowWindowAsync posts the window-state change.  Give Windows one
-            # short turn to apply it before querying the client rectangle.
-            time.sleep(0.10)
+            with _WINDOW_RECOVERY_LOCK:
+                # A sibling capture worker may have completed recovery while
+                # this worker waited for the shared lock.
+                if win32gui.IsIconic(hwnd):
+                    LOG.warning(
+                        "CAPTURE RECOVERY: game window minimized; maximizing %s",
+                        window_title,
+                    )
+                    _show_window_async(hwnd, win32con.SW_MAXIMIZE, win32gui)
+                    # The asynchronous User32 request needs one short turn to
+                    # apply before querying the client rectangle.
+                    time.sleep(0.10)
         except Exception as exc:
             raise WindowCaptureError(
                 f"游戏窗口最小化且无法最大化：{window_title}"

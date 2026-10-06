@@ -152,6 +152,15 @@ ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
 # Endpoint reversals need a real neutral input tick: Maple can otherwise
 # consume the new direction when it arrives in the old key-up poll slice.
 DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
+# Once the new patrol direction is physically down, only a very short guard
+# is needed before attacks may resume.  The longer neutral gap above is for
+# Maple's key polling; this is just enough to keep an attack from swallowing
+# the first new direction input.
+DIRECTION_SWITCH_POST_SEND_GUARD_SECONDS = 0.06
+# A pre-existing attack must finish before the opposite walk direction is
+# sent.  Do not hold an endpoint gate for a whole attack cadence: retry from
+# the next minimap frame if its animation is still active.
+ENDPOINT_TURN_ACTIVE_ATTACK_WAIT_SECONDS = 0.30
 # Jump records are X-precise, but the marker can be one or more vertical
 # minimap pixels away while grabbing/climbing a rope.  Keep a little more
 # than one X pixel and about two Y pixels: narrower than the earlier loose
@@ -268,6 +277,8 @@ STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES = 4
 # deliberately long, but it makes a near-anchor correction overshoot before
 # the next capture arrives.  Keep this distinct, short hold for stand-still
 # mode only.
+# The outer part of the final approach needs a slightly longer hold to make
+# visible progress across its wider ±0.040 X correction band.
 STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS = 0.12
 # Inside the small-step band the correction is the step that finishes the last
 # pixels onto the 桩.  It is the SAME arbiter motion as the longer walk back - a
@@ -282,13 +293,12 @@ STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS = 0.12
 # swallowed in-game instead of walking.  About 0.10 s travels one marker column,
 # which is the size of the gap a correction is asked to close, so the correction
 # now really steps and the next capture confirms it.
-STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.10
-# Space between two corrections.  The operator asked for a gap of about 300ms
-# between them: corrections pressed back to back read as continuous walking.  A
-# correction now carries its own attack, so this spacing is also the attack rate
-# while the character is correcting; on a map whose minimap is coarse enough
-# that every correction needs the longer hold, that is roughly one attack per
-# 0.3s until the marker is back on the band.
+STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.12
+# Earliest re-request point for a correction.  The stationary-correction
+# arbiter reservation is longer (700 ms after its attached attack), so it is
+# the effective spacing when repeated corrections are needed.  This shorter
+# re-request interval merely lets the movement loop ask promptly once that
+# post-cast protection ends.
 STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS = 0.30
 # X recovery around the temporary 桩.  Every correction - the near step and
 # the longer walk back - is ONE arbiter motion that carries ONE attack at its
@@ -310,7 +320,7 @@ STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.020
 # walk back normally.  The short correction-plus-attack motion is reserved
 # for the final approach only; using it for a rope-top or another platform
 # created a visible tiny-step/attack loop before the stake was reached.
-STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.030
+STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.040
 # How long the 朝向 tap holds its direction.  Unlike the anchor correction
 # (0.10 s, which must really walk about one marker column) the tap is a TURN,
 # not a move, and a longer hold walks the character out of the anchor band (at
@@ -362,8 +372,8 @@ STATIONARY_PICKUP_LEG_NO_PROGRESS_FRAMES = 38
 # A hit reaction / cast can consume the first ordinary far-return direction
 # even though the input ledger accepted it. Do not keep extending that
 # invisible hold while stationary recovery suppresses normal attacks. At 5 FPS
-# this is one second without progress, then the direction is sent anew.
-STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES = 5
+# this is about 0.6 seconds without progress, then the direction is sent anew.
+STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES = 3
 
 # A saved Left/Right endpoint that sits a fraction of a pixel outside the
 # walkable platform (wall/platform edge, or a residual projection error) can
@@ -1249,7 +1259,13 @@ class ClimbState:
     # Last raw marker Y used by the attachment verifier.  Attachment needs
     # two *new* upward advances, not two reads of one completed jump arc.
     last_marker_y: Optional[float] = None
+    # Last marker X accompanies ``last_marker_y`` for the attached-rope
+    # watchdog.  If both coordinates stop moving, Up may have been released
+    # by an outside focus change while the climb state still believes it owns
+    # the rope.
+    last_marker_x: Optional[float] = None
     stalled_frames: int = 0
+    position_stalled_frames: int = 0
     # Consecutive frames the marker sits inside the NEXT layer's arrival
     # band while holding Up (rope-top settle).  Bounds how long the
     # at-arrival stall suppression may hold Up before retrying.
@@ -1527,7 +1543,9 @@ def climb(
             state.recent_y = []
             state.last_world_y = state.baseline_world_y
             state.last_marker_y = state.baseline_y
+            state.last_marker_x = player.x
             state.stalled_frames = 0
+            state.position_stalled_frames = 0
             return result
         return "input-blocked"
 
@@ -1561,11 +1579,18 @@ def climb(
     # advancing.  Only treat it as a failed grab when the world Y is NOT
     # advancing.
     marker_frame_progress: Optional[float] = None
+    marker_position_static = False
     if persistent_up and state.up_held:
         if observation.player is not None:
             if state.last_marker_y is not None:
                 marker_frame_progress = state.last_marker_y - player.y
+                marker_position_static = bool(
+                    state.last_marker_x is not None
+                    and abs(player.y - state.last_marker_y) <= 0.001
+                    and abs(player.x - state.last_marker_x) <= 0.001
+                )
             state.last_marker_y = player.y
+            state.last_marker_x = player.x
             state.recent_y.append(player.y)
             if len(state.recent_y) > 4:
                 state.recent_y.pop(0)
@@ -1616,6 +1641,72 @@ def climb(
             state.arrival_frames = 0
         else:
             state.arrival_frames = 0
+        # Focus loss can release Up while the character is visibly attached
+        # to a rope.  World Y alone is not enough to distinguish that from a
+        # re-anchor, so require the raw minimap X *and* Y to be unchanged for
+        # four fresh captures.  A left climb jump then reacquires the rope
+        # rather than leaving the character stranded at the same rope point.
+        if marker_position_static:
+            state.position_stalled_frames += 1
+        else:
+            state.position_stalled_frames = 0
+        if state.position_stalled_frames >= 4:
+            key_up = getattr(sender, "key_up", None)
+
+            def restart_left_climb() -> bool:
+                if key_up is not None:
+                    key_up("up")
+                return _directional_jump_climb(
+                    sender,
+                    "left",
+                    nudge_duration,
+                    climb_duration,
+                    persistent_up=True,
+                )
+
+            ok = restart_left_climb() if action_lock is None else False
+            if action_lock is not None:
+                with action_lock:
+                    ok = restart_left_climb()
+            if ok:
+                state.baseline_y = player.y
+                state.baseline_world_y = (
+                    observation.world_y_diamonds
+                    if observation.structure_confidence >= 0.12 else None
+                )
+                state.phase = "check-primary-left"
+                state.up_held = True
+                state.progress_check_frames = 0
+                state.attach_frames = 0
+                state.recent_y = []
+                state.last_world_y = state.baseline_world_y
+                state.last_marker_y = player.y
+                state.last_marker_x = player.x
+                state.stalled_frames = 0
+                state.position_stalled_frames = 0
+                state.arrival_frames = 0
+                LOG.warning(
+                    "CLIMB rope-point stall: marker X/Y unchanged for 4 frames; "
+                    "restarting with Alt+Left"
+                )
+                return "left-position-stall-retry"
+            state.phase = "idle"
+            state.baseline_y = None
+            state.baseline_world_y = None
+            state.up_held = False
+            state.progress_check_frames = 0
+            state.attach_frames = 0
+            state.last_world_y = None
+            state.last_marker_y = None
+            state.last_marker_x = None
+            state.stalled_frames = 0
+            state.position_stalled_frames = 0
+            state.recent_y = []
+            LOG.warning(
+                "CLIMB rope-point stall: left recovery jump was blocked; "
+                "returning to rope recovery"
+            )
+            return "climb-stalled-retry"
         if fell_back:
             # The marker descended from its jump peak: the grab failed and
             # the character fell back.  Release Up immediately and restart
@@ -1631,7 +1722,9 @@ def climb(
             state.progress_check_frames = 0
             state.attach_frames = 0
             state.last_world_y = None
+            state.last_marker_x = None
             state.stalled_frames = 0
+            state.position_stalled_frames = 0
             state.recent_y = []
             LOG.warning("CLIMB grab failed: marker fell back; restarting recovery")
             return "climb-stalled-retry"
@@ -1654,7 +1747,9 @@ def climb(
                 state.up_held = False
                 state.progress_check_frames = 0
                 state.last_world_y = None
+                state.last_marker_x = None
                 state.stalled_frames = 0
+                state.position_stalled_frames = 0
                 LOG.warning(
                     "CLIMB stalled: world Y stopped advancing; restarting rope recovery"
                 )
@@ -1678,7 +1773,9 @@ def climb(
                     state.up_held = False
                     state.progress_check_frames = 0
                     state.last_world_y = None
+                    state.last_marker_x = None
                     state.stalled_frames = 0
+                    state.position_stalled_frames = 0
                     LOG.warning(
                         "CLIMB stalled: screen Y stopped advancing; "
                         "restarting rope recovery"
@@ -1842,7 +1939,9 @@ def climb(
                 state.recent_y = []
                 state.last_world_y = state.baseline_world_y
                 state.last_marker_y = state.baseline_y
+                state.last_marker_x = player.x
                 state.stalled_frames = 0
+                state.position_stalled_frames = 0
                 return f"{retry_direction}-retry-toward-rope"
             return "input-blocked"
 
@@ -1910,7 +2009,9 @@ def climb(
             state.recent_y = []
             state.last_world_y = state.baseline_world_y
             state.last_marker_y = state.baseline_y
+            state.last_marker_x = player.x
             state.stalled_frames = 0
+            state.position_stalled_frames = 0
             LOG.warning(
                 "CLIMB under-rope primary jump failed; step %s then sideways "
                 "climb jump %s with early Up (lateral #%d)",
@@ -2895,8 +2996,12 @@ class MovementWorker(threading.Thread):
         )
         state.last_world_y = state.baseline_world_y
         state.last_marker_y = state.baseline_y
+        state.last_marker_x = (
+            observation.player.x if observation.player is not None else None
+        )
         state.attach_frames = 2  # already attached to the rope
         state.stalled_frames = 0
+        state.position_stalled_frames = 0
         state.arrival_frames = 0
         with self._direction_lock:
             self.key_sender.key_down("up")
@@ -2974,6 +3079,8 @@ class MovementWorker(threading.Thread):
                             self._transition_stuck_frames * 0.02,
                         )
                         handoff.clear()
+                        self._endpoint_turn_expected_direction = None
+                        self._endpoint_turn_neutral_until = 0.0
                         self._transition_stuck_frames = 0
                 else:
                     self._transition_stuck_frames = 0
@@ -3198,10 +3305,44 @@ class MovementWorker(threading.Thread):
         if key_down is None:
             return _send_tap(self.key_sender, decision)
         direction_transition_started = False
+        endpoint_turn_completed = False
         try:
             with self._direction_lock, self._hold_lock:
                 if not self._patrol_input_allowed():
                     return False
+                endpoint_turn = (
+                    self._endpoint_turn_expected_direction == decision.key
+                )
+                if endpoint_turn:
+                    # The old walk was already released by
+                    # _begin_endpoint_turn().  Keep the gate closed only long
+                    # enough to complete the intentional neutral interval and
+                    # let an already-started attack finish; no new attack can
+                    # begin while the gate is set.
+                    neutral_remaining = (
+                        self._endpoint_turn_neutral_until - time.monotonic()
+                    )
+                    if neutral_remaining > 0:
+                        if not self._wait_for_patrol_motion(neutral_remaining):
+                            return False
+                    attack_motion_active = getattr(
+                        self.motion_arbiter, "attack_motion_active", None
+                    )
+                    if callable(attack_motion_active) and attack_motion_active():
+                        deadline = (
+                            time.monotonic()
+                            + ENDPOINT_TURN_ACTIVE_ATTACK_WAIT_SECONDS
+                        )
+                        while (attack_motion_active()
+                               and time.monotonic() < deadline):
+                            if not self._wait_for_patrol_motion(0.02):
+                                return False
+                        if attack_motion_active():
+                            LOG.info(
+                                "endpoint turn: waiting for prior attack before %s",
+                                decision.key,
+                            )
+                            return False
                 # The focus worker releases all physical keys on a focus dip.  Its
                 # release happens outside this hold state, so the worker can still
                 # believe Right/Z are held after refocus and silently skip their
@@ -3227,15 +3368,34 @@ class MovementWorker(threading.Thread):
                     if previous in ("left", "right"):
                         transition_event = self.direction_transition_event
                         if transition_event is not None:
-                            # Reserve the complete handoff before releasing the
-                            # old key. A fixed attack must not enter between
-                            # Left-up and Right-down (or vice versa).
+                            # Reserve the complete handoff before releasing
+                            # the old key. A fixed attack must not enter
+                            # between Left-up and Right-down (or vice versa).
                             transition_event.set()
                             direction_transition_started = True
+                        # Stop at the endpoint *before* waiting for an attack
+                        # animation.  Previously the old direction remained
+                        # held through that wait (up to one second), so a
+                        # narrow left/right route could carry the character
+                        # far past its recorded endpoint before reversal.
+                        self._release_walk_hold()
+                        # Endpoint turns are where a lost old key-up is most
+                        # harmful, so send one unconditional release as a
+                        # safeguard.  It MUST happen before the new direction
+                        # goes down: Maple can treat a late Right-up after a
+                        # Left-down (or vice versa) as "no horizontal input",
+                        # which produced the observed stall immediately after
+                        # a successful endpoint turn.
+                        force_key_up = getattr(self.key_sender, "force_key_up", None)
+                        key_up_old = getattr(self.key_sender, "key_up", None)
+                        if callable(force_key_up):
+                            force_key_up(previous, reason="walk direction switch")
+                        elif key_up_old is not None:
+                            key_up_old(previous)
                         # If an attack started just before the reservation, wait
                         # out its arbiter grace before sending the opposite walk
-                        # key. Otherwise the game can consume that new key as a
-                        # continuation of the attack animation.
+                        # key. The old direction is already released, so this
+                        # safety wait cannot become endpoint overshoot.
                         attack_motion_active = getattr(
                             self.motion_arbiter, "attack_motion_active", None
                         )
@@ -3247,21 +3407,9 @@ class MovementWorker(threading.Thread):
                                     if transition_event is not None:
                                         transition_event.clear()
                                     return False
-                    self._release_walk_hold()
+                    else:
+                        self._release_walk_hold()
                     if previous in ("left", "right"):
-                        # Endpoint turns are where a lost old key-up is most
-                        # harmful, so send one unconditional release as a
-                        # safeguard.  It MUST happen before the new direction
-                        # goes down: Maple can treat a late Right-up after a
-                        # Left-down (or vice versa) as "no horizontal input",
-                        # which produced the observed stall immediately after a
-                        # successful endpoint turn.
-                        force_key_up = getattr(self.key_sender, "force_key_up", None)
-                        key_up_old = getattr(self.key_sender, "key_up", None)
-                        if callable(force_key_up):
-                            force_key_up(previous, reason="walk direction switch")
-                        elif key_up_old is not None:
-                            key_up_old(previous)
                         # Maple can drop a newly pressed opposite direction when
                         # it arrives in the same input-poll slice as the old
                         # direction's key-up.  Keep a short neutral interval so
@@ -3275,12 +3423,14 @@ class MovementWorker(threading.Thread):
                                 self.direction_transition_event.clear()
                             return False
                     if not self._patrol_input_allowed():
-                        if self.direction_transition_event is not None:
+                        if (direction_transition_started
+                                and self.direction_transition_event is not None):
                             self.direction_transition_event.clear()
                         return False
                     claimed = key_down(decision.key) is not False
                     if not claimed:
-                        if self.direction_transition_event is not None:
+                        if (direction_transition_started
+                                and self.direction_transition_event is not None):
                             self.direction_transition_event.clear()
                         LOG.info(
                             "walk key %s send blocked (window not foreground "
@@ -3300,6 +3450,7 @@ class MovementWorker(threading.Thread):
                         "walk hold %s down (reason=%s)",
                         decision.key, decision.reason,
                     )
+                    endpoint_turn_completed = endpoint_turn
                 # Automatic pickup no longer sends Z.  Ctrl+Z is the sole
                 # pickup input and belongs to QuickPickupWorker, so movement
                 # holds only the requested direction.
@@ -3315,7 +3466,14 @@ class MovementWorker(threading.Thread):
                     # decision keeps a walk that the movement cooldown skipped
                     # or the input layer refused from looking like a turn.
                     self._stationary_facing_command = self._walk_hold_key
-            if direction_transition_started:
+            if endpoint_turn_completed:
+                # The new direction has been accepted.  This deliberately
+                # short post-send guard keeps the endpoint turnover usable
+                # while still protecting the first game input tick.
+                self._wait_for_patrol_motion(
+                    DIRECTION_SWITCH_POST_SEND_GUARD_SECONDS
+                )
+            elif direction_transition_started:
                 # Let the new direction settle for a game input tick before
                 # the attack worker can send another action key.
                 self._wait_for_patrol_motion(0.15)
@@ -3328,6 +3486,11 @@ class MovementWorker(threading.Thread):
             if (direction_transition_started
                     and self.direction_transition_event is not None):
                 self.direction_transition_event.clear()
+            if endpoint_turn_completed:
+                self._endpoint_turn_expected_direction = None
+                self._endpoint_turn_neutral_until = 0.0
+                if self.direction_transition_event is not None:
+                    self.direction_transition_event.clear()
 
     def __init__(
         self,
@@ -3570,6 +3733,12 @@ class MovementWorker(threading.Thread):
         )
         self.climb_attack_lock = climb_attack_lock
         self.direction_transition_event = direction_transition_event
+        # Endpoint turns release their old direction as soon as the marker
+        # reaches the recorded edge.  The next route calculation owns the
+        # one pending opposite direction; no other worker may inject input
+        # until it has been sent.
+        self._endpoint_turn_expected_direction: Optional[str] = None
+        self._endpoint_turn_neutral_until = 0.0
         self._transition_stuck_frames = 0
         # Frame heartbeat + stall reporting (see _stall_watchdog).
         self._last_frame_at: Optional[float] = None
@@ -4309,6 +4478,8 @@ class MovementWorker(threading.Thread):
             self._other_player_switch_owns_patrol = False
         if self.direction_transition_event is not None:
             self.direction_transition_event.clear()
+        self._endpoint_turn_expected_direction = None
+        self._endpoint_turn_neutral_until = 0.0
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
         if self.stationary_recovery_active_event is not None:
@@ -4896,6 +5067,7 @@ class MovementWorker(threading.Thread):
             attach_frames=2,
             last_world_y=world_y,
             last_marker_y=player.y,
+            last_marker_x=player.x,
             recent_y=[player.y],
         )
         self._jump_point_up_held = False
@@ -10472,6 +10644,49 @@ class MovementWorker(threading.Thread):
             phases.append("rope")
         return phases
 
+    def _begin_endpoint_turn(self, previous: str, next_direction: str) -> None:
+        """Release an endpoint walk now and reserve one clean reverse.
+
+        This is deliberately owned by the movement worker.  The attack worker
+        observes ``direction_transition_event`` and waits, while the next
+        route calculation is the only code permitted to put the opposite
+        direction down.
+        """
+
+        if (previous not in ("left", "right")
+                or next_direction not in ("left", "right")
+                or previous == next_direction):
+            return
+        self._endpoint_turn_expected_direction = next_direction
+        self._endpoint_turn_neutral_until = (
+            time.monotonic() + DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS
+        )
+        transition_event = self.direction_transition_event
+        if transition_event is not None:
+            transition_event.set()
+        key_up = getattr(self.key_sender, "key_up", None)
+        force_key_up = getattr(self.key_sender, "force_key_up", None)
+        with self._direction_lock, self._hold_lock:
+            if self._walk_hold_key == previous:
+                if callable(key_up):
+                    key_up(previous)
+                self._walk_hold_key = None
+                self._walk_hold_until = 0.0
+            # The regular release above removes our claim.  Send one forced
+            # release as well because a late key-up at an endpoint is the
+            # most damaging failure: it can cancel the newly pressed reverse.
+            if callable(force_key_up):
+                force_key_up(previous, reason="patrol endpoint reached")
+            elif callable(key_up):
+                key_up(previous)
+        LOG.info(
+            "endpoint turn armed: released %s at recorded edge; "%
+            "neutral %.0fms then %s",
+            previous,
+            DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS * 1000.0,
+            next_direction,
+        )
+
     def _advance_route_endpoint(self, observation: MinimapObservation, target_x: Optional[float]) -> bool:
         # A below-range recovery has its own rope target and completion
         # rules.  The route index still describes the old patrol floor while
@@ -10552,9 +10767,11 @@ class MovementWorker(threading.Thread):
         if current in phases:
             index = phases.index(current)
             if index + 1 < len(phases):
-                self._route_phase = phases[index + 1]
+                next_phase = phases[index + 1]
+                self._begin_endpoint_turn(current, next_phase)
+                self._route_phase = next_phase
                 LOG.info("route endpoint reached/crossed: %s; next %s",
-                         current, phases[index + 1])
+                         current, next_phase)
                 return True
         # End of this layer's recorded actions.
         if (is_final and len(self._route_layers) > 1
@@ -10568,7 +10785,9 @@ class MovementWorker(threading.Thread):
         if phases:
             # Repeat the layer's own actions: stand at a lone point, patrol a
             # floor back-and-forth, or hold position before climbing.
-            self._route_phase = phases[0]
+            next_phase = phases[0]
+            self._begin_endpoint_turn(current, next_phase)
+            self._route_phase = next_phase
             LOG.info("route endpoint reached/crossed: %s; repeating %s",
                      current, phases[0])
             return True
@@ -10592,7 +10811,9 @@ class MovementWorker(threading.Thread):
             return False
         completed = self._route_patrol_cycle
         self._route_patrol_cycle += 1
-        self._route_phase = movement_phases[0]
+        next_phase = movement_phases[0]
+        self._begin_endpoint_turn(current, next_phase)
+        self._route_phase = next_phase
         LOG.info(
             "layer %s patrol cycle %d/%d complete; repeating from %s",
             name,
@@ -11392,13 +11613,51 @@ class MovementWorker(threading.Thread):
         """
 
         if self.stationary_attack_enabled:
+            anchor = self._stationary_attack_anchor
+            player = getattr(getattr(self, "last_observation", None), "player", None)
+            settled = (
+                anchor is not None
+                and player is not None
+                and self._stationary_attack_ready_for_player(anchor, player)
+            )
+            cancelled = 0
+            if not settled:
+                # The hit moved the character - that displacement IS the
+                # knockback - so the correction the movement loop queued toward
+                # the *pre-hit* marker position must not run afterwards: it
+                # would walk the character the wrong way and spend the slot on
+                # that step.  Discard only corrections that have not physically
+                # started, and let the next capture choose a fresh one from the
+                # post-hit marker.
+                #
+                # The counterattack key is inserted either way.  Waiting for a
+                # "settled" stand-still beat was the v1.2.119 bug: a hit is
+                # exactly what unsettles the marker, so the gate refused the
+                # replacement in the one case it exists for and 被撞反击 never
+                # fired.  The beat the operator wants it carried by is the
+                # return-to-桩 correction itself ("tiny walk back + attack"), and
+                # the slot is consumed when a beat really executes
+                # (``_consume_attack_slot``), so a cancelled correction can
+                # never swallow the hit.
+                self._stationary_step_target_x = None
+                self._stationary_near_correction_next_at = 0.0
+                cancel_steps = getattr(
+                    self.motion_arbiter, "cancel_pending_stationary_steps", None
+                )
+                if callable(cancel_steps):
+                    cancelled = int(
+                        cancel_steps("HP hit changed stationary return position") or 0
+                    )
             replace = getattr(self.attack_slot, "replace_next", None)
             if callable(replace) and replace(self.counterattack_key):
                 LOG.info(
                     "被撞反击 queued as next stationary attack slot: HP %d->%d "
-                    "frame=%d key=%s",
+                    "frame=%d key=%s (%s)",
                     previous_hp, current_hp, frame_sequence,
                     self.counterattack_key,
+                    "settled at the 桩" if settled else
+                    "carried by the return-to-桩 correction; "
+                    f"{cancelled} stale correction(s) cleared",
                 )
             else:
                 LOG.warning("被撞反击 skipped: stationary attack slot unavailable")

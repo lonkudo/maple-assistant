@@ -86,6 +86,15 @@ class AttackWorker(threading.Thread):
         # not schedule an attack; it only changes the key for an approved
         # cadence beat, so a hit cannot race a movement correction.
         self.attack_slot = attack_slot
+        # 站桩攻击 only.  In stand-still mode the anchor correction and 小碎步
+        # carry their own attack as the beat itself, so the cadence must not add
+        # a second one right after them (see ``spacing_wait_seconds``).  On
+        # patrol the cadence is the primary attack source and 小碎步/被撞反击 are
+        # deliberate extras, so their attacks must never push the cadence later
+        # - the operator's patrol log showed the 2.50s cadence losing a beat to
+        # a 小碎步 attack and the character then walking an abnormally long
+        # stretch before its own attack.
+        self.stationary_mode = False
         # The optional sequence planner is deliberately separate from this
         # worker: it only selects a key for an already-approved cadence beat.
         self.combo_attack = ComboAttackPlan()
@@ -163,6 +172,35 @@ class AttackWorker(threading.Thread):
         random_gap = random.uniform(0.0, self.attack_jitter_seconds)
         return max(0.05, self.attack_interval + random_gap)
 
+    def spacing_wait_seconds(self) -> Optional[float]:
+        """How long this beat must still wait to keep the attack spacing.
+
+        站桩攻击 only (``stationary_mode``).  There the anchor correction walks
+        back and taps the attack that belongs to its own motion, and 小碎步
+        carries a middle attack, so that motion IS the beat: firing a cadence
+        beat right after it is the second, quick attack the operator reported
+        ("he went back to the 桩 and then attacked twice"), and the beat is
+        rescheduled a full interval after that attack instead.
+
+        On patrol those same motions are deliberate *extras* beside the fixed
+        cadence, so this returns ``None`` and their attacks never push the
+        cadence later.  ``None`` means the spacing is satisfied and the beat may
+        fire.
+
+        Measured from ``last_attack_at()`` (any owner) rather than from "did an
+        attack appear while we waited": the correction taps before the arbiter
+        sets its own busy window, so a beat that comes due just after that tap
+        would otherwise see the attack as already accounted for and fire the
+        moment the window expired.
+        """
+
+        if self.motion_arbiter is None or not self.stationary_mode:
+            return None
+        since_last_attack = time.monotonic() - self.motion_arbiter.last_attack_at()
+        if since_last_attack >= self.attack_interval:
+            return None
+        return self.attack_interval - since_last_attack
+
     def run(self) -> None:
         LOG.info("attack worker started offset=%.3fs interval=%.3fs key=%s "
                  "enabled=%s",
@@ -185,6 +223,24 @@ class AttackWorker(threading.Thread):
                 self.stop_event.wait(min(0.05, remaining))
             if self.stop_event.is_set():
                 break
+            # A beat must also keep a full interval after an attack another
+            # owner made.  The 站桩 correction walks back and taps the attack
+            # that belongs to its own motion, and 小碎步 carries a middle
+            # attack; the operator's field report is the cadence landing its
+            # catch-up beat a fraction of a second after one of those ("he went
+            # back to the 桩 and then attacked twice").  A motion that only
+            # moved (a buff, a jump) still keeps the ordinary catch-up beat,
+            # which must not cost a whole interval after stand-still recovery.
+            spacing_wait = self.spacing_wait_seconds()
+            if spacing_wait is not None:
+                LOG.info(
+                    "attack beat rescheduled: the last attack was %.2fs ago "
+                    "(a 站桩 correction or 小碎步 that carried its own attack); "
+                    "the next beat keeps a full %.2fs away",
+                    self.attack_interval - spacing_wait, self.attack_interval,
+                )
+                next_attack = time.monotonic() + spacing_wait
+                continue
             can_fire = self.enabled
             attack_lease = False
             handoff_deferred = False
@@ -203,18 +259,14 @@ class AttackWorker(threading.Thread):
                 handoff_deferred = True
             if can_fire:
                 # Advance only for a beat that passed all non-arbiter gates.
-                # A null slot deliberately consumes this beat without
+                # A null combo run deliberately consumes this beat without
                 # reserving motion input or emitting a key.
                 normal_key = self.combo_attack.peek_key(self.attack_key)
-                slot = self.attack_slot
-                consume = getattr(slot, "consume", None)
-                selected_key = (
-                    consume(normal_key) if callable(consume) else normal_key
-                )
-                if selected_key is None:
+                if normal_key is None:
                     self.combo_attack.consume()
                     LOG.info("combo attack idle beat")
                     can_fire = False
+            reschedule_after_wait: Optional[float] = None
             if can_fire and self.motion_arbiter is not None:
                 # Reservation is deliberately atomic.  Checking idle and
                 # tapping separately allowed a queued 小碎步 to start between
@@ -223,8 +275,15 @@ class AttackWorker(threading.Thread):
                 attack_lease = self.motion_arbiter.try_begin_attack()
                 if not attack_lease:
                     self.motion_arbiter.wait_until_idle()
+                    # The motion we just waited for may have attacked as part
+                    # of its own work (the 站桩 correction taps its attack at
+                    # the end of its walk back).  That attack has now spent
+                    # this beat, so it is rescheduled instead of firing a
+                    # second attack a fraction of a second later.
+                    reschedule_after_wait = self.spacing_wait_seconds()
                     attack_lease = bool(
-                        self.enabled
+                        reschedule_after_wait is None
+                        and self.enabled
                         and self.motion_arbiter.try_begin_attack()
                     )
                 can_fire = attack_lease
@@ -240,6 +299,25 @@ class AttackWorker(threading.Thread):
                 # Always return it, otherwise motion input would stay blocked.
                 self.motion_arbiter.finish_attack(False)
                 attack_lease = False
+            if reschedule_after_wait is not None:
+                LOG.info(
+                    "attack beat rescheduled: the motion it waited for attacked "
+                    "on its own (a 站桩 correction or 小碎步 carries its own "
+                    "attack); the next beat keeps a full %.2fs away",
+                    self.attack_interval,
+                )
+                next_attack = time.monotonic() + reschedule_after_wait
+                continue
+            if can_fire:
+                # The one-use replacement belongs to the beat that really
+                # attacks.  Claiming it before the lease let a deferred beat
+                # hold the 被撞反击 key while the correction - which taps first,
+                # as part of its own motion - used the ordinary key instead.
+                slot = self.attack_slot
+                consume = getattr(slot, "consume", None)
+                selected_key = (
+                    consume(normal_key) if callable(consume) else normal_key
+                )
             if can_fire:
                 LOG.info("attack repetition: %s", selected_key)
                 sent = False

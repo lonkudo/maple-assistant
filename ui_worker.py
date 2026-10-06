@@ -56,6 +56,9 @@ from update_manager import (
 )
 from runtime_paths import application_root, package_format
 from auto_lie_secret import clear_server_secret, get_server_secret, has_server_secret
+from auto_lie_outcome import (
+    LieSuccessBoxDetector, SUCCESS_CONSECUTIVE_FRAMES, SUCCESS_THRESHOLD,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -90,6 +93,8 @@ _AUTO_LIE_CONFIRM_FOCUS_ATTEMPTS = 3
 # after the prompt click.  A grace period avoids counting a normal transition.
 _AUTO_LIE_FAILURE_GRACE_SECONDS = 3.0
 _AUTO_LIE_FAILURE_MISSING_FRAMES = 15
+_AUTO_LIE_OUTCOME_ARM_SECONDS = 10.0
+_AUTO_LIE_OUTCOME_OBSERVE_SECONDS = 40.0
 
 
 def _auto_lie_confirm_client_point(
@@ -1013,6 +1018,11 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_event_active = False
         self._api_auto_lie_clear_since = 0.0
         self._api_auto_lie_last_pass_started = 0.0
+        # A transport-close timeout is accounted as success by policy, but the
+        # old detector square can remain visible for a few capture ticks.  Do
+        # not spend another pass on that same stale square; a clear frame arms
+        # the next real lie window normally.
+        self._api_auto_lie_ignore_until_clear = False
         # Establish the current HWND generation while the UI starts. A later
         # game recreation must differ from this baseline; waiting until the
         # first suspicious square would make that recreated handle look like
@@ -1026,6 +1036,15 @@ class UiWorker(threading.Thread):
         except Exception:
             self._api_auto_lie_handle_generation = 0
         self._api_auto_lie_new_window_block_until = 0.0
+        self._api_auto_lie_new_window_suppression_logged = False
+        self._latest_capture_frame: Any = None
+        self._auto_lie_outcome_state: Optional[dict[str, Any]] = None
+        self._auto_lie_success_box = LieSuccessBoxDetector()
+        width, height = self._auto_lie_success_box.size
+        AUTO_LIE_LOG.info(
+            "自动过测谎: success blue-box detector ready %dx%d coverage=%.2f x%d",
+            width, height, SUCCESS_THRESHOLD, SUCCESS_CONSECUTIVE_FRAMES,
+        )
         # True while an automatic pass has the patrol stood down (see _pause_patrol_for_api_pass).
         self._api_auto_lie_patrol_paused = False
         self._api_auto_lie_post_confirm_scheduled = False
@@ -2763,6 +2782,11 @@ class UiWorker(threading.Thread):
                 command=self._import_user_config,
                 takefocus=False,
             )
+            import_config_hint = HoverTooltip(
+                self._import_config_button, "重新导入会重启助手"
+            )
+            import_config_hint.set_enabled(True)
+            self._bind_key_tooltips.append(import_config_hint)
             self._export_config_button = ttk.Button(
                 log_actions, text="导出配置",
                 command=self._export_user_config,
@@ -3511,6 +3535,7 @@ class UiWorker(threading.Thread):
                 pass
         if latest is not None:
             try:
+                self._latest_capture_frame = latest
                 self.last_snapshot = build_debug_snapshot(
                     latest,
                     self.detector,
@@ -3538,8 +3563,10 @@ class UiWorker(threading.Thread):
             self._poll_yolo_exit,
             self._drain_hotkey_actions,
             self._drain_api_test_results,
+            self._refresh_auto_lie_window_transition_guard,
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
+            self._service_auto_lie_outcome_monitor,
             self._service_auto_lie_marker_verification,
         ):
             try:
@@ -5380,8 +5407,13 @@ class UiWorker(threading.Thread):
         except queue.Full:
             return
 
-    def _auto_lie_blocked_for_recreated_window(self) -> bool:
-        """Silently suppress a false lie square during a game HWND transition."""
+    def _refresh_auto_lie_window_transition_guard(self) -> bool:
+        """Refresh the false-lie guard whenever the game HWND is recreated.
+
+        This runs every UI tick, not only after the detector finds a square.
+        Therefore a second crash/restart replaces the first 60-second window
+        with a fresh one even if the first login surface contained no match.
+        """
 
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
         observe = getattr(sender, "observe_game_window_handle", None)
@@ -5395,7 +5427,37 @@ class UiWorker(threading.Thread):
             self._api_auto_lie_new_window_block_until = (
                 time.monotonic() + AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS
             )
+            # A queued detector match belonged to the dead game's surface.
+            # Never let it become a pass after the new loading/login surface
+            # settles; the next real lie window will arm its own event.
+            self._api_auto_lie_pending = False
+            self._api_auto_lie_event_active = False
+            self._api_auto_lie_ignore_until_clear = False
+            self._api_auto_lie_clear_since = time.monotonic()
+            with self._api_auto_lie_event_enqueue_lock:
+                self._api_auto_lie_match_queued = False
+                events = getattr(self, "_api_auto_lie_events", None)
+                if events is not None:
+                    while True:
+                        try:
+                            events.get_nowait()
+                            events.task_done()
+                        except queue.Empty:
+                            break
+                        except ValueError:
+                            break
+            self._api_auto_lie_new_window_suppression_logged = False
+            AUTO_LIE_LOG.warning(
+                "自动过测谎: 检测到新的游戏窗口句柄；为避免登录白屏/黑屏误触发，"
+                "临时暂停自动接管 %.0f 秒",
+                AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS,
+            )
         return time.monotonic() < self._api_auto_lie_new_window_block_until
+
+    def _auto_lie_blocked_for_recreated_window(self) -> bool:
+        """Compatibility wrapper used while handling one detector match."""
+
+        return self._refresh_auto_lie_window_transition_guard()
 
     def _handle_lie_event_for_api(self, match: object = None) -> None:
         """Handle one queued lie event on the UI thread.
@@ -5403,9 +5465,40 @@ class UiWorker(threading.Thread):
         This owns all Tk variable/widget access.  The detector must only
         enqueue an event, otherwise a cross-thread BooleanVar read can make a
         legitimate lie window fail before the API worker is created.
+
+        ``match is None`` is the detector reporting that the square is *gone*
+        (``lie_detector_worker`` forwards ``(None, frame)`` for a cleared
+        window): it closes the current window and releases the stale-square
+        guard, and it must never arm a pass.  It is handled before every gate
+        below, because a clear is lifecycle information rather than an
+        authorization action - gating it away on the license, the 自动过测谎
+        selection or the credential would leave ``event_active`` /
+        ``ignore_until_clear`` stuck after a handled popup and silently disarm
+        every later lie window.  Losing this branch is the v1.2.119 field bug:
+        the detector's first scan after a restart finds no square, and that
+        clear was read as "a new lie window armed a pass (bbox None)".
         """
 
-        if match is not None and self._auto_lie_blocked_for_recreated_window():
+        if match is None:
+            # The square is gone: this window is over, and the next bbox is a
+            # new event.  A pass that is merely pending still runs - the alarm
+            # was real, the square only flickered.
+            self._api_auto_lie_clear_since = time.monotonic()
+            self._api_auto_lie_event_active = False
+            self._api_auto_lie_ignore_until_clear = False
+            return
+        if self._auto_lie_blocked_for_recreated_window():
+            if not self._api_auto_lie_new_window_suppression_logged:
+                remaining = max(
+                    0.0,
+                    self._api_auto_lie_new_window_block_until - time.monotonic(),
+                )
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎: 检测到测谎窗口，但游戏窗口刚刚重建；"
+                    "临时保护仍在生效，本次未接管（剩余 %.0f 秒）",
+                    remaining,
+                )
+                self._api_auto_lie_new_window_suppression_logged = True
             return
         if not self._license_allowed():
             AUTO_LIE_LOG.info("自动过测谎: ignored because license is not valid")
@@ -5435,10 +5528,10 @@ class UiWorker(threading.Thread):
             AUTO_LIE_LOG.debug("自动过测谎: lie event ignored until enabled during this session")
             return
         now = time.monotonic()
-        if match is None:
-            # The square is gone: the window is over and the next bbox is a new event.
-            self._api_auto_lie_clear_since = now
-            self._api_auto_lie_event_active = False
+        if getattr(self, "_api_auto_lie_ignore_until_clear", False):
+            # A prior server-close timeout was recorded successfully.  Keep
+            # ignoring this *same* visual until detector reports it gone,
+            # then the following popup can start a fresh pass.
             return
         if getattr(self, "_api_auto_lie_event_active", False):
             return                                   # this window is already being handled
@@ -5574,15 +5667,50 @@ class UiWorker(threading.Thread):
         # mid-test - the operator's v1.0.26 log: "SELF-RESCUE: character stationary on patrol route
         # for 20 frames" twice inside one lie window, restarting the patrol and walking the character
         # while the api pass was supposed to have the machine).  Resume it as soon as the pass is done.
-        if getattr(self, "_api_auto_lie_patrol_paused", False) \
-                and not self._worker_is_running(self._api_lie_pass_worker):
+        # The pass lifecycle is concluded for every automatic pass, not only for
+        # one that paused a patrol: a lie test can run while the character just
+        # stands still (nothing to pause), and its dialog still has to be closed
+        # by the confirmation click.  ``_resume_patrol_after_api_pass`` is a
+        # no-op unless this pass really paused a patrol.
+        pass_worker = getattr(self, "_api_lie_pass_worker", None)
+        if pass_worker is not None and not self._worker_is_running(pass_worker):
+            outcome_state = getattr(self, "_auto_lie_outcome_state", None)
+            watching_outcome = bool(
+                outcome_state
+                and outcome_state.get("worker_id") == id(self._api_lie_pass_worker)
+                and not outcome_state.get("terminal")
+                and not outcome_state.get("timed_out")
+            )
             completed = bool(getattr(
                 self._api_lie_pass_worker, "completed_successfully", False
             ))
-            if completed and not self._api_auto_lie_post_confirm_scheduled:
+            terminal_outcome = str(outcome_state.get("terminal") or "") if outcome_state else ""
+            transport_waiting_for_visual_outcome = bool(
+                getattr(self._api_lie_pass_worker, "transport_closed", False)
+                and getattr(self._api_lie_pass_worker, "feed_started", False)
+                and not terminal_outcome
+            )
+            if terminal_outcome == "success":
+                # A server-close timeout is deliberately accounted as success
+                # without clicking an unverified dialog.  It must still clear
+                # the paused-pass lifecycle so the following lie window can
+                # be handled.
+                if outcome_state and outcome_state.get("skip_confirmation"):
+                    self._resume_patrol_after_api_pass()
+                elif self._api_auto_lie_post_confirm_complete:
+                    self._resume_patrol_after_api_pass()
+            elif terminal_outcome == "failed_marker_missing":
+                self._api_auto_lie_failed_handled = True
+            elif completed and not self._api_auto_lie_post_confirm_scheduled:
                 self._begin_auto_lie_post_confirm()
-            if completed and self._api_auto_lie_post_confirm_complete:
+            elif completed and self._api_auto_lie_post_confirm_complete:
                 self._resume_patrol_after_api_pass()
+            elif watching_outcome or transport_waiting_for_visual_outcome:
+                # A server-initiated close is transport state, not a game
+                # outcome.  Keep the visual observer alive through its 40 s
+                # window so the same success/failure rules still decide the
+                # accounting result and whether the confirmation is clicked.
+                pass
             elif not completed and not getattr(self, "_api_auto_lie_failed_handled", False):
                 # A WebSocket failure does not prove that the lie dialog has
                 # completed.  Clicking its fixed confirmation point, or
@@ -5677,6 +5805,7 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_post_confirm_scheduled = False
         self._api_auto_lie_post_confirm_complete = False
         self._api_auto_lie_failed_handled = False
+        self._auto_lie_outcome_state = None
         controller = getattr(self, "patrol_controller", None)
         if controller is not None and controller.is_enabled():
             try:
@@ -5714,6 +5843,27 @@ class UiWorker(threading.Thread):
             except Exception:
                 AUTO_LIE_LOG.debug("自动过测谎: the automation switch could not be set", exc_info=True)
         AUTO_LIE_LOG.warning("自动过测谎: the api pass is done - the patrol resumes where it was")
+
+    def _auto_lie_success_box_visible(self) -> bool:
+        """Whether the newest shared capture really shows the success box.
+
+        A policy success must not become a blind fixed click (the operator's
+        rule), but leaving a finished dialog on screen blocks the character.
+        This is the evidence that separates the two cases: the 40x40 success
+        field is measured in the latest frame, exactly as the outcome monitor
+        measures it.
+        """
+
+        frame = getattr(self, "_latest_capture_frame", None)
+        matcher = getattr(self, "_auto_lie_success_box", None)
+        image = getattr(frame, "image", None)
+        if image is None or matcher is None:
+            return False
+        try:
+            return float(matcher.score(image)) >= SUCCESS_THRESHOLD
+        except Exception:
+            AUTO_LIE_LOG.debug("自动过测谎: success box check failed", exc_info=True)
+            return False
 
     def _begin_auto_lie_post_confirm(self) -> None:
         """Click the completed automatic lie dialog's measured confirm point."""
@@ -5805,38 +5955,207 @@ class UiWorker(threading.Thread):
         results = getattr(worker, "results", None)
         if results is None:
             return
-        latest = None
+        received: list[tuple[str, str]] = []
         while True:
             try:
-                latest = results.get_nowait()
+                item = results.get_nowait()
             except queue.Empty:
                 break
             except Exception:
                 break
-        if not (isinstance(latest, tuple) and len(latest) == 2):
-            if latest is not None:
-                AUTO_LIE_LOG.warning("自动过测谎 result ignored: unexpected item %r", latest)
+            if isinstance(item, tuple) and len(item) == 2:
+                received.append((str(item[0]), str(item[1])))
+            else:
+                AUTO_LIE_LOG.warning("自动过测谎 result ignored: unexpected item %r", item)
+        for state, detail in received:
+            text = f"{state}: {detail}" if detail else str(state)
+            # Keep the independent auto_lie.log useful after the handoff too:
+            # progress/results originate in the worker queue, rather than all
+            # being emitted by the worker's general-purpose logger.
+            AUTO_LIE_LOG.info("自动过测谎: worker result %s", text)
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(text=f"自动过测谎: {text}")
+            if state == "feed_started":
+                self._arm_auto_lie_outcome_monitor(worker)
+            elif state == "transport_closed":
+                state_data = self._auto_lie_outcome_state
+                if state_data is not None and state_data.get("worker_id") == id(worker):
+                    state_data["transport_closed"] = True
+                    AUTO_LIE_LOG.warning(
+                        "自动过测谎: 后端先关闭连接；继续按成功图标/小地图缺失规则判断结果"
+                    )
+
+    def _arm_auto_lie_outcome_monitor(self, worker: Any) -> None:
+        """Begin result observation after the worker's first live frame is due."""
+
+        now = time.monotonic()
+        self._auto_lie_outcome_state = {
+            "worker_id": id(worker),
+            "started_at": now,
+            "not_before": now + _AUTO_LIE_OUTCOME_ARM_SECONDS,
+            "deadline": now + _AUTO_LIE_OUTCOME_OBSERVE_SECONDS,
+            "last_frame_sequence": -1,
+            "last_marker_sequence": -1,
+            "success_hits": 0,
+            "missing": 0,
+            "terminal": "",
+            "accounted": False,
+            "timed_out": False,
+            "transport_closed": False,
+        }
+        AUTO_LIE_LOG.info(
+            "自动过测谎: outcome observation armed after %.0fs; success/failure window %.0f-%.0fs",
+            _AUTO_LIE_OUTCOME_ARM_SECONDS,
+            _AUTO_LIE_OUTCOME_ARM_SECONDS,
+            _AUTO_LIE_OUTCOME_OBSERVE_SECONDS,
+        )
+
+    def _finish_auto_lie_outcome(
+        self,
+        state: dict[str, Any],
+        outcome: str,
+        *,
+        click_confirmation: bool = True,
+    ) -> None:
+        """Commit one visual outcome without waiting on socket/accounting work."""
+
+        if state.get("terminal"):
             return
-        state, detail = latest
-        text = f"{state}: {detail}" if detail else str(state)
-        # Keep the independent auto_lie.log useful after the handoff too:
-        # progress/results originate in the worker queue, rather than all
-        # being emitted by the worker's general-purpose logger.
-        AUTO_LIE_LOG.info("自动过测谎: worker result %s", text)
-        if hasattr(self, "_api_test_status"):
-            self._api_test_status.configure(text=f"自动过测谎: {text}")
-        # Handshake readiness already created the durable pending event.  A
-        # normal completion or interruption remains pending until heartbeat;
-        # only black-room marker loss is reported as an explicit failure.
-        if state not in {"done", "failed"}:
-            return
-        worker_id = id(worker)
-        if self._accounted_auto_lie_worker_id == worker_id:
-            return
-        self._accounted_auto_lie_worker_id = worker_id
+        state["terminal"] = outcome
+        state["skip_confirmation"] = not click_confirmation
+        worker = self._api_lie_pass_worker
+        if worker is not None and id(worker) == state.get("worker_id"):
+            request = getattr(worker, "request_terminal_outcome", None)
+            if callable(request):
+                try:
+                    request(outcome)
+                except Exception:
+                    AUTO_LIE_LOG.warning("自动过测谎: could not stop stream after %s", outcome,
+                                         exc_info=True)
+            release_capture = getattr(worker, "release_outcome_capture", None)
+            if callable(release_capture):
+                release_capture()
         event_id = str(getattr(worker, "accounting_event_id", "") or "")
-        if event_id:
-            self._arm_auto_lie_marker_verification(event_id)
+        if event_id and not state.get("accounted"):
+            try:
+                self._lie_accounting_worker.finalize_event(event_id, outcome)
+                state["accounted"] = True
+                AUTO_LIE_LOG.info("自动过测谎: visual %s; final accounting queued event=%s",
+                                  outcome, event_id[:8])
+            except Exception:
+                AUTO_LIE_LOG.warning("自动过测谎: could not queue visual %s event=%s",
+                                     outcome, event_id[:8], exc_info=True)
+        if outcome == "success":
+            clicked = self._api_auto_lie_post_confirm_scheduled
+            if not clicked and click_confirmation:
+                self._begin_auto_lie_post_confirm()
+                clicked = True
+            elif not clicked and self._auto_lie_success_box_visible():
+                # A policy success (the server closed and the observation window
+                # produced no verdict) used to leave the dialog standing, so the
+                # character stayed on the prompt until the operator clicked it.
+                # The blind fixed click stays forbidden, so this one is gated on
+                # evidence: the success box is on screen in the newest capture,
+                # which means the dialog really is up.
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎: 按规则成功记账；最新画面仍显示成功图标，补点确认关闭窗口"
+                )
+                self._begin_auto_lie_post_confirm()
+                clicked = True
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(
+                    text=(
+                        "自动过测谎: 检测到成功，正在点击确认…"
+                        if clicked
+                        else "自动过测谎: 后端已关闭且未见失败，按规则成功记账；"
+                             "画面中没有成功图标，未点击确认。"
+                    )
+                )
+        else:
+            self._api_auto_lie_failed_handled = True
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(text="自动过测谎: 小地图标记持续丢失，判定失败。")
+
+    def _service_auto_lie_outcome_monitor(self) -> None:
+        """Observe success image and minimap failure independently of the socket."""
+
+        state = self._auto_lie_outcome_state
+        if not state or state.get("terminal") or state.get("timed_out"):
+            return
+        if time.monotonic() < float(state["not_before"]):
+            return
+        if time.monotonic() >= float(state["deadline"]):
+            worker = self._api_lie_pass_worker
+            server_closed = bool(
+                state.get("transport_closed")
+                or (
+                    worker is not None
+                    and id(worker) == state.get("worker_id")
+                    and getattr(worker, "transport_closed", False)
+                )
+            )
+            if server_closed:
+                # The server explicitly ended its stream and 40 seconds of
+                # independent visual observation found neither the success
+                # panel nor the black-room failure.  The agreed policy is to
+                # settle this one as success, without an unsafe fixed click.
+                self._api_auto_lie_event_active = False
+                self._api_auto_lie_ignore_until_clear = True
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎: 后端已关闭，%.0fs 内未检测到成功或失败；按规则成功记账，"
+                    "等待当前窗口消失后才允许下一轮",
+                    _AUTO_LIE_OUTCOME_OBSERVE_SECONDS,
+                )
+                self._finish_auto_lie_outcome(
+                    state,
+                    "success",
+                    click_confirmation=False,
+                )
+                return
+            # A still-live backend may yet return a result.  Do not mark the
+            # event terminal or disarm the next round merely because this
+            # initial observation window elapsed; continue in short chunks.
+            state["deadline"] = time.monotonic() + 5.0
+            if not state.get("deadline_extended_logged"):
+                state["deadline_extended_logged"] = True
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎: %.0fs 内未见结果，但后端仍在传输；继续观察",
+                    _AUTO_LIE_OUTCOME_OBSERVE_SECONDS,
+                )
+            return
+
+        frame = getattr(self, "_latest_capture_frame", None)
+        sequence = int(getattr(frame, "sequence", -1))
+        if sequence > int(state["last_frame_sequence"]):
+            state["last_frame_sequence"] = sequence
+            matcher = getattr(self, "_auto_lie_success_box", None)
+            if matcher is not None:
+                try:
+                    score = float(matcher.score(getattr(frame, "image", None)))
+                except Exception:
+                    score = 0.0
+                    AUTO_LIE_LOG.debug("自动过测谎: success blue-box check failed", exc_info=True)
+                if score >= SUCCESS_THRESHOLD:
+                    state["success_hits"] = int(state["success_hits"]) + 1
+                    if int(state["success_hits"]) >= SUCCESS_CONSECUTIVE_FRAMES:
+                        AUTO_LIE_LOG.info("自动过测谎: success blue-box confirmed score=%.3f", score)
+                        self._finish_auto_lie_outcome(state, "success")
+                        return
+                else:
+                    state["success_hits"] = 0
+
+        snapshot = self.last_snapshot
+        snapshot_sequence = int(getattr(snapshot, "sequence", -1))
+        if snapshot_sequence <= int(state["last_marker_sequence"]):
+            return
+        state["last_marker_sequence"] = snapshot_sequence
+        if float(getattr(snapshot, "marker_confidence", 0.0)) > 0.0:
+            state["missing"] = 0
+            return
+        state["missing"] = int(state["missing"]) + 1
+        if int(state["missing"]) >= _AUTO_LIE_FAILURE_MISSING_FRAMES:
+            AUTO_LIE_LOG.warning("自动过测谎: black-room marker loss confirmed during outcome watch")
+            self._finish_auto_lie_outcome(state, "failed_marker_missing")
 
     def _begin_auto_lie_accounting_event(self) -> Optional[str]:
         """Persist the server lifecycle record when the WS handshake is ready."""
@@ -7660,6 +7979,10 @@ class UiWorker(threading.Thread):
             and data.get("stationary_jump_enabled", False)
         )
         worker.enabled = bool(mode in ("fixed", "stationary"))
+        # 站桩 shares its beats with the anchor correction and 小碎步, which carry
+        # their own attacks; on patrol those are deliberate extras, so only the
+        # stand-still cadence keeps the attack-spacing rule (attack_worker).
+        worker.stationary_mode = bool(mode == "stationary")
         worker.attack_interval = max(
             0.2, float(data.get("interval_seconds", 3.0))
         )

@@ -117,6 +117,8 @@ class ApiLieTestWorker(threading.Thread):
         on_capture_stop: Optional[Callable[[], None]] = None,
         on_backend_ready: Optional[Callable[[], Optional[str]]] = None,
         backend_opener: Optional[Callable[[RunLog], tuple[Any, str, Any]]] = None,
+        outcome_controlled: bool = False,
+        on_feed_started: Optional[Callable[[], None]] = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         super().__init__(name="api-lie-test", daemon=True)
@@ -150,6 +152,19 @@ class ApiLieTestWorker(threading.Thread):
         self._on_capture_start = on_capture_start
         self._on_capture_stop = on_capture_stop
         self._on_backend_ready = on_backend_ready
+        # Automatic live passes end on a confirmed game outcome (or on the
+        # service closing the round), rather than an arbitrary frame count.
+        # Standalone drills retain their bounded-duration behaviour.
+        self.outcome_controlled = bool(outcome_controlled)
+        self._on_feed_started = on_feed_started
+        self._requested_terminal_outcome: Optional[str] = None
+        self.terminal_outcome: Optional[str] = None
+        self.transport_closed = False
+        # Lets the UI distinguish a remote close after real frame streaming
+        # (continue visual outcome detection) from one before the game pass
+        # ever became active (show the ordinary backend failure instead).
+        self.feed_started = False
+        self._outcome_capture_retained = False
         # The automatic pass supplies a UI-start probe cache here.  Keeping
         # this optional preserves the standalone drill's normal probe path.
         self._backend_opener = backend_opener
@@ -171,6 +186,31 @@ class ApiLieTestWorker(threading.Thread):
     # ------------------------------------------------------------------ control
     def request_stop(self) -> None:
         self._stop_request.set()
+
+    def request_terminal_outcome(self, outcome: str) -> bool:
+        """Ask the streaming worker to end the round after a visual outcome."""
+
+        if outcome not in {"success", "failed_marker_missing"}:
+            raise ValueError(f"unsupported lie outcome: {outcome}")
+        with self._lock:
+            if self._requested_terminal_outcome is not None:
+                return False
+            self._requested_terminal_outcome = outcome
+            self.terminal_outcome = outcome
+            return True
+
+    def release_outcome_capture(self) -> None:
+        """Release the shared frame stream retained after a remote close."""
+
+        with self._lock:
+            if not self._outcome_capture_retained:
+                return
+            self._outcome_capture_retained = False
+        if self._on_capture_stop is not None:
+            try:
+                self._on_capture_stop()
+            except Exception:
+                LOG.warning("api test: could not release retained outcome capture", exc_info=True)
 
     def set_on_backend_ready(self, callback: Optional[Callable[[], Optional[str]]]) -> None:
         """Install the non-blocking handshake lifecycle hook before start."""
@@ -368,6 +408,12 @@ class ApiLieTestWorker(threading.Thread):
             self._running = True
         self._stop_request.clear()
         self.completed_successfully = False
+        self.transport_closed = False
+        self.feed_started = False
+        with self._lock:
+            self._requested_terminal_outcome = None
+            self.terminal_outcome = None
+            self._outcome_capture_retained = False
         if self._on_capture_start is not None:
             try:
                 self._on_capture_start()
@@ -427,7 +473,10 @@ class ApiLieTestWorker(threading.Thread):
             settle_deadline = pass_started + self.await_seconds
             remaining_settle = settle_deadline - time.perf_counter()
             await_ticks = max(0, int(round(max(0.0, remaining_settle) * self.fps)))
-            if remaining_settle > 0:
+            if self.outcome_controlled:
+                plan = (f"连接已建立，等待第二个窗口剩余 {max(0.0, remaining_settle):.1f} 秒后立即上传；"
+                        "将在 10 秒后开始等待游戏成功/失败结果")
+            elif remaining_settle > 0:
                 plan = (f"连接已建立，等待第二个窗口剩余 {remaining_settle:.1f} 秒后立即上传 "
                         f"{feed_frames} 帧 @ {self.fps:.0f} fps（{active_seconds:.0f} 秒）")
             else:
@@ -444,6 +493,13 @@ class ApiLieTestWorker(threading.Thread):
                     self._report("stopped", "等待测谎窗口时收到停止请求")
                     return
             started = time.perf_counter()
+            self.feed_started = True
+            if self._on_feed_started is not None:
+                try:
+                    self._on_feed_started()
+                except Exception:
+                    LOG.warning("api test: feed-start callback failed", exc_info=True)
+            self._report("feed_started", "数据推送已开始；10 秒后开始判断测谎结果")
             # The first upload is due now.  Later frames use the normal 5-fps
             # cadence; do not add an unnecessary first 200 ms tick.
             next_at = started - interval
@@ -504,9 +560,16 @@ class ApiLieTestWorker(threading.Thread):
                                                     frame_id, log)
                         if path is not None:
                             self._report("capture", str(path))
-            for tick in range(1, feed_frames + 1):
+            tick = 0
+            while self.outcome_controlled or tick < feed_frames:
+                tick += 1
                 if self._stop_request.is_set() or self.stop_event.is_set():
                     self._report("stopped", f"第 {tick} 帧前收到停止请求")
+                    break
+                with self._lock:
+                    requested_outcome = self._requested_terminal_outcome
+                if requested_outcome:
+                    self._report("outcome", requested_outcome)
                     break
                 next_at += interval
                 delay = next_at - time.perf_counter()
@@ -586,7 +649,10 @@ class ApiLieTestWorker(threading.Thread):
                          "quota_left": self.stats.quota_left,
                          "last_screen": self.stats.last_screen})
             log.close()
-            self.completed_successfully = True
+            self.completed_successfully = (
+                not self.outcome_controlled
+                or self.terminal_outcome == "success"
+            )
             self._report("logs", str(log.folder))
             self._report("done", self.stats.describe())
         except ConnectionError as exc:
@@ -599,7 +665,11 @@ class ApiLieTestWorker(threading.Thread):
                 log.summary({"outcome": "connection_interrupted", "error": str(exc)})
             finally:
                 log.close()
-            self._report("failed", f"后端连接中断：{exc}")
+            self.transport_closed = True
+            if self.outcome_controlled:
+                self._report("transport_closed", f"后端主动关闭连接：{exc}")
+            else:
+                self._report("failed", f"后端连接中断：{exc}")
         except Exception as exc:
             LOG.exception("api test crashed")
             try:
@@ -624,7 +694,16 @@ class ApiLieTestWorker(threading.Thread):
                     mimic.stop()
             except Exception:
                 LOG.debug("api test: mimic stop failed", exc_info=True)
-            if self._on_capture_stop is not None:
+            retain_capture = (
+                self.outcome_controlled
+                and self.transport_closed
+                and self.terminal_outcome is None
+            )
+            if retain_capture:
+                with self._lock:
+                    self._outcome_capture_retained = True
+                LOG.info("api test: retaining shared capture for visual outcome after remote close")
+            elif self._on_capture_stop is not None:
                 try:
                     self._on_capture_stop()
                 except Exception:

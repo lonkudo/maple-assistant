@@ -76,10 +76,22 @@ class MotionArbiter(threading.Thread):
         micro_step_motion_seconds: float = 0.25,
         micro_step_pre_step_quiet_seconds: float = 0.20,
         facing_motion_seconds: float = 0.10,
-        # A stand-still correction ends with an attack tap, so its lock is the
-        # same kind of hold a 小碎步 uses: the moment after the tap is where the
-        # fixed cadence would otherwise re-tap on top of it.
-        step_motion_seconds: float = 0.25,
+        # A stand-still correction ends with an attack tap, so it keeps a short
+        # lock after that tap - the same kind of hold a 小碎步 uses.  It must
+        # NOT be longer than the operator's own correction cadence
+        # (STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS, 0.30s): the
+        # executor sleeps this value after every correction, so a longer lock is
+        # exactly the visible freeze between two steps of the walk back.  At
+        # 0.70s the field log showed the marker standing on 0.504310 for three
+        # captures while the movement loop kept deciding "step right" and no key
+        # was pressed.  The cadence double-tap this lock used to guard is now
+        # prevented independently by AttackWorker's attack spacing, so the lock
+        # only has to cover the moment after its own attack tap.
+        step_motion_seconds: float = 0.30,
+        # 被撞反击 needs its own post-cast quiet period too.  It is slightly
+        # shorter than the stationary correction reservation, but long enough
+        # that patrol cannot press a direction into the counterattack cast.
+        counterattack_motion_seconds: float = 0.60,
         attack_grace_seconds: float = 0.73,
         delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:
@@ -106,6 +118,9 @@ class MotionArbiter(threading.Thread):
         # fixed cadence from re-tapping on top of that attack.
         self.step_motion_seconds = max(
             0.0, float(step_motion_seconds)
+        )
+        self.counterattack_motion_seconds = max(
+            0.0, float(counterattack_motion_seconds)
         )
         self.attack_grace_seconds = max(0.0, float(attack_grace_seconds))
         self.delivery_retry_seconds = max(0.0, float(delivery_retry_seconds))
@@ -342,6 +357,36 @@ class MotionArbiter(threading.Thread):
                 token.startswith(f"{STEP}:") for token in self._queued
             )
 
+    def cancel_pending_stationary_steps(self, reason: str = "position changed") -> int:
+        """Discard only unstarted stationary corrections.
+
+        An HP hit can move a stationary character after the movement loop has
+        queued a correction toward its old marker position.  That queued
+        direction must not run later, but an already-executing key hold is
+        never interrupted here: stopping a physical key mid-hold would create
+        a second, less predictable movement race.
+        """
+
+        with self._cv:
+            executing = self._executing_token
+            removed = [
+                token for token in self._pending
+                if token.startswith(f"{STEP}:") and token != executing
+            ]
+            if not removed:
+                return 0
+            self._pending = deque(
+                token for token in self._pending if token not in removed
+            )
+            for token in removed:
+                self._queued.discard(token)
+            self._cv.notify_all()
+        LOG.info(
+            "motion arbiter cancelled %d stale stationary correction(s): %s",
+            len(removed), reason,
+        )
+        return len(removed)
+
     def micro_step_pending(self) -> bool:
         """Whether the optional 小碎步 pair is queued or running.
 
@@ -536,6 +581,17 @@ class MotionArbiter(threading.Thread):
             self._last_attack_at = time.monotonic()
             self._cv.notify_all()
 
+    def last_attack_at(self) -> float:
+        """Monotonic time of the last attack any owner registered.
+
+        The cadence worker compares this before and after it waits for the
+        arbiter to go idle: a motion that attacked on its own while the beat
+        waited has already covered that beat (see ``AttackWorker.run``).
+        """
+
+        with self._cv:
+            return self._last_attack_at
+
     def attack_motion_active(self) -> bool:
         """True while a fixed-attack animation can mask movement progress."""
 
@@ -586,7 +642,7 @@ class MotionArbiter(threading.Thread):
         if token.startswith(f"{STEP}:"):
             return self.step_motion_seconds
         if token.startswith(f"{COUNTERATTACK}:"):
-            return self.step_motion_seconds
+            return self.counterattack_motion_seconds
         return self.buff_motion_seconds
 
     def _pop_locked(self, token: str) -> list[Any]:

@@ -1749,9 +1749,9 @@ def main() -> int:
     # only be started once.  api_lie_test.py (the older single-frame screen drill) has no panel
     # button any more; it stays as an offline tool for work/ scripts and the test suite.
     api_test_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=256)
-    # The service expects one short live round: after the separate 3-second
-    # settle, send frames for no more than 15 seconds, then round_end and
-    # close the WebSocket.
+    # Standalone/video drills still use a bounded frame feed.  The automatic
+    # live pass is outcome-controlled: it keeps streaming until the game
+    # reports success/failure or the service closes its advertised round.
     AUTO_LIE_TRACK_SECONDS = 15.0
 
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
@@ -1819,10 +1819,11 @@ def main() -> int:
             key_sender=key_sender,
             fps=5.0,
             transport="rtf1",
-            # The worker sends its explicit round_end and closes after this
-            # 15-second active tracking window.
+            # Kept only for the generic worker API.  outcome_controlled below
+            # makes the live pass end on the game's actual result instead.
             duration=AWAIT_SECOND_WINDOW_SEC + AUTO_LIE_TRACK_SECONDS,
             await_seconds=AWAIT_SECOND_WINDOW_SEC,
+            outcome_controlled=True,
             # The answer must be EXECUTED, not just measured: the pass drives the cursor to the point
             # the API returns (the vendor doc: "鼠标/执行层一般用 x / y（372×248 协议 ROI）"), exactly like
             # the 测试api video drill.  Without it the lie window was never answered.
