@@ -26,6 +26,12 @@ from auto_lie_secret import clear_server_secret, set_server_secret
 
 
 SERVER_LOG = logging.getLogger("server-client")
+# Automatic lie handling keeps its own log file.  Everything that belongs to
+# that feature - the credential delivered by an accepted reply, the event
+# accounting, and the connection trace of the accounting request - is written
+# here instead of into the licensing connection log, so the two diagnoses do
+# not share a file.
+AUTO_LIE_LOG = logging.getLogger("auto-lie")
 
 try:
     from cryptography.exceptions import InvalidSignature
@@ -387,23 +393,21 @@ def _persist_document(document: dict[str, Any], status: LicenseStatus, root: Opt
 
 
 def _with_server_device(
-    status: LicenseStatus, answer: Any, *, authoritative_credentials: bool = True,
+    status: LicenseStatus, answer: Any,
 ) -> LicenseStatus:
     """Attach device state and retain the server key in memory only.
 
-    ``authoritative_credentials`` is True for the replies that own the
-    credential - activation and the heartbeat.  There, a reply that does not
-    mention the credential at all still means "this server has none configured
-    for this device", which is the historical rule.  It is False for the
-    post-pass accounting reply: an older server never sends the field there, and
-    treating that silence as "no credential" erased the in-memory key after
-    every completed pass, disarming 自动过测谎 until the next three-hourly
-    heartbeat (the field symptom: "server credential is unavailable; pass was
-    not started" for every following lie window).
+    Only an explicit ``auto_lie`` object may change the in-memory credential: an
+    empty ``secret_key`` is the server saying this device has no passes left,
+    and a non-empty one is the credential itself.
 
-    A reply that *does* carry ``auto_lie`` is always authoritative, whichever
-    endpoint it came from: an empty ``secret_key`` is the server saying this
-    device has no passes left, and a non-empty one is the credential itself.
+    A reply that does not mention the credential at all leaves it untouched.
+    Treating that silence as "no credential" used to disarm 自动过测谎 until the
+    next three-hourly heartbeat, twice over: once for the post-pass accounting
+    reply (an older server never sends the field there), and once for every
+    activation/heartbeat reply of a server that omits it.  A device with a valid
+    license and passes left must never lose its credential because a reply
+    happened not to carry the field.
     """
 
     device = answer.get("device") if isinstance(answer, dict) else None
@@ -413,18 +417,14 @@ def _with_server_device(
         secret = str(auto_lie.get("secret_key") or "").strip()
         set_server_secret(secret)
         if secret:
-            SERVER_LOG.info("auto-lie credential refreshed from server reply")
+            AUTO_LIE_LOG.info("auto-lie credential refreshed from server reply")
         else:
-            SERVER_LOG.warning(
+            AUTO_LIE_LOG.warning(
                 "auto-lie credential withheld by the server (empty auto_lie.secret_key)"
             )
-    elif authoritative_credentials:
-        # Do not let an old in-memory key survive an authoritative reply that
-        # carries no credential at all.
-        clear_server_secret()
-        SERVER_LOG.warning("auto-lie credential unavailable in validated heartbeat")
     else:
-        SERVER_LOG.debug("auto-lie credential left untouched (this reply carries none)")
+        # Silence is not a verdict (see the docstring): the credential stays.
+        AUTO_LIE_LOG.debug("auto-lie credential left untouched (this reply carries none)")
     if not isinstance(device, dict) and not isinstance(usage, dict):
         return status
     # The full device document remains the compatibility response.  The
@@ -498,9 +498,15 @@ def _with_server_device(
 
 
 def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus:
-    """Activate against the built-in, certificate-pinned licensing endpoint."""
+    """Activate against the built-in, certificate-pinned licensing endpoint.
 
-    clear_server_secret()
+    The credential is not dropped before the request, for the same reason the
+    heartbeat no longer drops it: a transient failure would otherwise destroy a
+    still-valid credential.  A new entitlement must not inherit the previous
+    code's credential, so it is dropped when the activation is refused, fails,
+    or succeeds without an explicit ``auto_lie`` in the reply.
+    """
+
     try:
         SERVER_LOG.info("activation requested")
         answer = post_json(
@@ -517,29 +523,40 @@ def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus
         SERVER_LOG.warning(
             "activation rejected by server status=%s code=%s", exc.status, exc.code
         )
+        clear_server_secret()
         # Rejected activation replies still carry the safe public device
         # summary.  Keep it: a known device must not lose its equipment ID
         # merely because the submitted replacement code was rejected.
         return _with_server_device(
             LicenseStatus(False, f"server:{exc.code}", exc.message),
             exc.data,
-            authoritative_credentials=False,
         )
     except DeviceNotReadyError:
         SERVER_LOG.info("activation postponed: device fingerprint is not ready")
+        clear_server_secret()
         return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
     except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
         SERVER_LOG.warning("activation failed category=%s", type(exc).__name__)
+        clear_server_secret()
         return LicenseStatus(False, "server", "激活验证失败")
     status = _parse_document(document, root)
     if not status.valid:
         SERVER_LOG.warning("activation response rejected category=%s", status.code)
+        clear_server_secret()
         return status
     persisted = _with_server_device(_persist_document(document, status, root), answer)
     if persisted.valid:
         SERVER_LOG.info("activation accepted license_id=%s", persisted.license_id)
+        if not isinstance(answer.get("auto_lie"), dict):
+            # This entitlement replaces the previous code's, so it must not
+            # inherit that code's credential.
+            clear_server_secret()
+            AUTO_LIE_LOG.warning(
+                "auto-lie credential dropped: the activated reply carried none"
+            )
     else:
         SERVER_LOG.warning("activation could not be saved category=%s", persisted.code)
+        clear_server_secret()
     return persisted
 
 
@@ -550,10 +567,31 @@ def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
     signed document proves authenticity, while the online heartbeat proves the
     activation service is currently reachable and has not revoked the bound
     license.
+
+    The credential is NOT dropped before the request.  Clearing it up front
+    meant that for the whole round trip a licensed device with passes left had
+    no credential at all, and a lie window landing in that gap produced
+    "测谎窗口出现时本机没有测谎密钥" even though the entitlement was fine.  It is
+    dropped on the outcome instead: any failed heartbeat clears it, and so does
+    a verdict that the license is gone or the passes are used up.
     """
 
-    # Do not let an old in-memory key survive a failed/invalid revalidation.
-    clear_server_secret()
+    status = _heartbeat_via_server(root)
+    if not status.valid:
+        # A failed heartbeat clears the credential, and so does a verdict about
+        # the entitlement: revoked, expired, or no lie passes left.  A
+        # *successful* heartbeat never clears it - the reply either refreshes
+        # the credential or leaves the held one in place.
+        clear_server_secret()
+        AUTO_LIE_LOG.warning(
+            "auto-lie credential dropped: heartbeat outcome %s", status.code
+        )
+    return status
+
+
+def _heartbeat_via_server(root: Optional[Path] = None) -> LicenseStatus:
+    """The heartbeat request itself; the public wrapper applies the verdict rule."""
+
     local = verify_license(root)
     if not local.valid:
         return local
@@ -581,7 +619,6 @@ def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
         return _with_server_device(
             LicenseStatus(False, f"server:{exc.code}", exc.message),
             exc.data,
-            authoritative_credentials=False,
         )
     except DeviceNotReadyError:
         SERVER_LOG.info("license heartbeat postponed: device fingerprint is not ready")
@@ -613,7 +650,7 @@ def report_lie_event_via_server(
     if not local.valid or not local.license_id:
         return local
     try:
-        SERVER_LOG.info("lie accounting requested event=%s", str(event_id)[:8])
+        AUTO_LIE_LOG.info("lie accounting requested event=%s", str(event_id)[:8])
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/lie-events",
@@ -625,13 +662,16 @@ def report_lie_event_via_server(
                 "occurred_at": str(occurred_at),
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+            # The accounting request is part of automatic lie handling, so its
+            # connection trace stays with the rest of that feature.
+            logger=AUTO_LIE_LOG,
         )
-        status = _with_server_device(local, answer, authoritative_credentials=False)
-        SERVER_LOG.info("lie accounting accepted event=%s", str(event_id)[:8])
+        status = _with_server_device(local, answer)
+        AUTO_LIE_LOG.info("lie accounting accepted event=%s", str(event_id)[:8])
         return status
     except PinnedTlsResponseError as exc:
         status = _with_server_device(
-            local, getattr(exc, "data", {}), authoritative_credentials=False,
+            local, getattr(exc, "data", {}),
         )
         if exc.code in {"AUTO_LIE_QUOTA_BANNED", "FINGERPRINT_BANNED"}:
             return replace(
@@ -642,7 +682,7 @@ def report_lie_event_via_server(
     except DeviceNotReadyError:
         return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
     except (ValueError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
-        SERVER_LOG.warning("lie accounting failed category=%s", type(exc).__name__)
+        AUTO_LIE_LOG.warning("lie accounting failed category=%s", type(exc).__name__)
         return replace(local, code="server", message="激活验证失败")
 
 

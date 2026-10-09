@@ -47,7 +47,8 @@ $ErrorActionPreference = "Stop"
 # Nuitka writes progress to stderr; that must not be mistaken for a failure.
 $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$stage = Join-Path $root "work\protected-stage"
+$stageName = "protected-stage-$Version"
+$stage = Join-Path $root (Join-Path "work" $stageName)
 $out = Join-Path $root "release\TodoHelper-Protected"
 $dataRoot = Join-Path $root "work\protected-data"
 
@@ -288,7 +289,7 @@ Remove-Item -LiteralPath $out -Recurse -Force -ErrorAction SilentlyContinue
 # Python entry point with a standalone executable.  This prevents operator
 # tools/private key material from ever entering the protected package.
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build_release.ps1") `
-    -Version $Version -OutDir "work\protected-stage"
+    -Version $Version -OutDir (Join-Path "work" $stageName)
 if ($LASTEXITCODE -ne 0) { throw "Could not stage protected release." }
 
 Push-Location $root

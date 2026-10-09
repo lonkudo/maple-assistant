@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 
 LOG = logging.getLogger(__name__)
@@ -14,11 +14,15 @@ LOG = logging.getLogger(__name__)
 class FocusWorker(threading.Thread):
     """Pause automation whenever the selected game is not foreground.
 
-    A short focus dip (dialog, notification, taskbar flicker) is tolerated:
-    keyboard input pauses while the game is away, and automation resumes
-    silently if the game comes back within ``focus_lost_grace_seconds``.
-    Only a sustained loss (the user actually switched away) terminally stops
-    the run, so transient steals no longer kill the patrol.
+    A focus loss NEVER ends a run: the operator's rule is that only a manual
+    Stop Patrol ends a patrol, so automation pauses while the game is away and
+    resumes by itself the moment the game is focused again - whether the dip
+    lasted 0.1s or an hour.  While paused the direction keys are released, and
+    the input boundary refuses every key while the game is not foreground, so
+    nothing can be delivered into whatever window took the focus.
+
+    ``focus_lost_grace_seconds`` is the point at which the pause is *reported*;
+    a shorter dip resumes silently.
     """
 
     def __init__(
@@ -30,7 +34,6 @@ class FocusWorker(threading.Thread):
         poll_interval: float = 0.20,
         focus_lost_grace_seconds: float = 2.5,
         refocus_interval_seconds: float = 1.0,
-        on_focus_lost: Optional[Callable[[], None]] = None,
         lie_pass_event: Optional[threading.Event] = None,
         reconnect_active_event: Optional[threading.Event] = None,
     ) -> None:
@@ -50,10 +53,11 @@ class FocusWorker(threading.Thread):
         self.poll_interval = max(0.05, float(poll_interval))
         self.focus_lost_grace_seconds = max(0.0, float(focus_lost_grace_seconds))
         self.refocus_interval_seconds = max(0.25, float(refocus_interval_seconds))
-        self.on_focus_lost = on_focus_lost
         self._lost_since: Optional[float] = None
         self._last_refocus_at: Optional[float] = None
         self._refocus_in_flight = False
+        # The pause is reported once per unfocused episode, not every poll.
+        self._pause_reported = False
 
     def _try_refocus(self) -> None:
         """Bring the game window back to the foreground (async, rate-limited).
@@ -181,46 +185,43 @@ class FocusWorker(threading.Thread):
                 now = time.monotonic()
                 if active:
                     if self._lost_since is not None:
-                        # Focus returned inside the grace window: resume
-                        # without a terminal stop.
+                        # The game is foreground again: the patrol continues by
+                        # itself, whether the pause lasted 0.1s or an hour.
                         LOG.info(
-                            "AUTOMATION RESUMED after %.2fs focus dip",
+                            "AUTOMATION RESUMED after %.2fs unfocused",
                             now - self._lost_since,
                         )
                         self._lost_since = None
+                        self._pause_reported = False
                     previous = active
                 elif input_enabled:
-                    # Game not focused while keyboard input is armed.  First
-                    # try to restore the foreground automatically; the grace
-                    # timer then decides between a transient dip (resume) and
-                    # a sustained loss (terminal stop) if refocus fails.
+                    # Game not focused while keyboard input is armed.  First try
+                    # to restore the foreground automatically.  Patrol is
+                    # PAUSED here, never ended: keys are released and the run
+                    # resumes on its own once the game is focused again.  Only
+                    # the operator's own Stop Patrol ends a patrol.
                     self._try_refocus()
                     if self._lost_since is None:
                         self._lost_since = now
                         self._log_foreground_snapshot()
-                    if now - self._lost_since >= self.focus_lost_grace_seconds:
-                        if previous is True:
-                            self.key_sender.disable_input()
-                            if self.on_focus_lost is not None:
-                                try:
-                                    self.on_focus_lost()
-                                except Exception:
-                                    LOG.exception(
-                                        "could not mark patrol stopped after "
-                                        "focus loss"
-                                    )
+                    elif (not self._pause_reported
+                          and now - self._lost_since
+                          >= self.focus_lost_grace_seconds):
+                        self._pause_reported = True
                         LOG.warning(
-                            "AUTOMATION STOPPED: game window lost focus for "
-                            "%.1fs; UI stays active",
+                            "AUTOMATION PAUSED: game window has been unfocused "
+                            "for %.1fs; keys are released and the patrol resumes "
+                            "by itself when the game is focused again (only "
+                            "Stop Patrol ends it)",
                             now - self._lost_since,
                         )
-                        self._lost_since = None
-                        previous = False
+                    previous = False
                 else:
                     # Keyboard input disabled (patrol stopped by the user):
                     # idle, nothing to gate.
                     previous = False
                     self._lost_since = None
+                    self._pause_reported = False
                 if self.stop_event.wait(self.poll_interval):
                     break
         finally:

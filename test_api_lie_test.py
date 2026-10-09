@@ -286,7 +286,7 @@ class UiRowTests(unittest.TestCase):
         """The redundant controls are gone: one button, and no length/key widgets at all."""
 
         source = Path("ui_worker.py").read_text(encoding="utf-8")
-        self.assertIn('text="测试api"', source)
+        self.assertIn('text="测试API"', source)
         for gone in ("测试api（抓屏）", "_api_test_seconds_box", "_api_test_seconds_var",
                      "_api_test_key_button", "_api_test_change_key",
                      "_api_test_screen_clicked", "_load_api_test_settings",

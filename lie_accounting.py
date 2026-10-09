@@ -22,7 +22,10 @@ from typing import Optional
 from licensing import LicenseStatus, report_lie_event_via_server
 
 
-LOG = logging.getLogger("server-client")
+# Automatic lie handling owns its own log file: this durable outbox is part of
+# that feature, so its lines belong in auto_lie.log rather than in the
+# licensing connection log.
+LOG = logging.getLogger("auto-lie")
 
 
 @dataclass(frozen=True)

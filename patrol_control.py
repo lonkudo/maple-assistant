@@ -464,6 +464,32 @@ class PatrolController:
         with self._lock:
             self._enabled = bool(enabled)
 
+    def reload_recording(self) -> None:
+        """Adopt the recording section currently stored in the user config.
+
+        Configuration import is an in-process operation.  The controller is
+        the owner of the route snapshot consumed by movement, so replacing
+        that snapshot here is enough for the next movement tick to use the
+        imported route without a process restart.  Import always leaves a
+        patrol stopped; it must be started explicitly after the refresh.
+        """
+
+        try:
+            loaded = (
+                self.config_store.read_section("recording")
+                if self.config_store is not None
+                else json.loads(self.profile_path.read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"无法读取导入的巡逻录制: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("导入的巡逻录制格式错误")
+        with self._lock:
+            self._profile = deepcopy(loaded)
+            self._enabled = False
+            self._selected_layer = self._final_layer_name_locked()
+            self._inverted_range_reported = ("", "")
+
     def can_start(self) -> bool:
         """Whether the selected patrol route has both horizontal endpoints."""
 

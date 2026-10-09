@@ -9,10 +9,10 @@ The drill the 测试api button runs:
         -> draw the ROI, the answer and the aim on the frame -> show it -> log the frame
     ... until the run length is reached, then round_end + summary + logs.
 
-Why the mapping is exact even though the picture may be shown smaller than 1:1: the window hands
-the drill the **screen rectangle the picture actually occupies** (`widget_image_region`), and
-`RoiGeometry` maps client pixels onto it linearly - so `to_screen()` is the real cursor position and
-`MouseAimController(1366, 768)` with that same rectangle moves the cursor onto the same pixel.
+The preview deliberately preserves the source video's native pixel size.  The window hands the drill
+the **screen rectangle the picture actually occupies** (`widget_image_region`), and `RoiGeometry`
+maps source pixels onto it linearly - so `to_screen()` is the real cursor position and a
+`MouseAimController` created for that source size moves the cursor onto the same pixel.
 
 Everything goes into one run folder (autolie_api.logs.RunLog): connection.log, detection.jsonl,
 summary.json, frames/.
@@ -40,6 +40,7 @@ from autolie_api.intergration import (
 )
 from autolie_api.logs import RunLog
 from autolie_api.mock_backend import detect_bright_blob
+from lie_roi_geometry import resolve_lie_roi_box
 
 LOG = logging.getLogger("api_auto_lie")
 ROOT = Path(__file__).resolve().parent
@@ -105,10 +106,13 @@ DEFAULT_SECONDS = 30.0
 # service answered abandon_frame_hold for every one of them; its real content only appeared ~3.2 s
 # in), so feeding starts only after this wait - and the session is opened only then, because
 # 2.7.0 §4.1 kicks a session that stays 10 s without a valid frame.
-AWAIT_SECOND_WINDOW_SEC = 3.0
+AWAIT_SECOND_WINDOW_SEC = 2.0
 # The service's own limit (measured handshake_ack: idle_no_frame_sec = 10); we stay a step under it.
 IDLE_NO_FRAME_SEC = 10.0
 IDLE_SAFE_SECONDS = IDLE_NO_FRAME_SEC - 2.0
+# A video drill keeps its source pixels intact.  ``build_slot_frame`` derives
+# the protocol's fixed 372x248 ROI from whichever client/video size it gets,
+# so 1080x768 recordings do not need to be enlarged to 1366x768 first.
 ROI_CLIENT = (1366, 768)
 ANNOTATED_EVERY_SECONDS = 2.0
 CLIP = "api_lie_video"
@@ -153,6 +157,7 @@ class VideoDrillWindow:
         self._on_toggle_pause = on_toggle_pause
         self._paused = False
         self._mouse_on = True
+        self._native_size_applied = False
         self.top.bind("<Escape>", lambda _event: self._request_close(on_close))
         self.top.bind("q", lambda _event: self._request_close(on_close))
         self.top.bind("<space>", lambda _event: self._toggle_pause())
@@ -203,13 +208,26 @@ class VideoDrillWindow:
 
     # ---- display
     def update_frame(self, frame_bgr: np.ndarray, hud: str = "") -> None:
-        """Show one frame; the picture is centred by Tk, which image_region() accounts for."""
+        """Show one frame at its native source size.
+
+        The viewer window may be smaller than the video on compact displays,
+        but the image itself must never be resampled to fit that window: the
+        visual target, API ROI and cursor mapping all stay in the video's own
+        pixel space.
+        """
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = self._Image.fromarray(rgb)
         self._image_size = image.size
         self._photo = self._ImageTk.PhotoImage(image)
         self.label.configure(image=self._photo, text="")
+        if not self._native_size_applied:
+            # Request the video's real dimensions once.  Windows may clip a
+            # very large viewer to the desktop, but Tk must never resample the
+            # picture merely to make it fit the viewer's current size.
+            self.top.update_idletasks()
+            self.top.geometry(f"{self.top.winfo_reqwidth()}x{self.top.winfo_reqheight()}")
+            self._native_size_applied = True
         if hud:
             self.status.set(hud)
 
@@ -268,6 +286,8 @@ class VideoDrillWorker(threading.Thread):
         display: "queue.Queue[tuple[np.ndarray, str]]",
         stop_event: threading.Event,
         key: str = "",
+        host: str = "",
+        ports: tuple[int, ...] = (),
         seconds: float = DEFAULT_SECONDS,
         fps: float = DEFAULT_FPS,
         transport: str = "rtf1",
@@ -284,6 +304,8 @@ class VideoDrillWorker(threading.Thread):
         self.display = display
         self.stop_event = stop_event
         self.key = str(key or "")
+        self.host = str(host or "").strip()
+        self.ports = tuple(int(port) for port in ports)
         self.seconds = max(1.0, float(seconds))
         self.fps = max(1.0, float(fps))
         # RTF1 keeps the JPEG as bytes inside one binary WebSocket message.
@@ -307,6 +329,9 @@ class VideoDrillWorker(threading.Thread):
         self._suspended: list = []
         self.restore_cursor = True
         self._cursor_origin: Optional[tuple[float, float]] = None
+        # Filled from the video header before the aiming session starts.  The
+        # 1366x768 preset is only a safe fallback for malformed video files.
+        self._source_size: tuple[int, int] = ROI_CLIENT
         self._stop_request = threading.Event()
         self._lock = threading.Lock()
         self._running = False
@@ -367,7 +392,7 @@ class VideoDrillWorker(threading.Thread):
             _aim = _aim_module()
             MouseAimController, claim_cursor = _aim.MouseAimController, _aim.claim_cursor
 
-            self._aim = MouseAimController(ROI_CLIENT[0], ROI_CLIENT[1],
+            self._aim = MouseAimController(self._source_size[0], self._source_size[1],
                                            dead_band_px=6.0, confidence_threshold=0.0,
                                            target_stale_seconds=1.0)
             self._suspended = claim_cursor(self._aim)
@@ -499,9 +524,15 @@ class VideoDrillWorker(threading.Thread):
                 return
             video_fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
             total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if source_width > 0 and source_height > 0:
+                self._source_size = (source_width, source_height)
+            playback_fps = max(1.0, float(video_fps) if video_fps else self.fps)
             log.connection("video info", fps=round(video_fps, 3), frames=total_frames,
                            duration_sec=(round(total_frames / video_fps, 1)
-                                         if video_fps else None))
+                                         if video_fps else None),
+                           source_size=self._source_size)
             self._report("video", f"{self.video.name} · {total_frames} 帧 @ {video_fps:.1f} fps")
             interval = 1.0 / self.fps
             # The whole drill is the 时长 (30s by default) and the AWAIT_SECOND_WINDOW wait is part
@@ -510,8 +541,13 @@ class VideoDrillWorker(threading.Thread):
             total_ticks = max(1, int(round(self.seconds * self.fps)))
             clip_capped = False
             if not self.loop_video and total_frames > 0:
-                # one source frame per tick: 30s * 5fps frames, or fewer when the clip is shorter
-                capped = min(total_ticks, max(1, int(total_frames)))
+                # The upload is sampled at 5 fps, but the preview follows the
+                # source recording's clock.  A 30-fps recording must not
+                # visibly play at one sixth of its natural speed.
+                source_ticks = max(
+                    1, int(round((total_frames / playback_fps) * self.fps))
+                )
+                capped = min(total_ticks, source_ticks)
                 clip_capped = capped < total_ticks
                 total_ticks = capped
             await_ticks = self._await_ticks(total_ticks)
@@ -544,7 +580,9 @@ class VideoDrillWorker(threading.Thread):
                     f"{feed_ticks} 帧 @ {self.fps:.0f} fps（{feed_ticks / self.fps:.0f} 秒）"
                     if await_ticks else
                     f"连接已建立，{feed_ticks} 帧 @ {self.fps:.0f} fps（{self.seconds:.0f} 秒）")
-            self._report("start", f"{plan}，ROI={lie_roi_box(*ROI_CLIENT)}")
+            roi_box = None
+            roi_source = "preset"
+            self._report("start", f"{plan}，ROI={lie_roi_box(*self._source_size)}")
             sent = answered = holds = misses = 0
             last_quota = None
             loops = 0
@@ -552,7 +590,10 @@ class VideoDrillWorker(threading.Thread):
             truth_deltas: list[float] = []
             timings: list[float] = []
             started = time.perf_counter()
+            playback_started = started
             next_tick = started
+            source_frame_index = -1
+            current_source_frame = None
             last_annotated = 0.0
             consecutive_misses = 0
             previous_screen: Optional[tuple[float, float]] = None
@@ -571,7 +612,28 @@ class VideoDrillWorker(threading.Thread):
                     time.sleep(delay)
                 while self.paused.is_set() and not self._stop_request.is_set():
                     time.sleep(0.05)
-                ok, frame = capture.read()
+                desired_source_index = int(
+                    max(0.0, time.perf_counter() - playback_started) * playback_fps
+                )
+                if total_frames > 0 and self.loop_video:
+                    desired_source_index %= total_frames
+                    if desired_source_index < source_frame_index:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        source_frame_index = -1
+                        loops += 1
+                        log.connection("video looped", loop=loops, at_frame=tick)
+                if total_frames > 0 and not self.loop_video and desired_source_index >= total_frames:
+                    ended_reason = "video ended"
+                    self._report("video-end", f"视频已结束（第 {tick} 帧），不循环")
+                    break
+                ok = True
+                frame = current_source_frame
+                while source_frame_index < desired_source_index:
+                    ok, current_source_frame = capture.read()
+                    source_frame_index += 1
+                    if not ok:
+                        break
+                    frame = current_source_frame
                 if not ok:
                     if not self.loop_video:
                         ended_reason = "video ended"
@@ -579,15 +641,26 @@ class VideoDrillWorker(threading.Thread):
                         break
                     loops += 1
                     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    source_frame_index = -1
                     log.connection("video looped", loop=loops, at_frame=tick)
-                    ok, frame = capture.read()
+                    ok, current_source_frame = capture.read()
+                    source_frame_index = 0
+                    frame = current_source_frame
                     if not ok:
                         ended_reason = "video ended"
                         self._report("video-end", "视频无法继续读取")
                         break
-                if frame.shape[1] != ROI_CLIENT[0] or frame.shape[0] != ROI_CLIENT[1]:
-                    frame = cv2.resize(frame, ROI_CLIENT, interpolation=cv2.INTER_AREA)
+                # Keep the original recording dimensions.  The shared ROI
+                # geometry explicitly supports 1080x768 and other presets;
+                # scaling here made the player visibly shrink the video and
+                # put its displayed coordinate space out of sync with input.
                 client_bgr = frame
+                if roi_box is None or roi_source != "red-border":
+                    candidate_box, candidate_source = resolve_lie_roi_box(client_bgr)
+                    if roi_box is None or candidate_source == "red-border":
+                        roi_box, roi_source = candidate_box, candidate_source
+                        if candidate_source == "red-border":
+                            self._report("roi", f"已锁定红色测谎区域 ROI={roi_box}")
                 if tick <= await_ticks:
                     # AWAIT_SECOND_WINDOW: the second window is still coming up, so nothing is built
                     # and nothing is billed yet - but the session is already open and waiting, so
@@ -615,7 +688,7 @@ class VideoDrillWorker(threading.Thread):
                                    at_tick=tick, feed_ticks=feed_ticks,
                                    since_start=round(time.perf_counter() - started, 2))
                 round_frame_id += 1
-                built = build_slot_frame(client_bgr, frame_id=round_frame_id,
+                built = build_slot_frame(client_bgr, roi_box, frame_id=round_frame_id,
                                          interval_sec=interval, window_rect=self.image_rect,
                                          quality=JPEG_QUALITY)
                 caps_ok, caps_reason = check_caps(built)
@@ -659,8 +732,23 @@ class VideoDrillWorker(threading.Thread):
                     self._report("reconnect", f"已重连（第 {rounds} 轮）：{note}")
                     continue
                 sent += 1
+                # Playback must never wait for the network.  The previous
+                # request/response sequence waited up to 1.5 seconds here,
+                # turning a normal recording into roughly one displayed frame
+                # per second whenever the backend was busy.  Poll only what
+                # is already ready; the next upload tick will collect a late
+                # response.  The source-video clock above remains real time.
                 try:
-                    answer = client.wait_result(round_frame_id, timeout=max(1.5, interval * 3))
+                    ready_answers = client.poll_results(timeout=0.001)
+                    # ``poll_results`` retains replies for the synchronous
+                    # compatibility API.  This worker owns the session and
+                    # handles them immediately, so release that tiny cache.
+                    for ready_answer in ready_answers:
+                        try:
+                            client._pending.pop(int(ready_answer.get("frame_id")), None)
+                        except (AttributeError, TypeError, ValueError):
+                            pass
+                    answer = ready_answers[-1] if ready_answers else None
                 except (ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as exc:
                     log.connection("connection lost while reading", frame_id=frame_id,
                                    error=str(exc))
@@ -675,17 +763,16 @@ class VideoDrillWorker(threading.Thread):
                     self._report("reconnect", f"已重连（第 {rounds} 轮）：{note}")
                     continue
                 if answer is None:
-                    misses += 1
-                    consecutive_misses += 1
+                    # A missing *immediate* response is normal in a pipelined
+                    # WebSocket stream, not a failed frame.  Keep playing and
+                    # show the current source frame at its natural speed.
                     log.detection({"frame_id": frame_id, "jpeg_bytes": built.byte_size,
-                                   "answered": False})
-                    self._show(self._annotate(client_bgr, built.geometry, None, frame_id,
-                                              f"frame {frame_id}  NO ANSWER"),
-                               f"帧 {frame_id}：无回包")
-                    if consecutive_misses >= 3:
-                        log.connection("stopping after 3 consecutive misses")
-                        self._report("failed", "连续 3 帧没有回包，已停止")
-                        break
+                                   "answered": False, "awaiting_result": True})
+                    self._show(
+                        self._annotate(client_bgr, built.geometry, None, frame_id,
+                                       f"frame {frame_id}  TRACKING"),
+                        f"帧 {frame_id}/{feed_ticks}：传输中…",
+                    )
                     continue
                 consecutive_misses = 0
                 answered += 1
@@ -879,8 +966,10 @@ class VideoDrillWorker(threading.Thread):
         return new_client, new_mimic, note
 
     def _open(self, log: RunLog):
-        session = open_backend(key=self.key, transport=self.transport, frame_standard=self.fps,
+        session = open_backend(key=self.key, host=self.host, ports=self.ports,
+                              transport=self.transport, frame_standard=self.fps,
                               use_mimic=self.use_mimic, log=log,
+                              health=False,
                               client_info="maple_assistant_video")
         return session.client, session.note, session.mimic
 

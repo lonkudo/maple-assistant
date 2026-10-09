@@ -50,9 +50,10 @@ from reconnect_worker import (
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
 from update_manager import (
-    UpdateError, export_user_config,
+    UpdateError, desktop_roots, export_user_config, import_user_config,
     find_newer_desktop_update,
-    schedule_config_import_restart, schedule_hidden_restart,
+    restore_user_config_bytes,
+    schedule_hidden_restart,
     schedule_package_update,
 )
 from runtime_paths import application_root, package_format
@@ -125,12 +126,12 @@ def _auto_lie_confirm_client_point(
 # report was "the lie event happened, but the autolie_api is not taking over", with no line in the log
 # saying why.  Quota is protected by the minimum gap between passes instead, and every skip is logged.
 AUTO_LIE_MIN_PASS_GAP_SECONDS = 10.0
-# A lie window that arrives without an in-memory credential must not simply be
-# lost: the panel asks for an immediate heartbeat and lets the detector's next
-# event start the pass as soon as the key lands.  These two bound that request so
-# a failing server cannot turn every scan into its own heartbeat.
-AUTO_LIE_SECRET_RETRY_SECONDS = 10.0
-AUTO_LIE_SECRET_MAX_ATTEMPTS = 3
+# A lie window that arrives without an in-memory credential is reported once per
+# window and then left alone.  It deliberately does NOT request a heartbeat: the
+# per-window request this used to make (bounded to 3 attempts, 10 s apart) turned
+# a run of lie windows into a run of licensing round trips.  The heartbeat is
+# sent only at application startup, on its own three-hour/midnight schedule, and
+# from the operator's caption refresh control.
 # A repeating debug-UI poll failure logs a full traceback this often; the ones in between are DEBUG.
 POLL_FAILURE_LOG_SECONDS = 10.0
 # A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
@@ -140,6 +141,15 @@ AUTO_LIE_PENDING_MAX_SECONDS = 90.0
 # can contain a uniform square matching the lie HUD colour, but cannot be a
 # playable lie window. Suppress only auto-lie starts for this short transition.
 AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class _AutoLieDetectorEvent:
+    """One detector match with the monotonic time at which it was observed."""
+
+    match: object
+    detected_at: float
+
 
 # The debug UI uses two columns (controls + debug/YOLO); the initial
 # window (including the in-window caption bar when active) is compact by
@@ -932,6 +942,7 @@ class UiWorker(threading.Thread):
         on_patrol_stop: Optional[Callable[[], None]] = None,
         on_capture_now: Optional[Callable[[], Any]] = None,
         on_recording_verified: Optional[Callable[[DebugSnapshot], None]] = None,
+        on_imported_minimap_calibration: Optional[Callable[[], None]] = None,
         log_queue: Optional["queue.Queue[str]"] = None,
         ui_log_handler: Any = None,
         user_config_path: Optional[str] = None,
@@ -1010,10 +1021,6 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_quota_logged = False
         self._api_auto_lie_pending_since = 0.0
         self._api_auto_lie_wait_logged = False
-        # On-demand credential re-arm: how many immediate heartbeats this lie
-        # window has already asked for, and when the last one was requested.
-        self._api_auto_lie_secret_attempts = 0
-        self._api_auto_lie_secret_requested_at = 0.0
         # Debounce state: whether the window currently on screen has already been handled, when
         # the square was last seen to be gone, and when the last pass started.
         self._api_auto_lie_event_active = False
@@ -1024,18 +1031,10 @@ class UiWorker(threading.Thread):
         # not spend another pass on that same stale square; a clear frame arms
         # the next real lie window normally.
         self._api_auto_lie_ignore_until_clear = False
-        # Establish the current HWND generation while the UI starts. A later
-        # game recreation must differ from this baseline; waiting until the
-        # first suspicious square would make that recreated handle look like
-        # the initial state and fail to arm the safety window.
-        _sender = getattr(self.status_worker, "key_sender", None)
-        _observe_handle = getattr(_sender, "observe_game_window_handle", None)
-        try:
-            self._api_auto_lie_handle_generation: Optional[int] = (
-                int(_observe_handle()) if callable(_observe_handle) else 0
-            )
-        except Exception:
-            self._api_auto_lie_handle_generation = 0
+        # The first *armed* observation establishes the baseline.  Do not
+        # enumerate desktop windows while merely opening the assistant: that
+        # made an idle UI and Windows' own file picker noticeably sluggish.
+        self._api_auto_lie_handle_generation: Optional[int] = None
         self._api_auto_lie_new_window_block_until = 0.0
         self._api_auto_lie_new_window_suppression_logged = False
         self._latest_capture_frame: Any = None
@@ -1098,6 +1097,7 @@ class UiWorker(threading.Thread):
         self.on_patrol_stop = on_patrol_stop
         self.on_capture_now = on_capture_now
         self.on_recording_verified = on_recording_verified
+        self.on_imported_minimap_calibration = on_imported_minimap_calibration
         self.log_queue = log_queue
         self.ui_log_handler = ui_log_handler
         self.user_config_path = user_config_path
@@ -1161,6 +1161,9 @@ class UiWorker(threading.Thread):
         self._auto_lie_marker_verification: Optional[dict[str, Any]] = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
+        self._ui_text_cache: dict[str, str] = {}
+        self._countdown_display_state: Optional[tuple[float, str]] = None
+        self._patrol_controls_render_key: Any = None
         self._root: Any = None
         self._photo_minimap: Any = None
         self._photo_map_name: Any = None
@@ -1249,7 +1252,6 @@ class UiWorker(threading.Thread):
                 500 + (_CAPTION_HEIGHT if caption_installed else 0),
             )
             root.protocol("WM_DELETE_WINDOW", self._on_debug_window_close)
-            self._schedule_window_geometry_save(root)
             # While the OS runs its own move/resize loop Windows draws the
             # frame outline; freeze client repaints until the shape is
             # confirmed, then repaint once (avoids relayout/repaint lag on
@@ -2608,20 +2610,8 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             self._reconnect_message_button.pack(side="left", padx=(6, 0))
-            # The 测试API drill button is hidden from the panel by operator
-            # request.  The drill itself is untouched: it still opens the video
-            # picker and uses the automatic pass's connection/handshake path,
-            # and every reader of the widget already goes through
-            # ``getattr(self, "_api_test_button", None)``, so leaving the
-            # attribute unset is safe.  To bring the button back, uncomment the
-            # three statements below.
-            # self._api_test_button = ttk.Button(
-            #     reconnect_row,
-            #     text="测试API",
-            #     command=self._api_test_clicked,
-            #     takefocus=False,
-            # )
-            # self._api_test_button.pack(side="left", padx=(6, 0))
+            # The video drill remains available to internal callers, but the
+            # operator-facing panel keeps this diagnostic control hidden.
             restart_row = ttk.Frame(extra_panel)
             restart_row.pack(fill="x", pady=(4, 0))
             self._auto_restart_var = tk.BooleanVar(value=False)
@@ -2664,9 +2654,8 @@ class UiWorker(threading.Thread):
                 justify="left",
                 wraplength=440,
             )
-            # The invisible status sink is still needed: the automatic lie pass
-            # reports its progress and errors through it.  The 测试API button
-            # above is commented out, so only the automatic pass writes here.
+            # The invisible status sink is shared by the automatic lie pass and
+            # the manual 测试API video drill; details stay in the running log.
             self._api_test_status = ttk.Label(
                 extra_panel, text="",
                 justify="left", wraplength=440,
@@ -2784,7 +2773,7 @@ class UiWorker(threading.Thread):
                 takefocus=False,
             )
             import_config_hint = HoverTooltip(
-                self._import_config_button, "重新导入会重启助手"
+                self._import_config_button, "导入后会刷新当前助手并停止巡逻"
             )
             import_config_hint.set_enabled(True)
             self._bind_key_tooltips.append(import_config_hint)
@@ -2855,6 +2844,13 @@ class UiWorker(threading.Thread):
             self._refit_window_to_content()
             root.deiconify()
 
+            # Mapping the dashboard can make Windows give it foreground even
+            # though the assistant has not been started.  Return foreground to
+            # the selected game once, without arming automation or injecting a
+            # key, so the operator's ordinary keyboard input is usable as soon
+            # as the helper finishes opening.
+            root.after(120, self._return_game_focus_after_startup)
+
             self._start_license_heartbeat()
             root.after(0, self._poll)
             root.mainloop()
@@ -2864,6 +2860,20 @@ class UiWorker(threading.Thread):
             self._yolo_stop()
             self._root = None
             LOG.info("UI worker stopped")
+
+    def _return_game_focus_after_startup(self) -> None:
+        """Give the game back foreground after the dashboard's first map."""
+
+        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        select_window = getattr(sender, "select_window", None)
+        if not callable(select_window):
+            return
+        try:
+            select_window()
+        except Exception:
+            # The game may not be running yet.  Startup must remain usable for
+            # configuration in that case.
+            LOG.debug("startup game-focus restore skipped", exc_info=True)
 
     def _install_custom_caption(self, root: Any, tk: Any) -> bool:
         """Hide the native caption so an in-window one can host the ? button.
@@ -3147,7 +3157,11 @@ class UiWorker(threading.Thread):
         """Stop live input and close this instance for the scheduled restart."""
 
         # Stop live input before the helper starts a clean elevated instance.
-        self._stop_patrol()
+        stopped = self._stop_patrol()
+        if not stopped:
+            # Headless/minimal dashboards may not have a route controller;
+            # there is then no cleanup thread to wait for before copying.
+            self._patrol_stop_cleanup_done.set()
         root = getattr(self, "_root", None)
         if root is not None:
             root.after(250, self._on_debug_window_close)
@@ -3430,31 +3444,6 @@ class UiWorker(threading.Thread):
 
         return root.winfo_geometry()
 
-    def _schedule_window_geometry_save(self, root: Any, delay_ms: int = 3000) -> None:
-        """Periodically persist the debug UI geometry while it is open.
-
-        A periodic save (rather than only on close) also keeps the position
-        when the assistant is restarted hard (kill/restart scripts), so the
-        window never snaps back to a fixed default corner.
-        """
-
-        def _tick() -> None:
-            if self._root is not root:
-                return
-            try:
-                _save_window_geometry(self._geometry_for_save(root))
-            except Exception:
-                LOG.debug("could not save debug UI geometry", exc_info=True)
-            try:
-                root.after(delay_ms, _tick)
-            except Exception:
-                pass
-
-        try:
-            root.after(delay_ms, _tick)
-        except Exception:
-            pass
-
     def _poll(self) -> None:
         """Run one tick of the periodic UI work and ALWAYS schedule the next one.
 
@@ -3514,7 +3503,6 @@ class UiWorker(threading.Thread):
         self._drain_lie_accounting_results()
         self._drain_channel_update_events()
         self._drain_other_player_stop_events()
-
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
         # so the resize stays light, but keep the poll cadence alive.
@@ -3535,8 +3523,8 @@ class UiWorker(threading.Thread):
             except (AttributeError, ValueError):
                 pass
         if latest is not None:
+            self._latest_capture_frame = latest
             try:
-                self._latest_capture_frame = latest
                 self.last_snapshot = build_debug_snapshot(
                     latest,
                     self.detector,
@@ -3564,7 +3552,6 @@ class UiWorker(threading.Thread):
             self._poll_yolo_exit,
             self._drain_hotkey_actions,
             self._drain_api_test_results,
-            self._refresh_auto_lie_window_transition_guard,
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
             self._service_auto_lie_outcome_monitor,
@@ -4129,10 +4116,12 @@ class UiWorker(threading.Thread):
         )
 
     def _apply_auto_lie_entitlement(self, status: LicenseStatus) -> None:
-        """Disable future auto-lie passes after a server accounting refusal.
+        """Disarm and grey 自动过测谎 after a server accounting refusal.
 
         A live pass is deliberately left alone; accounting happens after a
-        completed event, so only subsequent windows are disarmed.
+        completed event, so only subsequent windows are disarmed.  The selection
+        is greyed as well, exactly like the exhausted-quota gate: a device the
+        server has switched off must not look switchable.
         """
 
         if bool(getattr(status, "auto_lie_allowed", True)):
@@ -4140,6 +4129,17 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_api_auto_lie_var"):
             self._api_auto_lie_var.set(False)
         self._api_auto_lie_session_armed = False
+        if getattr(status, "code", "") in {
+            "server:auto_lie_banned", "server:AUTO_LIE_QUOTA_BANNED",
+            "server:FINGERPRINT_BANNED",
+        }:
+            self._api_auto_lie_quota_locked = True
+            check = getattr(self, "_api_auto_lie_check", None)
+            if check is not None:
+                try:
+                    check.state(["disabled"])
+                except Exception:
+                    LOG.debug("could not grey 自动过测谎", exc_info=True)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text="自动过测谎：服务器已停用此设备。")
         LOG.warning("auto-lie disabled by server device status")
@@ -5185,7 +5185,9 @@ class UiWorker(threading.Thread):
     def _set_api_test_status(self, text: str) -> None:
         if hasattr(self, "_api_test_status"):
             try:
-                self._api_test_status.configure(text=text)
+                self._configure_text_if_changed(
+                    self._api_test_status, "api_test_status", text
+                )
             except Exception:
                 LOG.debug("api test status could not be updated", exc_info=True)
 
@@ -5398,7 +5400,9 @@ class UiWorker(threading.Thread):
                 if self._api_auto_lie_match_queued:
                     return
                 try:
-                    self._api_auto_lie_events.put_nowait(match)
+                    self._api_auto_lie_events.put_nowait(
+                        _AutoLieDetectorEvent(match=match, detected_at=time.monotonic())
+                    )
                     self._api_auto_lie_match_queued = True
                 except queue.Full:
                     return
@@ -5409,13 +5413,16 @@ class UiWorker(threading.Thread):
             return
 
     def _refresh_auto_lie_window_transition_guard(self) -> bool:
-        """Refresh the false-lie guard whenever the game HWND is recreated.
+        """Check the false-lie guard only when a lie candidate actually arrives.
 
-        This runs every UI tick, not only after the detector finds a square.
-        Therefore a second crash/restart replaces the first 60-second window
-        with a fresh one even if the first login surface contained no match.
+        ``IsWindow``/window recovery are Windows calls, not UI state reads.  A
+        previous implementation ran them from every 100 ms dashboard tick
+        whenever 自动测谎 was selected, which made an otherwise idle dashboard
+        periodically stall.  A recreated loading/login surface can only cause
+        harm once the detector has found a candidate, so checking here still
+        rejects that same first false candidate without placing window work on
+        the idle Tk path.
         """
-
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
         observe = getattr(sender, "observe_game_window_handle", None)
         if not callable(observe):
@@ -5460,7 +5467,12 @@ class UiWorker(threading.Thread):
 
         return self._refresh_auto_lie_window_transition_guard()
 
-    def _handle_lie_event_for_api(self, match: object = None) -> None:
+    def _handle_lie_event_for_api(
+        self,
+        match: object = None,
+        *,
+        detected_at: Optional[float] = None,
+    ) -> None:
         """Handle one queued lie event on the UI thread.
 
         This owns all Tk variable/widget access.  The detector must only
@@ -5504,15 +5516,6 @@ class UiWorker(threading.Thread):
         if not self._license_allowed():
             AUTO_LIE_LOG.info("自动过测谎: ignored because license is not valid")
             return
-        if not has_server_secret():
-            # Do not lose the window: ask for an immediate heartbeat and let the
-            # detector's next event (it fires on every scan) start the pass as
-            # soon as the key lands.  The request itself is bounded, so a server
-            # that keeps answering without a credential cannot turn every scan
-            # into its own heartbeat.
-            self._request_auto_lie_credential(match)
-            return
-        self._api_auto_lie_secret_attempts = 0
         if not hasattr(self, "_api_auto_lie_var"):
             AUTO_LIE_LOG.warning("自动过测谎: lie event ignored - the panel has no 自动过测谎 selection")
             return
@@ -5527,6 +5530,20 @@ class UiWorker(threading.Thread):
             # frames before the user enables this session.  It is expected,
             # not an operator-facing warning.
             AUTO_LIE_LOG.debug("自动过测谎: lie event ignored until enabled during this session")
+            return
+        # The credential belongs to a pass that can really start, so this check
+        # sits AFTER the selection gates.  Checked first, it spent up to three
+        # licensing round trips per lie window and printed 本机没有测谎密钥 for a
+        # feature the operator had switched off (the field log: "selection
+        # loaded as OFF" at 12:17, then the missing-key warning at 12:39 for a
+        # setting nobody had enabled).
+        if not has_server_secret():
+            # Deliberately silent and deliberately passive.  A window can arrive
+            # before the credential does - every session starts with none, and
+            # the heartbeat runs only at startup, on its own schedule, and from
+            # the caption refresh - so this is a normal state, not an incident.
+            # Nothing is written to the auto-lie log and no heartbeat is
+            # requested here: the window is answered by hand.
             return
         now = time.monotonic()
         if getattr(self, "_api_auto_lie_ignore_until_clear", False):
@@ -5563,62 +5580,14 @@ class UiWorker(threading.Thread):
                 )
             return
         self._api_auto_lie_pending = True
-        self._api_auto_lie_pending_since = now
+        self._api_auto_lie_pending_since = (
+            float(detected_at) if detected_at is not None else now
+        )
         self._api_auto_lie_wait_logged = False
         AUTO_LIE_LOG.warning(
             "自动过测谎: a new lie window armed a pass (bbox %s, previous pass %.0fs ago)",
             match, since_last,
         )
-
-    def _request_auto_lie_credential(self, match: object = None) -> None:
-        """Ask for an immediate heartbeat when a lie window has no credential.
-
-        The credential is delivered by the activation/heartbeat reply and lives
-        in RAM only, so a window that arrives before that reply - just after a
-        start or an automatic restart, during a heartbeat round trip, or after a
-        failed heartbeat - used to be dropped outright, and the next chance to
-        arm it could be three hours away.  The detector re-reports the window on
-        every scan, so requesting the heartbeat here is enough: the next event
-        starts the pass as soon as the key lands.
-
-        The request is rate-limited and capped per window, because the detector
-        runs at the capture cadence and a server that keeps answering without a
-        credential must not be polled 5 times a second.
-        """
-
-        now = time.monotonic()
-        if match is None:
-            # The square is gone: the next window starts with a fresh budget.
-            self._api_auto_lie_secret_attempts = 0
-            return
-        attempts = int(getattr(self, "_api_auto_lie_secret_attempts", 0))
-        if attempts > AUTO_LIE_SECRET_MAX_ATTEMPTS:
-            return
-        if attempts >= AUTO_LIE_SECRET_MAX_ATTEMPTS:
-            # Log the give-up exactly once per window.
-            self._api_auto_lie_secret_attempts = attempts + 1
-            AUTO_LIE_LOG.warning(
-                "自动过测谎: 本窗口已请求 %d 次心跳仍拿不到测谎密钥，不再请求；"
-                "等待下一次心跳，或检查服务器是否已配置密钥",
-                attempts,
-            )
-            return
-        since = now - float(getattr(self, "_api_auto_lie_secret_requested_at", 0.0))
-        if attempts and since < AUTO_LIE_SECRET_RETRY_SECONDS:
-            return
-        self._api_auto_lie_secret_attempts = attempts + 1
-        self._api_auto_lie_secret_requested_at = now
-        request = getattr(self, "_license_heartbeat_request", None)
-        if request is not None:
-            request.set()
-        AUTO_LIE_LOG.warning(
-            "自动过测谎: 测谎窗口出现时本机没有测谎密钥；已请求立即心跳（第 %d/%d 次）",
-            attempts + 1, AUTO_LIE_SECRET_MAX_ATTEMPTS,
-        )
-        if hasattr(self, "_api_test_status"):
-            self._api_test_status.configure(
-                text="自动过测谎: 正在向授权服务器重新获取测谎密钥…"
-            )
 
     @staticmethod
     def _worker_is_running(worker: Any) -> bool:
@@ -5651,13 +5620,21 @@ class UiWorker(threading.Thread):
         if events is not None:
             while True:
                 try:
-                    match = events.get_nowait()
+                    event = events.get_nowait()
                 except queue.Empty:
                     break
+                if isinstance(event, _AutoLieDetectorEvent):
+                    match = event.match
+                    detected_at = event.detected_at
+                else:
+                    # ``None`` clear events and old/test callers remain
+                    # compatible with the original queue payload.
+                    match = event
+                    detected_at = None
                 if match is not None:
                     with self._api_auto_lie_event_enqueue_lock:
                         self._api_auto_lie_match_queued = False
-                self._handle_lie_event_for_api(match)
+                self._handle_lie_event_for_api(match, detected_at=detected_at)
                 try:
                     events.task_done()
                 except ValueError:
@@ -5772,6 +5749,11 @@ class UiWorker(threading.Thread):
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
             return
+        feed_anchor_setter = getattr(worker, "set_feed_start_from_detection", None)
+        if callable(feed_anchor_setter):
+            feed_anchor_setter(
+                getattr(self, "_api_auto_lie_pending_since", time.monotonic())
+            )
         setter = getattr(worker, "set_on_backend_ready", None)
         if callable(setter):
             setter(self._begin_auto_lie_accounting_event)
@@ -5812,6 +5794,7 @@ class UiWorker(threading.Thread):
             try:
                 controller.set_enabled(False)
                 self._api_auto_lie_patrol_paused = True
+                self._refresh_patrol_controls()
                 AUTO_LIE_LOG.warning("自动过测谎: patrol paused for the api pass (it resumes when the pass "
                             "finishes)")
             except Exception:
@@ -5975,7 +5958,9 @@ class UiWorker(threading.Thread):
             # being emitted by the worker's general-purpose logger.
             AUTO_LIE_LOG.info("自动过测谎: worker result %s", text)
             if hasattr(self, "_api_test_status"):
-                self._api_test_status.configure(text=f"自动过测谎: {text}")
+                self._configure_text_if_changed(
+                    self._api_test_status, "api_test_status", f"自动过测谎: {text}"
+                )
             if state == "feed_started":
                 self._arm_auto_lie_outcome_monitor(worker)
             elif state == "transport_closed":
@@ -6113,15 +6098,31 @@ class UiWorker(threading.Thread):
                     click_confirmation=False,
                 )
                 return
-            # A still-live backend may yet return a result.  Do not mark the
-            # event terminal or disarm the next round merely because this
-            # initial observation window elapsed; continue in short chunks.
-            state["deadline"] = time.monotonic() + 5.0
-            if not state.get("deadline_extended_logged"):
-                state["deadline_extended_logged"] = True
-                AUTO_LIE_LOG.warning(
-                    "自动过测谎: %.0fs 内未见结果，但后端仍在传输；继续观察",
-                    _AUTO_LIE_OUTCOME_OBSERVE_SECONDS,
+            # A live socket is not enough evidence to keep this pass alive
+            # forever.  Bound the ownership window so a silent server cannot
+            # retain capture/mouse ownership and block every later lie event.
+            # Unlike an explicit server close, this is not accounted as
+            # success: leave the durable event pending for the established
+            # heartbeat/server settlement policy and keep patrol paused.
+            state["timed_out"] = True
+            self._api_auto_lie_event_active = False
+            self._api_auto_lie_ignore_until_clear = True
+            self._api_auto_lie_failed_handled = True
+            if worker is not None and id(worker) == state.get("worker_id"):
+                request_stop = getattr(worker, "request_stop", None)
+                if callable(request_stop):
+                    request_stop()
+                release_capture = getattr(worker, "release_outcome_capture", None)
+                if callable(release_capture):
+                    release_capture()
+            AUTO_LIE_LOG.warning(
+                "自动过测谎: %.0fs 内未检测到成功或失败，已停止数据推送；巡逻保持暂停，"
+                "等待当前窗口消失后才允许下一轮",
+                _AUTO_LIE_OUTCOME_OBSERVE_SECONDS,
+            )
+            if hasattr(self, "_api_test_status"):
+                self._api_test_status.configure(
+                    text="自动过测谎: 结果超时，已停止接管；巡逻保持暂停，请按 Esc 处理。"
                 )
             return
 
@@ -6745,7 +6746,19 @@ class UiWorker(threading.Thread):
             text = ""
         else:
             text = "自动化: 已停止"
-        self._automation_status_label.configure(text=text)
+        self._configure_text_if_changed(
+            self._automation_status_label, "automation_status", text
+        )
+
+    def _configure_text_if_changed(self, widget: Any, key: str, text: object) -> bool:
+        """Update a Tk text field only when its visible value actually changes."""
+
+        value = str(text)
+        if self._ui_text_cache.get(key) == value:
+            return False
+        self._ui_text_cache[key] = value
+        widget.configure(text=value)
+        return True
 
     def _drain_logs(self) -> None:
         if self.log_queue is None or not hasattr(self, "_log_label"):
@@ -6860,14 +6873,7 @@ class UiWorker(threading.Thread):
         LOG.info("自动过测谎日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
 
     def _import_user_config(self) -> None:
-        """Choose a saved configuration, load it, then restart this instance.
-
-        The imported file is only read at startup, and the running instance
-        would otherwise write its own in-memory settings back over it while
-        still patrolling the old route.  A successful import therefore stops
-        and restarts the assistant through the same hidden helper used by the
-        updater.
-        """
+        """Choose a saved configuration and refresh the running helper."""
 
         if not self.user_config_path:
             LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_IMPORT)
@@ -6875,11 +6881,15 @@ class UiWorker(threading.Thread):
         try:
             from tkinter import filedialog
 
+            desktops = desktop_roots()
+            desktop = desktops[0] if desktops else Path.home() / "Desktop"
+            config_folder = desktop / "助手配置"
+            config_folder.mkdir(parents=True, exist_ok=True)
             source = filedialog.askopenfilename(
                 parent=self._root,
                 title="导入用户配置",
-                initialfile="新配置.json",
-                filetypes=(("用户配置", "新配置.json"), ("JSON 文件", "*.json")),
+                initialdir=str(config_folder),
+                filetypes=(("JSON 文件", "*.json"), ("所有文件", "*.*")),
             )
         except Exception:
             LOG.exception("%s失败：无法打开文件选择窗口", LOG_CONFIG_IMPORT)
@@ -6887,18 +6897,119 @@ class UiWorker(threading.Thread):
         if not source:
             LOG.info("%s已取消", LOG_CONFIG_IMPORT)
             return
-        try:
-            schedule_config_import_restart(
-                Path(source), application_root(__file__)
-            )
-        except UpdateError as exc:
-            LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, exc)
+        if bool(getattr(self, "_config_import_in_progress", False)):
+            LOG.info("%s已在刷新中", LOG_CONFIG_IMPORT)
             return
-        LOG.info(
-            "%s成功：已排队 %s；当前实例退出后将写入并自动重启。",
-            LOG_CONFIG_IMPORT, source,
-        )
-        self._close_for_restart()
+        self._config_import_in_progress = True
+        self._control_status.configure(text="↻ 正在刷新导入配置…")
+        # Stop first so no worker can act on the old route while its shared
+        # recording snapshot is being replaced.
+        self._stop_patrol()
+        destination = Path(self.user_config_path)
+
+        def copy_then_refresh() -> None:
+            self._patrol_stop_cleanup_done.wait(timeout=5.0)
+            try:
+                original_content = destination.read_bytes()
+                import_user_config(Path(source), destination)
+                error: Optional[Exception] = None
+            except Exception as exc:
+                original_content = None
+                error = exc
+
+            root = getattr(self, "_root", None)
+            if root is None:
+                return
+
+            def finish() -> None:
+                if error is not None:
+                    self._config_import_in_progress = False
+                    LOG.warning("%s失败：%s", LOG_CONFIG_IMPORT, error)
+                    self._control_status.configure(text=f"导入配置失败：{error}")
+                    return
+                try:
+                    self._reload_imported_user_config()
+                except Exception as exc:
+                    LOG.exception("%s刷新失败", LOG_CONFIG_IMPORT)
+                    # The replacement succeeded but its complete live reload
+                    # did not. Restore the exact prior document before
+                    # accepting another UI change, so disk and workers cannot
+                    # remain on two different configurations.
+                    if original_content is None:
+                        self._config_import_in_progress = False
+                        self._control_status.configure(text=f"导入配置失败：{exc}")
+                        return
+
+                    def rollback_then_refresh() -> None:
+                        try:
+                            restore_user_config_bytes(destination, original_content)
+                            rollback_error: Optional[Exception] = None
+                        except Exception as rollback_exc:
+                            rollback_error = rollback_exc
+
+                        def finish_rollback() -> None:
+                            self._config_import_in_progress = False
+                            if rollback_error is not None:
+                                LOG.error(
+                                    "%s回滚失败: %s", LOG_CONFIG_IMPORT, rollback_error
+                                )
+                                self._control_status.configure(
+                                    text="导入配置失败，且无法恢复原配置；请不要继续保存并重启助手。"
+                                )
+                                return
+                            try:
+                                self._reload_imported_user_config()
+                            except Exception:
+                                LOG.exception("%s回滚后的刷新失败", LOG_CONFIG_IMPORT)
+                                self._control_status.configure(
+                                    text="导入配置失败，已恢复原配置；请重启助手后再试。"
+                                )
+                                return
+                            self._control_status.configure(
+                                text="导入配置失败，已恢复原配置。"
+                            )
+
+                        try:
+                            root.after(0, finish_rollback)
+                        except Exception:
+                            LOG.debug("configuration import rollback callback skipped", exc_info=True)
+
+                    threading.Thread(
+                        target=rollback_then_refresh,
+                        name="config-import-rollback",
+                        daemon=True,
+                    ).start()
+                    return
+                self._config_import_in_progress = False
+                self._control_status.configure(text="配置已刷新；巡逻保持停止。")
+                LOG.info("%s成功：已刷新 %s，无需重启。", LOG_CONFIG_IMPORT, source)
+
+            try:
+                root.after(0, finish)
+            except Exception:
+                LOG.debug("configuration import refresh callback skipped", exc_info=True)
+
+        threading.Thread(
+            target=copy_then_refresh, name="config-import-refresh", daemon=True,
+        ).start()
+
+    def _reload_imported_user_config(self) -> None:
+        """Redraw user-owned panels and apply their values after an import."""
+
+        reload_minimap = self.on_imported_minimap_calibration
+        if reload_minimap is not None:
+            reload_minimap()
+        controller = self.patrol_controller
+        if controller is not None:
+            controller.reload_recording()
+            self.configured_map_name = controller.map_name()
+        # Each loader also applies its values to its corresponding live worker.
+        self._yolo_load_settings()
+        self._fixed_load_settings()
+        self._drug_load_settings()
+        self._shutdown_load_settings()
+        self._patrol_controls_render_key = None
+        self._refresh_patrol_controls()
 
     def _export_user_config(self) -> None:
         """Export the live configuration to ``桌面\\助手配置\\新配置.json``."""
@@ -6907,6 +7018,11 @@ class UiWorker(threading.Thread):
             LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_EXPORT)
             return
         try:
+            # The attack panel is a user-owned section too.  Persist the
+            # controls visible right now before copying the unified document,
+            # including when this is the first export after the assistant
+            # started or after importing another configuration.
+            self._fixed_save_settings(self._fixed_collect_data())
             target = export_user_config(Path(self.user_config_path))
         except UpdateError as exc:
             LOG.warning("%s失败：%s", LOG_CONFIG_EXPORT, exc)
@@ -7390,7 +7506,8 @@ class UiWorker(threading.Thread):
     def _yolo_settings_path(self) -> Path:
         """JSON file holding the YOLO panel settings."""
 
-        return config_section_file("yolo_detection")
+        path = Path(self.user_config_path) if self.user_config_path else None
+        return config_section_file("yolo_detection", path)
 
     def _yolo_load_settings(self) -> None:
         """Restore saved YOLO panel values from the local JSON file."""
@@ -7440,11 +7557,11 @@ class UiWorker(threading.Thread):
         self._yolo_sync_show_button()
         LOG.info("yolo settings loaded from %s", self._yolo_settings_path())
 
-    @staticmethod
-    def _fixed_settings_path() -> Path:
+    def _fixed_settings_path(self) -> Path:
         """JSON file holding the Fixed Attack panel settings."""
 
-        return config_section_file("fixed_attack")
+        path = Path(self.user_config_path) if self.user_config_path else None
+        return config_section_file("fixed_attack", path)
 
     def _fixed_collect_data(self) -> dict:
         """Current Fixed Attack panel values as a settings dict."""
@@ -8255,9 +8372,9 @@ class UiWorker(threading.Thread):
         LOG.info("fixed attack settings loaded from %s",
                  self._fixed_settings_path())
 
-    @staticmethod
-    def _drug_settings_path() -> Path:
-        return config_section_file("drug")
+    def _drug_settings_path(self) -> Path:
+        path = Path(self.user_config_path) if self.user_config_path else None
+        return config_section_file("drug", path)
 
     def _attach_bind_hint(self, button: Any) -> None:
         """Attach the bindable-hotkeys popout hint to a key-bind button.
@@ -8454,11 +8571,11 @@ class UiWorker(threading.Thread):
         except Exception as exc:
             LOG.warning("drug settings apply failed: %s", exc)
 
-    @staticmethod
-    def _shutdown_settings_path() -> Path:
+    def _shutdown_settings_path(self) -> Path:
         """JSON file holding the Additional Functions panel settings."""
 
-        return config_section_file("additional_functions")
+        path = Path(self.user_config_path) if self.user_config_path else None
+        return config_section_file("additional_functions", path)
 
     def _shutdown_collect_data(self) -> dict:
         """Current Additional Functions panel values as a settings dict."""
@@ -8747,15 +8864,19 @@ class UiWorker(threading.Thread):
                 parent=self._root,
             )
         except Exception as exc:
-            self._telegram_status.configure(
-                text=f"消息提醒: 无法打开设备名称输入框 - {exc}"
+            self._configure_text_if_changed(
+                self._telegram_status,
+                "telegram_status",
+                f"消息提醒: 无法打开设备名称输入框 - {exc}",
             )
             return
         if name is None:
             return
         self._telegram_machine_var.set(name.strip()[:100])
-        self._telegram_machine_button.configure(
-            text=machine_name_button_text(self._telegram_machine_var.get())
+        self._configure_text_if_changed(
+            self._telegram_machine_button,
+            "telegram_machine_button",
+            machine_name_button_text(self._telegram_machine_var.get()),
         )
         self._shutdown_on_change()
 
@@ -9057,15 +9178,21 @@ class UiWorker(threading.Thread):
                 show="*",
             )
         except Exception as exc:
-            self._telegram_status.configure(
-                text=f"消息提醒: 无法打开 token 输入框 - {exc}"
+            self._configure_text_if_changed(
+                self._telegram_status,
+                "telegram_status",
+                f"消息提醒: 无法打开 token 输入框 - {exc}",
             )
             return
         if token is None:
             return
         self._telegram_bot_token = token.strip()
         self._telegram_chat_id = ""
-        self._telegram_status.configure(text="消息提醒: 正在验证 BOT 配置...")
+        self._configure_text_if_changed(
+            self._telegram_status,
+            "telegram_status",
+            "消息提醒: 正在验证 BOT 配置...",
+        )
         self._refresh_telegram_token_button()
         self._shutdown_on_change()
 
@@ -9076,8 +9203,10 @@ class UiWorker(threading.Thread):
         if button is None:
             return
         try:
-            button.configure(
-                text="已设置" if self._telegram_bot_token.strip() else "设置BOT token"
+            self._configure_text_if_changed(
+                button,
+                "telegram_token_button",
+                "已设置" if self._telegram_bot_token.strip() else "设置BOT token",
             )
         except Exception:
             LOG.debug("Telegram token button refresh failed", exc_info=True)
@@ -9089,11 +9218,15 @@ class UiWorker(threading.Thread):
             return
         notifier = getattr(self, "telegram_notifier", None)
         if notifier is None:
-            self._telegram_status.configure(text="消息提醒: 工作线程未接入。")
+            self._configure_text_if_changed(
+                self._telegram_status, "telegram_status", "消息提醒: 工作线程未接入。"
+            )
             return
         try:
             snapshot = notifier.snapshot()
-            self._telegram_status.configure(text=str(snapshot["status"]))
+            self._configure_text_if_changed(
+                self._telegram_status, "telegram_status", str(snapshot["status"])
+            )
             discovered = str(snapshot.get("chat_id", "")).strip()
             if discovered and discovered != self._telegram_chat_id:
                 self._telegram_chat_id = discovered
@@ -9101,8 +9234,10 @@ class UiWorker(threading.Thread):
             self._refresh_telegram_token_button()
         except Exception as exc:
             # Status display itself must be non-fatal too.
-            self._telegram_status.configure(
-                text=f"消息提醒: 状态读取失败 - {exc}"
+            self._configure_text_if_changed(
+                self._telegram_status,
+                "telegram_status",
+                f"消息提醒: 状态读取失败 - {exc}",
             )
 
     # Human-readable key labels for the help dialog (mirrors hotkey.json
@@ -9398,7 +9533,7 @@ class UiWorker(threading.Thread):
             minutes = int(remaining // 60.0)
             seconds = int(remaining % 60.0)
             text = (f"定时关闭已启动: 游戏将在 {minutes}分 {seconds:02d}秒后关闭。")
-        self._shutdown_status.configure(text=text)
+        self._configure_text_if_changed(self._shutdown_status, "shutdown_status", text)
 
     @staticmethod
     def _format_countdown_seconds(seconds: float) -> str:
@@ -9570,16 +9705,20 @@ class UiWorker(threading.Thread):
         enabled, interval, remaining = worker.snapshot()
         if not enabled:
             return
-        self._countdown_remaining_slider.configure(to=interval)
-        if not self._countdown_dragging:
-            self._countdown_remaining_var.set(remaining)
-            self._countdown_remaining_label.configure(
-                text=self._format_countdown_seconds(remaining)
-            )
-        self._countdown_status.configure(
-            text=("循环警报: 剩余 "
-                  f"{self._format_countdown_seconds(remaining)} / "
-                  f"间隔 {interval / 3600.0:.1f}h；到时提醒并自动重置。")
+        shown_remaining = self._format_countdown_seconds(remaining)
+        display_state = (round(float(interval), 3), shown_remaining)
+        if display_state != self._countdown_display_state:
+            self._countdown_display_state = display_state
+            self._countdown_remaining_slider.configure(to=interval)
+            if not self._countdown_dragging:
+                self._countdown_remaining_var.set(remaining)
+                self._configure_text_if_changed(
+                    self._countdown_remaining_label, "countdown_remaining", shown_remaining
+                )
+        self._configure_text_if_changed(
+            self._countdown_status, "countdown_status",
+            ("循环警报: 剩余 "
+             f"{shown_remaining} / 间隔 {interval / 3600.0:.1f}h；到时提醒并自动重置。")
         )
 
     def _shutdown_load_settings(self) -> None:
@@ -9717,10 +9856,10 @@ class UiWorker(threading.Thread):
                 self._telegram_machine_var.set(str(
                     data.get("telegram_machine_name", "")
                 ))
-                self._telegram_machine_button.configure(
-                    text=machine_name_button_text(
-                        self._telegram_machine_var.get()
-                    )
+                self._configure_text_if_changed(
+                    self._telegram_machine_button,
+                    "telegram_machine_button",
+                    machine_name_button_text(self._telegram_machine_var.get()),
                 )
                 self._refresh_telegram_token_button()
             if hasattr(self, "_quick_messages"):
@@ -10284,9 +10423,7 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         if str(getattr(self, "_attack_mode_var", None).get()
                if hasattr(self, "_attack_mode_var") else "fixed") == "stationary":
-            self._control_status.configure(
-                text="运行已开始。只有正确配置楼层，才能寻路回去。"
-            )
+            self._control_status.configure(text="运行已开始。")
         else:
             self._control_status.configure(text="运行已开始。")
         LOG.info(LOG_RUN_START + "。")
@@ -10340,15 +10477,9 @@ class UiWorker(threading.Thread):
             name="patrol-stop-cleanup",
             daemon=True,
         ).start()
-        # Stopping patrol also stops the YOLO attack subprocess: in stand-still
-        # mode the character stands and the YOLO executor attacks, so without
-        # this the character would keep attacking after Stop Patrol.
-        try:
-            self._yolo_stop()
-        except Exception:
-            # A detector subprocess/UI cleanup failure must never take down
-            # the dashboard after patrol input has already been disarmed.
-            LOG.exception("Stop Patrol detector cleanup failed")
+        # YOLO is no longer part of the patrol runtime.  In particular, Stop
+        # Patrol must not synchronously wait up to three seconds for a legacy
+        # detector process that this interface no longer starts.
         LOG.info(LOG_RUN_STOP + "。")
         try:
             # The controls already reflect the stopped controller. Keep Start
@@ -10426,6 +10557,19 @@ class UiWorker(threading.Thread):
         self._patrol_intent = False
         try:
             controller.reset_recording()
+        except PermissionError:
+            # A configuration copied from an older extracted release can
+            # still be owned by that release/Explorer.  Do not expose a raw
+            # WinError path; the old recording must be recreated for the
+            # current package before it can be exported again.
+            LOG.warning("Reset Recording refused: user configuration is inaccessible")
+            try:
+                self._control_status.configure(
+                    text="配置版本与当前助手版本不匹配，请重新录制以后导出新配置。"
+                )
+            except Exception:
+                LOG.debug("could not display reset compatibility refusal", exc_info=True)
+            return
         except Exception as exc:
             # The reset must never take down the UI.  A locked config/reference
             # file, malformed on-disk profile, or a transient Windows error is
@@ -10509,6 +10653,24 @@ class UiWorker(threading.Thread):
         layer_names = list(route)
         layer_names.extend(name for name in snapshot.layers if name not in layer_names)
         layer_names = list(layer_display_order(layer_names))
+        license_allowed = self._license_allowed()
+        # Treat the patrol panel as a tiny declarative view.  This method is
+        # called from both explicit actions and the periodic state observer;
+        # deleting/recreating every canvas item, combobox value and button
+        # state when the model is unchanged makes the whole Tk process feel
+        # slow (even native file dialogs share that event loop).
+        render_key = (
+            running,
+            can_start,
+            selected,
+            tuple(layer_names),
+            repr(snapshot.layers),
+            bool(self._patrol_stop_pending),
+            license_allowed,
+        )
+        if render_key == self._patrol_controls_render_key:
+            return
+        self._patrol_controls_render_key = render_key
         self._update_patrol_range_combos(layer_names)
         self._ensure_layer_rows(tuple(layer_names))
         if hasattr(self, "_selected_layer_var"):
@@ -10530,7 +10692,7 @@ class UiWorker(threading.Thread):
             state="normal" if len(layer_names) > 0 else "disabled"
         )
         self._reset_recording_button.configure(state="normal")
-        if not self._license_allowed():
+        if not license_allowed:
             # The dashboard remains inspectable, but no capture-driven
             # recording or automation entry point is usable before activation.
             for button in (

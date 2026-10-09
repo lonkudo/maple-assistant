@@ -34,7 +34,7 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
-The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer compatible release ZIP. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. The same helper owns **导入配置**: the selected JSON is validated first, the running assistant exits, then the helper atomically replaces `user_config.json` and launches the new instance. This prevents the departing instance from retaining or overwriting its own live configuration during import.
+The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer compatible release ZIP. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
 ### Current release behavior (v1.2.2)
 
@@ -192,6 +192,73 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   a heartbeat that arrives inside that second is not replaced by stale caption
   text.
 
+### Current release behavior (v1.2.160 – v1.2.163)
+
+- **A focus loss pauses the patrol; it does not end it.** `focus_worker.py` releases
+  the held direction keys and clears the automation gate the moment the game stops
+  being foreground, and re-opens it by itself when the game is focused again —
+  whether the gap lasted a tenth of a second or an hour. Only a manual **停止巡逻**
+  ends a run. The pause is reported once per episode (`AUTOMATION PAUSED`,
+  `AUTOMATION RESUMED`); the previous "terminal stop after the grace window" no
+  longer exists, and neither does the `on_focus_lost` callback that implemented it.
+- **An unresponsive game is not a focus loss.** When the client hangs, Windows hands
+  the foreground to a DWM *ghost* stand-in (class `Ghost`, owned by `dwm.exe`, title
+  = the game's title plus a localized "not responding" suffix). A lag spike therefore
+  used to satisfy "the game is not foreground" and stopped the patrol after 2.5 s.
+  The foreground predicate now accepts that stand-in when its title is this window's
+  own title plus that suffix, and it never excuses an unrelated window: a real
+  focus thief, another window's ghost, or a vanished game window still count as a
+  loss. A hang is reported once (`foreground: the game window is not responding …`).
+- **Every automatic-lie service instance is listed, and a pass fails over between
+  them.** `auto_lie_backend.py` holds six `host:port` WebSocket instances — three on
+  `221.10.121.69` (48001–48003) and the three the vendor's own list names on
+  `117.50.223.113` (8001–8003). `select_auto_lie_ws_endpoints()` shuffles them with
+  the system entropy source; the startup preflight probes that random order and
+  caches the first instance that answers, together with the whole order; and each
+  live pass tries its cached instance first and moves to the next one whenever a
+  handshake fails, logging every failure. Only when all six fail does the pass
+  raise. The old `fingerprint % 3` assignment is gone, so a device is no longer
+  pinned to one worker on one host.
+- **All automatic-lie logging lives in `auto_lie.log`.** The credential lines, the
+  durable event-accounting lines, and the connection trace of the accounting
+  request used to be written to the licensing connection log
+  (`server_client.log`); `server_client.log` now carries licensing only, and the
+  lie-events request's connect/pin/completed lines follow the feature into
+  `auto_lie.log` (`pinned_tls.post_json(..., logger=…)`).
+- **The credential can never appear in a log file.** A `CredentialRedactionFilter`
+  is attached to every file handler (assistant trace, licensing connection,
+  auto-lie, and the in-app running log). It rewrites the live credential *and* the
+  vendor's masked preview of it (`mask_key`, which shows the key's first six and
+  last four characters) to `(credential hidden)`, in the formatted message and in
+  any argument.
+- **The credential is fetched by the heartbeat and then kept.** It is not dropped
+  before a heartbeat request, so a licensed device with passes left always holds
+  its credential for the whole round trip. It is cleared on a failed heartbeat
+  (transport, TLS, or device-not-ready), on a verdict that the license is expired
+  or revoked, and when the server withholds it (an empty `auto_lie.secret_key`,
+  which is what a device with no passes left receives). A **successful** heartbeat
+  never clears it, and a reply that does not mention `auto_lie` at all leaves the
+  held credential alone — silence is not a verdict. Whenever a heartbeat clears
+  it, **自动过测谎** is unselected and greyed until a later heartbeat reports
+  otherwise.
+- **No lie window asks for a heartbeat.** The heartbeat is sent at application
+  startup, on its own schedule (three hours after an accepted one, and at the
+  GMT+8 midnight roll-over), after a failure, and when the operator presses the
+  caption **↻** refresh (which does a heartbeat as well as refreshing the
+  remaining-time line). A window that arrives before the credential does is
+  reported nowhere and simply answered by hand — no per-window request, no log
+  hint, no extra licensing round trips.
+- **The 测试API button is hidden again.** The video drill itself is untouched in
+  `api_lie_video.py`; uncommenting three statements in `ui_worker.py` puts the
+  button back.
+- **站桩攻击 correction tuning.** The arbiter step lock is **0.60 s** and is shared
+  with 被撞反击, so it — not the 0.30 s re-request interval — is the effective
+  spacing between repeated corrections; the near correction hold is **0.11 s**; the
+  final approach band is **±0.030 X**. The pre-emptive wait for an in-flight attack
+  before the first return key after a knockback is **gone**: a swallowed key is
+  caught by the three-capture progress watch instead, so the character starts
+  walking back immediately.
+
 ## Configuration
 
 Two configuration files keep personal settings separate from shipped defaults:
@@ -201,7 +268,7 @@ Two configuration files keep personal settings separate from shipped defaults:
 | `user_config.json` | Your keys, layers, patrol route, alerts, quick messages, and personal settings. |
 | `system_config.json` | Application defaults and internal behavior settings. |
 
-Use **导入配置** and **导出配置** in the running-log panel to move your personal configuration between installations. Import validates the selected JSON and then restarts the assistant; the replacement is performed only after the old process has fully exited, so its configuration file is never self-locked or overwritten by shutdown callbacks. Export writes `桌面\\助手配置\\新配置.json`. Import and export actions are recorded in the log.
+Use **导入配置** and **导出配置** in the running-log panel to move your personal configuration between installations. Import validates the selected JSON, stops patrol, replaces `user_config.json` atomically, and refreshes the current assistant without restarting it. Export writes `桌面\\助手配置\\新配置.json`. Import and export actions are recorded in the log. If **重置录制** cannot replace an inaccessible configuration carried over from an older release, the UI shows `配置版本与当前助手版本不匹配，请重新录制以后导出新配置。` rather than exposing a raw Windows access-denied error.
 
 ## Licensing and activation service
 
@@ -246,7 +313,10 @@ key can never be reconstructed from its public key.
 `server_client.log` records safe activation diagnostics: connection start,
 certificate-pin outcome, HTTP result, and local acceptance/refusal category.
 It never records an activation code, hardware fingerprint, token, or secret.
-The linked-node icon in **运行日志** copies this file to the clipboard.
+Automatic lie handling is deliberately *not* in this file: its credential,
+accounting and connection lines go to `auto_lie.log` (see *Current release
+behavior (v1.2.160 – v1.2.163)*). The linked-node icon in **运行日志** copies
+`server_client.log` to the clipboard.
 
 Immediately after a Windows restart, firmware or motherboard CIM/WMI signals
 can temporarily be unavailable. This is reported as **设备未就绪，稍后重试** and
@@ -265,9 +335,20 @@ After a successful online activation or heartbeat, the server may include the
 auto-lie credential in that already pinned, authenticated response. The client
 keeps it only in process memory, refreshes it on the three-hour heartbeat, and
 destroys it when the application exits. It is never written to
-`user_config.json`, `license.json`, a release ZIP, or a client log. The
-credential remains separate from both signed-license validation and the vendor
-WebSocket adapter.
+`user_config.json`, `license.json`, a release ZIP, or a client log — a redaction
+filter enforces the last of those even against a masked preview. The credential
+remains separate from both signed-license validation and the vendor WebSocket
+adapter.
+
+The credential is delivered by the reply and then held; it is *not* discarded
+before a request is sent. It is cleared by a failed heartbeat, by a verdict that
+the license expired or was revoked, and by the server withholding it (an empty
+`auto_lie.secret_key`, which is what a device with no passes left receives). A
+successful heartbeat never clears it, and a reply that does not mention
+`auto_lie` leaves it alone. **自动过测谎** is unselected and greyed whenever a
+heartbeat clears it. Heartbeats themselves are sent only at application startup,
+on their own three-hour/midnight schedule, after a failure, and from the caption
+**↻** — never because a lie window appeared.
 
 Each successful heartbeat also returns the server-issued eight-character
 **设备码**. The authorization line always displays that code (and left-clicking
@@ -554,7 +635,7 @@ The hover hint on the checkbox is the operator-facing warning: 建议在怪物�
 
 ### Position correction while standing
 
-站桩攻击 holds the recorded spot with one atomic motion per correction: a short direction hold — the tiny step inside the inner band, a longer walk when the character is further out — followed immediately by one attack. The attack belongs to the correction, so a correction can never be the moment a beat is lost; corrections repeat about 300 ms apart until the marker is back inside the arrival band (±0.006X). A drift is always walked back: the character never settles a pixel or two away from its 桩. The small-step band ends at ±0.010X, and the correction interval only spaces the corrections — it does not create a gap in which a beat is skipped.
+站桩攻击 holds the recorded spot with one atomic motion per correction: a short direction hold — the tiny step inside the inner band, a longer walk when the character is further out — followed immediately by one attack. The attack belongs to the correction, so a correction can never be the moment a beat is lost; corrections repeat until the marker is back inside the arrival band (±0.006X), spaced by the arbiter's own correction reservation (**0.60 s**, shared with 被撞反击) rather than by the shorter 0.30 s re-request interval. A drift is always walked back: the character never settles a pixel or two away from its 桩. The small-step band ends at ±0.010X, and the correction spacing only spaces the corrections — it does not create a gap in which a beat is skipped.
 
 When a normal return walk starts outside the final approach band, it first waits
 for an already-running attack animation to finish. Sending its initial Left or
@@ -592,6 +673,13 @@ a Telegram notification; **自动重连** reconnects after a verified disconnect
 and **自动测谎** hands the mouse to the automatic lie workflow and consumes one
 lie-detection use even if it is interrupted with Esc. Leave 自动测谎 off when
 manual lie handling is intended.
+
+After the automatic-lie WebSocket handshake, TodoHelper waits two seconds for
+the actual game dialog before sending frames. It first uses the safe preset
+ROI, then detects and locks the dialog's native dark-red (`#db231b`) border as
+soon as that border is visible. This keeps the sent crop tied to the real
+playfield on both 1366×768 and 1080×768 clients instead of assuming a fixed
+minimap-size rectangle while the dialog is still animating in.
 
 Telegram uses one bot token per TodoHelper configuration, but multiple helpers
 may use the same token and send to the same chat. Give each helper a distinct
@@ -659,8 +747,8 @@ unnecessary (the other player left) hands the patrol back on its own.
 
 The lie detector shares the normal 5 FPS capture cadence. When automatic lie handling is enabled:
 
-1. Application startup performs a background, no-billing WebSocket endpoint probe and caches the usable endpoint.
-2. On a lie event, the assistant opens a fresh authenticated connection while the game completes its visual transition.
+1. Application startup performs a background, no-billing WebSocket probe: it walks the six service instances in a random order and caches the first that answers, together with the whole order for failover.
+2. On a lie event, the assistant opens a fresh authenticated connection while the game completes its visual transition — on the cached instance first, moving to the next whenever a handshake fails.
 3. The visual settle period is three seconds from event start.
 4. Cursor-target frames are JPEG-quality-90 **RTF1** binary WebSocket packets:
    a compact JSON metadata section plus raw JPEG bytes, with no Base64 expansion.
@@ -672,9 +760,12 @@ The lie detector shares the normal 5 FPS capture cadence. When automatic lie han
    second. Silence beyond `FRAME_RESULT_STALL_SECONDS` (2.5 s) aborts the pass
    before the service's ten-second no-frame timeout closes the socket, and the run
    is recorded as `connection_interrupted`.
-6. The restored **测试API** video drill performs that same authenticated RTF1
+6. The **测试API** video drill performs that same authenticated RTF1
    handshake at video start, waits the three-second visual-settle period without
    uploading, then records its handshake timing and transport in its run report.
+   Its panel button is hidden (v1.2.163); the drill is unchanged in
+   `api_lie_video.py` and comes back by uncommenting three statements in
+   `ui_worker.py`.
 7. The live pass is ended by the outcome rather than a fixed 15-second frame
    window. From ten seconds after feeding begins through the 40-second deadline,
    the assistant looks for two consecutive captures containing the blue 40×40
@@ -794,6 +885,10 @@ number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.2.163` | — | 测试API button hidden again, and both auto-lie missing-credential hints removed. **Untagged: the working tree is not committed.** |
+| `1.2.162` | — | Focus loss pauses instead of ending a patrol, a hung game's DWM ghost is not a focus loss, all automatic-lie logging moved to `auto_lie.log`, and the credential can never reach a log file. **Untagged.** |
+| `1.2.161` | — | A 站桩 knockback starts walking back immediately: the pre-emptive wait for an in-flight attack before the first return key is gone. **Untagged.** |
+| `1.2.160` | — | 站桩 tuning: the arbiter step lock is 0.60 s and shared with 被撞反击, the near correction hold is 0.11 s, and the final approach band is ±0.030 X. **Untagged.** |
 | `1.2.112` | `release/v1.2.112` | 被撞反击 as an attack-slot replacement, RTF1 back-pressure, a failed pass that never clicks the lie dialog, and a finite balance that wins over the unlimited marker; normal and standalone EXE packages rebuilt from this commit. |
 | `1.2.105` – `1.2.111` | — | Intermediate builds of the same work. |
 | `1.2.104` | `release/v1.2.104` | Reload-proven channel switch, 被撞反击, 多等 in seconds, post-switch map re-anchor. |

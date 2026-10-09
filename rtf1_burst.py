@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import logging
 from typing import Any, Optional
 
 
@@ -16,6 +17,10 @@ from typing import Any, Optional
 # yet received a frame_result.  Keep this local rather than leaking the limit
 # into capture/UI workers.
 IN_FLIGHT_LIMITS = {3: 2, 4: 3, 5: 3, 6: 4, 7: 4}
+_MAX_UNSOLICITED_BINARY_FRAMES_PER_POLL = 8
+
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,7 @@ class Rtf1BurstSession:
         self.frame_standard = standard
         self.max_in_flight = IN_FLIGHT_LIMITS[standard]
         self._pending: "OrderedDict[int, Any]" = OrderedDict()
+        self._ignored_binary_frames = 0
 
     @property
     def pending_count(self) -> int:
@@ -70,7 +76,35 @@ class Rtf1BurstSession:
     def poll(self, client: Any, *, timeout: float = 0.0) -> list[BurstResult]:
         """Drain readable JSON ``frame_result`` messages and free their slots."""
 
-        messages = client.poll_results(timeout=max(0.0, float(timeout)))
+        # The protocol requires JSON text replies.  A few deployed endpoints
+        # nevertheless echo an RTF1 binary packet before their next text
+        # ``frame_result``.  ``ws_client`` correctly rejects that unexpected
+        # opcode, but it has already consumed the harmless frame.  Do not let
+        # that one server-side protocol blemish kill the live takeover; retry
+        # the read for the real text result.  Keep the guard finite so a server
+        # that *only* sends binary data still fails through the normal stalled
+        # response path rather than spinning forever.
+        skipped = 0
+        while True:
+            try:
+                messages = client.poll_results(timeout=max(0.0, float(timeout)))
+                break
+            except ValueError as exc:
+                if "expected a text frame, got opcode 2" not in str(exc):
+                    raise
+                skipped += 1
+                self._ignored_binary_frames += 1
+                if skipped >= _MAX_UNSOLICITED_BINARY_FRAMES_PER_POLL:
+                    raise ConnectionError(
+                        "RTF1 backend repeatedly sent binary replies instead of frame_result text"
+                    ) from exc
+                if skipped == 1:
+                    LOG.warning(
+                        "RTF1 backend sent an unsolicited binary frame; ignoring it and waiting for text results"
+                    )
+                # The first attempt may use the caller's bounded wait; each
+                # retry only drains already-readable data.
+                timeout = 0.0
         ready: list[BurstResult] = []
         for answer in messages:
             try:

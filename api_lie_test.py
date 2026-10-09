@@ -41,6 +41,7 @@ from autolie_api.intergration import (
 )
 from autolie_api.logs import RunLog
 from image_io import save_screenshot
+from lie_roi_geometry import resolve_lie_roi_box
 from rtf1_burst import Rtf1BurstSession
 
 LOG = logging.getLogger(__name__)
@@ -132,6 +133,10 @@ class ApiLieTestWorker(threading.Thread):
         self.fps = max(1.0, float(fps))
         self.duration = max(1.0, float(duration))
         self.await_seconds = max(0.0, float(await_seconds))
+        # Automatic live takeover can anchor this wait to the detector's
+        # timestamp.  Standalone/video drills leave it unset and retain the
+        # ordinary "wait after handshake" behaviour.
+        self._feed_start_deadline: Optional[float] = None
         self.key_sender = key_sender
         self._capture_fn = capture_fn
         self._client_size_fn = client_size_fn
@@ -216,6 +221,11 @@ class ApiLieTestWorker(threading.Thread):
         """Install the non-blocking handshake lifecycle hook before start."""
 
         self._on_backend_ready = callback
+
+    def set_feed_start_from_detection(self, detected_at: float) -> None:
+        """Start feeding at ``detected_at + await_seconds``, never later on purpose."""
+
+        self._feed_start_deadline = float(detected_at) + self.await_seconds
 
     def _sleep_or_stop(self, seconds: float) -> bool:
         """Wait for a visual settle period, but let Esc end it immediately."""
@@ -339,21 +349,54 @@ class ApiLieTestWorker(threading.Thread):
             LOG.exception("api test: the mouse aim could not be started")
             self._aim = None
 
-    def _push_aim(self, screen_x: float, screen_y: float) -> None:
-        """Move the cursor to the server answer's final desktop point.
+    @staticmethod
+    def _capture_point_to_screen(
+        window_rect: object,
+        image_width: int,
+        image_height: int,
+        client_x: float,
+        client_y: float,
+    ) -> tuple[float, float] | None:
+        """Convert a captured-client pixel into one physical desktop point.
 
-        The live overlay uses this same physical point.  Do not send it back
-        through a client-rectangle mapping: DPI virtualization can make a
-        captured bitmap and Windows' logical client dimensions differ.
+        GDI's bitmap dimensions and Windows' client rectangle are normally the
+        same.  On a DPI-virtualised process they may differ, however.  Keep the
+        v1.2.104 proportional mapping, but calculate it once so the cursor,
+        overlay and log cannot disagree about the target.
         """
+
+        if not isinstance(window_rect, tuple) or len(window_rect) != 4:
+            return None
+        left, top, right, bottom = (float(value) for value in window_rect)
+        width = right - left
+        height = bottom - top
+        if width <= 0.0 or height <= 0.0 or image_width <= 0 or image_height <= 0:
+            return None
+        return (
+            left + float(client_x) * width / float(image_width),
+            top + float(client_y) * height / float(image_height),
+        )
+
+    def _push_aim(
+        self,
+        screen_x: float,
+        screen_y: float,
+    ) -> None:
+        """Drive the already DPI-scaled physical desktop target immediately."""
 
         if not self.aim_enabled:
             return
         if self._aim is None:
-            self._start_aim(image_width, image_height)
+            # The controller still needs nominal dimensions at construction,
+            # even though this automatic path now supplies physical points.
+            self._start_aim(1, 1)
         if self._aim is None:
             return
         try:
+            # Do not remap a physical point through a client rectangle again.
+            # Immediate mode deliberately bypasses the viewer's dead band and
+            # speed limit: this is a short automatic takeover, not manual
+            # cursor following.
             self._aim.push_screen_target(
                 float(screen_x), float(screen_y), 1.0, "api", immediate=True
             )
@@ -423,10 +466,6 @@ class ApiLieTestWorker(threading.Thread):
         mimic = None
         log = RunLog(name="apitest_drill")
         self.log_folder = log.folder
-        # This clock is the lie-event clock, not the time at which connection
-        # setup happened to finish.  It lets the network setup run inside the
-        # visual settle period instead of adding its duration after it.
-        pass_started = time.perf_counter()
         try:
             self.stats = TestStats()
             if not self._prepare_window():
@@ -465,17 +504,42 @@ class ApiLieTestWorker(threading.Thread):
             if image is None:
                 self._report("failed", "无法截取游戏窗口")
                 return
-            box = lie_roi_box(image.shape[1], image.shape[0])
+            # The red game border becomes visible only after the second
+            # window finishes appearing.  Start with its safe preset box,
+            # then replace it with the measured border immediately before
+            # the first actual upload.
+            box, roi_source = resolve_lie_roi_box(image)
 
             interval = 1.0 / self.fps
             active_seconds = max(interval, self.duration - self.await_seconds)
             feed_frames = max(1, int(round(active_seconds * self.fps)))
-            settle_deadline = pass_started + self.await_seconds
-            remaining_settle = settle_deadline - time.perf_counter()
+            # Automatic live takeover overlaps connection/handshake with the
+            # visual settle period.  Its absolute deadline was calculated
+            # from the detector timestamp, so a fast handshake waits only the
+            # remainder and a slow handshake starts feeding immediately.  A
+            # standalone drill has no absolute deadline and keeps its normal
+            # post-handshake wait.
+            now = time.monotonic()
+            settle_deadline = (
+                self._feed_start_deadline
+                if self._feed_start_deadline is not None
+                else now + self.await_seconds
+            )
+            remaining_settle = settle_deadline - now
             await_ticks = max(0, int(round(max(0.0, remaining_settle) * self.fps)))
             if self.outcome_controlled:
-                plan = (f"连接已建立，等待第二个窗口剩余 {max(0.0, remaining_settle):.1f} 秒后立即上传；"
-                        "将在 10 秒后开始等待游戏成功/失败结果")
+                if remaining_settle > 0:
+                    plan = (
+                        f"连接已建立；距测谎窗口出现满 {self.await_seconds:.1f} 秒"
+                        f"还有 {remaining_settle:.1f} 秒，届时立即上传；"
+                        "将在上传开始 10 秒后等待游戏成功/失败结果"
+                    )
+                else:
+                    plan = (
+                        f"连接已建立时已超过测谎窗口出现后 {self.await_seconds:.1f} 秒"
+                        f"（已晚 {-remaining_settle:.1f} 秒）；现在立即上传；"
+                        "将在上传开始 10 秒后等待游戏成功/失败结果"
+                    )
             elif remaining_settle > 0:
                 plan = (f"连接已建立，等待第二个窗口剩余 {remaining_settle:.1f} 秒后立即上传 "
                         f"{feed_frames} 帧 @ {self.fps:.0f} fps（{active_seconds:.0f} 秒）")
@@ -483,7 +547,7 @@ class ApiLieTestWorker(threading.Thread):
                 late = -remaining_settle
                 plan = (f"连接在第二个窗口等待期后才完成（晚 {late:.1f} 秒）；现在立即上传 "
                         f"{feed_frames} 帧 @ {self.fps:.0f} fps")
-            self._report("start", f"{plan}，ROI={box}")
+            self._report("start", f"{plan}，ROI={box}（{roi_source}）")
             # The cursor is claimed as soon as the session exists (the drill does the same), so the pass
             # owns the mouse before the window is even readable.
             if self.aim_enabled and self._aim is None:
@@ -536,17 +600,28 @@ class ApiLieTestWorker(threading.Thread):
                         self.stats.holds += 1
                         line += " hold"
                     if point.x is not None and point.y is not None:
-                        screen_xy = point.to_screen(frame.geometry)
-                        self._push_aim(screen_xy[0], screen_xy[1])
-                        if self.aim_overlay is not None:
+                        client_xy = point.to_client(frame.geometry)
+                        screen_xy = self._capture_point_to_screen(
+                            captured_rect,
+                            captured_image.shape[1],
+                            captured_image.shape[0],
+                            client_xy[0],
+                            client_xy[1],
+                        )
+                        if screen_xy is not None:
+                            self._push_aim(screen_xy[0], screen_xy[1])
+                        if self.aim_overlay is not None and screen_xy is not None:
                             try:
                                 self.aim_overlay(int(round(screen_xy[0])),
                                                  int(round(screen_xy[1])))
                             except Exception:
                                 LOG.debug("api test: the aim overlay failed", exc_info=True)
                         self.stats.last_screen = screen_xy
-                        line += (f" slot=({point.x:.0f},{point.y:.0f}) "
-                                 f"screen=({screen_xy[0]:.0f},{screen_xy[1]:.0f})")
+                        line += f" slot=({point.x:.0f},{point.y:.0f}) "
+                        if screen_xy is None:
+                            line += "screen=unavailable"
+                        else:
+                            line += f"screen=({screen_xy[0]:.0f},{screen_xy[1]:.0f})"
                     line += f" {point.decision}"
                     if point.timing_ms is not None:
                         line += f" {point.timing_ms:.0f}ms"
@@ -606,6 +681,11 @@ class ApiLieTestWorker(threading.Thread):
                     self.stats.failures += 1
                     self._report("failed", "截取游戏窗口失败")
                     break
+                if roi_source != "red-border":
+                    measured_box, measured_source = resolve_lie_roi_box(image)
+                    if measured_source == "red-border":
+                        box, roi_source = measured_box, measured_source
+                        self._report("roi", f"已锁定红色测谎区域 ROI={box}")
                 frame = build_slot_frame(image, box, frame_id=next_frame_id,
                                          interval_sec=interval, window_rect=rect,
                                          quality=JPEG_QUALITY)

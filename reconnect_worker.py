@@ -173,7 +173,7 @@ OFFLINE_PROMPT_ATTEMPTS = 3
 # instead of blindly sleeping for a fixed amount of time.
 POST_LOGIN_MARKER_CONFIRM_SAMPLES = 3
 POST_LOGIN_MARKER_POLL_SECONDS = 0.20  # shared capture cadence: 5 fps
-POST_LOGIN_MARKER_TIMEOUT_SECONDS = 20.0
+POST_LOGIN_MARKER_TIMEOUT_SECONDS = 60.0
 # The login board and its buttons, measured by the operator on his own login page.  The 1366x768
 # numbers are the preset space; he re-measured them on his second device (a 1080x768 client,
 # 2026-09-17, work/anchors_1080.json) and the numbers below are those measurements mapped back into

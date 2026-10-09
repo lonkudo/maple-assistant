@@ -33,6 +33,22 @@ INPUT_NOT_ENABLED_REASON = (
     "(typing hotkeys re-arm it themselves)"
 )
 
+# An unresponsive game window keeps the foreground, but Windows does not hand it
+# to the game process.  The DWM draws a "ghost" stand-in and gives *that* the
+# foreground, so a plain hwnd equality check reports "the game lost focus" while
+# the operator never switched away - the field log showed
+# ``title='冒险岛怀旧服 (未响应)' class='Ghost' pid=... exe=dwm.exe``.  A laggy
+# game therefore stopped the patrol after the 2.5s grace even though the game
+# was still the foreground application.  The ghost is recognised by its class
+# name plus the suspended window's own title carrying a localized
+# "not responding" suffix.
+GHOST_WINDOW_CLASS = "Ghost"
+GHOST_WINDOW_TITLE_SUFFIXES = (
+    " (未响应)",
+    " (Not Responding)",
+    " (Not responding)",
+)
+
 # Action taps (jump / buff / periodic skill keys) are the shortest events the
 # assistant emits, and ``SendInput`` is global: the keystroke lands in whichever
 # window owns the keyboard at that instant.  Measured in the field log, a tap is
@@ -258,6 +274,11 @@ class WindowKeySender:
         self._last_observed_game_hwnd: Optional[int] = None
         self._window_handle_generation = 0
         self._window_handle_lock = threading.Lock()
+        # A title scan enumerates the desktop.  It is a recovery operation,
+        # never something a UI timer may do ten times per second.
+        self._next_handle_discovery_at = 0.0
+        # Logged once per unresponsive episode, not on every 0.2s poll.
+        self._game_unresponsive_logged = False
 
     def _remember_game_window_handle(self, hwnd: int) -> int:
         """Publish a recreated game HWND without treating first discovery as one."""
@@ -276,7 +297,7 @@ class WindowKeySender:
             return self._window_handle_generation
 
     def observe_game_window_handle(self) -> int:
-        """Return the selected game HWND generation, refreshing only after it vanishes."""
+        """Return the selected game HWND generation with bounded recovery discovery."""
 
         try:
             import win32gui
@@ -289,6 +310,14 @@ class WindowKeySender:
             if current and win32gui.IsWindow(current) and win32gui.IsWindowVisible(current):
                 with self._window_handle_lock:
                     return self._window_handle_generation
+            now = time.monotonic()
+            with self._window_handle_lock:
+                if now < self._next_handle_discovery_at:
+                    return self._window_handle_generation
+                # Missing/recreated windows are found promptly enough for the
+                # 60-second auto-lie safety guard, without starving Tk or a
+                # native file picker with continuous EnumWindows calls.
+                self._next_handle_discovery_at = now + 2.0
             self._find_target_window(required=False)
         except Exception:
             LOG.debug("game HWND observation failed", exc_info=True)
@@ -341,9 +370,17 @@ class WindowKeySender:
         delivered_to_game = game_was_foreground
         if refocus_before_release and not self.dry_run and not game_was_foreground:
             try:
-                delivered_to_game = bool(self.select_window()) and self.is_game_foreground()
+                # Stop Patrol only needs the game in front long enough to
+                # receive the key-up scrub.  The normal ``select_window``
+                # routine is intentionally thorough (selection lock, retry
+                # loop, thread-input fallback, and title re-anchoring), but
+                # using it here made an ordinary UI Stop wait seconds when
+                # Windows temporarily refused foreground activation.  Never
+                # turn one best-effort release into a multi-second lifecycle
+                # operation.
+                delivered_to_game = self._fast_refocus_for_input_release()
                 if not delivered_to_game:
-                    LOG.warning("INPUT RESET: game was not foreground after refocus")
+                    LOG.warning("INPUT RESET: fast game refocus was unavailable before key release")
             except Exception:
                 # The game-side key-up cannot be delivered without focus. A
                 # later Start Patrol always performs its own neutral reset.
@@ -374,6 +411,59 @@ class WindowKeySender:
             # the game again.
             self._forget_input_session_or_defer("input disabled (no game focus)")
         LOG.info("live keyboard input disabled")
+
+    def _fast_refocus_for_input_release(self) -> bool:
+        """Try once to foreground the known game window for Stop Patrol.
+
+        This deliberately does not acquire ``_selection_lock`` or enumerate
+        all desktop windows.  It is a bounded cleanup aid, not a general
+        window-selection operation: Start Patrol and reconnect retain the
+        full verified selector.  A failed attempt simply leaves the next Start
+        Patrol to perform its normal neutral reset.
+        """
+
+        if self.dry_run:
+            return True
+        try:
+            import win32con
+            import win32gui
+
+            candidates: list[int] = []
+            cached = self.hwnd
+            if cached:
+                candidates.append(int(cached))
+            exact = win32gui.FindWindow(None, self.window_title)
+            if exact and int(exact) not in candidates:
+                candidates.append(int(exact))
+            for hwnd in candidates:
+                if not (win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd)):
+                    continue
+                if win32gui.IsIconic(hwnd):
+                    try:
+                        ctypes.windll.user32.ShowWindowAsync(
+                            int(hwnd), int(win32con.SW_RESTORE)
+                        )
+                    except Exception:
+                        # Restoring a minimized game is not required to make
+                        # the UI responsive; leave its full recovery to the
+                        # regular selector/capture lifecycle.
+                        continue
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    continue
+                if win32gui.GetForegroundWindow() == hwnd:
+                    self._remember_game_window_handle(hwnd)
+                    return True
+                # One very short scheduling turn is enough for the normal
+                # UI-button stop path.  There are intentionally no retries.
+                time.sleep(0.03)
+                if win32gui.GetForegroundWindow() == hwnd:
+                    self._remember_game_window_handle(hwnd)
+                    return True
+        except Exception:
+            LOG.debug("fast input-release refocus failed", exc_info=True)
+        return False
 
     def _emergency_release_without_lock(self, reason: str) -> None:
         """Send neutral key-ups now, without waiting for ownership bookkeeping.
@@ -869,13 +959,66 @@ class WindowKeySender:
                     f"无法自动选择当前游戏窗口：{exc}"
                 ) from exc
 
+    def _foreground_is_unresponsive_game(self, foreground: int) -> bool:
+        """Whether *foreground* is the DWM stand-in for our own hung game window.
+
+        Only the ghost's class and its title relationship to the real game
+        window are trusted.  The ghost belongs to ``dwm.exe``, so no process
+        check can recognise it, and the game process itself cannot be queried
+        while it is hung.  A title that equals the game's own title plus a
+        localized "not responding" suffix is that window's stand-in and nothing
+        else, so this cannot excuse an unrelated foreground thief.
+        """
+
+        if not foreground or not self.hwnd:
+            return False
+        try:
+            import win32gui
+
+            if str(win32gui.GetClassName(foreground)) != GHOST_WINDOW_CLASS:
+                return False
+            ours = str(win32gui.GetWindowText(self.hwnd) or "").strip()
+            theirs = str(win32gui.GetWindowText(foreground) or "").strip()
+            if not ours or not theirs:
+                return False
+            return any(
+                theirs == ours + suffix for suffix in GHOST_WINDOW_TITLE_SUFFIXES
+            )
+        except Exception as exc:
+            LOG.debug("cannot verify foreground ghost window: %s", exc)
+            return False
+
+    def _note_unresponsive_game(self, unresponsive: bool) -> None:
+        """Say once that the foreground stand-in is the game's own hang."""
+
+        if unresponsive == self._game_unresponsive_logged:
+            return
+        self._game_unresponsive_logged = unresponsive
+        if unresponsive:
+            LOG.warning(
+                "foreground: the game window is not responding (its Windows "
+                "stand-in holds the foreground); the game is still the "
+                "foreground application, so automation continues"
+            )
+        else:
+            LOG.info("foreground: the game window responds again")
+
     def _foreground_matches(self) -> bool:
         try:
             import win32gui
             foreground = win32gui.GetForegroundWindow()
             if not self.hwnd or not win32gui.IsWindow(self.hwnd):
                 self._find_target_window()
-            return foreground == self.hwnd
+            if foreground == self.hwnd:
+                self._note_unresponsive_game(False)
+                return True
+            # A hung game must not read as "the operator switched away": patrol
+            # would terminally stop on a lag spike.
+            if self._foreground_is_unresponsive_game(foreground):
+                self._note_unresponsive_game(True)
+                return True
+            self._note_unresponsive_game(False)
+            return False
         except Exception as exc:  # pywin32 absent, non-Windows, or desktop unavailable
             # 游戏窗口未找到/未启动是正常状态，不当作告警刷屏。
             LOG.debug("cannot verify foreground window: %s", exc)
@@ -1187,9 +1330,13 @@ class WindowKeySender:
             except Exception:
                 pid = 0
             exe = _process_name(int(pid))
+            marker = (
+                " not_responding=True"
+                if str(class_name) == GHOST_WINDOW_CLASS else ""
+            )
             return (
                 f"hwnd={hwnd} title={title[:40]!r} class={class_name!r} "
-                f"pid={pid}{f' exe={exe}' if exe else ''}"
+                f"pid={pid}{f' exe={exe}' if exe else ''}{marker}"
             )
         except Exception as exc:
             return f"foreground=<unavailable: {exc}>"

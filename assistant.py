@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from minimap_detector import hud_scale_for
 from runtime_paths import application_root
-from auto_lie_secret import get_server_secret
+from auto_lie_secret import CredentialRedactionFilter, get_server_secret
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -366,8 +366,14 @@ def main() -> int:
         backupCount=2,
         encoding="utf-8",
     )
+    # The credential is process-memory only and must never reach a log file -
+    # masked or not.  One filter enforces that on every file handler: the
+    # licensing lines only ever name the *outcome* ("refreshed", "withheld"),
+    # so the state stays fully diagnosable without the value.
+    credential_filter = CredentialRedactionFilter()
     trace_log_handler.setLevel(logging.INFO)
     trace_log_handler.setFormatter(_compact_log_formatter())
+    trace_log_handler.addFilter(credential_filter)
     logging.getLogger().addHandler(trace_log_handler)
 
     # The licensing/server boundary gets its own compact, safe-to-share trace.
@@ -382,6 +388,7 @@ def main() -> int:
     server_log_handler.setFormatter(_compact_log_formatter())
     server_logger = logging.getLogger("server-client")
     server_logger.setLevel(logging.INFO)
+    server_log_handler.addFilter(credential_filter)
     server_logger.addHandler(server_log_handler)
 
     # Automatic lie handling needs a shareable diagnosis file independent of
@@ -398,6 +405,7 @@ def main() -> int:
     )
     auto_lie_log_handler.setLevel(logging.INFO)
     auto_lie_log_handler.setFormatter(_compact_log_formatter())
+    auto_lie_log_handler.addFilter(credential_filter)
     auto_lie_logger = logging.getLogger("auto-lie")
     for auto_lie_log_name in (
         "auto-lie",
@@ -533,6 +541,7 @@ def main() -> int:
     if not args.no_ui:
         ui_log_handler = UiLogHandler(capacity=300)
         ui_log_handler.setFormatter(_compact_log_formatter())
+        ui_log_handler.addFilter(credential_filter)
         logging.getLogger().addHandler(ui_log_handler)
     # The dashboard and frame analysis start without stealing focus. Keyboard
     # input is armed only after the user explicitly clicks Start Patrol.
@@ -557,21 +566,45 @@ def main() -> int:
     # serially probing every port.  Do NOT pre-handshake here: the protocol
     # drops an idle authenticated connection after 10 seconds without frames.
     auto_lie_endpoint_lock = threading.Lock()
-    auto_lie_endpoint: dict[str, object] = {"value": None, "error": ""}
+    auto_lie_endpoint: dict[str, object] = {
+        "value": None, "error": "", "candidates": (),
+    }
 
     def warm_auto_lie_endpoint() -> None:
-        try:
-            from autolie_api.connect import choose_endpoint, probe_ws_endpoints
+        """Probe the six service instances in a random order and cache the first answer.
 
-            best = choose_endpoint(probe_ws_endpoints())
+        The full random order is cached as well, so a live pass whose cached
+        endpoint fails its handshake continues with the next instance instead of
+        having to rediscover the list.
+        """
+
+        try:
+            from auto_lie_backend import select_auto_lie_ws_endpoints
+            from autolie_api.connect import probe_ws_endpoints
+
+            candidates = select_auto_lie_ws_endpoints()
+            best = None
+            tried: list[str] = []
+            for host, port in candidates:
+                results = probe_ws_endpoints(host, (int(port),))
+                answered = next((item for item in results if item.ok), None)
+                if answered is not None:
+                    best = answered
+                    break
+                tried.append(f"{host}:{port}")
             if best is None:
-                raise RuntimeError("no WebSocket endpoint answered the startup probe")
+                raise RuntimeError(
+                    "no WebSocket endpoint answered the startup probe ("
+                    + (", ".join(tried) or "no endpoints") + ")"
+                )
             with auto_lie_endpoint_lock:
                 auto_lie_endpoint["value"] = best
                 auto_lie_endpoint["error"] = ""
+                auto_lie_endpoint["candidates"] = candidates
             auto_lie_logger.info(
-                "AUTO LIE preflight ready: cached WebSocket endpoint %s (%.0f ms)",
-                best.endpoint, best.rtt_ms,
+                "AUTO LIE preflight ready: cached WebSocket endpoint %s "
+                "(%.0f ms; random start, %d of %d candidate(s) probed)",
+                best.endpoint, best.rtt_ms, len(tried) + 1, len(candidates),
             )
         except Exception as exc:
             with auto_lie_endpoint_lock:
@@ -585,14 +618,19 @@ def main() -> int:
     ).start()
 
     def open_prepared_auto_lie_backend(log):
-        """Open one fresh formal session against the UI-start cached endpoint.
+        """Open one fresh formal session, trying each service instance in turn.
 
         The HTTP health check is intentionally excluded: it is diagnostic-only
-        in protocol 2.7.0 and must never delay a live lie event.
+        in protocol 2.7.0 and must never delay a live lie event.  The startup
+        probe's endpoint is used first; a handshake failure moves on to the next
+        instance of the same random order rather than failing the pass.
         """
 
-        from autolie_api.connect import open_backend
-        from autolie_api.endpoints import ws_endpoints
+        from auto_lie_backend import (
+            describe_ws_endpoint,
+            ordered_candidates,
+            select_auto_lie_ws_endpoints,
+        )
         from autolie_api.key_store import mask_key
         from autolie_api.ws_client import RoiTrackWsClient
         from auto_lie_secret import get_server_secret
@@ -604,56 +642,68 @@ def main() -> int:
         with auto_lie_endpoint_lock:
             endpoint = auto_lie_endpoint.get("value")
             preflight_error = str(auto_lie_endpoint.get("error") or "")
+            candidates = list(auto_lie_endpoint.get("candidates") or ())
+        if not candidates:
+            candidates = list(select_auto_lie_ws_endpoints())
+        cached: "tuple[str, int] | None" = None
+        if endpoint is not None:
+            cached_host = str(getattr(endpoint, "host", "") or "")
+            cached_port = int(getattr(endpoint, "port", 0) or 0)
+            if cached_host and cached_port:
+                cached = (cached_host, cached_port)
+        ordered = ordered_candidates(cached, candidates)
         if endpoint is None:
-            choices = ws_endpoints()
-            if not choices:
-                raise RuntimeError("no configured WebSocket endpoint")
-            endpoint = choices[0]
             auto_lie_logger.warning(
-                "AUTO LIE preflight is unavailable (%s); trying configured endpoint %s directly",
-                preflight_error or "still running", endpoint.url,
+                "AUTO LIE preflight is unavailable (%s); trying %d endpoint(s) directly",
+                preflight_error or "still running", len(ordered),
             )
-        endpoint_url = str(getattr(endpoint, "endpoint", getattr(endpoint, "url", "")))
-        client = RoiTrackWsClient(endpoint.host, endpoint.port, timeout=5.0)
-        try:
-            started = time.perf_counter()
-            client.connect()
-            ack = client.handshake(
-                # RTF1 §5.2: one binary WebSocket packet carries compact JSON
-                # metadata plus the JPEG bytes.  Do not base64-expand the JPEG.
-                key, frame_standard=5, image_transport="bgr_jpeg90_packed",
-                client_info="maple_assistant_auto_lie",
-            )
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-        except Exception as exc:
-            client.close()
+
+        failures: list[str] = []
+        for index, (host, port) in enumerate(ordered):
+            endpoint_url = describe_ws_endpoint(host, port)
+            client = RoiTrackWsClient(host, port, timeout=5.0)
+            try:
+                started = time.perf_counter()
+                client.connect()
+                ack = client.handshake(
+                    # RTF1 §5.2: one binary WebSocket packet carries compact JSON
+                    # metadata plus the JPEG bytes.  Do not base64-expand the JPEG.
+                    key, frame_standard=5, image_transport="bgr_jpeg90_packed",
+                    client_info="maple_assistant_auto_lie",
+                )
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+            except Exception as exc:
+                client.close()
+                failures.append(f"{endpoint_url} ({type(exc).__name__}: {exc})")
+                if log is not None:
+                    log.connection(
+                        "endpoint handshake failed; trying the next one",
+                        endpoint=endpoint_url, error=str(exc),
+                    )
+                auto_lie_logger.warning(
+                    "AUTO LIE endpoint %s handshake failed; trying the next one: %s",
+                    endpoint_url, exc,
+                )
+                continue
             if log is not None:
                 log.connection(
-                    "cached endpoint handshake failed; falling back to discovery",
-                    endpoint=endpoint_url, error=str(exc),
+                    "endpoint handshake_ack", endpoint=endpoint_url,
+                    auth=ack.get("auth"), quota_left=ack.get("quota_left"),
+                    connect_ms=round(elapsed_ms),
                 )
-            # A stale startup probe must not make the live pass unavailable.
-            # This fallback still omits the HTTP health check.
-            session = open_backend(
-                key=key, transport="rtf1", frame_standard=5.0,
-                health=False, client_info="maple_assistant_auto_lie",
+            origin = "UI 启动预探测" if index == 0 and endpoint is not None else "备选端点"
+            note = (
+                f"真实后端 {endpoint_url} 密钥来自{source} "
+                f"(quota_left={ack.get('quota_left')}；{origin})"
             )
-            return session.client, session.note, session.mimic
-        if log is not None:
-            log.connection(
-                "cached endpoint handshake_ack", endpoint=endpoint_url,
-                auth=ack.get("auth"), quota_left=ack.get("quota_left"),
-                connect_ms=round(elapsed_ms),
+            auto_lie_logger.info(
+                "AUTO LIE ready: handshake %s in %.0f ms (key %s, %s)",
+                endpoint_url, elapsed_ms, mask_key(key), origin,
             )
-        note = (
-            f"真实后端 {endpoint_url} 密钥来自{source} "
-            f"(quota_left={ack.get('quota_left')}；UI 启动预探测)"
+            return client, note, None
+        raise RuntimeError(
+            "所有测谎服务端点握手均失败：" + ("；".join(failures) or "no endpoints")
         )
-        auto_lie_logger.info(
-            "AUTO LIE ready: direct handshake %s in %.0f ms (key %s)",
-            endpoint_url, elapsed_ms, mask_key(key),
-        )
-        return client, note, None
 
     calibration = (
         json.loads(args.rope_calibration.read_text(encoding="utf-8"))
@@ -688,13 +738,6 @@ def main() -> int:
     map_identity_store = MapIdentityStore(
         configuration_root / "recording-assets" / "map-names"
     )
-
-    def stop_patrol_after_focus_loss() -> None:
-        patrol_controller.set_enabled(False)
-        # Focus loss is also a real patrol stop. Merely clearing the route
-        # flag left attack/movement workers armed until some later UI action,
-        # which could preserve a held direction after the game returned.
-        disarm_patrol_runtime()
 
     def stop_patrol_for_disconnect() -> None:
         """Immediately disarm patrol input after a confirmed disconnect.
@@ -1753,6 +1796,7 @@ def main() -> int:
     # live pass is outcome-controlled: it keeps streaming until the game
     # reports success/failure or the service closes its advertised round.
     AUTO_LIE_TRACK_SECONDS = 15.0
+    AUTO_LIE_FEED_DELAY_SECONDS = 3.0
 
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
                                    fps=5.0):
@@ -1764,8 +1808,12 @@ def main() -> int:
         from the validated licensing heartbeat and remains only in this process's memory.
         """
 
+        from auto_lie_backend import host_ports, select_auto_lie_ws_endpoints
         from api_lie_video import VideoDrillWorker
 
+        # One randomly chosen host, with all of that host's ports handed over:
+        # the drill's own probe then picks the best instance of that host.
+        host, _port = select_auto_lie_ws_endpoints()[0]
         return VideoDrillWorker(
             video=video,
             results=results,
@@ -1775,6 +1823,8 @@ def main() -> int:
             seconds=seconds,
             fps=fps,
             transport="rtf1",
+            host=host,
+            ports=host_ports(host),
             aim_enabled=True,
             window_title=args.window_title,
         )
@@ -1802,13 +1852,9 @@ def main() -> int:
         """One automatic pass for one lie window - the SAME workflow as 测试api (the video drill)."""
 
         from api_lie_test import ApiLieTestWorker
-        # The drill's measured AWAIT_SECOND_WINDOW wait, so the automatic pass runs the drill's workflow
-        # in the live game: the lie window's HUD square is detected the moment the window opens, its real
-        # content needs ~3 s (his clip: the first 16 frames were one frozen image and the service answered
-        # abandon_frame_hold for every one of them), so we connect FIRST, wait that long WITHOUT sending a
-        # single frame, and only then start the picture push.  The wait is part of the pass length, exactly
-        # like the drill's 时长.
-        from api_lie_video import AWAIT_SECOND_WINDOW_SEC
+        # The detector timestamp is attached by the UI before this worker is
+        # started.  Connection/handshake therefore consumes part of the
+        # three-second visual settle instead of starting a fresh wait.
 
         auto_lie_logger.info("自动过测谎: starting a pass for the lie window")
         return ApiLieTestWorker(
@@ -1821,8 +1867,8 @@ def main() -> int:
             transport="rtf1",
             # Kept only for the generic worker API.  outcome_controlled below
             # makes the live pass end on the game's actual result instead.
-            duration=AWAIT_SECOND_WINDOW_SEC + AUTO_LIE_TRACK_SECONDS,
-            await_seconds=AWAIT_SECOND_WINDOW_SEC,
+            duration=AUTO_LIE_FEED_DELAY_SECONDS + AUTO_LIE_TRACK_SECONDS,
+            await_seconds=AUTO_LIE_FEED_DELAY_SECONDS,
             outcome_controlled=True,
             # The answer must be EXECUTED, not just measured: the pass drives the cursor to the point
             # the API returns (the vendor doc: "鼠标/执行层一般用 x / y（372×248 协议 ROI）"), exactly like
@@ -1866,6 +1912,31 @@ def main() -> int:
             "MINIMAP recording border saved source=%s | box=%s | client=%dx%d",
             detection.source, detection.window_box,
             client_size[0], client_size[1],
+        )
+
+    def reload_imported_minimap_calibration() -> None:
+        """Apply an imported minimap border to the running shared detector."""
+
+        frame = bus.latest
+        if frame is None:
+            minimap_detector.reset_geometry()
+            logging.warning(
+                "MINIMAP imported calibration deferred: no shared frame is available"
+            )
+            return
+        saved = config_store.read_section("minimap_calibration")
+        detection = minimap_calibration_from_dict(saved, frame.image.size)
+        if detection is None:
+            minimap_detector.reset_geometry()
+            logging.warning(
+                "MINIMAP imported calibration is unavailable; cleared prior geometry"
+            )
+            return
+        minimap_detector.seed_geometry(detection, frame.image.size)
+        logging.info(
+            "MINIMAP imported calibration applied source=%s | box=%s | client=%dx%d",
+            detection.source, detection.window_box,
+            frame.image.size[0], frame.image.size[1],
         )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
     telegram_notifier = TelegramNotifier(stop_event)
@@ -2270,7 +2341,8 @@ def main() -> int:
         stop_event,
         automation_active,
         game_focused,
-        on_focus_lost=stop_patrol_after_focus_loss,
+        # A focus loss only pauses: patrol resumes by itself when the game is
+        # focused again, and only the operator's Stop Patrol ends a run.
         # A lie pass disarms input but is fed by the same capture: keep the
         # foreground gate honest for the whole pass.
         lie_pass_event=lie_active,
@@ -2341,6 +2413,7 @@ def main() -> int:
                 key_sender, capture_worker.capture_now
             ),
             on_recording_verified=save_recording_minimap_calibration,
+            on_imported_minimap_calibration=reload_imported_minimap_calibration,
             log_queue=ui_log_handler.messages if ui_log_handler is not None else None,
             ui_log_handler=ui_log_handler,
             user_config_path=str(config_store.user_path),

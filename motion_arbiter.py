@@ -76,22 +76,14 @@ class MotionArbiter(threading.Thread):
         micro_step_motion_seconds: float = 0.25,
         micro_step_pre_step_quiet_seconds: float = 0.20,
         facing_motion_seconds: float = 0.10,
-        # A stand-still correction ends with an attack tap, so it keeps a short
-        # lock after that tap - the same kind of hold a 小碎步 uses.  It must
-        # NOT be longer than the operator's own correction cadence
-        # (STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS, 0.30s): the
-        # executor sleeps this value after every correction, so a longer lock is
-        # exactly the visible freeze between two steps of the walk back.  At
-        # 0.70s the field log showed the marker standing on 0.504310 for three
-        # captures while the movement loop kept deciding "step right" and no key
-        # was pressed.  The cadence double-tap this lock used to guard is now
-        # prevented independently by AttackWorker's attack spacing, so the lock
-        # only has to cover the moment after its own attack tap.
-        step_motion_seconds: float = 0.30,
-        # 被撞反击 needs its own post-cast quiet period too.  It is slightly
-        # shorter than the stationary correction reservation, but long enough
-        # that patrol cannot press a direction into the counterattack cast.
-        counterattack_motion_seconds: float = 0.60,
+        # A stand-still correction ends with an attack tap, so it keeps a lock
+        # after that tap - the same kind of hold a 小碎步 uses.  The executor
+        # sleeps this value after every correction, so it is also the effective
+        # spacing between repeated corrections when the movement loop keeps
+        # asking for another one.  被撞反击 deliberately SHARES this value (see
+        # ``_duration_for``): one post-cast quiet period covers both motions
+        # instead of two constants that can drift apart.
+        step_motion_seconds: float = 0.60,
         attack_grace_seconds: float = 0.73,
         delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:
@@ -118,9 +110,6 @@ class MotionArbiter(threading.Thread):
         # fixed cadence from re-tapping on top of that attack.
         self.step_motion_seconds = max(
             0.0, float(step_motion_seconds)
-        )
-        self.counterattack_motion_seconds = max(
-            0.0, float(counterattack_motion_seconds)
         )
         self.attack_grace_seconds = max(0.0, float(attack_grace_seconds))
         self.delivery_retry_seconds = max(0.0, float(delivery_retry_seconds))
@@ -642,7 +631,9 @@ class MotionArbiter(threading.Thread):
         if token.startswith(f"{STEP}:"):
             return self.step_motion_seconds
         if token.startswith(f"{COUNTERATTACK}:"):
-            return self.counterattack_motion_seconds
+            # Shared with the 站桩 correction lock on purpose: both are a
+            # post-cast quiet period, and one constant cannot drift.
+            return self.step_motion_seconds
         return self.buff_motion_seconds
 
     def _pop_locked(self, token: str) -> list[Any]:

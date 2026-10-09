@@ -96,7 +96,10 @@ only the aggregate of the equipment's active codes.
 request body is sent, and never falls back to plain HTTP. Safe milestones are
 written to the dedicated `server-client` logger, which `assistant.py` persists
 as `server_client.log`. This log records no activation code, fingerprint,
-token, or secret.
+token, or secret. `post_json(..., logger=…)` lets a caller send a request's
+connection trace somewhere else: the lie-events accounting request is part of
+automatic lie handling, so its trace goes to `auto_lie.log` with the rest of
+that feature instead of into the licensing connection log.
 
 `auto_lie_secret.py` is the in-process credential boundary. A successful
 activation or three-hour license heartbeat may contain an optional auto-lie
@@ -108,6 +111,26 @@ license, client log, or release package stores it. The server encrypts its
 operator-managed copy at rest in PostgreSQL. This path is additive to the
 versioned activation response so older clients can safely ignore it, and it
 does not modify vendor `autolie_api/` code.
+
+Only an explicit `auto_lie` object in a reply changes the credential:
+
+- a non-empty `secret_key` stores it, and an empty one clears it (the server
+  withholding it — what a device with no passes left receives);
+- a reply that does not mention `auto_lie` at all leaves it **alone**; silence is
+  not a verdict, and treating it as one used to disarm 自动过测谎 until the next
+  three-hourly heartbeat;
+- the credential is **not** cleared before a request. Clearing it up front meant a
+  licensed device with passes left held no credential for the whole heartbeat
+  round trip, which is what produced "测谎窗口出现时本机没有测谎密钥";
+- `validate_via_server()` drops it on the outcome instead: any failed heartbeat
+  (transport, TLS, or device-not-ready) and any verdict that the license expired
+  or was revoked. A successful heartbeat never does. `activate_via_server()` drops
+  it on a refusal, a failure, a rejected document, and on a success whose reply
+  carries no `auto_lie` — a new code must not inherit the previous code's
+  credential.
+
+`CredentialRedactionFilter` is attached to every file handler, so the credential
+cannot reach a log even through vendor code that prints a masked preview of it.
 
 ### Asynchronous auto-lie lifecycle accounting
 
@@ -192,6 +215,54 @@ the corresponding opaque `equipment_id` before displaying it. Raw fingerprint
 hashes stay off the operator-facing code table. `FingerprintSecurityState.memo`
 is an operator-only, bounded text field; device actions can set, replace, or
 clear it, and it is never returned to clients.
+
+### Automatic lie service endpoints
+
+`auto_lie_backend.py` owns the live RoiTrack deployment route, so an endpoint
+change never touches vendor files or the licensing backend. It lists six
+WebSocket instances — three on `221.10.121.69` (48001–48003) and the three the
+vendor's own `autolie_api/ip_port.txt` names on `117.50.223.113` (8001–8003) —
+and `select_auto_lie_ws_endpoints()` returns them in a random order
+(system-entropy Fisher-Yates). The choice is deliberately random rather than a
+fingerprint modulo: the modulo spread devices over one host's three workers, so
+adding or losing a host left the assignment lopsided and a device whose worker
+was down had nothing to fall back to.
+
+`assistant.py` consumes that order twice:
+
+1. **Preflight** (`warm_auto_lie_endpoint`, the `auto-lie-preflight` thread)
+   probes each instance's WebSocket in order and caches the first `ProbeResult`
+   that answers, together with the whole order. No handshake happens here: the
+   protocol drops an idle authenticated connection after ten seconds without
+   frames.
+2. **Live pass** (`open_prepared_auto_lie_backend`) tries `ordered_candidates()`
+   — the cached instance first, then every remaining instance of the same order,
+   no duplicates — doing a real connect + RTF1 handshake per instance. A failure
+   is logged to the run log and to `auto_lie.log` and the next instance is tried;
+   only when all six fail does the pass raise. The HTTP health check stays
+   excluded, because it is diagnostic-only and must never delay a live event.
+
+The video drill takes one randomly chosen host with all of that host's ports, so
+the vendor's own probe selects the best instance of it.
+
+### Focus loss is a pause, not a stop
+
+`focus_worker.py` clears the automation gate and releases the held direction
+keys the moment the selected window stops being foreground, and re-opens the gate
+by itself when it is foreground again — for any gap length. Only a manual Stop
+Patrol ends a run, so `FocusWorker` has no terminal-stop callback and
+`assistant.py` no longer supplies one. Nothing can be delivered while the game is
+away regardless, because `WindowKeySender.key_down()` and `tap()` both refuse a
+key unless the foreground predicate is true.
+
+That predicate accepts two windows: the game window itself, and — since a hung
+client keeps the foreground but not in its own process — the DWM *ghost* stand-in
+Windows draws for it (class `Ghost`, owned by `dwm.exe`, title = the game's own
+title plus a localized "not responding" suffix). A lag spike therefore no longer
+reads as "the operator switched away" and no longer stops the patrol after the
+grace window. The match is by class plus that title relationship, so an unrelated
+focus thief, another window's ghost, or a vanished game window still counts as a
+loss, and the hang is reported once per episode.
 
 ### Server deployment compatibility boundary
 
@@ -299,7 +370,7 @@ Three details keep one hit equal to one reaction. The cooldown is claimed where 
 
 The 站桩 half of the reaction owns no movement at all. `attack_slot.py` is a thread-safe, one-use key replacement created by the coordinator and handed to both sides: `AttackWorker` consumes it for the next cadence beat, and `MovementWorker._consume_attack_slot()` consumes it for the anchor correction and for 小碎步's middle attack. A stationary hit therefore only calls `replace_next()`, and whichever approved beat was going to happen anyway spends the counterattack key instead of the default one; an unconsumed replacement is retained rather than overwritten. This is what removed the competing movement transaction that used to fight the anchor correction for the same hit.
 
-The anchor correction is the one motion that also carries an attack (see the combat section). It is exclusive in the usual way — while it is queued or running, the fixed cadence cannot reserve a beat, so the correction’s own attack can never be doubled — but it is exempt from the arbiter’s shared post-attack grace, because that grace is measured from the correction’s own attack and would stretch a correction the operator expects roughly every 300 ms into one per second.
+The anchor correction is the one motion that also carries an attack (see the combat section). It is exclusive in the usual way — while it is queued or running, the fixed cadence cannot reserve a beat, so the correction’s own attack can never be doubled — but it is exempt from the arbiter’s shared post-attack grace, because that grace is measured from the correction’s own attack and would stretch a correction into one per second.
 
 While the optional 小碎步 pair is queued or running the movement loop queues nothing behind it: neither an anchor correction nor a 朝向 tap. The pair moves the character on purpose (away from, then back to the selected 朝向) and records the facing itself when it completes, so anything queued during it executed as an extra step straight after the pair. The facing obligation stays owed, so a pair that is dropped is corrected on the next settled capture.
 
@@ -331,7 +402,7 @@ In stationary attack mode, the temporary anchor is captured only on a manual pat
 
 That facing tap is a 30 ms turn, deliberately as short as the tiny anchor step: it exists to turn the character, and a longer hold walks it out of the anchor band, after which the correction walks it back, turns it again and re-arms the facing — the face/walk twitch.
 
-The anchor correction is one atomic motion per correction, shaped as “direction hold, then the attack belonging to that correction”. The hold is the tiny step inside the small-step band (±0.010X of the anchor) and the longer walk when the character is further out; both carry exactly one attack. The design reason is direct field evidence: as an ordinary walk hold the correction either deferred the fixed cadence (direction handoff) or blocked it (exclusive recovery), so the character corrected its position and attacked nothing. Corrections are spaced about 300 ms apart and repeat until the marker is inside the arrival band (±0.006X). That band is not widened to “hold” a small drift: a position that is off the band is always walked back, because tolerating it left the character standing a pixel or two away from its 桩.
+The anchor correction is one atomic motion per correction, shaped as “direction hold, then the attack belonging to that correction”. The hold is the tiny step inside the small-step band (±0.010X of the anchor) and the longer walk when the character is further out; both carry exactly one attack, and the near hold is 0.11 s. The design reason is direct field evidence: as an ordinary walk hold the correction either deferred the fixed cadence (direction handoff) or blocked it (exclusive recovery), so the character corrected its position and attacked nothing. Corrections repeat until the marker is inside the arrival band (±0.006X), spaced by the arbiter's own correction reservation (`step_motion_seconds`, **0.60 s**, shared with 被撞反击 through `_duration_for()`) rather than by the shorter 0.30 s re-request interval — the executor sleeps that reservation after every correction, so it is the effective spacing. That band is not widened to “hold” a small drift: a position that is off the band is always walked back, because tolerating it left the character standing a pixel or two away from its 桩.
 
 Stair jump observes sustained position stalls and submits one direction-preserving recovery jump. It uses a post-trigger frame cooldown and a movement-progress reset, preventing a single long stall from producing a burst of jumps. Recorded jump points are separate from this recovery rule: they are deliberate X/Y triggers, have their own once-per-leg pass record, and can fire while a rope climb is active.
 
@@ -374,11 +445,11 @@ Detection and proof are deliberately separate concerns:
 
 `api_lie_test.py` is the local client adapter. `autolie_api/` is vendor reference material and must remain unchanged.
 
-At UI/application startup, `assistant.py` performs an inexpensive WebSocket endpoint probe and caches the usable endpoint. When a lie event occurs, the adapter uses that cached endpoint to create a fresh authenticated connection while the game completes its visual transition. The event timeline is:
+At UI/application startup, `assistant.py` performs an inexpensive WebSocket endpoint probe and caches the usable endpoint. When a lie event occurs, the adapter uses that cached endpoint to create a fresh authenticated connection while the game completes its visual transition — and moves to the next listed service instance whenever a handshake fails (see *Automatic lie service endpoints*). The event timeline is:
 
 ```text
-event start ── connect/setup in parallel ── 3 s visual settle
-            └──────────────────────────────► RTF1 frame uploads, at most 15 s
+event start ── connect/setup in parallel ── 2 s visual settle
+            └──────────────────────────────► outcome-controlled RTF1 uploads
                                                 └► round_end + WebSocket close
 ```
 
@@ -402,8 +473,17 @@ frame feed, and leaves a transport-failed pass to the operator
 skipped`).
 
 The **测试API** video drill uses the same packed-JPEG handshake and sends no
-frames during its three-second visual settle. Its connection log and summary
+frames during its two-second visual settle. Its connection log and summary
 record the transport and handshake duration for field verification.
+
+ROI geometry is resolved by the local `lie_roi_geometry.py` adapter, not by
+the vendor client. It begins with the service-compatible preset box while the
+dialog is animating, then looks for the long horizontal and vertical evidence
+of the native dark-red (`#db231b`) playfield border in the captured bitmap. A
+measured border is locked for the remaining pass; a missing or incomplete
+border safely retains the preset. This preserves the service's client-pixel
+coordinate contract while allowing the 1366×768 and 1080×768 dialog layouts to
+have their actual, different rectangle sizes.
 
 The live frame stream uses the shared capture cadence. The temporary detection rectangle and one-shot target marker are display-only overlays and must never become tracking input.
 
@@ -441,7 +521,7 @@ The other-player 多等 delay is the mirror image of that rule: it is a **second
 
 Combat panel state is applied in both directions. The 被撞反击 checkbox and its 攻击键 button live on the 巡逻攻击 row and publish `counterattack_enabled` / `counterattack_key` into `fixed_attack_settings.json`; the mode handler pushes them through `MovementWorker.set_counterattack()` for 巡逻攻击 and 站桩攻击 and clears them when no attack mode is active. The stationary-only lock is re-applied after a settings load and after an authorization unlock, because the generic unlock enables every product widget and previously left a saved 巡逻攻击 session exposing 跳打/朝向 controls until the operator switched modes once.
 
-Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`. **Configuration import is a post-exit transaction:** the UI validates the selected JSON but does not write the live file. It starts the fixed `todohelper_update.ps1` helper with the current PID and source path, then closes. The helper waits until that PID is gone, copies the source to a same-folder temporary file, atomically replaces `user_config.json` (retrying only short-lived external handles), and launches the normal packaged launcher. Therefore no live UI callback can retain, overwrite, or race the incoming configuration.
+Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`. **Configuration import is an in-process refresh:** the UI validates the selected JSON, immediately stops patrol, then a background task waits for the key-release cleanup, copies through a same-folder temporary file, atomically replaces `user_config.json`, reloads user-owned settings, and redraws the panels. The helper remains running; importing never needs a manual restart. The status line is set to `↻ 正在刷新导入配置…` until completion. If Reset Recording encounters an inaccessible configuration from an older package, the UI reports `配置版本与当前助手版本不匹配，请重新录制以后导出新配置。` instead of presenting a raw access-denied path.
 
 `hotkey_worker.py`, quick messages, trade helpers, Telegram notification, screen blinking, countdowns, and shutdown logic are optional subsystems. They use isolated configuration/state and may request input only through the shared focus/key boundary.
 
@@ -456,7 +536,8 @@ Personal settings are stored in `user_config.json`; application defaults are sto
 | `work/` | Runtime workers | Recoverable patrol/timer/session state. |
 | `lie_accounting_pending.json` | `lie_accounting.py` | Durable auto-lie event outbox: one row per unresolved `started`/terminal report. |
 | `error.log` | Error reporting | Critical unexpected-error record. |
-| `server_client.log` | Licensing transport | Safe activation connection, pin, HTTP, and local verification events; never secrets. |
+| `server_client.log` | Licensing transport | Safe activation connection, pin, HTTP, and local verification events; never secrets. Automatic lie handling logs to its own file instead. |
+| `auto_lie.log` | `auto-lie` logger family | The whole automatic-lie feature: detector handoff, prepared WebSocket connection, pass outcomes, the credential lines, the event-accounting outbox, and the accounting request's connection trace. The credential is redacted even in masked form. |
 | `assistant-launch-error.log` | `startup_probe.py` | Hidden-launch failures, including the missing dependency that triggered the automatic install. |
 | `assistant-launch-status.log` | `startup_probe.py` | Launcher milestones: probe reached, repair started/finished, normal exit. |
 | `teach-assets/` | UI teaching viewer | Shipped JPG pages, loaded one at a time in natural filename order; copied unchanged into both packages. |
@@ -471,7 +552,7 @@ Atomic file replacement is used for runtime state where possible. A permission f
 3. **Finite motions are atomic.** Queue finite corrective motions through the arbiter; do not use the arbiter for routine walking.
 4. **Focus is a guard, not a background loop.** Window verification happens before an action that needs the game, not as continuous UI-stealing polling.
 5. **Workers communicate intent, not raw state mutations.** A worker may request a motion or alert; it must not independently overwrite another worker’s session state.
-6. **Release is mandatory.** Stop, focus loss, and worker failure must clear every held key through the shared sender.
+6. **Release is mandatory.** Stop, focus loss, and worker failure must clear every held key through the shared sender. Stop Patrol clears the automation gate and redraws its stopped state in the UI callback; the potentially slower sender scrub runs on `patrol-stop-cleanup` in the background. It never waits for the retired YOLO subprocess.
 7. **Vendor boundaries remain intact.** Extend auto-lie behavior in the adapter layer, never by editing `autolie_api/`.
 
 ## Packaging and release surfaces

@@ -15,7 +15,7 @@ import time
 import zipfile
 from typing import Iterable, Optional
 
-from config_store import user_config_version
+from config_store import USER_SECTIONS, user_config_version
 from versioning import read_version, version_key
 
 
@@ -383,8 +383,10 @@ def import_user_config(source: Path, destination: Path) -> Path:
     """Validate and atomically replace the live user configuration file.
 
     Import deliberately changes only ``user_config.json``.  System tuning and
-    program files remain untouched, and the caller can restart cleanly before
-    any in-memory UI state writes over the imported settings.
+    program files remain untouched. Validate the complete current user
+    document before replacing the live file: the running UI refreshes in
+    place, so accepting a merely JSON-shaped legacy document would otherwise
+    leave disk and in-memory settings out of sync.
     """
 
     source = Path(source).resolve()
@@ -399,6 +401,15 @@ def import_user_config(source: Path, destination: Path) -> Path:
         raise UpdateError(f"配置文件不是有效 JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise UpdateError("配置文件格式错误：根内容必须是 JSON 对象。")
+    missing_sections = sorted(section for section in USER_SECTIONS if section not in payload)
+    invalid_sections = sorted(
+        section for section in USER_SECTIONS
+        if section in payload and not isinstance(payload[section], dict)
+    )
+    if missing_sections or invalid_sections:
+        raise UpdateError(
+            "配置版本与当前助手版本不匹配，请重新录制以后导出新配置。"
+        )
     temporary = destination.with_name(
         f".{destination.name}.{os.getpid()}.{threading.get_ident()}.importing"
     )
@@ -423,6 +434,36 @@ def import_user_config(source: Path, destination: Path) -> Path:
         except OSError:
             pass
         raise UpdateError(f"导入 user_config.json 失败: {exc}") from exc
+    return destination
+
+
+def restore_user_config_bytes(destination: Path, content: bytes) -> Path:
+    """Atomically restore a pre-import user configuration after refresh failure."""
+
+    destination = Path(destination).resolve()
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.restoring"
+    )
+    try:
+        temporary.write_bytes(content)
+        last_error: Optional[PermissionError] = None
+        for attempt in range(_CONFIG_IMPORT_REPLACE_ATTEMPTS):
+            try:
+                temporary.replace(destination)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                if attempt + 1 < _CONFIG_IMPORT_REPLACE_ATTEMPTS:
+                    time.sleep(_CONFIG_IMPORT_REPLACE_RETRY_SECONDS)
+        if last_error is not None:
+            raise last_error
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise UpdateError(f"恢复原 user_config.json 失败: {exc}") from exc
     return destination
 
 
@@ -515,7 +556,7 @@ def schedule_package_update(package: DesktopUpdate, install_root: Path) -> Path:
 __all__ = [
     "DesktopUpdate", "UpdateError", "UpdateResult", "apply_desktop_update",
     "desktop_roots", "export_user_config", "find_newer_desktop_update",
-    "import_user_config", "remove_consumed_update_package",
+    "import_user_config", "remove_consumed_update_package", "restore_user_config_bytes",
     "schedule_config_import_restart", "schedule_hidden_restart",
     "schedule_package_update", "validate_user_config_import",
 ]

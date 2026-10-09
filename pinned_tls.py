@@ -9,6 +9,7 @@ import json
 import logging
 from pathlib import Path
 import ssl
+from typing import Optional
 from urllib.parse import urlsplit
 
 from cryptography import x509
@@ -44,8 +45,19 @@ def load_pin(path: Path) -> str:
         raise PinnedTlsError("安全连接配置不可用。") from exc
 
 
-def post_json(endpoint: str, path: str, payload: dict, pin_path: Path, timeout: float = 10.0) -> dict:
-    """Pin before transmitting the request body; never silently fall back."""
+def post_json(
+    endpoint: str, path: str, payload: dict, pin_path: Path,
+    timeout: float = 10.0, logger: Optional[logging.Logger] = None,
+) -> dict:
+    """Pin before transmitting the request body; never silently fall back.
+
+    ``logger`` selects the destination of the connection trace.  Licensing
+    questions belong in the ``server-client`` log, while automatic lie handling
+    has its own file: the lie-event accounting request is part of that feature,
+    so its connection lines must not land in the licensing connection log.
+    """
+
+    log = logger if logger is not None else SERVER_LOG
     parts = urlsplit(endpoint)
     if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
         raise PinnedTlsError("授权服务器必须使用 HTTPS。")
@@ -56,36 +68,36 @@ def post_json(endpoint: str, path: str, payload: dict, pin_path: Path, timeout: 
     context.verify_mode = ssl.CERT_NONE
     connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=timeout)
     try:
-        SERVER_LOG.info("secure request connecting endpoint=%s path=%s", safe_endpoint, path)
+        log.info("secure request connecting endpoint=%s path=%s", safe_endpoint, path)
         connection.connect()
         certificate = x509.load_der_x509_certificate(connection.sock.getpeercert(binary_form=True))
         spki = certificate.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         actual = base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
         if not hmac.compare_digest(expected, actual):
-            SERVER_LOG.warning("secure request rejected: certificate pin mismatch endpoint=%s", safe_endpoint)
+            log.warning("secure request rejected: certificate pin mismatch endpoint=%s", safe_endpoint)
             raise PinnedTlsError("服务器身份校验失败，连接已拒绝。")
-        SERVER_LOG.info("secure request certificate pin verified endpoint=%s", safe_endpoint)
+        log.info("secure request certificate pin verified endpoint=%s", safe_endpoint)
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         target = (parts.path.rstrip("/") + "/" + path.lstrip("/"))
         connection.request("POST", target, body=body, headers={"Content-Type": "application/json"})
         response = connection.getresponse()
         data = json.loads(response.read().decode("utf-8"))
         if response.status >= 400:
-            SERVER_LOG.warning("secure request rejected by server status=%s endpoint=%s", response.status, safe_endpoint)
+            log.warning("secure request rejected by server status=%s endpoint=%s", response.status, safe_endpoint)
             raise PinnedTlsResponseError(
                 response.status,
                 str(data.get("code", "SERVER_REJECTED")),
                 str(data.get("message", "授权服务器拒绝请求。")),
                 data,
             )
-        SERVER_LOG.info("secure request completed status=%s endpoint=%s", response.status, safe_endpoint)
+        log.info("secure request completed status=%s endpoint=%s", response.status, safe_endpoint)
         return data
     except PinnedTlsError:
         # This is an intentional, already-classified refusal (for example a
         # pin mismatch or a 4xx/5xx response), not a transport failure.
         raise
     except (OSError, ssl.SSLError, json.JSONDecodeError) as exc:
-        SERVER_LOG.warning("secure request failed category=%s endpoint=%s", type(exc).__name__, safe_endpoint)
+        log.warning("secure request failed category=%s endpoint=%s", type(exc).__name__, safe_endpoint)
         raise PinnedTlsError("无法建立安全授权连接。") from exc
     finally:
         connection.close()

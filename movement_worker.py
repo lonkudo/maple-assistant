@@ -278,7 +278,7 @@ STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES = 4
 # the next capture arrives.  Keep this distinct, short hold for stand-still
 # mode only.
 # The outer part of the final approach needs a slightly longer hold to make
-# visible progress across its wider ±0.040 X correction band.
+# visible progress across the 0.020-0.030 X band the correction owns.
 STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS = 0.12
 # Inside the small-step band the correction is the step that finishes the last
 # pixels onto the 桩.  It is the SAME arbiter motion as the longer walk back - a
@@ -292,10 +292,13 @@ STATIONARY_ATTACK_RECOVERY_HOLD_SECONDS = 0.12
 # hold is below the game's own movement granularity, so the correction was
 # swallowed in-game instead of walking.  About 0.10 s travels one marker column,
 # which is the size of the gap a correction is asked to close, so the correction
-# now really steps and the next capture confirms it.
-STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.12
+# now really steps and the next capture confirms it.  The operator's current
+# value is 0.11 s: just above the original 0.10 s that provably moves the
+# character, without the extra hold the previous build added.
+STATIONARY_ATTACK_NEAR_RECOVERY_HOLD_SECONDS = 0.11
 # Earliest re-request point for a correction.  The stationary-correction
-# arbiter reservation is longer (700 ms after its attached attack), so it is
+# arbiter reservation is longer (600 ms after its attached attack, shared with
+# 被撞反击 - see ``MotionArbiter._duration_for``), so it is
 # the effective spacing when repeated corrections are needed.  This shorter
 # re-request interval merely lets the movement loop ask promptly once that
 # post-cast protection ends.
@@ -320,7 +323,7 @@ STATIONARY_ATTACK_X_HOLD_TOLERANCE = 0.020
 # walk back normally.  The short correction-plus-attack motion is reserved
 # for the final approach only; using it for a rope-top or another platform
 # created a visible tiny-step/attack loop before the stake was reached.
-STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.040
+STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE = 0.030
 # How long the 朝向 tap holds its direction.  Unlike the anchor correction
 # (0.10 s, which must really walk about one marker column) the tap is a TURN,
 # not a move, and a longer hold walks the character out of the anchor band (at
@@ -550,6 +553,13 @@ LAYER_SINGLE_SUPPORTER_GAP_FALLBACK = 0.002
 # as "not arrived" zeroed the streak, so arrival could never be confirmed and the
 # climb restarted forever.  A longer blank run is real evidence and still resets.
 CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED = 3
+# A marker merely PASSING through the next floor's Y band while it is still
+# climbing a rope is not a landing.  Arrival evidence is allowed only after
+# three fresh readings produce two consecutive normalized-Y gaps no larger
+# than this value.  That lets a route whose platform is below its rope-exit
+# point keep climbing past the platform Y instead of releasing Up early.
+CLIMB_ARRIVAL_SETTLED_Y_GAP = 0.0001
+CLIMB_ARRIVAL_SETTLED_GAPS_REQUIRED = 2
 
 
 def _layer_marker_row(layer: Any) -> Optional[float]:
@@ -1255,6 +1265,11 @@ class ClimbState:
     recent_y: list[float] = field(default_factory=list)
     target_layer_frames: int = 0
     target_layer_since: Optional[float] = None
+    # Separate from ``last_marker_y``: that field belongs to rope-attachment
+    # progress.  These fields gate layer ARRIVAL so a character climbing past
+    # a platform's Y cannot be mistaken for standing on it.
+    arrival_last_marker_y: Optional[float] = None
+    arrival_settled_y_gaps: int = 0
     last_world_y: Optional[float] = None
     # Last raw marker Y used by the attachment verifier.  Attachment needs
     # two *new* upward advances, not two reads of one completed jump arc.
@@ -1501,6 +1516,11 @@ def climb(
             return send_all()
 
     if state.phase == "idle":
+        # A fresh rope attempt must build a fresh two-gap arrival-settle
+        # streak.  Do not let readings retained from a failed attempt make
+        # the next attempt appear already stationary.
+        state.arrival_last_marker_y = None
+        state.arrival_settled_y_gaps = 0
         inside_straight_up_zone = bool(
             rope_x is not None
             and abs(rope_x - player.x) <= straight_up_tolerance
@@ -2444,6 +2464,10 @@ class MovementWorker(threading.Thread):
         # 检测必须抑制：即使 arrival_y 缺失/未命中，也保持 Up 直到确认完成。
         arrival_in_progress = bool(
             self._climb_state.target_layer_frames > 0
+            or (
+                self._return_mode == "climb-to-route"
+                and self._return_arrival_floor is not None
+            )
         )
         # A climb chord owns all directional keys while it is emitted.  This
         # shares the same lock as 小碎步, so no left/right pair can land between
@@ -3269,35 +3293,18 @@ class MovementWorker(threading.Thread):
             self._stationary_return_watch_direction = None
             self._stationary_return_watch_best_distance = None
             self._stationary_return_watch_frames = 0
-        # A fixed-attack beat can already be in Maple's animation window on
-        # the frame where 站桩 recovery first discovers that the character is
-        # outside its final approach zone.  If Left/Right is sent during that
-        # window, Maple may consume it as part of the attack animation.  The
-        # hold manager then quite reasonably believes the key is down and
-        # merely extends that invisible hold on each fresh minimap frame,
-        # leaving the character frozen while every later attack is blocked by
-        # the return event.  The event set by the movement loop prevents a
-        # *new* attack; wait only for the one that was already in flight, then
-        # issue the first normal return walk on a clean input tick.
-        if (self.stationary_attack_enabled
-                and decision.reason
-                == "stationary return walking to final approach zone"):
-            attack_motion_active = getattr(
-                self.motion_arbiter, "attack_motion_active", None
-            )
-            if callable(attack_motion_active) and attack_motion_active():
-                deadline = time.monotonic() + 1.0
-                while (attack_motion_active()
-                       and time.monotonic() < deadline):
-                    if not self._wait_for_patrol_motion(0.02):
-                        return False
-                if attack_motion_active():
-                    LOG.info(
-                        "stationary return walk waiting for active attack "
-                        "to finish before %s",
-                        decision.key,
-                    )
-                    return False
+        # 站桩 recovery deliberately does NOT wait for an in-flight attack here.
+        # This used to poll ``attack_motion_active()`` for up to 1.0 s before the
+        # first return key after a knockback, because Maple can swallow a
+        # direction that arrives during an attack animation.  Blocking the send
+        # for the remainder of the 0.73 s attack grace left the character
+        # standing for three or four captures while the movement worker sat
+        # inside this call - the operator's "he does not walk back immediately".
+        # A key the animation really swallows is caught by the progress watch
+        # above (``STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES``), which releases
+        # and re-arms the same direction after three captures without X
+        # progress, so the pre-emptive wait only added delay it could not
+        # remove.
         if not _sender_is_safe(self.key_sender):
             LOG.warning("movement suppressed: target window is not safely selected")
             return False
@@ -3891,6 +3898,11 @@ class MovementWorker(threading.Thread):
         # route target was MOVE TO ROPE.  A horizontal stair point must never
         # manufacture a rope-climb handoff merely because its Y rises.
         self._jump_point_rope_handoff = False
+        # The point can fire while an ordinary climb is already confirmed.
+        # In that case both claims keep Up physically held until the landing
+        # path establishes whether this was a rope-to-rope transfer or a
+        # platform exit.
+        self._jump_point_preserved_climb = False
         # True once the automation input gate has been observed active, so the
         # disarmed->armed edge (Start Patrol) can be detected exactly once.
         self._automation_was_active = False
@@ -4773,6 +4785,7 @@ class MovementWorker(threading.Thread):
                 self._jump_point_last_y = None
                 self._jump_point_rise_frames = 0
                 self._jump_point_rope_handoff = False
+                self._jump_point_preserved_climb = False
                 if self.climbing_active_event is not None:
                     self.climbing_active_event.clear()
                 LOG.info("JUMP POINT: released prior Up hold for new jump")
@@ -4800,6 +4813,7 @@ class MovementWorker(threading.Thread):
                     if key_down("up") is False:
                         return False
                     jump_point_up_started = True
+                    self._jump_point_preserved_climb = False
                     self._jump_point_up_held = True
                     self._jump_point_up_started_at = time.monotonic()
                     self._jump_point_y_samples.clear()
@@ -4840,6 +4854,7 @@ class MovementWorker(threading.Thread):
                     self._jump_point_last_y = None
                     self._jump_point_rise_frames = 0
                     self._jump_point_rope_handoff = False
+                    self._jump_point_preserved_climb = False
                     if self.climbing_active_event is not None:
                         self.climbing_active_event.clear()
                 if added_direction_claim:
@@ -5049,27 +5064,45 @@ class MovementWorker(threading.Thread):
         key_up = getattr(self.key_sender, "key_up", None)
         if not callable(key_down) or not callable(key_up):
             return
+        preserved_climb = bool(
+            self._jump_point_preserved_climb
+            and self._climb_state.up_held
+            and self._climb_state.phase == "climbing-up"
+        )
         with self._direction_lock:
-            # Add the climb state's ownership claim before releasing the
-            # point's claim, so the physical Up key never flickers up.
-            if key_down("up") is False:
-                return
-            key_up("up")
+            if preserved_climb:
+                # The original climb and the point both currently own Up.
+                # Rope-2 attachment is now proven, so remove only the point's
+                # extra claim; the original climb keeps the key physically
+                # down without any flicker.
+                key_up("up")
+            else:
+                # Add the climb state's ownership claim before releasing the
+                # point's claim, so the physical Up key never flickers up.
+                if key_down("up") is False:
+                    return
+                key_up("up")
         world_y = (
             observation.world_y_diamonds
             if observation.structure_confidence >= 0.12 else None
         )
-        self._climb_state = ClimbState(
-            phase="climbing-up",
-            baseline_y=self._jump_point_start_y,
-            baseline_world_y=world_y,
-            up_held=True,
-            attach_frames=2,
-            last_world_y=world_y,
-            last_marker_y=player.y,
-            last_marker_x=player.x,
-            recent_y=[player.y],
-        )
+        if preserved_climb:
+            self._climb_state.last_world_y = world_y
+            self._climb_state.last_marker_y = player.y
+            self._climb_state.last_marker_x = player.x
+            self._climb_state.recent_y = [player.y]
+        else:
+            self._climb_state = ClimbState(
+                phase="climbing-up",
+                baseline_y=self._jump_point_start_y,
+                baseline_world_y=world_y,
+                up_held=True,
+                attach_frames=2,
+                last_world_y=world_y,
+                last_marker_y=player.y,
+                last_marker_x=player.x,
+                recent_y=[player.y],
+            )
         self._jump_point_up_held = False
         self._jump_point_up_started_at = 0.0
         self._jump_point_y_samples.clear()
@@ -5077,6 +5110,7 @@ class MovementWorker(threading.Thread):
         self._jump_point_last_y = None
         self._jump_point_rise_frames = 0
         self._jump_point_rope_handoff = False
+        self._jump_point_preserved_climb = False
         if self.climbing_active_event is not None:
             self.climbing_active_event.set()
         LOG.info(
@@ -5155,6 +5189,7 @@ class MovementWorker(threading.Thread):
             self._jump_point_last_y = None
             self._jump_point_rise_frames = 0
             self._jump_point_rope_handoff = False
+            self._jump_point_preserved_climb = False
             if climb_owns_up:
                 LOG.info(
                     "JUMP POINT landing Y settled; released Up and left it to "
@@ -6748,8 +6783,30 @@ class MovementWorker(threading.Thread):
                 if 0 <= expected_next_index < len(self._route_layers)
                 else None
             )
+            # Crossing a floor band on a rope is not a landing.  Require two
+            # consecutive effectively-unchanged Y gaps (three fresh reads)
+            # before either marker-Y or world-Y may confirm the next layer.
+            # Any continued climb movement resets the gate immediately.
+            if observation.player is None:
+                self._climb_state.arrival_last_marker_y = None
+                self._climb_state.arrival_settled_y_gaps = 0
+            else:
+                marker_y = float(observation.player.y)
+                previous_y = self._climb_state.arrival_last_marker_y
+                if (previous_y is not None
+                        and abs(marker_y - previous_y)
+                        <= CLIMB_ARRIVAL_SETTLED_Y_GAP):
+                    self._climb_state.arrival_settled_y_gaps += 1
+                else:
+                    self._climb_state.arrival_settled_y_gaps = 0
+                self._climb_state.arrival_last_marker_y = marker_y
+            arrival_y_settled = (
+                self._climb_state.arrival_settled_y_gaps
+                >= CLIMB_ARRIVAL_SETTLED_GAPS_REQUIRED
+            )
             marker_expected = bool(
-                expected_name is not None
+                arrival_y_settled
+                and expected_name is not None
                 and observation.player is not None
                 and self._climb_arrival_band_contains(
                     expected_name, observation.player.y
@@ -6839,6 +6896,10 @@ class MovementWorker(threading.Thread):
                     world_expected = world_expected or (
                         world_in_expected_band and not world_in_current_band
                     )
+            # The world tracker may already be near the next layer while the
+            # marker is still travelling up its rope.  It is supporting
+            # evidence only after the same physical-Y settle gate passes.
+            world_expected = world_expected and arrival_y_settled
             detected_name = (
                 expected_name
                 if marker_unambiguous or world_expected
@@ -9724,7 +9785,11 @@ class MovementWorker(threading.Thread):
                 else "dropping back",
             )
 
-    def _return_climb_arrival_ready(self, floor: Optional[str]) -> bool:
+    def _return_climb_arrival_ready(
+        self,
+        floor: Optional[str],
+        observation: MinimapObservation,
+    ) -> bool:
         """Confirm and settle a return climb before resuming patrol."""
 
         state = self._climb_state
@@ -9821,6 +9886,39 @@ class MovementWorker(threading.Thread):
             state.target_layer_frames = 0
             state.target_layer_since = None
             return False
+
+        # Seeing the destination floor while still moving up the rope is only
+        # a pass through that floor's marker band.  The ordinary route-climb
+        # path already applies this gate; return climbs have a separate
+        # arrival path and previously bypassed it, so they could release Up at
+        # the platform Y even when the rope exit was higher.  Require three
+        # fresh readings whose two consecutive Y gaps are effectively zero
+        # before starting the existing floor-confirmation count.
+        if observation.player is None:
+            state.arrival_last_marker_y = None
+            state.arrival_settled_y_gaps = 0
+        else:
+            marker_y = float(observation.player.y)
+            previous_y = state.arrival_last_marker_y
+            if (previous_y is not None
+                    and abs(marker_y - previous_y)
+                    <= CLIMB_ARRIVAL_SETTLED_Y_GAP):
+                state.arrival_settled_y_gaps += 1
+            else:
+                state.arrival_settled_y_gaps = 0
+            state.arrival_last_marker_y = marker_y
+        if (state.arrival_settled_y_gaps
+                < CLIMB_ARRIVAL_SETTLED_GAPS_REQUIRED):
+            # Keep the accepted destination as a *candidate* while its marker
+            # Y settles.  _run_climb_step uses this to suppress its rope-stall
+            # watchdog for the few frames required by the two-gap settle gate.
+            # Completion still cannot occur until the gate below passes and
+            # the ordinary target-layer confirmation count succeeds.
+            self._return_arrival_floor = floor
+            state.target_layer_frames = 0
+            state.target_layer_since = None
+            return False
+
         if floor != self._return_arrival_floor:
             self._return_arrival_floor = floor
             state.target_layer_frames = 0
@@ -10067,7 +10165,9 @@ class MovementWorker(threading.Thread):
         if self._return_mode is not None:
             if (self._return_mode == "climb-to-route"
                     and floor in self._route_layers
-                    and not self._return_climb_arrival_ready(floor)):
+                    and not self._return_climb_arrival_ready(
+                        floor, observation
+                    )):
                 # Do not re-anchor from the first apparent arrival frame. A
                 # bench jump can briefly enter an upper marker band while it
                 # is still part of the current logical layer.
@@ -10479,7 +10579,9 @@ class MovementWorker(threading.Thread):
             # happened, causing the visible left/right swing after a failed
             # rope attempt.  Only an active climb may confirm a new floor.
             if (climb_in_progress
-                    and self._return_climb_arrival_ready(detected_floor)):
+                    and self._return_climb_arrival_ready(
+                        detected_floor, observation
+                    )):
                 floor = self._return_arrival_floor
                 assert floor is not None
                 LOG.info(
@@ -11246,8 +11348,22 @@ class MovementWorker(threading.Thread):
             elif key_up is not None:
                 key_up("up")
             self._climb_state.up_held = False
+            # A jump point fired during an attached climb may still share the
+            # same physical Up hold.  A confirmed platform arrival/abort uses
+            # this release path, so clear that session too; otherwise its
+            # stale flag would keep replacing the new floor's route decision
+            # with MOVE TO ROPE/wait after Up was already released.
+            if self._jump_point_up_held:
+                self._jump_point_up_held = False
+                self._jump_point_up_started_at = 0.0
+                self._jump_point_y_samples.clear()
+                self._jump_point_start_y = None
+                self._jump_point_last_y = None
+                self._jump_point_rise_frames = 0
+                self._jump_point_rope_handoff = False
+                self._jump_point_preserved_climb = False
 
-    def _yield_climb_to_jump_point(self) -> None:
+    def _yield_climb_to_jump_point(self) -> bool:
         """Stop ordinary rope recovery without releasing a jump-point's Up.
 
         A directional jump point sends ``direction + Alt`` while holding Up
@@ -11262,6 +11378,26 @@ class MovementWorker(threading.Thread):
         """
 
         state = self._climb_state
+        if state.up_held and state.phase == "climbing-up":
+            # This point fired while the marker was already advancing on an
+            # attached rope.  That existing climb is stronger evidence than
+            # the jump-point detector's first post-Alt sample: resetting it
+            # here discarded several decreasing-Y frames and then required a
+            # second post-jump rise that may never occur.  Keep BOTH Up claims
+            # alive: the point may be transferring from rope 1 to rope 2.
+            # The rope-handoff or settled-platform path collapses/releases the
+            # claims only after the destination is known.
+            first_preservation = not self._jump_point_preserved_climb
+            self._jump_point_preserved_climb = True
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.set()
+            if first_preservation:
+                LOG.info(
+                    "JUMP POINT climb ownership: preserved confirmed rope "
+                    "climb and jump-point Up hold"
+                )
+            return True
+
         if state.up_held:
             key_up = getattr(self.key_sender, "key_up", None)
             if callable(key_up):
@@ -11276,6 +11412,7 @@ class MovementWorker(threading.Thread):
         # must stay set until _update_jump_point_landing clears it.
         if self.climbing_active_event is not None:
             self.climbing_active_event.set()
+        return False
 
     def _sync_input_session(self) -> None:
         """Drop worker-local holds when the sender starts a new generation."""
@@ -11631,10 +11768,11 @@ class MovementWorker(threading.Thread):
                 # post-hit marker.
                 #
                 # The counterattack key is inserted either way.  Waiting for a
-                # "settled" stand-still beat was the v1.2.119 bug: a hit is
-                # exactly what unsettles the marker, so the gate refused the
-                # replacement in the one case it exists for and 被撞反击 never
-                # fired.  The beat the operator wants it carried by is the
+                # "settled" stand-still beat first was the fault of the v1.2.119
+                # intermediate build (between tagged v1.2.112 and v1.2.131): a
+                # hit is exactly what unsettles the marker, so the gate refused
+                # the replacement in the one case it exists for and 被撞反击
+                # never fired.  The beat the operator wants it carried by is the
                 # return-to-桩 correction itself ("tiny walk back + attack"), and
                 # the slot is consumed when a beat really executes
                 # (``_consume_attack_slot``), so a cancelled correction can
@@ -12693,10 +12831,12 @@ class MovementWorker(threading.Thread):
                         and decision.key not in (
                             "jump_point_left", "jump_point_right",
                         )):
-                    self._yield_climb_to_jump_point()
+                    climb_was_preserved = self._yield_climb_to_jump_point()
                     decision = MovementDecision(
-                        None,
-                        "recorded directional jump point owns Up; waiting for landing",
+                        "climb" if climb_was_preserved else None,
+                        ("confirmed rope climb preserved through directional jump point"
+                         if climb_was_preserved else
+                         "recorded directional jump point owns Up; waiting for landing"),
                     )
                     active_target_x = None
                 # Other-player safety net: a per-frame scan (no cooldown)
