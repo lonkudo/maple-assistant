@@ -8,9 +8,9 @@ from dataclasses import replace
 import json
 import logging
 import math
-from logging.handlers import RotatingFileHandler
 import queue
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -19,6 +19,7 @@ from typing import Callable, Optional
 from minimap_detector import hud_scale_for
 from runtime_paths import application_root
 from auto_lie_secret import CredentialRedactionFilter, get_server_secret
+from async_log_writer import AsyncBatchLogWriter
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -347,12 +348,8 @@ def main() -> int:
         return 0
     args = parse_args()
     _clear_previous_log_files()
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(_compact_log_formatter())
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        handlers=[console_handler],
-    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
     # INFO and ERROR tracking are persisted in work/assistant.log; the UI
     # running log remains an in-memory convenience view.
     trace_log_path = Path(__file__).resolve().parent / "work" / "assistant.log"
@@ -360,36 +357,39 @@ def main() -> int:
         trace_log_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-    trace_log_handler = RotatingFileHandler(
+    trace_log_writer = AsyncBatchLogWriter(
         trace_log_path,
-        maxBytes=2_000_000,
-        backupCount=2,
-        encoding="utf-8",
+        max_bytes=2_000_000,
+        backup_count=2,
+        formatter=_compact_log_formatter(),
+        mirror=sys.stderr,
     )
     # The credential is process-memory only and must never reach a log file -
     # masked or not.  One filter enforces that on every file handler: the
     # licensing lines only ever name the *outcome* ("refreshed", "withheld"),
     # so the state stays fully diagnosable without the value.
     credential_filter = CredentialRedactionFilter()
+    trace_log_handler = trace_log_writer.handler
     trace_log_handler.setLevel(logging.INFO)
-    trace_log_handler.setFormatter(_compact_log_formatter())
     trace_log_handler.addFilter(credential_filter)
-    logging.getLogger().addHandler(trace_log_handler)
+    root_logger.addHandler(trace_log_handler)
+    trace_log_writer.start()
 
     # The licensing/server boundary gets its own compact, safe-to-share trace.
     # It deliberately records no activation code, fingerprint, token, or secret.
-    server_log_handler = RotatingFileHandler(
+    server_log_writer = AsyncBatchLogWriter(
         Path(__file__).with_name("server_client.log"),
-        maxBytes=500_000,
-        backupCount=2,
-        encoding="utf-8",
+        max_bytes=500_000,
+        backup_count=2,
+        formatter=_compact_log_formatter(),
     )
+    server_log_handler = server_log_writer.handler
     server_log_handler.setLevel(logging.INFO)
-    server_log_handler.setFormatter(_compact_log_formatter())
     server_logger = logging.getLogger("server-client")
     server_logger.setLevel(logging.INFO)
     server_log_handler.addFilter(credential_filter)
     server_logger.addHandler(server_log_handler)
+    server_log_writer.start()
 
     # Automatic lie handling needs a shareable diagnosis file independent of
     # the noisy patrol log.  It contains the detector-to-pass handoff, the
@@ -397,14 +397,14 @@ def main() -> int:
     # progress/errors; it deliberately does not add keys, activation codes or
     # raw frames.  These named loggers do not propagate to the root logger:
     # automatic lie activity belongs in auto_lie.log, not assistant.log.
-    auto_lie_log_handler = RotatingFileHandler(
+    auto_lie_log_writer = AsyncBatchLogWriter(
         Path(__file__).with_name("auto_lie.log"),
-        maxBytes=1_000_000,
-        backupCount=2,
-        encoding="utf-8",
+        max_bytes=1_000_000,
+        backup_count=2,
+        formatter=_compact_log_formatter(),
     )
+    auto_lie_log_handler = auto_lie_log_writer.handler
     auto_lie_log_handler.setLevel(logging.INFO)
-    auto_lie_log_handler.setFormatter(_compact_log_formatter())
     auto_lie_log_handler.addFilter(credential_filter)
     auto_lie_logger = logging.getLogger("auto-lie")
     for auto_lie_log_name in (
@@ -417,6 +417,7 @@ def main() -> int:
         scoped_logger.setLevel(logging.INFO)
         scoped_logger.addHandler(auto_lie_log_handler)
         scoped_logger.propagate = False
+    auto_lie_log_writer.start()
 
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
         logging.critical(
@@ -2284,14 +2285,32 @@ def main() -> int:
         action alive for a later patrol toggle.
         """
 
+        started_at = time.monotonic()
         automation_active.clear()
+        logging.info("STOP PATROL timing: automation gate cleared (0ms)")
         movement_worker.disarm_patrol_input()
+        logging.info(
+            "STOP PATROL timing: movement input disarmed after %.0fms",
+            (time.monotonic() - started_at) * 1000.0,
+        )
         motion_arbiter.cancel_pending("patrol lifecycle stopped")
+        logging.info(
+            "STOP PATROL timing: motion arbiter cancelled after %.0fms",
+            (time.monotonic() - started_at) * 1000.0,
+        )
         stair_jump_worker.cancel_pending("patrol lifecycle stopped")
+        logging.info(
+            "STOP PATROL timing: stair jump cancelled after %.0fms",
+            (time.monotonic() - started_at) * 1000.0,
+        )
         _stop_live_input(
             key_sender,
             automation_active,
             refocus_before_release=refocus_before_release,
+        )
+        logging.info(
+            "STOP PATROL timing: live input released after %.0fms",
+            (time.monotonic() - started_at) * 1000.0,
         )
 
     # 自动重开 owns only the memory/leak lifecycle.  Once the fresh game
@@ -2503,13 +2522,18 @@ def main() -> int:
             worker.join(timeout=5)
         supervisor.join(timeout=1)
         if ui_log_handler is not None:
-            logging.getLogger().removeHandler(ui_log_handler)
-        logging.getLogger().removeHandler(error_log_handler)
-        error_log_handler.close()
-        logging.getLogger().removeHandler(trace_log_handler)
-        trace_log_handler.close()
+            root_logger.removeHandler(ui_log_handler)
+        root_logger.removeHandler(trace_log_handler)
         server_logger.removeHandler(server_log_handler)
-        server_log_handler.close()
+        for auto_lie_log_name in (
+            "auto-lie", "api_auto_lie", "api_lie_test", "autolie_api",
+        ):
+            logging.getLogger(auto_lie_log_name).removeHandler(auto_lie_log_handler)
+        # Writers own file close/flush.  They drain only their current bounded
+        # record batches and never hold a live gameplay worker at shutdown.
+        auto_lie_log_writer.close(drain_timeout=1.0)
+        server_log_writer.close(drain_timeout=1.0)
+        trace_log_writer.close(drain_timeout=1.0)
         _release_single_instance_mutex(singleton_handle)
     return 0
 

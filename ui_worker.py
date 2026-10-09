@@ -1200,6 +1200,10 @@ class UiWorker(threading.Thread):
         # must never freeze Tk or leave the Stop button visually stale.
         self._patrol_stop_pending = False
         self._patrol_stop_cleanup_done = threading.Event()
+        # Monotonic timestamps are diagnostic-only.  They let the running log
+        # distinguish a delayed Tk callback from a slow background key scrub.
+        self._patrol_stop_started_at: Optional[float] = None
+        self._patrol_stop_cleanup_finished_at: Optional[float] = None
         # Ctrl+` can be reported twice while Windows changes focus.  A second
         # request queued during a start must not immediately undo that start
         # after calibration completes.
@@ -3503,6 +3507,32 @@ class UiWorker(threading.Thread):
         self._drain_lie_accounting_results()
         self._drain_channel_update_events()
         self._drain_other_player_stop_events()
+        # Physical hotkeys are an operator safety path.  The listener thread
+        # has already recognized the chord and placed its action in a queue;
+        # dispatch it before any OpenCV snapshot build, log display update, or
+        # periodic widget refresh.  In particular Ctrl+` must not wait behind
+        # debug rendering before it can stop game input.
+        try:
+            self._drain_hotkey_actions()
+        except Exception:
+            LOG.exception("urgent hotkey dispatch failed; the UI tick continues")
+        # A detected lie window is a real-time event.  Its detector timestamp
+        # anchors the upload deadline, so waiting for the debug snapshot or
+        # routine panel repaint here can make an otherwise fast WebSocket
+        # handshake start several seconds late.  Start/advance the dedicated
+        # worker before all nonessential display work.  The worker itself owns
+        # handshake, frame pushes, and server I/O on its own thread.
+        for step in (
+            self._service_api_auto_lie,
+            self._drain_api_auto_lie_results,
+        ):
+            try:
+                step()
+            except Exception:
+                AUTO_LIE_LOG.exception(
+                    "自动过测谎 priority service %s failed; the UI tick continues",
+                    getattr(step, "__name__", step),
+                )
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
         # so the resize stays light, but keep the poll cadence alive.
@@ -3522,8 +3552,19 @@ class UiWorker(threading.Thread):
                 self.frame_queue.task_done()
             except (AttributeError, ValueError):
                 pass
+        snapshot_to_render: Optional[DebugSnapshot] = None
         if latest is not None:
             self._latest_capture_frame = latest
+        # The outcome observer needs only the latest captured image; it does
+        # not need a freshly rendered debug snapshot.  Keeping it here means a
+        # success/failure observation is never held behind OpenCV UI drawing.
+        try:
+            self._service_auto_lie_outcome_monitor()
+        except Exception:
+            AUTO_LIE_LOG.exception(
+                "自动过测谎 priority outcome observation failed; the UI tick continues"
+            )
+        if latest is not None:
             try:
                 self.last_snapshot = build_debug_snapshot(
                     latest,
@@ -3532,7 +3573,10 @@ class UiWorker(threading.Thread):
                     self.diamond_size_tracker,
                     self.structure_tracker,
                 )
-                self._render(self.last_snapshot)
+                # Detection and tracker state stay on their established
+                # single-threaded path.  Only the completed debug display is
+                # deferred until all control work in this poll has run.
+                snapshot_to_render = self.last_snapshot
             except Exception:
                 LOG.exception("could not update debug UI")
         # Each periodic task is guarded on its own.  The whole body used to
@@ -3550,11 +3594,7 @@ class UiWorker(threading.Thread):
             self._refresh_countdown_status,
             self._refresh_telegram_status,
             self._poll_yolo_exit,
-            self._drain_hotkey_actions,
             self._drain_api_test_results,
-            self._service_api_auto_lie,
-            self._drain_api_auto_lie_results,
-            self._service_auto_lie_outcome_monitor,
             self._service_auto_lie_marker_verification,
         ):
             try:
@@ -3562,6 +3602,14 @@ class UiWorker(threading.Thread):
             except Exception:
                 LOG.exception("periodic UI step %s failed; the tick continues",
                               getattr(step, "__name__", step))
+
+        # Tk rendering is non-critical debug output.  Keep it last so a
+        # completed snapshot never delays hotkey or patrol-control handling.
+        if snapshot_to_render is not None:
+            try:
+                self._render(snapshot_to_render)
+            except Exception:
+                LOG.exception("could not render completed debug snapshot")
 
     def _sync_patrol_ui_state(self) -> None:
         """Refresh patrol buttons when patrol stopped outside the UI.
@@ -3580,6 +3628,9 @@ class UiWorker(threading.Thread):
             return
         if (self._patrol_stop_pending
                 and self._patrol_stop_cleanup_done.is_set()):
+            completed_at = getattr(self, "_patrol_stop_cleanup_finished_at", None)
+            started_at = getattr(self, "_patrol_stop_started_at", None)
+            now = time.monotonic()
             self._patrol_stop_pending = False
             self._patrol_stop_cleanup_done.clear()
             self._refresh_patrol_controls()
@@ -3587,7 +3638,27 @@ class UiWorker(threading.Thread):
                 self._control_status.configure(text="巡逻已停止。")
             except Exception:
                 LOG.debug("could not display completed patrol stop", exc_info=True)
-            LOG.info("STOP PATROL: background input cleanup completed")
+            cleanup_ms = (
+                (completed_at - started_at) * 1000.0
+                if isinstance(started_at, float) and isinstance(completed_at, float)
+                else None
+            )
+            ui_notice_ms = (
+                (now - completed_at) * 1000.0
+                if isinstance(completed_at, float) else None
+            )
+            total_ms = (
+                (now - started_at) * 1000.0
+                if isinstance(started_at, float) else None
+            )
+            LOG.info(
+                "STOP PATROL timing: stopped fully; cleanup=%s, UI-notice=%s, total=%s",
+                self._format_stop_elapsed(cleanup_ms),
+                self._format_stop_elapsed(ui_notice_ms),
+                self._format_stop_elapsed(total_ms),
+            )
+            self._patrol_stop_started_at = None
+            self._patrol_stop_cleanup_finished_at = None
         running = bool(self.patrol_controller.is_enabled())
         if running == getattr(self, "_patrol_ui_running", None):
             self._patrol_pending_running = None
@@ -10444,6 +10515,17 @@ class UiWorker(threading.Thread):
         if self._patrol_stop_pending:
             LOG.info("STOP PATROL already releasing keys")
             return True
+        stop_started_at = time.monotonic()
+        self._patrol_stop_started_at = stop_started_at
+        self._patrol_stop_cleanup_finished_at = None
+        # This is the main-panel state transition.  It happens before any
+        # controller or keyboard work, so the user gets immediate feedback as
+        # soon as Tk begins handling the toggle.
+        try:
+            self._control_status.configure(text="正在停止巡逻并释放按键…")
+        except Exception:
+            LOG.debug("Stop Patrol could not show immediate stopping status", exc_info=True)
+        LOG.info("STOP PATROL timing: request accepted; stopping workers")
         try:
             self.patrol_controller.set_enabled(False)
         except Exception:
@@ -10456,13 +10538,18 @@ class UiWorker(threading.Thread):
         # lock on Tk used to make the whole app look crashed.
         try:
             self._refresh_patrol_controls()
-            self._control_status.configure(text="正在停止巡逻并释放按键…")
         except Exception:
             LOG.exception("Stop Patrol immediate UI refresh failed")
 
         def release_input_in_background() -> None:
+            cleanup_started_at = time.monotonic()
             try:
-                LOG.info("STOP PATROL: background input cleanup starting")
+                LOG.info(
+                    "STOP PATROL timing: background cleanup started after %s",
+                    self._format_stop_elapsed(
+                        (cleanup_started_at - stop_started_at) * 1000.0
+                    ),
+                )
                 if self.on_patrol_stop is not None:
                     self.on_patrol_stop()
             except Exception:
@@ -10470,7 +10557,14 @@ class UiWorker(threading.Thread):
                 # Patrol must leave the dashboard usable for manual recovery.
                 LOG.exception("Stop Patrol input cleanup failed")
             finally:
+                self._patrol_stop_cleanup_finished_at = time.monotonic()
                 self._patrol_stop_cleanup_done.set()
+                LOG.info(
+                    "STOP PATROL timing: background cleanup finished in %s",
+                    self._format_stop_elapsed(
+                        (self._patrol_stop_cleanup_finished_at - cleanup_started_at) * 1000.0
+                    ),
+                )
 
         threading.Thread(
             target=release_input_in_background,
@@ -10490,6 +10584,14 @@ class UiWorker(threading.Thread):
             # widget must not turn a safe input stop into an app crash.
             LOG.exception("Stop Patrol UI refresh failed")
         return True
+
+    @staticmethod
+    def _format_stop_elapsed(milliseconds: Optional[float]) -> str:
+        """Render a bounded timing value for Stop Patrol diagnostics."""
+
+        if milliseconds is None:
+            return "n/a"
+        return f"{max(0.0, float(milliseconds)):.0f}ms"
 
     def _stationary_attack_selected(self) -> bool:
         """Whether Start Patrol must use the route-independent stand-still mode.
