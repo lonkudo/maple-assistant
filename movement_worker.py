@@ -668,10 +668,14 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     # movement, scaled by the operator's upper-band factor.  Only one third is
     # allowed below the confirmed layer base: enough for OpenCV/marker
     # quantization noise without making the band unnecessarily reach toward the
-    # layer below.
+    # layer below.  It must still cover one full quantised marker row.
+    lower_grace = effective_tolerance / 3.0
+    marker_row = _layer_marker_row(layer)
+    if marker_row is not None:
+        lower_grace = max(lower_grace, marker_row)
     return (
         min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
-        max(values) + effective_tolerance / 3.0,
+        max(values) + lower_grace,
     )
 
 

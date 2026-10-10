@@ -298,6 +298,16 @@ The capture path follows this order:
 
 This shared model prevents conflicting focus changes, reduces capture overhead, and makes marker-loss and timeout counters meaningful.
 
+`LieScreenshotRecorder` is a passive diagnostic consumer of that same stream.
+When a lie window, disconnect, or countdown begins, it receives the already
+published 5 FPS frames through a one-frame overwrite queue, writes JPG evidence
+on its background writer, and later composes the diagnostic MP4. It never calls
+the window capture API itself. If disk writing falls behind, stale diagnostic
+frames are discarded rather than delaying the shared capture, minimap analysis,
+movement, or live auto-lie stream. While the normal capture worker is parked,
+the existing parked-watch capture publishes the same cadence to the recorder
+only for an active recording.
+
 ### Minimap geometry and position
 
 `minimap_detector.py` locates the actual minimap border and detects the yellow character marker. All normalized map coordinates are calculated from the detected border, not from a fixed screen region.

@@ -751,7 +751,13 @@ unnecessary (the other player left) hands the patrol back on its own.
 
 ## Lie detection and automatic handling
 
-The lie detector shares the normal 5 FPS capture cadence. When automatic lie handling is enabled:
+The lie detector shares the normal 5 FPS capture cadence. Diagnostic evidence
+recording does too: when a lie window, disconnect, or countdown is detected, the
+recorder saves copies of those same shared frames as JPGs under `screenshots/`
+and later creates its MP4. It does not open a second high-frequency game-capture
+loop. Disk writes run in the background through a bounded queue; if they cannot
+keep up, old diagnostic frames are dropped rather than delaying patrol, UI, or
+automatic lie handling. When automatic lie handling is enabled:
 
 1. Application startup performs a background, no-billing WebSocket probe: it walks the six service instances in a random order and caches the first that answers, together with the whole order for failover.
 2. On a lie event, the assistant opens a fresh authenticated connection while the game completes its visual transition — on the cached instance first, moving to the next whenever a handshake fails.

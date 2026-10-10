@@ -134,6 +134,10 @@ AUTO_LIE_MIN_PASS_GAP_SECONDS = 10.0
 # from the operator's caption refresh control.
 # A repeating debug-UI poll failure logs a full traceback this often; the ones in between are DEBUG.
 POLL_FAILURE_LOG_SECONDS = 10.0
+# Diagnostic threshold only.  Timing is emitted through the asynchronous log
+# writer, so observing a slow UI phase never adds synchronous file I/O to it.
+UI_POLL_SLOW_PHASE_SECONDS = 0.10
+UI_POLL_SLOW_TOTAL_SECONDS = 0.25
 # A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
 # never keep the pending flag set (and this method retrying) for the rest of the session.
 AUTO_LIE_PENDING_MAX_SECONDS = 90.0
@@ -3465,6 +3469,7 @@ class UiWorker(threading.Thread):
         if self.stop_event.is_set():
             root.destroy()
             return
+        poll_started = time.perf_counter()
         try:
             self._poll_body(root)
         except Exception as exc:
@@ -3489,11 +3494,22 @@ class UiWorker(threading.Thread):
                     self._poll_failure_count, signature,
                 )
         finally:
+            elapsed = time.perf_counter() - poll_started
+            if elapsed >= UI_POLL_SLOW_TOTAL_SECONDS:
+                LOG.warning("UI POLL timing: total=%.0fms", elapsed * 1000.0)
             try:
                 if not self.stop_event.is_set() and root.winfo_exists():
                     root.after(self.refresh_ms, self._poll)
             except Exception:
                 LOG.debug("could not re-arm the debug UI poll", exc_info=True)
+
+    @staticmethod
+    def _report_ui_poll_phase(phase: str, started_at: float) -> None:
+        """Log only material UI-poll delays without adding disk I/O to Tk."""
+
+        elapsed = time.perf_counter() - started_at
+        if elapsed >= UI_POLL_SLOW_PHASE_SECONDS:
+            LOG.warning("UI POLL timing: phase=%s elapsed=%.0fms", phase, elapsed * 1000.0)
 
     def _poll_body(self, root: Any) -> None:
         """One tick's work, without the re-arm (see :meth:`_poll`)."""
@@ -3503,6 +3519,7 @@ class UiWorker(threading.Thread):
         # never defer the heartbeat result: otherwise a successful immediate
         # validation can leave the visible header stuck at “正在验证授权” until
         # some unrelated UI change ends the freeze state.
+        priority_started = time.perf_counter()
         self._drain_license_heartbeat_results()
         self._drain_lie_accounting_results()
         self._drain_channel_update_events()
@@ -3516,12 +3533,14 @@ class UiWorker(threading.Thread):
             self._drain_hotkey_actions()
         except Exception:
             LOG.exception("urgent hotkey dispatch failed; the UI tick continues")
+        self._report_ui_poll_phase("priority-gates-and-hotkeys", priority_started)
         # A detected lie window is a real-time event.  Its detector timestamp
         # anchors the upload deadline, so waiting for the debug snapshot or
         # routine panel repaint here can make an otherwise fast WebSocket
         # handshake start several seconds late.  Start/advance the dedicated
         # worker before all nonessential display work.  The worker itself owns
         # handshake, frame pushes, and server I/O on its own thread.
+        auto_lie_started = time.perf_counter()
         for step in (
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
@@ -3533,6 +3552,7 @@ class UiWorker(threading.Thread):
                     "自动过测谎 priority service %s failed; the UI tick continues",
                     getattr(step, "__name__", step),
                 )
+        self._report_ui_poll_phase("auto-lie-dispatch", auto_lie_started)
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
         # so the resize stays light, but keep the poll cadence alive.
@@ -3565,6 +3585,7 @@ class UiWorker(threading.Thread):
                 "自动过测谎 priority outcome observation failed; the UI tick continues"
             )
         if latest is not None:
+            snapshot_started = time.perf_counter()
             try:
                 self.last_snapshot = build_debug_snapshot(
                     latest,
@@ -3579,6 +3600,7 @@ class UiWorker(threading.Thread):
                 snapshot_to_render = self.last_snapshot
             except Exception:
                 LOG.exception("could not update debug UI")
+            self._report_ui_poll_phase("debug-snapshot", snapshot_started)
         # Each periodic task is guarded on its own.  The whole body used to
         # share ONE try/except, so an exception thrown by any single step (log
         # drain, status refresh, patrol sync, YOLO exit poll, a result drain)
@@ -3597,19 +3619,25 @@ class UiWorker(threading.Thread):
             self._drain_api_test_results,
             self._service_auto_lie_marker_verification,
         ):
+            step_started = time.perf_counter()
             try:
                 step()
             except Exception:
                 LOG.exception("periodic UI step %s failed; the tick continues",
                               getattr(step, "__name__", step))
+            self._report_ui_poll_phase(
+                getattr(step, "__name__", str(step)), step_started,
+            )
 
         # Tk rendering is non-critical debug output.  Keep it last so a
         # completed snapshot never delays hotkey or patrol-control handling.
         if snapshot_to_render is not None:
+            render_started = time.perf_counter()
             try:
                 self._render(snapshot_to_render)
             except Exception:
                 LOG.exception("could not render completed debug snapshot")
+            self._report_ui_poll_phase("debug-render", render_started)
 
     def _sync_patrol_ui_state(self) -> None:
         """Refresh patrol buttons when patrol stopped outside the UI.
@@ -5475,6 +5503,9 @@ class UiWorker(threading.Thread):
                         _AutoLieDetectorEvent(match=match, detected_at=time.monotonic())
                     )
                     self._api_auto_lie_match_queued = True
+                    AUTO_LIE_LOG.info(
+                        "自动过测谎 timing: detector event queued for UI dispatch"
+                    )
                 except queue.Full:
                     return
             return
@@ -5656,8 +5687,9 @@ class UiWorker(threading.Thread):
         )
         self._api_auto_lie_wait_logged = False
         AUTO_LIE_LOG.warning(
-            "自动过测谎: a new lie window armed a pass (bbox %s, previous pass %.0fs ago)",
-            match, since_last,
+            "自动过测谎: a new lie window armed a pass (bbox %s, previous pass %.0fs ago, "
+            "detector-to-arm=%.0fms)",
+            match, since_last, (now - self._api_auto_lie_pending_since) * 1000.0,
         )
 
     @staticmethod
@@ -5705,6 +5737,11 @@ class UiWorker(threading.Thread):
                 if match is not None:
                     with self._api_auto_lie_event_enqueue_lock:
                         self._api_auto_lie_match_queued = False
+                    if detected_at is not None:
+                        AUTO_LIE_LOG.info(
+                            "自动过测谎 timing: detector-to-UI-dequeue=%.0fms",
+                            (time.monotonic() - float(detected_at)) * 1000.0,
+                        )
                 self._handle_lie_event_for_api(match, detected_at=detected_at)
                 try:
                     events.task_done()
@@ -5828,7 +5865,9 @@ class UiWorker(threading.Thread):
         setter = getattr(worker, "set_on_backend_ready", None)
         if callable(setter):
             setter(self._begin_auto_lie_accounting_event)
+        pause_started = time.perf_counter()
         self._pause_patrol_for_api_pass()
+        pause_elapsed = time.perf_counter() - pause_started
         self._api_lie_pass_worker = worker
         self._api_auto_lie_last_pass_started = time.monotonic()
         self._api_auto_lie_wait_logged = False
@@ -5840,6 +5879,13 @@ class UiWorker(threading.Thread):
             if hasattr(self, "_api_test_status"):
                 self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
             return
+        detected_at = getattr(self, "_api_auto_lie_pending_since", None)
+        if isinstance(detected_at, (float, int)):
+            AUTO_LIE_LOG.info(
+                "自动过测谎 timing: detector-to-worker-start=%.0fms, patrol-pause=%.0fms",
+                (time.monotonic() - float(detected_at)) * 1000.0,
+                pause_elapsed * 1000.0,
+            )
         AUTO_LIE_LOG.info("自动过测谎: pass %d started for a lie window", self._api_auto_lie_runs)
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(

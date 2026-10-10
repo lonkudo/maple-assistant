@@ -526,10 +526,14 @@ def main() -> int:
     ui_frames: queue.Queue = queue.Queue(maxsize=1)
     character_frames: queue.Queue = queue.Queue(maxsize=1)
     lie_detector_frames: queue.Queue = queue.Queue(maxsize=1)
+    # Passive diagnostic subscriber.  It never causes a capture; it receives
+    # the same published frame only while LieScreenshotRecorder is active.
+    recorder_frames: queue.Queue = queue.Queue(maxsize=1)
     trade_frames: queue.Queue = queue.Queue(maxsize=1)
     character_positions: queue.Queue = queue.Queue(maxsize=1)
     subscribers = [
         movement_frames, status_frames, character_frames, lie_detector_frames,
+        recorder_frames,
         # Ctrl+Q waits for the trade dialog's small presence area to change.
         # Its worker arms the shared capture only during that workflow, but it
         # must still be a FrameBus subscriber or it will never receive a frame.
@@ -1990,9 +1994,11 @@ def main() -> int:
         )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
     telegram_notifier = TelegramNotifier(stop_event)
-    # 独立的多事件截图录制器（诊断用，与测谎流程解耦）：测谎 / 掉线 / 循环
-    # 事件触发后连续抓取完整游戏窗口约 20 秒，按帧存入 screenshots/<kind>_*/。
-    screenshot_recorder = LieScreenshotRecorder(args.window_title)
+    # Passive diagnostic recorder: it writes only the existing shared frames;
+    # it must never create a second GDI/window-capture loop beside auto-lie.
+    screenshot_recorder = LieScreenshotRecorder(
+        args.window_title, frame_queue=recorder_frames,
+    )
     countdown_worker = CountdownWorker(
         stop_event,
         sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
@@ -2026,6 +2032,14 @@ def main() -> int:
                 lie_detector_frames,
                 "测谎 (lie detector)",
                 armed_event=lie_detection_armed,
+                interval=LIE_WATCH_INTERVAL_SECONDS,
+            ),
+            # When shared patrol capture is parked, diagnostics still consume
+            # the exact parked-watch frames rather than opening another source.
+            WatchFeed(
+                recorder_frames,
+                "诊断截图",
+                armed_event=screenshot_recorder.recording_event,
                 interval=LIE_WATCH_INTERVAL_SECONDS,
             ),
             WatchFeed(

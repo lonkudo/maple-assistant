@@ -112,12 +112,16 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         if gap <= 0.0:
             gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
         return only_y, only_y + gap
-    # The margin above covers climb/drop arrival movement, scaled by the upper-band factor. A smaller
-    # one-third margin below the confirmed layer base absorbs OpenCV marker precision noise without
-    # excessive overlap with the layer below.
+    # The margin above covers climb/drop arrival movement, scaled by the upper-band factor.  Below,
+    # retain at least one marker row: a smaller fractional tolerance can fall between two quantised
+    # diamond rows and leave the character one visible minimap row below its own floor.
+    lower_grace = effective_tolerance / 3.0
+    marker_row = _layer_marker_row(layer)
+    if marker_row is not None:
+        lower_grace = max(lower_grace, marker_row)
     return (
         min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
-        max(values) + effective_tolerance / 3.0,
+        max(values) + lower_grace,
     )
 
 
@@ -207,7 +211,14 @@ def _recalculate_layer_band(layer: Any) -> bool:
     else:
         raw_upper, raw_lower = min(values), max(values)
         y_upper = raw_upper - tolerance * LAYER_UP_REACH_FACTOR
-        y_lower = raw_lower + tolerance / 3.0
+        # A live diamond is quantised to whole marker rows.  Never persist a
+        # lower grace smaller than one of those rows or a floor can miss by a
+        # single pixel and require the bottom-floor fallback to resolve.
+        lower_grace = tolerance / 3.0
+        marker_row = _layer_marker_row(layer)
+        if marker_row is not None:
+            lower_grace = max(lower_grace, marker_row)
+        y_lower = raw_lower + lower_grace
 
     world_values: list[float] = []
     for point_name in REQUIRED_LAYER_POINTS:
