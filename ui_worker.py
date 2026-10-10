@@ -140,7 +140,7 @@ AUTO_LIE_PENDING_MAX_SECONDS = 90.0
 # A recreated game HWND first shows white/black login/loading surfaces. Those
 # can contain a uniform square matching the lie HUD colour, but cannot be a
 # playable lie window. Suppress only auto-lie starts for this short transition.
-AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS = 60.0
+AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS = 30.0
 
 
 @dataclass(frozen=True)

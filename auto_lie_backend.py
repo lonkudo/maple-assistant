@@ -4,11 +4,10 @@ The bundled ``autolie_api`` folder is vendor reference material and keeps its
 original endpoint list. The application selects its live service here so an
 endpoint migration never changes vendor files or the licensing backend.
 
-Both live deployments are listed, six WebSocket service instances in total:
-the three on the original host and the three the vendor's own list names
-(``autolie_api/ip_port.txt``).  A pass starts on a randomly chosen instance and
-moves to the next one when a handshake fails, so a single dead or overloaded
-service cannot take automatic lie handling down.
+Both live deployments are listed here.  The application probes a random small
+set before a live pass and then formally handshakes on a reported-available
+worker.  Keeping this deployment list outside ``autolie_api`` means endpoint
+migrations never modify vendor reference material.
 """
 
 from __future__ import annotations
@@ -21,9 +20,17 @@ AUTO_LIE_WS_ENDPOINTS: tuple[tuple[str, int], ...] = (
     ("221.10.121.69", 48001),
     ("221.10.121.69", 48002),
     ("221.10.121.69", 48003),
+    ("221.10.121.69", 48007),
+    ("221.10.121.69", 48009),
+    ("221.10.121.69", 48011),
+    ("221.10.121.69", 48013),
+    ("221.10.121.69", 48015),
     ("117.50.223.113", 8001),
     ("117.50.223.113", 8002),
     ("117.50.223.113", 8003),
+    ("117.50.223.113", 8007),
+    ("117.50.223.113", 8009),
+    ("117.50.223.113", 8011),
 )
 
 
@@ -44,7 +51,7 @@ def describe_ws_endpoint(host: str, port: int) -> str:
 
 
 def select_auto_lie_ws_endpoints() -> tuple[tuple[str, int], ...]:
-    """All six service instances in a random starting order.
+    """All live service instances in a random order.
 
     The choice is deliberately random rather than a fingerprint modulo: the
     modulo spread known devices over one host's three workers, so adding a
@@ -55,7 +62,8 @@ def select_auto_lie_ws_endpoints() -> tuple[tuple[str, int], ...]:
     """
 
     endpoints = list(AUTO_LIE_WS_ENDPOINTS)
-    # Fisher-Yates with the system entropy source: uniform over all six orders.
+    # Fisher-Yates with the system entropy source: uniform over every endpoint
+    # order.  The caller takes concurrent groups from this ordering.
     for index in range(len(endpoints) - 1, 0, -1):
         swap = secrets.randbelow(index + 1)
         endpoints[index], endpoints[swap] = endpoints[swap], endpoints[index]

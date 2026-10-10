@@ -315,7 +315,7 @@ class WindowKeySender:
                 if now < self._next_handle_discovery_at:
                     return self._window_handle_generation
                 # Missing/recreated windows are found promptly enough for the
-                # 60-second auto-lie safety guard, without starving Tk or a
+                # 30-second auto-lie safety guard, without starving Tk or a
                 # native file picker with continuous EnumWindows calls.
                 self._next_handle_discovery_at = now + 2.0
             self._find_target_window(required=False)

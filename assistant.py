@@ -572,31 +572,80 @@ def main() -> int:
     }
 
     def warm_auto_lie_endpoint() -> None:
-        """Probe the six service instances in a random order and cache the first answer.
+        """Probe random three-port groups and cache the first available answer.
 
-        The full random order is cached as well, so a live pass whose cached
-        endpoint fails its handshake continues with the next instance instead of
-        having to rediscover the list.
+        A probe is only a capacity observation, never a reservation.  We do
+        not wait for all three responses when the first returned server reports
+        ``slots_left > 0``: it becomes the candidate for the fresh, formal
+        handshake.  If a group is full or unreachable, the next random group
+        is tried.  The full randomized order remains cached so a handshake
+        failure has deterministic in-process fallbacks.
         """
 
         try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             from auto_lie_backend import select_auto_lie_ws_endpoints
             from autolie_api.connect import probe_ws_endpoints
 
             candidates = select_auto_lie_ws_endpoints()
             best = None
             tried: list[str] = []
-            for host, port in candidates:
-                results = probe_ws_endpoints(host, (int(port),))
-                answered = next((item for item in results if item.ok), None)
-                if answered is not None:
-                    best = answered
+            full: list[str] = []
+
+            def probe_one(host: str, port: int):
+                """Return one safe probe result without failing sibling probes."""
+
+                try:
+                    results = probe_ws_endpoints(host, (int(port),))
+                    return next((item for item in results if item.ok), None)
+                except Exception as exc:
+                    auto_lie_logger.debug(
+                        "AUTO LIE probe %s:%d raised %s: %s",
+                        host, port, type(exc).__name__, exc,
+                    )
+                    return None
+
+            for offset in range(0, len(candidates), 3):
+                batch = candidates[offset:offset + 3]
+                executor = ThreadPoolExecutor(
+                    max_workers=len(batch),
+                    thread_name_prefix="auto-lie-probe",
+                )
+                futures = {
+                    executor.submit(probe_one, host, int(port)): (host, int(port))
+                    for host, port in batch
+                }
+                chosen_early = False
+                try:
+                    for future in as_completed(futures):
+                        host, port = futures[future]
+                        result = future.result()
+                        tried.append(f"{host}:{port}")
+                        slots_left = getattr(result, "slots_left", None)
+                        if result is not None and isinstance(slots_left, (int, float)):
+                            if int(slots_left) > 0:
+                                best = result
+                                chosen_early = True
+                                # The other probes have no side effects and are
+                                # deliberately abandoned: waiting for a slower
+                                # sibling would postpone a live lie handshake.
+                                for sibling in futures:
+                                    if sibling is not future:
+                                        sibling.cancel()
+                                break
+                            full.append(f"{host}:{port}")
+                finally:
+                    # Never wait for slow siblings after the first port with a
+                    # remaining slot answered.  Without this, Executor's
+                    # context-manager shutdown would undo the early choice.
+                    executor.shutdown(wait=not chosen_early)
+                if best is not None:
                     break
-                tried.append(f"{host}:{port}")
             if best is None:
                 raise RuntimeError(
-                    "no WebSocket endpoint answered the startup probe ("
-                    + (", ".join(tried) or "no endpoints") + ")"
+                    "no WebSocket endpoint reported a remaining slot ("
+                    + (", ".join(full or tried) or "no endpoints") + ")"
                 )
             with auto_lie_endpoint_lock:
                 auto_lie_endpoint["value"] = best
@@ -604,8 +653,8 @@ def main() -> int:
                 auto_lie_endpoint["candidates"] = candidates
             auto_lie_logger.info(
                 "AUTO LIE preflight ready: cached WebSocket endpoint %s "
-                "(%.0f ms; random start, %d of %d candidate(s) probed)",
-                best.endpoint, best.rtt_ms, len(tried) + 1, len(candidates),
+                "(slots_left=%s, %.0f ms; first available result from %d of %d candidate(s))",
+                best.endpoint, best.slots_left, best.rtt_ms, len(tried), len(candidates),
             )
         except Exception as exc:
             with auto_lie_endpoint_lock:
