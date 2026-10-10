@@ -209,16 +209,17 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   own title plus that suffix, and it never excuses an unrelated window: a real
   focus thief, another window's ghost, or a vanished game window still count as a
   loss. A hang is reported once (`foreground: the game window is not responding …`).
-- **Every automatic-lie service instance is listed, and a pass fails over between
-  them.** `auto_lie_backend.py` holds six `host:port` WebSocket instances — three on
-  `221.10.121.69` (48001–48003) and the three the vendor's own list names on
-  `117.50.223.113` (8001–8003). `select_auto_lie_ws_endpoints()` shuffles them with
-  the system entropy source; the startup preflight probes that random order and
-  caches the first instance that answers, together with the whole order; and each
-  live pass tries its cached instance first and moves to the next one whenever a
-  handshake fails, logging every failure. Only when all six fail does the pass
-  raise. The old `fingerprint % 3` assignment is gone, so a device is no longer
-  pinned to one worker on one host.
+- **Automatic-lie capacity selection is fast and distributed.**
+  `auto_lie_backend.py` holds fourteen `host:port` WebSocket instances:
+  `221.10.121.69` ports 48001–48003 and 48007/48009/48011/48013/48015, plus
+  `117.50.223.113` ports 8001–8003 and 8007/8009/8011. The startup preflight
+  shuffles the full list, probes a concurrent random group of three, and accepts
+  the *first responding* instance with `slots_left > 0`; it does not wait for
+  slower sibling probes. The winning probe is only a capacity observation, not a
+  reservation, so the live pass always creates a fresh authenticated connection
+  and may fail over through the rest of the same shuffled order if its handshake
+  fails. The old `fingerprint % 3` assignment is gone, so a device is not pinned
+  to one worker or host.
 - **All automatic-lie logging lives in `auto_lie.log`.** The credential lines, the
   durable event-accounting lines, and the connection trace of the accounting
   request used to be written to the licensing connection log
@@ -674,12 +675,17 @@ and **自动测谎** hands the mouse to the automatic lie workflow and consumes 
 lie-detection use even if it is interrupted with Esc. Leave 自动测谎 off when
 manual lie handling is intended.
 
-After the automatic-lie WebSocket handshake, TodoHelper waits two seconds for
-the actual game dialog before sending frames. It first uses the safe preset
-ROI, then detects and locks the dialog's native dark-red (`#db231b`) border as
-soon as that border is visible. This keeps the sent crop tied to the real
-playfield on both 1366×768 and 1080×768 clients instead of assuming a fixed
-minimap-size rectangle while the dialog is still animating in.
+When a lie window is detected, TodoHelper targets the first frame upload for
+**three seconds after that detection**, not three seconds after the WebSocket
+handshake. Connection, capacity preflight, and the formal handshake happen in
+parallel with the game's transition; if they finish late, frame upload starts
+immediately rather than abandoning the pass. It first uses the safe preset ROI,
+then detects and locks the dialog's native dark-red (`#db231b`) border as soon as
+that border is visible. This keeps the sent crop tied to the real playfield on
+both 1366×768 and 1080×768 clients instead of assuming a fixed minimap-size
+rectangle while the dialog is still animating in. A newly recreated game window
+silently suppresses automatic-lie starts for 30 seconds so its white/black
+loading surfaces cannot trigger a false pass.
 
 Telegram uses one bot token per TodoHelper configuration, but multiple helpers
 may use the same token and send to the same chat. Give each helper a distinct

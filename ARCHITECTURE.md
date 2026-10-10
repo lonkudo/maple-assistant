@@ -219,27 +219,29 @@ clear it, and it is never returned to clients.
 ### Automatic lie service endpoints
 
 `auto_lie_backend.py` owns the live RoiTrack deployment route, so an endpoint
-change never touches vendor files or the licensing backend. It lists six
-WebSocket instances — three on `221.10.121.69` (48001–48003) and the three the
-vendor's own `autolie_api/ip_port.txt` names on `117.50.223.113` (8001–8003) —
-and `select_auto_lie_ws_endpoints()` returns them in a random order
-(system-entropy Fisher-Yates). The choice is deliberately random rather than a
-fingerprint modulo: the modulo spread devices over one host's three workers, so
-adding or losing a host left the assignment lopsided and a device whose worker
-was down had nothing to fall back to.
+change never touches vendor files or the licensing backend. It lists fourteen
+WebSocket instances: `221.10.121.69` ports 48001–48003 and
+48007/48009/48011/48013/48015, and `117.50.223.113` ports 8001–8003 and
+8007/8009/8011. `select_auto_lie_ws_endpoints()` returns a system-entropy
+Fisher-Yates order. The choice is deliberately random rather than a fingerprint
+modulo: a modulo assignment leaves devices lopsided when workers are added,
+removed, or overloaded.
 
 `assistant.py` consumes that order twice:
 
 1. **Preflight** (`warm_auto_lie_endpoint`, the `auto-lie-preflight` thread)
-   probes each instance's WebSocket in order and caches the first `ProbeResult`
-   that answers, together with the whole order. No handshake happens here: the
+   takes concurrent random groups of three ports. It chooses the first returned
+   `ProbeResult` whose `slots_left` is positive and cancels the unneeded sibling
+   probes instead of waiting for them. A probe is a capacity observation, not a
+   reservation or connection allocation; the selected endpoint and the full
+   shuffled fallback order are cached. No handshake happens here because the
    protocol drops an idle authenticated connection after ten seconds without
    frames.
 2. **Live pass** (`open_prepared_auto_lie_backend`) tries `ordered_candidates()`
    — the cached instance first, then every remaining instance of the same order,
    no duplicates — doing a real connect + RTF1 handshake per instance. A failure
    is logged to the run log and to `auto_lie.log` and the next instance is tried;
-   only when all six fail does the pass raise. The HTTP health check stays
+   only when all fourteen fail does the pass raise. The HTTP health check stays
    excluded, because it is diagnostic-only and must never delay a live event.
 
 The video drill takes one randomly chosen host with all of that host's ports, so
@@ -445,11 +447,11 @@ Detection and proof are deliberately separate concerns:
 
 `api_lie_test.py` is the local client adapter. `autolie_api/` is vendor reference material and must remain unchanged.
 
-At UI/application startup, `assistant.py` performs an inexpensive WebSocket endpoint probe and caches the usable endpoint. When a lie event occurs, the adapter uses that cached endpoint to create a fresh authenticated connection while the game completes its visual transition — and moves to the next listed service instance whenever a handshake fails (see *Automatic lie service endpoints*). The event timeline is:
+At UI/application startup, `assistant.py` performs an inexpensive WebSocket endpoint probe and caches the usable endpoint. When a lie event occurs, the adapter uses that cached endpoint to create a fresh authenticated connection while the game completes its visual transition — and moves to the next listed service instance whenever a handshake fails (see *Automatic lie service endpoints*). The feed target is absolute: it is the detector timestamp plus three seconds, never handshake completion plus three seconds. If connection is late, the first frame is sent immediately rather than discarding the takeover. The event timeline is:
 
 ```text
-event start ── connect/setup in parallel ── 2 s visual settle
-            └──────────────────────────────► outcome-controlled RTF1 uploads
+event start ── detect timestamp ── connect/setup in parallel ── target: +3 s
+            └──────────────────────────────────────────────────► outcome-controlled RTF1 uploads
                                                 └► round_end + WebSocket close
 ```
 
@@ -473,7 +475,7 @@ frame feed, and leaves a transport-failed pass to the operator
 skipped`).
 
 The **测试API** video drill uses the same packed-JPEG handshake and sends no
-frames during its two-second visual settle. Its connection log and summary
+frames during its three-second visual settle. Its connection log and summary
 record the transport and handshake duration for field verification.
 
 ROI geometry is resolved by the local `lie_roi_geometry.py` adapter, not by
