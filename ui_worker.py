@@ -78,13 +78,15 @@ AUTO_LIE_LOG = logging.getLogger("auto-lie")
 # Ctrl+Q/Ctrl+W can wake unrelated attack workers while patrol is stopped.
 TYPING_HOTKEY_PREFIXES = ("quick_message:", "quick_pickup:")
 
-# The auto-lie result button has separate measured points for the two fixed
-# game presets.  Wider clients follow the 1366 reference by width, including
-# 1980x1020: (round(800 * 1980 / 1366), round(472 * 1980 / 1366)) = (1160, 684).
+# The auto-lie result dialog needs both measured confirmation points, twice
+# each.  Wider clients follow the 1366 reference by width.  The 1080 preset
+# uses separately measured coordinates: its second point keeps the same X as
+# its first point and applies the reference's 32-pixel upward Y shift.
 _AUTO_LIE_CONFIRM_1080_SIZE = (1080, 768)
-_AUTO_LIE_CONFIRM_1080_POINT = (630, 428)
+_AUTO_LIE_CONFIRM_1080_POINTS = ((630, 428), (630, 396))
 _AUTO_LIE_CONFIRM_REFERENCE_WIDTH = 1366
-_AUTO_LIE_CONFIRM_REFERENCE_POINT = (800, 472)
+_AUTO_LIE_CONFIRM_REFERENCE_POINTS = ((800, 472), (800, 440))
+_AUTO_LIE_CONFIRM_CLICKS_PER_POINT = 2
 # Completing a lie round can leave the API/game transition owning focus for a
 # moment.  A click during that handoff lands on the desktop even when the point
 # is correct, so the confirmation is deliberately gated on a settled game
@@ -99,19 +101,19 @@ _AUTO_LIE_OUTCOME_ARM_SECONDS = 10.0
 _AUTO_LIE_OUTCOME_OBSERVE_SECONDS = 40.0
 
 
-def _auto_lie_confirm_client_point(
+def _auto_lie_confirm_client_points(
     client_width: int, client_height: int,
-) -> tuple[int, int]:
-    """Return the measured post-lie confirmation point in game-client pixels."""
+) -> tuple[tuple[int, int], ...]:
+    """Return the measured post-lie confirmation points in client pixels."""
 
     width = max(1, int(client_width))
     height = max(1, int(client_height))
     if (width, height) == _AUTO_LIE_CONFIRM_1080_SIZE:
-        return _AUTO_LIE_CONFIRM_1080_POINT
+        return _AUTO_LIE_CONFIRM_1080_POINTS
     scale = width / float(_AUTO_LIE_CONFIRM_REFERENCE_WIDTH)
-    return (
-        int(round(_AUTO_LIE_CONFIRM_REFERENCE_POINT[0] * scale)),
-        int(round(_AUTO_LIE_CONFIRM_REFERENCE_POINT[1] * scale)),
+    return tuple(
+        (int(round(x * scale)), int(round(y * scale)))
+        for x, y in _AUTO_LIE_CONFIRM_REFERENCE_POINTS
     )
 
 # 自动过测谎 debouncing.  The lie detector reports a NEW event when it sees the square again after it
@@ -145,6 +147,10 @@ AUTO_LIE_PENDING_MAX_SECONDS = 90.0
 # can contain a uniform square matching the lie HUD colour, but cannot be a
 # playable lie window. Suppress only auto-lie starts for this short transition.
 AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS = 30.0
+# A busy Maple client may recreate only its top-level window while keeping the
+# same process alive.  That is not a reboot: give its surface a moment to
+# settle, but do not throw away a half minute of legitimate auto-lie handling.
+AUTO_LIE_SAME_PROCESS_WINDOW_BLOCK_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -1040,7 +1046,9 @@ class UiWorker(threading.Thread):
         # made an idle UI and Windows' own file picker noticeably sluggish.
         self._api_auto_lie_handle_generation: Optional[int] = None
         self._api_auto_lie_new_window_block_until = 0.0
+        self._api_auto_lie_new_window_block_reason = ""
         self._api_auto_lie_new_window_suppression_logged = False
+        self._api_auto_lie_change_origin = "unknown"
         self._latest_capture_frame: Any = None
         self._auto_lie_outcome_state: Optional[dict[str, Any]] = None
         self._auto_lie_success_box = LieSuccessBoxDetector()
@@ -2545,6 +2553,19 @@ class UiWorker(threading.Thread):
                 text="自动测谎",
                 variable=self._api_auto_lie_var,
                 command=self._api_auto_lie_on_change,
+                takefocus=False,
+            )
+            # Patrol sends global key input.  If a temporary game stall leaves
+            # the dashboard foreground, Space/Enter must not silently toggle
+            # this security-sensitive selection.  It remains a mouse control.
+            self._api_auto_lie_check.bind(
+                "<ButtonPress-1>", self._mark_auto_lie_mouse_change, add="+"
+            )
+            self._api_auto_lie_check.bind(
+                "<space>", self._block_auto_lie_keyboard_toggle, add="+"
+            )
+            self._api_auto_lie_check.bind(
+                "<Return>", self._block_auto_lie_keyboard_toggle, add="+"
             )
             self._api_auto_lie_check.pack(side="left")
             auto_lie_hint = HoverTooltip(
@@ -5421,6 +5442,9 @@ class UiWorker(threading.Thread):
     def _api_auto_lie_on_change(self) -> None:
         """Arm or disarm the automatic api pass, and persist it immediately."""
 
+        origin = getattr(self, "_api_auto_lie_change_origin", "unknown")
+        self._api_auto_lie_change_origin = "unknown"
+
         if not self._license_allowed():
             if hasattr(self, "_api_auto_lie_var"):
                 self._api_auto_lie_var.set(False)
@@ -5462,7 +5486,22 @@ class UiWorker(threading.Thread):
                 "自动过测谎 is armed but 测谎 (lie detection) is OFF: no lie window can be detected, so "
                 "the automatic pass can never start - tick 测谎 as well"
             )
-        AUTO_LIE_LOG.info("自动过测谎 %s", "armed" if armed else "disarmed")
+        AUTO_LIE_LOG.info(
+            "自动过测谎 %s (source=%s)", "armed" if armed else "disarmed", origin
+        )
+
+    def _mark_auto_lie_mouse_change(self, _event: object = None) -> None:
+        """Tag the following checkbutton command for diagnostics only."""
+
+        self._api_auto_lie_change_origin = "mouse"
+
+    def _block_auto_lie_keyboard_toggle(self, _event: object = None) -> str:
+        """Keep global Space/Enter input from changing the auto-lie setting."""
+
+        AUTO_LIE_LOG.warning(
+            "自动过测谎: ignored Space/Enter on dashboard; use the mouse checkbox"
+        )
+        return "break"
 
     def _lie_detection_armed(self) -> bool:
         """Whether the 测谎 checkbox is ticked (it is what enables the detector)."""
@@ -5526,17 +5565,30 @@ class UiWorker(threading.Thread):
         the idle Tk path.
         """
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
+        observe_transition = getattr(sender, "observe_game_window_transition", None)
         observe = getattr(sender, "observe_game_window_handle", None)
-        if not callable(observe):
+        if not callable(observe_transition) and not callable(observe):
             return False
-        generation = int(observe())
+        transition_kind = "new-process"
+        if callable(observe_transition):
+            generation, transition_kind = observe_transition()
+            generation = int(generation)
+        else:
+            generation = int(observe())
         if self._api_auto_lie_handle_generation is None:
             self._api_auto_lie_handle_generation = generation
         elif generation != self._api_auto_lie_handle_generation:
             self._api_auto_lie_handle_generation = generation
-            self._api_auto_lie_new_window_block_until = (
-                time.monotonic() + AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS
+            same_process = transition_kind == "same-process"
+            block_seconds = (
+                AUTO_LIE_SAME_PROCESS_WINDOW_BLOCK_SECONDS
+                if same_process else AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS
             )
+            block_reason = "same-process window recreation" if same_process else "new game process"
+            self._api_auto_lie_new_window_block_until = (
+                time.monotonic() + block_seconds
+            )
+            self._api_auto_lie_new_window_block_reason = block_reason
             # A queued detector match belonged to the dead game's surface.
             # Never let it become a pass after the new loading/login surface
             # settles; the next real lie window will arm its own event.
@@ -5558,9 +5610,10 @@ class UiWorker(threading.Thread):
                             break
             self._api_auto_lie_new_window_suppression_logged = False
             AUTO_LIE_LOG.warning(
-                "自动过测谎: 检测到新的游戏窗口句柄；为避免登录白屏/黑屏误触发，"
-                "临时暂停自动接管 %.0f 秒",
-                AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS,
+                "自动过测谎: detected %s; suppressing takeover for %.0f seconds "
+                "without changing the 自动测谎 selection",
+                block_reason,
+                block_seconds,
             )
         return time.monotonic() < self._api_auto_lie_new_window_block_until
 
@@ -5609,8 +5662,9 @@ class UiWorker(threading.Thread):
                     self._api_auto_lie_new_window_block_until - time.monotonic(),
                 )
                 AUTO_LIE_LOG.warning(
-                    "自动过测谎: 检测到测谎窗口，但游戏窗口刚刚重建；"
-                    "临时保护仍在生效，本次未接管（剩余 %.0f 秒）",
+                    "自动过测谎: lie window ignored during %s guard "
+                    "(%.0f seconds remain; selection unchanged)",
+                    self._api_auto_lie_new_window_block_reason or "window recreation",
                     remaining,
                 )
                 self._api_auto_lie_new_window_suppression_logged = True
@@ -6031,18 +6085,27 @@ class UiWorker(threading.Thread):
             if width <= 0 or height <= 0:
                 AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation click skipped; invalid client size")
                 return False
-            client_x, client_y = _auto_lie_confirm_client_point(width, height)
             origin_x, origin_y = win32gui.ClientToScreen(hwnd, (0, 0))
-            screen_x = int(origin_x) + client_x
-            screen_y = int(origin_y) + client_y
-            clicked = click_screen(screen_x, screen_y, keep_focus=hwnd)
-            if clicked:
-                AUTO_LIE_LOG.info(
-                    "自动过测谎: clicked confirmation at client=(%d,%d) "
-                    "screen=(%d,%d) client_size=%dx%d",
-                    client_x, client_y, screen_x, screen_y, width, height,
-                )
-            return bool(clicked)
+            clicks: list[tuple[int, int, int, int]] = []
+            for client_x, client_y in _auto_lie_confirm_client_points(width, height):
+                screen_x = int(origin_x) + client_x
+                screen_y = int(origin_y) + client_y
+                for _ in range(_AUTO_LIE_CONFIRM_CLICKS_PER_POINT):
+                    if not click_screen(screen_x, screen_y, keep_focus=hwnd):
+                        AUTO_LIE_LOG.warning(
+                            "自动过测谎: confirmation click failed at client=(%d,%d) "
+                            "screen=(%d,%d)",
+                            client_x, client_y, screen_x, screen_y,
+                        )
+                        return False
+                    clicks.append((client_x, client_y, screen_x, screen_y))
+            AUTO_LIE_LOG.info(
+                "自动过测谎: clicked both confirmation points twice "
+                "client=%s client_size=%dx%d",
+                [(x, y) for x, y, _screen_x, _screen_y in clicks],
+                width, height,
+            )
+            return True
         except Exception:
             AUTO_LIE_LOG.warning("自动过测谎: post-pass confirmation point could not be clicked", exc_info=True)
             return False

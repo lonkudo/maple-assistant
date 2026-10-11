@@ -600,6 +600,12 @@ HP and MP potions have priority over ordinary combat actions. Pet food is treate
 It works in both 巡逻攻击 and 站桩攻击 while patrol input is armed, and switching the
 attack mode off disables it with the rest of the combat controls.
 
+Turning **被撞反击** off is final for pending work as well: TodoHelper removes
+unstarted reactions waiting for an arbiter or marker sample and clears an
+unspent stationary replacement slot. It never interrupts a key hold that is
+already physically in progress, but it cannot reserve a later movement or
+replace a later normal attack after the checkbox has been cleared.
+
 1. **The HP bar is the trigger.** `status_worker.py` owns the reading: only an
    action-grade sample (confidence at or above the action threshold) that is
    *lower* than the previous action-grade sample counts as a hit. A one-frame bar
@@ -684,8 +690,12 @@ then detects and locks the dialog's native dark-red (`#db231b`) border as soon a
 that border is visible. This keeps the sent crop tied to the real playfield on
 both 1366×768 and 1080×768 clients instead of assuming a fixed minimap-size
 rectangle while the dialog is still animating in. A newly recreated game window
-silently suppresses automatic-lie starts for 30 seconds so its white/black
-loading surfaces cannot trigger a false pass.
+is classified by its process identity, not its HWND alone: a replacement inside
+the same running game process receives a short five-second surface-settle guard,
+while a genuinely new process keeps the 30-second white/black login guard.
+Neither guard changes the **自动测谎** selection. That selection is mouse-only,
+so global Space/Enter input cannot accidentally toggle it while a stalled game
+briefly leaves the dashboard foreground.
 
 Telegram uses one bot token per TodoHelper configuration, but multiple helpers
 may use the same token and send to the same chat. Give each helper a distinct

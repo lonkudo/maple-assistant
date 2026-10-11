@@ -11678,6 +11678,29 @@ class MovementWorker(threading.Thread):
         value = str(key).strip().casefold()
         self.counterattack_enabled = bool(enabled and value and value != "-")
         self.counterattack_key = value or "ctrl"
+        if not self.counterattack_enabled:
+            # ``notify_hp_drop`` rejects new events when disabled, but a
+            # StatusWorker report can already be waiting for its matching
+            # minimap sample.  Such stale work must not reserve the arbiter,
+            # move patrol, or replace a later ordinary attack.
+            while True:
+                try:
+                    self._counterattack_events.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    try:
+                        self._counterattack_events.task_done()
+                    except ValueError:
+                        pass
+            cancel = getattr(
+                self.motion_arbiter, "cancel_pending_counterattacks", None
+            )
+            if callable(cancel):
+                cancel("counterattack disabled")
+            clear_slot = getattr(self.attack_slot, "clear", None)
+            if callable(clear_slot):
+                clear_slot()
         LOG.info(
             "被撞反击 %s key=%s",
             "enabled" if self.counterattack_enabled else "disabled",
@@ -11752,6 +11775,11 @@ class MovementWorker(threading.Thread):
         Returns ``False`` only when the matching minimap frame has not been
         published yet, so the caller may retry on the next movement tick.
         """
+
+        # Deferred StatusWorker events must be gated again here.  The UI can
+        # disable the feature between the original HP read and this retry.
+        if not self.counterattack_enabled or not self._patrol_input_allowed():
+            return True
 
         if self.stationary_attack_enabled:
             anchor = self._stationary_attack_anchor

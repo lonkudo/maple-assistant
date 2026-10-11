@@ -150,6 +150,57 @@ def _process_image_name(pid: int) -> str:
     return ""
 
 
+def _process_start_token(pid: int) -> Optional[int]:
+    """Return the Windows creation-time token for a live process.
+
+    A window handle is only a UI object: a busy game can recreate one without
+    restarting its process.  The PID plus this creation token identifies the
+    actual game instance without adding a polling dependency such as psutil.
+    ``None`` is deliberately harmless when Windows denies the query.
+    """
+
+    if not pid:
+        return None
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return None
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def _window_process_identity(hwnd: int) -> tuple[Optional[int], Optional[int], str]:
+    """Return ``(pid, process-start-token, image-name)`` for a game HWND."""
+
+    try:
+        import win32process
+
+        _thread, pid = win32process.GetWindowThreadProcessId(int(hwnd))
+        pid = int(pid)
+        return pid, _process_start_token(pid), _process_image_name(pid)
+    except Exception:
+        return None, None, ""
+
+
 class WindowKeySender:
     """Send scan-code input only while the dynamically found game window is active."""
     # Set-1 keyboard scan codes. Extended keys require the E0 flag.
@@ -272,6 +323,10 @@ class WindowKeySender:
         # transition can keep the same title while replacing its HWND, and the
         # new white/black surface is not a valid lie-test scene.
         self._last_observed_game_hwnd: Optional[int] = None
+        self._last_observed_game_process_identity: Optional[
+            tuple[Optional[int], Optional[int], str]
+        ] = None
+        self._last_window_transition_kind = "initial"
         self._window_handle_generation = 0
         self._window_handle_lock = threading.Lock()
         # A title scan enumerates the desktop.  It is a recovery operation,
@@ -284,15 +339,37 @@ class WindowKeySender:
         """Publish a recreated game HWND without treating first discovery as one."""
 
         hwnd = int(hwnd)
+        identity = _window_process_identity(hwnd)
         with self._window_handle_lock:
             previous = self._last_observed_game_hwnd
             if previous is not None and previous != hwnd:
                 self._window_handle_generation += 1
-                LOG.info(
-                    "WINDOW HANDLE: game window recreated old=%s new=%s generation=%d",
-                    previous, hwnd, self._window_handle_generation,
+                previous_identity = self._last_observed_game_process_identity
+                same_process = (
+                    previous_identity is not None
+                    and identity[0] is not None
+                    and previous_identity[0] == identity[0]
+                    and (
+                        previous_identity[1] is None
+                        or identity[1] is None
+                        or previous_identity[1] == identity[1]
+                    )
                 )
+                self._last_window_transition_kind = (
+                    "same-process" if same_process else "new-process"
+                )
+                LOG.info(
+                    "WINDOW HANDLE: game window recreated old=%s new=%s generation=%d "
+                    "transition=%s old_pid=%s new_pid=%s",
+                    previous, hwnd, self._window_handle_generation,
+                    self._last_window_transition_kind,
+                    previous_identity[0] if previous_identity else None,
+                    identity[0],
+                )
+            elif previous is None:
+                self._last_window_transition_kind = "initial"
             self._last_observed_game_hwnd = hwnd
+            self._last_observed_game_process_identity = identity
             self.hwnd = hwnd
             return self._window_handle_generation
 
@@ -323,6 +400,17 @@ class WindowKeySender:
             LOG.debug("game HWND observation failed", exc_info=True)
         with self._window_handle_lock:
             return self._window_handle_generation
+
+    def observe_game_window_transition(self) -> tuple[int, str]:
+        """Return the handle generation and whether its process was recreated.
+
+        Consumers that need a login/loading guard should use this instead of
+        treating every HWND replacement as a full game restart.
+        """
+
+        generation = self.observe_game_window_handle()
+        with self._window_handle_lock:
+            return generation, self._last_window_transition_kind
 
     def enable_input(self) -> None:
         """Allow workers to emit keyboard events after explicit UI activation."""

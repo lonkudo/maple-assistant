@@ -37,5 +37,13 @@ class AttackSlot:
             self._replacement = None
         return key if key is not None else default_key
 
+    def clear(self) -> bool:
+        """Discard an unspent replacement when its feature is disabled."""
+
+        with self._lock:
+            had_replacement = self._replacement is not None
+            self._replacement = None
+        return had_replacement
+
 
 __all__ = ["AttackSlot"]

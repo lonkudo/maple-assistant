@@ -266,6 +266,20 @@ grace window. The match is by class plus that title relationship, so an unrelate
 focus thief, another window's ghost, or a vanished game window still counts as a
 loss, and the hang is reported once per episode.
 
+### Game-window identity and auto-lie transition guard
+
+`WindowKeySender` tracks each discovered game HWND together with its process ID,
+Windows process-creation token, and executable name. An HWND replacement in the
+same process is a soft UI/renderer recreation, which is common while a leaking
+client is temporarily unresponsive; it produces only a five-second auto-lie
+surface-settle guard. A replacement belonging to a new process remains a true
+restart and produces the 30-second login-surface guard. The guard is evaluated
+only when the lie detector supplies a candidate, clears stale candidate work,
+and never changes the persisted 自动测谎 setting. The corresponding ttk control
+does not accept keyboard focus and consumes Space/Enter, because patrol's global
+input must not silently change an auto-lie entitlement setting if the dashboard
+temporarily becomes foreground.
+
 ### Server deployment compatibility boundary
 
 The desktop application and `maple-assistant-server` are independently
@@ -381,6 +395,8 @@ Patrol hit reactions are a motion type of their own (`COUNTERATTACK`) rather tha
 Three details keep one hit equal to one reaction. The cooldown is claimed where the hit is *decided* (`COUNTERATTACK_COOLDOWN_FRAMES` = 3 frames), not where the arbiter happens to run it, so a damage animation that lowers HP across adjacent reads cannot queue a row of delayed reactions. The reaction is resolved immediately from marker samples the movement worker has already published, with `COUNTERATTACK_MARKER_SEQUENCE_TOLERANCE` (2 captures) absorbing the fact that HP parsing and marker detection finish at slightly different moments; only a hit whose sample has genuinely not been published yet stays queued for the next movement tick. And when the marker moved less than 0.003, `COUNTERATTACK_IMPACT_LOOKBACK_FRAMES` (4 captures) is searched for motion *against* the planned patrol direction, which is the only surviving evidence of a knockback the character's own walk cancelled.
 
 The 站桩 half of the reaction owns no movement at all. `attack_slot.py` is a thread-safe, one-use key replacement created by the coordinator and handed to both sides: `AttackWorker` consumes it for the next cadence beat, and `MovementWorker._consume_attack_slot()` consumes it for the anchor correction and for 小碎步's middle attack. A stationary hit therefore only calls `replace_next()`, and whichever approved beat was going to happen anyway spends the counterattack key instead of the default one; an unconsumed replacement is retained rather than overwritten. This is what removed the competing movement transaction that used to fight the anchor correction for the same hit.
+
+Disabling 被撞反击 is also a cancellation boundary. `MovementWorker.set_counterattack(False)` drains unresolved HP-drop samples, asks `MotionArbiter` to discard only unstarted `COUNTERATTACK` tokens, and clears the unspent `AttackSlot`. It does not interrupt a physical input transaction already executing, which keeps the key ledger balanced, but no disabled reaction can later reserve motion or replace an ordinary attack.
 
 The anchor correction is the one motion that also carries an attack (see the combat section). It is exclusive in the usual way — while it is queued or running, the fixed cadence cannot reserve a beat, so the correction’s own attack can never be doubled — but it is exempt from the arbiter’s shared post-attack grace, because that grace is measured from the correction’s own attack and would stretch a correction into one per second.
 

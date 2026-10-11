@@ -376,6 +376,32 @@ class MotionArbiter(threading.Thread):
         )
         return len(removed)
 
+    def cancel_pending_counterattacks(self, reason: str = "counterattack disabled") -> int:
+        """Discard unstarted hit reactions that are no longer permitted.
+
+        A setting toggle must be final: a hit can have been waiting briefly
+        for its matching minimap sample when the checkbox was cleared.  Do not
+        interrupt an action already holding a physical key; its callback sees
+        the disabled setting and drains without input.
+        """
+
+        with self._cv:
+            executing = self._executing_token
+            removed = [
+                token for token in self._pending
+                if token.startswith(f"{COUNTERATTACK}:") and token != executing
+            ]
+            if not removed:
+                return 0
+            self._pending = deque(
+                token for token in self._pending if token not in removed
+            )
+            for token in removed:
+                self._queued.discard(token)
+            self._cv.notify_all()
+        LOG.info("motion arbiter cancelled %d counterattack(s): %s", len(removed), reason)
+        return len(removed)
+
     def micro_step_pending(self) -> bool:
         """Whether the optional 小碎步 pair is queued or running.
 
