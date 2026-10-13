@@ -346,6 +346,15 @@ Each layer may also own X-sorted, immutable directional jump points. A point rec
 
 `movement_worker.py` owns the patrol state machine. It reads the latest character/map state, resolves the current recorded layer, and emits decisions such as patrol left/right, move-to-rope, climb, return-to-route, recovery, or safe wait.
 
+Movement decisions remain per-frame; their INFO rendering is not part of the
+control loop. `_movement_status_log_signature` records stage, route, layer,
+action, and a log-only rounded target. A signature change is emitted
+immediately. `_movement_status_log_position` independently emits a `[moved]`
+sample whenever either normalized coordinate differs by at least `0.003` from
+the last emitted position. If neither changes, a three-second `[steady]`
+heartbeat preserves liveness. Stuck/no-progress/layer-fallback warnings have
+their own paths and are not rate-limited by this status sampler.
+
 Patrol has these core rules:
 
 - Routes are an inclusive range of recorded layers, from bottom to top.
@@ -552,6 +561,49 @@ Combat panel state is applied in both directions. The 被撞反击 checkbox and 
 Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`. **Configuration import is an in-process refresh:** the UI validates the selected JSON, immediately stops patrol, then a background task waits for the key-release cleanup, copies through a same-folder temporary file, atomically replaces `user_config.json`, reloads user-owned settings, and redraws the panels. The helper remains running; importing never needs a manual restart. The status line is set to `↻ 正在刷新导入配置…` until completion. If Reset Recording encounters an inaccessible configuration from an older package, the UI reports `配置版本与当前助手版本不匹配，请重新录制以后导出新配置。` instead of presenting a raw access-denied path.
 
 `hotkey_worker.py`, quick messages, trade helpers, Telegram notification, screen blinking, countdowns, and shutdown logic are optional subsystems. They use isolated configuration/state and may request input only through the shared focus/key boundary.
+
+### Tk scheduling and urgent dispatch
+
+Tk widgets are owned exclusively by `UiWorker`; worker threads publish results
+through queues and never mutate widgets. One `_poll()` iteration gives the
+latency-sensitive paths a strict order:
+
+```text
+pre-armed physical Stop Patrol
+→ queued hotkey actions
+→ automatic-lie event service/result drain
+→ shared-frame outcome observation
+→ routine result queues and panel refreshes
+→ optional diagnostic rendering
+```
+
+The physical hotkey hook disarms automation before Tk is involved, so game
+input stops even if the UI thread is late. The Tk half then updates controls
+without waiting for reconnect, quick-pickup, license/accounting, channel, or
+other-player result drains. Automatic-lie startup follows the urgent hotkey
+path and therefore cannot wait behind those routine handlers. The handlers
+remain on Tk only for their widget work; network communication and worker I/O
+remain on their dedicated threads.
+
+The normal panel does not continuously request `DebugSnapshotWorker` analysis.
+That secondary OpenCV path receives frames only when a diagnostic view has a
+consumer or during the brief post-auto-lie marker verification. Patrol,
+status, character, lie-window, and cursor workers continue consuming the shared
+capture independently.
+
+Timing instrumentation is diagnostic-only and uses monotonic/performance
+timestamps captured when work runs, not when asynchronous logs reach disk.
+`TK EVENT LOOP GAP` measures a late Tk callback; `UI POLL timing: total` measures
+the current callback; and `UI POLL timing: phase=...` isolates slow substeps,
+including `prearmed-hotkey-stop`, `hotkey-actions`, and each `auto-lie:` step.
+These measurements do not gate or reschedule any frame-based worker.
+
+The attack cadence uses `WindowKeySender.tap_attack()` for compact release
+diagnostics. It shares the exact verified `tap()` delivery, focus, ownership,
+hold, and retry path; only the INFO presentation differs. The first line pairs
+the cadence choice with key-down and owner count, and the second pairs key-up,
+remaining owners, and actual hold duration. Generic movement/action keys retain
+their ordinary lifecycle logging.
 
 ## Data and persistence
 

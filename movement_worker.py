@@ -122,6 +122,18 @@ VK_ESCAPE = 0x1B
 # which timings were actually used.
 OTHER_PLAYER_TIME_SCALE = 1.0
 
+# The movement loop still evaluates every fresh 5-fps minimap frame.  This is
+# only the cadence of its human-readable status line: printing the identical
+# routing verdict every frame hides the transitions that matter and can make a
+# field log unnecessarily busy.  A stable state is therefore sampled once in
+# the log every few seconds; a state change is always printed immediately.
+MOVEMENT_STATUS_STEADY_LOG_SECONDS = 3.0
+# In diagnostic release logging, preserve a materially changed minimap marker
+# even while the chosen route/action is unchanged.  This is deliberately much
+# smaller than a patrol leg: it exposes knock-back, oscillation and rope/bench
+# motion without recreating a line for every identical 5-fps capture.
+MOVEMENT_STATUS_POSITION_LOG_DELTA = 0.003
+
 
 # Stall recovery is only valid at the rope itself.  Keeping this threshold in
 # one place prevents the stall detector and its recovery action from drifting
@@ -4253,6 +4265,9 @@ class MovementWorker(threading.Thread):
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._debug_last_layer: Optional[str] = None
+        self._movement_status_log_signature: Optional[tuple[Any, ...]] = None
+        self._movement_status_log_at = float("-inf")
+        self._movement_status_log_position: Optional[tuple[float, float]] = None
         self._dispatched_position_logged: Optional[float] = None
         self._last_drop_attempt = float("-inf")
         # The edge-walk fallback is deliberately scoped to an automatic
@@ -13178,15 +13193,65 @@ class MovementWorker(threading.Thread):
                             action_text = "attack"
                     if action_text is None:
                         action_text = "wait"
-                    LOG.info(
-                        "%s| pos=(%.6f, %.6f) | target=%s | gap=%s | action=%s",
+                    # The routing calculation above is deliberately still
+                    # performed for every capture.  Only its repetitive INFO
+                    # rendering is sampled: a new route/action/target/layer
+                    # remains immediate, while an unchanged verdict gets a
+                    # periodic position heartbeat for field diagnosis.
+                    #
+                    # Round the target for this *log-only* identity.  The
+                    # live rope target may make harmless sub-pixel smoothing
+                    # adjustments between frames; treating those as a state
+                    # transition would recreate the 5-fps log flood.
+                    status_signature = (
                         stage,
-                        observation.player.x,
-                        observation.player.y,
-                        target_text,
-                        gap_text,
+                        route_label,
+                        detected_layer_name,
                         action_text,
+                        (round(float(active_target_x), 3)
+                         if active_target_x is not None else None),
                     )
+                    status_now = time.monotonic()
+                    status_changed = (
+                        status_signature != self._movement_status_log_signature
+                    )
+                    previous_status_position = self._movement_status_log_position
+                    position_changed = bool(
+                        previous_status_position is not None
+                        and (
+                            abs(observation.player.x - previous_status_position[0])
+                            >= MOVEMENT_STATUS_POSITION_LOG_DELTA
+                            or abs(observation.player.y - previous_status_position[1])
+                            >= MOVEMENT_STATUS_POSITION_LOG_DELTA
+                        )
+                    )
+                    steady_due = (
+                        status_now - self._movement_status_log_at
+                        >= MOVEMENT_STATUS_STEADY_LOG_SECONDS
+                    )
+                    if status_changed or position_changed or steady_due:
+                        suffix = (
+                            " [steady]" if not status_changed and not position_changed
+                            else " [moved]" if position_changed and not status_changed
+                            else ""
+                        )
+                        LOG.info(
+                            "%s| pos=(%.6f, %.6f) | target=%s | gap=%s | "
+                            "action=%s%s",
+                            stage,
+                            observation.player.x,
+                            observation.player.y,
+                            target_text,
+                            gap_text,
+                            action_text,
+                            suffix,
+                        )
+                        self._movement_status_log_signature = status_signature
+                        self._movement_status_log_at = status_now
+                        self._movement_status_log_position = (
+                            observation.player.x,
+                            observation.player.y,
+                        )
                 else:
                     LOG.warning("movement waiting: %s", decision.reason)
                 now = time.monotonic()

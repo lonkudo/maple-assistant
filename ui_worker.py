@@ -1261,6 +1261,12 @@ class UiWorker(threading.Thread):
         self.last_snapshot: Optional[DebugSnapshot] = None
         self._debug_snapshot_worker = DebugSnapshotWorker(stop_event, detector)
         self._debug_snapshot_worker_started = False
+        # A debug snapshot is not part of patrol logic.  In the normal UI both
+        # debug views are hidden, so continuously running a second minimap
+        # detector at capture rate only steals CPU from Tk and the real
+        # workers.  It is enabled briefly for the post-auto-lie marker check
+        # and on demand by recording.
+        self._next_poll_due_at: Optional[float] = None
         self._ui_text_cache: dict[str, str] = {}
         self._countdown_display_state: Optional[tuple[float, str]] = None
         self._patrol_controls_render_key: Any = None
@@ -3604,6 +3610,16 @@ class UiWorker(threading.Thread):
         if self.stop_event.is_set():
             root.destroy()
             return
+        now = time.monotonic()
+        due_at = self._next_poll_due_at
+        if due_at is not None:
+            late_by = now - due_at
+            if late_by >= UI_POLL_SLOW_TOTAL_SECONDS:
+                LOG.warning(
+                    "TK EVENT LOOP GAP: poll began %.0fms late; a prior Tk callback "
+                    "or CPU starvation delayed hotkey/UI dispatch",
+                    late_by * 1000.0,
+                )
         poll_started = time.perf_counter()
         try:
             self._poll_body(root)
@@ -3634,6 +3650,9 @@ class UiWorker(threading.Thread):
                 LOG.warning("UI POLL timing: total=%.0fms", elapsed * 1000.0)
             try:
                 if not self.stop_event.is_set() and root.winfo_exists():
+                    self._next_poll_due_at = (
+                        time.monotonic() + self.refresh_ms / 1000.0
+                    )
                     root.after(self.refresh_ms, self._poll)
             except Exception:
                 LOG.debug("could not re-arm the debug UI poll", exc_info=True)
@@ -3646,29 +3665,44 @@ class UiWorker(threading.Thread):
         if elapsed >= UI_POLL_SLOW_PHASE_SECONDS:
             LOG.warning("UI POLL timing: phase=%s elapsed=%.0fms", phase, elapsed * 1000.0)
 
+    def _debug_snapshot_is_needed(self) -> bool:
+        """Whether a new diagnostic minimap analysis has a live consumer.
+
+        Patrol, status, character, lie-window detection, and auto-lie cursor
+        control all have their own shared-frame workers.  They never depend on
+        this display snapshot.  The only non-visual consumer is the brief
+        marker-return check after a completed auto-lie pass.
+        """
+
+        return bool(
+            self._SHOW_MINIMAP_PREVIEW
+            or self._SHOW_DETECTION_INFO
+            or self._auto_lie_marker_verification is not None
+        )
+
     def _poll_body(self, root: Any) -> None:
         """One tick's work, without the re-arm (see :meth:`_poll`)."""
 
-        # Online entitlement is a state gate, not visual work.  A resize burst
-        # may defer expensive frame rendering and log insertion, but it must
-        # never defer the heartbeat result: otherwise a successful immediate
-        # validation can leave the visible header stuck at “正在验证授权” until
-        # some unrelated UI change ends the freeze state.
+        # The physical hotkey stop is an emergency path.  Its hook has already
+        # disarmed game input, so let Tk show that fact before draining any
+        # routine result queue.  In particular, a slow channel/configuration
+        # update must never place a multi-second wall between Ctrl+` and the
+        # dashboard state change.
         priority_started = time.perf_counter()
-        self._drain_license_heartbeat_results()
-        self._drain_lie_accounting_results()
-        self._drain_channel_update_events()
-        self._drain_other_player_stop_events()
+        prearmed_started = time.perf_counter()
         self._service_prearmed_hotkey_stop()
+        self._report_ui_poll_phase("prearmed-hotkey-stop", prearmed_started)
         # Physical hotkeys are an operator safety path.  The listener thread
         # has already recognized the chord and placed its action in a queue;
         # dispatch it before any OpenCV snapshot build, log display update, or
         # periodic widget refresh.  In particular Ctrl+` must not wait behind
         # debug rendering before it can stop game input.
+        hotkey_started = time.perf_counter()
         try:
             self._drain_hotkey_actions()
         except Exception:
             LOG.exception("urgent hotkey dispatch failed; the UI tick continues")
+        self._report_ui_poll_phase("hotkey-actions", hotkey_started)
         self._report_ui_poll_phase("priority-gates-and-hotkeys", priority_started)
         # A detected lie window is a real-time event.  Its detector timestamp
         # anchors the upload deadline, so waiting for the debug snapshot or
@@ -3681,6 +3715,7 @@ class UiWorker(threading.Thread):
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
         ):
+            step_started = time.perf_counter()
             try:
                 step()
             except Exception:
@@ -3688,6 +3723,9 @@ class UiWorker(threading.Thread):
                     "自动过测谎 priority service %s failed; the UI tick continues",
                     getattr(step, "__name__", step),
                 )
+            self._report_ui_poll_phase(
+                f"auto-lie:{getattr(step, '__name__', step)}", step_started,
+            )
         self._report_ui_poll_phase("auto-lie-dispatch", auto_lie_started)
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
@@ -3722,7 +3760,7 @@ class UiWorker(threading.Thread):
             AUTO_LIE_LOG.exception(
                 "自动过测谎 priority outcome observation failed; the UI tick continues"
             )
-        if latest is not None:
+        if latest is not None and self._debug_snapshot_is_needed():
             # OpenCV minimap detection and image cropping are diagnostic UI
             # work.  Hand them to a latest-only worker so a slow snapshot can
             # never delay the next hotkey, auto-lie event, or patrol control.
@@ -3735,6 +3773,17 @@ class UiWorker(threading.Thread):
         # the operator's "the hotkey binding is lost" report.  A failing step
         # now costs only itself.
         for step in (
+            # Result handlers may update many widgets, persist settings, or
+            # restart reconnect work.  They stay on Tk because widgets are
+            # not thread-safe, but are deliberately after hotkey and auto-lie
+            # dispatch: an armed live pass never waits for cosmetic/status
+            # work or configuration I/O.
+            self._drain_license_heartbeat_results,
+            self._drain_lie_accounting_results,
+            self._drain_channel_update_events,
+            self._drain_other_player_stop_events,
+            self._drain_quick_pickup_results,
+            self._drain_reconnect_results,
             self._drain_logs,
             self._refresh_automation_status,
             self._sync_patrol_ui_state,
@@ -4799,17 +4848,12 @@ class UiWorker(threading.Thread):
     def _drain_hotkey_actions(self) -> None:
         """Run physical hotkey actions safely on Tk's owning thread.
 
-        Never raises: the queue is drained item by item, and the result reports
-        that run before it are guarded too, so a malformed item or a failing
-        result drain cannot leave a queued chord unexecuted.
+        Never raises: the queue is drained item by item, so a malformed item
+        or a failing action cannot leave a queued chord unexecuted.  Routine
+        worker-result drains are intentionally serviced later in ``_poll``:
+        they may write configuration or refresh multiple widgets and must not
+        delay this emergency path or auto-lie dispatch.
         """
-
-        for drain in (self._drain_quick_pickup_results,
-                      self._drain_reconnect_results):
-            try:
-                drain()
-            except Exception:
-                LOG.exception("periodic result drain failed; hotkeys continue")
         actions = self.hotkey_queue
         if actions is None:
             return
@@ -6409,10 +6453,15 @@ class UiWorker(threading.Thread):
     def _arm_auto_lie_marker_verification(self, event_id: str) -> None:
         """Watch fresh minimap reads for the post-takeover black-room state."""
 
+        # Continuous debug snapshots are intentionally off during ordinary
+        # play.  Ignore any old on-demand/recording snapshot and require a
+        # capture that arrives after this verification is armed.
+        latest_frame = getattr(self, "_latest_capture_frame", None)
+        latest_sequence = int(getattr(latest_frame, "sequence", -1))
         self._auto_lie_marker_verification = {
             "event_id": str(event_id),
             "not_before": time.monotonic() + _AUTO_LIE_FAILURE_GRACE_SECONDS,
-            "last_sequence": -1,
+            "last_sequence": latest_sequence,
             "missing": 0,
         }
         AUTO_LIE_LOG.info(

@@ -151,9 +151,17 @@ class AttackWorker(threading.Thread):
             if self.stop_event.wait(self.jump_attack_delay):
                 # Stopping mid-bundle: skip the attack half.
                 return False
-            return tap(key) is not False
+            attack_tap = getattr(self.key_sender, "tap_attack", None)
+            if not callable(attack_tap):
+                attack_tap = tap
+            return attack_tap(key) is not False
 
-        tap = getattr(self.key_sender, "tap", None)
+        # A real WindowKeySender offers the paired two-line attack lifecycle
+        # logger.  Small test/dry-run senders may only implement ``tap``;
+        # retain that compatible fallback without changing their behaviour.
+        tap = getattr(self.key_sender, "tap_attack", None)
+        if not callable(tap):
+            tap = getattr(self.key_sender, "tap", None)
         if callable(tap):
             return tap(key) is not False
 
@@ -319,7 +327,6 @@ class AttackWorker(threading.Thread):
                     consume(normal_key) if callable(consume) else normal_key
                 )
             if can_fire:
-                LOG.info("attack repetition: %s", selected_key)
                 sent = False
                 try:
                     self.combo_attack.consume()

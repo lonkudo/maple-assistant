@@ -88,6 +88,9 @@ class KeySender(Protocol):
     def tap(self, key: str, *, hold_seconds: Optional[float] = None) -> bool:
         """Tap *key*, returning True only when it was sent (or dry-run logged)."""
 
+    def tap_attack(self, key: str, *, hold_seconds: Optional[float] = None) -> bool:
+        """Tap an attack key with compact paired lifecycle diagnostics."""
+
 
 def _process_name(pid: int) -> str:
     """Executable name for ``pid`` ('' when it cannot be queried).
@@ -1095,7 +1098,14 @@ class WindowKeySender:
                 LOG.info("key hold complete=%s actual_hold=%.3fs", key,
                          time.monotonic() - started)
 
-    def key_down(self, key: str, *, owner: str = "") -> bool:
+    def key_down(
+        self,
+        key: str,
+        *,
+        owner: str = "",
+        emit_lifecycle_log: bool = True,
+        attack_diagnostic: bool = False,
+    ) -> bool:
         """Claim a key; inject key-down only for the first concurrent owner."""
 
         key = key.casefold()
@@ -1139,10 +1149,23 @@ class WindowKeySender:
             if owners == 0:
                 self._emit_locked(key, key_up=False)
             self._key_owners[key] = owners + 1
-        LOG.info("key-down=%s owners=%d", key, owners + 1)
+        if attack_diagnostic:
+            LOG.info(
+                "attack repetition: %s; key-down=%s owners=%d",
+                key, key, owners + 1,
+            )
+        elif emit_lifecycle_log:
+            LOG.info("key-down=%s owners=%d", key, owners + 1)
         return True
 
-    def key_up(self, key: str, *, owner: str = "") -> bool:
+    def key_up(
+        self,
+        key: str,
+        *,
+        owner: str = "",
+        emit_lifecycle_log: bool = True,
+        attack_diagnostic_started_at: Optional[float] = None,
+    ) -> bool:
         """Release one claim; inject key-up only after the final owner exits.
 
         A key-up is NEVER blocked by ownership: releasing is always safe, and blocking it would leave
@@ -1160,7 +1183,16 @@ class WindowKeySender:
             else:
                 self._key_owners.pop(key, None)
                 self._emit_locked(key, key_up=True)
-        LOG.info("key-up=%s owners=%d", key, remaining)
+        if attack_diagnostic_started_at is not None:
+            LOG.info(
+                "key-up=%s owners=%d; key hold complete=%s actual_hold=%.3fs",
+                key,
+                remaining,
+                key,
+                time.monotonic() - attack_diagnostic_started_at,
+            )
+        elif emit_lifecycle_log:
+            LOG.info("key-up=%s owners=%d", key, remaining)
         return True
 
     def repeat_key_down(self, key: str) -> bool:
@@ -1220,6 +1252,31 @@ class WindowKeySender:
         Returns True only when the game owned the keyboard for the whole tap.
         """
 
+        return self._tap_with_retry(
+            key, owner=owner, hold_seconds=hold_seconds, attack_diagnostic=False,
+        )
+
+    def tap_attack(
+        self, key: str, *, owner: str = "", hold_seconds: Optional[float] = None,
+    ) -> bool:
+        """Tap an ordinary attack key with two compact diagnostic lines.
+
+        Attack cadence needs its lifecycle in a release log, but the generic
+        key sender used to turn one healthy beat into four INFO records.  This
+        keeps the same ownership ledger and delivery checks while pairing the
+        down/repetition and up/measured-hold records.
+        """
+
+        return self._tap_with_retry(
+            key, owner=owner, hold_seconds=hold_seconds, attack_diagnostic=True,
+        )
+
+    def _tap_with_retry(
+        self, key: str, *, owner: str, hold_seconds: Optional[float],
+        attack_diagnostic: bool,
+    ) -> bool:
+        """Common verified tap transport; ``attack_diagnostic`` changes logs only."""
+
         key = key.casefold()
         if key not in self._SCAN:
             raise ValueError(f"unsupported key: {key}")
@@ -1239,7 +1296,12 @@ class WindowKeySender:
                 if attempt < _ACTION_TAP_ATTEMPTS:
                     time.sleep(_ACTION_TAP_RETRY_SECONDS)
                 continue
-            if self._tap_verified(key, owner=owner, hold_seconds=hold_seconds):
+            if self._tap_verified(
+                key,
+                owner=owner,
+                hold_seconds=hold_seconds,
+                attack_diagnostic=attack_diagnostic,
+            ):
                 return True
             if attempt < _ACTION_TAP_ATTEMPTS:
                 time.sleep(_ACTION_TAP_RETRY_SECONDS)
@@ -1250,7 +1312,12 @@ class WindowKeySender:
         return False
 
     def _tap_verified(
-        self, key: str, *, owner: str = "", hold_seconds: Optional[float] = None,
+        self,
+        key: str,
+        *,
+        owner: str = "",
+        hold_seconds: Optional[float] = None,
+        attack_diagnostic: bool = False,
     ) -> bool:
         """One down/hold/up with a focus check at both ends (see :meth:`tap`)."""
 
@@ -1263,16 +1330,31 @@ class WindowKeySender:
             self._begin_ctrl_chord()
         try:
             return self._tap_verified_inner(
-                key, owner=owner, started=started, hold_seconds=hold_seconds,
+                key,
+                owner=owner,
+                started=started,
+                hold_seconds=hold_seconds,
+                attack_diagnostic=attack_diagnostic,
             )
         finally:
             if own_ctrl:
                 self._end_ctrl_chord()
 
     def _tap_verified_inner(
-        self, key: str, *, owner: str, started: float, hold_seconds: Optional[float]
+        self,
+        key: str,
+        *,
+        owner: str,
+        started: float,
+        hold_seconds: Optional[float],
+        attack_diagnostic: bool,
     ) -> bool:
-        if not self.key_down(key, owner=owner):
+        if not self.key_down(
+            key,
+            owner=owner,
+            emit_lifecycle_log=not attack_diagnostic,
+            attack_diagnostic=attack_diagnostic,
+        ):
             return False
         owned_at_release = True
         try:
@@ -1282,9 +1364,15 @@ class WindowKeySender:
             # window which stole the focus leaves the game holding the key.
             owned_at_release = bool(self.dry_run or self._foreground_matches())
         finally:
-            self.key_up(key, owner=owner)
-            LOG.info("key hold complete=%s actual_hold=%.3fs", key,
-                     time.monotonic() - started)
+            self.key_up(
+                key,
+                owner=owner,
+                emit_lifecycle_log=not attack_diagnostic,
+                attack_diagnostic_started_at=(started if attack_diagnostic else None),
+            )
+            if not attack_diagnostic:
+                LOG.info("key hold complete=%s actual_hold=%.3fs", key,
+                         time.monotonic() - started)
         if not owned_at_release:
             self.force_key_up(key, reason="action tap lost focus")
             self._warn_delivery(

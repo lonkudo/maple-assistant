@@ -861,6 +861,47 @@ the IME to 英数/半角英数, or set `"delivery": "hook"` in `hotkey.json`.
 
 For a minimap-less area, return to a normal map before expecting patrol or disconnect monitoring to resume.
 
+### Runtime timing and diagnostic logs
+
+The movement worker still evaluates every shared 5 FPS capture. Its readable
+status log is diagnostic but bounded: an action, target, route, or resolved
+layer change is written immediately; an X or Y movement of at least `0.003`
+from the last emitted position is written immediately with `[moved]`; and a
+truly unchanged state is sampled every three seconds with `[steady]`. Existing
+stuck, no-progress, nearest-layer, and fallback warnings are never suppressed.
+This keeps short knockbacks, oscillation, rope motion, and stationary-return
+progress visible without writing five identical lines per second.
+
+Ordinary cadence attacks keep release-grade ownership diagnostics in two lines
+per attack rather than four:
+
+```text
+attack repetition: a; key-down=a owners=1
+key-up=a owners=0; key hold complete=a actual_hold=0.078s
+```
+
+This preserves the press/release ordering, remaining owner count, and measured
+hold duration needed to diagnose overlapping keys. Failed delivery, lost
+focus, forced release, and ownership conflicts continue to log immediately.
+
+Urgent Tk work is ordered as **pre-armed Stop Patrol → hotkey actions →
+automatic-lie dispatch**. Heartbeat/accounting/channel/other-player and
+reconnect result presentation runs afterward. Those handlers stay on Tk
+because they update widgets, but their configuration or display work cannot
+postpone a newly armed automatic-lie pass or the immediate Stop Patrol path.
+
+For a delayed hotkey or automatic-lie start, search the main log for:
+
+- `TK EVENT LOOP GAP:` — Tk began a scheduled poll late.
+- `UI POLL timing: total=` — one complete poll took too long.
+- `UI POLL timing: phase=` — the named poll substep exceeded its budget,
+  including `prearmed-hotkey-stop`, `hotkey-actions`, and the two
+  `auto-lie:` phases.
+- `自动过测谎 timing: detector-to-UI-dequeue=` — direct detector-to-Tk delay.
+
+When reporting a delay, include each matching line and roughly fifteen lines
+before and after it so the preceding operation is visible.
+
 ## Development and releases
 
 **Release policy: never create a release unless the operator explicitly says
