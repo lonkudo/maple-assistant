@@ -143,16 +143,6 @@ UI_POLL_SLOW_TOTAL_SECONDS = 0.25
 # A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
 # never keep the pending flag set (and this method retrying) for the rest of the session.
 AUTO_LIE_PENDING_MAX_SECONDS = 90.0
-# A recreated game HWND first shows white/black login/loading surfaces. Those
-# can contain a uniform square matching the lie HUD colour, but cannot be a
-# playable lie window. Suppress only auto-lie starts for this short transition.
-AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS = 30.0
-# A busy Maple client may recreate only its top-level window while keeping the
-# same process alive.  That is not a reboot: give its surface a moment to
-# settle, but do not throw away a half minute of legitimate auto-lie handling.
-AUTO_LIE_SAME_PROCESS_WINDOW_BLOCK_SECONDS = 5.0
-
-
 @dataclass(frozen=True)
 class _AutoLieDetectorEvent:
     """One detector match with the monotonic time at which it was observed."""
@@ -714,6 +704,102 @@ def build_debug_snapshot(
     )
 
 
+class DebugSnapshotWorker(threading.Thread):
+    """Build best-effort dashboard snapshots away from Tk's event loop.
+
+    This worker is deliberately display-only.  It owns a private minimap
+    detector and does not update the movement/route trackers, so dropping an
+    old debug frame can never change a patrol decision.  Both queues hold one
+    item: when the dashboard is busy, only the newest capture is worth
+    rendering.
+    """
+
+    def __init__(self, stop_event: threading.Event, detector: MinimapDetector) -> None:
+        super().__init__(name="debug-snapshot", daemon=True)
+        self.stop_event = stop_event
+        self._requests: "queue.Queue[tuple[Any, str]]" = queue.Queue(maxsize=1)
+        self._results: "queue.Queue[DebugSnapshot]" = queue.Queue(maxsize=1)
+        # MinimapDetector carries smoothing/history state.  A private copy
+        # keeps the diagnostic view from racing movement's live detector.
+        self.detector = MinimapDetector(
+            fallback_region=detector.fallback_region,
+            map_name_reader=detector.map_name_reader,
+            dedicated_crop=detector.dedicated_crop,
+            opencv_size=detector.opencv_size,
+            transient_hold_seconds=detector.transient_hold_seconds,
+            box_history=detector.box_history_len,
+            box_jump_ratio=detector.box_jump_ratio,
+            include_header=detector.include_header,
+        )
+
+    @staticmethod
+    def _put_latest(target: "queue.Queue[Any]", item: Any) -> None:
+        try:
+            target.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            target.get_nowait()
+            try:
+                target.task_done()
+            except (AttributeError, ValueError):
+                pass
+        except queue.Empty:
+            pass
+        try:
+            target.put_nowait(item)
+        except queue.Full:
+            # A concurrent worker completion can only make this diagnostic
+            # frame stale; the next capture will replace it.
+            pass
+
+    def submit(self, frame: Any, configured_map_name: str) -> None:
+        self._put_latest(self._requests, (frame, configured_map_name))
+
+    def poll_latest(self) -> Optional[DebugSnapshot]:
+        latest: Optional[DebugSnapshot] = None
+        while True:
+            try:
+                latest = self._results.get_nowait()
+            except queue.Empty:
+                return latest
+            try:
+                self._results.task_done()
+            except (AttributeError, ValueError):
+                pass
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                frame, configured_map_name = self._requests.get(timeout=0.20)
+            except queue.Empty:
+                continue
+            try:
+                # Collapse requests that arrived while OpenCV processed the
+                # preceding image.  Debug output must never form a backlog.
+                while True:
+                    try:
+                        frame, configured_map_name = self._requests.get_nowait()
+                    except queue.Empty:
+                        break
+                snapshot = build_debug_snapshot(
+                    frame, self.detector, configured_map_name,
+                    # These trackers own route/session state elsewhere.  The
+                    # dashboard needs only an independent visual snapshot.
+                    diamond_size_tracker=None,
+                    structure_tracker=None,
+                )
+                self._put_latest(self._results, snapshot)
+            except Exception:
+                LOG.exception("could not build background debug snapshot")
+            finally:
+                try:
+                    self._requests.task_done()
+                except (AttributeError, ValueError):
+                    pass
+
+
 def _box_text(box: Box) -> str:
     left, top, right, bottom = box
     return f"x={left}, y={top}, w={right-left}, h={bottom-top}"
@@ -930,6 +1016,8 @@ class UiWorker(threading.Thread):
         small_step_worker: Any = None,
         hotkey_queue: Optional["queue.Queue[str]"] = None,
         hotkey_worker: Any = None,
+        on_hotkey_stop_prearmed: Optional[Callable[[], bool]] = None,
+        hotkey_stop_cleanup_done_event: Optional[threading.Event] = None,
         quick_pickup_worker: Any = None,
         quick_pickup_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         reconnect_worker: Any = None,
@@ -992,6 +1080,11 @@ class UiWorker(threading.Thread):
         # Physical hotkey hook whose bindings are temporarily disabled while
         # patrol runs (only the patrol-toggle chord stays live).
         self.hotkey_worker = hotkey_worker
+        # Ctrl+` can be received while Tk is rendering a diagnostic frame.
+        # The hotkey worker has already disabled automation in that case; Tk
+        # later consumes this marker only to refresh its controls/status.
+        self.on_hotkey_stop_prearmed = on_hotkey_stop_prearmed
+        self._hotkey_stop_cleanup_done_event = hotkey_stop_cleanup_done_event
         # Manual-only rapid Z pickup has its own worker/result channel so it
         # cannot arm the normal patrol automation workers.
         self.quick_pickup_worker = quick_pickup_worker
@@ -1041,13 +1134,6 @@ class UiWorker(threading.Thread):
         # not spend another pass on that same stale square; a clear frame arms
         # the next real lie window normally.
         self._api_auto_lie_ignore_until_clear = False
-        # The first *armed* observation establishes the baseline.  Do not
-        # enumerate desktop windows while merely opening the assistant: that
-        # made an idle UI and Windows' own file picker noticeably sluggish.
-        self._api_auto_lie_handle_generation: Optional[int] = None
-        self._api_auto_lie_new_window_block_until = 0.0
-        self._api_auto_lie_new_window_block_reason = ""
-        self._api_auto_lie_new_window_suppression_logged = False
         self._api_auto_lie_change_origin = "unknown"
         self._latest_capture_frame: Any = None
         self._auto_lie_outcome_state: Optional[dict[str, Any]] = None
@@ -1173,9 +1259,15 @@ class UiWorker(threading.Thread):
         self._auto_lie_marker_verification: Optional[dict[str, Any]] = None
         self._yolo_process: Any = None
         self.last_snapshot: Optional[DebugSnapshot] = None
+        self._debug_snapshot_worker = DebugSnapshotWorker(stop_event, detector)
+        self._debug_snapshot_worker_started = False
         self._ui_text_cache: dict[str, str] = {}
         self._countdown_display_state: Optional[tuple[float, str]] = None
         self._patrol_controls_render_key: Any = None
+        # A persistent first-panel explanation for a disabled patrol Start
+        # button.  Keep it separate from transient start/recording errors so
+        # switching back to a valid configuration can restore the normal text.
+        self._patrol_start_condition_hint_visible = False
         self._root: Any = None
         self._photo_minimap: Any = None
         self._photo_map_name: Any = None
@@ -1221,6 +1313,25 @@ class UiWorker(threading.Thread):
         # after calibration completes.
         self._hotkey_toggle_ignore_until = 0.0
 
+    def _service_prearmed_hotkey_stop(self) -> None:
+        """Catch up Tk after the hotkey worker performed an immediate stop."""
+
+        consume_prearmed = self.on_hotkey_stop_prearmed
+        if not callable(consume_prearmed):
+            return
+        try:
+            if not consume_prearmed():
+                return
+        except Exception:
+            LOG.exception("could not consume pre-armed hotkey stop")
+            return
+        self._finish_prearmed_hotkey_stop()
+        # The matching queued Ctrl+` action may arrive in this same poll, or
+        # may have been rejected by its ordinary hotkey cooldown.  In either
+        # case it must never turn the just-stopped patrol back on.
+        self._hotkey_toggle_ignore_until = time.monotonic() + 0.75
+        self._play_action_sound(False)
+
     def run(self) -> None:
         try:
             import tkinter as tk
@@ -1233,6 +1344,9 @@ class UiWorker(threading.Thread):
             # applied only after every panel has been built and laid out.
             root.withdraw()
             self._root = root
+            if not self._debug_snapshot_worker_started:
+                self._debug_snapshot_worker.start()
+                self._debug_snapshot_worker_started = True
             if not self._lie_accounting_started:
                 self._lie_accounting_worker.start()
                 self._lie_accounting_started = True
@@ -3545,6 +3659,7 @@ class UiWorker(threading.Thread):
         self._drain_lie_accounting_results()
         self._drain_channel_update_events()
         self._drain_other_player_stop_events()
+        self._service_prearmed_hotkey_stop()
         # Physical hotkeys are an operator safety path.  The listener thread
         # has already recognized the chord and placed its action in a queue;
         # dispatch it before any OpenCV snapshot build, log display update, or
@@ -3593,7 +3708,9 @@ class UiWorker(threading.Thread):
                 self.frame_queue.task_done()
             except (AttributeError, ValueError):
                 pass
-        snapshot_to_render: Optional[DebugSnapshot] = None
+        snapshot_to_render: Optional[DebugSnapshot] = (
+            self._debug_snapshot_worker.poll_latest()
+        )
         if latest is not None:
             self._latest_capture_frame = latest
         # The outcome observer needs only the latest captured image; it does
@@ -3606,22 +3723,10 @@ class UiWorker(threading.Thread):
                 "自动过测谎 priority outcome observation failed; the UI tick continues"
             )
         if latest is not None:
-            snapshot_started = time.perf_counter()
-            try:
-                self.last_snapshot = build_debug_snapshot(
-                    latest,
-                    self.detector,
-                    self.configured_map_name,
-                    self.diamond_size_tracker,
-                    self.structure_tracker,
-                )
-                # Detection and tracker state stay on their established
-                # single-threaded path.  Only the completed debug display is
-                # deferred until all control work in this poll has run.
-                snapshot_to_render = self.last_snapshot
-            except Exception:
-                LOG.exception("could not update debug UI")
-            self._report_ui_poll_phase("debug-snapshot", snapshot_started)
+            # OpenCV minimap detection and image cropping are diagnostic UI
+            # work.  Hand them to a latest-only worker so a slow snapshot can
+            # never delay the next hotkey, auto-lie event, or patrol control.
+            self._debug_snapshot_worker.submit(latest, self.configured_map_name)
         # Each periodic task is guarded on its own.  The whole body used to
         # share ONE try/except, so an exception thrown by any single step (log
         # drain, status refresh, patrol sync, YOLO exit poll, a result drain)
@@ -3655,6 +3760,7 @@ class UiWorker(threading.Thread):
         if snapshot_to_render is not None:
             render_started = time.perf_counter()
             try:
+                self.last_snapshot = snapshot_to_render
                 self._render(snapshot_to_render)
             except Exception:
                 LOG.exception("could not render completed debug snapshot")
@@ -3675,13 +3781,19 @@ class UiWorker(threading.Thread):
         if (self.patrol_controller is None
                 or not hasattr(self, "_start_patrol_button")):
             return
+        hotkey_cleanup_done = bool(
+            self._hotkey_stop_cleanup_done_event is not None
+            and self._hotkey_stop_cleanup_done_event.is_set()
+        )
         if (self._patrol_stop_pending
-                and self._patrol_stop_cleanup_done.is_set()):
+                and (self._patrol_stop_cleanup_done.is_set() or hotkey_cleanup_done)):
             completed_at = getattr(self, "_patrol_stop_cleanup_finished_at", None)
             started_at = getattr(self, "_patrol_stop_started_at", None)
             now = time.monotonic()
             self._patrol_stop_pending = False
             self._patrol_stop_cleanup_done.clear()
+            if hotkey_cleanup_done and self._hotkey_stop_cleanup_done_event is not None:
+                self._hotkey_stop_cleanup_done_event.clear()
             self._refresh_patrol_controls()
             try:
                 self._control_status.configure(text="巡逻已停止。")
@@ -4718,7 +4830,25 @@ class UiWorker(threading.Thread):
                 except (AttributeError, ValueError):
                     pass
                 continue
+            prearmed_stop = False
+            if action == "toggle_patrol":
+                consume_prearmed = self.on_hotkey_stop_prearmed
+                if callable(consume_prearmed):
+                    try:
+                        prearmed_stop = bool(consume_prearmed())
+                    except Exception:
+                        LOG.exception("could not consume pre-armed hotkey stop")
             if not self._license_allowed():
+                # Stopping is always permitted.  The hook has already stopped
+                # live input; keep the dashboard consistent even if an
+                # entitlement result arrived between key-down and this poll.
+                if prearmed_stop:
+                    self._finish_prearmed_hotkey_stop()
+                    try:
+                        actions.task_done()
+                    except (AttributeError, ValueError):
+                        pass
+                    continue
                 LOG.warning("hotkey %s ignored: license is not valid", action)
                 self._show_license_refusal()
                 try:
@@ -4839,7 +4969,10 @@ class UiWorker(threading.Thread):
                             "just completed"
                         )
                     else:
-                        if (self.patrol_controller is not None
+                        if prearmed_stop:
+                            self._finish_prearmed_hotkey_stop()
+                            self._play_action_sound(False)
+                        elif (self.patrol_controller is not None
                                 and self.patrol_controller.is_enabled()):
                             self._stop_patrol()
                             self._play_action_sound(False)
@@ -5553,75 +5686,6 @@ class UiWorker(threading.Thread):
         except queue.Full:
             return
 
-    def _refresh_auto_lie_window_transition_guard(self) -> bool:
-        """Check the false-lie guard only when a lie candidate actually arrives.
-
-        ``IsWindow``/window recovery are Windows calls, not UI state reads.  A
-        previous implementation ran them from every 100 ms dashboard tick
-        whenever 自动测谎 was selected, which made an otherwise idle dashboard
-        periodically stall.  A recreated loading/login surface can only cause
-        harm once the detector has found a candidate, so checking here still
-        rejects that same first false candidate without placing window work on
-        the idle Tk path.
-        """
-        sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
-        observe_transition = getattr(sender, "observe_game_window_transition", None)
-        observe = getattr(sender, "observe_game_window_handle", None)
-        if not callable(observe_transition) and not callable(observe):
-            return False
-        transition_kind = "new-process"
-        if callable(observe_transition):
-            generation, transition_kind = observe_transition()
-            generation = int(generation)
-        else:
-            generation = int(observe())
-        if self._api_auto_lie_handle_generation is None:
-            self._api_auto_lie_handle_generation = generation
-        elif generation != self._api_auto_lie_handle_generation:
-            self._api_auto_lie_handle_generation = generation
-            same_process = transition_kind == "same-process"
-            block_seconds = (
-                AUTO_LIE_SAME_PROCESS_WINDOW_BLOCK_SECONDS
-                if same_process else AUTO_LIE_NEW_WINDOW_BLOCK_SECONDS
-            )
-            block_reason = "same-process window recreation" if same_process else "new game process"
-            self._api_auto_lie_new_window_block_until = (
-                time.monotonic() + block_seconds
-            )
-            self._api_auto_lie_new_window_block_reason = block_reason
-            # A queued detector match belonged to the dead game's surface.
-            # Never let it become a pass after the new loading/login surface
-            # settles; the next real lie window will arm its own event.
-            self._api_auto_lie_pending = False
-            self._api_auto_lie_event_active = False
-            self._api_auto_lie_ignore_until_clear = False
-            self._api_auto_lie_clear_since = time.monotonic()
-            with self._api_auto_lie_event_enqueue_lock:
-                self._api_auto_lie_match_queued = False
-                events = getattr(self, "_api_auto_lie_events", None)
-                if events is not None:
-                    while True:
-                        try:
-                            events.get_nowait()
-                            events.task_done()
-                        except queue.Empty:
-                            break
-                        except ValueError:
-                            break
-            self._api_auto_lie_new_window_suppression_logged = False
-            AUTO_LIE_LOG.warning(
-                "自动过测谎: detected %s; suppressing takeover for %.0f seconds "
-                "without changing the 自动测谎 selection",
-                block_reason,
-                block_seconds,
-            )
-        return time.monotonic() < self._api_auto_lie_new_window_block_until
-
-    def _auto_lie_blocked_for_recreated_window(self) -> bool:
-        """Compatibility wrapper used while handling one detector match."""
-
-        return self._refresh_auto_lie_window_transition_guard()
-
     def _handle_lie_event_for_api(
         self,
         match: object = None,
@@ -5654,20 +5718,6 @@ class UiWorker(threading.Thread):
             self._api_auto_lie_clear_since = time.monotonic()
             self._api_auto_lie_event_active = False
             self._api_auto_lie_ignore_until_clear = False
-            return
-        if self._auto_lie_blocked_for_recreated_window():
-            if not self._api_auto_lie_new_window_suppression_logged:
-                remaining = max(
-                    0.0,
-                    self._api_auto_lie_new_window_block_until - time.monotonic(),
-                )
-                AUTO_LIE_LOG.warning(
-                    "自动过测谎: lie window ignored during %s guard "
-                    "(%.0f seconds remain; selection unchanged)",
-                    self._api_auto_lie_new_window_block_reason or "window recreation",
-                    remaining,
-                )
-                self._api_auto_lie_new_window_suppression_logged = True
             return
         if not self._license_allowed():
             AUTO_LIE_LOG.info("自动过测谎: ignored because license is not valid")
@@ -10609,6 +10659,30 @@ class UiWorker(threading.Thread):
         LOG.info(LOG_RUN_START + "。")
         return True
 
+    def _finish_prearmed_hotkey_stop(self) -> bool:
+        """Apply the Tk-only half of a Ctrl+` stop already made by the hook.
+
+        The hotkey worker clears the automation gate and starts key release at
+        chord time.  This method intentionally sends no keys and never waits:
+        it merely catches the dashboard up when Tk next becomes available.
+        """
+
+        self._patrol_intent = False
+        if self.patrol_controller is None:
+            return False
+        if self._patrol_stop_pending:
+            return True
+        self._patrol_stop_pending = True
+        self._patrol_stop_started_at = time.monotonic()
+        self._patrol_stop_cleanup_finished_at = None
+        try:
+            self._control_status.configure(text="正在停止巡逻并释放按键…")
+            self._refresh_patrol_controls()
+        except Exception:
+            LOG.debug("could not refresh pre-armed patrol stop", exc_info=True)
+        LOG.info("STOP PATROL: UI caught up with immediate hotkey disarm")
+        return True
+
     def _stop_patrol(self) -> bool:
         # The operator does NOT want to patrol any more: a later reconnect must not start one.
         self._patrol_intent = False
@@ -10873,6 +10947,7 @@ class UiWorker(threading.Thread):
         render_key = (
             running,
             can_start,
+            self._stationary_attack_selected(),
             selected,
             tuple(layer_names),
             repr(snapshot.layers),
@@ -10903,6 +10978,23 @@ class UiWorker(threading.Thread):
             state="normal" if len(layer_names) > 0 else "disabled"
         )
         self._reset_recording_button.configure(state="normal")
+        show_patrol_start_hint = bool(
+            license_allowed
+            and not running
+            and not self._patrol_stop_pending
+            and not self._stationary_attack_selected()
+            and not can_start
+        )
+        if show_patrol_start_hint:
+            self._control_status.configure(
+                text=("巡逻模式开始条件不满足。请检查楼层配置，"
+                      "可点击右上书本图标查看教程。")
+            )
+        elif self._patrol_start_condition_hint_visible:
+            self._control_status.configure(
+                text="先录制 最左、绳索、最右，然后添加上方图层。"
+            )
+        self._patrol_start_condition_hint_visible = show_patrol_start_hint
         if not license_allowed:
             # The dashboard remains inspectable, but no capture-driven
             # recording or automation entry point is usable before activation.

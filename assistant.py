@@ -576,18 +576,22 @@ def main() -> int:
     }
 
     def warm_auto_lie_endpoint() -> None:
-        """Probe random three-port groups and cache the first available answer.
+        """Probe six random ports and cache the least-loaded quick reply.
 
-        A probe is only a capacity observation, never a reservation.  We do
-        not wait for all three responses when the first returned server reports
-        ``slots_left > 0``: it becomes the candidate for the fresh, formal
-        handshake.  If a group is full or unreachable, the next random group
-        is tried.  The full randomized order remains cached so a handshake
-        failure has deterministic in-process fallbacks.
+        A probe is only a capacity observation, never a reservation.  For the
+        first 300 ms of each six-port concurrent batch, collect every healthy
+        result with a positive ``slots_left`` and select the largest value.
+        If that short observation window has no usable answer, retain the old
+        latency-first rule: use the first later reply that has a free slot.
+        The full randomized order remains cached for handshake fallbacks.
         """
 
         try:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import (
+                ThreadPoolExecutor,
+                TimeoutError as FuturesTimeoutError,
+                as_completed,
+            )
 
             from auto_lie_backend import select_auto_lie_ws_endpoints
             from autolie_api.connect import probe_ws_endpoints
@@ -610,8 +614,8 @@ def main() -> int:
                     )
                     return None
 
-            for offset in range(0, len(candidates), 3):
-                batch = candidates[offset:offset + 3]
+            for offset in range(0, len(candidates), 6):
+                batch = candidates[offset:offset + 6]
                 executor = ThreadPoolExecutor(
                     max_workers=len(batch),
                     thread_name_prefix="auto-lie-probe",
@@ -620,30 +624,77 @@ def main() -> int:
                     executor.submit(probe_one, host, int(port)): (host, int(port))
                     for host, port in batch
                 }
-                chosen_early = False
+                chosen_without_waiting = False
+                quick_available: list[tuple[object, int]] = []
+                sampled_futures: set[object] = set()
                 try:
-                    for future in as_completed(futures):
-                        host, port = futures[future]
-                        result = future.result()
-                        tried.append(f"{host}:{port}")
-                        slots_left = getattr(result, "slots_left", None)
-                        if result is not None and isinstance(slots_left, (int, float)):
-                            if int(slots_left) > 0:
+                    # Let six probes race for a small, fixed capacity sample.
+                    # `as_completed` preserves actual arrival order for the
+                    # fallback path below, unlike inspecting an unordered set
+                    # of completed futures.
+                    quick_deadline = time.monotonic() + 0.300
+                    try:
+                        for future in as_completed(
+                            futures,
+                            timeout=max(0.0, quick_deadline - time.monotonic()),
+                        ):
+                            sampled_futures.add(future)
+                            host, port = futures[future]
+                            result = future.result()
+                            tried.append(f"{host}:{port}")
+                            slots_left = getattr(result, "slots_left", None)
+                            if (result is not None
+                                    and isinstance(slots_left, (int, float))
+                                    and int(slots_left) > 0):
+                                quick_available.append((result, len(tried)))
+                            else:
+                                full.append(f"{host}:{port}")
+                    except FuturesTimeoutError:
+                        # The bounded sample is complete.  Do not wait for
+                        # slow ports merely to compare capacity.
+                        pass
+
+                    if quick_available:
+                        # Higher reported free capacity wins.  Arrival order
+                        # resolves an equal-capacity tie, keeping selection
+                        # deterministic within this batch.
+                        best, _arrival = max(
+                            quick_available,
+                            key=lambda item: (
+                                int(getattr(item[0], "slots_left", 0)),
+                                -item[1],
+                            ),
+                        )
+                        chosen_without_waiting = True
+                    else:
+                        # No usable capacity sample appeared in 300 ms.  Keep
+                        # the previous behavior exactly: accept the first
+                        # later positive-slot response and immediately proceed.
+                        remaining_futures = [
+                            future for future in futures
+                            if future not in sampled_futures
+                        ]
+                        for future in as_completed(remaining_futures):
+                            host, port = futures[future]
+                            result = future.result()
+                            tried.append(f"{host}:{port}")
+                            slots_left = getattr(result, "slots_left", None)
+                            if (result is not None
+                                    and isinstance(slots_left, (int, float))
+                                    and int(slots_left) > 0):
                                 best = result
-                                chosen_early = True
-                                # The other probes have no side effects and are
-                                # deliberately abandoned: waiting for a slower
-                                # sibling would postpone a live lie handshake.
-                                for sibling in futures:
-                                    if sibling is not future:
-                                        sibling.cancel()
+                                chosen_without_waiting = True
                                 break
                             full.append(f"{host}:{port}")
                 finally:
-                    # Never wait for slow siblings after the first port with a
-                    # remaining slot answered.  Without this, Executor's
-                    # context-manager shutdown would undo the early choice.
-                    executor.shutdown(wait=not chosen_early)
+                    # The selected endpoint is just a probe observation, so
+                    # slow sibling probes must never delay the later formal
+                    # handshake.  A full/unreachable batch is allowed to
+                    # finish so its next batch starts with a clean state.
+                    if chosen_without_waiting:
+                        for sibling in futures:
+                            sibling.cancel()
+                    executor.shutdown(wait=not chosen_without_waiting)
                 if best is not None:
                     break
             if best is None:
@@ -657,7 +708,7 @@ def main() -> int:
                 auto_lie_endpoint["candidates"] = candidates
             auto_lie_logger.info(
                 "AUTO LIE preflight ready: cached WebSocket endpoint %s "
-                "(slots_left=%s, %.0f ms; first available result from %d of %d candidate(s))",
+                "(slots_left=%s, %.0f ms; six-port capacity sample, %d of %d candidate(s) replied)",
                 best.endpoint, best.slots_left, best.rtt_ms, len(tried), len(candidates),
             )
         except Exception as exc:
@@ -1644,6 +1695,21 @@ def main() -> int:
     # shutdown_worker = ShutdownWorker(...)
     shutdown_worker = None
     hotkey_actions: "queue.Queue[str]" = queue.Queue(maxsize=32)
+    # Ctrl+` is an emergency stop path.  Its hook callback runs independently
+    # of Tk, so it can disarm automation even while the dashboard is occupied
+    # with a diagnostic repaint.  Tk consumes this marker later to update its
+    # buttons and text; it never repeats the physical key cleanup.
+    hotkey_stop_prearmed = threading.Event()
+    hotkey_stop_cleanup_done = threading.Event()
+    hotkey_stop_prearm_lock = threading.Lock()
+
+    def consume_hotkey_stop_prearmed() -> bool:
+        with hotkey_stop_prearm_lock:
+            if not hotkey_stop_prearmed.is_set():
+                return False
+            hotkey_stop_prearmed.clear()
+            return True
+
     # Global hotkeys are UI actions: they are only useful (and only safe) when
     # the interactive UI drains the action queue.  A headless/--no-ui instance
     # (a dry-run smoke test, or a leftover process) must NOT claim the Ctrl
@@ -1667,6 +1733,45 @@ def main() -> int:
         ``HotkeyWorker.delivery`` (defaults to "hook" while this cleanup is
         enabled).
         """
+
+        if action == "toggle_patrol":
+            # The stop gate must be first.  ``force_key_up`` below can wait
+            # for an in-flight key transaction, which previously made Ctrl+`
+            # look unresponsive even though the hook had already recognized
+            # it.  This block performs no Tk or physical-input work.
+            with hotkey_stop_prearm_lock:
+                if not hotkey_stop_prearmed.is_set() and patrol_controller.is_enabled():
+                    hotkey_stop_prearmed.set()
+                    hotkey_stop_cleanup_done.clear()
+                    automation_active.clear()
+                    patrol_controller.set_enabled(False)
+                    try:
+                        movement_worker.disarm_patrol_input()
+                        motion_arbiter.cancel_pending("hotkey patrol stop")
+                        stair_jump_worker.cancel_pending("hotkey patrol stop")
+                    except Exception:
+                        logging.exception("STOP PATROL: hotkey worker disarm failed")
+
+                    def release_hotkey_input() -> None:
+                        try:
+                            # Ctrl+` was received while the game was active.
+                            # Never refocus from this emergency path: focus
+                            # selection may block and defeat immediate stop.
+                            _stop_live_input(
+                                key_sender, automation_active,
+                                refocus_before_release=False,
+                            )
+                        finally:
+                            hotkey_stop_cleanup_done.set()
+
+                    threading.Thread(
+                        target=release_hotkey_input,
+                        name="hotkey-patrol-stop-cleanup",
+                        daemon=True,
+                    ).start()
+                    logging.info(
+                        "STOP PATROL: hotkey pre-armed before any key cleanup or Tk dispatch"
+                    )
 
         try:
             key_sender.force_key_up("ctrl", reason=f"hotkey chord: {action}")
@@ -2124,7 +2229,7 @@ def main() -> int:
             climb_arrival_world_tolerance=float(
                 calibration.get("climb_arrival_world_tolerance", 0.20)
             ),
-            climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.10)),
+            climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.12)),
             climb_y_change_required=float(calibration.get("climb_y_change_required", 0.015)),
             climb_world_y_change_required=float(
                 calibration.get("climb_world_y_change_required", 0.75)
@@ -2467,6 +2572,8 @@ def main() -> int:
             small_step_worker=small_step_worker,
             hotkey_queue=hotkey_actions,
             hotkey_worker=hotkey_worker,
+            on_hotkey_stop_prearmed=consume_hotkey_stop_prearmed,
+            hotkey_stop_cleanup_done_event=hotkey_stop_cleanup_done,
             quick_pickup_worker=quick_pickup_worker,
             quick_pickup_results=quick_pickup_results,
             reconnect_worker=reconnect_worker,
@@ -2512,11 +2619,72 @@ def main() -> int:
     )
 
     if ui_worker is not None:
-        # 自动过测谎: the lie detector's own event drives the automatic api pass (the callback
-        # only raises a flag; the panel's Tk thread services it, so nothing Tk is touched
-        # from the detector's thread).
+        # 自动过测谎 starts only when the grey lie square and the yellow player
+        # marker appear in the SAME shared capture.  This replaces the old
+        # timed window-recreation/refocus guard: a white/black login surface
+        # has no player marker, while a real live lie scene does.  The probe
+        # never captures another frame and uses a private geometry detector,
+        # so it cannot disturb patrol's live minimap detector.
+        auto_lie_marker_geometry: dict[tuple[int, int], object] = {}
+        auto_lie_marker_detector = MinimapDetector(
+            fallback_region=minimap_region,
+            dedicated_crop=True,
+            opencv_size=MINIMAP_ANALYSIS_SIZE,
+        )
+        auto_lie_marker_miss_logged = False
+
+        def auto_lie_frame_has_marker(frame: object) -> bool:
+            try:
+                image = getattr(frame, "image", None)
+                if image is None:
+                    return False
+                image_size = image.size
+                detection = minimap_detector.retained_geometry(image_size)
+                if detection is None:
+                    detection = auto_lie_marker_geometry.get(image_size)
+                if detection is None:
+                    detection = minimap_calibration_from_dict(
+                        config_store.read_section("minimap_calibration"), image_size
+                    )
+                    if detection is not None:
+                        auto_lie_marker_geometry[image_size] = detection
+                if detection is None:
+                    # Automatic lie may be enabled before the first patrol
+                    # start on a map. This private fallback runs only for a
+                    # grey-box candidate and never alters patrol geometry.
+                    detection = auto_lie_marker_detector.detect(image)
+                marker_rgb = np.asarray(
+                    image.crop(detection.analysis_box).convert("RGB")
+                )
+                return detect_yellow_diamond(marker_rgb) is not None
+            except Exception:
+                auto_lie_logger.debug(
+                    "自动过测谎: same-frame marker gate could not inspect the candidate",
+                    exc_info=True,
+                )
+                return False
+
+        def forward_auto_lie_candidate(match: object, frame: object) -> None:
+            nonlocal auto_lie_marker_miss_logged
+            if match is None:
+                auto_lie_marker_miss_logged = False
+                ui_worker.on_lie_event_for_api(None)
+                return
+            if auto_lie_frame_has_marker(frame):
+                auto_lie_marker_miss_logged = False
+                ui_worker.on_lie_event_for_api(match)
+                return
+            if not auto_lie_marker_miss_logged:
+                auto_lie_logger.info(
+                    "自动过测谎: grey lie square ignored because the yellow marker "
+                    "is absent in the same capture"
+                )
+                auto_lie_marker_miss_logged = True
+
+        # The callback only raises a flag; the panel's Tk thread services it,
+        # so nothing Tk is touched from the detector thread.
         lie_detector_worker.add_lie_seen_callback(
-            lambda match, _frame: ui_worker.on_lie_event_for_api(match)
+            forward_auto_lie_candidate
         )
 
     def auto_lie_is_active() -> bool:

@@ -486,7 +486,15 @@ class HotkeyWorker(threading.Thread):
         # this even if a legacy hotkey.json disabled the general cleanup: a
         # trader wait is unrelated to whether the game's Ctrl attack is safe.
         release_ctrl = self.release_ctrl_after_chord or action.startswith("trade:")
-        if release_ctrl and not preserve_modifier:
+        # Ctrl+` is also the emergency patrol stop.  Its callback clears the
+        # automation gate before any Tk poll or keyboard transaction, so it
+        # must run even when a legacy config opted out of the general Ctrl
+        # release helper.
+        run_callback = (
+            (release_ctrl and not preserve_modifier)
+            or action == "toggle_patrol"
+        )
+        if run_callback:
             callback = self.on_chord
             if callable(callback):
                 try:
@@ -494,12 +502,13 @@ class HotkeyWorker(threading.Thread):
                 except Exception:
                     LOG.warning("hotkey Ctrl cleanup failed for %s", action,
                                 exc_info=True)
-            if native_delivery:
+            if release_ctrl and not preserve_modifier and native_delivery:
                 # RegisterHotKey can deliver WM_HOTKEY before the passive
                 # hook sees Ctrl-down. The native chord itself is direct
                 # evidence that Ctrl is physically held.
                 self._ctrl_down = True
-            self._arm_ctrl_release(action)
+            if release_ctrl and not preserve_modifier:
+                self._arm_ctrl_release(action)
         # Exempt actions bypass the two-second cooldown; MOD_NOREPEAT / the hook key-up state still
         # prevent a held chord from firing repeatedly.
         repeatable = self._cooldown_exempt(action)

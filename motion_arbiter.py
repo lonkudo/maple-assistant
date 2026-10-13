@@ -83,7 +83,7 @@ class MotionArbiter(threading.Thread):
         # asking for another one.  被撞反击 deliberately SHARES this value (see
         # ``_duration_for``): one post-cast quiet period covers both motions
         # instead of two constants that can drift apart.
-        step_motion_seconds: float = 0.60,
+        step_motion_seconds: float = 0.70,
         attack_grace_seconds: float = 0.73,
         delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:

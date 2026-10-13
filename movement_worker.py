@@ -1259,12 +1259,15 @@ class ClimbState:
     failed_shift_used: bool = False
     # Sideways climb-jump attempts already made on this approach to reach a
     # rope whose bottom a straight jump cannot reach (stairs/benches beside
-    # the rope).  The side is chosen by the worker and alternates every
-    # failed cycle; this counter is informational (log + alternation within
-    # one continuous approach).
+    # the rope). The launch side is random for every failed cycle.
     lateral_hop_cycles: int = 0
     up_held: bool = False
     progress_check_frames: int = 0
+    # A failed grab may retry early only after the marker has settled.  The
+    # attempt timestamp is recorded before its jump chord, and the unchanged
+    # Y streak is sampled from fresh minimap captures thereafter.
+    attempt_started_at: Optional[float] = None
+    settled_y_frames: int = 0
     attach_frames: int = 0
     recent_y: list[float] = field(default_factory=list)
     target_layer_frames: int = 0
@@ -1458,7 +1461,7 @@ def climb(
     state: ClimbState,
     *,
     climb_duration: float = 0.45,
-    nudge_duration: float = 0.10,
+    nudge_duration: float = 0.12,
     y_change_required: float = 0.015,
     world_y_change_required: float = 0.75,
     world_y_stall_change_required: float = 0.15,
@@ -1474,10 +1477,6 @@ def climb(
     arrival_y: Optional[float] = None,
     arrival_tolerance: float = 0.02,
     arrival_in_progress: bool = False,
-    # Side for the under-rope lateral recovery (see the failed-cycle block):
-    # the worker alternates it after every sideways climb jump.  Left when
-    # unset (direct/legacy callers).
-    lateral_hop_side: Optional[str] = None,
 ) -> str:
     """Try to grab the rope and verify it from the next minimap screenshot.
 
@@ -1545,6 +1544,7 @@ def climb(
                 if preferred_direction in ("left", "right", "up") else "left"
             )
         def jump_toward() -> bool:
+            state.attempt_started_at = time.monotonic()
             return _directional_jump_climb(
                 sender, direction, nudge_duration, climb_duration, persistent_up
             )
@@ -1563,6 +1563,7 @@ def climb(
             state.phase = next_phase
             state.up_held = persistent_up
             state.progress_check_frames = 0
+            state.settled_y_frames = 0
             state.attach_frames = 0
             state.recent_y = []
             state.last_world_y = state.baseline_world_y
@@ -1613,6 +1614,10 @@ def climb(
                     and abs(player.y - state.last_marker_y) <= 0.001
                     and abs(player.x - state.last_marker_x) <= 0.001
                 )
+                if abs(marker_frame_progress) <= 0.0001:
+                    state.settled_y_frames += 1
+                else:
+                    state.settled_y_frames = 0
             state.last_marker_y = player.y
             state.last_marker_x = player.x
             state.recent_y.append(player.y)
@@ -1680,6 +1685,7 @@ def climb(
             def restart_left_climb() -> bool:
                 if key_up is not None:
                     key_up("up")
+                state.attempt_started_at = time.monotonic()
                 return _directional_jump_climb(
                     sender,
                     "left",
@@ -1701,6 +1707,7 @@ def climb(
                 state.phase = "check-primary-left"
                 state.up_held = True
                 state.progress_check_frames = 0
+                state.settled_y_frames = 0
                 state.attach_frames = 0
                 state.recent_y = []
                 state.last_world_y = state.baseline_world_y
@@ -1884,15 +1891,40 @@ def climb(
             # The first upward movement may simply be the apex of an ordinary
             # jump. Give delayed minimap/world updates a short grace window,
             # but never promote an unchanged frame to "attached".
-            if state.progress_check_frames < 6:
+            attempt_elapsed = (
+                time.monotonic() - state.attempt_started_at
+                if state.attempt_started_at is not None else 0.0
+            )
+            if (state.progress_check_frames < 6
+                    and not (
+                        attempt_elapsed >= 0.25
+                        and state.settled_y_frames >= 2
+                    )):
                 return "holding-up-awaiting-progress"
             state.attach_frames = 0
-        # Phase-correlation and the game animation can lag the jump chord by
-        # several minimap frames. Keep Up owned during that grace period;
-        # releasing it on the first centered-diamond frame makes the character
-        # jump away from the rope before the map starts scrolling.
-        if state.progress_check_frames < 4:
+        # A failed grab retries after two consecutive unchanged-Y readings,
+        # but never before 250 ms.  That provides two independent minimap
+        # captures at the normal 5-fps cadence without mistaking the jump
+        # launch/apex for a landing.  A 500 ms cap prevents a noisy marker
+        # from leaving the rope state held forever.
+        attempt_elapsed = (
+            time.monotonic() - state.attempt_started_at
+            if state.attempt_started_at is not None else 0.0
+        )
+        settled_for_retry = bool(
+            attempt_elapsed >= 0.25 and state.settled_y_frames >= 2
+        )
+        if not settled_for_retry and attempt_elapsed < 0.50:
             return "holding-up-awaiting-progress"
+        if settled_for_retry:
+            LOG.info(
+                "CLIMB grab retry: marker Y settled for %d frames after %.3fs",
+                state.settled_y_frames, attempt_elapsed,
+            )
+        else:
+            LOG.info(
+                "CLIMB grab retry: 500 ms settle fallback elapsed"
+            )
         # No upward progress on the fresh screenshot: release this Up claim
         # before another directional jump attempt.
         key_up = getattr(sender, "key_up", None)
@@ -1917,19 +1949,11 @@ def climb(
             rope_x is not None
             and abs(rope_x - player.x) <= straight_up_tolerance
         )
-        skip_straight_retry = bool(
-            inside_straight_up_zone
-            and state.phase == "check-primary-up"
-        )
-        if skip_straight_retry:
-            # Directly under the rope gets one Alt+Up attempt only.  If it
-            # fails, fall through immediately to the sideways early-Up hop
-            # below; a second identical jump only added delay on high ropes.
-            LOG.info(
-                "CLIMB under-rope primary Alt+Up failed; trying sideways recovery"
-            )
-            retry_direction = None
-        elif inside_straight_up_zone:
+        if inside_straight_up_zone:
+            # A centred rope gets two direct Alt+Up grab attempts before the
+            # randomized sideways recovery.  The second attempt moves to
+            # ``check-opposite``, which deliberately falls through below if
+            # it also cannot attach.
             retry_direction = "up"
         elif player is not None and rope_x is not None:
             retry_direction = "right" if rope_x - player.x > 0 else "left"
@@ -1943,6 +1967,7 @@ def climb(
 
         if retry_direction is not None:
             def jump_toward_current_rope_side() -> bool:
+                state.attempt_started_at = time.monotonic()
                 return _directional_jump_climb(
                     sender, retry_direction, nudge_duration, climb_duration, persistent_up
                 )
@@ -1959,6 +1984,7 @@ def climb(
                 state.phase = "check-opposite"
                 state.up_held = persistent_up
                 state.progress_check_frames = 0
+                state.settled_y_frames = 0
                 state.attach_frames = 0
                 state.recent_y = []
                 state.last_world_y = state.baseline_world_y
@@ -1971,11 +1997,11 @@ def climb(
 
     # Both attempts failed.  Recovery depends on where the character is:
     #
-    # - RIGHT UNDER THE ROPE (straight-up zone): the one plain jump+climb
-    #   attempt failed, so this rope bottom hangs above jump reach
+    # - RIGHT UNDER THE ROPE (straight-up zone): both plain Alt+Up attempts
+    #   failed, so this rope bottom hangs above jump reach
     #   here (or a knock-down left the character on a step below it).  Try a
     #   real SIDEWAYS climb jump - Alt+Left / Alt+Right with Up held from the
-    #   very start of the jump (the worker alternates the side every failed
+    #   very start of the jump (the launch side is random every failed
     #   cycle): a stair/bench beside the rope may be reachable and the rope
     #   grabbable from the higher spot, and the early Up also grabs the rope
     #   the moment the sideways jump touches it.
@@ -1986,18 +2012,11 @@ def climb(
         and abs(rope_x - player.x) <= straight_up_tolerance
     )
     if under_rope:
-        # Always jump back TOWARD the live rope location.  When the marker is
-        # exactly centred (or quantised to the same minimap pixel), keep the
-        # alternating fallback so consecutive attempts explore both sides.
-        rope_gap = rope_x - player.x
-        if abs(rope_gap) > 1e-9:
-            side = "right" if rope_gap > 0 else "left"
-        else:
-            side = (
-                lateral_hop_side
-                if lateral_hop_side in ("left", "right") else "left"
-            )
-        pre_step_direction = "right" if side == "left" else "left"
+        # Randomly step away from one side of the rope, then jump back toward
+        # it.  Choosing the launch side on every retry avoids a fixed left or
+        # right pattern when the player is quantised on the rope's centre.
+        pre_step_direction = random.choice(("left", "right"))
+        side = "right" if pre_step_direction == "left" else "left"
         state.lateral_hop_cycles += 1
 
         def climb_jump_side() -> bool:
@@ -2007,6 +2026,7 @@ def climb(
             press = getattr(sender, "press", None)
             if not callable(press):
                 raise TypeError("lateral climb recovery requires press()")
+            state.attempt_started_at = time.monotonic()
             LOG.info(
                 "CLIMB under-rope recovery: small step %s, then Alt+%s with early Up",
                 pre_step_direction, side,
@@ -2029,6 +2049,7 @@ def climb(
             state.phase = "check-opposite"
             state.up_held = persistent_up
             state.progress_check_frames = 0
+            state.settled_y_frames = 0
             state.attach_frames = 0
             state.recent_y = []
             state.last_world_y = state.baseline_world_y
@@ -2498,7 +2519,6 @@ class MovementWorker(threading.Thread):
             arrival_y=arrival_y,
             arrival_tolerance=arrival_tolerance,
             arrival_in_progress=arrival_in_progress,
-                lateral_hop_side=self._climb_lateral_side,
             )
         LOG.info("climb recovery state: %s", result)
         if result == "succeeded" and self._route_layers:
@@ -2520,14 +2540,11 @@ class MovementWorker(threading.Thread):
             # at left-most after a few cycles instead of jumping in place.
             self._climb_cycle_failed()
         elif isinstance(result, str) and result.endswith("-lateral-toward-rope"):
-            # Under-rope sideways climb jump: alternate the side for the
-            # next attempt and count the streak.  The walk back to the rope
+            # Under-rope sideways climb jump: count the retry streak.  The
+            # next launch side is selected randomly.  The walk back to the rope
             # must NOT reset this streak (walks reset the ordinary failure
             # counter), otherwise a rope the sideways jumps cannot reach
             # would loop forever without ever restarting the approach.
-            self._climb_lateral_side = (
-                "right" if self._climb_lateral_side == "left" else "left"
-            )
             self._climb_lateral_streak += 1
             if self._climb_lateral_streak >= self.climb_lateral_cycles_reset:
                 self._climb_lateral_streak = 0
@@ -3528,7 +3545,7 @@ class MovementWorker(threading.Thread):
         climb_layer_confirm_frames: int = 4,
         climb_layer_confirm_seconds: float = 0.3,
         climb_arrival_world_tolerance: float = 0.20,
-        climb_nudge_seconds: float = 0.10,
+        climb_nudge_seconds: float = 0.12,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
         climb_world_y_stall_change_required: float = 0.15,
@@ -3716,14 +3733,12 @@ class MovementWorker(threading.Thread):
         # 同一层爬楼反复失败的"重置回最左"次数：超过上限后升级为完整自救
         # （回第一层 + 重启 + 重锚定），避免无限在同一层巡逻不爬楼。
         self._climb_restarts = 0
-        # Under-rope lateral recovery state: the side to try next (alternates
-        # after every sideways climb jump) and the consecutive-failure streak
-        # that restarts the rope approach once the rope cannot be reached
-        # even from the side (stairs/bench hops included).
+        # Under-rope lateral recovery state.  Each launch side is random; the
+        # streak restarts the rope approach once the rope cannot be reached
+        # even from either side (stairs/bench hops included).
         self.climb_lateral_cycles_reset = max(
             1, int(climb_lateral_cycles_reset)
         )
-        self._climb_lateral_side = "left"
         self._climb_lateral_streak = 0
         # 爬楼失败时记录上一次的标记 X，用于检测"X 冻结"（绳子不可达）。
         self._climb_last_x: Optional[float] = None
@@ -4937,12 +4952,13 @@ class MovementWorker(threading.Thread):
         """Return a jump when the marker enters an armed recorded point.
 
         The point layer is not a gate: rope approach frames can have an
-        ambiguous/current layer label.  The recorded *direction* is always a
-        gate: 右跳 fires only while travelling right and 左跳 only while
-        travelling left, including during a rope approach.  A climb with no
-        known horizontal approach direction does not guess.  Allowing either
-        point during a climb made a 左跳 fire while the route phase was right,
-        which then left the rope planner in a misleading ``action=wait`` state.
+        ambiguous/current layer label.  On a floor or while approaching a
+        rope, the recorded *direction* is a gate: 右跳 fires only while
+        travelling right and 左跳 only while travelling left.  Once the marker
+        is demonstrably climbing, however, its travel direction is ``up``;
+        that is a rope-exit transition, so either recorded horizontal exit is
+        eligible.  The direction used to mount the rope must not suppress a
+        later right/left jump recorded higher on that same rope.
 
         A point fires at most ONCE PER LEG (``_jump_point_leg_key``) and is
         armed again by the next leg or the next Start Patrol pass.  Leaving the
@@ -4963,16 +4979,17 @@ class MovementWorker(threading.Thread):
         # first; the next patrol leg will re-arm legitimate points.
         if self._fall_frames > 0 or self._fall_pending:
             return None
-        if travel_direction not in ("left", "right"):
+        if travel_direction not in ("left", "right", "up"):
             travel_direction = (
                 plan.decision.key
                 if plan is not None and plan.decision.key in ("left", "right")
                 else None
             )
-        # A directional point must never guess at the rope centre.  The
-        # approach direction is retained by the route/climb state, so if it
-        # is absent this frame simply cannot dispatch a left/right record.
-        if travel_direction not in ("left", "right"):
+        # A stationary/ordinary rope-approach marker must never guess at the
+        # rope centre.  ``up`` is different: active climb detection has
+        # already proved that the marker is travelling on the rope, and must
+        # be allowed to find either recorded rope-exit direction.
+        if travel_direction not in ("left", "right", "up"):
             return None
 
         matches: list[tuple[tuple[str, int], str, str]] = []
@@ -4988,7 +5005,8 @@ class MovementWorker(threading.Thread):
                 direction = str(point.get("direction", "")).casefold()
                 if direction not in ("left", "right"):
                     continue
-                if direction != travel_direction:
+                if (travel_direction != "up"
+                        and direction != travel_direction):
                     continue
                 try:
                     matched = (
@@ -5002,10 +5020,15 @@ class MovementWorker(threading.Thread):
 
         if climbing and len(matches) > 1:
             # Two points can match at once on a rope (a 左跳 and a 右跳 recorded
-            # at the same height).  Prefer the recorded direction the character
-            # is actually travelling; the stable sort keeps the X-sorted
-            # recording order for everything else.
-            matches.sort(key=lambda match: match[2] != travel_direction)
+            # at the same height).  During a vertical climb, the mounting side
+            # is a tie-breaker only; it is never a filter.  The stable sort
+            # keeps the recorded order for all other candidates.
+            preferred_direction = (
+                travel_direction if travel_direction in ("left", "right")
+                else self._rope_approach_direction
+            )
+            if preferred_direction in ("left", "right"):
+                matches.sort(key=lambda match: match[2] != preferred_direction)
 
         matched_tokens = {token for token, _name, _direction in matches}
         # A fired point stays suppressed until the marker leaves its zone (the
@@ -12836,12 +12859,12 @@ class MovementWorker(threading.Thread):
                                 jump_layer,
                                 None,
                                 climbing=True,
-                                # A return climb has no ordinary left/right
-                                # patrol decision, but it retains the actual
-                                # side used to approach the rope. Preserve
-                                # that direction so a matching 左跳/右跳 can
-                                # fire while climbing back to the stake.
-                                travel_direction=self._rope_approach_direction,
+                                # A marker with an active Up hold is climbing:
+                                # it is travelling vertically, not in the
+                                # horizontal direction that originally mounted
+                                # the rope.  This deliberately permits either
+                                # recorded left/right rope-exit jump.
+                                travel_direction="up",
                             )
                             if climb_jump_point is not None:
                                 break
