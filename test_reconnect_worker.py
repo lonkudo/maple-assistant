@@ -1426,7 +1426,8 @@ class ClientSpaceTests(unittest.TestCase):
 
         from reconnect_worker import (
             CHANNEL_FIRST_CLIENT, CHANNEL_ROW_STEP_CLIENT, CHANNEL_STEP_CLIENT, WORLD_ROW_CLIENT,
-            WORLD_ROW_STEP_CLIENT, window_client_delta, window_client_length, window_client_point,
+            WORLD_COLUMN_STEP_CLIENT, WORLD_LINE_STEP_CLIENT, window_client_length,
+            window_client_point,
         )
 
         size = (1080, 768)
@@ -1438,7 +1439,8 @@ class ClientSpaceTests(unittest.TestCase):
         self.assertLessEqual(abs(channel_y - 387), 3, "his 1080 channel 1 click")
         # 蘑菇仔 is 82 px to the RIGHT at 1080 (his answer), the column pitch is 74.3 (his 75) and the
         # row pitch 24.1 (the row bands in his screenshot measured 24.5)
-        self.assertEqual(window_client_delta(WORLD_ROW_STEP_CLIENT, size), (82, 0))
+        self.assertAlmostEqual(window_client_length(WORLD_COLUMN_STEP_CLIENT, size), 82.3, places=1)
+        self.assertAlmostEqual(window_client_length(WORLD_LINE_STEP_CLIENT, size), 21.3, places=1)
         self.assertAlmostEqual(window_client_length(CHANNEL_STEP_CLIENT, size), 74.3, places=1)
         self.assertAlmostEqual(window_client_length(CHANNEL_ROW_STEP_CLIENT, size), 24.1, places=1)
 
@@ -2105,12 +2107,14 @@ class KeyboardOnlyTests(unittest.TestCase):
                      "layout_from_points"):
             self.assertFalse(hasattr(module, gone), gone)
 
-    def test_the_world_row_is_clicked_at_the_measured_position(self):
-        """The five worlds are in ONE horizontal line: click the row, never walk with 'down'."""
+    def test_the_world_grid_is_clicked_at_the_measured_position(self):
+        """Five worlds fill line one; 红螃蟹 starts line two without keyboard traversal."""
 
-        from reconnect_worker import WORLD_ROW_CLIENT, WORLD_ROW_STEP_CLIENT
+        from reconnect_worker import (
+            WORLD_COLUMNS, WORLD_COLUMN_STEP_CLIENT, WORLD_LINE_STEP_CLIENT, WORLD_ROW_CLIENT,
+        )
 
-        self.assertEqual(len(WORLD_NAMES), 5)
+        self.assertEqual(len(WORLD_NAMES), 6)
         case = ReconnectSequenceTests("test_the_settings_are_validated")
         case.setUp()
         try:
@@ -2131,10 +2135,12 @@ class KeyboardOnlyTests(unittest.TestCase):
                 worker.set_world(world)
                 worker.set_channel(1)
                 worker._handle_disconnect()
-                expected_x = 100 + WORLD_ROW_CLIENT[0] + index * WORLD_ROW_STEP_CLIENT[0]
-                expected_y = 50 + WORLD_ROW_CLIENT[1] + index * WORLD_ROW_STEP_CLIENT[1]
+                expected_x = 100 + WORLD_ROW_CLIENT[0] + \
+                    (index % WORLD_COLUMNS) * WORLD_COLUMN_STEP_CLIENT
+                expected_y = 50 + WORLD_ROW_CLIENT[1] + \
+                    (index // WORLD_COLUMNS) * WORLD_LINE_STEP_CLIENT
                 self.assertIn((expected_x, expected_y), clicks,
-                              f"{world} (row {index + 1}) must be clicked at "
+                              f"{world} must be clicked at "
                               f"({expected_x}, {expected_y}); clicks were {clicks}")
         finally:
             case.tearDown()

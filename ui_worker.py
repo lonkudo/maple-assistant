@@ -2662,8 +2662,8 @@ class UiWorker(threading.Thread):
                 "自动过测谎: selection loaded as %s",
                 "ON" if saved_api_auto_lie else "OFF",
             )
-            # Keep restart, lie, and reconnect as separate selections.  自动重开
-            # only hands a newly launched client to 自动重连; it must never
+            # Keep cleanup, lie, and reconnect as separate selections.  清理内存
+            # only hands the logged-out client to 自动重连; it must never
             # silently alter the reconnect selection itself.
             reconnect_row = ttk.Frame(extra_panel)
             reconnect_row.pack(fill="x", pady=(4, 0))
@@ -2766,22 +2766,22 @@ class UiWorker(threading.Thread):
             self._auto_restart_var = tk.BooleanVar(value=False)
             self._auto_restart_check = ttk.Checkbutton(
                 restart_row,
-                text="自动重开",
+                text="清理内存",
                 variable=self._auto_restart_var,
                 command=self._shutdown_on_change,
             )
             self._auto_restart_check.pack(side="left")
             restart_hint = HoverTooltip(
                 self._auto_restart_check,
-                "当内存达到98%的时候，主动发送重开消息，然后重开游戏。",
+                "内存达到98%以后，主动发送下线消息 （未配置不发送），然后重连游戏",
             )
             restart_hint.set_enabled(True)
             self._bind_key_tooltips.append(restart_hint)
             self._restart_offline_message_var = tk.StringVar(value="")
             self._restart_offline_message_button = ttk.Button(
-                restart_row, text="重开消息",
+                restart_row, text="下线消息",
                 command=lambda: self._edit_workflow_message(
-                    "restart_offline", "重开消息", self._restart_offline_message_var
+                    "restart_offline", "下线消息", self._restart_offline_message_var
                 ),
                 takefocus=False,
             )
@@ -6663,11 +6663,11 @@ class UiWorker(threading.Thread):
                     self._refresh_license_ui()
                     continue
                 if state == "restart":
-                    # 自动重开 belongs to the game/layer lifecycle, not to
+                    # 清理内存 belongs to the game/layer lifecycle, not to
                     # the Additional Functions control area.  Keep its live
                     # progress beside the patrol calibration status.
                     if hasattr(self, "_control_status"):
-                        self._control_status.configure(text=f"自动重开：{detail}")
+                        self._control_status.configure(text=f"清理内存：{detail}")
                     continue
                 if not hasattr(self, "_reconnect_status"):
                     continue
@@ -10073,7 +10073,7 @@ class UiWorker(threading.Thread):
                     str(data.get("restart_offline_message", "")).strip()[:500]
                 )
                 self._refresh_workflow_message_button(
-                    "restart_offline", "重开消息", self._restart_offline_message_var
+                    "restart_offline", "下线消息", self._restart_offline_message_var
                 )
             if hasattr(self, "_reconnect_message_var"):
                 self._reconnect_message_var.set(

@@ -32,19 +32,32 @@ class WorkflowCancelWorker(threading.Thread):
         self.stop_event = stop_event
         self.workflows = tuple(workflows)
         self._was_pressed = False
+        self._watching = False
 
     @staticmethod
-    def _escape_pressed() -> bool:
+    def _escape_state() -> int:
+        """Return both Windows Esc signals: currently down and pressed-since-read.
+
+        The previous implementation kept only the high bit (currently down).
+        A quick physical tap could therefore begin and end between two polls,
+        making Esc appear to do nothing in every workflow using this shared
+        supervisor.  The low bit latches that short tap until it is read.
+        """
+
         if sys.platform != "win32":
-            return False
+            return 0
         try:
-            return bool(
+            return int(
                 ctypes.WinDLL("user32", use_last_error=True)
-                .GetAsyncKeyState(VK_ESCAPE) & 0x8000
+                .GetAsyncKeyState(VK_ESCAPE)
             )
         except Exception:
             LOG.debug("workflow cancel: Esc state could not be read", exc_info=True)
-            return False
+            return 0
+
+    @classmethod
+    def _escape_pressed(cls) -> bool:
+        return bool(cls._escape_state() & 0x8001)
 
     def run(self) -> None:
         LOG.info("workflow cancel worker started (Esc watches reconnect, restart, auto-lie, Ctrl+Q trade)")
@@ -56,8 +69,24 @@ class WorkflowCancelWorker(threading.Thread):
                         active.append((name, cancel))
                 except Exception:
                     LOG.debug("workflow cancel: active check failed for %s", name, exc_info=True)
-            pressed = self._escape_pressed() if active else False
+            if active and not self._watching:
+                # Consume a stale low-bit latch from before the workflow began.
+                # If Esc is already physically held, require release + a new
+                # press rather than cancelling the new workflow immediately.
+                state = self._escape_state()
+                self._was_pressed = bool(state & 0x8000)
+                self._watching = True
+                LOG.info("workflow cancel: Esc armed for %s",
+                         ", ".join(name for name, _cancel in active))
+                continue
+            if not active:
+                self._watching = False
+                self._was_pressed = False
+                continue
+            pressed = self._escape_pressed()
             if pressed and not self._was_pressed:
+                LOG.info("workflow cancel: physical Esc observed while %s active",
+                         ", ".join(name for name, _cancel in active))
                 cancelled = []
                 for name, cancel in active:
                     try:

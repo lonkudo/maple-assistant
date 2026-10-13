@@ -93,7 +93,7 @@ ASSETS_DIR = ROOT / "recording-assets"
 
 # The worlds the operator can choose between (the order is the order of the list in the
 # game's first select window).
-WORLD_NAMES = ("蓝蜗牛", "蘑菇仔", "绿水灵", "漂漂猪", "小白兔")
+WORLD_NAMES = ("蓝蜗牛", "蘑菇仔", "绿水灵", "漂漂猪", "小白兔", "红螃蟹")
 CHANNEL_MIN = 1
 CHANNEL_MAX = 60
 CHANNEL_DEFAULT = 1
@@ -202,14 +202,16 @@ LOGIN_EXIT_BUTTON_CLIENT_BOXES = (
     (1040, 467, 95, 29),                 # his 1080 pick (897, 467, 95x29), mapped back
 )
 # The WORLD list: measured from the operator's own clicks on screenshots/channel_select_first.jpg.
-# The five worlds are in ONE HORIZONTAL LINE (his clicks: (498,163) and (602,163)), so the list is
-# reached with LEFT/RIGHT, not up/down - which is exactly why the old "press down (row-1) times"
-# left the default 蓝蜗牛 selected and Enter confirmed it.  World w is clicked directly:
+# The first five worlds form one horizontal line (his clicks: (498,163) and (602,163)). 红螃蟹 is
+# the first element of the second wooden-board line, 27 reference pixels below 蓝蜗牛. Every world
+# is clicked directly; no keyboard traversal or implicit wrapping is trusted:
 # Confirmed again on 2026-09-17 for the 1080 client: 蘑菇仔 is to the RIGHT of 蓝蜗牛 (he answered
 # "右边（向右 82px）" = 104 x 0.7906), and his 1080 pick of 蓝蜗牛 (392, 209) is within 2 px of where
 # this preset maps to.  A second pick he made 22 px lower was NOT a world - the step stays horizontal.
-WORLD_ROW_CLIENT = (498, 163)            # centre of 蓝蜗牛 (world 1)
-WORLD_ROW_STEP_CLIENT = (104, 0)         # world 2 sits 104 px to its right
+WORLD_ROW_CLIENT = (498, 163)            # centre of 蓝蜗牛: line 1, column 1
+WORLD_COLUMNS = 5                        # five worlds per wooden-board line
+WORLD_COLUMN_STEP_CLIENT = 104           # next world on the same line
+WORLD_LINE_STEP_CLIENT = 27              # 红螃蟹 starts line 2, column 1
 # The same dilution trap as the channel list: the highlight that moves when a world is clicked is
 # ~104x30 px inside a 731x507 window, which a 64x36 whole-frame thumbnail averages away.  The world
 # row itself is therefore measured too, so a click that DID work never falls back to the keyboard.
@@ -224,6 +226,36 @@ CHANNEL_STEP_CLIENT = 94                   # channel 2 is 94 px to the right (hi
 CHANNEL_ROW_STEP_CLIENT = 30.5             # fitted from his clicks on rows 1..5
 CHANNEL_VISIBLE_ROWS = 5                   # rows on screen at scroll top 0
 CHANNELS_PER_ROW = 4
+# Channel clicks and channel-number reading are deliberately separate.  The click centre sits on
+# the coloured load bar; the small label above it contains ``频道N``.  The two presets rasterise
+# that label differently, so each one has its own native centre/pitch/number crop and its own set of
+# 60 samples.  Do not scale the 1366 glyphs down and call that a 1080 recogniser.
+CHANNEL_NUMBER_PROFILES = {
+    "1080x768": {
+        "reference_size": (1079, 768),
+        "first": (438.0, 387.0),
+        "column_pitch": 74.25,
+        "row_pitch": 24.1,
+        "number_rel": (-13.0, -16.0, 3.0, 0.0),
+        "asset": "channel_number_templates_1080x768.npz",
+    },
+    "1366x768": {
+        "reference_size": (1366, 768),
+        "first": (555.0, 388.0),
+        "column_pitch": 94.0,
+        "row_pitch": 30.5,
+        "number_rel": (-16.0, -20.0, 4.0, 0.0),
+        "asset": "channel_number_templates_1366x768.npz",
+    },
+}
+CHANNEL_GRID_STARTS = tuple(range(1, 42, CHANNELS_PER_ROW))
+CHANNEL_GRID_TRIM_WORST = 3                # cursor/highlight may obscure a few of the 20 labels
+CHANNEL_GRID_MIN_SCORE = 0.72
+CHANNEL_GRID_MIN_MARGIN = 0.05
+CHANNEL_VERIFY_CONFIRM_READS = 2
+CHANNEL_VERIFY_POLL_SECONDS = 0.20
+CHANNEL_VERIFY_MAX_ATTEMPTS = 32            # enough for all 10 rows plus swallowed-wheel retries
+CHANNEL_VERIFY_SHIFT_PIXELS = 2
 # The list scrolls: one wheel notch shifts it by one row (4 channels) - the operator's measurement.
 # The walk therefore moves down with the keyboard and scrolls one row whenever the selection cannot
 # move any further, so a channel that is not on screen is still reachable.
@@ -306,6 +338,10 @@ CHANNEL_CONFIRM_MARKER_POLL_SECONDS = 0.20
 # The shared WindowKeySender itself first tries its current handle and only then
 # re-anchors to a newly created game window.
 FOCUS_REANCHOR_INTERVAL_SECONDS = 10.0
+# A manual Esc cancels the current run and suppresses automatic disconnect
+# retriggers for one minute.  The checkbox remains selected; this is a cooldown
+# for the current offline episode, not a settings change.
+ESC_RECONNECT_SUPPRESS_SECONDS = 60.0
 # Pause after logging in, before the worker reports the reconnect as finished.
 LOGIN_SETTLE_SECONDS = 1.0
 
@@ -1356,6 +1392,166 @@ def list_scroll_rows(before, after, *, box: tuple[int, int, int, int] = CHANNEL_
     return shift / float(pitch)
 
 
+@dataclass(frozen=True)
+class ChannelGridReading:
+    """One closed-loop reading of the 20 visible channel-number labels."""
+
+    first_channel: int
+    score: float
+    margin: float
+    profile: str
+
+
+_CHANNEL_TEMPLATE_CACHE: dict[str, Any] = {}
+
+
+def _channel_profile(client_size) -> tuple[str, dict[str, Any]]:
+    """Select the closest native sampler; 1080 and 1366 never share glyph samples."""
+
+    width, height = _client_size_tuple(client_size)
+    name = min(
+        CHANNEL_NUMBER_PROFILES,
+        key=lambda candidate: abs(width - CHANNEL_NUMBER_PROFILES[candidate]["reference_size"][0])
+        + abs(height - CHANNEL_NUMBER_PROFILES[candidate]["reference_size"][1]),
+    )
+    return name, CHANNEL_NUMBER_PROFILES[name]
+
+
+def _channel_native_point(point, client_size, profile: dict[str, Any]) -> tuple[float, float]:
+    """Map a point inside one native sampler onto a near-identical capture of that preset."""
+
+    width, height = _client_size_tuple(client_size)
+    reference_width, reference_height = profile["reference_size"]
+    scale = width / float(reference_width)
+    return (
+        float(point[0]) * scale,
+        height / 2.0 + scale * (float(point[1]) - reference_height / 2.0),
+    )
+
+
+def channel_number_box(slot: int, client_size=REFERENCE_CLIENT) -> tuple[int, int, int, int]:
+    """Return the native number-only box for visible slot 0..19 as x, y, width, height."""
+
+    _name, profile = _channel_profile(client_size)
+    slot = max(0, min(int(slot), CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1))
+    centre_x = profile["first"][0] + (slot % CHANNELS_PER_ROW) * profile["column_pitch"]
+    centre_y = profile["first"][1] + (slot // CHANNELS_PER_ROW) * profile["row_pitch"]
+    left, top, right, bottom = profile["number_rel"]
+    x0, y0 = _channel_native_point((centre_x + left, centre_y + top), client_size, profile)
+    x1, y1 = _channel_native_point((centre_x + right, centre_y + bottom), client_size, profile)
+    x0, y0, x1, y1 = (int(round(value)) for value in (x0, y0, x1, y1))
+    return x0, y0, max(1, x1 - x0 + 1), max(1, y1 - y0 + 1)
+
+
+def _channel_templates(profile_name: str):
+    """Load the 60 tiny grayscale samples for one preset without accepting pickled data."""
+
+    cached = _CHANNEL_TEMPLATE_CACHE.get(profile_name)
+    if cached is not None:
+        return cached
+    import numpy as np
+
+    profile = CHANNEL_NUMBER_PROFILES[profile_name]
+    path = ASSETS_DIR / profile["asset"]
+    try:
+        with np.load(path, allow_pickle=False) as stored:
+            templates = np.asarray(stored["templates"], dtype=np.uint8)
+        if templates.shape[0] != CHANNEL_MAX:
+            raise ValueError(f"expected {CHANNEL_MAX} templates, got {templates.shape}")
+    except Exception:
+        LOG.error("auto reconnect: channel-number samples could not be loaded from %s", path,
+                  exc_info=True)
+        return None
+    _CHANNEL_TEMPLATE_CACHE[profile_name] = templates
+    return templates
+
+
+def _channel_number_ink(gray):
+    """Normalize the dark glyph strokes while discarding the slowly varying paper colour."""
+
+    import cv2
+    import numpy as np
+
+    source = np.asarray(gray, dtype=np.float32)
+    ink = cv2.GaussianBlur(source, (0, 0), 3) - source
+    ink -= float(ink.mean())
+    return ink
+
+
+def _channel_number_score(observed, reference) -> float:
+    """Compare one glyph crop while tolerating one capture-pixel of repaint movement."""
+
+    import cv2
+    import numpy as np
+
+    if observed.shape != reference.shape:
+        observed = cv2.resize(observed, (reference.shape[1], reference.shape[0]),
+                              interpolation=cv2.INTER_AREA)
+    reference_ink = _channel_number_ink(reference)
+    reference_norm = float(np.linalg.norm(reference_ink))
+    best = -1.0
+    for dy in range(-CHANNEL_VERIFY_SHIFT_PIXELS, CHANNEL_VERIFY_SHIFT_PIXELS + 1):
+        for dx in range(-CHANNEL_VERIFY_SHIFT_PIXELS, CHANNEL_VERIFY_SHIFT_PIXELS + 1):
+            transform = np.float32(((1, 0, dx), (0, 1, dy)))
+            shifted = cv2.warpAffine(
+                observed, transform,
+                (observed.shape[1], observed.shape[0]),
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            observed_ink = _channel_number_ink(shifted)
+            denominator = float(np.linalg.norm(observed_ink)) * reference_norm
+            score = float((observed_ink * reference_ink).sum() / denominator) \
+                if denominator else -1.0
+            best = max(best, score)
+    return best
+
+
+def read_channel_grid(frame, client_size=None) -> Optional[ChannelGridReading]:
+    """Read the visible page as one of the valid consecutive grids: 1,5,9,...,41.
+
+    Scoring the complete grid is substantially safer than trusting one blurred digit.  The three
+    worst cells are discarded so a mouse cursor, selection highlight, or partial repaint cannot
+    change the page identity.  Ambiguous readings fail closed: reconnect may retry or scroll again,
+    but it may not double-click a channel.
+    """
+
+    import cv2
+    import numpy as np
+
+    if frame is None or getattr(frame, "shape", None) is None:
+        return None
+    height, width = frame.shape[:2]
+    size = client_size or (width, height)
+    profile_name, _profile = _channel_profile(size)
+    templates = _channel_templates(profile_name)
+    if templates is None:
+        return None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    observed = []
+    for slot in range(CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS):
+        crop = crop_client_region(gray, channel_number_box(slot, size))
+        if crop is None or not crop.size:
+            return None
+        observed.append(crop)
+    candidates = []
+    for first_channel in CHANNEL_GRID_STARTS:
+        scores = [
+            _channel_number_score(observed[slot], templates[first_channel + slot - 1])
+            for slot in range(len(observed))
+        ]
+        kept = sorted(scores)[CHANNEL_GRID_TRIM_WORST:]
+        candidates.append((float(np.mean(kept)), first_channel))
+    candidates.sort(reverse=True)
+    score, first_channel = candidates[0]
+    runner_up = candidates[1][0]
+    margin = score - runner_up
+    if score < CHANNEL_GRID_MIN_SCORE or margin < CHANNEL_GRID_MIN_MARGIN:
+        LOG.info("auto reconnect: channel grid ambiguous profile=%s best=%d score=%.3f "
+                 "margin=%.3f", profile_name, first_channel, score, margin)
+        return None
+    return ChannelGridReading(first_channel, score, margin, profile_name)
+
+
 def login_colour_reference(image) -> Optional[LoginColourReference]:
     """The base colour and range of a login-page reference crop (BGR)."""
 
@@ -1667,6 +1863,7 @@ class ReconnectWorker(threading.Thread):
         self._running = False
         self._last_run_succeeded: Optional[bool] = None
         self._cancel_requested = threading.Event()
+        self._esc_suppress_until = 0.0
 
     # ------------------------------------------------------------------ settings
 
@@ -1722,8 +1919,15 @@ class ReconnectWorker(threading.Thread):
         """Queue one confirmed 掉线 event; return whether this worker accepted it."""
 
         with self._lock:
+            remaining = self._esc_suppress_until - time.monotonic()
+            if remaining > 0:
+                LOG.info(
+                    "auto reconnect: disconnect ignored for %.1fs after manual Esc cancellation",
+                    remaining,
+                )
+                return False
             if self.restart_active_event is not None and self.restart_active_event.is_set():
-                LOG.info("auto reconnect: disconnect deferred; 自动重开 owns the launcher phase")
+                LOG.info("auto reconnect: disconnect deferred; 清理内存 owns the logout phase")
                 return False
             if not self._enabled:
                 LOG.info("auto reconnect: disconnect ignored because it is disabled")
@@ -1740,10 +1944,10 @@ class ReconnectWorker(threading.Thread):
         return True
 
     def trigger_restart_reconnect(self) -> bool:
-        """Accept the one explicit handoff from 自动重开 without changing its selection.
+        """Accept the one explicit handoff from 清理内存 without changing its selection.
 
         This is deliberately distinct from :meth:`notify_disconnect`: the
-        restart worker already knows a fresh login page is expected, so it
+        memory-cleanup worker already confirmed that the login page is ready, so it
         bypasses the checked-state gate but never edits ``_enabled``.  The
         normal 自动重连 checkbox therefore stays selected (or unselected)
         exactly as the operator configured it.
@@ -1755,7 +1959,7 @@ class ReconnectWorker(threading.Thread):
                 return False
             self._restart_requested = True
             self._login_entered = False
-        LOG.info("auto reconnect: 自动重开 handed over the fresh game client")
+        LOG.info("auto reconnect: 清理内存 handed over the logged-out game client")
         self._wake.set()
         return True
 
@@ -1793,15 +1997,23 @@ class ReconnectWorker(threading.Thread):
             return self._last_run_succeeded
 
     def request_cancel(self) -> bool:
-        """Stop the current reconnect at its next safe wait/checkpoint."""
+        """Stop the current reconnect and suppress automatic retries for 60 seconds."""
 
         with self._lock:
             if not self._running:
                 return False
+            self._esc_suppress_until = time.monotonic() + ESC_RECONNECT_SUPPRESS_SECONDS
+            # Cancel every not-yet-consumed trigger belonging to this mission.
+            # Most importantly, do not wake the worker here: the previous
+            # implementation left _wake set after the active call unwound,
+            # which immediately launched a second reconnect round.
+            self._disconnect_queued = False
         self._cancel_requested.set()
-        self._wake.set()
-        LOG.warning("auto reconnect: cancellation requested by Esc")
-        self._report("cancelled", "Esc 已取消自动重连")
+        LOG.warning(
+            "auto reconnect: cancellation requested by Esc; automatic retries suppressed for %.0fs",
+            ESC_RECONNECT_SUPPRESS_SECONDS,
+        )
+        self._report("cancelled", "Esc 已取消自动重连，60 秒内不会自动重试")
         return True
 
     def _take_test_request(self) -> bool:
@@ -1850,6 +2062,7 @@ class ReconnectWorker(threading.Thread):
     def _handle_disconnect(self) -> None:
         enabled, world, channel = self.settings()
         with self._lock:
+            disconnect_requested = self._disconnect_queued
             testing_requested = self._test_requested
             restart_requested = self._restart_requested
             self._restart_requested = False
@@ -1857,11 +2070,14 @@ class ReconnectWorker(threading.Thread):
             # to this loop iteration.  Once consumed, a later real disconnect can
             # be handled after this run completes.
             self._disconnect_queued = False
+        if not (disconnect_requested or testing_requested or restart_requested):
+            LOG.info("auto reconnect: stale/spurious wake ignored; no reconnect trigger is queued")
+            return
         if not enabled and not testing_requested and not restart_requested:
             return
         testing = self._take_test_request()
         if restart_requested:
-            LOG.info("auto reconnect: running dedicated 自动重开 handoff (selection remains %s)", enabled)
+            LOG.info("auto reconnect: running dedicated 清理内存 handoff (selection remains %s)", enabled)
         with self._lock:
             self._running = True
             self._last_run_succeeded = None
@@ -2060,8 +2276,12 @@ class ReconnectWorker(threading.Thread):
     def _run_verified(self, world: str, channel: int, testing: bool) -> bool:
         """The sequence itself -> True only when the character really got in."""
 
+        if self._cancelled():
+            return False
         if not self._prepare_window():
             self._report("failed", "game window is not available")
+            return False
+        if self._cancelled():
             return False
         self._check_frame_size()
         self._report("checking", f"{world} {channel}频道")
@@ -2792,6 +3012,8 @@ class ReconnectWorker(threading.Thread):
 
         self._click_failure = None
         for attempt in (1, 2):
+            if self._cancelled():
+                return None
             frame, rect = self._capture()
             screen_x, screen_y = self._client_point_to_screen(frame, rect, client_x, client_y)
             owner = self._point_owner(screen_x, screen_y)
@@ -2816,8 +3038,10 @@ class ReconnectWorker(threading.Thread):
                             "again (%s)", label, screen_x, screen_y, owner[1],
                             self._geometry_dump(client_x, client_y, screen_x, screen_y))
                 self._lower_own_windows()
-                self._prepare_window()
-                self._sleep(CLICK_RETRY_WAIT_SECONDS)
+                if not self._prepare_window():
+                    return None
+                if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                    return None
                 continue
             LOG.error("auto reconnect: the point for %s still belongs to the ASSISTANT window %r "
                       "(hwnd %s) even after lowering it - NO click is sent, because a click there "
@@ -2837,6 +3061,10 @@ class ReconnectWorker(threading.Thread):
         click timing (see :func:`click_screen`).
         """
 
+        # This is the last common boundary before every reconnect mouse event.
+        # Esc must stop the ACTIVE round, not merely prevent its next retry.
+        if self._cancelled():
+            return False
         if self._click_fn is not None:
             return bool(self._click_fn(int(x), int(y)))
         if self.dry_run:
@@ -3394,11 +3622,7 @@ class ReconnectWorker(threading.Thread):
                 LOG.info("auto reconnect: login page colour found on attempt %d (%s)",
                          attempt, evidence.describe())
                 return True
-            if self._sleep is not time.sleep:
-                self._sleep(LOGIN_CHECK_INTERVAL_SECONDS)
-                if self.stop_event.is_set():
-                    return False
-            elif self.stop_event.wait(LOGIN_CHECK_INTERVAL_SECONDS):
+            if not self._sleep_checked(LOGIN_CHECK_INTERVAL_SECONDS):
                 return False
         if captured == 0:
             LOG.error("auto reconnect: the game window could not be captured at all "
@@ -3454,10 +3678,13 @@ class ReconnectWorker(threading.Thread):
         index = WORLD_NAMES.index(world)
         size = self._click_size()
         row_x, row_y = window_client_point(WORLD_ROW_CLIENT, size)
-        step_x, step_y = window_client_delta(WORLD_ROW_STEP_CLIENT, size)
+        world_column = index % WORLD_COLUMNS
+        world_line = index // WORLD_COLUMNS
+        step_x = window_client_length(WORLD_COLUMN_STEP_CLIENT, size)
+        step_y = window_client_length(WORLD_LINE_STEP_CLIENT, size)
         select_window = window_client_box(SELECT_WINDOW_CLIENT_BOX, size)
-        client_x = row_x + index * step_x
-        client_y = row_y + index * step_y
+        client_x = int(round(row_x + world_column * step_x))
+        client_y = int(round(row_y + world_line * step_y))
 
         page, score = self.page_now()
         if page == PAGE_CHANNEL:
@@ -3471,9 +3698,10 @@ class ReconnectWorker(threading.Thread):
             return False
 
         for attempt in range(1, PAGE_STEP_ATTEMPTS + 1):
-            LOG.info("auto reconnect: world double-click sequence %d/%d for %s (row %d)", attempt,
-                     PAGE_STEP_ATTEMPTS, world, index + 1)
-            label = f"{world} (row {index + 1}, 双击 1/2)"
+            LOG.info("auto reconnect: world double-click sequence %d/%d for %s (line %d, column "
+                     "%d)", attempt, PAGE_STEP_ATTEMPTS, world, world_line + 1,
+                     world_column + 1)
+            label = f"{world} (第 {world_line + 1} 行第 {world_column + 1} 个, 双击 1/2)"
             if not self._double_click_client(client_x, client_y, "world", label):
                 LOG.warning("auto reconnect: the first double-click on world %s could not be sent", world)
                 continue
@@ -3481,13 +3709,15 @@ class ReconnectWorker(threading.Thread):
                 return False
             page, score = self.page_now()
             if page == PAGE_CHANNEL:
-                self._report("world", f"{world} (row {index + 1}) 已进入频道页")
+                self._report("world", f"{world} (第 {world_line + 1} 行第 {world_column + 1} 个) "
+                             "已进入频道页")
                 return True
             # The first pair did not open the world. Send the requested second
             # pair only while still on the world page, never onto channels.
             second_before = self._capture()[0]
             if not self._double_click_client(
-                client_x, client_y, "world", f"{world} (row {index + 1}, 双击 2/2)"
+                client_x, client_y, "world",
+                f"{world} (第 {world_line + 1} 行第 {world_column + 1} 个, 双击 2/2)"
             ):
                 LOG.warning("auto reconnect: the second double-click on world %s could not be sent", world)
                 continue
@@ -3498,7 +3728,8 @@ class ReconnectWorker(threading.Thread):
                 timeout=PAGE_WAIT_WORLD_SECONDS,
                 first_pause=SELECT_WINDOW_WAIT_SECONDS,
             ):
-                self._report("world", f"{world} (row {index + 1}) 已进入频道页")
+                self._report("world", f"{world} (第 {world_line + 1} 行第 {world_column + 1} 个) "
+                             "已进入频道页")
                 return True
             LOG.warning(
                 "auto reconnect: both double-click pairs did not open %s; page=%s (%.2f)",
@@ -3521,18 +3752,26 @@ class ReconnectWorker(threading.Thread):
         click repeated up to ``CLICK_ATTEMPTS`` times; every attempt is logged.
         """
 
+        if self._cancelled():
+            return False
         # The focus is checked BEFORE the first click: measured in the field, the login-board
         # click needed attempt 2 because the window was not foreground yet.
         if not self._game_is_active():
             LOG.info("auto reconnect: focusing the game window before clicking %s", label)
-            self._prepare_window()
-            self._sleep(CLICK_RETRY_WAIT_SECONDS)
+            if not self._prepare_window():
+                return False
+            if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                return False
         for attempt in range(1, CLICK_ATTEMPTS + 1):
+            if self._cancelled():
+                return False
             if not self._game_is_active():
                 LOG.warning("auto reconnect: the game is not the active window before clicking %s "
                             "(attempt %d/%d); bringing it back", label, attempt, CLICK_ATTEMPTS)
-                self._prepare_window()
-                self._sleep(CLICK_RETRY_WAIT_SECONDS)
+                if not self._prepare_window():
+                    return False
+                if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                    return False
             point = self._screen_point(client_x, client_y, label)
             if point is None:
                 return False
@@ -3551,13 +3790,16 @@ class ReconnectWorker(threading.Thread):
                 LOG.warning("auto reconnect: the click on %s lost the foreground (foreground is "
                             "%r) - taking it back and clicking again", label,
                             self._foreground_title())
-                self._prepare_window()
-                self._sleep(CLICK_RETRY_WAIT_SECONDS)
+                if not self._prepare_window():
+                    return False
+                if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                    return False
                 continue
             LOG.warning("auto reconnect: the click on %s failed (attempt %d/%d)",
                         label, attempt, CLICK_ATTEMPTS)
             self._click_failure = f"点击 {label} ({screen_x}, {screen_y}) 没有送出 {CLICK_ATTEMPTS} 次"
-            self._sleep(CLICK_RETRY_WAIT_SECONDS)
+            if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                return False
         LOG.error("auto reconnect: the click on %s failed %d times", label, CLICK_ATTEMPTS)
         return False
 
@@ -3582,10 +3824,14 @@ class ReconnectWorker(threading.Thread):
         (the first click still highlights the cell).
         """
 
+        if self._cancelled():
+            return False
         if not self._game_is_active():
             LOG.info("auto reconnect: focusing the game window before double-clicking %s", label)
-            self._prepare_window()
-            self._sleep(CLICK_RETRY_WAIT_SECONDS)
+            if not self._prepare_window():
+                return False
+            if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                return False
         point = self._screen_point(client_x, client_y, label)
         if point is None:
             return False
@@ -3599,12 +3845,14 @@ class ReconnectWorker(threading.Thread):
                            hold=DOUBLE_CLICK_HOLD_SECONDS):
             LOG.error("auto reconnect: the first click of the double-click on %s failed", label)
             return False
-        self._sleep(gap)
+        if not self._sleep_checked(gap):
+            return False
         if not self._game_is_active():
             LOG.warning("auto reconnect: the game lost the foreground between the two clicks of the "
                         "double-click on %s (foreground is %r) - taking it back for the second click",
                         label, self._foreground_title())
-            self._prepare_window()
+            if not self._prepare_window():
+                return False
         if not self._click(screen_x, screen_y, keep_focus=True, settle=0.0,
                            hold=DOUBLE_CLICK_HOLD_SECONDS):
             LOG.error("auto reconnect: the second click of the double-click on %s failed", label)
@@ -3667,7 +3915,7 @@ class ReconnectWorker(threading.Thread):
         channel_x, channel_y = window_client_point(CHANNEL_FIRST_CLIENT, self._click_size())
         channel_list_box = window_client_box(CHANNEL_LIST_CLIENT_BOX, self._click_size())
         for notch in range(1, total + 1):
-            if self.stop_event.is_set():
+            if self._cancelled():
                 return notch - 1
             before = self._capture()[0]
             if not self._wheel_client(channel_x, channel_y, CHANNEL_SCROLL_NOTCHES_PER_ROW):
@@ -3703,6 +3951,8 @@ class ReconnectWorker(threading.Thread):
                       method: Optional[str] = None) -> bool:
         """Scroll at a *client* point -> True when the wheel event was sent."""
 
+        if self._cancelled():
+            return False
         point = self._screen_point(client_x, client_y, f"滚轮 {notches} 格")
         if point is None:
             return False
@@ -3716,8 +3966,109 @@ class ReconnectWorker(threading.Thread):
         if self.dry_run:
             LOG.info("auto reconnect: DRY-RUN wheel at (%d, %d)", screen_x, screen_y)
             return True
+        if self._cancelled():
+            return False
         return wheel_screen(screen_x, screen_y, notches, method=chosen,
                             hwnd=self._game_hwnd())
+
+    def _verified_channel_cell(self, channel: int, size, channel_x: int,
+                               channel_y: int) -> Optional[tuple[int, int, int]]:
+        """Closed-loop channel navigation -> verified (x, y, visible slot).
+
+        One wheel event is sent at a time.  Its effect is never inferred from the fact that input
+        injection returned successfully: the 20 number labels are reread, and a swallowed event is
+        simply sent again.  Two consecutive identical page readings are required before the target
+        cell can be returned to the click path.
+        """
+
+        target_row = (int(channel) - 1) // CHANNELS_PER_ROW
+        desired_first_row = max(0, target_row - (CHANNEL_VISIBLE_ROWS - 1))
+        desired_first_channel = 1 + desired_first_row * CHANNELS_PER_ROW
+        confirmed_first = None
+        confirmations = 0
+        for attempt in range(1, CHANNEL_VERIFY_MAX_ATTEMPTS + 1):
+            if self.stop_event.is_set() or self._cancel_requested.is_set():
+                return None
+            frame = self._capture()[0]
+            reading = read_channel_grid(frame, size)
+            if reading is None:
+                confirmations = 0
+                confirmed_first = None
+                LOG.info("auto reconnect: channel grid unreadable on verification %d/%d; "
+                         "waiting for repaint", attempt, CHANNEL_VERIFY_MAX_ATTEMPTS)
+                if not self._sleep_checked(CHANNEL_VERIFY_POLL_SECONDS):
+                    return None
+                continue
+
+            LOG.info("auto reconnect: channel grid read %d-%d profile=%s score=%.3f margin=%.3f "
+                     "(check %d/%d)", reading.first_channel,
+                     reading.first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1,
+                     reading.profile, reading.score, reading.margin, attempt,
+                     CHANNEL_VERIFY_MAX_ATTEMPTS)
+            if reading.first_channel == desired_first_channel:
+                if confirmed_first == reading.first_channel:
+                    confirmations += 1
+                else:
+                    confirmed_first = reading.first_channel
+                    confirmations = 1
+                if confirmations >= CHANNEL_VERIFY_CONFIRM_READS:
+                    visible_slot = int(channel) - reading.first_channel
+                    if not 0 <= visible_slot < CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS:
+                        LOG.error("auto reconnect: verified grid %d-%d does not contain channel %d",
+                                  reading.first_channel, reading.first_channel + 19, channel)
+                        return None
+                    column_pitch = window_client_length(CHANNEL_STEP_CLIENT, size)
+                    row_pitch = window_client_length(CHANNEL_ROW_STEP_CLIENT, size)
+                    cell_x = int(round(channel_x + (visible_slot % CHANNELS_PER_ROW) * column_pitch))
+                    cell_y = int(round(channel_y + (visible_slot // CHANNELS_PER_ROW) * row_pitch))
+                    self._report("channel", f"已识别频道列表 {reading.first_channel}-"
+                                 f"{reading.first_channel + 19}，确认 {channel}频道")
+                    return cell_x, cell_y, visible_slot
+                if not self._sleep_checked(CHANNEL_VERIFY_POLL_SECONDS):
+                    return None
+                continue
+
+            confirmations = 0
+            confirmed_first = None
+            current_row = (reading.first_channel - 1) // CHANNELS_PER_ROW
+            direction = 1 if desired_first_row > current_row else -1
+            LOG.warning("auto reconnect: expected grid start %d but read %d; sending one %s wheel "
+                        "step and checking the labels again", desired_first_channel,
+                        reading.first_channel, "down" if direction > 0 else "up")
+            self._report("channel", f"当前显示 {reading.first_channel}-"
+                         f"{reading.first_channel + 19}，继续校正到 {desired_first_channel}-"
+                         f"{desired_first_channel + 19}")
+            if not self._wheel_client(channel_x, channel_y,
+                                      direction * CHANNEL_SCROLL_NOTCHES_PER_ROW):
+                LOG.error("auto reconnect: corrective channel-list wheel input failed")
+                return None
+            if not self._sleep_checked(CHANNEL_SCROLL_WAIT_SECONDS):
+                return None
+
+        LOG.error("auto reconnect: channel %d was not visually confirmed after %d closed-loop "
+                  "checks; refusing to double-click", channel, CHANNEL_VERIFY_MAX_ATTEMPTS)
+        self._report("failed", f"无法识别并确认 {channel}频道，未执行双击")
+        return None
+
+    def _post_click_channel_is_correct(self, channel: int, visible_slot: int, size) -> bool:
+        """The final safety gate after the single click and before either double-click."""
+
+        frame = self._capture()[0]
+        reading = read_channel_grid(frame, size)
+        if reading is None:
+            LOG.warning("auto reconnect: channel labels became unreadable after selecting %d; "
+                        "refusing to double-click", channel)
+            return False
+        observed_channel = reading.first_channel + int(visible_slot)
+        if observed_channel != int(channel):
+            LOG.error("auto reconnect: post-click gate expected channel %d at slot %d but read %d "
+                      "(grid %d-%d); refusing to enter", channel, visible_slot, observed_channel,
+                      reading.first_channel, reading.first_channel + 19)
+            return False
+        LOG.info("auto reconnect: post-click channel gate confirmed channel %d at slot %d "
+                 "(grid %d-%d, score %.3f, margin %.3f)", channel, visible_slot,
+                 reading.first_channel, reading.first_channel + 19, reading.score, reading.margin)
+        return True
 
     def _select_channel(self, channel: int) -> bool:
         """Second select window: click channel 1, SCROLL to the target row, double-click its cell.
@@ -3733,9 +4084,9 @@ class ReconnectWorker(threading.Thread):
         the target row) and could never reach a row that was not on screen.  Now:
 
         1. channel 1 is clicked (one click - it is the top-left cell of an unscrolled list),
-        2. the list is scrolled the computed number of rows, each notch verified and MEASURED
-           (``_scroll_list_rows``),
-        3. the target cell is double-clicked - a single click only highlights a cell,
+        2. the native 1080/1366 sampler reads all 20 visible labels and scrolls one row at a time
+           until the intended page is confirmed twice,
+        3. the target cell is clicked, its label is checked again, then it is double-clicked,
         4. ``Enter`` (verified by the page change), 2 s, ``Enter`` again starts the login.
 
         Anything that does not verify is a failure and is reported as one: no Enter is ever sent
@@ -3757,8 +4108,6 @@ class ReconnectWorker(threading.Thread):
         channel_x, channel_y = window_client_point(CHANNEL_FIRST_CLIENT, size)
         select_window = window_client_box(SELECT_WINDOW_CLIENT_BOX, size)
         channel_list_box = window_client_box(CHANNEL_LIST_CLIENT_BOX, size)
-        column_pitch = window_client_length(CHANNEL_STEP_CLIENT, size)
-        row_pitch = window_client_length(CHANNEL_ROW_STEP_CLIENT, size)
         if not point_in_box(channel_x, channel_y, select_window):
             LOG.error("auto reconnect: channel 1 point %s is outside the select window %s",
                       CHANNEL_FIRST_CLIENT, SELECT_WINDOW_CLIENT_BOX)
@@ -3802,18 +4151,14 @@ class ReconnectWorker(threading.Thread):
             LOG.info("auto reconnect: after the second channel 1 click the list region changed by "
                      "%.2f", region_change(before, self._capture()[0], channel_list_box))
 
-        achieved = 0
-        if rows_to_scroll:
-            self._report("channel", f"从频道 1 起向下滚动 {rows_to_scroll} 行")
-            achieved = self._scroll_list_rows(rows_to_scroll)
-            if achieved < rows_to_scroll:
-                LOG.error("auto reconnect: %d of %d notches could not be sent (a key/wheel failure), "
-                          "not a picture measurement", achieved, rows_to_scroll)
-            self._report("channel", f"已滚动 {achieved} 行，第 {target_row + 1} 行应已显示")
-
-        visible_row = target_row - achieved
-        cell_x = int(round(channel_x + target_column * column_pitch))
-        cell_y = int(round(channel_y + visible_row * row_pitch))
+        # Do not trust a count of injected wheel events.  On a leaking/lagging game process the OS
+        # can accept an event that the game never consumes.  Read the 20 channel labels after every
+        # wheel step and continue until the native 1080/1366 sampler proves the intended grid is on
+        # screen twice in succession.
+        verified_cell = self._verified_channel_cell(channel, size, channel_x, channel_y)
+        if verified_cell is None:
+            return False
+        cell_x, cell_y, visible_slot = verified_cell
         if not point_in_box(cell_x, cell_y, select_window):
             LOG.error("auto reconnect: channel %d cell (%d, %d) is outside the select window %s",
                       channel, cell_x, cell_y, select_window)
@@ -3830,6 +4175,22 @@ class ReconnectWorker(threading.Thread):
             return False
         if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
             return False
+        # This is intentionally AFTER selection and BEFORE entry.  If the game swallowed a wheel
+        # event or repainted stale content, no double-click is allowed to enter the wrong channel.
+        if not self._post_click_channel_is_correct(channel, visible_slot, size):
+            self._report("channel", f"{channel}频道 单击后校验失败，重新读取频道列表")
+            verified_cell = self._verified_channel_cell(channel, size, channel_x, channel_y)
+            if verified_cell is None:
+                return False
+            cell_x, cell_y, visible_slot = verified_cell
+            if not self._click_client(cell_x, cell_y, "channel", f"{channel}频道（校正后单击）"):
+                self._report_click_failure(f"校正后单击 {channel}频道 失败")
+                return False
+            if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
+                return False
+            if not self._post_click_channel_is_correct(channel, visible_slot, size):
+                self._report("failed", f"{channel}频道 单击后仍无法确认，未执行双击")
+                return False
         chosen = False
         for attempt, gap in enumerate(DOUBLE_CLICK_GAPS, start=1):
             if not self._double_click_client(cell_x, cell_y, "channel",
@@ -3974,6 +4335,9 @@ class ReconnectWorker(threading.Thread):
         forward again and the key retried.  ``hold`` lets the login Enter use a longer press.
         """
 
+        # This is the last common boundary before every reconnect key event.
+        if self._cancelled():
+            return "自动重连已由 Esc 取消"
         sender = self.key_sender
         if sender is None:
             return "没有按键发送器"
@@ -3988,13 +4352,17 @@ class ReconnectWorker(threading.Thread):
                         "(attempt %d/%d); bringing it back",
                         key, attempt, KEY_REFOCUS_ATTEMPTS + 1)
             # focus, then click again: a re-focused game ignores keys until it sees a click
-            self._activate_window()
-            self._sleep(KEY_REFOCUS_WAIT_SECONDS)
+            if not self._activate_window():
+                return "自动重连已取消或游戏窗口无法激活"
+            if not self._sleep_checked(KEY_REFOCUS_WAIT_SECONDS):
+                return "自动重连已由 Esc 取消"
         if not self._window_is_foreground():
             LOG.error("auto reconnect: game window is not foreground - key %s was not sent",
                       key)
             return "游戏窗口不在前台，按键被拒绝"
         self._release_modifiers(f"before {key}")
+        if self._cancelled():
+            return "自动重连已由 Esc 取消"
         try:
             try:
                 ok = sender.press(key, duration=float(hold), owner="auto-reconnect")
@@ -4108,6 +4476,11 @@ class ReconnectWorker(threading.Thread):
             if remaining <= 0:
                 return True
             self.stop_event.wait(min(0.05, remaining))
+
+    def _cancelled(self) -> bool:
+        """Whether this reconnect round must stop before sending more input."""
+
+        return bool(self.stop_event.is_set() or self._cancel_requested.is_set())
 
 
 __all__ = [

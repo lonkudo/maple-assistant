@@ -2481,8 +2481,8 @@ def main() -> int:
             (time.monotonic() - started_at) * 1000.0,
         )
 
-    # 自动重开 owns only the memory/leak lifecycle.  Once the fresh game
-    # window appears it queues ReconnectWorker's dedicated handoff, rather
+    # 清理内存 owns only the logout/login lifecycle.  Once the existing game
+    # reaches its login page it queues ReconnectWorker's dedicated handoff, rather
     # than reimplementing any world/channel/login steps here.
     auto_restart_worker = AutoRestartWorker(
         stop_event,
@@ -2693,10 +2693,24 @@ def main() -> int:
     def cancel_auto_lie() -> bool:
         return bool(ui_worker is not None and ui_worker.request_cancel_auto_lie_pass())
 
+    def cancel_auto_reconnect() -> bool:
+        """Cancel the whole reconnect mission and discard its offline diagnostic."""
+
+        cancelled = reconnect_worker.request_cancel()
+        if cancelled:
+            try:
+                screenshot_recorder.cancel_disconnect()
+            except Exception:
+                logging.debug(
+                    "auto reconnect: cancelled offline recording could not be discarded",
+                    exc_info=True,
+                )
+        return bool(cancelled)
+
     workflow_cancel_worker = WorkflowCancelWorker(
         stop_event,
         (
-            ("auto reconnect", reconnect_worker.is_active, reconnect_worker.request_cancel),
+            ("auto reconnect", reconnect_worker.is_active, cancel_auto_reconnect),
             ("auto restart", auto_restart_worker.is_active, auto_restart_worker.request_cancel),
             ("automatic lie pass", auto_lie_is_active, cancel_auto_lie),
             ("Ctrl+Q/Ctrl+W trade", trade_worker.is_trade_active, trade_worker.request_cancel),

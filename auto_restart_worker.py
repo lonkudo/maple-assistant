@@ -1,8 +1,8 @@
-"""Independent game-restart workflow for the game's memory-leak recovery.
+"""Independent memory-cleanup workflow for the game's memory-leak recovery.
 
-The worker owns only the restart lifecycle.  Login/world/channel selection stays
-inside :mod:`reconnect_worker`; this boundary prevents two reconnect sequences
-from competing for the keyboard.
+The worker logs the current character out and keeps the game process alive.
+Login/world/channel selection stays inside :mod:`reconnect_worker`; this
+boundary prevents two reconnect sequences from competing for the keyboard.
 """
 
 from __future__ import annotations
@@ -52,9 +52,9 @@ def system_memory_percent() -> Optional[float]:
 
 
 class AutoRestartWorker(threading.Thread):
-    """Restart the game after sustained high system memory usage.
+    """Return to login and reconnect after sustained high memory usage.
 
-    ``restart_active_event`` covers the whole launcher-to-login handoff.  The
+    ``restart_active_event`` covers the whole logout-to-login handoff.  The
     ordinary reconnect selection is never changed: a dedicated reconnect
     request takes over only after the game client has returned.
     """
@@ -415,7 +415,7 @@ class AutoRestartWorker(threading.Thread):
         return False
 
     def _wait_for_login_page_ready(self) -> bool:
-        """Keep the freshly launched client focused until its login page exists."""
+        """Keep the existing client focused until logout reaches its login page."""
 
         measure = getattr(self.reconnect_worker, "measure_login_page_colour", None)
         if not callable(measure):
@@ -423,10 +423,18 @@ class AutoRestartWorker(threading.Thread):
             return False
         deadline = time.monotonic() + self.GAME_LOGIN_PAGE_TIMEOUT_SECONDS
         reported_wait = False
+        reported_missing = False
         while not self._cancelled() and time.monotonic() < deadline:
             if not self._game_available():
-                self._report("game", "游戏窗口在启动中消失")
-                return False
+                # Logout and the game's protection component may briefly hide
+                # or rebuild the window.  Keep waiting for the same client
+                # instead of falling back to the obsolete kill/launcher path.
+                if not reported_missing:
+                    self._report("waiting-login", "等待游戏窗口返回并显示登录页")
+                    reported_missing = True
+                if not self._wait(self.GAME_REFOCUS_INTERVAL_SECONDS):
+                    return False
+                continue
             # This shares the normal re-anchor path with every other workflow.
             # It is intentionally repeated: the game's protection window may
             # steal focus while the client is painting the login screen.
@@ -442,17 +450,17 @@ class AutoRestartWorker(threading.Thread):
             except Exception:
                 LOG.debug("auto restart: login-page readiness probe failed", exc_info=True)
             if not reported_wait:
-                self._report("waiting-login", "游戏启动中：等待登录页并持续聚焦游戏窗口")
+                self._report("waiting-login", "正在等待游戏返回登录页")
                 reported_wait = True
             if not self._wait(self.GAME_REFOCUS_INTERVAL_SECONDS):
                 return False
-        self._report("warning", "游戏窗口仍在启动，尚未检测到登录页；保留游戏窗口")
+        self._report("warning", "未检测到登录页，已停止本次内存清理")
         return False
 
     def _handoff_to_reconnect(self) -> bool:
         request = getattr(self.reconnect_worker, "trigger_restart_reconnect", None)
         if not callable(request) or not request():
-            self._report("failed", "自动重连未接受重开接管请求")
+            self._report("failed", "自动重连未接受内存清理接管请求")
             return False
         deadline = time.monotonic() + self.RECONNECT_START_TIMEOUT_SECONDS
         started = False
@@ -485,39 +493,17 @@ class AutoRestartWorker(threading.Thread):
             if callable(self.stop_patrol):
                 self.stop_patrol()
             if not self._send_offline_sequence(offline_message):
-                self._report("warning", "下线按键未完整送达，仍继续重开")
-            if not self._wait(self.OFFLINE_WAIT_SECONDS):
+                self._report("warning", "下线按键未完整送达，继续等待登录页")
+            if not self._wait_for_login_page_ready():
                 return
-            if not self._terminate_game():
-                return
-            for attempt in range(self.RETRY_COUNT_AFTER_INITIAL + 1):
-                if self._cancelled():
-                    return
-                self._report("attempt", f"重开第 {attempt + 1}/{self.RETRY_COUNT_AFTER_INITIAL + 1} 次")
-                launched = self._launch_game()
-                game_visible = launched and self._wait_for_game()
-                if game_visible:
-                    login_ready = self._wait_for_login_page_ready()
-                    if login_ready and self._handoff_to_reconnect():
-                        return
-                    # A game window that is still present is in its own
-                    # startup/login transition, not proof that it crashed.
-                    # Do not kill it and create an endless launcher loop.
-                    if self._game_available():
-                        self._report("warning", "游戏已启动但自动重连未完成；保留游戏窗口，不重复结束进程")
-                        return
-                if attempt < self.RETRY_COUNT_AFTER_INITIAL:
-                    self._report("retry", "游戏未稳定进入，准备再次启动")
-                    if not self._wait(2.0):
-                        return
-            self._report("failed", "重开重试次数已用尽")
+            self._handoff_to_reconnect()
         finally:
             self.restart_active_event.clear()
 
     def run(self) -> None:
         LOG.info("auto restart worker started (checks system memory every %.0f minutes)", self.CHECK_SECONDS / 60.0)
         # Give the header one prompt reading, then use the shared 30-second
-        # cadence.  This still runs when 自动重开 itself is unchecked.
+        # cadence.  This still runs when 清理内存 itself is unchecked.
         next_check = time.monotonic()
         while not self.stop_event.is_set():
             wait_for = max(0.0, next_check - time.monotonic())
@@ -532,7 +518,7 @@ class AutoRestartWorker(threading.Thread):
                     self._running = True
                     self._cancel_requested.clear()
                 try:
-                    self._report("test", "手动测试自动重开")
+                    self._report("test", "手动测试清理内存")
                     self._run_restart(offline_message)
                 finally:
                     with self._lock:

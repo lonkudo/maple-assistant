@@ -95,6 +95,8 @@ class LieScreenshotRecorder:
         self.frame_queue = frame_queue
         self._lock = threading.Lock()
         self._recording = False
+        self._active_kind: Optional[str] = None
+        self._cancel_recording = threading.Event()
         # ParkedWatchCapture uses this to fan its existing 5-FPS frames to the
         # recorder only while a diagnostic recording is active.
         self.recording_event = threading.Event()
@@ -124,6 +126,19 @@ class LieScreenshotRecorder:
         """CountdownWorker listener: 循环 circular alert reached zero."""
 
         self._start("countdown")
+
+    def cancel_disconnect(self) -> bool:
+        """Discard the active offline diagnostic after Esc cancels reconnect."""
+
+        with self._lock:
+            if not self._recording or self._active_kind != "offline":
+                return False
+            self._cancel_recording.set()
+            # Stop the shared capture fan-out immediately; the writer wakes
+            # within its 250 ms queue timeout and removes frames already saved.
+            self.recording_event.clear()
+        LOG.info("lie-shot: offline recording cancelled with auto reconnect; video will not be saved")
+        return True
 
     def _discard_stale_frames(self) -> None:
         """A passive subscriber may hold one old frame while idle."""
@@ -162,6 +177,8 @@ class LieScreenshotRecorder:
                 )
                 return
             self._recording = True
+            self._active_kind = kind
+            self._cancel_recording.clear()
             self._discard_stale_frames()
             self._queue_frame(initial_frame)
             self.recording_event.set()
@@ -192,6 +209,8 @@ class LieScreenshotRecorder:
                 LOG.error("lie-shot: cannot create output folder: %s", exc)
                 return
             while True:
+                if self._cancel_recording.is_set():
+                    break
                 now = time.monotonic()
                 if now >= deadline or saved >= self.max_frames:
                     break
@@ -219,6 +238,7 @@ class LieScreenshotRecorder:
             LOG.exception("lie-shot: recorder crashed")
         finally:
             elapsed = time.monotonic() - started
+            cancelled = bool(kind == "offline" and self._cancel_recording.is_set())
             if run_dir is not None:
                 LOG.info(
                     "lie-shot: %s recording finished after %.1fs "
@@ -228,7 +248,24 @@ class LieScreenshotRecorder:
                     saved,
                     run_dir,
                 )
-                if self.compose_video and saved > 0:
+                if cancelled:
+                    removed = 0
+                    for frame_path in frame_files(run_dir):
+                        try:
+                            frame_path.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+                    try:
+                        run_dir.rmdir()
+                    except OSError:
+                        pass
+                    LOG.info(
+                        "lie-shot: cancelled offline diagnostic discarded (%d frame files); "
+                        "no video composed",
+                        removed,
+                    )
+                elif self.compose_video and saved > 0:
                     # Best effort and never raising; runs before the flag is
                     # released so a new event cannot overlap the compose.
                     self._compose_run_video(run_dir, saved, elapsed)
@@ -236,6 +273,8 @@ class LieScreenshotRecorder:
             # crash - so a later lie event can start a fresh recording.
             with self._lock:
                 self._recording = False
+                self._active_kind = None
+                self._cancel_recording.clear()
                 self.recording_event.clear()
 
     # ------------------------------------------------------------- video

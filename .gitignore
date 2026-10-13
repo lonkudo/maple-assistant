@@ -6,7 +6,9 @@ __pycache__/
 
 work/
 outputs/
-recording-assets/
+recording-assets/*
+!recording-assets/channel_number_templates_1080x768.npz
+!recording-assets/channel_number_templates_1366x768.npz
 release/
 config.json
 user_config.json
