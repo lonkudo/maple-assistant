@@ -56,10 +56,26 @@ ACTIVATION_SERVER_PIN_FILE = "activation_server_pin.json"
 # but TodoHelper now has one product edition.  Existing normal/NP documents
 # remain valid; neither value changes available features.
 _LEGACY_EDITION_VALUES = {"normal", "np"}
-_FINGERPRINT_CACHE_SECONDS = 300.0
+# A complete hardware fingerprint is stable while the assistant process is
+# alive.  Match the normal heartbeat cadence so background auto-lie accounting
+# never causes an unnecessary CIM refresh between heartbeats.
+_FINGERPRINT_COMPLETE_CACHE_SECONDS = 3 * 60 * 60.0
+# Do not hold an incomplete startup read for three hours: Windows may simply
+# still be bringing CIM/WMI online, so the scheduled failure retry or a manual
+# refresh must get another chance soon.
+_FINGERPRINT_INCOMPLETE_CACHE_SECONDS = 300.0
+# Windows may occasionally return an empty CIM value even though the firmware
+# provider is otherwise healthy.  One short second attempt filters that
+# transient state without turning every heartbeat into a retry loop.
+_CIM_RETRY_DELAY_SECONDS = 0.20
 _fingerprint_cache_lock = threading.Lock()
 _fingerprint_cache_at = 0.0
 _fingerprint_cache: dict[str, str] = {}
+# A fingerprint is stable for the life of one assistant process.  Keep the
+# most recent *complete* one separately: a transient WMI/CIM outage must not
+# replace it with only MachineGuid and make later background work appear to be
+# an unready device.
+_fingerprint_last_good_cache: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -166,27 +182,76 @@ def _cim_value(class_name: str, property_name: str) -> str:
         return ""
 
 
+def _usable_device_value(value: str) -> str:
+    """Normalize one hardware signal, returning empty when Windows has no usable value."""
+
+    normalized = " ".join(str(value or "").strip().upper().split())
+    if normalized in {"", "NONE", "UNKNOWN", "TO BE FILLED BY O.E.M."}:
+        return ""
+    return normalized
+
+
+def _cim_value_with_one_retry(class_name: str, property_name: str, signal_name: str) -> str:
+    """Read one CIM signal again once when its first bounded lookup is unavailable."""
+
+    value = _cim_value(class_name, property_name)
+    if _usable_device_value(value):
+        return value
+    # This runs only in the background activation/heartbeat path.  Do not log
+    # raw serial data, but retain enough information to distinguish a local
+    # provider hiccup from an activation-server refusal.
+    SERVER_LOG.info("CIM %s signal unavailable; retrying once", signal_name)
+    time.sleep(_CIM_RETRY_DELAY_SECONDS)
+    retry = _cim_value(class_name, property_name)
+    if _usable_device_value(retry):
+        SERVER_LOG.info("CIM %s signal recovered on retry", signal_name)
+    else:
+        SERVER_LOG.warning("CIM %s signal remained unavailable after retry", signal_name)
+    return retry
+
+
 def machine_fingerprint_components() -> dict[str, str]:
     """Return hashed hardware signals suitable for a signed device binding."""
 
-    global _fingerprint_cache_at, _fingerprint_cache
+    global _fingerprint_cache_at, _fingerprint_cache, _fingerprint_last_good_cache
     with _fingerprint_cache_lock:
-        if time.monotonic() - _fingerprint_cache_at < _FINGERPRINT_CACHE_SECONDS:
+        cache_lifetime = (
+            _FINGERPRINT_COMPLETE_CACHE_SECONDS
+            if len(_fingerprint_cache) >= 2
+            else _FINGERPRINT_INCOMPLETE_CACHE_SECONDS
+        )
+        if time.monotonic() - _fingerprint_cache_at < cache_lifetime:
             return dict(_fingerprint_cache)
     raw = {
         "windows": _machine_guid(),
-        "firmware": _cim_value("Win32_ComputerSystemProduct", "UUID"),
-        "board": _cim_value("Win32_BaseBoard", "SerialNumber"),
+        "firmware": _cim_value_with_one_retry(
+            "Win32_ComputerSystemProduct", "UUID", "firmware UUID",
+        ),
+        "board": _cim_value_with_one_retry(
+            "Win32_BaseBoard", "SerialNumber", "motherboard serial",
+        ),
     }
     components: dict[str, str] = {}
     for name, value in raw.items():
-        normalized = " ".join(value.strip().upper().split())
-        if normalized and normalized not in {"NONE", "UNKNOWN", "TO BE FILLED BY O.E.M."}:
+        normalized = _usable_device_value(value)
+        if normalized:
             components[name] = _component_digest(name, normalized)
     with _fingerprint_cache_lock:
-        _fingerprint_cache = dict(components)
+        if len(components) >= 2:
+            _fingerprint_last_good_cache = dict(components)
+            _fingerprint_cache = dict(components)
+        elif len(_fingerprint_last_good_cache) >= 2:
+            # The device was already authenticated with this fingerprint in
+            # this process.  Do not turn a short CIM outage during asynchronous
+            # lie accounting into a false "device not ready" verdict.
+            SERVER_LOG.warning(
+                "CIM refresh incomplete; retaining the last complete device fingerprint"
+            )
+            _fingerprint_cache = dict(_fingerprint_last_good_cache)
+        else:
+            _fingerprint_cache = dict(components)
         _fingerprint_cache_at = time.monotonic()
-    return components
+        return dict(_fingerprint_cache)
 
 
 def device_request_code() -> str:

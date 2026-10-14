@@ -573,14 +573,34 @@ class WindowKeySender:
     def _emit_locked(self, key: str, *, key_up: bool) -> None:
         """Emit and ledger one transition while the input state is locked."""
 
+        self._emit_many_locked((key,), key_up=key_up)
+
+    def _emit_many_locked(self, keys: Sequence[str], *, key_up: bool) -> None:
+        """Emit one same-edge key batch and update the physical-key ledger.
+
+        ``SendInput`` accepts an array.  Sending an Alt+Left chord as two
+        individual calls lets the game poll between them and turn it into an
+        Alt press followed by an ordinary Left press.  A single array keeps
+        both edges in one Windows input packet; its event order is retained,
+        but there is no intervening game-input timeslice.
+
+        Caller holds ``_key_state_lock``.
+        """
+
+        keys = tuple(keys)
+        if not keys:
+            return
         if not self.dry_run:
-            scan_code, extended = self._SCAN[key]
-            self._send_scan_code(scan_code, key_up=key_up, extended=extended)
+            transitions = [
+                (self._SCAN[key][0], key_up, self._SCAN[key][1])
+                for key in keys
+            ]
+            self._send_scan_codes(transitions)
         if key_up:
-            self._physical_keys.discard(key)
+            self._physical_keys.difference_update(keys)
         else:
-            self._physical_keys.add(key)
-            self._used_keys.add(key)
+            self._physical_keys.update(keys)
+            self._used_keys.update(keys)
 
     def ctrl_chord_in_flight(self) -> bool:
         """True while the assistant itself is sending a Ctrl-involving chord.
@@ -1158,6 +1178,78 @@ class WindowKeySender:
             LOG.info("key-down=%s owners=%d", key, owners + 1)
         return True
 
+    def key_down_chord(
+        self,
+        *keys: str,
+        owner: str = "",
+        emit_lifecycle_log: bool = True,
+    ) -> bool:
+        """Claim chord keys and emit new downs in one ``SendInput`` packet.
+
+        This is intentionally a separate API from ``key_down``: ordinary
+        movement retains its per-key conflict handling, while rope jumps can
+        explicitly request a hardware-like simultaneous Alt+direction edge.
+        """
+
+        normalized = tuple(dict.fromkeys(str(key).casefold() for key in keys))
+        if len(normalized) < 2:
+            raise ValueError("key_down_chord requires at least two distinct keys")
+        if any(key not in self._SCAN for key in normalized):
+            invalid = next(key for key in normalized if key not in self._SCAN)
+            raise ValueError(f"unsupported key: {invalid}")
+        if self._exclusive_blocks(owner):
+            LOG.info("blocked chord=%s: keyboard owned by %r",
+                     "+".join(normalized), self._exclusive_owner)
+            return False
+        if not self.input_is_enabled():
+            self._note_input_refused("+".join(normalized), INPUT_NOT_ENABLED_REASON)
+            return False
+        if not self.dry_run and not self._foreground_matches():
+            LOG.debug("blocked key-down chord=%s: game window is not foreground",
+                      "+".join(normalized))
+            return False
+
+        with self._key_state_lock:
+            if not self.input_is_enabled():
+                LOG.debug("blocked key-down chord=%s: input disarmed during wait",
+                          "+".join(normalized))
+                return False
+            # A lateral chord may not coexist with its opposite direction.
+            # Release conflicts before the single chord packet; Alt itself is
+            # independent and never participates in this switch.
+            for key in normalized:
+                if key not in self._DIRECTION_KEYS:
+                    continue
+                conflicts = (
+                    self._HORIZONTAL_DIRECTION_KEYS - {key}
+                    if key in self._HORIZONTAL_DIRECTION_KEYS
+                    else self._VERTICAL_DIRECTION_KEYS - {key}
+                )
+                for other in conflicts:
+                    if other in self._key_owners or other in self._physical_keys:
+                        self._key_owners.pop(other, None)
+                        self._emit_locked(other, key_up=True)
+                        LOG.info("key-up forced=%s reason=direction-switch", other)
+
+            fresh = tuple(
+                key for key in normalized if self._key_owners.get(key, 0) == 0
+            )
+            if fresh:
+                self._emit_many_locked(fresh, key_up=False)
+            owners = {
+                key: self._key_owners.get(key, 0) + 1 for key in normalized
+            }
+            for key, count in owners.items():
+                self._key_owners[key] = count
+
+        if emit_lifecycle_log:
+            LOG.info(
+                "key-down chord=%s packet=1 owners=%s",
+                "+".join(normalized),
+                ",".join(f"{key}:{owners[key]}" for key in normalized),
+            )
+        return True
+
     def key_up(
         self,
         key: str,
@@ -1194,6 +1286,44 @@ class WindowKeySender:
         elif emit_lifecycle_log:
             LOG.info("key-up=%s owners=%d", key, remaining)
         return True
+
+    def key_up_chord(
+        self, *keys: str, owner: str = "", emit_lifecycle_log: bool = True,
+    ) -> bool:
+        """Release one claim from every chord key in one ``SendInput`` packet."""
+
+        normalized = tuple(dict.fromkeys(str(key).casefold() for key in keys))
+        if len(normalized) < 2:
+            raise ValueError("key_up_chord requires at least two distinct keys")
+        if any(key not in self._SCAN for key in normalized):
+            invalid = next(key for key in normalized if key not in self._SCAN)
+            raise ValueError(f"unsupported key: {invalid}")
+        with self._key_state_lock:
+            remaining: dict[str, int] = {}
+            releases: list[str] = []
+            for key in normalized:
+                owners = self._key_owners.get(key, 0)
+                if owners <= 0:
+                    remaining[key] = 0
+                    continue
+                remaining[key] = owners - 1
+                if owners == 1:
+                    releases.append(key)
+            if releases:
+                self._emit_many_locked(tuple(releases), key_up=True)
+            for key, count in remaining.items():
+                if count:
+                    self._key_owners[key] = count
+                else:
+                    self._key_owners.pop(key, None)
+        if emit_lifecycle_log:
+            LOG.info(
+                "key-up chord=%s packet=1 owners=%s",
+                "+".join(normalized),
+                ",".join(f"{key}:{remaining[key]}" for key in normalized),
+            )
+        return any(self._key_owners.get(key, 0) or key in self._physical_keys
+                   for key in normalized) or bool(remaining)
 
     def repeat_key_down(self, key: str) -> bool:
         """Re-emit key-down for an already-owned movement key.
@@ -1536,6 +1666,14 @@ class WindowKeySender:
         keep its chord state machine clean.
         """
 
+        WindowKeySender._send_scan_codes(((scan_code, key_up, extended),))
+
+    @staticmethod
+    def _send_scan_codes(
+        transitions: Sequence[tuple[int, bool, bool]],
+    ) -> None:
+        """Inject a sequence of scan-code transitions in exactly one call."""
+
         from ctypes import wintypes
 
         ULONG_PTR = wintypes.WPARAM
@@ -1582,22 +1720,29 @@ class WindowKeySender:
         KEYEVENTF_EXTENDEDKEY = 0x0001
         KEYEVENTF_KEYUP = 0x0002
         KEYEVENTF_SCANCODE = 0x0008
-        flags = KEYEVENTF_SCANCODE
-        if extended:
-            flags |= KEYEVENTF_EXTENDEDKEY
-        if key_up:
-            flags |= KEYEVENTF_KEYUP
-        event = INPUT(type=1, ki=KEYBDINPUT(
-            0, scan_code, flags, 0, SELF_INPUT_EXTRA_INFO
-        ))
+        events = (INPUT * len(transitions))()
+        for index, (scan_code, key_up, extended) in enumerate(transitions):
+            flags = KEYEVENTF_SCANCODE
+            if extended:
+                flags |= KEYEVENTF_EXTENDEDKEY
+            if key_up:
+                flags |= KEYEVENTF_KEYUP
+            events[index] = INPUT(type=1, ki=KEYBDINPUT(
+                0, scan_code, flags, 0, SELF_INPUT_EXTRA_INFO
+            ))
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
         user32.SendInput.restype = wintypes.UINT
         ctypes.set_last_error(0)
-        sent = user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
-        if sent != 1:
+        sent = user32.SendInput(
+            len(events), events, ctypes.sizeof(INPUT)
+        )
+        if sent != len(events):
             error_code = ctypes.get_last_error()
-            raise OSError(error_code, f"SendInput injected {sent}/1 events")
+            raise OSError(
+                error_code,
+                f"SendInput injected {sent}/{len(events)} events",
+            )
 
 
 @dataclass(frozen=True)

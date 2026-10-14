@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -64,6 +65,12 @@ from auto_lie_outcome import (
 
 
 LOG = logging.getLogger(__name__)
+# High-volume UI poll boundary diagnostics have their own asynchronous file.
+# They never propagate into assistant.log or the Tk running-log history.
+UI_POLL_LOG = logging.getLogger("ui-poll")
+# Per-poll timing traces were temporary diagnosis telemetry.  Keep the trace
+# hooks available, but leave their high-volume logging disabled in releases.
+UI_POLL_TRACE_LOGGING = False
 # Automatic lie workflow diagnostics are deliberately isolated from the
 # regular patrol/application log.  The application configures this named
 # logger to write only to auto_lie.log.
@@ -136,9 +143,8 @@ AUTO_LIE_MIN_PASS_GAP_SECONDS = 10.0
 # from the operator's caption refresh control.
 # A repeating debug-UI poll failure logs a full traceback this often; the ones in between are DEBUG.
 POLL_FAILURE_LOG_SECONDS = 10.0
-# Diagnostic threshold only.  Timing is emitted through the asynchronous log
-# writer, so observing a slow UI phase never adds synchronous file I/O to it.
-UI_POLL_SLOW_PHASE_SECONDS = 0.10
+# Diagnostic threshold only. Timing is registered in memory first and emitted
+# through the asynchronous log writer only when the whole poll is slow.
 UI_POLL_SLOW_TOTAL_SECONDS = 0.25
 # A lie event waiting for an already-running pass is dropped after this long, so a stuck pass can
 # never keep the pending flag set (and this method retrying) for the rest of the session.
@@ -1267,6 +1273,13 @@ class UiWorker(threading.Thread):
         # workers.  It is enabled briefly for the post-auto-lie marker check
         # and on demand by recording.
         self._next_poll_due_at: Optional[float] = None
+        # Each Tk poll records phase begin/end times in RAM.  Normal fast polls
+        # stay silent; a slow poll flushes its complete ordered trace through
+        # the asynchronous logger so diagnostics cannot create the lag they
+        # are trying to measure.
+        self._ui_poll_trace_id = 0
+        self._ui_poll_trace_started_at = 0.0
+        self._ui_poll_trace_steps: list[list[Any]] = []
         self._ui_text_cache: dict[str, str] = {}
         self._countdown_display_state: Optional[tuple[float, str]] = None
         self._patrol_controls_render_key: Any = None
@@ -1326,17 +1339,25 @@ class UiWorker(threading.Thread):
         if not callable(consume_prearmed):
             return
         try:
-            if not consume_prearmed():
+            # The handoff crosses from the hotkey hook thread to Tk.  Keep
+            # this boundary separate from the visual catch-up: a held hotkey
+            # lock and a slow widget redraw have very different fixes.
+            with self._trace_ui_poll_step("prearmed-hotkey-stop:consume-flag"):
+                prearmed = consume_prearmed()
+            if not prearmed:
                 return
         except Exception:
             LOG.exception("could not consume pre-armed hotkey stop")
             return
-        self._finish_prearmed_hotkey_stop()
+        with self._trace_ui_poll_step("prearmed-hotkey-stop:ui-catch-up"):
+            self._finish_prearmed_hotkey_stop()
         # The matching queued Ctrl+` action may arrive in this same poll, or
         # may have been rejected by its ordinary hotkey cooldown.  In either
         # case it must never turn the just-stopped patrol back on.
-        self._hotkey_toggle_ignore_until = time.monotonic() + 0.75
-        self._play_action_sound(False)
+        with self._trace_ui_poll_step("prearmed-hotkey-stop:ignore-window"):
+            self._hotkey_toggle_ignore_until = time.monotonic() + 0.75
+        with self._trace_ui_poll_step("prearmed-hotkey-stop:feedback-sound"):
+            self._play_action_sound(False)
 
     def run(self) -> None:
         try:
@@ -3612,15 +3633,25 @@ class UiWorker(threading.Thread):
             return
         now = time.monotonic()
         due_at = self._next_poll_due_at
+        late_by = 0.0
+        trace_id = self._ui_poll_trace_id + 1
         if due_at is not None:
             late_by = now - due_at
             if late_by >= UI_POLL_SLOW_TOTAL_SECONDS:
                 LOG.warning(
-                    "TK EVENT LOOP GAP: poll began %.0fms late; a prior Tk callback "
+                    "TK EVENT LOOP GAP: poll_id=%d began %.0fms late; a prior Tk callback "
                     "or CPU starvation delayed hotkey/UI dispatch",
-                    late_by * 1000.0,
+                    trace_id, late_by * 1000.0,
                 )
         poll_started = time.perf_counter()
+        self._ui_poll_trace_id = trace_id
+        self._ui_poll_trace_started_at = poll_started
+        self._ui_poll_trace_steps = []
+        if UI_POLL_TRACE_LOGGING:
+            UI_POLL_LOG.info(
+                "POLL BEGIN id=%d scheduled_late=%.3fms",
+                trace_id, max(0.0, late_by) * 1000.0,
+            )
         try:
             self._poll_body(root)
         except Exception as exc:
@@ -3645,25 +3676,83 @@ class UiWorker(threading.Thread):
                     self._poll_failure_count, signature,
                 )
         finally:
+            with self._trace_ui_poll_step("rearm-next-poll"):
+                try:
+                    if not self.stop_event.is_set() and root.winfo_exists():
+                        self._next_poll_due_at = (
+                            time.monotonic() + self.refresh_ms / 1000.0
+                        )
+                        root.after(self.refresh_ms, self._poll)
+                except Exception:
+                    LOG.debug("could not re-arm the debug UI poll", exc_info=True)
             elapsed = time.perf_counter() - poll_started
-            if elapsed >= UI_POLL_SLOW_TOTAL_SECONDS:
-                LOG.warning("UI POLL timing: total=%.0fms", elapsed * 1000.0)
-            try:
-                if not self.stop_event.is_set() and root.winfo_exists():
-                    self._next_poll_due_at = (
-                        time.monotonic() + self.refresh_ms / 1000.0
-                    )
-                    root.after(self.refresh_ms, self._poll)
-            except Exception:
-                LOG.debug("could not re-arm the debug UI poll", exc_info=True)
+            if UI_POLL_TRACE_LOGGING:
+                UI_POLL_LOG.info(
+                    "POLL END id=%d body=%.3fms scheduled_late=%.3fms steps=%d",
+                    trace_id,
+                    elapsed * 1000.0,
+                    max(0.0, late_by) * 1000.0,
+                    len(self._ui_poll_trace_steps),
+                )
+            if (UI_POLL_TRACE_LOGGING and (
+                    elapsed >= UI_POLL_SLOW_TOTAL_SECONDS
+                    or late_by >= UI_POLL_SLOW_TOTAL_SECONDS)):
+                self._log_slow_ui_poll_trace(trace_id, elapsed, late_by)
 
-    @staticmethod
-    def _report_ui_poll_phase(phase: str, started_at: float) -> None:
-        """Log only material UI-poll delays without adding disk I/O to Tk."""
+    @contextmanager
+    def _trace_ui_poll_step(self, phase: str):
+        """Record one UI sub-process boundary without doing synchronous I/O."""
 
-        elapsed = time.perf_counter() - started_at
-        if elapsed >= UI_POLL_SLOW_PHASE_SECONDS:
-            LOG.warning("UI POLL timing: phase=%s elapsed=%.0fms", phase, elapsed * 1000.0)
+        if not UI_POLL_TRACE_LOGGING:
+            yield
+            return
+        started_at = time.perf_counter()
+        entry: list[Any] = [str(phase), started_at, None]
+        self._ui_poll_trace_steps.append(entry)
+        UI_POLL_LOG.info(
+            "STEP BEGIN poll=%d phase=%s offset=%.3fms",
+            self._ui_poll_trace_id,
+            phase,
+            (started_at - self._ui_poll_trace_started_at) * 1000.0,
+        )
+        try:
+            yield
+        finally:
+            ended_at = time.perf_counter()
+            entry[2] = ended_at
+            UI_POLL_LOG.info(
+                "STEP END poll=%d phase=%s offset=%.3fms elapsed=%.3fms",
+                self._ui_poll_trace_id,
+                phase,
+                (ended_at - self._ui_poll_trace_started_at) * 1000.0,
+                (ended_at - started_at) * 1000.0,
+            )
+
+    def _log_slow_ui_poll_trace(
+        self, trace_id: int, elapsed: float, scheduled_late: float,
+    ) -> None:
+        """Flush the exact begin/end timeline for one materially slow poll."""
+
+        origin = self._ui_poll_trace_started_at
+        LOG.warning(
+            "UI POLL TRACE BEGIN id=%d body=%.0fms scheduled_late=%.0fms steps=%d",
+            trace_id,
+            elapsed * 1000.0,
+            max(0.0, scheduled_late) * 1000.0,
+            len(self._ui_poll_trace_steps),
+        )
+        for phase, started_at, ended_at in tuple(self._ui_poll_trace_steps):
+            effective_end = time.perf_counter() if ended_at is None else ended_at
+            LOG.warning(
+                "UI POLL TRACE STEP id=%d phase=%s begin=+%.0fms end=+%.0fms elapsed=%.0fms%s",
+                trace_id,
+                phase,
+                (started_at - origin) * 1000.0,
+                (effective_end - origin) * 1000.0,
+                (effective_end - started_at) * 1000.0,
+                " unfinished" if ended_at is None else "",
+            )
+        LOG.warning("UI POLL TRACE END id=%d", trace_id)
 
     def _debug_snapshot_is_needed(self) -> bool:
         """Whether a new diagnostic minimap analysis has a live consumer.
@@ -3688,83 +3777,81 @@ class UiWorker(threading.Thread):
         # routine result queue.  In particular, a slow channel/configuration
         # update must never place a multi-second wall between Ctrl+` and the
         # dashboard state change.
-        priority_started = time.perf_counter()
-        prearmed_started = time.perf_counter()
-        self._service_prearmed_hotkey_stop()
-        self._report_ui_poll_phase("prearmed-hotkey-stop", prearmed_started)
+        with self._trace_ui_poll_step("prearmed-hotkey-stop"):
+            self._service_prearmed_hotkey_stop()
         # Physical hotkeys are an operator safety path.  The listener thread
         # has already recognized the chord and placed its action in a queue;
         # dispatch it before any OpenCV snapshot build, log display update, or
         # periodic widget refresh.  In particular Ctrl+` must not wait behind
         # debug rendering before it can stop game input.
-        hotkey_started = time.perf_counter()
-        try:
-            self._drain_hotkey_actions()
-        except Exception:
-            LOG.exception("urgent hotkey dispatch failed; the UI tick continues")
-        self._report_ui_poll_phase("hotkey-actions", hotkey_started)
-        self._report_ui_poll_phase("priority-gates-and-hotkeys", priority_started)
+        with self._trace_ui_poll_step("hotkey-actions"):
+            try:
+                self._drain_hotkey_actions()
+            except Exception:
+                LOG.exception("urgent hotkey dispatch failed; the UI tick continues")
         # A detected lie window is a real-time event.  Its detector timestamp
         # anchors the upload deadline, so waiting for the debug snapshot or
         # routine panel repaint here can make an otherwise fast WebSocket
         # handshake start several seconds late.  Start/advance the dedicated
         # worker before all nonessential display work.  The worker itself owns
         # handshake, frame pushes, and server I/O on its own thread.
-        auto_lie_started = time.perf_counter()
         for step in (
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
         ):
-            step_started = time.perf_counter()
-            try:
-                step()
-            except Exception:
-                AUTO_LIE_LOG.exception(
-                    "自动过测谎 priority service %s failed; the UI tick continues",
-                    getattr(step, "__name__", step),
-                )
-            self._report_ui_poll_phase(
-                f"auto-lie:{getattr(step, '__name__', step)}", step_started,
-            )
-        self._report_ui_poll_phase("auto-lie-dispatch", auto_lie_started)
+            phase = f"auto-lie:{getattr(step, '__name__', step)}"
+            with self._trace_ui_poll_step(phase):
+                try:
+                    step()
+                except Exception:
+                    AUTO_LIE_LOG.exception(
+                        "自动过测谎 priority service %s failed; the UI tick continues",
+                        getattr(step, "__name__", step),
+                    )
         # While a move/resize modal loop is running the client is frozen
         # (repaint suppressed); skip the heavy snapshot render + log insert
         # so the resize stays light, but keep the poll cadence alive.
-        frozen = bool(
-            getattr(self, "_resize_freeze_state", {}).get("active", False)
-        )
+        with self._trace_ui_poll_step("resize-freeze-gate"):
+            frozen = bool(
+                getattr(self, "_resize_freeze_state", {}).get("active", False)
+            )
         if frozen:
             return
         latest = None
-        while True:
-            try:
-                candidate = self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
-            latest = candidate
-            try:
-                self.frame_queue.task_done()
-            except (AttributeError, ValueError):
-                pass
-        snapshot_to_render: Optional[DebugSnapshot] = (
-            self._debug_snapshot_worker.poll_latest()
-        )
-        if latest is not None:
-            self._latest_capture_frame = latest
+        with self._trace_ui_poll_step("frame-queue-drain"):
+            while True:
+                try:
+                    candidate = self.frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+                latest = candidate
+                try:
+                    self.frame_queue.task_done()
+                except (AttributeError, ValueError):
+                    pass
+        with self._trace_ui_poll_step("debug-snapshot-result"):
+            snapshot_to_render: Optional[DebugSnapshot] = (
+                self._debug_snapshot_worker.poll_latest()
+            )
+        with self._trace_ui_poll_step("latest-frame-cache"):
+            if latest is not None:
+                self._latest_capture_frame = latest
         # The outcome observer needs only the latest captured image; it does
         # not need a freshly rendered debug snapshot.  Keeping it here means a
         # success/failure observation is never held behind OpenCV UI drawing.
-        try:
-            self._service_auto_lie_outcome_monitor()
-        except Exception:
-            AUTO_LIE_LOG.exception(
-                "自动过测谎 priority outcome observation failed; the UI tick continues"
-            )
-        if latest is not None and self._debug_snapshot_is_needed():
-            # OpenCV minimap detection and image cropping are diagnostic UI
-            # work.  Hand them to a latest-only worker so a slow snapshot can
-            # never delay the next hotkey, auto-lie event, or patrol control.
-            self._debug_snapshot_worker.submit(latest, self.configured_map_name)
+        with self._trace_ui_poll_step("auto-lie:outcome-monitor"):
+            try:
+                self._service_auto_lie_outcome_monitor()
+            except Exception:
+                AUTO_LIE_LOG.exception(
+                    "自动过测谎 priority outcome observation failed; the UI tick continues"
+                )
+        with self._trace_ui_poll_step("debug-snapshot-submit"):
+            if latest is not None and self._debug_snapshot_is_needed():
+                # OpenCV minimap detection and image cropping are diagnostic UI
+                # work.  Hand them to a latest-only worker so a slow snapshot can
+                # never delay the next hotkey, auto-lie event, or patrol control.
+                self._debug_snapshot_worker.submit(latest, self.configured_map_name)
         # Each periodic task is guarded on its own.  The whole body used to
         # share ONE try/except, so an exception thrown by any single step (log
         # drain, status refresh, patrol sync, YOLO exit poll, a result drain)
@@ -3794,26 +3881,23 @@ class UiWorker(threading.Thread):
             self._drain_api_test_results,
             self._service_auto_lie_marker_verification,
         ):
-            step_started = time.perf_counter()
-            try:
-                step()
-            except Exception:
-                LOG.exception("periodic UI step %s failed; the tick continues",
-                              getattr(step, "__name__", step))
-            self._report_ui_poll_phase(
-                getattr(step, "__name__", str(step)), step_started,
-            )
+            phase = getattr(step, "__name__", str(step))
+            with self._trace_ui_poll_step(phase):
+                try:
+                    step()
+                except Exception:
+                    LOG.exception("periodic UI step %s failed; the tick continues",
+                                  getattr(step, "__name__", step))
 
         # Tk rendering is non-critical debug output.  Keep it last so a
         # completed snapshot never delays hotkey or patrol-control handling.
         if snapshot_to_render is not None:
-            render_started = time.perf_counter()
-            try:
-                self.last_snapshot = snapshot_to_render
-                self._render(snapshot_to_render)
-            except Exception:
-                LOG.exception("could not render completed debug snapshot")
-            self._report_ui_poll_phase("debug-render", render_started)
+            with self._trace_ui_poll_step("debug-render"):
+                try:
+                    self.last_snapshot = snapshot_to_render
+                    self._render(snapshot_to_render)
+                except Exception:
+                    LOG.exception("could not render completed debug snapshot")
 
     def _sync_patrol_ui_state(self) -> None:
         """Refresh patrol buttons when patrol stopped outside the UI.
@@ -3890,35 +3974,21 @@ class UiWorker(threading.Thread):
             LOG.info(LOG_RUN_START + "。")
 
     def _license_allowed(self) -> bool:
-        """Refresh and return the signed-license gate without raising."""
+        """Return the last background-validation verdict without doing I/O.
+
+        This gate is used by routine UI paths such as Start/Stop Patrol and
+        control redraws.  It must never re-read the license document, verify
+        a signature, or refresh the hardware fingerprint: the latter can
+        start CIM/PowerShell calls and held the Tk thread for several seconds
+        during an otherwise immediate Ctrl+` stop.  Startup establishes the
+        initial state; activation and the heartbeat worker are the only paths
+        that refresh it thereafter.
+        """
 
         if getattr(self, "_license_session_locked", False):
             return False
-        local_status = verify_license()
-        previous = getattr(self, "_license_status", None)
-        # Local signature checks intentionally know nothing about the online
-        # device record.  Preserve the heartbeat's equipment ID and usage
-        # data when they refer to the same signed license, otherwise a normal
-        # UI gate would erase the value immediately after it was received.
-        if (
-            isinstance(previous, LicenseStatus)
-            and local_status.license_id
-            and previous.license_id == local_status.license_id
-        ):
-            local_status = replace(
-                local_status,
-                equipment_id=previous.equipment_id,
-                auto_lie_allowed=previous.auto_lie_allowed,
-                remaining_auto_lie_count=previous.remaining_auto_lie_count,
-                remaining_auto_lie_unlimited=previous.remaining_auto_lie_unlimited,
-                lie_detect_total=previous.lie_detect_total,
-                lie_detect_success_total=previous.lie_detect_success_total,
-                lie_detect_failed_total=previous.lie_detect_failed_total,
-                lie_detect_today=previous.lie_detect_today,
-                lie_detect_yesterday=previous.lie_detect_yesterday,
-            )
-        self._license_status = local_status
-        return bool(self._license_status.valid)
+        status = getattr(self, "_license_status", None)
+        return bool(isinstance(status, LicenseStatus) and status.valid)
 
     def _start_license_heartbeat(self) -> None:
         """Start the immediate + three-hour online entitlement heartbeat."""
@@ -10725,8 +10795,14 @@ class UiWorker(threading.Thread):
         self._patrol_stop_started_at = time.monotonic()
         self._patrol_stop_cleanup_finished_at = None
         try:
-            self._control_status.configure(text="正在停止巡逻并释放按键…")
-            self._refresh_patrol_controls()
+            with self._trace_ui_poll_step(
+                "prearmed-hotkey-stop:status-widget"
+            ):
+                self._control_status.configure(text="正在停止巡逻并释放按键…")
+            with self._trace_ui_poll_step(
+                "prearmed-hotkey-stop:patrol-controls"
+            ):
+                self._refresh_patrol_controls()
         except Exception:
             LOG.debug("could not refresh pre-armed patrol stop", exc_info=True)
         LOG.info("STOP PATROL: UI caught up with immediate hotkey disarm")

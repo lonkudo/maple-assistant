@@ -419,6 +419,27 @@ def main() -> int:
         scoped_logger.propagate = False
     auto_lie_log_writer.start()
 
+    # UI poll diagnostics are intentionally verbose: every sub-process writes
+    # an exact BEGIN/END boundary so a multi-second Tk stall can be assigned to
+    # one phase even before that phase returns.  Keep this stream out of both
+    # assistant.log and the Tk log history, and batch its writes independently.
+    ui_poll_log_writer = AsyncBatchLogWriter(
+        Path(__file__).with_name("ui_poll.log"),
+        max_bytes=8_000_000,
+        backup_count=2,
+        capacity=20_000,
+        batch_records=500,
+        batch_seconds=0.10,
+        formatter=_compact_log_formatter(),
+    )
+    ui_poll_log_handler = ui_poll_log_writer.handler
+    ui_poll_log_handler.setLevel(logging.INFO)
+    ui_poll_logger = logging.getLogger("ui-poll")
+    ui_poll_logger.setLevel(logging.INFO)
+    ui_poll_logger.addHandler(ui_poll_log_handler)
+    ui_poll_logger.propagate = False
+    ui_poll_log_writer.start()
+
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
         logging.critical(
             "uncaught exception in worker %s",
@@ -574,6 +595,10 @@ def main() -> int:
     auto_lie_endpoint: dict[str, object] = {
         "value": None, "error": "", "candidates": (),
     }
+    # A dead service port must not consume the lie window.  The next candidate
+    # can be tried quickly; a healthy local/remote service has historically
+    # completed its WebSocket upgrade and formal handshake far below this.
+    AUTO_LIE_HANDSHAKE_TIMEOUT_SECONDS = 0.5
 
     def warm_auto_lie_endpoint() -> None:
         """Probe six random ports and cache the least-loaded quick reply.
@@ -766,7 +791,9 @@ def main() -> int:
         failures: list[str] = []
         for index, (host, port) in enumerate(ordered):
             endpoint_url = describe_ws_endpoint(host, port)
-            client = RoiTrackWsClient(host, port, timeout=5.0)
+            client = RoiTrackWsClient(
+                host, port, timeout=AUTO_LIE_HANDSHAKE_TIMEOUT_SECONDS,
+            )
             try:
                 started = time.perf_counter()
                 client.connect()
@@ -1754,12 +1781,18 @@ def main() -> int:
 
                     def release_hotkey_input() -> None:
                         try:
-                            # Ctrl+` was received while the game was active.
-                            # Never refocus from this emergency path: focus
-                            # selection may block and defeat immediate stop.
+                            # The game can lose foreground between the bot's
+                            # last key-down and this hotkey callback (most
+                            # visibly while a laggy client briefly hands focus
+                            # to its Ghost surface).  The old no-refocus path
+                            # then only forgot the local ledger and sent *no*
+                            # game-side key-up, leaving that held direction in
+                            # MapleStory.  This remains a background cleanup:
+                            # its one bounded refocus attempt cannot delay the
+                            # immediate stop gate or Tk handoff.
                             _stop_live_input(
                                 key_sender, automation_active,
-                                refocus_before_release=False,
+                                refocus_before_release=True,
                             )
                         finally:
                             hotkey_stop_cleanup_done.set()
@@ -2229,7 +2262,7 @@ def main() -> int:
             climb_arrival_world_tolerance=float(
                 calibration.get("climb_arrival_world_tolerance", 0.20)
             ),
-            climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.12)),
+            climb_nudge_seconds=float(calibration.get("climb_nudge_seconds", 0.20)),
             climb_y_change_required=float(calibration.get("climb_y_change_required", 0.015)),
             climb_world_y_change_required=float(
                 calibration.get("climb_world_y_change_required", 0.75)
@@ -2774,9 +2807,11 @@ def main() -> int:
             "auto-lie", "api_auto_lie", "api_lie_test", "autolie_api",
         ):
             logging.getLogger(auto_lie_log_name).removeHandler(auto_lie_log_handler)
+        ui_poll_logger.removeHandler(ui_poll_log_handler)
         # Writers own file close/flush.  They drain only their current bounded
         # record batches and never hold a live gameplay worker at shutdown.
         auto_lie_log_writer.close(drain_timeout=1.0)
+        ui_poll_log_writer.close(drain_timeout=1.0)
         server_log_writer.close(drain_timeout=1.0)
         trace_log_writer.close(drain_timeout=1.0)
         _release_single_instance_mutex(singleton_handle)

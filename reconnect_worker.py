@@ -324,12 +324,18 @@ CONNECT_BUTTON_ASPECT_RANGE = (1.2, 14.0)
 CONNECT_BUTTON_REFERENCE_NAME = "login_connect_target.jpg"
 # Template matching threshold for the 连接 button crop (a shipped crop must match the real art).
 CONNECT_TEMPLATE_MIN_SCORE = 0.62
-# The final channel handoff is deliberately three quiet rounds: wait for the client
-# to accept the selected channel, then double-tap Enter.  A rapid continuous
-# Enter loop is often discarded by the client at this boundary.
+# One final channel-handoff attempt is deliberately three quiet rounds: wait
+# for the client to accept the selected channel, then double-tap Enter.  A
+# rapid continuous Enter loop is often discarded by the client at this boundary.
 CHANNEL_CONFIRM_ROUND_WAIT_SECONDS = 2.0
 CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS = 0.12
 CHANNEL_CONFIRM_ROUNDS = 3
+# If the page is still the channel selector after one complete handoff, a slow
+# game gets 15 seconds to consume the last input before the final handoff is
+# repeated.  There are the initial attempt plus two retries; world/channel
+# selection is never repeated by this recovery.
+CHANNEL_CONFIRM_HANDOFF_ATTEMPTS = 3
+CHANNEL_CONFIRM_RETRY_WAIT_SECONDS = 15.0
 # During the final channel handoff, a real minimap marker is stronger evidence
 # than a completed Enter routine.  Poll at the shared capture cadence so an
 # already-loaded game immediately cancels the remaining confirmation keys.
@@ -1506,13 +1512,15 @@ def _channel_number_score(observed, reference) -> float:
     return best
 
 
-def read_channel_grid(frame, client_size=None) -> Optional[ChannelGridReading]:
+def read_channel_grid(frame, client_size=None, *, ignore_slot: Optional[int] = None) -> Optional[ChannelGridReading]:
     """Read the visible page as one of the valid consecutive grids: 1,5,9,...,41.
 
     Scoring the complete grid is substantially safer than trusting one blurred digit.  The three
     worst cells are discarded so a mouse cursor, selection highlight, or partial repaint cannot
-    change the page identity.  Ambiguous readings fail closed: reconnect may retry or scroll again,
-    but it may not double-click a channel.
+    change the page identity.  ``ignore_slot`` is the one calculated target cell whose number may
+    be too blurred to read on a 1080 preset; the other 19 labels must still prove the page.
+    Ambiguous readings fail closed: reconnect may retry or scroll again, but it may not
+    double-click a channel.
     """
 
     import cv2
@@ -1533,11 +1541,14 @@ def read_channel_grid(frame, client_size=None) -> Optional[ChannelGridReading]:
         if crop is None or not crop.size:
             return None
         observed.append(crop)
+    ignored = int(ignore_slot) if ignore_slot is not None else None
+    if ignored is not None and not 0 <= ignored < len(observed):
+        ignored = None
     candidates = []
     for first_channel in CHANNEL_GRID_STARTS:
         scores = [
             _channel_number_score(observed[slot], templates[first_channel + slot - 1])
-            for slot in range(len(observed))
+            for slot in range(len(observed)) if slot != ignored
         ]
         kept = sorted(scores)[CHANNEL_GRID_TRIM_WORST:]
         candidates.append((float(np.mean(kept)), first_channel))
@@ -2254,6 +2265,40 @@ class ReconnectWorker(threading.Thread):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
+            if not self._sleep_checked(
+                    min(CHANNEL_CONFIRM_MARKER_POLL_SECONDS, remaining)):
+                return None
+
+    def _wait_for_channel_handoff_retry(self, seconds: float) -> Optional[str]:
+        """Wait before retrying Enter while watching marker and page state.
+
+        ``"retry"`` means the channel page remained visible for the complete
+        backoff; ``"ready"`` means a character marker appeared; ``"left"``
+        means the selector disappeared, so further Enter presses would be
+        unsafe; ``None`` is cancellation/shutdown.
+        """
+
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self.stop_event.is_set() or self._cancel_requested.is_set():
+                return None
+            if self._post_login_marker_visible():
+                LOG.info(
+                    "auto reconnect: yellow marker appeared during final-channel retry wait"
+                )
+                return "ready"
+            if self.page_verification_available():
+                page, score = self.page_now()
+                if page != PAGE_CHANNEL:
+                    LOG.info(
+                        "auto reconnect: channel selector left during final-channel retry wait; "
+                        "page=%s score=%.2f, stopping further Enter presses",
+                        self._page_label(page), score,
+                    )
+                    return "left"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "retry"
             if not self._sleep_checked(
                     min(CHANNEL_CONFIRM_MARKER_POLL_SECONDS, remaining)):
                 return None
@@ -3899,7 +3944,7 @@ class ReconnectWorker(threading.Thread):
         return None
 
     def _scroll_list_rows(self, rows: int) -> int:
-        """Send the CALCULATED number of wheel notches - one notch per channel row.
+        """Send the signed calculated number of wheel notches, one per channel row.
 
         The operator's measurement: the channels are paged (1-20, 21-40, 41-60) and one notch shifts the
         list by one row, so channel 51 needs exactly 8 notches.  The picture is measured as evidence and
@@ -3911,27 +3956,34 @@ class ReconnectWorker(threading.Thread):
         is kept); later notches just carry on with it.
         """
 
-        total = max(0, int(rows))
+        requested = int(rows)
+        direction = 1 if requested >= 0 else -1
+        total = abs(requested)
+        if not total:
+            return 0
         channel_x, channel_y = window_client_point(CHANNEL_FIRST_CLIENT, self._click_size())
         channel_list_box = window_client_box(CHANNEL_LIST_CLIENT_BOX, self._click_size())
         for notch in range(1, total + 1):
             if self._cancelled():
-                return notch - 1
+                return direction * (notch - 1)
             before = self._capture()[0]
-            if not self._wheel_client(channel_x, channel_y, CHANNEL_SCROLL_NOTCHES_PER_ROW):
+            if not self._wheel_client(
+                    channel_x, channel_y,
+                    direction * CHANNEL_SCROLL_NOTCHES_PER_ROW):
                 LOG.error("auto reconnect: the wheel event for the channel list could not be sent")
-                return notch - 1
+                return direction * (notch - 1)
             if not self._sleep_checked(CHANNEL_SCROLL_WAIT_SECONDS):
-                return notch - 1
+                return direction * (notch - 1)
             after = self._capture()[0]
             change = region_change(before, after, channel_list_box)
-            LOG.info("auto reconnect: notch %d/%d sent (the list region changed by %.2f - evidence "
-                     "only)", notch, total, change)
+            LOG.info("auto reconnect: %s notch %d/%d sent (the list region changed by %.2f - "
+                     "evidence only)", "down" if direction > 0 else "up", notch, total, change)
             if notch == 1:
                 self._pick_wheel_method(before, after, change)
-        LOG.info("auto reconnect: sent %d notch(es) = %d row(s) by calculation", total, total)
-        self._report("channel", f"已滚动 {total} 行（按计算）")
-        return total
+        LOG.info("auto reconnect: sent %d %s notch(es) = %d row(s) by calculation", total,
+                 "down" if direction > 0 else "up", total)
+        self._report("channel", f"按计算向{'下' if direction > 0 else '上'}滚动 {total} 行")
+        return requested
 
     def _pick_wheel_method(self, before, after, change: float) -> None:
         """Keep the wheel method that visibly moved the list (evidence, not a gate)."""
@@ -3984,6 +4036,7 @@ class ReconnectWorker(threading.Thread):
         target_row = (int(channel) - 1) // CHANNELS_PER_ROW
         desired_first_row = max(0, target_row - (CHANNEL_VISIBLE_ROWS - 1))
         desired_first_channel = 1 + desired_first_row * CHANNELS_PER_ROW
+        expected_visible_slot = int(channel) - desired_first_channel
         confirmed_first = None
         confirmations = 0
         for attempt in range(1, CHANNEL_VERIFY_MAX_ATTEMPTS + 1):
@@ -3991,6 +4044,23 @@ class ReconnectWorker(threading.Thread):
                 return None
             frame = self._capture()[0]
             reading = read_channel_grid(frame, size)
+            target_number_ignored = False
+            # On the 1080 preset the selected target's tiny numeral can be too blurred for a
+            # full 20-cell OCR reading.  The page itself is still safely identifiable from the
+            # other 19 labels, so do not abandon a confirmed target page merely because its own
+            # number is unreadable.  This fallback is deliberately restricted to the planned
+            # page and never authorises an off-page target.
+            if reading is None:
+                fallback = read_channel_grid(
+                    frame, size, ignore_slot=expected_visible_slot,
+                )
+                if fallback is not None and fallback.first_channel == desired_first_channel:
+                    reading = fallback
+                    target_number_ignored = True
+                    LOG.info("auto reconnect: channel %d target numeral is unreadable; "
+                             "the remaining 19 labels confirmed grid %d-%d", channel,
+                             reading.first_channel,
+                             reading.first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1)
             if reading is None:
                 confirmations = 0
                 confirmed_first = None
@@ -4001,10 +4071,11 @@ class ReconnectWorker(threading.Thread):
                 continue
 
             LOG.info("auto reconnect: channel grid read %d-%d profile=%s score=%.3f margin=%.3f "
-                     "(check %d/%d)", reading.first_channel,
+                     "(check %d/%d%s)", reading.first_channel,
                      reading.first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1,
                      reading.profile, reading.score, reading.margin, attempt,
-                     CHANNEL_VERIFY_MAX_ATTEMPTS)
+                     CHANNEL_VERIFY_MAX_ATTEMPTS,
+                     "; target numeral ignored" if target_number_ignored else "")
             if reading.first_channel == desired_first_channel:
                 if confirmed_first == reading.first_channel:
                     confirmations += 1
@@ -4021,8 +4092,12 @@ class ReconnectWorker(threading.Thread):
                     row_pitch = window_client_length(CHANNEL_ROW_STEP_CLIENT, size)
                     cell_x = int(round(channel_x + (visible_slot % CHANNELS_PER_ROW) * column_pitch))
                     cell_y = int(round(channel_y + (visible_slot // CHANNELS_PER_ROW) * row_pitch))
-                    self._report("channel", f"已识别频道列表 {reading.first_channel}-"
-                                 f"{reading.first_channel + 19}，确认 {channel}频道")
+                    self._report(
+                        "channel",
+                        f"已识别频道列表 {reading.first_channel}-"
+                        f"{reading.first_channel + 19}，确认 {channel}频道"
+                        + ("（目标数字模糊，按页面位置点击）" if target_number_ignored else ""),
+                    )
                     return cell_x, cell_y, visible_slot
                 if not self._sleep_checked(CHANNEL_VERIFY_POLL_SECONDS):
                     return None
@@ -4031,18 +4106,31 @@ class ReconnectWorker(threading.Thread):
             confirmations = 0
             confirmed_first = None
             current_row = (reading.first_channel - 1) // CHANNELS_PER_ROW
-            direction = 1 if desired_first_row > current_row else -1
-            LOG.warning("auto reconnect: expected grid start %d but read %d; sending one %s wheel "
-                        "step and checking the labels again", desired_first_channel,
-                        reading.first_channel, "down" if direction > 0 else "up")
+            remaining_rows = desired_first_row - current_row
+            # The page was successfully read but is not yet the page that
+            # places the target at its calculated visible slot.  This is
+            # normal for an off-screen channel, never a recognition failure.
+            # Use the recognised page start to compute the whole remaining
+            # travel, scroll it, then read the new page again before allowing
+            # a click.
+            LOG.warning("auto reconnect: target channel %d is not yet on its planned grid %d-%d; "
+                        "current grid is %d-%d, %d row(s) still needed %s", channel,
+                        desired_first_channel, desired_first_channel + 19,
+                        reading.first_channel,
+                        reading.first_channel + 19, abs(remaining_rows),
+                        "down" if remaining_rows > 0 else "up")
             self._report("channel", f"当前显示 {reading.first_channel}-"
-                         f"{reading.first_channel + 19}，继续校正到 {desired_first_channel}-"
-                         f"{desired_first_channel + 19}")
-            if not self._wheel_client(channel_x, channel_y,
-                                      direction * CHANNEL_SCROLL_NOTCHES_PER_ROW):
-                LOG.error("auto reconnect: corrective channel-list wheel input failed")
+                         f"{reading.first_channel + 19}，{channel}频道不在当前页，"
+                         f"按计算继续向{'下' if remaining_rows > 0 else '上'}滚动 "
+                         f"{abs(remaining_rows)} 行")
+            scrolled = self._scroll_list_rows(remaining_rows)
+            if scrolled != remaining_rows:
+                LOG.warning("auto reconnect: corrective channel-list scroll sent %d/%d row(s)",
+                            scrolled, remaining_rows)
+            if self._cancelled():
                 return None
-            if not self._sleep_checked(CHANNEL_SCROLL_WAIT_SECONDS):
+            if scrolled != remaining_rows and not self._sleep_checked(
+                    CHANNEL_SCROLL_WAIT_SECONDS):
                 return None
 
         LOG.error("auto reconnect: channel %d was not visually confirmed after %d closed-loop "
@@ -4055,6 +4143,17 @@ class ReconnectWorker(threading.Thread):
 
         frame = self._capture()[0]
         reading = read_channel_grid(frame, size)
+        target_number_ignored = False
+        expected_first_channel = int(channel) - int(visible_slot)
+        if reading is None:
+            fallback = read_channel_grid(frame, size, ignore_slot=visible_slot)
+            if fallback is not None and fallback.first_channel == expected_first_channel:
+                reading = fallback
+                target_number_ignored = True
+                LOG.info("auto reconnect: selected channel %d numeral is unreadable after click; "
+                         "the remaining 19 labels confirmed grid %d-%d", channel,
+                         reading.first_channel,
+                         reading.first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1)
         if reading is None:
             LOG.warning("auto reconnect: channel labels became unreadable after selecting %d; "
                         "refusing to double-click", channel)
@@ -4066,8 +4165,9 @@ class ReconnectWorker(threading.Thread):
                       reading.first_channel, reading.first_channel + 19)
             return False
         LOG.info("auto reconnect: post-click channel gate confirmed channel %d at slot %d "
-                 "(grid %d-%d, score %.3f, margin %.3f)", channel, visible_slot,
-                 reading.first_channel, reading.first_channel + 19, reading.score, reading.margin)
+                 "(grid %d-%d, score %.3f, margin %.3f%s)", channel, visible_slot,
+                 reading.first_channel, reading.first_channel + 19, reading.score, reading.margin,
+                 "; target numeral ignored" if target_number_ignored else "")
         return True
 
     def _select_channel(self, channel: int) -> bool:
@@ -4151,6 +4251,30 @@ class ReconnectWorker(threading.Thread):
             LOG.info("auto reconnect: after the second channel 1 click the list region changed by "
                      "%.2f", region_change(before, self._capture()[0], channel_list_box))
 
+        # First bring an off-screen target into view by the known channel-grid
+        # arithmetic.  The selector always opens on channel 1, so this does
+        # not need OpenCV to recognise a target that is not visible yet:
+        # channel 51, for example, is row 13 and needs 8 row-scrolls before
+        # its label can possibly be read.  A previous refactor left this
+        # helper unused and asked OpenCV to prove the destination page before
+        # it had been scrolled there, causing reconnect to stop on an ordinary
+        # off-page target.
+        #
+        # The calculated scroll is deliberately not the final authority.  A
+        # laggy game may swallow a wheel event, so the closed-loop reader
+        # below still verifies the visible grid and applies further corrective
+        # scrolling before any target-cell click is allowed.
+        if rows_to_scroll:
+            scrolled = self._scroll_list_rows(rows_to_scroll)
+            if scrolled != rows_to_scroll:
+                LOG.warning(
+                    "auto reconnect: calculated channel scroll stopped after %d/%d row(s); "
+                    "the visual verifier will determine whether more scrolling is needed",
+                    scrolled, rows_to_scroll,
+                )
+                if self._cancelled():
+                    return False
+
         # Do not trust a count of injected wheel events.  On a leaking/lagging game process the OS
         # can accept an event that the game never consumes.  Read the 20 channel labels after every
         # wheel step and continue until the native 1080/1366 sampler proves the intended grid is on
@@ -4222,48 +4346,86 @@ class ReconnectWorker(threading.Thread):
             self._report("channel", f"点击 {channel}频道 ({cell_x}, {cell_y}) 后画面无明显变化（继续）")
         self._report("channel", f"{channel}频道 已双击选中 ({cell_x}, {cell_y})")
 
-        # The last handoff is intentionally not a one-second Enter loop.  The
-        # client needs a quiet interval after channel selection, then receives
-        # two Enter taps; repeat that complete round twice more.  Once the
-        # yellow character marker appears, the client has already loaded into
-        # the map, so no remaining Enter pair is sent.
+        # The last handoff is intentionally not a one-second Enter loop.  One
+        # attempt consists of three quiet wait + double-Enter rounds (~6.24 s).
+        # If the selector is still visibly open afterward, wait 15 s and retry
+        # only this handoff twice more.  Never repeat world/channel selection.
+        # If the selector disappears at any point, stop typing immediately and
+        # let the normal post-login marker readiness gate establish success.
         before_enter = self._capture()[0]
-        for round_number in range(1, CHANNEL_CONFIRM_ROUNDS + 1):
-            marker_seen = self._wait_for_channel_confirm_or_marker(
-                CHANNEL_CONFIRM_ROUND_WAIT_SECONDS
-            )
-            if marker_seen is None:
-                return False
-            if marker_seen:
-                return True
-            for press_number in range(1, 3):
-                reason = self._press("enter")
-                if reason:
-                    self._report("failed", reason)
+        for handoff_attempt in range(1, CHANNEL_CONFIRM_HANDOFF_ATTEMPTS + 1):
+            for round_number in range(1, CHANNEL_CONFIRM_ROUNDS + 1):
+                marker_seen = self._wait_for_channel_confirm_or_marker(
+                    CHANNEL_CONFIRM_ROUND_WAIT_SECONDS
+                )
+                if marker_seen is None:
                     return False
-                if press_number == 1 and not self._sleep_checked(
-                    CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS
-                ):
-                    return False
-            self._report(
-                "enter-confirm",
-                f"{channel}频道：第 {round_number}/{CHANNEL_CONFIRM_ROUNDS} 轮双按 Enter",
-            )
+                if marker_seen:
+                    return True
+                for press_number in range(1, 3):
+                    reason = self._press("enter")
+                    if reason:
+                        self._report("failed", reason)
+                        return False
+                    if press_number == 1 and not self._sleep_checked(
+                        CHANNEL_CONFIRM_DOUBLE_PRESS_GAP_SECONDS
+                    ):
+                        return False
+                self._report(
+                    "enter-confirm",
+                    f"{channel}频道：第 {handoff_attempt}/{CHANNEL_CONFIRM_HANDOFF_ATTEMPTS} 次确认，"
+                    f"第 {round_number}/{CHANNEL_CONFIRM_ROUNDS} 轮双按 Enter",
+                )
+                # The channel page may vanish as soon as a pair is consumed.
+                # No later pair may be sent into a loading map/login transition.
+                if self.page_verification_available():
+                    page, score = self.page_now()
+                    if page != PAGE_CHANNEL:
+                        LOG.info(
+                            "auto reconnect: channel %d handoff accepted after attempt %d round %d; "
+                            "page=%s (%.2f), stopping further Enter presses",
+                            channel, handoff_attempt, round_number,
+                            self._page_label(page), score,
+                        )
+                        self._report("loading", "频道选择页已关闭，等待黄色角色标记确认登录")
+                        return self._sleep_checked(LOGIN_SETTLE_SECONDS)
 
-        after_enter = self._capture()[0]
-        change = screen_change(before_enter, after_enter)
-        page, score = self.page_now()
-        LOG.info("auto reconnect: after %d channel-confirmation rounds the screen changed by "
-                 "%.2f and the page is %s (%.2f)", CHANNEL_CONFIRM_ROUNDS,
-                 change, self._page_label(page), score)
-        if self.page_verification_available() and page is not None:
-            LOG.error("auto reconnect: confirming channel %d did not leave the channel page (%s, "
-                      "%.2f) after %d double-Enter rounds", channel,
-                      self._page_label(page), score, CHANNEL_CONFIRM_ROUNDS)
-            self._report("failed", f"确认 {channel}频道 后页面仍是{self._page_label(page)}")
-            return False
-        self._report("enter", f"{channel}频道")
-        return self._sleep_checked(LOGIN_SETTLE_SECONDS)
+            after_enter = self._capture()[0]
+            change = screen_change(before_enter, after_enter)
+            page, score = self.page_now()
+            LOG.info(
+                "auto reconnect: final channel handoff %d/%d completed; screen change %.2f; "
+                "page=%s (%.2f)",
+                handoff_attempt, CHANNEL_CONFIRM_HANDOFF_ATTEMPTS, change,
+                self._page_label(page), score,
+            )
+            if not self.page_verification_available() or page != PAGE_CHANNEL:
+                self._report("loading", "频道选择页已关闭，等待黄色角色标记确认登录")
+                return self._sleep_checked(LOGIN_SETTLE_SECONDS)
+            if handoff_attempt >= CHANNEL_CONFIRM_HANDOFF_ATTEMPTS:
+                break
+            self._report(
+                "channel",
+                f"{channel}频道仍在选择页，等待 {CHANNEL_CONFIRM_RETRY_WAIT_SECONDS:.0f} 秒后重试确认",
+            )
+            retry_state = self._wait_for_channel_handoff_retry(
+                CHANNEL_CONFIRM_RETRY_WAIT_SECONDS
+            )
+            if retry_state is None:
+                return False
+            if retry_state == "ready":
+                return True
+            if retry_state == "left":
+                self._report("loading", "频道选择页已关闭，等待黄色角色标记确认登录")
+                return self._sleep_checked(LOGIN_SETTLE_SECONDS)
+
+        LOG.error(
+            "auto reconnect: channel %d remained on the channel selector after %d final handoff "
+            "attempts (each %d double-Enter rounds)",
+            channel, CHANNEL_CONFIRM_HANDOFF_ATTEMPTS, CHANNEL_CONFIRM_ROUNDS,
+        )
+        self._report("failed", f"确认 {channel}频道 {CHANNEL_CONFIRM_HANDOFF_ATTEMPTS} 次后仍在频道选择页")
+        return False
 
     # ------------------------------------------------------------------ plumbing
 

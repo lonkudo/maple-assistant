@@ -1080,6 +1080,22 @@ class PatrolController:
                 if not isinstance(coordinate, dict):
                     continue
                 adaptive_points += 1
+                # A rope is a physical X landmark, not an endpoint whose
+                # relative position should follow a detected canvas.  The
+                # marker and rope values are both already normalised within
+                # the minimap analysis box at recording time.  Projecting a
+                # rope through a later canvas/diamond measurement can turn a
+                # correct recorded x into an "air rope" target.  Preserve it
+                # exactly on every preset and analysis-size fluctuation.
+                if point_name == "rope_pos":
+                    try:
+                        x, y = float(point["x"]), float(point["y"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    point["x"] = round(max(0.02, min(0.98, x)), 6)
+                    point["y"] = round(max(0.02, min(0.98, y)), 6)
+                    projected_y.append(y)
+                    continue
                 recorded_layout = coordinate.get("recorded_layout")
                 same_analysis_frame = False
                 if isinstance(recorded_layout, dict):
@@ -1134,7 +1150,6 @@ class PatrolController:
                                 - layout.analysis_width) <= 1.0
                             and abs(float(recorded_layout["analysis_height"])
                                     - layout.analysis_height) <= 1.0
-                            and _diamond_geometry_matches(recorded_layout, layout)
                         )
                     except (KeyError, TypeError, ValueError):
                         same_analysis_frame = False

@@ -135,7 +135,7 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "estimated_minimap_speed": .11, "final_calculation_distance": .035,
         "final_calculation_diamonds": 1.025, "estimated_final_speed": .205,
         "final_move_safety_gain": .95, "climb_up_hold_seconds": .45,
-        "climb_nudge_seconds": .12, "climb_y_change_required": .015,
+        "climb_nudge_seconds": .20, "climb_y_change_required": .015,
         "climb_failed_shift_right_seconds": .1,
         "climb_attempt_interval_seconds": .5,
         "climb_failed_cycles_reset": 3,

@@ -1374,13 +1374,14 @@ def _directional_jump_climb(
     climb_duration: float,
     persistent_up: bool = False,
 ) -> bool:
-    """Press Alt+direction, then hand off immediately to Up for the grab.
+    """Press Alt+direction and immediately add Up for the rope grab.
 
     Left/Right/Up/Down are centrally serialized by ``WindowKeySender``.  A
     lateral rope jump therefore holds Alt+Left/Right for its configured jump
-    window, releases the lateral key, and sends Up with no deliberate sleep
-    between those two transitions.  This avoids both opposing directional
-    keys being down and the former visible lag before the rope grab.
+    window and presses Up immediately while that chord remains down.  Up is a
+    separate axis, so it does not conflict with Left/Right; sending it early
+    lets the character grab the rope at the top of the sideways arc instead
+    of first finishing a plain lateral jump.
     """
 
     if not _sender_is_safe(sender):
@@ -1388,6 +1389,8 @@ def _directional_jump_climb(
         return False
     key_down = getattr(sender, "key_down", None)
     key_up = getattr(sender, "key_up", None)
+    key_down_chord = getattr(sender, "key_down_chord", None)
+    key_up_chord = getattr(sender, "key_up_chord", None)
     press = getattr(sender, "press", None)
     if key_down is None or key_up is None or press is None:
         raise TypeError("directional climb requires key_down(), key_up(), and press()")
@@ -1396,26 +1399,51 @@ def _directional_jump_climb(
     direction_claimed = False
     alt_claimed = False
     up_claimed = False
+    chord_claimed = False
     failed = True
     try:
-        # Alt is independent.  Directional keys are mutually exclusive, so a
-        # sideways chord never overlaps its Left/Right with the following Up.
-        direction_claimed = key_down(direction) is not False
-        if not direction_claimed:
-            return False
-        alt_claimed = key_down("alt") is not False
-        if not alt_claimed:
-            return False
+        # Use one Win32 ``SendInput`` packet when the sender supports it.
+        # Two adjacent key_down calls can be separated by a game input poll,
+        # which looks like Alt first and a normal Left/Right on the next tick.
+        # The compatibility fallback keeps lightweight/mock senders working.
+        if callable(key_down_chord):
+            chord_claimed = key_down_chord("alt", direction) is not False
+            if not chord_claimed:
+                return False
+            direction_claimed = alt_claimed = True
+        else:
+            direction_claimed = key_down(direction) is not False
+            if not direction_claimed:
+                return False
+            alt_claimed = key_down("alt") is not False
+            if not alt_claimed:
+                return False
+        # Up and Left/Right use different axes.  Do not wait for Alt or the
+        # lateral key to be released: the rope must see Up throughout the
+        # sideways jump, not only after its launch window has elapsed.
+        if direction != "up":
+            up_claimed = key_down("up") is not False
+            if not up_claimed:
+                return False
         time.sleep(max(0.025, direction_hold))
         failed = False
     finally:
-        if alt_claimed:
-            key_up("alt")
-        # The order is intentional: lateral release immediately followed by
-        # Up creates a smooth handoff without ever holding both directions.
-        if direction_claimed and direction != "up":
-            key_up(direction)
+        if chord_claimed and direction != "up" and callable(key_up_chord):
+            # Release the lateral chord in the same one-packet form.  The
+            # following Up remains a separate edge because it must start only
+            # after Left/Right is no longer held.
+            key_up_chord("alt", direction)
+        else:
+            if alt_claimed:
+                key_up("alt")
+            if direction_claimed and direction != "up":
+                key_up(direction)
         if direction_claimed and direction == "up" and failed:
+            if chord_claimed and callable(key_up_chord):
+                key_up_chord("alt", "up")
+            else:
+                key_up("up")
+        elif direction != "up" and up_claimed and failed:
             key_up("up")
     # Straight-up retains the Alt+Up chord.  Persistent climbs leave Up down;
     # timed callers release it before issuing their duration-limited Up press.
@@ -1427,13 +1455,16 @@ def _directional_jump_climb(
             key_up("up")
             up_ok = press("up", duration=climb_duration)
         return up_ok is not False
-    # Sideways chord: no intentional gap after releasing Left/Right.  Up is
-    # the very next input event, so a rope touched during the jump is grabbed
-    # without reintroducing conflicting directional holds.
+    # Sideways chord: Up has already been pressed during the lateral jump.
     if persistent_up:
-        up_claimed = key_down("up") is not False
         return up_claimed
-    return press("up", duration=climb_duration) is not False
+    if not up_claimed:
+        return False
+    try:
+        time.sleep(max(0.0, climb_duration))
+        return True
+    finally:
+        key_up("up")
 
 
 def _drop_through_platform(
@@ -2032,19 +2063,30 @@ def climb(
         state.lateral_hop_cycles += 1
 
         def climb_jump_side() -> bool:
-            # Move a small step AWAY first, then jump back toward the rope.
-            # This gives the sideways jump a useful launch arc instead of
-            # repeatedly jumping from the exact same under-rope pixel.
-            press = getattr(sender, "press", None)
-            if not callable(press):
-                raise TypeError("lateral climb recovery requires press()")
+            # Complete a short sideways reposition FIRST, then launch back
+            # toward the rope.  ``press()`` is normally blocking, but make
+            # the hold explicit here so this recovery can never enqueue the
+            # Alt chord before the reposition key has been released.
+            #
+            # 200 ms is deliberate: it is long enough to create a lateral
+            # launch offset, while remaining a small reposition rather than
+            # a patrol walk.
+            key_down = getattr(sender, "key_down", None)
+            key_up = getattr(sender, "key_up", None)
+            if not callable(key_down) or not callable(key_up):
+                raise TypeError("lateral climb recovery requires key_down()/key_up()")
+            step_duration = max(0.20, float(nudge_duration))
             state.attempt_started_at = time.monotonic()
             LOG.info(
-                "CLIMB under-rope recovery: small step %s, then Alt+%s with early Up",
-                pre_step_direction, side,
+                "CLIMB under-rope recovery: %dms step %s completed before Alt+%s + immediate Up",
+                round(step_duration * 1000.0), pre_step_direction, side,
             )
-            if press(pre_step_direction, duration=nudge_duration) is False:
+            if key_down(pre_step_direction) is False:
                 return False
+            try:
+                time.sleep(step_duration)
+            finally:
+                key_up(pre_step_direction)
             return _directional_jump_climb(
                 sender, side, nudge_duration, climb_duration, persistent_up
             )
@@ -2861,9 +2903,14 @@ class MovementWorker(threading.Thread):
                     and self.reconnect_active_event.is_set()):
                 LOG.info("SELF-RESCUE cancelled: auto reconnect owns input")
                 return
-            if self.patrol_controller is not None:
-                self.patrol_controller.set_enabled(False)
             # Pre-flight: a character frozen by frequent attacks is NOT stuck.
+            # ``_rescue_active`` is a private movement-input gate.  Do not
+            # turn the shared patrol controller off for this probe: doing so
+            # made the normal route report ``patrol-paused`` / ``wait`` and
+            # caused the UI to show a false external stop even when the
+            # marker moved during the probe.  The movement thread continues
+            # sampling the marker, but yields all route keys until this
+            # rescue returns.
             if not self._rescue_verify_stuck_by_probe():
                 LOG.warning(
                     "SELF-RESCUE aborted: character moves when attacks are "
@@ -2937,9 +2984,11 @@ class MovementWorker(threading.Thread):
                     self.reconnect_active_event is not None
                     and self.reconnect_active_event.is_set()
                 )
-                self.patrol_controller.set_enabled(
-                    False if reconnect_owns_input else not give_up
-                )
+                # Successful/aborted rescue now leaves the controller exactly
+                # as the operator left it.  Only a terminal rescue failure or
+                # auto reconnect is allowed to stop patrol here.
+                if reconnect_owns_input or give_up:
+                    self.patrol_controller.set_enabled(False)
             self._rescue_active = False
 
     def _rope_approach_stalled(
@@ -3557,7 +3606,7 @@ class MovementWorker(threading.Thread):
         climb_layer_confirm_frames: int = 4,
         climb_layer_confirm_seconds: float = 0.3,
         climb_arrival_world_tolerance: float = 0.20,
-        climb_nudge_seconds: float = 0.12,
+        climb_nudge_seconds: float = 0.20,
         climb_y_change_required: float = 0.015,
         climb_world_y_change_required: float = 0.75,
         climb_world_y_stall_change_required: float = 0.15,
@@ -4279,6 +4328,7 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_assessed_at = float("-inf")
         self._reconnect_drop_stalled_attempts = 0
         self._reconnect_drop_edge_phase: Optional[str] = None
+        self._reconnect_drop_edge_second_pass = False
         self._reconnect_drop_edge_started_at = 0.0
         self._reconnect_drop_edge_start_y: Optional[float] = None
         # Drop-to-route landing evidence (see ``_drop_landing_floor``): where
@@ -8913,6 +8963,7 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_assessed_at = float("-inf")
         self._reconnect_drop_stalled_attempts = 0
         self._reconnect_drop_edge_phase = None
+        self._reconnect_drop_edge_second_pass = False
         self._reconnect_drop_edge_started_at = 0.0
         self._reconnect_drop_edge_start_y = None
         # A fresh start owns a fresh descent: no landing evidence from the run
@@ -9391,6 +9442,7 @@ class MovementWorker(threading.Thread):
                 self._reconnect_drop_stalled_attempts = 0
                 self._reconnect_drop_attempt_y = None
                 self._reconnect_drop_edge_phase = None
+                self._reconnect_drop_edge_second_pass = False
                 self._reconnect_drop_edge_start_y = None
                 return None
             if now < self._reconnect_drop_edge_started_at + RECONNECT_DROP_EDGE_HOLD_SECONDS:
@@ -9403,18 +9455,21 @@ class MovementWorker(threading.Thread):
                     f"reconnect drop recovery: holding {phase} to find a drop edge",
                     max(0.05, remaining),
                 )
-            if phase == "left":
-                self._reconnect_drop_edge_phase = "right"
+            next_phase = "left" if phase == "right" else "right"
+            if not self._reconnect_drop_edge_second_pass:
+                self._reconnect_drop_edge_phase = next_phase
+                self._reconnect_drop_edge_second_pass = True
                 self._reconnect_drop_edge_started_at = now
                 self._reconnect_drop_edge_start_y = current_y
                 LOG.warning(
-                    "RECONNECT DROP RECOVERY: left edge found no descent; "
-                    "holding right for %.1fs",
+                    "RECONNECT DROP RECOVERY: %s edge found no descent; "
+                    "holding %s for %.1fs",
+                    phase, next_phase,
                     RECONNECT_DROP_EDGE_HOLD_SECONDS,
                 )
                 return MovementDecision(
-                    "right",
-                    "reconnect drop recovery: left edge did not descend; seeking right edge",
+                    next_phase,
+                    f"reconnect drop recovery: {phase} edge did not descend; seeking {next_phase} edge",
                     RECONNECT_DROP_EDGE_HOLD_SECONDS,
                 )
             LOG.warning(
@@ -9424,6 +9479,7 @@ class MovementWorker(threading.Thread):
             self._reconnect_drop_stalled_attempts = 0
             self._reconnect_drop_attempt_y = None
             self._reconnect_drop_edge_phase = None
+            self._reconnect_drop_edge_second_pass = False
             self._reconnect_drop_edge_start_y = None
             return None
 
@@ -9452,18 +9508,25 @@ class MovementWorker(threading.Thread):
         )
         if self._reconnect_drop_stalled_attempts < RECONNECT_DROP_STALLED_ATTEMPTS:
             return None
-        self._reconnect_drop_edge_phase = "left"
+        # Start toward the nearer outer side: markers left of centre try the
+        # right edge first; markers at/right of centre try the left edge.  If
+        # that 5-second edge walk does not produce a downward Y change, the
+        # existing branch above tries the opposite edge next.
+        first_phase = "right" if float(player.x) < 0.5 else "left"
+        self._reconnect_drop_edge_phase = first_phase
+        self._reconnect_drop_edge_second_pass = False
         self._reconnect_drop_edge_started_at = now
         self._reconnect_drop_edge_start_y = current_y
         LOG.warning(
             "RECONNECT DROP RECOVERY: %d Alt+Down attempts stalled; "
-            "holding left for %.1fs",
+            "marker X=%.6f; holding %s first for %.1fs",
             RECONNECT_DROP_STALLED_ATTEMPTS,
+            float(player.x), first_phase,
             RECONNECT_DROP_EDGE_HOLD_SECONDS,
         )
         return MovementDecision(
-            "left",
-            "reconnect drop recovery: Alt+Down stalled; seeking left drop edge",
+            first_phase,
+            f"reconnect drop recovery: Alt+Down stalled; seeking {first_phase} drop edge",
             RECONNECT_DROP_EDGE_HOLD_SECONDS,
         )
 
@@ -9790,6 +9853,7 @@ class MovementWorker(threading.Thread):
             self._reconnect_drop_assessed_at = float("-inf")
             self._reconnect_drop_stalled_attempts = 0
             self._reconnect_drop_edge_phase = None
+            self._reconnect_drop_edge_second_pass = False
             self._reconnect_drop_edge_start_y = None
             # A return climb can reach the route while persistent Up is still
             # owned.  Release it before resetting the climb state; otherwise
@@ -12351,6 +12415,20 @@ class MovementWorker(threading.Thread):
                                 dispatched.x, dispatched.y, dispatched.confidence,
                             )
                             self._dispatched_position_logged = time.monotonic()
+                # Self-rescue owns movement input while it verifies (or
+                # recovers) a genuine stall.  Keep consuming capture frames
+                # and refresh ``last_observation`` for its right/left probe,
+                # but do not let ordinary route planning issue a competing
+                # walk/climb/drop command.  This is deliberately private to
+                # MovementWorker: patrol remains enabled, so the UI never
+                # enters the false ``patrol-paused``/``action=wait`` state
+                # merely because a probe is checking a suspected stall.
+                if self._rescue_active:
+                    self.last_observation = observation
+                    self.last_decision = MovementDecision(
+                        None, "self-rescue owns movement input"
+                    )
+                    continue
                 coordinate_layout = None
                 if (minimap_detection is not None
                         and observation.marker_pixel_size is not None
@@ -13501,7 +13579,7 @@ class MovementWorker(threading.Thread):
                                     press(
                                         "alt",
                                         duration=getattr(
-                                            self, "climb_nudge_seconds", 0.08
+                                            self, "climb_nudge_seconds", 0.20
                                         ),
                                     )
                         # Cancellable walk hold: the movement key is released

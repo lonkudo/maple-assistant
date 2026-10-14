@@ -2,7 +2,7 @@
 
 The live WebSocket/cursor path never waits for this module. A successful
 handshake creates one durable ``started`` event whose HTTP dispatch is jittered
-over 0--30 seconds. A later terminal report is independently jittered, but it
+over 0--10 seconds. A later terminal report is independently jittered, but it
 cannot leave the client until the server has accepted that event's start.
 """
 from __future__ import annotations
@@ -88,7 +88,7 @@ class LieAccountingWorker(threading.Thread):
 
     @staticmethod
     def _jitter() -> float:
-        return random.uniform(0.0, 30.0)
+        return random.uniform(0.0, 10.0)
 
     @staticmethod
     def _now_iso() -> str:

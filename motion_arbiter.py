@@ -354,6 +354,11 @@ class MotionArbiter(threading.Thread):
         direction must not run later, but an already-executing key hold is
         never interrupted here: stopping a physical key mid-hold would create
         a second, less predictable movement race.
+
+        This is deliberately *not* a general queue reset.  In particular,
+        pending ``buff:<key>`` tokens survive a stationary-return correction:
+        a buff timer may have only one opportunity for several minutes, while
+        the correction is merely a short-lived travel phase.
         """
 
         with self._cv:
@@ -1004,6 +1009,33 @@ class MotionArbiter(threading.Thread):
         # a tap can be "sent" and still do nothing, so it must be retried - and
         # a periodic buff in particular must not be lost, because its timer
         # will not ask again for minutes.
+        # A stationary return can close the safe-stage gate in the small gap
+        # between the executor's gate check and MovementWorker borrowing the
+        # keyboard for the buff.  That is a normal defer, not an input
+        # delivery failure.  Keep this periodic buff queued until the return
+        # settles; otherwise the bounded focus-retry deadline below would
+        # eventually drain it and lose the scheduled buff altogether.
+        deferred_by_motion_gate = False
+        if token.startswith("buff:"):
+            with self._cv:
+                deferred_by_motion_gate = (
+                    self._automation_allowed_locked()
+                    and not self._motion_gate_allows_locked()
+                )
+                if deferred_by_motion_gate:
+                    self._executing_token = None
+                    # This wait is not a failed physical delivery, so it must
+                    # not inherit an earlier focus-retry expiry either.
+                    self._delivery_deadline.pop(token, None)
+                    self._cv.notify_all()
+        if deferred_by_motion_gate:
+            LOG.info(
+                "motion arbiter deferred %s: stationary/travel motion owns "
+                "the safe stage; keeping buff queued",
+                token,
+            )
+            return
+
         now = time.monotonic()
         deadline = self._delivery_deadline.setdefault(
             token, now + self.delivery_retry_seconds

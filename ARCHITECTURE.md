@@ -338,7 +338,7 @@ The canvas is measured from the captured pixels, not derived from the window: `_
 
 The resolution order is: the separate inner-border detector's measurement (including its held previous result) → an inner contour the outer pass already found → this pixel measurement → the canvas measured earlier in the same session, held through a few pixels of jitter so the coordinate frame does not move under a standing character, and cleared by `reset_geometry()` with the rest of the session geometry → and otherwise no canvas at all. That last case is deliberately honest rather than generous: `MinimapDetection.canvas_measured` is false, `assistant.py` flashes only the minimap frame, and it logs that no yellow marker/patrol region was drawn. A rectangle that claims the whole minimap window (or the broad search region) as the map canvas is worse than no rectangle.
 
-Recorded points contain minimap-relative X/Y values. Layer recognition uses recorded Y anchors and asymmetric layer bands: the top of a layer is more tolerant than its confirmed base. World-Y tracking provides continuity between frames and is re-anchored only by explicit recovery logic, not by ordinary movement such as stepping onto a bench.
+Recorded points contain minimap-relative X/Y values. Layer recognition uses recorded Y anchors and asymmetric layer bands: the top of a layer is more tolerant than its confirmed base. World-Y tracking provides continuity between frames and is re-anchored only by explicit recovery logic, not by ordinary movement such as stepping onto a bench. A recorded `rope_pos` is a physical landmark: its normalised X/Y is passed through unchanged for the climb target. Unlike adaptable endpoints, it is never reprojected through a later canvas or diamond measurement, because that measurement can jitter and turn a correctly recorded rope into an unreachable air target.
 
 Each layer may also own X-sorted, immutable directional jump points. A point records X, Y, and either left or right travel direction. During a horizontal leg, the direction must match the leg. During an active rope climb, either directional record may be selected if the marker matches its X/Y window: the recorded direction is only a preference there (it breaks a tie when a 左跳 and a 右跳 sit at the same height), because a climb has no horizontal leg to compare against. Gating a rope point on the direction the character happened to *walk in* to the rope made a point recorded as a right jump invisible during a return climb that approached from the right — the rope jump point that never fired. The matching policy is intentionally asymmetric: X is ±0.010, while Y is ±0.020 to accommodate vertical rope movement. A matched point is marked passed only after the dedicated jump worker accepts it.
 
@@ -377,6 +377,22 @@ swallowing without making the endpoint gate a long patrol pause.
 
 Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
 
+Self-rescue uses a private `MovementWorker` ownership gate rather than the
+shared `PatrolController`. A suspected stall is first verified after 25
+near-unchanged captures (about 5.0 seconds at 5 FPS): attacks are blocked for
+2.0 seconds while the rescue worker performs a 700 ms Right nudge, waits
+200 ms for a fresh marker, then performs a 700 ms Left nudge and another
+200 ms marker settle. A marker X displacement of at least 0.006 rejects the
+rescue; no drop or route restart is allowed. The maximum probe is 1.8 seconds.
+
+While this private gate is active, the main movement loop continues to consume
+captures and publish `last_observation` for the probe, but skips ordinary
+route key decisions. Patrol remains logically enabled, so a rejected probe
+cannot generate `patrol-paused`, a false external-stop UI update, or a normal
+route `wait` decision. Only a confirmed rescue holds this private gate while
+it performs its separate recovery work; only terminal failure or auto reconnect
+may disable the shared patrol controller.
+
 An attached rope climb has a separate raw-position watchdog. `ClimbState`
 retains its last marker X and Y; four consecutive fresh captures with neither
 coordinate changing, outside a next-layer arrival confirmation, indicate that
@@ -398,6 +414,8 @@ Horizontal directions are mutually exclusive with each other, as are vertical di
 4. restore pickup ownership only when walking is active.
 
 `motion_arbiter.py` handles finite, atomic motions: rope jumps, return motions, small steps, queued buffs, stationary-facing taps, the 站桩 anchor correction, and the **被撞反击** hit reaction. The dedicated stair-jump worker owns recorded jump-point taps: it presses the recorded horizontal direction with Alt and preserves Up until the movement worker observes a stable landing Y. Atomic workers return control to patrol after completion and are deliberately not used for ordinary continuous walking.
+
+Stationary-return cleanup is selective. `cancel_pending_stationary_steps()` may remove only obsolete, unstarted `STEP:*` anchor corrections after the character's position changes; it never clears `buff:*` tokens. If a stationary return closes the safe-motion gate between a queued buff's gate check and its input attempt, the arbiter treats that as a defer rather than a delivery failure: it keeps the buff queued and retries after the return settles. `cancel_pending()` remains the lifecycle boundary used by an actual Stop Patrol, where all pending automation motions—including buffs—must be removed.
 
 Patrol hit reactions are a motion type of their own (`COUNTERATTACK`) rather than a walk beside the cadence, so the short recovery hold and its bound counterattack key cannot overlap a jump, buff, climb, or ordinary attack. `request_counterattack()` refuses to stack, and the arbiter carries the optional hit X in its own token (`COUNTERATTACK:<direction>:<key>[:<hit_x>]`), so the reaction that finally executes still knows where the hit happened. For a clear knockback the direction is retained. For a walking-compensated hit (`abs(ΔX) < 0.003`) the token carries the marker X captured at the HP-drop frame, and `perform_counterattack()` re-derives the direction from the live marker against that saved X when it executes; the planned-walk opposite direction is the fallback, and a reaction whose marker has not moved a whole minimap column is sent as `direction="none"`, which taps the key without stepping. The reaction holds for `COUNTERATTACK_STEP_HOLD_SECONDS` (0.10 s), taps the independent key, then calls `note_attack()`.
 

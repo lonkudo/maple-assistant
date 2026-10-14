@@ -539,6 +539,7 @@ A one-row band is a reference row, not the whole floor: on a floor whose canvas 
 - Movement is sent only while the selected game window is safely foregrounded.
 - Left, right, up, and down are serialized. Direction switches release the old direction before arming the new one.
 - Patrol, rope return, recovery, small-step, buffs, and special motions use coordinated input ownership so a stale key cannot keep the character moving.
+- A queued buff is not discarded merely because a short stationary return temporarily owns the movement stage. It remains queued until that return settles; only an actual Stop Patrol clears queued buff motions.
 - If patrol has no recorded route, the assistant remains in a safe stand-still state and combat functions can still operate.
 
 At a patrol endpoint, TodoHelper performs a movement-owned turnover. As soon as
@@ -568,6 +569,8 @@ A recorded floor **outside** the patrol range that the climb has climbed up to i
 A frame in which no recorded floor matches while a climb owns Up is the character's own jump arc just above the platform row, not evidence against the arrival: up to three consecutive such frames are tolerated and the arrival confirmation survives them (`CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED`). Four or more still restart the climb.
 
 A floor without a recorded rope no longer inherits the legacy profile-wide `rope.x`. The climb target is that floor's own recorded rope, or — when there is none — its recorded jump point nearest that legacy X, which is the operator's own way onto the rope: `ROPE TARGET: layer2 has no recorded rope; using its recorded jump point x=0.469298 as the rope approach`. The legacy `rope.x` walked the character to a rope that floor never recorded (on layer2 it went off the platform and dropped to layer1). When a floor has neither a rope nor a jump point, the return stands still and logs it instead of walking to the legacy X.
+
+A recorded rope is exact: its saved normalised X/Y is used as the climb target without canvas, diamond-size, preset, or smoothing projection. This prevents an unstable live minimap measurement from moving a correctly recorded rope sideways into an unreachable air-rope target. Record the rope directly under the real rope; the assistant uses that same position.
 
 A return is still a return: the patrol range selected in the layer panel decides which floors may be patrolled, and an out-of-range floor can only ever be used as the way home. A floor used as a waypoint needs its rope — or at least the jump point that mounts it — recorded.
 
@@ -672,6 +675,23 @@ Two related rules protect that motion:
 ## Alerts and recovery
 
 The additional-functions panel can enable sound, screen flash, Telegram messages, disconnect alerts, lie-detection alerts, timer alarms, and other-player channel switching.
+
+### Patrol self-rescue probe
+
+Self-rescue is guarded so a normal attack animation cannot be mistaken for a
+genuine movement stall. After 25 consecutive near-unchanged minimap captures
+(about five seconds at the shared 5 FPS cadence), the movement worker blocks
+attacks for 2.0 seconds and performs a bounded probe: right for 700 ms, wait
+200 ms, then left for 700 ms and wait 200 ms. If the live marker moves by at
+least 0.006 X during either nudge, the character is not stuck and no
+drop/restart is attempted.
+
+The probe owns only movement input; it does **not** stop the shared patrol
+controller. Capture and marker tracking continue normally, while ordinary
+route input yields to the probe for at most 1.8 seconds. Therefore a rejected
+probe does not show `巡逻已停止`, does not enter `patrol-paused`, and does not
+turn a normal attack handoff into a misleading `wait` action. Only a confirmed
+stuck condition can proceed to the existing recovery path.
 
 Every optional alert control has a hover explanation: **循环** raises an alarm
 when its remaining time reaches zero; **声音** plays the dingdong sound;
