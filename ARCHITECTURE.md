@@ -216,6 +216,15 @@ hashes stay off the operator-facing code table. `FingerprintSecurityState.memo`
 is an operator-only, bounded text field; device actions can set, replace, or
 clear it, and it is never returned to clients.
 
+The authorization-code list has one authenticated lookup boundary:
+`POST /console/api/codes` accepts either a public `equipment_id` or an original
+activation code. For the latter, `operator_api._list_codes()` passes the value
+through `canonical_code()` and `code_hash()` before querying the unique
+`ActivationCode.activation_code_hash` index. This lets an operator resolve a
+plaintext code to its authorization ID without ever exposing the stored digest
+or writing the plaintext to URL logs, audit rows, or response data. The legacy
+GET list form remains available for a paged, non-sensitive list request.
+
 ### Automatic lie service endpoints
 
 `auto_lie_backend.py` owns the live RoiTrack deployment route, so an endpoint

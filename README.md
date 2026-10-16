@@ -383,6 +383,13 @@ equipment ID rather than a fingerprint fragment. The device list has an
 operator-only **备注** field: setting, replacing, or clearing it never reaches
 the desktop client or license document.
 
+On the console's **授权码** page, the `授权码 / 设备码` search accepts either an
+eight-character equipment ID or the original 256-character activation code.
+For an activation-code lookup, the browser sends the value in an authenticated
+POST body; the server normalizes and hashes it using the activation algorithm,
+then finds the matching stored digest and displays its authorization ID. The
+plaintext is neither stored, returned, audited, nor put into the request URL.
+
 ### Server deployment, updates, and client compatibility
 
 The server lives in the separate `maple-assistant-server` repository. A remote
