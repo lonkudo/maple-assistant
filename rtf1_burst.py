@@ -69,7 +69,19 @@ class Rtf1BurstSession:
             return False
         if frame_id in self._pending:
             raise ValueError(f"frame_id {frame_id} is already in flight")
-        client.send_frame_rtf1(frame_id, jpeg, frame_interval_sec=frame_interval_sec)
+        try:
+            client.send_frame_rtf1(
+                frame_id, jpeg, frame_interval_sec=frame_interval_sec,
+            )
+        except TimeoutError as exc:
+            # A timed-out ``sendall`` means the peer is no longer draining its
+            # TCP receive buffer.  The packet may be partial, so retrying the
+            # same frame on this socket would corrupt the ordered RTF1 stream.
+            # Surface it as normal transport loss: the takeover's visual
+            # success/missing-marker monitor can continue independently.
+            raise ConnectionError(
+                "RTF1 backend timed out while accepting a frame"
+            ) from exc
         self._pending[frame_id] = context
         return True
 

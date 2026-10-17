@@ -379,9 +379,20 @@ through the stale-row cleanup. Both rules use server receipt time, so a fresh
 delayed report cannot be inferred complete early.
 
 The operator console shows an activation code's **设备绑定** as this public
-equipment ID rather than a fingerprint fragment. The device list has an
-operator-only **备注** field: setting, replacing, or clearing it never reaches
-the desktop client or license document.
+equipment ID rather than a fingerprint fragment. A device memo is a shared,
+bounded label: the desktop stores it in `user_config.json`, accepts only
+Chinese/English letters, digits, spaces, `_`, and `-` (at most 24 characters),
+and asynchronously syncs the same value to the bound device through the
+pinned activation service. It is not included in a signed license document.
+
+An activation code has either **counting** or **unsettled** auto-lie mode.
+Counting mode consumes its remaining balance. Unsettled mode leaves the balance
+unlimited and increments the code's unsettled counter for each auto-lie start.
+The device console exposes mode switch and settlement actions: settlement resets
+the unsettled counter and its current usage-window totals, while switching from
+counting to unsettled begins a new zeroed window. The desktop keeps the daily
+and yesterday counters visible and renders the primary value as either
+`测谎 (剩余, N)` or `测谎 (未清算, N)`.
 
 On the console's **授权码** page, the `授权码 / 设备码` search accepts either an
 eight-character equipment ID or the original 256-character activation code.
@@ -553,11 +564,15 @@ At a patrol endpoint, TodoHelper performs a movement-owned turnover. As soon as
 the marker reaches the left-most or right-most arrival band, it releases the
 old direction, reserves a 100 ms neutral input interval, then sends the one
 opposite direction selected by the next route phase. Attack input is blocked
-only through that neutral interval and a 60 ms post-send guard. A pre-existing
-attack is allowed a short bounded time to finish; if it is still active, the
-reverse is retried from the next minimap frame instead of competing with it.
-This keeps endpoint turns responsive while preventing attack, jump, or stale
-walk input from swallowing the reverse.
+through that neutral interval and a 60 ms post-send guard. The reverse key is
+sent immediately after the neutral interval even if a prior attack is still
+animating, so a turnover never waits through an attack cadence. If that first
+key-down is swallowed, the first capture after the prior attack ends becomes
+the X baseline; on the following 5-FPS capture, no reverse movement of at
+least 0.003 X causes exactly one fresh reverse-key re-arm (20 ms key-up gap).
+The hold manager preserves that reverse hold until this verdict, and no second
+attack may enter the handoff. This keeps endpoint turns responsive while
+preventing attack, jump, or stale walk input from swallowing the reverse.
 
 ### Returning to the route from a lower floor
 

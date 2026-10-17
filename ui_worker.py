@@ -37,7 +37,7 @@ from game_chat import send_game_chat_message
 from countdown_worker import play_mp3
 from licensing import (
     LicenseStatus, activate as activate_license, activate_via_server,
-    revoke_license, validate_via_server, verify_license,
+    revoke_license, set_device_memo_via_server, validate_via_server, verify_license,
 )
 from lie_accounting import LieAccountingWorker
 from reconnect_worker import (
@@ -71,6 +71,7 @@ UI_POLL_LOG = logging.getLogger("ui-poll")
 # Per-poll timing traces were temporary diagnosis telemetry.  Keep the trace
 # hooks available, but leave their high-volume logging disabled in releases.
 UI_POLL_TRACE_LOGGING = False
+_DEVICE_MEMO_PATTERN = re.compile(r"^[A-Za-z0-9\u4e00-\u9fff _-]{0,24}$")
 # Automatic lie workflow diagnostics are deliberately isolated from the
 # regular patrol/application log.  The application configures this named
 # logger to write only to auto_lie.log.
@@ -1241,6 +1242,7 @@ class UiWorker(threading.Thread):
         self._license_heartbeat_results: "queue.Queue[tuple[int, LicenseStatus]]" = (
             queue.Queue()
         )
+        self._device_memo_results: "queue.Queue[tuple[str, LicenseStatus]]" = queue.Queue()
         self._license_heartbeat_started = False
         self._license_heartbeat_generation = 0
         self._license_heartbeat_consecutive_failures = 0
@@ -1471,20 +1473,25 @@ class UiWorker(threading.Thread):
             # An expanding label here pushed the counters into a detached
             # right-side island with a large blank gap between them.
             self._license_label.pack(side="left")
-            self._license_label.bind("<Button-1>", self._copy_equipment_id)
-            self._license_memory_label = ttk.Label(license_bar, anchor="w")
-            self._license_memory_label.pack(side="left")
-            # Keep usage values as separate labels so total/success/failure
-            # remain readable at a glance instead of becoming one grey string.
-            self._license_lie_stats = ttk.Frame(license_bar)
-            self._license_lie_stats.pack(side="left", padx=(5, 6))
+            self._license_device_label = ttk.Label(license_bar, anchor="w")
+            self._license_device_label.pack(side="left")
+            self._license_device_label.bind("<Button-1>", self._copy_equipment_id)
+            self._license_activation_label = ttk.Label(license_bar, anchor="w")
+            self._license_activation_label.pack(side="left")
+            self._license_activation_label.bind("<Button-1>", self._copy_activation_code)
+            self._license_memo_label = ttk.Label(license_bar, anchor="w")
+            self._license_memo_label.pack(side="left")
+            self._license_memo_label.bind("<Button-1>", self._edit_device_memo)
+            # Usage has its own row. It retains the day-by-day breakdown while
+            # making the current finite/unsettled entitlement easy to read.
+            self._license_lie_stats = ttk.Frame(container)
+            self._license_lie_stats.pack(fill="x", pady=(0, 3))
             self._license_lie_prefix = ttk.Label(self._license_lie_stats, text="")
             self._license_lie_remaining = ttk.Label(
                 self._license_lie_stats, text="", foreground="#777777"
             )
-            self._license_lie_today_prefix = ttk.Label(
-                self._license_lie_stats, text=""
-            )
+            self._license_lie_suffix = ttk.Label(self._license_lie_stats, text="")
+            self._license_lie_today_prefix = ttk.Label(self._license_lie_stats, text="")
             self._license_lie_total = ttk.Label(
                 self._license_lie_stats, text="", foreground="#777777"
             )
@@ -1494,9 +1501,7 @@ class UiWorker(threading.Thread):
             self._license_lie_failed = ttk.Label(
                 self._license_lie_stats, text="", foreground="#b42318"
             )
-            self._license_lie_yesterday_prefix = ttk.Label(
-                self._license_lie_stats, text=""
-            )
+            self._license_lie_yesterday_prefix = ttk.Label(self._license_lie_stats, text="")
             self._license_lie_yesterday_total = ttk.Label(
                 self._license_lie_stats, text="", foreground="#777777"
             )
@@ -1506,9 +1511,13 @@ class UiWorker(threading.Thread):
             self._license_lie_yesterday_failed = ttk.Label(
                 self._license_lie_stats, text="", foreground="#b42318"
             )
+            # Memory belongs with runtime measurements rather than the stable
+            # authorization/device identity row above.
+            self._license_memory_label = ttk.Label(self._license_lie_stats, anchor="w")
             for stat_label in (
                 self._license_lie_prefix,
                 self._license_lie_remaining,
+                self._license_lie_suffix,
                 self._license_lie_today_prefix,
                 self._license_lie_total,
                 self._license_lie_success,
@@ -1517,6 +1526,7 @@ class UiWorker(threading.Thread):
                 self._license_lie_yesterday_total,
                 self._license_lie_yesterday_success,
                 self._license_lie_yesterday_failed,
+                self._license_memory_label,
             ):
                 stat_label.pack(side="left")
             self._license_button = ttk.Button(
@@ -3866,6 +3876,7 @@ class UiWorker(threading.Thread):
             # dispatch: an armed live pass never waits for cosmetic/status
             # work or configuration I/O.
             self._drain_license_heartbeat_results,
+            self._drain_device_memo_results,
             self._drain_lie_accounting_results,
             self._drain_channel_update_events,
             self._drain_other_player_stop_events,
@@ -4194,6 +4205,29 @@ class UiWorker(threading.Thread):
                 text=hint
             )
 
+    def _drain_device_memo_results(self) -> None:
+        """Show the result of the non-blocking remote memo synchronization."""
+
+        latest: Optional[tuple[str, LicenseStatus]] = None
+        while True:
+            try:
+                latest = self._device_memo_results.get_nowait()
+            except queue.Empty:
+                break
+        if latest is None:
+            return
+        _memo, status = latest
+        if status.valid:
+            self._license_status = self._preserve_server_identity(status)
+            self._refresh_license_ui()
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="备注已同步到服务器。")
+            LOG.info("device memo synchronized")
+            return
+        if hasattr(self, "_control_status"):
+            self._control_status.configure(text=f"备注已保存到本地；服务器同步失败：{status.message}")
+        LOG.warning("device memo synchronization rejected: %s", status.code)
+
     def _drain_lie_accounting_results(self) -> None:
         """Apply immediate server accounting after a completed lie pass.
 
@@ -4235,23 +4269,14 @@ class UiWorker(threading.Thread):
         if label is not None:
             memory = getattr(self, "_memory_usage_text", "内存：读取中")
             self._render_memory_usage(memory)
-            # A fingerprint that Windows has not finished exposing is a local
-            # device-readiness state, not a pending server response.  Showing
-            # both messages together was contradictory and made it look as if
-            # the server was at fault.
-            device_text = (
-                f"设备：{status.equipment_id}（左键复制）"
-                if status.equipment_id else "设备：等待服务器返回"
-            )
+            self._render_license_identity(status)
             if getattr(self, "_license_online_validation_pending", False):
                 self._render_lie_usage(None)
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
                 label.configure(
-                    text=(
-                        f"正在验证在线授权 · {device_text} · 到期：{expiry}"
-                    ),
+                    text=f"正在验证在线授权 · 到期：{expiry}",
                     foreground="#9a6700",
                 )
             elif status.valid:
@@ -4262,23 +4287,53 @@ class UiWorker(threading.Thread):
                 auto_lie = ""
                 if not status.auto_lie_allowed:
                     auto_lie = " · 自动测谎已停用"
-                label.configure(
-                    text=f"验证成功 · {device_text} · 到期：{expiry}{auto_lie}",
-                    foreground="#17803d",
-                )
+                label.configure(text=f"验证成功 · 到期：{expiry}{auto_lie}", foreground="#17803d")
             else:
                 self._render_lie_usage(status)
                 expiry = "永久" if status.expires_at is None else self._format_license_expiry(
                     status.expires_at
                 )
                 if status.code == "expired":
-                    text = f"授权已过期 · {device_text} · 到期：{expiry}"
+                    text = f"授权已过期 · 到期：{expiry}"
                 else:
-                    text = f"未授权：{status.message} · {device_text}"
+                    text = f"未授权：{status.message}"
                 label.configure(text=text, foreground="#202020")
         button = getattr(self, "_license_button", None)
         if button is not None:
             button.configure(text="更换授权" if status.valid else "激活授权")
+
+    def _license_display_values(self) -> tuple[str, str]:
+        """Read the user-owned activation code and memo without trusting shape."""
+
+        try:
+            data = json.loads(self._license_settings_path().read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            return "", ""
+        return str(data.get("activation_code", "") or "").strip(), str(data.get("memo", "") or "").strip()
+
+    def _render_license_identity(self, status: LicenseStatus) -> None:
+        """Render independently clickable device, code, and local memo fields."""
+
+        device_label = getattr(self, "_license_device_label", None)
+        code_label = getattr(self, "_license_activation_label", None)
+        memo_label = getattr(self, "_license_memo_label", None)
+        code, memo = self._license_display_values()
+        if device_label is not None:
+            device_text = (
+                f" · 设备：{status.equipment_id}（左键复制）"
+                if status.equipment_id else " · 设备：等待服务器返回"
+            )
+            device_label.configure(text=device_text, foreground="#17803d" if status.equipment_id else "#202020")
+        if code_label is not None:
+            masked = code[-5:] if code else "未设置"
+            code_label.configure(text=f" · 授权码：{masked}（左键复制）", foreground="#17803d" if code else "#202020")
+        if memo_label is not None:
+            memo_label.configure(
+                text=f" · 备注：{memo or '未设置'}（左键设置）",
+                foreground="#17803d" if memo else "#202020",
+            )
 
     def _render_memory_usage(self, text: str) -> None:
         """Render header memory separately so critical memory is visible."""
@@ -4308,7 +4363,7 @@ class UiWorker(threading.Thread):
         try:
             root.clipboard_clear()
             root.clipboard_append(equipment_id)
-            label = getattr(self, "_license_label", None)
+            label = getattr(self, "_license_device_label", None)
             if label is not None:
                 label.configure(
                     text=str(label.cget("text")).replace("（左键复制）", "（已复制）")
@@ -4333,18 +4388,97 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.debug("equipment ID copy failed", exc_info=True)
 
-    def _render_lie_usage(self, status: Optional[LicenseStatus]) -> None:
-        """Render the compact colored daily auto-lie usage summary.
+    def _copy_activation_code(self, _event: Any = None) -> None:
+        """Copy the full locally stored activation code while keeping it masked."""
 
-        The server returns today/yesterday as independent counters.  Keeping
-        outcome categories in distinct labels makes total grey, success green,
-        and failed red without changing the authorization label's color.
-        """
+        code, _memo = self._license_display_values()
+        root = getattr(self, "_root", None)
+        if not code or root is None:
+            return
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(code)
+            label = getattr(self, "_license_activation_label", None)
+            if label is not None:
+                label.configure(text=str(label.cget("text")).replace("（左键复制）", "（已复制）"))
+            previous_job = getattr(self, "_activation_code_copy_restore_job", None)
+            if previous_job is not None:
+                try:
+                    root.after_cancel(previous_job)
+                except Exception:
+                    pass
+            self._activation_code_copy_restore_job = root.after(
+                1500,
+                lambda: (setattr(self, "_activation_code_copy_restore_job", None), self._refresh_license_ui()),
+            )
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="授权码已复制。")
+        except Exception:
+            LOG.debug("activation code copy failed", exc_info=True)
+
+    def _save_local_device_memo(self, memo: str) -> bool:
+        """Persist the safe display note in the user-owned license section."""
+
+        try:
+            path = self._license_settings_path()
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["memo"] = memo
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return True
+        except OSError:
+            LOG.warning("could not save device memo to user_config", exc_info=True)
+            return False
+
+    def _edit_device_memo(self, _event: Any = None) -> None:
+        """Prompt for a safe memo, save it locally, then synchronize remotely."""
+
+        _code, current = self._license_display_values()
+        try:
+            from tkinter import simpledialog
+            value = simpledialog.askstring(
+                "设置备注",
+                "备注仅支持中文、英文、数字、空格、下划线和短横线（最多24字符）：",
+                initialvalue=current,
+                parent=self._root,
+            )
+        except Exception:
+            LOG.exception("device memo dialog could not open")
+            return
+        if value is None:
+            return
+        memo = str(value).strip()
+        if not _DEVICE_MEMO_PATTERN.fullmatch(memo):
+            self._control_status.configure(
+                text="备注格式无效：仅支持中文、英文、数字、空格、下划线和短横线（最多24字符）。"
+            )
+            return
+        if not self._save_local_device_memo(memo):
+            self._control_status.configure(text="备注未能保存到本地配置。")
+            return
+        self._refresh_license_ui()
+        self._control_status.configure(text="备注已保存到本地，正在同步服务器…")
+
+        def _sync() -> None:
+            status = set_device_memo_via_server(memo)
+            try:
+                self._device_memo_results.put_nowait((memo, status))
+            except Exception:
+                LOG.warning("device memo result could not be queued", exc_info=True)
+
+        threading.Thread(target=_sync, name="device-memo-sync", daemon=True).start()
+
+    def _render_lie_usage(self, status: Optional[LicenseStatus]) -> None:
+        """Render entitlement plus today/yesterday outcome counters."""
 
         fields = (
             "_license_lie_prefix", "_license_lie_remaining",
-            "_license_lie_today_prefix", "_license_lie_total",
-            "_license_lie_success", "_license_lie_failed",
+            "_license_lie_suffix", "_license_lie_today_prefix",
+            "_license_lie_total", "_license_lie_success", "_license_lie_failed",
             "_license_lie_yesterday_prefix", "_license_lie_yesterday_total",
             "_license_lie_yesterday_success", "_license_lie_yesterday_failed",
         )
@@ -4356,16 +4490,10 @@ class UiWorker(threading.Thread):
                 widget.configure(text="")
             return
 
-        # A finite server balance always wins over the marker.  This keeps a
-        # just-validated limited activation from displaying the initial
-        # unlimited placeholder if an older response left that marker behind.
-        if status.remaining_auto_lie_count is not None:
-            remaining = str(status.remaining_auto_lie_count)
-        elif status.remaining_auto_lie_unlimited:
-            remaining = "无限"
-        else:
-            remaining = "—"
-
+        unlimited = bool(
+            status.auto_lie_unlimited_mode
+            or status.remaining_auto_lie_unlimited
+        )
         def _values(source: object, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
             source = source if isinstance(source, dict) else {}
             parsed: list[int] = []
@@ -4387,9 +4515,22 @@ class UiWorker(threading.Thread):
         yesterday_total, yesterday_success, yesterday_failed = _values(
             status.lie_detect_yesterday, (0, 0, 0)
         )
-        self._license_lie_prefix.configure(text=" · 测谎 (剩余, ")
-        self._license_lie_remaining.configure(text=remaining)
-        self._license_lie_today_prefix.configure(text=") (今日, ")
+        if unlimited:
+            try:
+                unsettled = max(0, int(status.auto_lie_unsettled_count))
+            except (TypeError, ValueError):
+                unsettled = 0
+            self._license_lie_prefix.configure(text="测谎 (未清算, ")
+            self._license_lie_remaining.configure(text=str(unsettled), foreground="#17803d")
+        else:
+            remaining = (
+                str(status.remaining_auto_lie_count)
+                if status.remaining_auto_lie_count is not None else "—"
+            )
+            self._license_lie_prefix.configure(text="测谎 (剩余, ")
+            self._license_lie_remaining.configure(text=remaining, foreground="#777777")
+        self._license_lie_suffix.configure(text=")")
+        self._license_lie_today_prefix.configure(text=" (今日, ")
         self._license_lie_total.configure(text=str(today_total))
         self._license_lie_success.configure(text=f", {today_success}")
         self._license_lie_failed.configure(text=f", {today_failed})")
@@ -4678,6 +4819,14 @@ class UiWorker(threading.Thread):
             remaining_auto_lie_unlimited=(
                 status.remaining_auto_lie_unlimited
                 or previous.remaining_auto_lie_unlimited
+            ),
+            auto_lie_unlimited_mode=(
+                status.auto_lie_unlimited_mode
+                or previous.auto_lie_unlimited_mode
+            ),
+            auto_lie_unsettled_count=max(
+                status.auto_lie_unsettled_count,
+                previous.auto_lie_unsettled_count,
             ),
             lie_detect_total=max(status.lie_detect_total, previous.lie_detect_total),
             lie_detect_success_total=max(

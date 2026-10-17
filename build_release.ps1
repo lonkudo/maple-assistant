@@ -199,8 +199,9 @@ foreach ($assetName in $requiredReconnectAssets) {
 # --- autolie_api（自动过测谎 API 集成：图像转换 + 坐标换算）------------------------
 # 该目录是一个 Python 包，必须随包分发，否则 import autolie_api 会失败。除本机测试
 # 文件与体积较大的 sample_captures 外，整个目录原样复制——厂商参考材料
-# （ct_lie3_remote_workflow_sample.py / 2.7.0.md / ip_port.txt）不得改动，也不为了
-# 打包而删改其中任何文件，见 README.md 的“Reference material is read-only”。
+# （ct_lie3_remote_workflow_sample.py / 2.7.0.md / ip_port.txt）不得改动。2.7.0.md
+# is a vendor protocol reference, not runtime data, so it remains read-only in
+# the repository but is intentionally excluded from end-user releases.
 $apiIn = Join-Path $root "autolie_api"
 if (Test-Path $apiIn) {
     $apiOut = Join-Path $out "autolie_api"
@@ -211,6 +212,7 @@ if (Test-Path $apiIn) {
         # validated licensing heartbeat.  Never ship the vendor's local
         # key file in a release, even though vendor source remains read-only.
         $_.Name -ne "key_secret.txt" -and
+        $_.Name -ne "2.7.0.md" -and
         $_.FullName -notlike "*sample_captures*" -and
         $_.FullName -notlike "*__pycache__*" -and
         $_.Extension -ne ".pyc"

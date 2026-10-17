@@ -169,10 +169,12 @@ DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
 # Maple's key polling; this is just enough to keep an attack from swallowing
 # the first new direction input.
 DIRECTION_SWITCH_POST_SEND_GUARD_SECONDS = 0.06
-# A pre-existing attack must finish before the opposite walk direction is
-# sent.  Do not hold an endpoint gate for a whole attack cadence: retry from
-# the next minimap frame if its animation is still active.
-ENDPOINT_TURN_ACTIVE_ATTACK_WAIT_SECONDS = 0.30
+# An endpoint turn sends its new direction as soon as the neutral gap ends.
+# If that key-down collided with an already-running attack, the first capture
+# after the attack ends may re-arm it once with this small physical key-up
+# interval.  This is deliberately not a long "wait for attack" pause.
+ENDPOINT_TURN_REARM_RELEASE_GAP_SECONDS = 0.020
+ENDPOINT_TURN_REARM_MIN_PROGRESS_X = 0.003
 # Jump records are X-precise, but the marker can be one or more vertical
 # minimap pixels away while grabbing/climbing a rope.  Keep a little more
 # than one X pixel and about two Y pixels: narrower than the earlier loose
@@ -1467,6 +1469,71 @@ def _directional_jump_climb(
         key_up("up")
 
 
+def _jump_point_style_lateral_climb(
+    sender: Any,
+    direction: str,
+    direction_hold: float,
+    climb_duration: float,
+    *,
+    persistent_up: bool = False,
+) -> bool:
+    """Launch a rope retry in the proven recorded-jump-point input order.
+
+    A recorded 左跳/右跳 is not sent as an ``Alt+Left/Right`` chord.  Its
+    normal travel direction is already down, then Up is held, and Alt is a
+    short 30 ms jump tap.  The under-rope retry must use the same order after
+    its walk-away reposition; sending Alt+direction first made the game take
+    a plain side jump before it saw the rope-grab Up input.
+    """
+
+    if direction not in ("left", "right"):
+        raise ValueError("lateral rope retry requires left or right")
+    if not _sender_is_safe(sender):
+        LOG.warning("jump-point-style rope retry suppressed: target window is not safely selected")
+        return False
+    key_down = getattr(sender, "key_down", None)
+    key_up = getattr(sender, "key_up", None)
+    if not callable(key_down) or not callable(key_up):
+        raise TypeError("jump-point-style rope retry requires key_down()/key_up()")
+
+    direction_claimed = False
+    up_claimed = False
+    alt_claimed = False
+    succeeded = False
+    try:
+        # Same ordering as perform_stair_jump(..., hold_up=True): a normal
+        # direction hold owns the horizontal arc, Up is present before the
+        # jump edge, and Alt is only the short jump tap.
+        direction_claimed = key_down(direction) is not False
+        if not direction_claimed:
+            return False
+        up_claimed = key_down("up") is not False
+        if not up_claimed:
+            return False
+        alt_claimed = key_down("alt") is not False
+        if not alt_claimed:
+            return False
+        time.sleep(0.03)
+        key_up("alt")
+        alt_claimed = False
+        # Keep the same 200 ms lateral launch window as the old retry.  This
+        # is a direction hold, not a second Alt jump.
+        time.sleep(max(0.025, direction_hold))
+        # A normal climb attempt has a finite Up hold; a route climb retains
+        # it for the existing marker-based landing confirmation.
+        if not persistent_up:
+            time.sleep(max(0.0, climb_duration))
+        succeeded = True
+        return True
+    finally:
+        if alt_claimed:
+            key_up("alt")
+        if direction_claimed:
+            key_up(direction)
+        if up_claimed and (not persistent_up or not succeeded):
+            key_up("up")
+
+
 def _drop_through_platform(
     sender: Any,
     chord_hold_seconds: float = 0.10,
@@ -2087,8 +2154,14 @@ def climb(
                 time.sleep(step_duration)
             finally:
                 key_up(pre_step_direction)
-            return _directional_jump_climb(
-                sender, side, nudge_duration, climb_duration, persistent_up
+            # Let the game consume the released walk motion before the
+            # opposite directional jump begins. Without this fixed neutral
+            # 100 ms gap, a slow game can merge the walk-away release into
+            # the following jump and launch from the wrong input state.
+            time.sleep(0.10)
+            return _jump_point_style_lateral_climb(
+                sender, side, nudge_duration, climb_duration,
+                persistent_up=persistent_up,
             )
         ok = climb_jump_side() if action_lock is None else False
         if action_lock is not None:
@@ -3187,6 +3260,10 @@ class MovementWorker(threading.Thread):
                         handoff.clear()
                         self._endpoint_turn_expected_direction = None
                         self._endpoint_turn_neutral_until = 0.0
+                        self._endpoint_turn_rearm_direction = None
+                        self._endpoint_turn_rearm_start_x = None
+                        self._endpoint_turn_rearm_waiting_for_attack = False
+                        self._endpoint_turn_rearm_attempted = False
                         self._transition_stuck_frames = 0
                 else:
                     self._transition_stuck_frames = 0
@@ -3196,7 +3273,12 @@ class MovementWorker(threading.Thread):
                     now = time.monotonic()
                     release = now >= self._walk_hold_until
                     if not release and self._attack_state is not None:
-                        if (not self._movement_busy_now()
+                        endpoint_rearm_pending = (
+                            self._endpoint_turn_rearm_direction
+                            == self._walk_hold_key
+                        )
+                        if (not endpoint_rearm_pending
+                                and not self._movement_busy_now()
                                 and self._attack_state.is_active()):
                             if self._attack_active_since is None:
                                 self._attack_active_since = now
@@ -3395,6 +3477,7 @@ class MovementWorker(threading.Thread):
             return _send_tap(self.key_sender, decision)
         direction_transition_started = False
         endpoint_turn_completed = False
+        endpoint_turn_attack_was_active = False
         try:
             with self._direction_lock, self._hold_lock:
                 if not self._patrol_input_allowed():
@@ -3404,10 +3487,12 @@ class MovementWorker(threading.Thread):
                 )
                 if endpoint_turn:
                     # The old walk was already released by
-                    # _begin_endpoint_turn().  Keep the gate closed only long
-                    # enough to complete the intentional neutral interval and
-                    # let an already-started attack finish; no new attack can
-                    # begin while the gate is set.
+                    # _begin_endpoint_turn().  Keep the gate closed through
+                    # the intentional neutral interval.  The new direction
+                    # itself goes down immediately afterwards: delaying it for
+                    # an attack animation made endpoint reversals visibly
+                    # stick.  A swallowed first direction is repaired by
+                    # _service_endpoint_turn_rearm() after that animation.
                     neutral_remaining = (
                         self._endpoint_turn_neutral_until - time.monotonic()
                     )
@@ -3417,21 +3502,9 @@ class MovementWorker(threading.Thread):
                     attack_motion_active = getattr(
                         self.motion_arbiter, "attack_motion_active", None
                     )
-                    if callable(attack_motion_active) and attack_motion_active():
-                        deadline = (
-                            time.monotonic()
-                            + ENDPOINT_TURN_ACTIVE_ATTACK_WAIT_SECONDS
-                        )
-                        while (attack_motion_active()
-                               and time.monotonic() < deadline):
-                            if not self._wait_for_patrol_motion(0.02):
-                                return False
-                        if attack_motion_active():
-                            LOG.info(
-                                "endpoint turn: waiting for prior attack before %s",
-                                decision.key,
-                            )
-                            return False
+                    endpoint_turn_attack_was_active = bool(
+                        callable(attack_motion_active) and attack_motion_active()
+                    )
                 # The focus worker releases all physical keys on a focus dip.  Its
                 # release happens outside this hold state, so the worker can still
                 # believe Right/Z are held after refocus and silently skip their
@@ -3540,6 +3613,15 @@ class MovementWorker(threading.Thread):
                         decision.key, decision.reason,
                     )
                     endpoint_turn_completed = endpoint_turn
+                    if endpoint_turn_attack_was_active:
+                        current_player = getattr(
+                            getattr(self, "last_observation", None), "player", None
+                        )
+                        if current_player is not None:
+                            self._endpoint_turn_rearm_direction = decision.key
+                            self._endpoint_turn_rearm_start_x = float(current_player.x)
+                            self._endpoint_turn_rearm_waiting_for_attack = True
+                            self._endpoint_turn_rearm_attempted = False
                 # Automatic pickup no longer sends Z.  Ctrl+Z is the sole
                 # pickup input and belongs to QuickPickupWorker, so movement
                 # holds only the requested direction.
@@ -3573,12 +3655,14 @@ class MovementWorker(threading.Thread):
             # leave the event set, so every later attack was skipped with
             # "patrol direction handoff is active" until a restart.
             if (direction_transition_started
+                    and self._endpoint_turn_rearm_direction is None
                     and self.direction_transition_event is not None):
                 self.direction_transition_event.clear()
             if endpoint_turn_completed:
                 self._endpoint_turn_expected_direction = None
                 self._endpoint_turn_neutral_until = 0.0
-                if self.direction_transition_event is not None:
+                if (self._endpoint_turn_rearm_direction is None
+                        and self.direction_transition_event is not None):
                     self.direction_transition_event.clear()
 
     def __init__(
@@ -3826,6 +3910,16 @@ class MovementWorker(threading.Thread):
         # until it has been sent.
         self._endpoint_turn_expected_direction: Optional[str] = None
         self._endpoint_turn_neutral_until = 0.0
+        # A reverse direction sent during an attack can be accepted by the
+        # keyboard ledger but ignored by Maple.  Keep the handoff reservation
+        # through that one attack and, only if the first post-attack minimap
+        # sample still shows no reverse progress, issue one fresh release /
+        # press.  This state belongs to endpoint turns only; ordinary patrol
+        # walks retain their normal attack handoff behaviour.
+        self._endpoint_turn_rearm_direction: Optional[str] = None
+        self._endpoint_turn_rearm_start_x: Optional[float] = None
+        self._endpoint_turn_rearm_waiting_for_attack = False
+        self._endpoint_turn_rearm_attempted = False
         self._transition_stuck_frames = 0
         # Frame heartbeat + stall reporting (see _stall_watchdog).
         self._last_frame_at: Optional[float] = None
@@ -4572,8 +4666,7 @@ class MovementWorker(threading.Thread):
         # disabled patrol earlier must not switch it back on when it finishes.
         with self._other_player_settings_lock:
             self._other_player_switch_owns_patrol = False
-        if self.direction_transition_event is not None:
-            self.direction_transition_event.clear()
+        self._clear_endpoint_turn_rearm()
         self._endpoint_turn_expected_direction = None
         self._endpoint_turn_neutral_until = 0.0
         if self.climbing_active_event is not None:
@@ -9064,6 +9157,7 @@ class MovementWorker(threading.Thread):
         self, floor: str, observation: Optional[MinimapObservation] = None
     ) -> None:
         """Restart patrol from ``floor`` (must be inside the patrol range)."""
+        self._clear_endpoint_turn_rearm()
         self._clear_layer_resync_candidate()
         self._route_layer_index = self._route_layers.index(floor)
         # Back inside the patrol range: any below-range rescue streak is over.
@@ -10865,6 +10959,7 @@ class MovementWorker(threading.Thread):
                 or next_direction not in ("left", "right")
                 or previous == next_direction):
             return
+        self._clear_endpoint_turn_rearm()
         self._endpoint_turn_expected_direction = next_direction
         self._endpoint_turn_neutral_until = (
             time.monotonic() + DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS
@@ -10894,6 +10989,113 @@ class MovementWorker(threading.Thread):
             DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS * 1000.0,
             next_direction,
         )
+
+    def _clear_endpoint_turn_rearm(self) -> None:
+        """Forget a completed/cancelled endpoint re-arm and open attacks."""
+
+        self._endpoint_turn_rearm_direction = None
+        self._endpoint_turn_rearm_start_x = None
+        self._endpoint_turn_rearm_waiting_for_attack = False
+        self._endpoint_turn_rearm_attempted = False
+        if self.direction_transition_event is not None:
+            self.direction_transition_event.clear()
+
+    def _service_endpoint_turn_rearm(
+        self, observation: MinimapObservation,
+    ) -> None:
+        """Repair one reverse key swallowed by the endpoint's prior attack.
+
+        The first opposite direction goes down immediately after the normal
+        100 ms neutral interval.  We do not delay a turn for the whole attack
+        cadence.  If that first key collided with a pre-existing animation,
+        however, Maple can ignore it even though the input ledger accepted it.
+        The first minimap sample after that animation ends is the only place
+        where a fresh release/press is allowed, and only if X did not progress
+        in the requested reverse direction.
+        """
+
+        direction = self._endpoint_turn_rearm_direction
+        start_x = self._endpoint_turn_rearm_start_x
+        player = observation.player
+        if direction not in ("left", "right") or start_x is None or player is None:
+            return
+        attack_motion_active = getattr(self.motion_arbiter, "attack_motion_active", None)
+        if callable(attack_motion_active) and attack_motion_active():
+            # The transition gate remains set, preventing a new attack from
+            # extending the exact animation that may have swallowed the turn.
+            return
+        if self._endpoint_turn_rearm_waiting_for_attack:
+            # Knockback can move X in the requested direction *during* the
+            # attack.  That does not prove the reverse key was accepted.
+            # Establish the baseline only after motion reports the prior
+            # attack finished, then require one fresh 5-FPS sample of reverse
+            # travel before declaring the first key-down good.
+            self._endpoint_turn_rearm_waiting_for_attack = False
+            self._endpoint_turn_rearm_start_x = float(player.x)
+            return
+        moved_reverse = (
+            player.x >= start_x + ENDPOINT_TURN_REARM_MIN_PROGRESS_X
+            if direction == "right"
+            else player.x <= start_x - ENDPOINT_TURN_REARM_MIN_PROGRESS_X
+        )
+        if moved_reverse:
+            LOG.info(
+                "endpoint turn accepted: %s moved %.6f after prior attack",
+                direction,
+                player.x - start_x,
+            )
+            self._clear_endpoint_turn_rearm()
+            return
+        if self._endpoint_turn_rearm_attempted:
+            # The one permitted re-arm has already been emitted.  Do not turn
+            # a bad edge recording into a repeated key-up/key-down loop; the
+            # ordinary endpoint no-progress safeguard owns any later recovery.
+            self._clear_endpoint_turn_rearm()
+            return
+
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        force_key_up = getattr(self.key_sender, "force_key_up", None)
+        if key_down is None or not self._patrol_input_allowed():
+            self._clear_endpoint_turn_rearm()
+            return
+        with self._direction_lock, self._hold_lock:
+            if callable(force_key_up):
+                force_key_up(direction, reason="endpoint turn re-arm")
+            elif callable(key_up):
+                key_up(direction)
+            if self._walk_hold_key == direction:
+                self._walk_hold_key = None
+                self._walk_hold_until = 0.0
+        if not self._wait_for_patrol_motion(ENDPOINT_TURN_REARM_RELEASE_GAP_SECONDS):
+            self._clear_endpoint_turn_rearm()
+            return
+        with self._direction_lock, self._hold_lock:
+            if not self._patrol_input_allowed():
+                self._clear_endpoint_turn_rearm()
+                return
+            claimed = key_down(direction) is not False
+            if claimed:
+                self._walk_hold_key = direction
+                self._walk_hold_until = time.monotonic() + max(
+                    self.minimum_movement_hold_seconds,
+                    self.movement_hold_seconds,
+                )
+        self._endpoint_turn_rearm_attempted = True
+        if not claimed:
+            LOG.warning("endpoint turn re-arm blocked for %s", direction)
+            self._clear_endpoint_turn_rearm()
+            return
+        LOG.warning(
+            "endpoint turn re-armed: %s had no %.3f X reverse progress "
+            "after prior attack",
+            direction,
+            ENDPOINT_TURN_REARM_MIN_PROGRESS_X,
+        )
+        # Same short guard used after the original Right/Left-down.  It is a
+        # 60 ms input-settle, not an animation wait.
+        self._wait_for_patrol_motion(DIRECTION_SWITCH_POST_SEND_GUARD_SECONDS)
+        self._clear_endpoint_turn_rearm()
 
     def _advance_route_endpoint(self, observation: MinimapObservation, target_x: Optional[float]) -> bool:
         # A below-range recovery has its own rope target and completion
@@ -11142,6 +11344,7 @@ class MovementWorker(threading.Thread):
         self._rescue_cycles = 0
         self._climb_lateral_streak = 0
         self._route_phase = "left"
+        self._clear_endpoint_turn_rearm()
         self._route_patrol_cycle = 1
         self._forced_phase_entry = None
         self._climb_state = ClimbState()
@@ -12517,6 +12720,11 @@ class MovementWorker(threading.Thread):
                     route_target_x = self._stabilize_rope_target(
                         route_target_x, route_is_rope, route_label
                     )
+                # Endpoint reversal is input-first: Right/Left goes down as
+                # soon as the neutral gap ends.  This per-capture service is
+                # only the one-shot recovery for an input Maple swallowed
+                # because the *prior* attack was still animating.
+                self._service_endpoint_turn_rearm(observation)
                 if (route_label != "drop-to-route"
                         and self._return_mode != "drop-to-route"):
                     # The landing evidence belongs to one descent only.  The

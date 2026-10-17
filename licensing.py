@@ -95,6 +95,11 @@ class LicenseStatus:
     # count).  The header then shows 无限 and the quota gate must not disarm the
     # automatic lie pass.
     remaining_auto_lie_unlimited: bool = False
+    # The current activation code's explicit mode.  Older servers omit this;
+    # the legacy unlimited marker remains the compatibility fallback.
+    auto_lie_unlimited_mode: bool = False
+    # Unlimited-mode takeovers since the operator's last settlement.
+    auto_lie_unsettled_count: int = 0
     lie_detect_total: int = 0
     lie_detect_success_total: int = 0
     lie_detect_failed_total: int = 0
@@ -545,6 +550,7 @@ def _with_server_device(
         and reported_remaining is None
         and server_state.get("remaining_auto_lie_unlimited") is True
     )
+    unlimited_mode = bool(server_state.get("auto_lie_unlimited_mode", unlimited))
 
     return replace(
         status,
@@ -552,6 +558,10 @@ def _with_server_device(
         auto_lie_allowed=bool(server_state.get("auto_lie_allowed", status.auto_lie_allowed)),
         remaining_auto_lie_count=remaining,
         remaining_auto_lie_unlimited=bool(unlimited),
+        auto_lie_unlimited_mode=unlimited_mode,
+        auto_lie_unsettled_count=_counter(
+            "auto_lie_unsettled_count", status.auto_lie_unsettled_count
+        ),
         lie_detect_total=_counter("lie_detect_total", status.lie_detect_total),
         lie_detect_success_total=_counter("lie_detect_success_total", status.lie_detect_success_total),
         lie_detect_failed_total=_counter("lie_detect_failed_total", status.lie_detect_failed_total),
@@ -652,6 +662,38 @@ def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
             "auto-lie credential dropped: heartbeat outcome %s", status.code
         )
     return status
+
+
+def set_device_memo_via_server(memo: str, root: Optional[Path] = None) -> LicenseStatus:
+    """Save the locally chosen equipment note through the pinned service."""
+
+    local = verify_license(root)
+    if not local.valid or not local.license_id:
+        return LicenseStatus(False, "server", "激活验证失败")
+    try:
+        SERVER_LOG.info("device memo update requested")
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/device-memo",
+            {
+                "fingerprint": machine_fingerprint_hash(),
+                "license_id": local.license_id,
+                "memo": memo,
+            },
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
+        return _with_server_device(local, answer)
+    except PinnedTlsResponseError as exc:
+        SERVER_LOG.warning("device memo update rejected status=%s code=%s", exc.status, exc.code)
+        return _with_server_device(
+            replace(local, valid=False, code=f"server:{exc.code}", message=exc.message),
+            exc.data,
+        )
+    except DeviceNotReadyError:
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
+    except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("device memo update failed category=%s", type(exc).__name__)
+        return replace(local, code="server", message="激活验证失败")
 
 
 def _heartbeat_via_server(root: Optional[Path] = None) -> LicenseStatus:
@@ -756,5 +798,5 @@ __all__ = [
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
     "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
-    "report_lie_event_via_server", "validate_via_server",
+    "report_lie_event_via_server", "set_device_memo_via_server", "validate_via_server",
 ]

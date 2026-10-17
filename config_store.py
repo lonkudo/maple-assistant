@@ -110,6 +110,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     # section only remembers what the operator last submitted and its result.
     "license": {
         "activation_code": "",
+        "memo": "",
         "last_validation_valid": False,
         "last_validation_code": "",
         "last_validation_message": "",

@@ -252,6 +252,12 @@ CHANNEL_GRID_STARTS = tuple(range(1, 42, CHANNELS_PER_ROW))
 CHANNEL_GRID_TRIM_WORST = 3                # cursor/highlight may obscure a few of the 20 labels
 CHANNEL_GRID_MIN_SCORE = 0.72
 CHANNEL_GRID_MIN_MARGIN = 0.05
+# A valid page can tolerate a few damaged digits, but not a whole damaged row
+# or a partially repainted upper half.  The 1080 failure report showed eight
+# adjacent weak cells accepted by the trimmed mean; reject that pattern before
+# a grid is allowed to drive scrolling.
+CHANNEL_GRID_WEAK_CELL_SCORE = 0.70
+CHANNEL_GRID_MAX_CONSECUTIVE_WEAK = 3
 CHANNEL_VERIFY_CONFIRM_READS = 2
 CHANNEL_VERIFY_POLL_SECONDS = 0.20
 CHANNEL_VERIFY_MAX_ATTEMPTS = 32            # enough for all 10 rows plus swallowed-wheel retries
@@ -270,6 +276,10 @@ CHANNEL_SCROLL_ATTEMPTS = 2                      # a wheel can be swallowed whil
 CHANNEL_SCROLL_SLACK_NOTCHES = 4                 # extra notches allowed (swallowed events)
 CHANNEL_SCROLL_MATCH_ROWS = 3                    # rows of margin above the matched strip
 CHANNEL_SCROLL_MATCH_MIN_SCORE = 0.40            # matchTemplate score below this = not measurable
+# The 1080 client uses before/after list-page tracking instead of tiny-number
+# OCR.  A wheel event counts only when the list visibly changes; a swallowed
+# event leaves the counter unchanged.
+CHANNEL_SCROLL_TRACK_MAX_EVENTS = 24
 # The cell is CLICKED and then DOUBLE-CLICKED (the operator's rule; the double click is what enters
 # the channel - "press enter will go into channel1", so Enter is NOT a substitute).
 #
@@ -1406,6 +1416,12 @@ class ChannelGridReading:
     score: float
     margin: float
     profile: str
+    runner_up_first_channel: int
+    runner_up_score: float
+    longest_weak_run: int
+    # One native-template score for every visible slot.  ``None`` means that
+    # the deliberately ignored target slot was not used in this reading.
+    cell_scores: tuple[Optional[float], ...]
 
 
 _CHANNEL_TEMPLATE_CACHE: dict[str, Any] = {}
@@ -1512,6 +1528,28 @@ def _channel_number_score(observed, reference) -> float:
     return best
 
 
+def _channel_grid_weak_run(cell_scores: tuple[Optional[float], ...]) -> int:
+    """Longest run of weak readable labels in one candidate grid.
+
+    A selected target label may be deliberately ignored; it is neutral rather
+    than evidence that the page is wrong.  A run of four weak *readable*
+    labels, however, is a partial repaint/crop problem rather than ordinary
+    one-digit blur and must not steer the wheel.
+    """
+
+    longest = 0
+    current = 0
+    for score in cell_scores:
+        if score is None:
+            current = 0
+        elif score < CHANNEL_GRID_WEAK_CELL_SCORE:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
 def read_channel_grid(frame, client_size=None, *, ignore_slot: Optional[int] = None) -> Optional[ChannelGridReading]:
     """Read the visible page as one of the valid consecutive grids: 1,5,9,...,41.
 
@@ -1546,21 +1584,58 @@ def read_channel_grid(frame, client_size=None, *, ignore_slot: Optional[int] = N
         ignored = None
     candidates = []
     for first_channel in CHANNEL_GRID_STARTS:
-        scores = [
-            _channel_number_score(observed[slot], templates[first_channel + slot - 1])
-            for slot in range(len(observed)) if slot != ignored
-        ]
-        kept = sorted(scores)[CHANNEL_GRID_TRIM_WORST:]
-        candidates.append((float(np.mean(kept)), first_channel))
+        cell_scores: list[Optional[float]] = []
+        for slot in range(len(observed)):
+            if slot == ignored:
+                cell_scores.append(None)
+            else:
+                cell_scores.append(_channel_number_score(
+                    observed[slot], templates[first_channel + slot - 1]
+                ))
+        kept = sorted(score for score in cell_scores if score is not None)[CHANNEL_GRID_TRIM_WORST:]
+        frozen_scores = tuple(cell_scores)
+        candidates.append((
+            float(np.mean(kept)),
+            first_channel,
+            frozen_scores,
+            _channel_grid_weak_run(frozen_scores),
+        ))
     candidates.sort(reverse=True)
-    score, first_channel = candidates[0]
-    runner_up = candidates[1][0]
+    usable = [candidate for candidate in candidates
+              if candidate[3] <= CHANNEL_GRID_MAX_CONSECUTIVE_WEAK]
+    if usable:
+        score, first_channel, cell_scores, longest_weak_run = usable[0]
+    else:
+        best_score, best_first, _best_cells, best_weak_run = candidates[0]
+        LOG.info(
+            "auto reconnect: channel grid rejected profile=%s best=%d score=%.3f "
+            "weak-run=%d (limit %d)",
+            profile_name, best_first, best_score, best_weak_run,
+            CHANNEL_GRID_MAX_CONSECUTIVE_WEAK,
+        )
+        return None
+    # A candidate that has a long weak run is not safe to select, but it is
+    # still meaningful competition for the score margin.  Requiring a second
+    # *usable* candidate rejected a perfectly clear page whenever only its
+    # true grid passed the weak-run guard.
+    runner_up, runner_up_first_channel, _runner_up_cells, _runner_up_weak_run = next(
+        candidate for candidate in candidates if candidate[1] != first_channel
+    )
     margin = score - runner_up
     if score < CHANNEL_GRID_MIN_SCORE or margin < CHANNEL_GRID_MIN_MARGIN:
         LOG.info("auto reconnect: channel grid ambiguous profile=%s best=%d score=%.3f "
                  "margin=%.3f", profile_name, first_channel, score, margin)
         return None
-    return ChannelGridReading(first_channel, score, margin, profile_name)
+    return ChannelGridReading(
+        first_channel,
+        score,
+        margin,
+        profile_name,
+        runner_up_first_channel,
+        runner_up,
+        longest_weak_run,
+        cell_scores,
+    )
 
 
 def login_colour_reference(image) -> Optional[LoginColourReference]:
@@ -3985,6 +4060,84 @@ class ReconnectWorker(threading.Thread):
         self._report("channel", f"按计算向{'下' if direction > 0 else '上'}滚动 {total} 行")
         return requested
 
+    def _tracked_1080_channel_cell(self, channel: int, size, channel_x: int, channel_y: int,
+                                   initial_frame) -> Optional[tuple[int, int, int]]:
+        """Locate a channel cell from verified list displacement, without OCR.
+
+        The selector opens at channel 1 in row 1/column 1.  Every wheel event
+        is compared with the immediately preceding list image.  Thus an eaten
+        event contributes zero; one visibly consumed wheel notch contributes
+        one row, matching the game's fixed four-channels-per-row list.
+        """
+
+        target_index = max(CHANNEL_MIN, min(int(channel), CHANNEL_MAX)) - 1
+        target_row = target_index // CHANNELS_PER_ROW
+        target_column = target_index % CHANNELS_PER_ROW
+        confirmed_rows = 0
+        frame = initial_frame
+        row_pitch = window_client_length(CHANNEL_ROW_STEP_CLIENT, size)
+
+        for event_number in range(1, CHANNEL_SCROLL_TRACK_MAX_EVENTS + 1):
+            if self._cancelled():
+                return None
+            visible_row = target_row - confirmed_rows
+            if 0 <= visible_row < CHANNEL_VISIBLE_ROWS:
+                column_pitch = window_client_length(CHANNEL_STEP_CLIENT, size)
+                cell_x = int(round(channel_x + target_column * column_pitch))
+                cell_y = int(round(channel_y + visible_row * row_pitch))
+                LOG.info(
+                    "auto reconnect: 1080 tracked list confirmed scroll=%d row(s); "
+                    "channel %d is visible at row %d column %d",
+                    confirmed_rows, channel, visible_row + 1, target_column + 1,
+                )
+                self._report(
+                    "channel",
+                    f"列表位移已确认 {confirmed_rows} 行，{channel}频道在第 "
+                    f"{visible_row + 1} 行第 {target_column + 1} 列",
+                )
+                return cell_x, cell_y, visible_row * CHANNELS_PER_ROW + target_column
+
+            direction = 1 if visible_row >= CHANNEL_VISIBLE_ROWS else -1
+            before = frame if frame is not None else self._capture()[0]
+            if before is None:
+                LOG.error("auto reconnect: cannot capture the 1080 channel list before scrolling")
+                return None
+            if not self._wheel_client(channel_x, channel_y,
+                                      direction * CHANNEL_SCROLL_NOTCHES_PER_ROW):
+                LOG.error("auto reconnect: 1080 tracked channel wheel could not be sent")
+                return None
+            moved, after, change = self._wait_for_list_change(
+                before,
+                f"1080 {'down' if direction > 0 else 'up'} scroll {event_number}/"
+                f"{CHANNEL_SCROLL_TRACK_MAX_EVENTS}",
+            )
+            self._pick_wheel_method(before, after, change)
+            if not moved:
+                LOG.warning(
+                    "auto reconnect: 1080 scroll event %d was not consumed; "
+                    "row counter remains %d",
+                    event_number, confirmed_rows,
+                )
+                frame = after
+                continue
+            # ``list_scroll_rows`` is intentionally NOT used here.  On the
+            # 1080 art it can template-match repeated wooden textures at its
+            # old Y coordinate and return zero even when the whole list page
+            # visibly changed.  The confirmed before/after page transition is
+            # the reliable swallowed-wheel gate for this fixed one-notch,
+            # one-row selector.
+            confirmed_rows += direction
+            frame = after
+            LOG.info(
+                "auto reconnect: 1080 scroll event %d visibly consumed; confirmed total=%d row(s)",
+                event_number, confirmed_rows,
+            )
+
+        LOG.error(
+                  "auto reconnect: 1080 could not bring channel %d into view after %d tracked wheel events",
+                  channel, CHANNEL_SCROLL_TRACK_MAX_EVENTS)
+        return None
+
     def _pick_wheel_method(self, before, after, change: float) -> None:
         """Keep the wheel method that visibly moved the list (evidence, not a gate)."""
 
@@ -4034,11 +4187,9 @@ class ReconnectWorker(threading.Thread):
         """
 
         target_row = (int(channel) - 1) // CHANNELS_PER_ROW
-        desired_first_row = max(0, target_row - (CHANNEL_VISIBLE_ROWS - 1))
-        desired_first_channel = 1 + desired_first_row * CHANNELS_PER_ROW
-        expected_visible_slot = int(channel) - desired_first_channel
         confirmed_first = None
         confirmations = 0
+        last_diagnostic_first: Optional[int] = None
         for attempt in range(1, CHANNEL_VERIFY_MAX_ATTEMPTS + 1):
             if self.stop_event.is_set() or self._cancel_requested.is_set():
                 return None
@@ -4048,19 +4199,25 @@ class ReconnectWorker(threading.Thread):
             # On the 1080 preset the selected target's tiny numeral can be too blurred for a
             # full 20-cell OCR reading.  The page itself is still safely identifiable from the
             # other 19 labels, so do not abandon a confirmed target page merely because its own
-            # number is unreadable.  This fallback is deliberately restricted to the planned
-            # page and never authorises an off-page target.
+            # number is unreadable.  The target can be at any visible slot: a laggy wheel can
+            # legitimately land on 21-40 while channel 35 is already visible.  Each fallback is
+            # therefore restricted to a grid that contains that target; it never authorises an
+            # off-page click.
             if reading is None:
-                fallback = read_channel_grid(
-                    frame, size, ignore_slot=expected_visible_slot,
-                )
-                if fallback is not None and fallback.first_channel == desired_first_channel:
-                    reading = fallback
-                    target_number_ignored = True
-                    LOG.info("auto reconnect: channel %d target numeral is unreadable; "
-                             "the remaining 19 labels confirmed grid %d-%d", channel,
-                             reading.first_channel,
-                             reading.first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1)
+                for candidate_first in CHANNEL_GRID_STARTS:
+                    candidate_slot = int(channel) - candidate_first
+                    if not 0 <= candidate_slot < CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS:
+                        continue
+                    fallback = read_channel_grid(frame, size, ignore_slot=candidate_slot)
+                    if fallback is not None and fallback.first_channel == candidate_first:
+                        reading = fallback
+                        target_number_ignored = True
+                        LOG.info("auto reconnect: channel %d target numeral is unreadable; "
+                                 "the remaining 19 labels confirmed grid %d-%d", channel,
+                                 reading.first_channel,
+                                 reading.first_channel
+                                 + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1)
+                        break
             if reading is None:
                 confirmations = 0
                 confirmed_first = None
@@ -4076,18 +4233,39 @@ class ReconnectWorker(threading.Thread):
                      reading.profile, reading.score, reading.margin, attempt,
                      CHANNEL_VERIFY_MAX_ATTEMPTS,
                      "; target numeral ignored" if target_number_ignored else "")
-            if reading.first_channel == desired_first_channel:
+            # This is intentionally emitted only for the first accepted page
+            # and when its identity changes.  It makes a 12-31 <-> 16-35
+            # swing diagnosable without turning every 5-fps grid poll into a
+            # long log line.
+            if last_diagnostic_first != reading.first_channel:
+                slot_details = ", ".join(
+                    f"{reading.first_channel + slot}:"
+                    f"{'skip' if cell_score is None else f'{cell_score:.3f}'}"
+                    for slot, cell_score in enumerate(reading.cell_scores)
+                )
+                LOG.warning(
+                    "auto reconnect: channel-grid diagnostic profile=%s chosen=%d-%d "
+                    "score=%.3f runner-up=%d-%d score=%.3f margin=%.3f weak-run=%d cells=[%s]",
+                    reading.profile,
+                    reading.first_channel,
+                    reading.first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1,
+                    reading.score,
+                    reading.runner_up_first_channel,
+                    reading.runner_up_first_channel + CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS - 1,
+                    reading.runner_up_score,
+                    reading.margin,
+                    reading.longest_weak_run,
+                    slot_details,
+                )
+                last_diagnostic_first = reading.first_channel
+            visible_slot = int(channel) - reading.first_channel
+            if 0 <= visible_slot < CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS:
                 if confirmed_first == reading.first_channel:
                     confirmations += 1
                 else:
                     confirmed_first = reading.first_channel
                     confirmations = 1
                 if confirmations >= CHANNEL_VERIFY_CONFIRM_READS:
-                    visible_slot = int(channel) - reading.first_channel
-                    if not 0 <= visible_slot < CHANNELS_PER_ROW * CHANNEL_VISIBLE_ROWS:
-                        LOG.error("auto reconnect: verified grid %d-%d does not contain channel %d",
-                                  reading.first_channel, reading.first_channel + 19, channel)
-                        return None
                     column_pitch = window_client_length(CHANNEL_STEP_CLIENT, size)
                     row_pitch = window_client_length(CHANNEL_ROW_STEP_CLIENT, size)
                     cell_x = int(round(channel_x + (visible_slot % CHANNELS_PER_ROW) * column_pitch))
@@ -4106,16 +4284,16 @@ class ReconnectWorker(threading.Thread):
             confirmations = 0
             confirmed_first = None
             current_row = (reading.first_channel - 1) // CHANNELS_PER_ROW
-            remaining_rows = desired_first_row - current_row
-            # The page was successfully read but is not yet the page that
-            # places the target at its calculated visible slot.  This is
-            # normal for an off-screen channel, never a recognition failure.
-            # Use the recognised page start to compute the whole remaining
-            # travel, scroll it, then read the new page again before allowing
-            # a click.
-            LOG.warning("auto reconnect: target channel %d is not yet on its planned grid %d-%d; "
-                        "current grid is %d-%d, %d row(s) still needed %s", channel,
-                        desired_first_channel, desired_first_channel + 19,
+            last_visible_row = current_row + CHANNEL_VISIBLE_ROWS - 1
+            if target_row < current_row:
+                remaining_rows = target_row - current_row
+            else:
+                remaining_rows = target_row - last_visible_row
+            # The page is known, but the target genuinely lies outside its
+            # five visible rows.  Scroll only far enough to make it visible;
+            # do not force it onto one special 20-channel range.
+            LOG.warning("auto reconnect: target channel %d is outside current grid %d-%d; "
+                        "%d row(s) still needed %s", channel,
                         reading.first_channel,
                         reading.first_channel + 19, abs(remaining_rows),
                         "down" if remaining_rows > 0 else "up")
@@ -4205,6 +4383,7 @@ class ReconnectWorker(threading.Thread):
             self._report("failed", "还在登录页，无法选择频道")
             return False
         size = self._click_size()
+        channel_profile, _channel_profile_data = _channel_profile(size)
         channel_x, channel_y = window_client_point(CHANNEL_FIRST_CLIENT, size)
         select_window = window_client_box(SELECT_WINDOW_CLIENT_BOX, size)
         channel_list_box = window_client_box(CHANNEL_LIST_CLIENT_BOX, size)
@@ -4251,35 +4430,28 @@ class ReconnectWorker(threading.Thread):
             LOG.info("auto reconnect: after the second channel 1 click the list region changed by "
                      "%.2f", region_change(before, self._capture()[0], channel_list_box))
 
-        # First bring an off-screen target into view by the known channel-grid
-        # arithmetic.  The selector always opens on channel 1, so this does
-        # not need OpenCV to recognise a target that is not visible yet:
-        # channel 51, for example, is row 13 and needs 8 row-scrolls before
-        # its label can possibly be read.  A previous refactor left this
-        # helper unused and asked OpenCV to prove the destination page before
-        # it had been scrolled there, causing reconnect to stop on an ordinary
-        # off-page target.
-        #
-        # The calculated scroll is deliberately not the final authority.  A
-        # laggy game may swallow a wheel event, so the closed-loop reader
-        # below still verifies the visible grid and applies further corrective
-        # scrolling before any target-cell click is allowed.
-        if rows_to_scroll:
-            scrolled = self._scroll_list_rows(rows_to_scroll)
-            if scrolled != rows_to_scroll:
-                LOG.warning(
-                    "auto reconnect: calculated channel scroll stopped after %d/%d row(s); "
-                    "the visual verifier will determine whether more scrolling is needed",
-                    scrolled, rows_to_scroll,
-                )
-                if self._cancelled():
-                    return False
-
-        # Do not trust a count of injected wheel events.  On a leaking/lagging game process the OS
-        # can accept an event that the game never consumes.  Read the 20 channel labels after every
-        # wheel step and continue until the native 1080/1366 sampler proves the intended grid is on
-        # screen twice in succession.
-        verified_cell = self._verified_channel_cell(channel, size, channel_x, channel_y)
+        if channel_profile == "1080x768":
+            # The 1080 numerals are too small to safely identify a full page.
+            # Begin at the known channel-1 origin and let measured row movement,
+            # rather than OCR, establish the target cell.
+            verified_cell = self._tracked_1080_channel_cell(
+                channel, size, channel_x, channel_y, self._capture()[0]
+            )
+        else:
+            # The 1366 native sampler remains closed-loop OCR: its glyphs are
+            # clear enough to verify the visible grid after every corrective
+            # scroll.
+            if rows_to_scroll:
+                scrolled = self._scroll_list_rows(rows_to_scroll)
+                if scrolled != rows_to_scroll:
+                    LOG.warning(
+                        "auto reconnect: calculated channel scroll stopped after %d/%d row(s); "
+                        "the visual verifier will determine whether more scrolling is needed",
+                        scrolled, rows_to_scroll,
+                    )
+                    if self._cancelled():
+                        return False
+            verified_cell = self._verified_channel_cell(channel, size, channel_x, channel_y)
         if verified_cell is None:
             return False
         cell_x, cell_y, visible_slot = verified_cell
@@ -4299,9 +4471,10 @@ class ReconnectWorker(threading.Thread):
             return False
         if not self._sleep_checked(CLICK_RETRY_WAIT_SECONDS):
             return False
-        # This is intentionally AFTER selection and BEFORE entry.  If the game swallowed a wheel
-        # event or repainted stale content, no double-click is allowed to enter the wrong channel.
-        if not self._post_click_channel_is_correct(channel, visible_slot, size):
+        # This is intentionally AFTER selection and BEFORE entry.  The 1366
+        # path checks the selected numeral; the 1080 path's equivalent safety
+        # proof is its measured row-displacement ledger from channel 1.
+        if channel_profile != "1080x768" and not self._post_click_channel_is_correct(channel, visible_slot, size):
             self._report("channel", f"{channel}频道 单击后校验失败，重新读取频道列表")
             verified_cell = self._verified_channel_cell(channel, size, channel_x, channel_y)
             if verified_cell is None:

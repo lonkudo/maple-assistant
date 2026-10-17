@@ -181,8 +181,8 @@ operator-run check of the same upstream service, so it keeps the immediate
 begin-and-finalize-`success` accounting instead of the live lifecycle.
 
 The server keeps its established `device` response for compatibility and adds
-`autolie_fingerprint_usage` containing only current auto-lie permission,
-remaining balance, and usage counters. `licensing._with_server_device()`
+`autolie_fingerprint_usage` containing current auto-lie permission, remaining
+balance, usage counters, mode, and unsettled count. `licensing._with_server_device()`
 merges that additive object into the live `LicenseStatus`; `UiWorker` applies
 it on its Tk thread and redraws the always-visible 设备码/usage line immediately.
 Routine local license checks retain this online state for the same license,
@@ -213,8 +213,19 @@ future activation and feature gates identical.
 The operator console maps an activation code's stored fingerprint binding to
 the corresponding opaque `equipment_id` before displaying it. Raw fingerprint
 hashes stay off the operator-facing code table. `FingerprintSecurityState.memo`
-is an operator-only, bounded text field; device actions can set, replace, or
-clear it, and it is never returned to clients.
+is a 24-character shared label. `POST /api/v1/device-memo` validates the same
+allowed character set on the pinned server boundary, saves it to the bound
+device, and returns the updated normal device response. The desktop persists
+its local copy in `user_config.json` and sends this request asynchronously, so
+memo editing cannot block capture, movement, or auto-lie handling.
+
+`ActivationCode.auto_lie_unlimited_mode` selects code-owned counting versus
+unsettled usage. A finite code reduces `remaining_auto_lie_count`; an unsettled
+code leaves it unlimited and increments `auto_lie_unsettled_count` on `STARTED`.
+`auto_lie_settled_at` is a code-owned accounting baseline, so settlement and a
+count-to-unsettled mode switch reset the current-window total/success/failure
+view without rewriting historical lie-event rows. The device console's settle
+and switch actions are enabled only where that mode permits them.
 
 The authorization-code list has one authenticated lookup boundary:
 `POST /console/api/codes` accepts either a public `equipment_id` or an original
@@ -377,12 +388,17 @@ Endpoint turnover is a short movement-owned transaction. `_advance_route_endpoin
 immediately releases the old held direction and records the one expected
 opposite direction. It sets `direction_transition_event`, which blocks attack
 and other competing input, through the 100 ms neutral interval. `_send_walk_hold()`
-is the only sender that may satisfy that pending direction; it waits only for a
-pre-existing attack (bounded to 300 ms per fresh frame), sends the new key, then
-holds the gate for a 60 ms post-send guard. The gate is cleared immediately
-afterwards, and a watchdog clears a stranded pending turnover on lifecycle
-interruption. This arrangement prevents overlapping directions and attack
-swallowing without making the endpoint gate a long patrol pause.
+is the only sender that may satisfy that pending direction; it sends the new
+key immediately after the neutral interval, even if the preceding attack is
+still active, then holds the gate for a 60 ms post-send guard. If that attack
+was active, `_service_endpoint_turn_rearm()` retains the gate through the
+attack, samples a post-attack X baseline, and accepts the original key only on
+the next fresh frame with at least 0.003 X reverse progress. Otherwise it
+performs one `20 ms` reverse key-up/key-down re-arm. The hold manager preserves
+the reverse hold while this state exists. The gate is then cleared, and a
+watchdog clears a stranded pending turnover on lifecycle interruption. This
+prevents overlapping directions and attack swallowing without making the
+endpoint gate a long patrol pause.
 
 Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
 
