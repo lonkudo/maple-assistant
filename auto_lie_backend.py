@@ -1,4 +1,4 @@
-"""TodoHelper's live RoiTrack deployment route.
+"""MoonEclipse's live RoiTrack deployment route.
 
 The bundled ``autolie_api`` folder is vendor reference material and keeps its
 original endpoint list. The application selects its live service here so an

@@ -49,7 +49,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $stageName = "protected-stage-$Version"
 $stage = Join-Path $root (Join-Path "work" $stageName)
-$out = Join-Path $root "release\TodoHelper-Protected"
+$out = Join-Path $root "release\MoonEclipse-Protected"
 $dataRoot = Join-Path $root "work\protected-data"
 
 # Reports the third-party modules reachable from assistant.py, and which of
@@ -203,7 +203,7 @@ function Install-MissingRequirement {
 
 function Test-FrozenStartup {
     param([string]$DistDir, [int]$TimeoutSeconds = 20)
-    $exe = Join-Path $DistDir "TodoHelper.exe"
+    $exe = Join-Path $DistDir "MoonEclipse.exe"
     if (-not (Test-Path $exe)) { throw "Packaged executable not found: $exe" }
 
     # Snapshot the package so the probe's own generated files can be removed
@@ -248,11 +248,11 @@ function Test-FrozenStartup {
         # output and a fast clean exit proves the bundled modules loaded.  The
         # usual reason for the early exit is that an assistant is already
         # running in this Windows session and owns the singleton mutex.
-        $others = @(Get-Process -Name "TodoHelper" -ErrorAction SilentlyContinue)
+        $others = @(Get-Process -Name "MoonEclipse" -ErrorAction SilentlyContinue)
         if ($others.Count -gt 0) {
-            Write-Host "Frozen import check passed: every bundled module imported, then the executable exited through the single-instance guard because $($others.Count) TodoHelper process(es) are already running in this session." -ForegroundColor Green
+            Write-Host "Frozen import check passed: every bundled module imported, then the executable exited through the single-instance guard because $($others.Count) MoonEclipse process(es) are already running in this session." -ForegroundColor Green
         } else {
-            Write-Warning "The packaged executable exited after ${TimeoutSeconds}s (exit code $exitCode) without an import error, and no other TodoHelper process is running, so the cause is unknown. Captured output:`n$captured"
+            Write-Warning "The packaged executable exited after ${TimeoutSeconds}s (exit code $exitCode) without an import error, and no other MoonEclipse process is running, so the cause is unknown. Captured output:`n$captured"
         }
     } else {
         Write-Host "Frozen startup check passed: the executable stayed running for ${TimeoutSeconds}s." -ForegroundColor Green
@@ -361,7 +361,7 @@ try {
     try {
         & $interpreter -m nuitka --standalone --assume-yes-for-downloads --enable-plugin=tk-inter `
             --windows-console-mode=hide `
-            "--output-dir=$out" "--output-filename=TodoHelper.exe" `
+            "--output-dir=$out" "--output-filename=MoonEclipse.exe" `
             @dataArguments @moduleArguments `
             assistant.py
         if ($LASTEXITCODE -ne 0) { throw "Nuitka compilation failed." }
@@ -374,7 +374,7 @@ try {
 }
 } else {
     $existingDist = Join-Path $out "assistant.dist"
-    if (-not (Test-Path (Join-Path $existingDist "TodoHelper.exe"))) {
+    if (-not (Test-Path (Join-Path $existingDist "MoonEclipse.exe"))) {
         throw "No completed Nuitka distribution is available to resume."
     }
     if (-not (Test-Path $dataRoot)) {
@@ -406,7 +406,7 @@ Option Explicit
 Dim shellApp, files, root, exePath, arguments, item
 Set files = CreateObject("Scripting.FileSystemObject")
 root = files.GetParentFolderName(WScript.ScriptFullName)
-exePath = root & "\TodoHelper.exe"
+exePath = root & "\MoonEclipse.exe"
 arguments = ""
 For Each item In WScript.Arguments
     arguments = arguments & " " & QuoteArgument(CStr(item))
@@ -416,8 +416,8 @@ Set shellApp = CreateObject("Shell.Application")
 On Error Resume Next
 shellApp.ShellExecute exePath, arguments, root, "runas", 0
 If Err.Number <> 0 Then
-    MsgBox "TodoHelper could not start (administrator permission was not granted)." & vbCrLf & _
-           "Run diagnose_start.bat to see the startup error.", 16, "TodoHelper"
+    MsgBox "MoonEclipse could not start (administrator permission was not granted)." & vbCrLf & _
+           "Run diagnose_start.bat to see the startup error.", 16, "MoonEclipse"
 End If
 On Error GoTo 0
 
@@ -455,10 +455,10 @@ $diagnoser = @"
 rem Diagnostic launcher: keeps this window open so a startup error is readable.
 cd /d "%~dp0"
 echo ============================================
-echo   TodoHelper diagnostic start
+echo   MoonEclipse diagnostic start
 echo ============================================
 echo.
-"%~dp0TodoHelper.exe" %*
+"%~dp0MoonEclipse.exe" %*
 echo.
 echo Exit code: %ERRORLEVEL%
 echo Send the text above to the developer if the assistant did not start.
@@ -476,19 +476,22 @@ pause
 )
 
 # Ship the complete standalone directory.  The executable's embedded Python
-# runtime lives beside TodoHelper.exe, so distributing only the .exe would
+# runtime lives beside MoonEclipse.exe, so distributing only the .exe would
 # be broken.  Operator-side license inventory/private material was never
 # copied into this directory by build_release.ps1.
 #
 # The package name says "release", not "EXE"; the frozen package is a release
 # in its own right.  The in-app updater only accepts archives that contain
 # assistant.py, so it ignores this one under either name.
-$zip = Join-Path $root "release\TodoHelper-release-$Version.zip"
+$zip = Join-Path $root "release\MoonEclipse-release-$Version.zip"
 Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $dist.FullName "*") -DestinationPath $zip -Force
 # Drop the previous name's archive as well, so no stale package is mistaken
 # for the current one.
-foreach ($pattern in @("TodoHelper-release-*.zip", "TodoHelper-EXE-*.zip")) {
+foreach ($pattern in @(
+    "MoonEclipse-release-*.zip", "MoonEclipse-EXE-*.zip",
+    "TodoHelper-release-*.zip", "TodoHelper-EXE-*.zip"
+)) {
     Get-ChildItem (Join-Path $root "release") -File -Filter $pattern |
         Where-Object { $_.FullName -ne $zip } |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }

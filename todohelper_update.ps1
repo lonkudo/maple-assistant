@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Persistent TodoHelper restart and ZIP-update helper.
+    Persistent MoonEclipse restart and ZIP-update helper.
 
 .DESCRIPTION
     This script ships with every package.  The running application invokes it
@@ -34,7 +34,7 @@ function Wait-ForTarget([int]$targetProcessId) {
         if (-not (Get-Process -Id $targetProcessId -ErrorAction SilentlyContinue)) { return }
         Start-Sleep -Milliseconds 100
     }
-    throw "Timed out waiting for TodoHelper to exit."
+    throw "Timed out waiting for MoonEclipse to exit."
 }
 
 function Find-PackageRoot([string]$stage, [string]$format) {
@@ -42,12 +42,14 @@ function Find-PackageRoot([string]$stage, [string]$format) {
         ForEach-Object { $_.Directory } |
         Where-Object {
             if ($format -eq "frozen") {
-                (Test-Path (Join-Path $_ "TodoHelper.exe")) -or (Test-Path (Join-Path $_ "MapleAssistant.exe"))
+                (Test-Path (Join-Path $_ "MoonEclipse.exe")) -or
+                (Test-Path (Join-Path $_ "TodoHelper.exe")) -or
+                (Test-Path (Join-Path $_ "MapleAssistant.exe"))
             } else {
                 Test-Path (Join-Path $_ "assistant.py")
             }
         })
-    if ($candidates.Count -ne 1) { throw "Update ZIP has no unambiguous compatible TodoHelper package." }
+    if ($candidates.Count -ne 1) { throw "Update ZIP has no unambiguous compatible MoonEclipse package." }
     return $candidates[0].FullName
 }
 
@@ -86,7 +88,7 @@ function Install-ImportedConfig([string]$sourcePath, [string]$destinationRoot) {
         for ($i = 0; $i -lt 150; $i++) {
             try {
                 # File.Replace preserves the all-or-nothing handoff when the
-                # destination already exists.  The old TodoHelper process was
+                # destination already exists.  The old MoonEclipse process was
                 # waited out above, so this retry only covers a short-lived
                 # external handle such as antivirus indexing.
                 if (Test-Path -LiteralPath $target -PathType Leaf) {

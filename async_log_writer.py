@@ -117,7 +117,7 @@ class _BatchRotatingFileHandler(RotatingFileHandler):
             # Do not call logging from a writer failure: doing so would enqueue
             # into the same failed channel recursively.
             try:
-                sys.stderr.write("TodoHelper async log write failed; retrying batch\n")
+                sys.stderr.write("MoonEclipse async log write failed; retrying batch\n")
             except Exception:
                 pass
             return False

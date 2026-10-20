@@ -58,6 +58,8 @@ from update_manager import (
     schedule_package_update,
 )
 from runtime_paths import application_root, package_format
+from crash_reporter import record_current_exception, record_exception
+from ui_hang_watchdog import UiHangWatchdog
 from auto_lie_secret import clear_server_secret, get_server_secret, has_server_secret
 from auto_lie_outcome import (
     LieSuccessBoxDetector, SUCCESS_CONSECUTIVE_FRAMES, SUCCESS_THRESHOLD,
@@ -1373,6 +1375,29 @@ class UiWorker(threading.Thread):
             # applied only after every panel has been built and laid out.
             root.withdraw()
             self._root = root
+            self._ui_hang_watchdog = UiHangWatchdog(
+                application_root() / "work" / "ui_hang_trace.log",
+                timeout_seconds=8.0,
+            )
+            self._ui_hang_watchdog.start()
+
+            # Tk intercepts exceptions raised by individual button/timer
+            # callbacks instead of letting them escape ``mainloop``.  Preserve
+            # their traceback before Tk prints it, otherwise a crashed
+            # dashboard leaves no usable evidence once its copy button is gone.
+            original_callback_reporter = root.report_callback_exception
+
+            def report_callback_exception(
+                exc_type: type[BaseException],
+                exc_value: BaseException,
+                exc_traceback: object,
+            ) -> None:
+                record_exception(
+                    "Tk callback exception", exc_type, exc_value, exc_traceback,
+                )
+                original_callback_reporter(exc_type, exc_value, exc_traceback)
+
+            root.report_callback_exception = report_callback_exception
             if not self._debug_snapshot_worker_started:
                 self._debug_snapshot_worker.start()
                 self._debug_snapshot_worker_started = True
@@ -1380,7 +1405,7 @@ class UiWorker(threading.Thread):
                 self._lie_accounting_worker.start()
                 self._lie_accounting_started = True
             app_version = version_label()
-            root.title(f"TodoHelper {app_version}")
+            root.title(f"MoonEclipse {app_version}")
             screen_width = root.winfo_screenwidth()
             screen_height = root.winfo_screenheight()
             # 调试窗口不抢前台：不设置 -topmost，游戏在爬绳/挂绳时保持焦点，
@@ -3035,8 +3060,12 @@ class UiWorker(threading.Thread):
             root.after(0, self._poll)
             root.mainloop()
         except Exception:
+            record_current_exception("Tk UI worker exception")
             LOG.exception("debug UI stopped unexpectedly")
         finally:
+            watchdog = getattr(self, "_ui_hang_watchdog", None)
+            if watchdog is not None:
+                watchdog.close()
             self._yolo_stop()
             self._root = None
             LOG.info("UI worker stopped")
@@ -3116,7 +3145,7 @@ class UiWorker(threading.Thread):
         self._caption_separator = separator
 
         title = tk.Label(
-            bar, text=f"TodoHelper {app_version}", bg="#f0f0f0",
+            bar, text=f"MoonEclipse {app_version}", bg="#f0f0f0",
             anchor="w",
         )
         title.pack(side="left", padx=(10, 0))
@@ -3271,7 +3300,7 @@ class UiWorker(threading.Thread):
         import tkinter as tk
 
         viewer = tk.Toplevel(root)
-        viewer.title("TodoHelper 教学")
+        viewer.title("MoonEclipse 教学")
         viewer.transient(root)
         viewer.resizable(False, False)
         self._teaching_viewer = viewer
@@ -3358,7 +3387,7 @@ class UiWorker(threading.Thread):
         install_root = application_root(__file__)
         current = read_version(install_root / "VERSION")
         LOG.info(
-            "更新：正在桌面、当前目录及上级目录查找比 v%s 更新的 TodoHelper 安装包。",
+            "更新：正在桌面、当前目录及上级目录查找比 v%s 更新的 MoonEclipse 安装包。",
             current,
         )
         try:
@@ -3638,6 +3667,9 @@ class UiWorker(threading.Thread):
         root = self._root
         if root is None:
             return
+        watchdog = getattr(self, "_ui_hang_watchdog", None)
+        if watchdog is not None:
+            watchdog.kick()
         if self.stop_event.is_set():
             root.destroy()
             return

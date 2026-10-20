@@ -461,6 +461,43 @@ class MinimapDetector:
             self._last_good_at = time.monotonic()
         return detection
 
+    def _client_edge_canvas_fallback(
+        self, image: Image.Image,
+    ) -> Optional[MinimapDetection]:
+        """Recover a canvas whose outer minimap frame is clipped at x=0.
+
+        The game can draw the left minimap edge flush with the client edge.
+        That prevents Canny from closing the outer widget contour.  The
+        no-header pass still measures the live canvas right and bottom edges;
+        retain those measured edges, but use the known client-edge canvas
+        origin (0, 57).  This deliberately changes only the upper-left edge,
+        never the map's measured width or height.
+        """
+
+        detector = self._canvas_detector
+        if detector is None:
+            return None
+        candidate = detector.detect(image)
+        if not candidate.source.startswith("opencv"):
+            return None
+        _left, _top, right, bottom = candidate.canvas_box
+        image_width, image_height = image.size
+        if right <= 0 or bottom <= 57 or right > image_width or bottom > image_height:
+            return None
+        canvas_box = (0, 57, right, bottom)
+        if right < 40 or bottom - 57 < 40:
+            return None
+        return self._remember_good(MinimapDetection(
+            window_box=canvas_box,
+            analysis_box=canvas_box,
+            canvas_box=canvas_box,
+            map_name_box=candidate.map_name_box,
+            confidence=max(0.80, candidate.confidence),
+            source="opencv-client-edge-canvas",
+            map_name=self._read_map_name(image, candidate.map_name_box),
+            canvas_measured=True,
+        ), image.size)
+
     def _measure_inner_canvas(
         self, image: Image.Image, window_box: Box
     ) -> Optional[Box]:
@@ -955,6 +992,17 @@ class MinimapDetector:
             candidates.append((score, candidate_box, rectangularity))
 
         if not candidates:
+            client_edge_canvas = self._client_edge_canvas_fallback(image)
+            if client_edge_canvas is not None:
+                LOG.info(
+                    "MINIMAP opencv client-edge canvas | box=%s | size=%dx%d | "
+                    "confidence=%.3f",
+                    client_edge_canvas.canvas_box,
+                    client_edge_canvas.window_size[0],
+                    client_edge_canvas.window_size[1],
+                    client_edge_canvas.confidence,
+                )
+                return client_edge_canvas
             return self._held_or_fallback(image)
 
         # A partially detected outer border shares the real frame's top-left
@@ -977,6 +1025,17 @@ class MinimapDetector:
             if not contained:
                 outer.append((score, box, rectangularity))
         if not outer:
+            client_edge_canvas = self._client_edge_canvas_fallback(image)
+            if client_edge_canvas is not None:
+                LOG.info(
+                    "MINIMAP opencv client-edge canvas | box=%s | size=%dx%d | "
+                    "confidence=%.3f",
+                    client_edge_canvas.canvas_box,
+                    client_edge_canvas.window_size[0],
+                    client_edge_canvas.window_size[1],
+                    client_edge_canvas.confidence,
+                )
+                return client_edge_canvas
             return self._held_or_fallback(image)
         candidates = outer
 
@@ -1206,7 +1265,8 @@ def choose_stable_minimap_index(
 
     clusters: list[list[int]] = []
     for index, detection in enumerate(detections):
-        if detection.source != "opencv" or detection.confidence < 0.80:
+        if (not detection.source.startswith("opencv")
+                or detection.confidence < 0.80):
             continue
         width, height = detection.window_size
         for cluster in clusters:

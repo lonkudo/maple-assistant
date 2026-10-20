@@ -53,7 +53,7 @@ LICENSE_FILE = "license.json"
 ACTIVATION_SERVER_ENDPOINT = "https://211.149.169.194:8443"
 ACTIVATION_SERVER_PIN_FILE = "activation_server_pin.json"
 # The signed legacy document keeps an edition field for wire compatibility,
-# but TodoHelper now has one product edition.  Existing normal/NP documents
+# but MoonEclipse now has one product edition.  Existing normal/NP documents
 # remain valid; neither value changes available features.
 _LEGACY_EDITION_VALUES = {"normal", "np"}
 # A complete hardware fingerprint is stable while the assistant process is

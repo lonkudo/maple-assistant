@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    打包 TodoHelper 的最小发布文件夹。
+    打包 MoonEclipse 的最小发布文件夹。
 
 .DESCRIPTION
     只复制运行所需的文件（不含虚拟环境、日志、测试、work 数据、git 元数据）。
@@ -30,7 +30,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "版本号必须是 1.0.0 这样的三段数字（主.次.补丁）: $Version"
 }
 if (-not $OutDir) {
-    $OutDir = "release\TodoHelper"
+    $OutDir = "release\MoonEclipse"
 }
 $out = Join-Path $root $OutDir
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
@@ -98,7 +98,7 @@ On Error Resume Next
 shellApp.ShellExecute "powershell.exe", arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
-    MsgBox "TodoHelper could not start. Open assistant-launch-status.log in this folder.", 16, "TodoHelper"
+    MsgBox "MoonEclipse could not start. Open assistant-launch-status.log in this folder.", 16, "MoonEclipse"
 End If
 On Error GoTo 0
 
@@ -250,7 +250,7 @@ Write-Host "  3. 安装完成后双击 启动助手.bat 开始。" -ForegroundCo
 Write-Host ""
 
 if ($Zip) {
-    $zipPath = Join-Path $root "release\TodoHelper-$Version.zip"
+    $zipPath = Join-Path $root "release\MoonEclipse-$Version.zip"
     # 仅替换同版本的压缩包；历史发布包保留。
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue

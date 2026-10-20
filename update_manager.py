@@ -1,4 +1,4 @@
-"""Find and apply a newer TodoHelper package from safe nearby locations."""
+"""Find and apply a newer MoonEclipse package from safe nearby locations."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from versioning import read_version, version_key
 _SKIP_DIRECTORIES = {
     ".git", ".venv", "__pycache__", "work", "node_modules",
 }
-_PACKAGE_NAME = re.compile(r"(?:todohelper|maple.*assistant)", re.IGNORECASE)
-_FROZEN_ENTRY_NAMES = {"todohelper.exe", "mapleassistant.exe"}
+_PACKAGE_NAME = re.compile(r"(?:mooneclipse|todohelper|maple.*assistant)", re.IGNORECASE)
+_FROZEN_ENTRY_NAMES = {"mooneclipse.exe", "todohelper.exe", "mapleassistant.exe"}
 _CONFIG_IMPORT_REPLACE_ATTEMPTS = 15
 _CONFIG_IMPORT_REPLACE_RETRY_SECONDS = 0.20
 
@@ -205,7 +205,7 @@ def find_newer_desktop_update(
             str(root) for root in (desktop_search_roots + nearby_roots)
         )
         raise UpdateError(
-            f"未找到比 v{current_version} 更新的 TodoHelper 安装包。"
+            f"未找到比 v{current_version} 更新的 MoonEclipse 安装包。"
             f"已检查: {roots_text or '桌面和安装目录不存在'}"
         )
     return max(
@@ -228,7 +228,7 @@ def _extract_zip_source(package: DesktopUpdate, staging: Path) -> Path:
                 None,
             )
         if entry is None:
-            raise UpdateError("更新压缩包缺少 TodoHelper 程序入口。")
+            raise UpdateError("更新压缩包缺少 MoonEclipse 程序入口。")
         prefix = PurePosixPath(entry).parent
         for item in archive.infolist():
             name = PurePosixPath(item.filename.replace("\\", "/"))
@@ -291,7 +291,7 @@ def apply_desktop_update(
         else "source" if (destination / "assistant.py").is_file() else None
     )
     if installed_format is None:
-        raise UpdateError("当前运行目录无 TodoHelper 程序入口，无法安全更新。")
+        raise UpdateError("当前运行目录无 MoonEclipse 程序入口，无法安全更新。")
     if installed_format != package.package_format:
         raise UpdateError("更新包类型与当前安装不一致；EXE 和普通包请分别更新。")
     staging = destination / f".todohelper-update-{os.getpid()}"
@@ -544,7 +544,7 @@ def schedule_package_update(package: DesktopUpdate, install_root: Path) -> Path:
     """Apply a same-format ZIP only after the running app has exited."""
 
     if package.kind != "zip":
-        raise UpdateError("请使用 TodoHelper 发布 ZIP 进行自动更新。")
+        raise UpdateError("请使用 MoonEclipse 发布 ZIP 进行自动更新。")
     root = Path(install_root).resolve()
     return _run_persistent_helper(
         ["-Mode", "Update", "-TargetPid", str(os.getpid()),

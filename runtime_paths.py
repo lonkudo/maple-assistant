@@ -18,7 +18,7 @@ def package_format(root: Path) -> str:
     """Return the update format that can safely replace this installation."""
 
     root = Path(root)
-    if any((root / name).is_file() for name in ("TodoHelper.exe", "MapleAssistant.exe")):
+    if any((root / name).is_file() for name in ("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe")):
         return "frozen"
     return "source"
 

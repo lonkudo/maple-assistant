@@ -20,6 +20,7 @@ from minimap_detector import hud_scale_for
 from runtime_paths import application_root
 from auto_lie_secret import CredentialRedactionFilter, get_server_secret
 from async_log_writer import AsyncBatchLogWriter
+from crash_reporter import record_exception
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -74,6 +75,9 @@ MINIMAP_FALLBACK_REGION = (0, MINIMAP_REGION_TOP, 400, 320)
 STATUS_CAPTURE_WIDTH = 538
 STATUS_CAPTURE_HEIGHT = 40
 STATUS_CAPTURE_CENTER_OFFSET = 37  # info-bar centre, ref px right of centre
+# Keep the original mutex identity after the product rename.  An in-place
+# update must not let an already-running TodoHelper instance and its
+# MoonEclipse replacement automate the same game window simultaneously.
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\TodoHelper.Singleton.v1"
 # Status-bar widths are FIXED PIXEL values measured on the real client:
 # with the updated UI every bar (HP/MP/EXP) is ~130 px wide at the 1080x768
@@ -140,7 +144,7 @@ def _acquire_single_instance_mutex(
         # Treat access denied as proof that the singleton already exists.
         if error_code == 5:
             return None
-        raise OSError(error_code, "could not create TodoHelper singleton mutex")
+        raise OSError(error_code, "could not create MoonEclipse singleton mutex")
     if error_code == 183:  # ERROR_ALREADY_EXISTS
         kernel32.CloseHandle(handle)
         return None
@@ -167,8 +171,8 @@ def _show_already_running_notice() -> None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.MessageBoxW(
             None,
-            "TodoHelper 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
-            "TodoHelper",
+            "MoonEclipse 已经在运行。\n\n请在任务栏中找到现有窗口；如需重启，请先关闭它。",
+            "MoonEclipse",
             0x00000040,  # MB_ICONINFORMATION
         )
     except Exception:
@@ -305,12 +309,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def _clear_previous_log_files() -> None:
-    """Startup: wipe every log file from previous runs.
+    """Startup: wipe routine logs from previous runs.
 
     Runs after the single-instance check so a second instance never clears
     a live session's logs.  work/assistant.log, yolo logs, demo console logs,
     the dedicated auto_lie.log and target_tracker logs all start fresh each launch, which
-    keeps any pasted diagnostic output attributable to the current run.
+    keeps any pasted diagnostic output attributable to the current run.  The
+    exception-only crash report is deliberately preserved: it is the evidence
+    available after the dashboard has already disappeared.
     """
 
     root = Path(__file__).resolve().parent
@@ -329,6 +335,10 @@ def _clear_previous_log_files() -> None:
     for base in bases:
         try:
             for path in base.rglob("*.log"):
+                if path.name.casefold() in {
+                    "crash_report.log", "ui_hang_trace.log",
+                }:
+                    continue
                 try:
                     path.unlink()
                     removed += 1
@@ -441,6 +451,12 @@ def main() -> int:
     ui_poll_log_writer.start()
 
     def _log_uncaught_thread_error(args: threading.ExceptHookArgs) -> None:
+        record_exception(
+            f"uncaught worker exception: {getattr(args.thread, 'name', 'unknown')}",
+            args.exc_type,
+            args.exc_value,
+            args.exc_traceback,
+        )
         logging.critical(
             "uncaught exception in worker %s",
             getattr(args.thread, "name", "unknown"),
@@ -448,6 +464,20 @@ def main() -> int:
         )
 
     threading.excepthook = _log_uncaught_thread_error
+
+    previous_sys_excepthook = sys.excepthook
+
+    def _log_uncaught_main_error(
+        exc_type: type[BaseException],
+        exc_value: BaseException,
+        exc_traceback: object,
+    ) -> None:
+        record_exception(
+            "uncaught main-thread exception", exc_type, exc_value, exc_traceback,
+        )
+        previous_sys_excepthook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = _log_uncaught_main_error
 
     # Imports are delayed so `--help` works even before dependencies are installed.
     import numpy as np
@@ -2000,8 +2030,9 @@ def main() -> int:
         from the validated licensing heartbeat and remains only in this process's memory.
         """
 
-        from auto_lie_backend import host_ports, select_auto_lie_ws_endpoints
         from api_lie_video import VideoDrillWorker
+
+        from auto_lie_backend import host_ports, select_auto_lie_ws_endpoints
 
         # One randomly chosen host, with all of that host's ports handed over:
         # the drill's own probe then picks the best instance of that host.
@@ -2774,7 +2805,7 @@ def main() -> int:
     supervisor.start()
 
     logging.info(
-        "TodoHelper %s starting from %s",
+        "MoonEclipse %s starting from %s",
         version_label(),
         Path(__file__).resolve().parent,
     )
@@ -2784,7 +2815,7 @@ def main() -> int:
     )
     try:
         if ui_worker is not None:
-            logging.info("opening TodoHelper Debug UI")
+            logging.info("opening MoonEclipse Debug UI")
             # Tk must run on Python's main thread on Windows. All automation
             # work remains in its own independent workers.
             ui_worker.run()

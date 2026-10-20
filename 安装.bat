@@ -12,12 +12,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 
 exit /b
 
 :elevated
-title TodoHelper Installer
+title MoonEclipse Installer
 cd /d "%~dp0"
 
 echo.
 echo ============================================
-echo   TodoHelper Installer
+echo   MoonEclipse Installer
 echo ============================================
 echo.
 echo   One-click setup (YOLO monster detection temporarily disabled).

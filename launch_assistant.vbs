@@ -5,9 +5,9 @@ Set files = CreateObject("Scripting.FileSystemObject")
 root = files.GetParentFolderName(WScript.ScriptFullName)
 pythonwPath = root & "\.venv\Scripts\pythonw.exe"
 ' Launch through a renamed interpreter so the running process is
-' "TodoHelper.exe" (and the game sees that name) instead of "pythonw.exe".
+' "MoonEclipse.exe" (and the game sees that name) instead of "pythonw.exe".
 ' The copy is created on first use and self-heals after an overlay update.
-exePath = root & "\.venv\Scripts\TodoHelper.exe"
+exePath = root & "\.venv\Scripts\MoonEclipse.exe"
 On Error Resume Next
 If Not files.FileExists(exePath) Then files.CopyFile pythonwPath, exePath, True
 If Not files.FileExists(exePath) Then exePath = pythonwPath
@@ -32,7 +32,7 @@ On Error Resume Next
 shellApp.ShellExecute exePath, arguments, root, "runas", 0
 If Err.Number <> 0 Then
     WriteStatus "Windows could not start the assistant: " & Err.Description
-    MsgBox "TodoHelper could not start. Open assistant-launch-status.log in this folder.", 16, "TodoHelper"
+    MsgBox "MoonEclipse could not start. Open assistant-launch-status.log in this folder.", 16, "MoonEclipse"
 End If
 On Error GoTo 0
 
