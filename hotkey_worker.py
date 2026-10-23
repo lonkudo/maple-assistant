@@ -36,6 +36,20 @@ VK_CONTROL = 0x11
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
 
+# Physical virtual keys accepted as a skill-point release binding.  This is
+# deliberately the same practical vocabulary as the normal attack-key picker
+# (``status_worker.BINDABLE_KEYS``), without importing it here: status_worker
+# imports this module for the self-input stamp, so doing so would create a
+# circular import.  Keys which are reserved for movement (Alt/arrows) are not
+# included.
+_SKILL_CAPTURE_KEYS_BY_VK = {
+    0x10: "shift", 0x11: "ctrl", 0x20: "space",
+    0x21: "pageup", 0x22: "pagedown", 0x23: "end", 0x24: "home",
+    0x2D: "insert", 0x2E: "delete", 0xBF: "slash",
+    **{ord(key): key.lower() for key in "QWERTYUIOPASDFGHJKLZXCVBNM"},
+    **{ord(key): key for key in "123456789"},
+}
+
 # dwExtraInfo stamp placed on every key event Maple Assistant injects itself
 # (status_worker.WindowKeySender._send_scan_code). The hook ignores only these
 # self-marked events plus lower-integrity injection, so keystrokes injected by
@@ -150,10 +164,12 @@ def ime_status() -> str:
 KEY_VK = {
     "a": 0x41,
     "d": 0x44,
+    "e": 0x45,
     "f": 0x46,
     "q": 0x51,
     "w": 0x57,
     "z": 0x5A,
+    "s": 0x53,
     "0": 0x30,
     "1": 0x31,
     "2": 0x32,
@@ -240,7 +256,23 @@ class HotkeyWorker(threading.Thread):
         self._suppressed_action = ""
         self._suppressed_reason = ""
         self._suppressed_log_at = float("-inf")
+        # Ctrl+E arms this short lived attack-key capture.  It is handled by
+        # the hook before ordinary binding filtering, so the requested key
+        # never leaks into Maple or depends on a registered hotkey.
+        self._skill_key_capture_armed = False
+        # Ctrl+E itself naturally arrives with Ctrl held.  Do not mistake
+        # that already-held modifier for the requested key; after its physical
+        # key-up, a fresh Ctrl press is a legitimate ``ctrl`` binding.
+        self._skill_key_capture_wait_for_ctrl_release = False
         self._load_config()
+
+    def arm_skill_key_capture(self) -> None:
+        self._skill_key_capture_armed = True
+        self._skill_key_capture_wait_for_ctrl_release = bool(self._ctrl_down)
+
+    def cancel_skill_key_capture(self) -> None:
+        self._skill_key_capture_armed = False
+        self._skill_key_capture_wait_for_ctrl_release = False
 
     def set_patrol_running(self, running: bool) -> None:
         """Disable all bindings except ``toggle_patrol`` while patrol runs."""
@@ -343,6 +375,9 @@ class HotkeyWorker(threading.Thread):
     _COOLDOWN_EXEMPT_PREFIXES = (
         "record:",
         "record_jump_point",
+        "record_split_point",
+        "record_skill_point",
+        "record_skill_key:",
         "select_next_layer",
         "select_next_patrol_start",
         "add_highest_layer",
@@ -588,6 +623,11 @@ class HotkeyWorker(threading.Thread):
             is_up = message in (WM_KEYUP, WM_SYSKEYUP)
             if vk in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL):
                 if is_down:
+                    if (self._skill_key_capture_armed
+                            and not self._skill_key_capture_wait_for_ctrl_release):
+                        self._skill_key_capture_armed = False
+                        self._queue_action("record_skill_key:ctrl")
+                        return 1
                     self._ctrl_down = True
                     # A real Ctrl-down after Ctrl+` is the only event that
                     # clears the stale-modifier safety gate. The assistant's
@@ -603,6 +643,8 @@ class HotkeyWorker(threading.Thread):
                         self._configuration_requires_fresh_ctrl = False
                 elif is_up:
                     self._ctrl_down = False
+                    if self._skill_key_capture_wait_for_ctrl_release:
+                        self._skill_key_capture_wait_for_ctrl_release = False
                     if self._configuration_wait_for_ctrl_release:
                         self._configuration_wait_for_ctrl_release = False
                     # The hardware key-up normally reaches the game too; one
@@ -615,6 +657,19 @@ class HotkeyWorker(threading.Thread):
                             LOG.debug("final physical Ctrl release cleanup failed", exc_info=True)
                         self._ctrl_repeat_active = False
                 return user32.CallNextHookEx(self._hook, code, message, l_param)
+
+            if self._skill_key_capture_armed and is_down:
+                skill_key = _SKILL_CAPTURE_KEYS_BY_VK.get(vk)
+                if skill_key is not None:
+                    self._skill_key_capture_armed = False
+                    self._skill_key_capture_wait_for_ctrl_release = False
+                    self._queue_action(f"record_skill_key:{skill_key}")
+                    return 1
+                if vk == 0x1B:  # Esc cancels a partially entered Ctrl+E.
+                    self._skill_key_capture_armed = False
+                    self._skill_key_capture_wait_for_ctrl_release = False
+                    self._queue_action("record_skill_key:cancel")
+                    return 1
 
             if vk not in active_vks:
                 # Claimed natively (or unbound): leave it to the native

@@ -37,7 +37,8 @@ from game_chat import send_game_chat_message
 from countdown_worker import play_mp3
 from licensing import (
     LicenseStatus, activate as activate_license, activate_via_server,
-    revoke_license, set_device_memo_via_server, validate_via_server, verify_license,
+    revoke_license, set_device_memo_via_server, unbind_device_via_server,
+    validate_via_server, verify_license,
 )
 from lie_accounting import LieAccountingWorker
 from reconnect_worker import (
@@ -164,16 +165,18 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1076
+_INITIAL_WINDOW_WIDTH = 1160
 _INITIAL_WINDOW_HEIGHT = 560
-_LEFT_COLUMN_WIDTH = 500
-_RIGHT_COLUMN_WIDTH = 540
+_LEFT_COLUMN_WIDTH = 520
+_RIGHT_COLUMN_WIDTH = 580
 _LAYER_AXIS_WIDTH = 430
 _LAYER_AXIS_HEIGHT = 38
 _LAYER_AXIS_LEFT = 8
 _LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH - 8
 _LAYER_AXIS_Y = 28
-# Both columns are FIXED at 500px (500 + 500 + 12px gap + 24px padding).
+# The columns are fixed at 520px and 580px respectively.  The wider initial
+# geometry leaves room for the expanded split-patrol and skill-point rows on
+# the first launch instead of relying on a prior saved window size.
 # The default height is deliberately compact; users can still enlarge it and
 # their saved window size is never overwritten.
 
@@ -315,7 +318,7 @@ def _clamp_window_geometry(
     geometry: str,
     screen_width: int = 1920,
     screen_height: int = 1080,
-    min_width: int = 980,
+    min_width: int = _INITIAL_WINDOW_WIDTH,
     min_height: int = 560,
     max_height: Optional[int] = None,
 ) -> str:
@@ -346,7 +349,7 @@ def _clamp_window_geometry(
 # instead of restoring a mismatched size (e.g. 1275x904 / 1620x1050 /
 # 1635x1272 from an older layout, a remembered manual resize, or a
 # DPI-aware run that stored physical-pixel sizes).
-_GEOMETRY_FORMAT = 6
+_GEOMETRY_FORMAT = 7
 
 
 def _load_window_geometry(default_geometry: str) -> str:
@@ -1245,6 +1248,11 @@ class UiWorker(threading.Thread):
             queue.Queue()
         )
         self._device_memo_results: "queue.Queue[tuple[str, LicenseStatus]]" = queue.Queue()
+        # Self-unbind is a round-trip operation.  The worker owns the pinned
+        # request; Tk only owns the resulting prompt and immediate local lock.
+        self._device_unbind_results: "queue.Queue[LicenseStatus]" = queue.Queue(maxsize=1)
+        self._device_unbind_in_flight = False
+        self._self_unbound_this_session = False
         self._license_heartbeat_started = False
         self._license_heartbeat_generation = 0
         self._license_heartbeat_consecutive_failures = 0
@@ -1413,7 +1421,7 @@ class UiWorker(threading.Thread):
             # 按上次保存的几何恢复（可移动、可调整），默认不再固定左上角。
             # The size constants are LOGICAL pixels: on scaled displays
             # (125%/150%) Windows bitmap-scales the DPI-unaware window, so a
-            # 1036x680 logical window physically renders 1295x850 / 1554x1020
+            # 1160x560 logical window physically scales with every other app
             # - the width scales with every other app and the height stays the
             # natural content height (no clipping, no extra space).
             restored = _load_window_geometry(
@@ -1428,7 +1436,7 @@ class UiWorker(threading.Thread):
             # buttons (Tk cannot add widgets to the OS caption bar).  Native
             # resize borders and the taskbar entry are preserved.  The
             # in-window caption is part of the Tk client, so geometry is
-            # whole-window (the default 1036 width includes the caption row).
+            # whole-window (the default width includes the caption row).
             caption_installed = self._install_custom_caption(root, tk)
             root.geometry(clamped)
             root.minsize(
@@ -1507,6 +1515,9 @@ class UiWorker(threading.Thread):
             self._license_memo_label = ttk.Label(license_bar, anchor="w")
             self._license_memo_label.pack(side="left")
             self._license_memo_label.bind("<Button-1>", self._edit_device_memo)
+            self._license_unbind_label = ttk.Label(license_bar, anchor="w")
+            self._license_unbind_label.pack(side="left")
+            self._license_unbind_label.bind("<Button-1>", self._request_device_unbind)
             # Usage has its own row. It retains the day-by-day breakdown while
             # making the current finite/unsettled entitlement easy to read.
             self._license_lie_stats = ttk.Frame(container)
@@ -1910,18 +1921,19 @@ class UiWorker(threading.Thread):
             fixed_key_row = ttk.Frame(fixed_panel)
             self._fixed_key_row = fixed_key_row
             fixed_key_row.pack(fill="x", pady=(4, 0))
-            # 跳打 is a 站桩攻击 child option. Keep it directly before 按键
-            # on this same row so the mode's attack control is one unit.
-            self._stationary_jump_enabled_var = tk.BooleanVar(value=False)
-            stationary_jump_button = ttk.Checkbutton(
+            # 跳打 is shared by patrol and stand-still attacks.  Keep it next
+            # to the attack key because it changes that key's atomic delivery
+            # sequence, not patrol movement itself.
+            self._jump_attack_enabled_var = tk.BooleanVar(value=False)
+            jump_attack_button = ttk.Checkbutton(
                 fixed_key_row, text="跳打",
-                variable=self._stationary_jump_enabled_var,
+                variable=self._jump_attack_enabled_var,
                 command=self._fixed_on_change,
             )
-            self._stationary_jump_button = stationary_jump_button
+            self._jump_attack_button = jump_attack_button
             # This slot always exists.  Toggling attack mode only changes
             # enabled state, never the row's geometry.
-            stationary_jump_button.pack(side="left", padx=(0, 4))
+            jump_attack_button.pack(side="left", padx=(0, 4))
             fixed_key_label = ttk.Label(fixed_key_row, text="攻击键:")
             self._fixed_key_label = fixed_key_label
             fixed_key_label.pack(
@@ -3909,6 +3921,7 @@ class UiWorker(threading.Thread):
             # work or configuration I/O.
             self._drain_license_heartbeat_results,
             self._drain_device_memo_results,
+            self._drain_device_unbind_results,
             self._drain_lie_accounting_results,
             self._drain_channel_update_events,
             self._drain_other_player_stop_events,
@@ -4260,6 +4273,58 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text=f"备注已保存到本地；服务器同步失败：{status.message}")
         LOG.warning("device memo synchronization rejected: %s", status.code)
 
+    def _drain_device_unbind_results(self) -> None:
+        """Complete a customer self-unbind on Tk after its background request."""
+
+        latest: Optional[LicenseStatus] = None
+        while True:
+            try:
+                latest = self._device_unbind_results.get_nowait()
+            except queue.Empty:
+                break
+        if latest is None:
+            return
+        self._device_unbind_in_flight = False
+        root = getattr(self, "_root", None)
+        if latest.valid and latest.code == "unbound":
+            # Copy first: the newly unbound code is what the customer needs on
+            # the replacement computer.  The local signed document is then
+            # removed so no future launch can briefly re-enable this PC.
+            self._copy_activation_code()
+            clear_server_secret()
+            self._revoke_saved_license()
+            self._self_unbound_this_session = True
+            old = self._license_status
+            self._license_status = LicenseStatus(
+                False, "unbound", "授权已解绑，请在新设备激活授权。",
+                equipment_id=old.equipment_id,
+            )
+            self._license_online_validation_pending = False
+            self._lock_licensed_functions()
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="解绑成功，授权码已复制，本机功能已锁定。")
+            try:
+                from tkinter import messagebox
+                if root is not None:
+                    messagebox.showinfo(
+                        "解绑成功",
+                        "解绑成功，授权码已复制。\n\n请在新设备激活授权；本机功能已锁定。",
+                        parent=root,
+                    )
+            except Exception:
+                LOG.debug("device self-unbind success dialog could not open", exc_info=True)
+            LOG.info("device self-unbind accepted; local automation locked")
+            return
+        if hasattr(self, "_control_status"):
+            self._control_status.configure(text=f"解绑失败：{latest.message}")
+        try:
+            from tkinter import messagebox
+            if root is not None:
+                messagebox.showerror("解绑失败", latest.message, parent=root)
+        except Exception:
+            LOG.debug("device self-unbind failure dialog could not open", exc_info=True)
+        LOG.warning("device self-unbind rejected: %s", latest.code)
+
     def _drain_lie_accounting_results(self) -> None:
         """Apply immediate server accounting after a completed lie pass.
 
@@ -4351,20 +4416,36 @@ class UiWorker(threading.Thread):
         device_label = getattr(self, "_license_device_label", None)
         code_label = getattr(self, "_license_activation_label", None)
         memo_label = getattr(self, "_license_memo_label", None)
+        unbind_label = getattr(self, "_license_unbind_label", None)
         code, memo = self._license_display_values()
+        identity_active = bool(status.valid) and not bool(
+            getattr(self, "_self_unbound_this_session", False)
+        )
         if device_label is not None:
             device_text = (
                 f" · 设备：{status.equipment_id}（左键复制）"
                 if status.equipment_id else " · 设备：等待服务器返回"
             )
-            device_label.configure(text=device_text, foreground="#17803d" if status.equipment_id else "#202020")
+            device_label.configure(
+                text=device_text,
+                foreground="#17803d" if identity_active and status.equipment_id else "#202020",
+            )
         if code_label is not None:
             masked = code[-5:] if code else "未设置"
-            code_label.configure(text=f" · 授权码：{masked}（左键复制）", foreground="#17803d" if code else "#202020")
+            code_label.configure(
+                text=f" · 授权码：{masked}（左键复制）",
+                foreground="#17803d" if identity_active and code else "#202020",
+            )
         if memo_label is not None:
             memo_label.configure(
                 text=f" · 备注：{memo or '未设置'}（左键设置）",
-                foreground="#17803d" if memo else "#202020",
+                foreground="#17803d" if identity_active and memo else "#202020",
+            )
+        if unbind_label is not None:
+            already_unbound = bool(getattr(self, "_self_unbound_this_session", False))
+            unbind_label.configure(
+                text=" · 已解绑" if already_unbound else " · 解绑",
+                foreground="#777777" if already_unbound else "#b42318",
             )
 
     def _render_memory_usage(self, text: str) -> None:
@@ -4503,6 +4584,58 @@ class UiWorker(threading.Thread):
                 LOG.warning("device memo result could not be queued", exc_info=True)
 
         threading.Thread(target=_sync, name="device-memo-sync", daemon=True).start()
+
+    def _request_device_unbind(self, _event: Any = None) -> None:
+        """Ask the server to detach this count-mode code from this equipment."""
+
+        if getattr(self, "_self_unbound_this_session", False):
+            return
+        if getattr(self, "_device_unbind_in_flight", False):
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="正在请求解绑，请稍候。")
+            return
+        code, _memo = self._license_display_values()
+        if not code:
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="本机没有可用的授权码，无法解绑。")
+            return
+        root = getattr(self, "_root", None)
+        try:
+            from tkinter import messagebox
+            approved = bool(messagebox.askyesno(
+                "解绑授权",
+                "解绑后授权码会复制到剪贴板，本机所有功能会立即锁定。\n\n"
+                "每日最多可解绑2次。是否继续？",
+                parent=root,
+            ))
+        except Exception:
+            LOG.exception("device self-unbind confirmation dialog could not open")
+            return
+        if not approved:
+            return
+        self._device_unbind_in_flight = True
+        if hasattr(self, "_control_status"):
+            self._control_status.configure(text="正在请求解绑…")
+
+        def _unbind() -> None:
+            status = unbind_device_via_server(code)
+            try:
+                self._device_unbind_results.put_nowait(status)
+            except queue.Full:
+                # There can be only one in-flight request.  If an unexpected
+                # duplicate result appears, retain the newest verdict.
+                try:
+                    self._device_unbind_results.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._device_unbind_results.put_nowait(status)
+                except queue.Full:
+                    LOG.warning("device self-unbind result could not be queued")
+            except Exception:
+                LOG.warning("device self-unbind result could not be queued", exc_info=True)
+
+        threading.Thread(target=_unbind, name="device-self-unbind", daemon=True).start()
 
     def _render_lie_usage(self, status: Optional[LicenseStatus]) -> None:
         """Render entitlement plus today/yesterday outcome counters."""
@@ -4946,13 +5079,16 @@ class UiWorker(threading.Thread):
                 stationary_setter = getattr(mover, "set_stationary_attack_enabled", None)
                 if callable(stationary_setter):
                     stationary_setter(False)
+                jump_setter = getattr(mover, "set_jump_attack_enabled", None)
+                if callable(jump_setter):
+                    jump_setter(False)
                 pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
                 if callable(pickup_setter):
                     pickup_setter(False, 0.0, 0.0)
             except Exception:
                 LOG.debug("license lock could disable stationary actions", exc_info=True)
         for variable_name in (
-            "_stationary_jump_enabled_var", "_stationary_pickup_enabled_var",
+            "_jump_attack_enabled_var", "_stationary_pickup_enabled_var",
             "_small_step_enabled_var",
         ):
             variable = getattr(self, variable_name, None)
@@ -5244,6 +5380,23 @@ class UiWorker(threading.Thread):
                 elif action.startswith("record_jump_point:"):
                     direction = action.partition(":")[2]
                     self._play_action_sound(self._record_jump_point(direction))
+                elif action == "record_split_point":
+                    self._play_action_sound(self._record_split_point())
+                elif action == "record_skill_point":
+                    arm = getattr(self.hotkey_worker, "arm_skill_key_capture", None)
+                    if callable(arm) and self._prepare_skill_point_recording():
+                        arm()
+                        self._control_status.configure(
+                            text="技能点：请按一个可绑定为攻击键的按键作为释放键（Esc 取消）。"
+                        )
+                    else:
+                        self._play_action_sound(False)
+                elif action.startswith("record_skill_key:"):
+                    key = action.partition(":")[2]
+                    if key == "cancel":
+                        self._control_status.configure(text="技能点录制已取消。")
+                    else:
+                        self._play_action_sound(self._record_skill_point(key))
                 elif action == "select_next_layer":
                     self._play_action_sound(self._select_next_layer())
                 elif action == "select_next_patrol_start":
@@ -7779,8 +7932,55 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         return True
 
+    def _record_split_point(self) -> bool:
+        """Record a global vertical split boundary at the current marker."""
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法添加分区线，请先停止巡逻。")
+            return False
+        snapshot = self._capture_snapshot_for_recording()
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(text="无法添加分区线：未检测到黄色菱形标记。")
+            return False
+        try:
+            point = self.patrol_controller.record_split_point(
+                snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._control_status.configure(text=f"无法添加分区线: {exc}")
+            return False
+        self._control_status.configure(
+            text=f"已添加分区线 X={point.x:.6f}；波浪线贯穿楼层1至最高层。"
+        )
+        self._refresh_patrol_controls()
+        return True
+
+    def _prepare_skill_point_recording(self) -> bool:
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法录制技能点，请先停止巡逻。")
+            return False
+        return True
+
+    def _record_skill_point(self, key: str) -> bool:
+        snapshot = self._capture_snapshot_for_recording()
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(text="无法录制技能点：未检测到黄色菱形标记。")
+            return False
+        try:
+            point = self.patrol_controller.record_skill_point(
+                snapshot.player_x, snapshot.player_y, key, snapshot.coordinate_layout,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._control_status.configure(text=f"无法录制技能点: {exc}")
+            return False
+        self._control_status.configure(
+            text=f"已录制 {point.layer} 技能点 {str(key).upper()}：X={point.x:.6f}。"
+        )
+        self._refresh_patrol_controls()
+        return True
+
     def _delete_recorded_axis_point(
-        self, layer_name: str, point_kind: str, jump_index: Optional[int] = None
+        self, layer_name: str, point_kind: str, point_x: float,
+        point_index: Optional[int] = None,
     ) -> None:
         """Delete a point chosen by a double-click in the layer X-axis."""
 
@@ -7793,35 +7993,23 @@ class UiWorker(threading.Thread):
         # remain as a stale floating hint.
         self._hide_layer_axis_hint()
         try:
-            if point_kind == "jump_point":
-                point = self.patrol_controller.snapshot().layers.get(layer_name, {}).get(
-                    "jump_points", []
-                )
-                direction = (
-                    str(point[int(jump_index)].get("direction", "")).casefold()
-                    if isinstance(point, list) and jump_index is not None
-                    and 0 <= int(jump_index) < len(point) and isinstance(point[int(jump_index)], dict)
-                    else ""
-                )
-                removed = self.patrol_controller.delete_jump_point(
-                    layer_name, int(jump_index) if jump_index is not None else -1
-                )
-                label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
-            else:
-                removed = self.patrol_controller.clear_endpoint(layer_name, point_kind)
+            removed = self.patrol_controller.delete_axis_point(
+                layer_name, point_kind, point_x, point_index,
+            )
+            if point_kind not in ("jump_point", "skill_point"):
                 self._unlocked_points.discard((layer_name, point_kind))
-                label = {
-                    "left_most_pos": "最左",
-                    "rope_pos": "绳索",
-                    "right_most_pos": "最右",
-                }.get(point_kind, "录制点")
+            label = {
+                "left_most_pos": "最左", "rope_pos": "绳索",
+                "right_most_pos": "最右", "jump_point": "跳点",
+                "skill_point": "技能点",
+            }.get(point_kind, "录制点")
         except (OSError, ValueError) as exc:
             LOG.warning("axis point delete failed", exc_info=True)
             self._control_status.configure(text=f"无法删除录制点: {exc}")
             return
         if removed:
             band_note = ""
-            if point_kind != "jump_point":
+            if point_kind not in ("jump_point", "skill_point"):
                 if self.patrol_controller.layer_has_band(layer_name):
                     band_note = " 已重新计算该层图层带。"
                 else:
@@ -7832,8 +8020,8 @@ class UiWorker(threading.Thread):
             self._control_status.configure(
                 text=f"已删除 {self._patrol_display_name(layer_name)} {label}。{band_note}"
             )
-            LOG.info("layer axis point deleted layer=%s kind=%s index=%s",
-                     layer_name, point_kind, jump_index)
+            LOG.info("layer axis point deleted layer=%s kind=%s x=%.6f index=%s",
+                     layer_name, point_kind, point_x, point_index)
             self._refresh_patrol_controls()
 
     def _layer_axis_menu(self, event: Any, layer_name: str) -> None:
@@ -7859,14 +8047,51 @@ class UiWorker(threading.Thread):
             unavailable_rope = kind == "rope_pos" and layer_name == final_name
             state = "disabled" if already_recorded or unavailable_rope else "normal"
             menu.add_command(label=label, command=command, state=state)
+        menu.add_separator()
+        repeat_menu = self._tk.Menu(menu, tearoff=False)
+        current_layer = self.patrol_controller.snapshot().layers.get(layer_name, {})
+        current_times = max(1, int(current_layer.get("patrol_times", 1))) if isinstance(current_layer, dict) else 1
+        for times in range(1, 6):
+            prefix = "✓ " if times == current_times else ""
+            repeat_menu.add_command(
+                label=f"{prefix}巡逻 {times} 次",
+                command=lambda times=times, layer_name=layer_name: self._set_layer_patrol_times(layer_name, times),
+            )
+        menu.add_cascade(label="本层巡逻次数", menu=repeat_menu)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
+    def _set_layer_patrol_times(self, layer_name: str, times: int) -> None:
+        try:
+            self.patrol_controller.set_layer_patrol_times(layer_name, times)
+        except (OSError, TypeError, ValueError) as exc:
+            self._control_status.configure(text=f"无法设置巡逻次数: {exc}")
+            return
+        self._control_status.configure(
+            text=f"{self._patrol_display_name(layer_name)} 将巡逻 {times} 次后再进入下一层/分区。"
+        )
+        self._refresh_patrol_controls()
+
     @staticmethod
     def _layer_axis_point_text(label: str, point: Any) -> str:
         return f"{label} ({float(point['x']):.4f}, {float(point['y']):.4f})"
+
+    @staticmethod
+    def _skill_key_axis_label(key: Any) -> str:
+        """Return the compact, two-character label for a skill-point key."""
+
+        normalized = str(key or "").strip().casefold()
+        labels = {
+            "ctrl": "CT", "shift": "SH", "space": "SP",
+            "delete": "DL", "end": "ED", "pagedown": "PD",
+            "pageup": "PU", "home": "HM", "insert": "IN",
+            "slash": "/",
+        }
+        if normalized in labels:
+            return labels[normalized]
+        return normalized.upper()[:2] or "?"
 
     def _hide_layer_axis_hint(self, _canvas: Any = None) -> None:
         """Destroy the out-of-canvas layer-axis coordinate popup safely."""
@@ -7913,7 +8138,9 @@ class UiWorker(threading.Thread):
             self._hide_layer_axis_hint()
             LOG.debug("layer-axis hover hint unavailable", exc_info=True)
 
-    def _draw_layer_axis(self, layer_name: str, layer: Any) -> None:
+    def _draw_layer_axis(
+        self, layer_name: str, layer: Any, split_points: tuple[dict[str, Any], ...] = (),
+    ) -> None:
         """Draw the layer axis with the same marker grammar as the blinker."""
 
         canvas = self._layer_axis_canvases.get(layer_name)
@@ -7924,22 +8151,46 @@ class UiWorker(threading.Thread):
         canvas.create_line(left, axis_y, right, axis_y, fill="#6b6b6b", width=1)
         if not isinstance(layer, dict):
             return
+        # A split is global to the map rather than an individual floor.  Draw
+        # the same short wave on every layer row: stacked rows therefore form
+        # one visibly continuous wave from layer1 through the final layer.
+        for split in split_points:
+            try:
+                split_x = max(0.0, min(1.0, float(split["x"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            center = left + round((right - left) * split_x)
+            wave: list[float] = []
+            for y in range(1, _LAYER_AXIS_HEIGHT + 2, 2):
+                offset = 3 if ((y // 3) % 2 == 0) else -3
+                wave.extend((center + offset, y))
+            canvas.create_line(*wave, fill="#8b5a2b", width=2, smooth=True)
         entries: list[tuple[str, Any, str, Optional[int]]] = []
-        for kind, label in (
+        sources = [layer]
+        parts = layer.get("part_points")
+        if isinstance(parts, dict):
+            sources = [part for part in parts.values() if isinstance(part, dict)]
+        for source in sources:
+            for kind, label in (
             ("left_most_pos", "最左"),
             ("rope_pos", "绳索"),
             ("right_most_pos", "最右"),
-        ):
-            point = layer.get(kind)
-            if isinstance(point, dict) and "x" in point and "y" in point:
-                entries.append((kind, point, label, None))
-        jump_points = layer.get("jump_points", [])
-        if isinstance(jump_points, list):
-            for index, point in enumerate(jump_points):
+            ):
+                point = source.get(kind)
                 if isinstance(point, dict) and "x" in point and "y" in point:
-                    direction = str(point.get("direction", "")).casefold()
-                    label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
-                    entries.append(("jump_point", point, label, index))
+                    entries.append((kind, point, label, None))
+            jump_points = source.get("jump_points", [])
+            if isinstance(jump_points, list):
+                for index, point in enumerate(jump_points):
+                    if isinstance(point, dict) and "x" in point and "y" in point:
+                        direction = str(point.get("direction", "")).casefold()
+                        label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
+                        entries.append(("jump_point", point, label, index))
+            skill_points = source.get("skill_points", [])
+            if isinstance(skill_points, list):
+                for index, point in enumerate(skill_points):
+                    if isinstance(point, dict) and "x" in point and "y" in point:
+                        entries.append(("skill_point", point, f"技能{point.get('key', '?')}", index))
         def _axis_x(entry: tuple[str, Any, str, Optional[int]]) -> float:
             try:
                 return float(entry[1].get("x", 0.0))
@@ -7957,6 +8208,7 @@ class UiWorker(threading.Thread):
             "right_most_pos": "#1479d1",
             "rope_pos": "#d8a400",
             "jump_point": "#1d9b45",
+            "skill_point": "#8a2be2",
         }
         for kind, point, label, index in entries:
             try:
@@ -7980,6 +8232,19 @@ class UiWorker(threading.Thread):
                                    fill=colors[kind], width=1)
                 canvas.create_line(x, axis_y - 15, x + 6, axis_y - 9,
                                    tags=(tag,), fill=colors[kind], width=1)
+            elif kind == "skill_point":
+                # Match the jump arrow's height with a 14px square so skill
+                # markers stay legible even when two-character key labels are
+                # needed (for example Ctrl -> CT, PageUp -> PU).
+                canvas.create_rectangle(
+                    x - 7, axis_y - 16, x + 7, axis_y - 2,
+                    fill=colors[kind], outline="", tags=(tag,),
+                )
+                canvas.create_text(
+                    x, axis_y - 9,
+                    text=self._skill_key_axis_label(point.get("key", "")),
+                    fill="white", font=("TkDefaultFont", 10, "bold"), tags=(tag,),
+                )
             else:
                 direction = str(point.get("direction", "")).casefold()
                 if direction == "left":
@@ -8007,8 +8272,11 @@ class UiWorker(threading.Thread):
             )
             canvas.tag_bind(
                 tag, "<Double-Button-1>",
-                lambda _event, layer_name=layer_name, kind=kind, index=index:
-                self._delete_recorded_axis_point(layer_name, kind, index),
+                lambda _event, layer_name=layer_name, kind=kind,
+                point_x=x_value, index=index:
+                self._delete_recorded_axis_point(
+                    layer_name, kind, point_x, index,
+                ),
             )
         # The temporary 站桩 anchor is not recording data and therefore has
         # no delete/click action.  When its current location successfully
@@ -8119,9 +8387,9 @@ class UiWorker(threading.Thread):
                 if hasattr(self, "_combo_attack_enabled_var") else False
             ),
             "combo_attack_slots": self._combo_attack_slots_data(),
-            "stationary_jump_enabled": bool(
-                getattr(self, "_stationary_jump_enabled_var", None).get()
-                if hasattr(self, "_stationary_jump_enabled_var") else False
+            "jump_attack_enabled": bool(
+                getattr(self, "_jump_attack_enabled_var", None).get()
+                if hasattr(self, "_jump_attack_enabled_var") else False
             ),
             "small_step_enabled": bool(
                 getattr(self, "_small_step_enabled_var", None).get()
@@ -8468,12 +8736,25 @@ class UiWorker(threading.Thread):
 
         mode = str(getattr(self, "_attack_mode_var", None).get()
                    if hasattr(self, "_attack_mode_var") else "fixed")
-        stationary_jump_button = getattr(self, "_stationary_jump_button", None)
+        jump_attack_button = getattr(self, "_jump_attack_button", None)
         # This method runs again after several ordinary UI refreshes.  It must
         # never reopen stationary controls that the authorization lock closed.
+        fixed_attack_enabled = (
+            mode in ("fixed", "stationary") and self._license_allowed()
+        )
         stationary_enabled = mode == "stationary" and self._license_allowed()
         for widget in [
-            stationary_jump_button,
+            jump_attack_button,
+        ]:
+            if widget is None:
+                continue
+            try:
+                widget.state(["!disabled" if fixed_attack_enabled else "disabled"])
+            except Exception:
+                widget.configure(
+                    state="normal" if fixed_attack_enabled else "disabled"
+                )
+        for widget in [
             *getattr(self, "_stationary_facing_controls", []),
             *getattr(self, "_stationary_pickup_controls", []),
         ]:
@@ -8624,10 +8905,11 @@ class UiWorker(threading.Thread):
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
                 and mode not in ("fixed", "stationary")):
             mode = "fixed"
-        worker.jump_attack = bool(
-            mode == "stationary"
-            and data.get("stationary_jump_enabled", False)
-        )
+        jump_attack_enabled = bool(data.get(
+            "jump_attack_enabled",
+            data.get("stationary_jump_enabled", False),
+        )) and mode in ("fixed", "stationary")
+        worker.jump_attack = jump_attack_enabled
         worker.enabled = bool(mode in ("fixed", "stationary"))
         # 站桩 shares its beats with the anchor correction and 小碎步, which carry
         # their own attacks; on patrol those are deliberate extras, so only the
@@ -8650,6 +8932,9 @@ class UiWorker(threading.Thread):
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
             mover.small_step_attack_key = worker.attack_key
+            jump_setter = getattr(mover, "set_jump_attack_enabled", None)
+            if callable(jump_setter):
+                jump_setter(jump_attack_enabled)
             counterattack_setter = getattr(mover, "set_counterattack", None)
             if callable(counterattack_setter):
                 counterattack_setter(
@@ -8732,13 +9017,14 @@ class UiWorker(threading.Thread):
                               f"{self._fixed_attack_key_var.get()}；"
                               f"开始运行时记录临时位置；"
                               f"只有正确配置楼层，才能寻路回去；"
-                              f"{'先跳跃、0.3s 后攻击；' if self._stationary_jump_enabled_var.get() else ''}每 "
+                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}每 "
                               f"{interval:.1f}s。")
                     )
                 else:
                     self._fixed_status.configure(
                         text=(f"巡逻攻击已启用 - 按键 "
-                              f"{self._fixed_attack_key_var.get()}；每 "
+                              f"{self._fixed_attack_key_var.get()}；"
+                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}每 "
                               f"{interval:.1f}s。")
                     )
             else:
@@ -8786,8 +9072,8 @@ class UiWorker(threading.Thread):
                 if mode == "jump_attack":
                     # One-time migration from the former dedicated mode.
                     self._attack_mode_var.set("stationary")
-                    if hasattr(self, "_stationary_jump_enabled_var"):
-                        self._stationary_jump_enabled_var.set(True)
+                    if hasattr(self, "_jump_attack_enabled_var"):
+                        self._jump_attack_enabled_var.set(True)
                 elif mode in ("yolo", "fixed", "stationary"):
                     self._attack_mode_var.set(mode)
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
@@ -8839,11 +9125,14 @@ class UiWorker(threading.Thread):
                     key = raw_key if raw_key in BINDABLE_KEYS else "-"
                     if index < len(getattr(self, "_combo_attack_key_vars", ())):
                         self._combo_attack_key_vars[index].set(key)
-            if ("stationary_jump_enabled" in data
-                    and hasattr(self, "_stationary_jump_enabled_var")):
-                self._stationary_jump_enabled_var.set(bool(
-                    data["stationary_jump_enabled"]
-                ))
+            if hasattr(self, "_jump_attack_enabled_var"):
+                # ``stationary_jump_enabled`` is the pre-shared-option field.
+                # New saves use ``jump_attack_enabled``; retain the old value
+                # only when the new field is absent.
+                self._jump_attack_enabled_var.set(bool(data.get(
+                    "jump_attack_enabled",
+                    data.get("stationary_jump_enabled", False),
+                )))
             if ("small_step_enabled" in data
                     and hasattr(self, "_small_step_enabled_var")):
                 self._small_step_enabled_var.set(bool(
@@ -9776,7 +10065,7 @@ class UiWorker(threading.Thread):
         "left": "←", "right": "→", "up": "↑", "down": "↓",
         "home": "Home", "insert": "Insert", "delete": "Delete",
         "bracketleft": "[", "bracketright": "]", "grave": "`",
-        "d": "D", "f": "F",
+        "d": "D", "e": "E", "f": "F", "s": "S",
         "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
         "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
     }
@@ -9787,6 +10076,8 @@ class UiWorker(threading.Thread):
         "record:right_most_pos": "录制当前图层的 最右 巡逻点",
         "record_jump_point:left": "插入当前图层的 左跳 点 (Ctrl+D)",
         "record_jump_point:right": "插入当前图层的 右跳 点 (Ctrl+F)",
+        "record_split_point": "在当前位置添加贯穿全部楼层的波浪分区线 (Ctrl+S)",
+        "record_skill_point": "录制技能点；随后按任意攻击键可绑定按键 (Ctrl+E)",
         "select_next_layer": "选择下一个录制图层 (Ctrl+↓)",
         "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
         "add_highest_layer": "添加最高楼层",
@@ -11268,11 +11559,13 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_selected_layer_var"):
             self._selected_layer_var.set(selected)
         for layer_name in layer_names:
+            layer = snapshot.layers.get(layer_name, {})
+            patrol_times = max(1, int(layer.get("patrol_times", 1))) if isinstance(layer, dict) else 1
             self._layer_labels[layer_name].configure(
-                text=self._patrol_display_name(layer_name)
+                text=f"{self._patrol_display_name(layer_name)} 巡逻{patrol_times}次"
             )
             self._draw_layer_axis(
-                layer_name, snapshot.layers.get(layer_name, {})
+                layer_name, layer, snapshot.split_points,
             )
         start_state, stop_state = patrol_button_states(running, can_start)
         if self._patrol_stop_pending:
@@ -11505,7 +11798,7 @@ class UiWorker(threading.Thread):
             # display name (for example, 楼层10).  A 4-character Tk width clips
             # CJK glyphs on some Windows font/DPI combinations and lets the
             # axis canvas visually cover the final digit.
-            label = ttk.Label(row, width=6)
+            label = ttk.Label(row, width=13)
             # Keep the axis marker canvas a further fixed three pixels away;
             # no row is resized when modes or recordings change.
             label.pack(side="left", anchor="center", padx=(0, 10))

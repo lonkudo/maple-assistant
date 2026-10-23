@@ -696,6 +696,50 @@ def set_device_memo_via_server(memo: str, root: Optional[Path] = None) -> Licens
         return replace(local, code="server", message="激活验证失败")
 
 
+def unbind_device_via_server(
+    activation_code: str, root: Optional[Path] = None,
+) -> LicenseStatus:
+    """Request a customer-authorized device unbind through pinned TLS.
+
+    Unlike a heartbeat this deliberately does not require a currently valid
+    local license document: an expired count-mode code may still be moved to a
+    replacement device.  The raw code authenticates the request and is sent
+    only over the pinned connection; it is never written to the log.
+    """
+
+    code = "".join(str(activation_code or "").upper().split())
+    if not code:
+        return LicenseStatus(False, "unbind_missing_code", "本机没有可用的授权码，无法解绑。")
+    try:
+        SERVER_LOG.info("device self-unbind requested")
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/device-unbind",
+            {
+                "activation_code": code,
+                "fingerprint": machine_fingerprint_hash(),
+            },
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
+        if answer.get("ok") is not True:
+            return LicenseStatus(False, str(answer.get("code", "server")), str(
+                answer.get("message", "解绑失败，请稍后重试。")
+            ))
+        return LicenseStatus(True, "unbound", str(
+            answer.get("message", "解绑成功，授权码已复制。请在新设备激活授权。")
+        ))
+    except PinnedTlsResponseError as exc:
+        SERVER_LOG.warning(
+            "device self-unbind rejected status=%s code=%s", exc.status, exc.code
+        )
+        return LicenseStatus(False, f"server:{exc.code}", exc.message)
+    except DeviceNotReadyError:
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
+    except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("device self-unbind failed category=%s", type(exc).__name__)
+        return LicenseStatus(False, "server", "解绑请求失败，请检查网络后重试。")
+
+
 def _heartbeat_via_server(root: Optional[Path] = None) -> LicenseStatus:
     """The heartbeat request itself; the public wrapper applies the verdict rule."""
 
@@ -798,5 +842,5 @@ __all__ = [
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
     "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
-    "report_lie_event_via_server", "set_device_memo_via_server", "validate_via_server",
+    "report_lie_event_via_server", "set_device_memo_via_server", "unbind_device_via_server", "validate_via_server",
 ]

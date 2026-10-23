@@ -186,6 +186,11 @@ ENDPOINT_TURN_REARM_MIN_PROGRESS_X = 0.003
 # recorded marker step in either direction.
 JUMP_POINT_X_TOLERANCE = 0.010
 JUMP_POINT_Y_TOLERANCE = 0.015
+# Skill points are traversal markers rather than a physical jump location.
+# At 5 FPS, a normal walking marker can advance past the old +/-0.012 X gate
+# between frames, so give it one extra half-marker step without making nearby
+# skill points overlap during a single traversal.
+SKILL_POINT_X_TOLERANCE = 0.016
 # A left/right point that lands on a horizontal platform needs only a brief
 # post-Alt guard, then two stable 5-FPS samples before its Up claim releases.
 # A point that really grabbed a rope hands over earlier, on its first upward
@@ -3764,6 +3769,7 @@ class MovementWorker(threading.Thread):
         # throttled verifier.
         reconnect_active_event: Optional[threading.Event] = None,
         motion_arbiter: Any = None,
+        atomic_motion_runner: Any = None,
         attack_state_path: Optional[str] = None,
         attack_block_max_seconds: float = 4.0,
         rope_state_path: Optional[str] = None,
@@ -3938,6 +3944,17 @@ class MovementWorker(threading.Thread):
         self.dropping_active_event = dropping_active_event
         self.near_rope_event = near_rope_event
         self.important_positions = important_positions or {}
+        # Split-map state.  A split is a global X boundary, but each active
+        # patrol pass sees a normal flat layer dictionary materialised from
+        # just one part.  That lets the mature climb/return state machine keep
+        # owning layers without mixing endpoints from the other side.
+        self._split_enabled = False
+        self._split_active_part = 0
+        self._split_part_count = 0
+        self._split_source_layers: dict[str, Any] = {}
+        self._split_route_order: tuple[str, ...] = ()
+        self._split_transition_after_drop = False
+        self._skill_fired_tokens: set[tuple[int, str, str, int]] = set()
         # A layer patrols with any non-empty subset of Left/Rope/Right; a
         # layer with NO recorded action (or an empty profile) stands still
         # and only attacks.
@@ -4023,6 +4040,11 @@ class MovementWorker(threading.Thread):
         # injects the shared arbiter so confirmed stair jumps can queue
         # behind attack motions.
         self.motion_arbiter = motion_arbiter
+        # Unlike the arbiter's FIFO motions, atomic combat sequences preserve
+        # an existing patrol Left/Right hold.  STEP and COUNTERATTACK invoke
+        # it only while their existing arbiter token already owns admission.
+        self.atomic_motion_runner = atomic_motion_runner
+        self.jump_attack_enabled = False
         # Stair detection stays on this minimap-consuming worker, but the
         # direction+Alt action runs on its own worker.  It waits for attack
         # motion without making patrol release its current Left/Right hold.
@@ -8953,8 +8975,7 @@ class MovementWorker(threading.Thread):
             return False
         key_down = getattr(self.key_sender, "key_down", None)
         key_up = getattr(self.key_sender, "key_up", None)
-        tap = getattr(self.key_sender, "tap", None)
-        if key_down is None or key_up is None or not callable(tap):
+        if key_down is None or key_up is None:
             return False
         hold = self._stationary_correction_hold()
         with self._direction_lock, self._hold_lock:
@@ -9010,7 +9031,9 @@ class MovementWorker(threading.Thread):
                 str(getattr(self, "small_step_attack_key", "ctrl"))
             )
             if (not self._patrol_input_allowed()
-                    or tap(attack_key) is False):
+                    or not self._perform_combat_attack(
+                        attack_key, label="stationary-correction",
+                    )):
                 LOG.warning(
                     "stationary correction %s: attack tap not delivered",
                     direction,
@@ -10828,6 +10851,7 @@ class MovementWorker(threading.Thread):
             LOG.info("route phase %r not recorded on %s; starting at %s",
                      self._route_phase, name, phases[0])
             self._route_phase = phases[0]
+        self._trigger_skill_points(observation, name, layer)
         if self._route_phase == "left":
             return float(layer["left_most_pos"]["x"]), False, f"{name}.left-most"
         if self._route_phase == "right":
@@ -10853,12 +10877,53 @@ class MovementWorker(threading.Thread):
         rope_x = float(rope["x"]) if isinstance(rope, dict) and "x" in rope else self.fixed_target_x
         return rope_x, True, f"{name}.rope"
 
+    def _trigger_skill_points(
+        self, observation: MinimapObservation, layer_name: str, layer: Any,
+    ) -> None:
+        """Queue a recorded skill once per directional traversal."""
+
+        if observation.player is None or self._route_phase not in ("left", "right"):
+            return
+        points = layer.get("skill_points", []) if isinstance(layer, dict) else []
+        request = getattr(self.motion_arbiter, "request_buff", None)
+        if not isinstance(points, list) or not callable(request):
+            return
+        for index, point in enumerate(points):
+            if not isinstance(point, dict):
+                continue
+            try:
+                point_x = float(point["x"])
+                key = str(point["key"]).strip().casefold()
+            except (KeyError, TypeError, ValueError):
+                continue
+            token = (self._split_active_part, layer_name, self._route_phase, index)
+            if (token in self._skill_fired_tokens
+                    or abs(observation.player.x - point_x) > SKILL_POINT_X_TOLERANCE):
+                continue
+            if request(key):
+                self._skill_fired_tokens.add(token)
+                LOG.info("skill point fired: part=%d %s phase=%s key=%s",
+                         self._split_active_part + 1, layer_name,
+                         self._route_phase, key.upper())
+
     def _sync_patrol_controller(
         self, coordinate_layout: Optional[CoordinateLayout] = None
     ) -> None:
         if self.patrol_controller is None:
             return
         snapshot = self.patrol_controller.snapshot(coordinate_layout)
+        split_points = tuple(getattr(snapshot, "split_points", ()) or ())
+        self._split_enabled = bool(split_points)
+        self._split_part_count = len(split_points) + 1 if split_points else 0
+        self._split_source_layers = snapshot.layers
+        self._split_route_order = snapshot.route_order
+        if self._split_enabled:
+            self._split_active_part = max(
+                0, min(self._split_active_part, self._split_part_count - 1)
+            )
+            source_layers = self._materialize_split_part(self._split_active_part)
+        else:
+            source_layers = snapshot.layers
         previous_name = None
         if (self._route_layer_index is not None
                 and 0 <= self._route_layer_index < len(self._route_layers)):
@@ -10866,7 +10931,7 @@ class MovementWorker(threading.Thread):
         # The route is every action-bearing layer (any subset of Left/Rope/
         # Right), in recorded bottom-up order plus any newly recorded layers.
         routable = {
-            name for name, layer in snapshot.layers.items()
+            name for name, layer in source_layers.items()
             if _layer_present_actions(layer)
         }
         new_route = [name for name in snapshot.route_order if name in routable]
@@ -10909,7 +10974,7 @@ class MovementWorker(threading.Thread):
         self.patrol_enabled = snapshot.enabled
         self.climbing_enabled = snapshot.climbing_enabled
         self.final_layer_action = snapshot.final_layer_action
-        self.important_positions = snapshot.layers
+        self.important_positions = source_layers
         if route_changed:
             self._route_layers = new_route
             if previous_name in new_route:
@@ -10920,6 +10985,65 @@ class MovementWorker(threading.Thread):
                 self._route_patrol_cycle = 1
             LOG.info("patrol route updated from UI: %s",
                      " -> ".join(new_route) if new_route else "none")
+
+    def _materialize_split_part(self, part_index: int) -> dict[str, Any]:
+        """Build the legacy-shaped layer view for one split-map part."""
+
+        materialized: dict[str, Any] = {}
+        for name, source in self._split_source_layers.items():
+            if not isinstance(source, dict):
+                continue
+            parts = source.get("part_points")
+            part = parts.get(str(part_index)) if isinstance(parts, dict) else None
+            if not isinstance(part, dict) or not _layer_present_actions(part):
+                continue
+            layer = dict(source)
+            for key in ("left_most_pos", "right_most_pos", "rope_pos", "jump_points", "skill_points"):
+                layer.pop(key, None)
+            layer.update(part)
+            materialized[name] = layer
+        return materialized
+
+    def select_split_start_part(self, part_index: int) -> None:
+        """Accept startup's X-resolved split part before the next frame sync."""
+
+        self._split_active_part = max(0, int(part_index))
+
+    def _activate_next_split_part(self) -> None:
+        """Switch to the next left-to-right part after returning to layer1."""
+
+        if not self._split_enabled or self._split_part_count <= 1:
+            return
+        previous = self._split_active_part
+        for _attempt in range(self._split_part_count):
+            self._split_active_part = (self._split_active_part + 1) % self._split_part_count
+            self.important_positions = self._materialize_split_part(self._split_active_part)
+            routable = {
+                name for name, layer in self.important_positions.items()
+                if _layer_present_actions(layer)
+            }
+            route = [name for name in self._split_route_order if name in routable]
+            route.extend(sorted(routable - set(route), key=lambda name: int("".join(filter(str.isdigit, name)) or 0)))
+            route.sort(key=lambda name: int("".join(filter(str.isdigit, name)) or 0))
+            self._route_layers = _slice_patrol_range(
+                route, self._patrol_range_min and f"layer{self._patrol_range_min}",
+                self._patrol_range_max and f"layer{self._patrol_range_max}",
+            )
+            if self._route_layers:
+                break
+            LOG.warning("split part %d has no patrol supporters; skipping", self._split_active_part + 1)
+        else:
+            self._route_layers = []
+            self._split_transition_after_drop = False
+            return
+        self.first_layer = self._route_layers[0]
+        self._route_layer_index = 0
+        self._route_phase = "left"
+        self._route_patrol_cycle = 1
+        self._split_transition_after_drop = False
+        LOG.info("split patrol: part %d/%d complete; entering part %d/%d",
+                 previous + 1, self._split_part_count,
+                 self._split_active_part + 1, self._split_part_count)
 
     def _layer_phases(self, name: str) -> list[str]:
         """Ordered action phases for a layer from its recorded points.
@@ -10959,6 +11083,7 @@ class MovementWorker(threading.Thread):
                 or next_direction not in ("left", "right")
                 or previous == next_direction):
             return
+        self._skill_fired_tokens.clear()
         self._clear_endpoint_turn_rearm()
         self._endpoint_turn_expected_direction = next_direction
         self._endpoint_turn_neutral_until = (
@@ -11184,6 +11309,20 @@ class MovementWorker(threading.Thread):
                          current, next_phase)
                 return True
         # End of this layer's recorded actions.
+        if is_final and self._split_enabled:
+            # Each part is a complete mini-route.  Higher final layers must
+            # fall back to that part's bottom layer before changing sides;
+            # a one-floor part already is at its bottom layer and can switch
+            # immediately without an unnecessary Alt+Down.
+            if len(self._route_layers) > 1:
+                self._split_transition_after_drop = True
+                self._route_phase = "drop"
+                LOG.info("split part %d/%d done; descending to %s before next part",
+                         self._split_active_part + 1, self._split_part_count,
+                         self.first_layer)
+            else:
+                self._activate_next_split_part()
+            return True
         if (is_final and len(self._route_layers) > 1
                 and (self._patrol_range_configured
                      or self.final_layer_action == "drop_to_first_layer")):
@@ -11215,9 +11354,14 @@ class MovementWorker(threading.Thread):
         """
 
         movement_phases = [phase for phase in phases if phase in ("left", "right")]
+        layer = self.important_positions.get(name, {})
+        try:
+            repeat_limit = max(1, int(layer.get("patrol_times", self.patrol_cycles_per_layer)))
+        except (AttributeError, TypeError, ValueError):
+            repeat_limit = self.patrol_cycles_per_layer
         if (not movement_phases
                 or current != movement_phases[-1]
-                or self._route_patrol_cycle >= self.patrol_cycles_per_layer):
+                or self._route_patrol_cycle >= repeat_limit):
             return False
         completed = self._route_patrol_cycle
         self._route_patrol_cycle += 1
@@ -11228,7 +11372,7 @@ class MovementWorker(threading.Thread):
             "layer %s patrol cycle %d/%d complete; repeating from %s",
             name,
             completed,
-            self.patrol_cycles_per_layer,
+            repeat_limit,
             self._route_phase,
         )
         return True
@@ -11380,6 +11524,9 @@ class MovementWorker(threading.Thread):
             # forever and the YOLO attack stays blocked ("attack blocked:
             # patrol climbing/dropping" -> the character never attacks).
             self.dropping_active_event.clear()
+        if self._split_transition_after_drop:
+            self._activate_next_split_part()
+            return
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
 
     def _endpoint_band_timeout(
@@ -12012,6 +12159,33 @@ class MovementWorker(threading.Thread):
             self.counterattack_key,
         )
 
+    def set_jump_attack_enabled(self, enabled: bool) -> None:
+        """Apply the shared patrol/stand-still jump-combat setting live."""
+
+        self.jump_attack_enabled = bool(enabled)
+
+    def _perform_combat_attack(self, attack_key: str, *, label: str) -> bool:
+        """Run a correction/counter combat tap through the atomic runner.
+
+        The caller already owns its MotionArbiter callback.  This helper does
+        not add a second queued motion and does not release Left/Right.
+        """
+
+        runner = self.atomic_motion_runner
+        if runner is not None:
+            return bool(runner.execute_combat_attack(
+                attack_key,
+                jump_attack_enabled=self.jump_attack_enabled,
+                allowed=lambda: (
+                    self._patrol_input_allowed()
+                    and not self._movement_busy_now()
+                    and _sender_is_safe(self.key_sender)
+                ),
+                label=label,
+            ))
+        tap = getattr(self.key_sender, "tap", None)
+        return bool(callable(tap) and tap(attack_key) is not False)
+
     def set_attack_slot(self, attack_slot: object) -> None:
         """Attach the shared next-attack replacement slot."""
 
@@ -12244,14 +12418,13 @@ class MovementWorker(threading.Thread):
                 or self._movement_busy_now()
                 or not _sender_is_safe(self.key_sender)):
             return False
-        tap = getattr(self.key_sender, "tap", None)
-        if not callable(tap):
-            return False
         with self._direction_lock, self._hold_lock:
             if not self._patrol_input_allowed() or self._movement_busy_now():
                 return False
             if direction == "none":
-                if tap(attack_key) is False:
+                if not self._perform_combat_attack(
+                    attack_key, label="counterattack",
+                ):
                     return False
                 note_attack = getattr(self.motion_arbiter, "note_attack", None)
                 if callable(note_attack):
@@ -12286,7 +12459,10 @@ class MovementWorker(threading.Thread):
                     return False
             finally:
                 key_up(direction)
-            if not self._patrol_input_allowed() or tap(attack_key) is False:
+            if (not self._patrol_input_allowed()
+                    or not self._perform_combat_attack(
+                        attack_key, label="counterattack",
+                    )):
                 return False
             self._patrol_facing = direction
             note_attack = getattr(self.motion_arbiter, "note_attack", None)

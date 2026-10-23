@@ -219,6 +219,34 @@ device, and returns the updated normal device response. The desktop persists
 its local copy in `user_config.json` and sends this request asynchronously, so
 memo editing cannot block capture, movement, or auto-lie handling.
 
+### Customer self-unbind
+
+`POST /api/v1/device-unbind` is a narrow, pinned-TLS customer operation. The
+desktop reads the original code from its local `user_config.json` and combines
+it with a freshly collected fingerprint. `licensing.unbind_device()` canonicalizes
+and hashes the code, locks the matching `ActivationCode` and
+`FingerprintSecurityState`, and accepts only the code currently bound to that
+same fingerprint. The plaintext code is neither persisted by the server nor
+placed in a client/server log.
+
+The server rejects an unlimited-mode code with the Chinese message
+`测谎未结算，请联系管理员结算后解绑。`; operator settlement is required before a
+device move, even with an unsettled value of zero. For a counting-mode code,
+the server uses its `Asia/Shanghai` local date with
+`FingerprintSecurityState.self_unbind_day` and `self_unbind_count`: a new date
+resets the count and at most two successful self-unbinds are allowed that day.
+The successful transaction clears only `ActivationCode.fingerprint_hash` and
+refreshes the old equipment's derived quota cache; expiry, code-owned balance,
+and auto-lie history remain with the code for its next activation.
+
+On the desktop, `UiWorker` starts this request on the `device-self-unbind`
+thread. Its result queue is consumed on Tk: success copies the original code,
+removes `license.json`, clears the in-memory auto-lie secret, and invokes the
+normal licensed-function lock before showing the success dialog. A refusal
+changes none of that local state and instead presents the server's Chinese
+reason. This ownership split ensures TLS I/O cannot delay capture, movement,
+or automatic-lie handling.
+
 `ActivationCode.auto_lie_unlimited_mode` selects code-owned counting versus
 unsettled usage. A finite code reduces `remaining_auto_lie_count`; an unsettled
 code leaves it unlimited and increments `auto_lie_unsettled_count` on `STARTED`.
@@ -309,6 +337,14 @@ server replacement retains the TLS private key (therefore the client pin),
 `/api/v1/validate`. Response additions are optional; removals, renamed fields,
 new mandatory fields, signing-key rotation, or TLS-key rotation require a
 coordinated desktop release.
+
+The self-unbind feature additionally requires server migration
+`licensing.0015_fingerprint_self_unbind_limit`. It is additive: two nullable/
+defaulted rate-limit fields on `FingerprintSecurityState` and the new
+`/api/v1/device-unbind` route. Deploy the migration before distributing a
+desktop client that shows **解绑**. Older clients are unaffected; a new client
+against an older server receives a normal pinned request failure rather than
+changing any binding locally.
 
 On a server failure, restoring the previous compatible server code against the
 same database and keys restores existing clients. Online validation runs

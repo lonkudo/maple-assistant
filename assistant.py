@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from minimap_detector import hud_scale_for
 from runtime_paths import application_root
@@ -504,6 +504,7 @@ def main() -> int:
     )
     from attack_worker import AttackWorker
     from attack_slot import AttackSlot
+    from atomic_motion import AtomicMotionRunner
     from small_step_worker import SmallStepWorker
     from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
@@ -1566,14 +1567,43 @@ def main() -> int:
                 logging.warning(
                     "LAYER BAND OVERLAY: clean post-overlay capture timed out"
                 )
-        detected_name = (
-            detect_layer_by_y(marker.y, snapshot.layers)
-            if marker is not None else None
-        )
         if marker is None:
             raise OSError(
                 "巡逻启动时未检测到黄色角色标记"
             )
+        # Flat recordings have one band per layer.  Split recordings have a
+        # separate band in each X part, so startup must first pick the part
+        # containing the yellow marker; consulting the outer legacy layer
+        # dict here is what produced "Y does not belong to any layer" even
+        # when the point had just been recorded in a split part.
+        split_points = tuple(getattr(snapshot, "split_points", ()) or ())
+        startup_part_index = 0
+        anchor_layer_override: Optional[dict[str, Any]] = None
+        if split_points:
+            startup_part_index = sum(
+                1 for split in split_points
+                if float(marker.x) >= float(split.get("x", 1.0))
+            )
+            split_candidates: list[tuple[float, str, dict[str, Any]]] = []
+            for name in snapshot.route_order:
+                layer = snapshot.layers.get(name, {})
+                parts = layer.get("part_points") if isinstance(layer, dict) else None
+                part = parts.get(str(startup_part_index)) if isinstance(parts, dict) else None
+                if not isinstance(part, dict):
+                    continue
+                band = _layer_y_band(
+                    part, float(part.get("y_tolerance", 0.020000))
+                )
+                if band is None or not (band[0] - 1e-9 <= marker.y <= band[1] + 1e-9):
+                    continue
+                reference_y = float(part.get("layer_y", (band[0] + band[1]) / 2.0))
+                split_candidates.append((abs(marker.y - reference_y), name, part))
+            if split_candidates:
+                _distance, detected_name, anchor_layer_override = min(split_candidates)
+            else:
+                detected_name = None
+        else:
+            detected_name = detect_layer_by_y(marker.y, snapshot.layers)
         startup_above_route = False
         if detected_name is None:
             # A player can start on an upper platform that has no separately
@@ -1595,15 +1625,18 @@ def main() -> int:
                 key=lambda name: int("".join(filter(str.isdigit, name)) or 0),
                 default=None,
             )
-            top_band = (
-                _layer_y_band(
-                    snapshot.layers.get(top_route, {}),
-                    float(snapshot.layers.get(top_route, {}).get("y_tolerance", 0.020000)),
-                ) if top_route is not None else None
-            )
+            top_layer = snapshot.layers.get(top_route, {}) if top_route is not None else {}
+            if split_points and isinstance(top_layer, dict):
+                parts = top_layer.get("part_points")
+                top_layer = parts.get(str(startup_part_index), {}) if isinstance(parts, dict) else {}
+            top_band = (_layer_y_band(
+                top_layer, float(top_layer.get("y_tolerance", 0.020000)),
+            ) if isinstance(top_layer, dict) else None)
             if top_band is not None and marker.y < top_band[0]:
                 startup_above_route = True
                 detected_name = top_route
+                if split_points and isinstance(top_layer, dict):
+                    anchor_layer_override = top_layer
                 logging.warning(
                     "MAP SESSION: marker Y=%.6f is above the patrol route "
                     "(top %s begins at %.6f); dropping into the route",
@@ -1633,13 +1666,26 @@ def main() -> int:
             )
             detected_name = fallback
         anchor_name = str(detected_name)
-        anchor_layer = snapshot.layers.get(anchor_name, {})
+        if split_points and anchor_layer_override is None:
+            split_layer = snapshot.layers.get(anchor_name, {})
+            parts = split_layer.get("part_points") if isinstance(split_layer, dict) else None
+            part = parts.get(str(startup_part_index)) if isinstance(parts, dict) else None
+            if isinstance(part, dict):
+                anchor_layer_override = part
+        anchor_layer = anchor_layer_override or snapshot.layers.get(anchor_name, {})
         anchor_world_y = anchor_layer.get("layer_world_y")
         if anchor_world_y is None:
             raise OSError(
                 f"{anchor_name or '第一层'} 没有录制世界 Y；请在本图重新录制一次"
             )
         structure_tracker.start_session(float(anchor_world_y))
+        select_split_part = getattr(movement_worker, "select_split_start_part", None)
+        if split_points and callable(select_split_part):
+            select_split_part(startup_part_index)
+            logging.info(
+                "MAP SESSION split start: marker X=%.6f selected part %d/%d",
+                marker.x, startup_part_index + 1, len(split_points) + 1,
+            )
         movement_worker.prepare_patrol_start(
             anchor_name,
             above_route=startup_above_route,
@@ -1731,6 +1777,14 @@ def main() -> int:
         climbing_active_event=action_motion_active,
         automation_active_event=automation_active,
     )
+    # Short multi-key combat sequences have their own atomic lane.  They are
+    # admitted by the existing arbiter lease/token but do not become FIFO
+    # movement motions and therefore leave a patrol Left/Right hold intact.
+    atomic_motion_runner = AtomicMotionRunner(
+        key_sender,
+        stop_event,
+        automation_active_event=automation_active,
+    )
     # The fixed-rate attack worker always exists so the UI can toggle it
     # live (Fixed Attack panel).  Without --enable-attack it starts disabled
     # and only waits; the panel flips ``enabled`` when the mode is selected.
@@ -1745,6 +1799,7 @@ def main() -> int:
         direction_transition_event=direction_transition_active,
         attack_resume_event=stationary_attack_resume,
         attack_slot=attack_slot,
+        atomic_motion_runner=atomic_motion_runner,
     )
     attack_worker.enabled = bool(args.enable_attack)
     attack_workers.append(attack_worker)
@@ -2398,6 +2453,7 @@ def main() -> int:
             # first act after the reconnect gives the input back.
             reconnect_active_event=reconnect_active,
             motion_arbiter=motion_arbiter,
+            atomic_motion_runner=atomic_motion_runner,
             moving_active_event=moving_active,
             pickup_active_event=pickup_active,
             attack_state_path=str(

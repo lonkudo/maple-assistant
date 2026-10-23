@@ -209,6 +209,22 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   own title plus that suffix, and it never excuses an unrelated window: a real
   focus thief, another window's ghost, or a vanished game window still count as a
   loss. A hang is reported once (`foreground: the game window is not responding …`).
+
+### Current release behavior (v1.2.252)
+
+- **Customers can securely解绑 a counting-mode authorization from their own
+  device.** The authorization line now has **解绑** after **备注**. It asks for
+  confirmation, sends the locally stored original authorization code and the
+  local fingerprint only through the certificate-pinned activation service,
+  then shows a Chinese success or failure dialog. On success the client copies
+  the original code, deletes its local signed entitlement, clears the in-memory
+  auto-lie credential, and immediately locks all automation on that computer.
+  The code remains usable for activation on the replacement device.
+- **Unlimited-mode codes cannot be self-unbound.** The server returns
+  `测谎未结算，请联系管理员结算后解绑。` even when the unsettled count is zero;
+  settlement is an operator-controlled boundary. The server allows at most two
+  successful customer unbinds per equipment per GMT+8 calendar day. A rejected
+  request never copies the code or locks the current desktop.
 - **Automatic-lie capacity selection is fast and distributed.**
   `auto_lie_backend.py` holds fourteen `host:port` WebSocket instances:
   `221.10.121.69` ports 48001–48003 and 48007/48009/48011/48013/48015, plus
@@ -385,6 +401,16 @@ Chinese/English letters, digits, spaces, `_`, and `-` (at most 24 characters),
 and asynchronously syncs the same value to the bound device through the
 pinned activation service. It is not included in a signed license document.
 
+The same row also contains **解绑**. This is a customer self-service endpoint,
+not an operator-console action: `POST /api/v1/device-unbind` authenticates with
+the original authorization code plus the device fingerprint, never logs the
+plaintext code, and detaches only that currently bound code. It is available
+only when `auto_lie_unlimited_mode` is false. The per-device local-day counter
+limits successful calls to two; its day boundary uses the activation server's
+`Asia/Shanghai` timezone. A success deliberately deletes only the desktop's
+local signed document: `user_config.json` retains the code so it can be copied
+and used to activate the new device.
+
 An activation code has either **counting** or **unsettled** auto-lie mode.
 Counting mode consumes its remaining balance. Unsettled mode leaves the balance
 unlimited and increments the code's unsettled counter for each auto-lie start.
@@ -414,6 +440,12 @@ run Django migrations, and restart Gunicorn only after migrations succeed.
 Keep the previous deployed commit available for rollback. Check the pinned
 `/api/v1/validate` endpoint and `/forbestop/` after every restart; never test a
 production update by changing a customer's client endpoint.
+
+The v1.2.252 self-unbind endpoint requires migration
+`licensing.0015_fingerprint_self_unbind_limit` before the new desktop client is
+used. It adds only the per-fingerprint `self_unbind_day` and
+`self_unbind_count` rate-limit fields; it does not alter activation codes,
+existing bindings, entitlement periods, or auto-lie balances.
 
 **Existing clients remain compatible only when the server preserves all of
 these contracts:** the same HTTPS address and TLS key/pin, the same

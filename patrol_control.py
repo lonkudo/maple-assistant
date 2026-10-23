@@ -340,6 +340,10 @@ class PatrolSnapshot:
     patrol_start_layer: str = ""
     patrol_end_layer: str = ""
     patrol_range_set: bool = False
+    # Split boundaries are global X dividers.  They are deliberately kept
+    # outside individual layers: one recorded split represents the same map
+    # partition all the way from layer1 to the highest layer.
+    split_points: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -464,6 +468,7 @@ class PatrolController:
                     self._profile.get("patrol_start_layer")
                     and self._profile.get("patrol_end_layer")
                 ),
+                split_points=tuple(deepcopy(self._split_points_locked())),
             )
 
     def is_enabled(self) -> bool:
@@ -533,6 +538,31 @@ class PatrolController:
                 return ("未选择有效的巡逻楼层。",)
             errors: list[str] = []
             layers = self._profile.get("layers", {})
+            splits = self._split_points_locked()
+            if splits:
+                # A part begins from layer1, then may climb through only the
+                # layers that have supporters in that same part.  Requiring
+                # every higher layer would reject the exact sparse-map layout
+                # split patrol is intended to support.
+                part_count = len(splits) + 1
+                base_name = route[0]
+                for part_index in range(part_count):
+                    part = self._part_layer_locked(
+                        layers.get(base_name, {}), part_index, create=False
+                    ) if isinstance(layers.get(base_name), dict) else None
+                    missing = [
+                        label for point, label in (
+                            ("left_most_pos", "最左"),
+                            ("right_most_pos", "最右"),
+                        ) if not (isinstance(part, dict)
+                                  and isinstance(part.get(point), dict)
+                                  and "x" in part[point] and "y" in part[point])
+                    ]
+                    if missing:
+                        errors.append(
+                            f"分区{part_index + 1} 的 {base_name} 缺少{'、'.join(missing)}点"
+                        )
+                return tuple(errors)
             for name in route:
                 layer = layers.get(name)
                 missing = [
@@ -585,6 +615,7 @@ class PatrolController:
             # over without a stale start/end selection.
             self._profile["patrol_start_layer"] = ""
             self._profile["patrol_end_layer"] = ""
+            self._profile.pop("split_points", None)
             self._profile["layers"] = {
                 "layer1": {
                     "y_tolerance": 0.020000,
@@ -624,6 +655,180 @@ class PatrolController:
 
     def snapshot_layers(self) -> dict[str, Any]:
         return self.snapshot().layers
+
+    def _split_points_locked(self) -> list[dict[str, Any]]:
+        """Return valid split boundaries in stable left-to-right order."""
+
+        raw = self._profile.get("split_points", [])
+        if not isinstance(raw, list):
+            return []
+        points: list[dict[str, Any]] = []
+        for point in raw:
+            if not isinstance(point, dict):
+                continue
+            try:
+                x = float(point["x"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0.02 <= x <= 0.98:
+                points.append(point)
+        return sorted(points, key=lambda item: float(item["x"]))
+
+    def _part_index_for_x_locked(self, x: float) -> int:
+        """Map X to its half-open left-to-right split part."""
+
+        return sum(1 for point in self._split_points_locked()
+                   if float(x) >= float(point["x"]))
+
+    def _part_layer_locked(
+        self, layer: dict[str, Any], part_index: int, *, create: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        parts = layer.get("part_points")
+        if not isinstance(parts, dict):
+            if not create:
+                return None
+            parts = layer["part_points"] = {}
+        key = str(max(0, int(part_index)))
+        part = parts.get(key)
+        if not isinstance(part, dict) and create:
+            part = parts[key] = {
+                "y_tolerance": float(layer.get("y_tolerance", 0.020000)),
+                "world_y_tolerance": float(layer.get("world_y_tolerance", 0.75)),
+            }
+        return part if isinstance(part, dict) else None
+
+    def record_split_point(
+        self, player_x: float, player_y: float,
+        layout: Optional[CoordinateLayout] = None,
+    ) -> RecordedEndpoint:
+        """Create a vertical map boundary and migrate legacy points by X.
+
+        The first boundary turns a flat recording into parts.  Original flat
+        points remain on disk for a safe rollback, but split-aware consumers
+        read only ``part_points`` afterwards.
+        """
+
+        with self._lock:
+            x = round(max(0.02, min(0.98, float(player_x))), 6)
+            for existing in self._split_points_locked():
+                if abs(float(existing["x"]) - x) < 0.010:
+                    raise ValueError("分区线距离已有分区线不足 0.010 X")
+            point: dict[str, Any] = {
+                "x": x,
+                "y": round(max(0.02, min(0.98, float(player_y))), 6),
+                "source": "manual-ui",
+            }
+            if layout is not None:
+                stable_x, stable_y = layout.stable_point(player_x, player_y)
+                point["coordinate_v2"] = {
+                    "x_diamond": round(stable_x, 6),
+                    "y_diamond": round(stable_y, 6),
+                    "recorded_layout": layout.as_dict(),
+                }
+            splits = self._profile.setdefault("split_points", [])
+            if not isinstance(splits, list):
+                splits = self._profile["split_points"] = []
+            splits.append(point)
+            splits.sort(key=lambda item: float(item.get("x", 0.0)))
+            # Repartition every time a boundary is added.  An earlier part
+            # may now be cut in two, so keeping its old numeric key would put
+            # a point on the wrong side of the new wave.
+            for layer in self._profile.get("layers", {}).values():
+                if not isinstance(layer, dict):
+                    continue
+                old_parts = layer.get("part_points")
+                parts: dict[str, Any] = {}
+                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points"):
+                    values: list[Any] = []
+                    if isinstance(old_parts, dict):
+                        for old_part in old_parts.values():
+                            if not isinstance(old_part, dict):
+                                continue
+                            value = old_part.get(name)
+                            values.extend(value if isinstance(value, list) else [value])
+                    else:
+                        value = layer.get(name)
+                        values = value if isinstance(value, list) else [value]
+                    for item in values:
+                        if not isinstance(item, dict) or "x" not in item:
+                            continue
+                        index = self._part_index_for_x_locked(float(item["x"]))
+                        target = parts.setdefault(str(index), {
+                            "y_tolerance": float(layer.get("y_tolerance", 0.020000)),
+                            "world_y_tolerance": float(layer.get("world_y_tolerance", 0.75)),
+                        })
+                        # Existing flat recordings already have the canonical
+                        # layer anchors.  Preserve them per part so a newly
+                        # split map can start patrol immediately instead of
+                        # demanding every point be re-recorded.
+                        for anchor_key in (
+                            "layer_y", "layer_world_y", "y_tolerance_diamonds",
+                            "world_y_tolerance",
+                        ):
+                            if anchor_key in layer:
+                                target.setdefault(anchor_key, deepcopy(layer[anchor_key]))
+                        if name in ("jump_points", "skill_points"):
+                            target.setdefault(name, []).append(deepcopy(item))
+                        else:
+                            target[name] = deepcopy(item)
+                for part in parts.values():
+                    _recalculate_layer_band(part)
+                layer["part_points"] = parts
+                layer.setdefault("patrol_times", 1)
+            self._persist_locked()
+            return RecordedEndpoint(self._selected_layer, "split_point", x, point["y"])
+
+    def record_skill_point(
+        self, player_x: float, player_y: float, key: str,
+        layout: Optional[CoordinateLayout] = None,
+    ) -> RecordedEndpoint:
+        """Store one one-shot skill trigger in the current split part."""
+
+        key = str(key).strip().casefold()
+        # Must stay aligned with the regular attack-key picker.  Skill points
+        # use MotionArbiter's normal action path, so accepting a key which the
+        # normal attack picker cannot send would create a saved dead point.
+        bindable_keys = {
+            "shift", "ctrl", "space", "delete", "end", "pagedown",
+            "pageup", "home", "insert", "q", "w", "e", "r", "t",
+            "y", "u", "i", "o", "p", "a", "s", "d", "f", "g",
+            "h", "j", "k", "l", "x", "c", "v", "b", "n", "m",
+            "slash", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        }
+        if key not in bindable_keys:
+            raise ValueError("技能键必须是攻击键可绑定的按键")
+        with self._lock:
+            layer_name = self._selected_layer
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                raise ValueError("没有可录制的楼层；请先点击「添加楼层」")
+            point: dict[str, Any] = {
+                "x": round(max(0.02, min(0.98, float(player_x))), 6),
+                "y": round(max(0.02, min(0.98, float(player_y))), 6),
+                "key": key, "source": "manual-ui",
+            }
+            if layout is not None:
+                stable_x, stable_y = layout.stable_point(player_x, player_y)
+                point["coordinate_v2"] = {
+                    "x_diamond": round(stable_x, 6),
+                    "y_diamond": round(stable_y, 6),
+                    "recorded_layout": layout.as_dict(),
+                }
+            target = (self._part_layer_locked(
+                layer, self._part_index_for_x_locked(point["x"]), create=True,
+            ) if self._split_points_locked() else layer)
+            assert target is not None
+            target.setdefault("skill_points", []).append(point)
+            self._persist_locked()
+            return RecordedEndpoint(layer_name, "skill_point", point["x"], point["y"])
+
+    def set_layer_patrol_times(self, layer_name: str, times: int) -> None:
+        with self._lock:
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                raise ValueError(f"未知楼层：{layer_name}")
+            layer["patrol_times"] = max(1, min(99, int(times)))
+            self._persist_locked()
 
     def _adaptive_ready_locked(self, name: str) -> bool:
         """True when every recorded action point on *name* is adaptive.
@@ -863,6 +1068,42 @@ class PatrolController:
                 )
             layers = self._profile["layers"]
             layer = layers[layer_name]
+            # A split map stores action points in the part containing the
+            # current marker.  Keep every part's Y envelope independent: a
+            # bench in part 1 must never make layer2 appear present in part 2.
+            split_mode = bool(self._split_points_locked())
+            target_layer = (
+                self._part_layer_locked(
+                    layer, self._part_index_for_x_locked(float(player_x)),
+                    create=True,
+                ) if split_mode else layer
+            )
+            assert target_layer is not None
+            if split_mode:
+                point = target_layer.setdefault(boundary, {})
+                point["x"] = round(max(0.02, min(0.98, float(player_x))), 6)
+                point["y"] = round(max(0.02, min(0.98, float(player_y))), 6)
+                point["source"] = "manual-ui"
+                if layout is not None:
+                    stable_x, stable_y = layout.stable_point(player_x, player_y)
+                    point["coordinate_v2"] = {
+                        "x_diamond": round(stable_x, 6),
+                        "y_diamond": round(stable_y, 6),
+                        "recorded_layout": layout.as_dict(),
+                    }
+                if world_y is not None:
+                    point["world_y"] = round(float(world_y), 6)
+                    point["tracking_confidence"] = round(float(tracking_confidence or 0.0), 6)
+                    target_layer["layer_world_y"] = round(float(world_y), 6)
+                target_layer["layer_y"] = round(float(player_y), 6)
+                target_layer["layer_y_source"] = "manual-ui"
+                _recalculate_layer_band(target_layer)
+                layer.setdefault("patrol_times", 1)
+                route = self._profile.setdefault("route_order", [])
+                if layer_name not in route:
+                    route.append(layer_name)
+                self._persist_locked()
+                return RecordedEndpoint(layer_name, boundary, float(point["x"]), float(point["y"]))
             if boundary == "rope_pos" and layer_name == self._final_layer_name_locked():
                 raise ValueError(
                     "最上层无法录制绳索点：绳索用于爬到上一层，"
@@ -1037,9 +1278,15 @@ class PatrolController:
                     "y_diamond": round(stable_y, 6),
                     "recorded_layout": layout.as_dict(),
                 }
-            points = layer.setdefault("jump_points", [])
+            target_layer = (
+                self._part_layer_locked(
+                    layer, self._part_index_for_x_locked(point["x"]), create=True,
+                ) if self._split_points_locked() else layer
+            )
+            assert target_layer is not None
+            points = target_layer.setdefault("jump_points", [])
             if not isinstance(points, list):
-                points = layer["jump_points"] = []
+                points = target_layer["jump_points"] = []
             points.append(point)
             self._persist_locked()
             return RecordedEndpoint(layer_name, "jump_point", point["x"], point["y"])
@@ -1065,12 +1312,61 @@ class PatrolController:
             self._persist_locked()
             return True
 
+    def delete_axis_point(
+        self, layer_name: str, point_kind: str, point_x: float,
+        index: Optional[int] = None,
+    ) -> bool:
+        """Remove one displayed axis point, including one inside a split part.
+
+        ``index`` is local to the point list in the owning part, exactly as it
+        was when the canvas was drawn.  The X position locates that part after
+        a split; it avoids treating the displayed, sorted canvas order as the
+        storage order.
+        """
+
+        allowed = set(REQUIRED_LAYER_POINTS) | {"jump_point", "skill_point"}
+        if point_kind not in allowed:
+            raise ValueError(f"不支持的点类型：{point_kind}")
+        with self._lock:
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                return False
+            target = (
+                self._part_layer_locked(
+                    layer, self._part_index_for_x_locked(float(point_x)),
+                    create=False,
+                ) if self._split_points_locked() else layer
+            )
+            if not isinstance(target, dict):
+                return False
+            if point_kind in ("jump_point", "skill_point"):
+                field = f"{point_kind}s"
+                points = target.get(field)
+                if not isinstance(points, list) or index is None:
+                    return False
+                point_index = int(index)
+                if not (0 <= point_index < len(points)):
+                    return False
+                points.pop(point_index)
+                if not points:
+                    target.pop(field, None)
+            elif target.pop(point_kind, None) is None:
+                return False
+            _recalculate_layer_band(target)
+            self._persist_locked()
+            return True
+
     def _project_layers_locked(
         self, layers: dict[str, Any], layout: CoordinateLayout
     ) -> None:
         for layer in layers.values():
             if not isinstance(layer, dict):
                 continue
+            part_points = layer.get("part_points")
+            if isinstance(part_points, dict):
+                # Project each part independently; its stored points follow
+                # the same coordinate contract as legacy flat layer points.
+                self._project_layers_locked(part_points, layout)
             projected_y: list[float] = []
             adaptive_points = 0
             incompatible_layout = False

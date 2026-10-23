@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from atomic_motion import AtomicMotionRunner
 from combo_attack import ComboAttackPlan
 
 
@@ -45,9 +46,10 @@ class AttackWorker(threading.Thread):
         motion_arbiter: Any = None,
         direction_transition_event: Optional[threading.Event] = None,
         jump_attack: bool = False,
-        jump_attack_delay: float = 0.3,
+        jump_attack_delay: float = 0.155,
         attack_resume_event: Optional[threading.Event] = None,
         attack_slot: Any = None,
+        atomic_motion_runner: Optional[AtomicMotionRunner] = None,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
@@ -73,7 +75,7 @@ class AttackWorker(threading.Thread):
         # pressed opposite direction.
         self.direction_transition_event = direction_transition_event
         # 跳跃攻击 mode: every cadence beat emits a bundle - jump (Alt) first,
-        # then the attack key ``jump_attack_delay`` (default 0.3s) later.  The
+        # then the attack key ``jump_attack_delay`` (default 155ms) later. The
         # jump belongs to the attack bundle in this mode, so NO jump event is
         # registered into the motion-arbiter queue.
         self.jump_attack = bool(jump_attack)
@@ -86,6 +88,11 @@ class AttackWorker(threading.Thread):
         # not schedule an attack; it only changes the key for an approved
         # cadence beat, so a hit cannot race a movement correction.
         self.attack_slot = attack_slot
+        # The sequence runner owns Alt -> airborne gap -> attack as one
+        # combat-lane transaction.  This worker still owns the existing
+        # MotionArbiter attack lease around that call; the sequence is not a
+        # second queued arbiter motion and never touches patrol Left/Right.
+        self.atomic_motion_runner = atomic_motion_runner
         # 站桩攻击 only.  In stand-still mode the anchor correction and 小碎步
         # carry their own attack as the beat itself, so the cadence must not add
         # a second one right after them (see ``spacing_wait_seconds``).  On
@@ -137,11 +144,23 @@ class AttackWorker(threading.Thread):
         normal ``tap`` method, which holds the scan code for 25 ms just like
         the reliable potion input path.
 
-        In 跳跃攻击 mode the beat is a bundle: tap the jump key (Alt), wait
-        ``jump_attack_delay`` (300ms), then tap the configured attack key.
+        In 跳跃攻击 mode the beat is a bundle: Alt for 45ms, then 155ms of
+        airborne gap, then the configured attack key.  The attack therefore
+        begins 200ms after Alt-down.
         """
 
         key = self.attack_key if attack_key is None else attack_key
+        runner = self.atomic_motion_runner
+        if runner is not None:
+            return runner.execute_combat_attack(
+                key,
+                jump_attack_enabled=self.jump_attack,
+                allowed=self._combat_input_allowed,
+                label="fixed-cadence",
+            )
+
+        # Compatibility path for integrations that have not supplied the
+        # atomic runner yet.
         if self.jump_attack:
             tap = getattr(self.key_sender, "tap", None)
             if not callable(tap):
@@ -173,6 +192,19 @@ class AttackWorker(threading.Thread):
                 return False
             return key_up(key) is not False
         return False
+
+    def _combat_input_allowed(self) -> bool:
+        """Whether a currently running combat bundle may complete safely."""
+
+        if not self.enabled or self.stop_event.is_set():
+            return False
+        if (self.automation_active_event is not None
+                and not self.automation_active_event.is_set()):
+            return False
+        return not (
+            self.climbing_active_event is not None
+            and self.climbing_active_event.is_set()
+        )
 
     def next_delay(self) -> float:
         """Configured attack interval plus the configured random gap."""
