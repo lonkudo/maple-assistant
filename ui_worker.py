@@ -4294,6 +4294,10 @@ class UiWorker(threading.Thread):
             clear_server_secret()
             self._revoke_saved_license()
             self._self_unbound_this_session = True
+            # A heartbeat that began before the detach still describes the old
+            # binding.  Its result must not repaint or unlock this now-unbound
+            # computer after the server has accepted the detach.
+            self._license_heartbeat_generation += 1
             old = self._license_status
             self._license_status = LicenseStatus(
                 False, "unbound", "授权已解绑，请在新设备激活授权。",
@@ -5211,6 +5215,10 @@ class UiWorker(threading.Thread):
         self._license_status = self._preserve_server_identity(activation_status)
         self._save_license_attempt(code, self._license_status)
         if self._license_status.valid:
+            # A freshly accepted activation is the only path that may turn a
+            # session-local "已解绑" caption back into the clickable "解绑".
+            # It is safe even when the replacement binds to this same device.
+            self._self_unbound_this_session = False
             self._license_session_locked = False
             self._refresh_license_ui()
             LOG.info("license activated id=%s", self._license_status.license_id)
