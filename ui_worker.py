@@ -1918,6 +1918,11 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(0, 8))
+            ttk.Radiobutton(
+                mode_row, text="死花模式", value="dead_flower",
+                variable=self._attack_mode_var,
+                command=self._fixed_on_mode_change,
+            ).pack(side="left")
             fixed_key_row = ttk.Frame(fixed_panel)
             self._fixed_key_row = fixed_key_row
             fixed_key_row.pack(fill="x", pady=(4, 0))
@@ -3817,10 +3822,24 @@ class UiWorker(threading.Thread):
         marker-return check after a completed auto-lie pass.
         """
 
+        # The auto-lie outcome watcher has two independent evidence paths:
+        # the success panel uses the newest raw capture, while black-room
+        # failure uses the minimap marker from a DebugSnapshot.  Without this
+        # explicit live consumer, ``last_snapshot`` can remain an old
+        # pre-pass frame after the transport closes, so a visibly missing
+        # marker is never allowed to reach its consecutive-frame threshold
+        # and the close-timeout fallback incorrectly records success.
+        outcome_watch = self._auto_lie_outcome_state
+        outcome_marker_watch_active = bool(
+            outcome_watch
+            and not outcome_watch.get("terminal")
+            and not outcome_watch.get("timed_out")
+        )
         return bool(
             self._SHOW_MINIMAP_PREVIEW
             or self._SHOW_DETECTION_INFO
             or self._auto_lie_marker_verification is not None
+            or outcome_marker_watch_active
         )
 
     def _poll_body(self, root: Any) -> None:
@@ -5083,6 +5102,9 @@ class UiWorker(threading.Thread):
                 stationary_setter = getattr(mover, "set_stationary_attack_enabled", None)
                 if callable(stationary_setter):
                     stationary_setter(False)
+                dead_flower_setter = getattr(mover, "set_dead_flower_mode", None)
+                if callable(dead_flower_setter):
+                    dead_flower_setter(False)
                 jump_setter = getattr(mover, "set_jump_attack_enabled", None)
                 if callable(jump_setter):
                     jump_setter(False)
@@ -8780,7 +8802,7 @@ class UiWorker(threading.Thread):
             return
         mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "stationary")):
+                and mode not in ("fixed", "stationary", "dead_flower")):
             mode = "fixed"
             self._attack_mode_var.set("fixed")
         # Layout is intentionally not refreshed here.  Sliders and long-hold
@@ -8911,8 +8933,9 @@ class UiWorker(threading.Thread):
             return
         mode = str(data.get("attack_mode", "fixed"))
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "stationary")):
+                and mode not in ("fixed", "stationary", "dead_flower")):
             mode = "fixed"
+        dead_flower_mode = mode == "dead_flower"
         jump_attack_enabled = bool(data.get(
             "jump_attack_enabled",
             data.get("stationary_jump_enabled", False),
@@ -8934,11 +8957,14 @@ class UiWorker(threading.Thread):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
                         key, worker.attack_key)
         worker.set_combo_attack(
-            bool(data.get("combo_attack_enabled", False)),
+            bool(data.get("combo_attack_enabled", False)) and not dead_flower_mode,
             data.get("combo_attack_slots", ()),
         )
         mover = getattr(self, "movement_worker", None)
         if mover is not None:
+            dead_flower_setter = getattr(mover, "set_dead_flower_mode", None)
+            if callable(dead_flower_setter):
+                dead_flower_setter(dead_flower_mode)
             mover.small_step_attack_key = worker.attack_key
             jump_setter = getattr(mover, "set_jump_attack_enabled", None)
             if callable(jump_setter):
@@ -8946,7 +8972,7 @@ class UiWorker(threading.Thread):
             counterattack_setter = getattr(mover, "set_counterattack", None)
             if callable(counterattack_setter):
                 counterattack_setter(
-                    bool(data.get("counterattack_enabled", False)),
+                    bool(data.get("counterattack_enabled", False)) and not dead_flower_mode,
                     str(data.get("counterattack_key", "ctrl")).strip(),
                 )
             stationary_setter = getattr(
@@ -8997,7 +9023,7 @@ class UiWorker(threading.Thread):
         mode = str(self._attack_mode_var.get())
         fixed_mode = (
             not self._YOLO_MONSTER_DETECTION_ENABLED
-            or mode in ("fixed", "stationary")
+            or mode in ("fixed", "stationary", "dead_flower")
         )
         if fixed_mode:
             # Only one attack engine at a time: selecting Fixed Attack stops
@@ -9019,7 +9045,11 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_fixed_status"):
             if fixed_mode:
                 interval = float(self._fixed_interval_var.get())
-                if mode == "stationary":
+                if mode == "dead_flower":
+                    self._fixed_status.configure(
+                        text="死花模式已启用 - 不移动、不攻击；仅使用已启用的 Buff 与 HP/MP 药水。"
+                    )
+                elif mode == "stationary":
                     self._fixed_status.configure(
                         text=(f"站桩攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；"
@@ -9082,10 +9112,10 @@ class UiWorker(threading.Thread):
                     self._attack_mode_var.set("stationary")
                     if hasattr(self, "_jump_attack_enabled_var"):
                         self._jump_attack_enabled_var.set(True)
-                elif mode in ("yolo", "fixed", "stationary"):
+                elif mode in ("yolo", "fixed", "stationary", "dead_flower"):
                     self._attack_mode_var.set(mode)
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
-                if self._attack_mode_var.get() not in ("fixed", "stationary"):
+                if self._attack_mode_var.get() not in ("fixed", "stationary", "dead_flower"):
                     self._attack_mode_var.set("fixed")
             if "interval_seconds" in data:
                 self._fixed_interval_var.set(
@@ -11193,7 +11223,8 @@ class UiWorker(threading.Thread):
         # worker still follows an old route endpoint/temporary anchor.
         self._fixed_on_change()
         stationary_mode = self._stationary_attack_selected()
-        if not stationary_mode and not self.patrol_controller.can_start():
+        dead_flower_mode = self._dead_flower_selected()
+        if not (stationary_mode or dead_flower_mode) and not self.patrol_controller.can_start():
             route_errors = self.patrol_controller.validate_patrol_route()
             # Logged, not only shown: this refusal used to leave no trace in the log the operator
             # sends, so "the patrol toggle does nothing" was undiagnosable.
@@ -11250,8 +11281,12 @@ class UiWorker(threading.Thread):
                 and self._attack_mode_var.get() == "yolo"):
             self._yolo_start()
         self._refresh_patrol_controls()
-        if str(getattr(self, "_attack_mode_var", None).get()
-               if hasattr(self, "_attack_mode_var") else "fixed") == "stationary":
+        if dead_flower_mode:
+            self._control_status.configure(
+                text="死花模式已开始：仅 Buff 与 HP/MP 药水运行。"
+            )
+        elif str(getattr(self, "_attack_mode_var", None).get()
+                 if hasattr(self, "_attack_mode_var") else "fixed") == "stationary":
             self._control_status.configure(text="运行已开始。")
         else:
             self._control_status.configure(text="运行已开始。")
@@ -11401,6 +11436,20 @@ class UiWorker(threading.Thread):
             "stationary_attack_enabled", False,
         ))
 
+    def _dead_flower_selected(self) -> bool:
+        """Whether Buff/HP/MP-only mode bypasses route and minimap gates."""
+
+        mode_var = getattr(self, "_attack_mode_var", None)
+        if mode_var is not None:
+            try:
+                if str(mode_var.get()) == "dead_flower":
+                    return True
+            except Exception:
+                pass
+        return bool(getattr(
+            getattr(self, "movement_worker", None), "dead_flower_mode", False,
+        ))
+
     def _add_layer_above(self) -> bool:
         if self.patrol_controller is None:
             self._control_status.configure(text="巡逻控制器不可用。")
@@ -11535,6 +11584,7 @@ class UiWorker(threading.Thread):
         # route completeness requirement.
         can_start = (
             self._stationary_attack_selected()
+            or self._dead_flower_selected()
             or self.patrol_controller.can_start()
         )
         selected = self.patrol_controller.selected_layer()
@@ -11553,6 +11603,7 @@ class UiWorker(threading.Thread):
             running,
             can_start,
             self._stationary_attack_selected(),
+            self._dead_flower_selected(),
             selected,
             tuple(layer_names),
             repr(snapshot.layers),
@@ -11590,6 +11641,7 @@ class UiWorker(threading.Thread):
             and not running
             and not self._patrol_stop_pending
             and not self._stationary_attack_selected()
+            and not self._dead_flower_selected()
             and not can_start
         )
         if show_patrol_start_hint:

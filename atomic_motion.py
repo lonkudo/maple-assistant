@@ -20,9 +20,9 @@ LOG = logging.getLogger(__name__)
 
 
 # Requested timings, measured from Alt-down.  The combat key therefore begins
-# 200 ms after the jump starts: Alt held 45 ms, then 155 ms of airborne gap.
+# 100 ms after the jump starts: Alt held 45 ms, then 55 ms of airborne gap.
 JUMP_ATTACK_ALT_HOLD_SECONDS = 0.045
-JUMP_ATTACK_AIR_GAP_SECONDS = 0.155
+JUMP_ATTACK_AIR_GAP_SECONDS = 0.055
 ATTACK_TAP_HOLD_SECONDS = 0.045
 
 
@@ -106,7 +106,7 @@ class AtomicMotionRunner:
         """Emit a normal or jump-combat attack as one indivisible sequence.
 
         ``jump_attack_enabled`` is supplied as a value, not read later from
-        UI state.  A checkbox change during the 155 ms airborne gap therefore
+        UI state.  A checkbox change during the 55 ms airborne gap therefore
         cannot turn an already-started sequence into a malformed half-motion.
         """
 

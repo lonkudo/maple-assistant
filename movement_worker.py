@@ -4150,6 +4150,10 @@ class MovementWorker(threading.Thread):
         # configured recorded route, it borrows that route to climb back after
         # a fall.  It never writes an anchor into the map.
         self.stationary_attack_enabled = False
+        # 死花模式 keeps the automation session alive solely for StatusWorker's
+        # Buff and HP/MP potion keys.  MovementWorker must never plan or send
+        # route, rope, jump, recovery, or counterattack input in that mode.
+        self.dead_flower_mode = False
         # UI-only association of the temporary standing point with an
         # existing recorded layer.  It remains visible even when the route
         # configuration is not sufficient to arm a return.
@@ -7597,6 +7601,40 @@ class MovementWorker(threading.Thread):
                 "stationary attack mode %s",
                 "enabled; awaiting temporary Start Patrol position" if enabled else "disabled",
             )
+
+    def set_dead_flower_mode(self, enabled: bool) -> None:
+        """Toggle Buff/HP/MP-only mode while preserving queued Buff taps."""
+
+        enabled = bool(enabled)
+        if self.dead_flower_mode == enabled:
+            return
+        self.dead_flower_mode = enabled
+        if not enabled:
+            LOG.info("dead flower mode disabled; movement planning restored")
+            return
+
+        # This transition may happen while normal patrol is running. Release
+        # only movement-owned keys and clear only movement-owned queue items;
+        # an already queued buff remains valid and must still be delivered.
+        self._release_walk_hold()
+        self._release_climb_up()
+        self._climb_state = ClimbState()
+        self._return_mode = None
+        self._return_from_floor = None
+        self._return_arrival_floor = None
+        self._descending_to_first = False
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
+        if self.moving_active_event is not None:
+            self.moving_active_event.clear()
+        cancel = getattr(self.motion_arbiter, "cancel_pending_movement", None)
+        if callable(cancel):
+            cancel("死花模式启用")
+        LOG.info(
+            "dead flower mode enabled: movement/attacks disabled; Buff and HP/MP remain active"
+        )
 
     def stationary_route_anchor_marker(self) -> Optional[tuple[str, Point, str]]:
         """Temporary layer-axis marker and selected facing for this session."""
@@ -12106,9 +12144,16 @@ class MovementWorker(threading.Thread):
         """
         decision = self.last_decision
         if (not _sender_is_safe(self.key_sender)
-                or self._movement_busy_now()
                 or (self.direction_transition_event is not None
                     and self.direction_transition_event.is_set())):
+            return False
+        if self.dead_flower_mode:
+            # Buff/HP/MP-only mode has no route stage by design.  Its Buff
+            # path is therefore independent of patrol-stage publication; it
+            # waits only for a real, still-active vertical/stair transaction
+            # to finish before tapping the configured Buff key.
+            return not self._movement_busy_now()
+        if self._movement_busy_now():
             return False
         if self.stationary_attack_enabled:
             # Stand-still attack has no climb/drop/route phase. Its anchor
@@ -12658,6 +12703,14 @@ class MovementWorker(threading.Thread):
                     self._automation_was_active = True
                 if self._patrol_started_at is None:
                     self._patrol_started_at = time.monotonic()
+                if self.dead_flower_mode:
+                    # The automation gate deliberately remains set so
+                    # StatusWorker can cast Buffs and consume HP/MP potions.
+                    # Do not inspect minimap state or issue any movement here.
+                    self.last_decision = MovementDecision(
+                        None, "dead flower mode: Buff/HP/MP only"
+                    )
+                    continue
                 # Attack priority: while the YOLO attack worker reports an
                 # active target, hold patrol movement so the character stands
                 # and fights - but only for a BOUNDED window.  Past

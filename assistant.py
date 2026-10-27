@@ -1711,6 +1711,17 @@ def main() -> int:
         # Start a new movement generation before arming input.  Delayed work
         # from a stopped patrol remains cancelled until this exact point.
         movement_worker.arm_patrol_input()
+        if bool(getattr(movement_worker, "dead_flower_mode", False)):
+            # 死花模式 intentionally has no marker, minimap, recorded-layer,
+            # or route dependency.  It only needs a foreground game window,
+            # then StatusWorker may cast Buffs and use HP/MP potions.
+            logging.info(
+                "DEAD FLOWER startup: skipping minimap/marker/route calibration; "
+                "arming Buff + HP/MP only"
+            )
+            return _start_live_input(
+                key_sender, automation_active, None, patrol_preparing,
+            )
         armed = _start_live_input(
             key_sender, automation_active,
             lambda: prepare_map_session(

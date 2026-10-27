@@ -407,6 +407,36 @@ class MotionArbiter(threading.Thread):
         LOG.info("motion arbiter cancelled %d counterattack(s): %s", len(removed), reason)
         return len(removed)
 
+    def cancel_pending_movement(self, reason: str = "movement disabled") -> int:
+        """Discard unstarted movement actions without discarding queued Buffs."""
+
+        prefixes = (JUMP, MICRO_STEP, STAIR_JUMP, FACING, STEP, COUNTERATTACK)
+        callbacks: list[Any] = []
+        with self._cv:
+            executing = self._executing_token
+            removed = [
+                token for token in self._pending
+                if token != executing and any(
+                    token == prefix or token.startswith(f"{prefix}:")
+                    for prefix in prefixes
+                )
+            ]
+            if not removed:
+                return 0
+            self._pending = deque(
+                token for token in self._pending if token not in removed
+            )
+            for token in removed:
+                self._queued.discard(token)
+                callbacks.extend(self._stair_jump_completion_callbacks.pop(token, []))
+            self._cv.notify_all()
+        self._notify_buff_completion(callbacks, False)
+        LOG.info(
+            "motion arbiter cancelled %d movement action(s): %s",
+            len(removed), reason,
+        )
+        return len(removed)
+
     def micro_step_pending(self) -> bool:
         """Whether the optional 小碎步 pair is queued or running.
 

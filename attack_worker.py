@@ -46,7 +46,7 @@ class AttackWorker(threading.Thread):
         motion_arbiter: Any = None,
         direction_transition_event: Optional[threading.Event] = None,
         jump_attack: bool = False,
-        jump_attack_delay: float = 0.155,
+        jump_attack_delay: float = 0.055,
         attack_resume_event: Optional[threading.Event] = None,
         attack_slot: Any = None,
         atomic_motion_runner: Optional[AtomicMotionRunner] = None,
@@ -75,7 +75,7 @@ class AttackWorker(threading.Thread):
         # pressed opposite direction.
         self.direction_transition_event = direction_transition_event
         # 跳跃攻击 mode: every cadence beat emits a bundle - jump (Alt) first,
-        # then the attack key ``jump_attack_delay`` (default 155ms) later. The
+        # then the attack key ``jump_attack_delay`` (default 55ms) later. The
         # jump belongs to the attack bundle in this mode, so NO jump event is
         # registered into the motion-arbiter queue.
         self.jump_attack = bool(jump_attack)
@@ -144,9 +144,9 @@ class AttackWorker(threading.Thread):
         normal ``tap`` method, which holds the scan code for 25 ms just like
         the reliable potion input path.
 
-        In 跳跃攻击 mode the beat is a bundle: Alt for 45ms, then 155ms of
+        In 跳跃攻击 mode the beat is a bundle: Alt for 45ms, then 55ms of
         airborne gap, then the configured attack key.  The attack therefore
-        begins 200ms after Alt-down.
+        begins 100ms after Alt-down.
         """
 
         key = self.attack_key if attack_key is None else attack_key
