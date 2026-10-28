@@ -134,6 +134,22 @@ MOVEMENT_STATUS_STEADY_LOG_SECONDS = 3.0
 # motion without recreating a line for every identical 5-fps capture.
 MOVEMENT_STATUS_POSITION_LOG_DELTA = 0.003
 
+# 死花模式: flower points sit on one rope.  Their X is the recorded rope X;
+# a pair of distinct Y positions makes an Up/Down loop.  The tolerance is a
+# little wider than one minimap marker row, while still keeping adjacent rope
+# stops separate. 增益1's configured interval drives the transition between
+# flower points; the route never invents a separate dwell timer.
+DEAD_FLOWER_X_TOLERANCE = 0.018
+DEAD_FLOWER_Y_TOLERANCE = 0.018
+DEAD_FLOWER_WALK_HOLD_SECONDS = 0.20
+DEAD_FLOWER_DROP_PROGRESS_Y = 0.018
+DEAD_FLOWER_DROP_MAX_ATTEMPTS = 3
+# Two flower points can be only 0.035 Y apart, so their 0.018-Y acceptance
+# bands can overlap by one quantised marker row.  After a Buff changes the
+# target, demand one real 0.003-Y movement in the requested direction before
+# the next point may be considered reached.
+DEAD_FLOWER_NEXT_POINT_PROGRESS_Y = 0.003
+
 
 # Stall recovery is only valid at the rope itself.  Keeping this threshold in
 # one place prevents the stall detector and its recovery action from drifting
@@ -161,6 +177,10 @@ ROPE_TARGET_SMOOTHING_ALPHA = 0.15
 # aligned and keeps the side it approached from, instead of flipping on marker
 # quantization noise.
 ROPE_JUMP_DIRECTION_DEAD_BAND = 0.002
+# Minimap capture normally arrives at 5 fps.  Start a lateral rope grab when
+# the live approach velocity says the marker will enter the physical jump band
+# during the next one capture interval, rather than waiting for that late frame.
+ROPE_PREGRAB_LOOKAHEAD_SECONDS = 0.200
 # Endpoint reversals need a real neutral input tick: Maple can otherwise
 # consume the new direction when it arrives in the old key-up poll slice.
 DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS = 0.10
@@ -1381,19 +1401,31 @@ def _directional_jump_climb(
     climb_duration: float,
     persistent_up: bool = False,
 ) -> bool:
-    """Press Alt+direction and immediately add Up for the rope grab.
+    """Launch a rope grab, adding Up shortly after the lateral jump edge.
 
     Left/Right/Up/Down are centrally serialized by ``WindowKeySender``.  A
-    lateral rope jump therefore holds Alt+Left/Right for its configured jump
-    window and presses Up immediately while that chord remains down.  Up is a
-    separate axis, so it does not conflict with Left/Right; sending it early
-    lets the character grab the rope at the top of the sideways arc instead
-    of first finishing a plain lateral jump.
+    A lateral Alt edge can be consumed by Maple as a plain side jump before
+    the next input packet arrives.  For Left/Right attempts, use the proven
+    selected rope-grab order: direction, Alt, then Up 10 ms later.  Centered
+    jumps retain their simultaneous Alt+Up packet.
     """
 
     if not _sender_is_safe(sender):
         LOG.warning("directional climb suppressed: target window is not safely selected")
         return False
+    if direction in ("left", "right"):
+        LOG.info(
+            "CLIMB recovery: %s, then Alt; Up follows 10ms later for rope grab",
+            direction,
+        )
+        return _jump_point_style_lateral_climb(
+            sender,
+            direction,
+            direction_hold,
+            climb_duration,
+            persistent_up=persistent_up,
+            alt_before_up_seconds=0.010,
+        )
     key_down = getattr(sender, "key_down", None)
     key_up = getattr(sender, "key_up", None)
     key_down_chord = getattr(sender, "key_down_chord", None)
@@ -1481,6 +1513,7 @@ def _jump_point_style_lateral_climb(
     climb_duration: float,
     *,
     persistent_up: bool = False,
+    alt_before_up_seconds: float = 0.010,
 ) -> bool:
     """Launch a rope retry in the proven recorded-jump-point input order.
 
@@ -1506,17 +1539,20 @@ def _jump_point_style_lateral_climb(
     alt_claimed = False
     succeeded = False
     try:
-        # Same ordering as perform_stair_jump(..., hold_up=True): a normal
-        # direction hold owns the horizontal arc, Up is present before the
-        # jump edge, and Alt is only the short jump tap.
+        # A normal direction hold owns the horizontal arc.  Trigger the jump
+        # edge first, then add Up after 10 ms so the grab input reaches Maple
+        # during the early jump motion instead of delaying its launch.
         direction_claimed = key_down(direction) is not False
         if not direction_claimed:
             return False
-        up_claimed = key_down("up") is not False
-        if not up_claimed:
-            return False
         alt_claimed = key_down("alt") is not False
         if not alt_claimed:
+            return False
+        # The rope grab has already launched.  Add Up 10 ms later while Alt
+        # remains down, so it is sampled in the jump's first motion window.
+        time.sleep(max(0.0, float(alt_before_up_seconds)))
+        up_claimed = key_down("up") is not False
+        if not up_claimed:
             return False
         time.sleep(0.03)
         key_up("alt")
@@ -2630,6 +2666,46 @@ class MovementWorker(threading.Thread):
         # shares the same lock as 小碎步, so no left/right pair can land between
         # Alt+side and the immediately-following Up grab.
         with self._direction_lock:
+            # The first rope grab follows an ordinary approach walk.  A normal
+            # ``key_up`` only releases that walk's one ledger claim; another
+            # delayed walk/arbiter claim can leave Left/Right physically down.
+            # In the field this made the first Alt+Up arrive as Left+Alt+Up,
+            # while retries worked because their direction switch happened to
+            # force-release the prior key.  Establish a clean boundary for
+            # the initial grab: cancel the approach hold and scrub either
+            # physical horizontal direction.  Do not wait after that release:
+            # a 10 ms neutral pause made the first Alt edge visibly later than
+            # its retries.  The lateral grab itself still adds Up 10 ms after
+            # Alt, while the centered case uses its immediate Alt+Up chord.
+            # This is intentionally only for ``idle`` -> first-grab; retries
+            # retain their own current-position direction selection.
+            if self._climb_state.phase == "idle":
+                prior_walk = self._walk_hold_key
+                if prior_walk in ("left", "right"):
+                    self._release_walk_hold()
+
+                is_key_down = getattr(self.key_sender, "is_key_down", None)
+                force_key_up = getattr(self.key_sender, "force_key_up", None)
+                key_up = getattr(self.key_sender, "key_up", None)
+                released: list[str] = []
+                for key in ("left", "right"):
+                    physically_down = (
+                        bool(is_key_down(key)) if callable(is_key_down)
+                        else key == prior_walk
+                    )
+                    if not physically_down:
+                        continue
+                    if callable(force_key_up):
+                        force_key_up(key, reason="rope grab neutral boundary")
+                    elif callable(key_up):
+                        key_up(key)
+                    released.append(key)
+                if released:
+                    LOG.info(
+                        "CLIMB initial grab boundary: released %s; launching "
+                        "rope jump immediately",
+                        "+".join(released),
+                    )
             result = climb(
             self.key_sender,
             observation,
@@ -2665,7 +2741,7 @@ class MovementWorker(threading.Thread):
                 # from the new floor's own rope.
                 self._resolve_fall(observation)
             else:
-                self._advance_after_climb()
+                self._advance_after_climb(observation)
         elif result == "failed-cycle-no-more-shift":
             # Both jump directions failed and the one-time correction is
             # used up: a stuck-under-the-rope character restarts the route
@@ -3902,6 +3978,14 @@ class MovementWorker(threading.Thread):
         self.near_rope_diamonds = (
             float(near_rope_diamonds) if near_rope_diamonds is not None else None
         )
+        # Updated from normal patrol's per-frame rope calculation.  Dead
+        # Flower uses it only for the layer1 -> rope jump gate, never for
+        # ordinary flower-point alignment.
+        self._current_rope_inner_distance = (
+            self.near_rope_inner_range
+            if self.near_rope_inner_range is not None
+            else (self.near_rope_range if self.near_rope_range is not None else 0.0)
+        )
         # |minimap gap| at which the character counts as DIRECTLY under the
         # rope: jump straight up (Alt+Up) instead of a left/right chord, so
         # the sideways jump cannot shove the character past the rope.
@@ -3996,6 +4080,12 @@ class MovementWorker(threading.Thread):
         self._route_layer_index: Optional[int] = None
         self._route_phase = "left"
         self._route_patrol_cycle = 1
+        # The first horizontal endpoint of a newly entered layer is chosen
+        # from the live marker position.  It remains fixed for every repeat
+        # of that layer, so patrol_times=2 is e.g. right -> left -> right ->
+        # left, rather than recalculating direction at every turn.
+        self._route_entry_phase: Optional[str] = None
+        self._route_entry_context: Optional[tuple[int, str]] = None
         # Start Patrol performs its own focused capture and floor detection.
         # Transfer that result into this worker on its next frame so a stale
         # Stop/Start climb, return, or route index cannot survive the restart.
@@ -4150,10 +4240,44 @@ class MovementWorker(threading.Thread):
         # configured recorded route, it borrows that route to climb back after
         # a fall.  It never writes an anchor into the map.
         self.stationary_attack_enabled = False
-        # 死花模式 keeps the automation session alive solely for StatusWorker's
-        # Buff and HP/MP potion keys.  MovementWorker must never plan or send
-        # route, rope, jump, recovery, or counterattack input in that mode.
+        # 死花模式 keeps the automation session alive for Buff/HP/MP and an
+        # optional private rope flower loop.  It never uses normal patrol,
+        # jump-point, recovery, rescue or counterattack input.
         self.dead_flower_mode = False
+        # 死花模式 uses a deliberately small private route machine.  It never
+        # enters the normal patrol phases, so its rope loop cannot be mistaken
+        # for a normal climb/return and it cannot wake attacks or rescue.
+        self.dead_flower_ground_enabled = False
+        self.dead_flower_ground_interval_seconds = 900.0
+        self.dead_flower_ground_jitter_seconds = 0.0
+        self._dead_flower_ground_next_at = float("inf")
+        self._dead_flower_phase = "flower"
+        self._dead_flower_target_index = 0
+        # StatusWorker owns the 增益1 key.  It must never mutate this
+        # movement state directly from its own thread: it posts one delivery
+        # event, which the 5-FPS movement loop consumes with its next marker.
+        self._dead_flower_state_lock = threading.Lock()
+        self._dead_flower_buff2_delivery_pending = False
+        self._dead_flower_rope_attached = False
+        self._dead_flower_target_requires_progress = False
+        self._dead_flower_target_source_y: Optional[float] = None
+        # Entry is classified once, from the first usable marker after Start.
+        # A character on layer1 must first attach to the rope; any other Y is
+        # already a rope entry and can immediately travel between flower points.
+        self._dead_flower_entry_checked = False
+        self._dead_flower_started_from_layer1 = False
+        # Separate from normal patrol's climb state.  Dead Flower entry may
+        # reuse the proven jump-to-rope algorithm, but it must never advance
+        # normal route/layer state or wake normal recovery.
+        self._dead_flower_entry_climb = ClimbState()
+        self._dead_flower_buff2_request: Any = None
+        self._dead_flower_buff2_cycle_started = False
+        self._dead_flower_buff2_unavailable_logged = False
+        self._dead_flower_vertical_key: Optional[str] = None
+        self._dead_flower_drop_start_y: Optional[float] = None
+        self._dead_flower_drop_attempts = 0
+        self._dead_flower_drop_retry_at = 0.0
+        self._dead_flower_ground_jump_tokens: set[int] = set()
         # UI-only association of the temporary standing point with an
         # existing recorded layer.  It remains visible even when the route
         # configuration is not sufficient to arm a return.
@@ -4481,6 +4605,10 @@ class MovementWorker(threading.Thread):
         self._last_climb_attempt = float("-inf")
         self._climb_state = ClimbState()
         self._rope_approach_direction: Optional[str] = None
+        # (route label, marker X, monotonic sample time).  It is deliberately
+        # local to rope approach prediction; normal patrol decisions never use
+        # this sample.
+        self._rope_pregrab_sample: Optional[tuple[str, float, float]] = None
         # Set while the character is dropping from the final layer all the
         # way down to the first layer.  While descending, layer resync is
         # suppressed so an intermediate platform cannot hijack the descent
@@ -4633,6 +4761,13 @@ class MovementWorker(threading.Thread):
 
         self._patrol_abort_event.clear()
         self.reset_other_player_switch(reason)
+        if self.dead_flower_mode:
+            # Stop → Start is a new Dead Flower session, not a continuation
+            # of a previous rope climb.  Retaining ``rope_attached`` or the
+            # second flower index here made a fresh layer1 start issue plain
+            # Up instead of the required Alt+Up / jump-to-rope sequence.
+            self._dead_flower_reset()
+            LOG.info("DEAD FLOWER: fresh input session; entry/flower state reset")
 
     def _stop_patrol_for_other_player_switch(self) -> None:
         """Stop patrol the way Stop Patrol does - but without disarming input.
@@ -4663,6 +4798,7 @@ class MovementWorker(threading.Thread):
         self._return_from_floor = None
         self._return_arrival_floor = None
         self._descending_to_first = False
+        self._rescue_active = False
         self._patrol_abort_event.set()
         force_key_up = getattr(self.key_sender, "force_key_up", None)
         if callable(force_key_up):
@@ -6786,6 +6922,59 @@ class MovementWorker(threading.Thread):
             return nearest
         return self._current_route_layer_with_grace(observation)
 
+    def _choose_route_entry_phase(
+        self,
+        layer_name: str,
+        observation: Optional[MinimapObservation],
+        *,
+        reason: str,
+    ) -> str:
+        """Choose the closer horizontal endpoint for one entered layer.
+
+        This is deliberately an entry decision, not a per-frame decision.
+        Once chosen, :meth:`_layer_phases` preserves that endpoint order for
+        the configured patrol repeats before the route moves to a rope/drop.
+        """
+
+        layer = self.important_positions.get(layer_name, {})
+        edges = [
+            edge for edge in ("left", "right")
+            if isinstance(layer, dict)
+            and isinstance(layer.get(f"{edge}_most_pos"), dict)
+        ]
+        if not edges:
+            chosen = "stand"
+        elif len(edges) == 1:
+            chosen = edges[0]
+        else:
+            player = observation.player if observation is not None else None
+            if player is None:
+                # A missing live marker cannot make a distance choice.  Keep
+                # the legacy left-first fallback until the route resolves it.
+                chosen = "left"
+            else:
+                chosen = min(
+                    edges,
+                    key=lambda edge: (
+                        abs(float(layer[f"{edge}_most_pos"]["x"])
+                            - float(player.x)),
+                        0 if edge == "left" else 1,
+                    ),
+                )
+        self._route_entry_phase = chosen if chosen in ("left", "right") else None
+        self._route_entry_context = (self._split_active_part, layer_name)
+        self._route_phase = chosen
+        self._route_patrol_cycle = 1
+        if observation is not None and observation.player is not None and chosen in ("left", "right"):
+            endpoint_x = float(layer[f"{chosen}_most_pos"]["x"])
+            LOG.info(
+                "route entry: %s %s first (marker_x=%.6f endpoint_x=%.6f, %s)",
+                layer_name, chosen, observation.player.x, endpoint_x, reason,
+            )
+        else:
+            LOG.info("route entry: %s %s first (%s)", layer_name, chosen, reason)
+        return chosen
+
     def _select_route_layer(self, observation: MinimapObservation | Point) -> None:
         if isinstance(observation, Point):
             observation = MinimapObservation(
@@ -6797,6 +6986,9 @@ class MovementWorker(threading.Thread):
         if detected_name is None:
             if len(self._route_layers) == 1:
                 self._route_layer_index = 0
+                self._choose_route_entry_phase(
+                    self._route_layers[0], observation, reason="single-layer fallback"
+                )
                 LOG.warning(
                     "single-layer fallback: selected %s marker_y=%s world_y=%s",
                     self._route_layers[0],
@@ -6814,8 +7006,9 @@ class MovementWorker(threading.Thread):
             )
             return
         self._route_layer_index = self._route_layers.index(detected_name)
-        LOG.info("route starting on %s: left-most -> right-most -> rope",
-                 self._route_layers[self._route_layer_index])
+        self._choose_route_entry_phase(
+            detected_name, observation, reason="route start"
+        )
 
     def _layer_band_contains(self, layer_name: str, y: float) -> bool:
         """True when the marker Y is inside the layer's recorded-point band."""
@@ -7304,10 +7497,9 @@ class MovementWorker(threading.Thread):
         if self._route_layer_index is None:
             self._clear_layer_resync_candidate()
             self._route_layer_index = detected_index
-            self._route_phase = "left"
-            self._route_patrol_cycle = 1
-            LOG.info("route starting on %s: left-most -> right-most -> rope",
-                     detected_name)
+            self._choose_route_entry_phase(
+                detected_name, observation, reason="layer confirmed"
+            )
             return detected_name
         if detected_index == self._route_layer_index:
             self._clear_layer_resync_candidate()
@@ -7392,8 +7584,10 @@ class MovementWorker(threading.Thread):
         # rescue streak is over.
         self._rescue_cycles = 0
         self._climb_lateral_streak = 0
-        self._route_phase = "left"
-        self._route_patrol_cycle = 1
+        self._choose_route_entry_phase(
+            detected_name, observation,
+            reason="climb arrival" if was_climbing else "layer resync",
+        )
         self._climb_state = ClimbState()
         self._aligned_frames = 0
         self._rope_approach_direction = None
@@ -7526,6 +7720,67 @@ class MovementWorker(threading.Thread):
             return "left"
         return None
 
+    def _rope_pregrab_jump_decision(
+        self,
+        observation: MinimapObservation,
+        rope_x: Optional[float],
+        inner_range: float,
+        near_range: float,
+        route_label: str,
+    ) -> Optional[MovementDecision]:
+        """Return an early lateral rope jump predicted one capture ahead.
+
+        This does not widen the *physical* rope jump band.  It compares two
+        fresh marker X samples and launches only when the marker is moving
+        toward the rope quickly enough to enter ``inner_range`` within 200 ms.
+        The next 5-fps frame would otherwise make the first Alt edge one full
+        capture late.  Climb retries are intentionally excluded: they already
+        have a newer marker position and their own state-machine timing.
+        """
+
+        player = observation.player
+        now = time.monotonic()
+        if player is None or rope_x is None:
+            self._rope_pregrab_sample = None
+            return None
+
+        sample = (str(route_label), float(player.x), now)
+        prior = self._rope_pregrab_sample
+        self._rope_pregrab_sample = sample
+        if (self._climb_state.phase != "idle" or prior is None
+                or prior[0] != sample[0]):
+            return None
+
+        elapsed = now - prior[2]
+        # A stale sample must never make a new route leg jump unexpectedly.
+        if elapsed < 0.05 or elapsed > 0.75:
+            return None
+        gap = float(rope_x) - float(player.x)
+        gap_abs = abs(gap)
+        if gap_abs <= inner_range or gap_abs > near_range:
+            return None
+        delta_x = sample[1] - prior[1]
+        # ``gap * delta_x`` is positive only while the marker moves toward the
+        # rope.  Ignore minimap jitter below one material position movement.
+        if gap * delta_x <= 0.0 or abs(delta_x) < 0.003:
+            return None
+        projected_toward = abs(delta_x) * (ROPE_PREGRAB_LOOKAHEAD_SECONDS / elapsed)
+        needed_to_band = gap_abs - inner_range
+        if projected_toward + 1e-9 < needed_to_band:
+            return None
+        direction = "right" if gap > 0.0 else "left"
+        LOG.info(
+            "ROPE pre-grab: player_x=%.6f rope_x=%.6f gap=%+.6f; "
+            "dx=%.6f/%.0fms predicts inner band in %.0fms -> Alt+%s now",
+            player.x, rope_x, gap, delta_x, elapsed * 1000.0,
+            ROPE_PREGRAB_LOOKAHEAD_SECONDS * 1000.0, direction,
+        )
+        return MovementDecision(
+            f"jump_climb_{direction}",
+            "rope pre-grab: predicted inner band one capture ahead",
+            self.minimum_final_hold_seconds,
+        )
+
     def _log_climb_direction(
         self,
         direction: str,
@@ -7610,6 +7865,7 @@ class MovementWorker(threading.Thread):
             return
         self.dead_flower_mode = enabled
         if not enabled:
+            self._dead_flower_reset()
             LOG.info("dead flower mode disabled; movement planning restored")
             return
 
@@ -7623,6 +7879,7 @@ class MovementWorker(threading.Thread):
         self._return_from_floor = None
         self._return_arrival_floor = None
         self._descending_to_first = False
+        self._rescue_active = False
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
         if self.dropping_active_event is not None:
@@ -7632,9 +7889,640 @@ class MovementWorker(threading.Thread):
         cancel = getattr(self.motion_arbiter, "cancel_pending_movement", None)
         if callable(cancel):
             cancel("死花模式启用")
+        self._dead_flower_reset()
+        # 重置花's timer does not begin merely because the mode was selected.
+        # It starts only after this run has confirmed a real rope attachment.
+        self._dead_flower_ground_next_at = float("inf")
         LOG.info(
-            "dead flower mode enabled: movement/attacks disabled; Buff and HP/MP remain active"
+            "dead flower mode enabled: normal patrol/attacks disabled; flower rope route, Buff and HP/MP remain active"
         )
+
+    def set_dead_flower_ground_schedule(
+        self, enabled: bool, interval_seconds: float, jitter_seconds: float,
+    ) -> None:
+        """Configure the optional 重置花 ground circuit for 死花模式.
+
+        The existing UI stores this value in seconds.  A due timer never
+        interrupts a mid-rope climb: it is consumed only after a flower-point
+        dwell, then the state machine drops, crosses the recorded layer1
+        endpoints, returns to its rope and resumes the flower loop.
+        """
+
+        self.dead_flower_ground_enabled = bool(enabled)
+        self.dead_flower_ground_interval_seconds = max(
+            STATIONARY_PICKUP_MIN_INTERVAL_SECONDS, float(interval_seconds),
+        )
+        self.dead_flower_ground_jitter_seconds = max(0.0, float(jitter_seconds))
+        with self._dead_flower_state_lock:
+            attached = self._dead_flower_rope_attached
+        self._dead_flower_ground_next_at = float("inf")
+        if self.dead_flower_ground_enabled and attached:
+            self._dead_flower_arm_ground_timer("重置花 configuration changed")
+        if not self.dead_flower_ground_enabled:
+            self._dead_flower_phase = "flower"
+        LOG.info(
+            "dead flower 重置花 %s interval=%.1fm random_gap=%.1fs",
+            "enabled" if self.dead_flower_ground_enabled else "disabled",
+            self.dead_flower_ground_interval_seconds / 60.0,
+            self.dead_flower_ground_jitter_seconds,
+        )
+
+    def _dead_flower_ground_delay(self) -> float:
+        return self.dead_flower_ground_interval_seconds + random.uniform(
+            0.0, self.dead_flower_ground_jitter_seconds,
+        )
+
+    def _dead_flower_arm_ground_timer(self, reason: str) -> None:
+        """Start 重置花 only after a confirmed attachment to its rope."""
+
+        if (not self.dead_flower_ground_enabled
+                or self._dead_flower_ground_next_at != float("inf")):
+            return
+        delay = self._dead_flower_ground_delay()
+        self._dead_flower_ground_next_at = time.monotonic() + delay
+        LOG.info(
+            "DEAD FLOWER 重置花: timer armed after %s; due in %.1fs",
+            reason, delay,
+        )
+
+    def _dead_flower_release_vertical(self) -> None:
+        key = self._dead_flower_vertical_key
+        if key:
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(key_up):
+                key_up(key)
+        self._dead_flower_vertical_key = None
+        entry_climb = self._dead_flower_entry_climb
+        if entry_climb.up_held and key != "up":
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(key_up):
+                key_up("up")
+        self._dead_flower_entry_climb = ClimbState()
+
+    def _dead_flower_reset(self) -> None:
+        self._release_walk_hold()
+        self._dead_flower_release_vertical()
+        with self._dead_flower_state_lock:
+            self._dead_flower_phase = "flower"
+            self._dead_flower_target_index = 0
+            self._dead_flower_buff2_delivery_pending = False
+            self._dead_flower_rope_attached = False
+            self._dead_flower_target_requires_progress = False
+            self._dead_flower_target_source_y = None
+            self._dead_flower_entry_checked = False
+            self._dead_flower_started_from_layer1 = False
+        self._dead_flower_buff2_cycle_started = False
+        self._dead_flower_buff2_unavailable_logged = False
+        self._dead_flower_drop_start_y = None
+        self._dead_flower_drop_attempts = 0
+        self._dead_flower_drop_retry_at = 0.0
+        self._dead_flower_ground_jump_tokens.clear()
+
+    def _dead_flower_enter_rope(
+        self, observation: MinimapObservation, rope_x: float,
+    ) -> str:
+        """Advance the private layer1 -> rope grab state machine one frame.
+
+        This is the exact established rope algorithm: centered entries use up
+        to two Alt+Up attempts, then the ordinary short side-step/side jump
+        recovery; off-centre entries jump toward the recorded rope.  Its
+        state is private, so no normal patrol route, climb arrival, rescue or
+        counterattack state can be changed by Dead Flower mode.
+        """
+
+        state = self._dead_flower_entry_climb
+        with self._direction_lock:
+            result = climb(
+                self.key_sender,
+                observation,
+                state,
+                climb_duration=self.climb_up_hold_seconds,
+                nudge_duration=self.climb_nudge_seconds,
+                y_change_required=self.climb_y_change_required,
+                world_y_change_required=self.climb_world_y_change_required,
+                world_y_stall_change_required=(
+                    self.climb_world_y_stall_change_required
+                ),
+                world_y_stall_frames=self.climb_world_y_stall_frames,
+                action_lock=self.climb_attack_lock,
+                persistent_up=True,
+                rope_x=rope_x,
+                straight_up_tolerance=self.under_rope_tolerance,
+            )
+        if result == "climbing-up":
+            with self._dead_flower_state_lock:
+                if not self._dead_flower_rope_attached:
+                    self._dead_flower_rope_attached = True
+                    LOG.info("DEAD FLOWER entry: rope attachment confirmed; climbing toward flower point")
+                    self._dead_flower_arm_ground_timer("rope attachment confirmed")
+        elif result in ("climb-stalled-retry", "failed-cycle-no-more-shift"):
+            # Keep retry ownership private to Dead Flower instead of allowing
+            # the ordinary patrol escalation to restart/drop the route.
+            self._dead_flower_entry_climb = ClimbState()
+        LOG.info("DEAD FLOWER entry rope recovery: %s", result)
+        return result
+
+    def set_dead_flower_buff2_request(self, callback: Any) -> None:
+        """Wire StatusWorker's 增益 1 timer without sharing worker ownership."""
+
+        self._dead_flower_buff2_request = callback
+
+    def dead_flower_buff2_delivery_allowed(self) -> bool:
+        """Allow 增益 1 only at the next reached flower point.
+
+        ``False`` means StatusWorker must retain the normal 增益1 arbiter path.
+        It becomes ``True`` only for a multi-layer Dead Flower route waiting
+        at its selected flower point.
+        """
+
+        if (not self.dead_flower_mode
+                or not self.dead_flower_ground_enabled
+                or self._dead_flower_route() is None):
+            return False
+        with self._dead_flower_state_lock:
+            return self._dead_flower_phase == "flower-await-buff2"
+
+    def notify_dead_flower_buff2_delivered(self) -> None:
+        """Post an 增益 1 delivery for the movement worker to consume.
+
+        This callback runs on StatusWorker.  Posting an event instead of
+        changing target/keys here keeps 死花 rope movement fully owned by the
+        movement worker and cannot interfere with other attack modes.
+        """
+
+        if not self.dead_flower_mode:
+            return
+        with self._dead_flower_state_lock:
+            if self._dead_flower_phase != "flower-await-buff2":
+                return
+            self._dead_flower_buff2_delivery_pending = True
+        LOG.info("DEAD FLOWER: 增益1 delivered; movement event posted for next flower")
+
+    def _consume_dead_flower_buff2_delivery(
+        self, flower_count: int, player_y: float,
+    ) -> bool:
+        """Advance a delivered flower 增益1 on the movement-owner thread."""
+
+        with self._dead_flower_state_lock:
+            if not self._dead_flower_buff2_delivery_pending:
+                return False
+            self._dead_flower_buff2_delivery_pending = False
+            self._dead_flower_target_index = (
+                self._dead_flower_target_index + 1
+            ) % max(1, flower_count)
+            self._dead_flower_phase = "flower"
+            # 增益1 can only be delivered after the movement worker placed
+            # the character at a recorded flower point.  That is positive
+            # rope-attachment evidence for the next vertical leg.
+            self._dead_flower_rope_attached = True
+            self._dead_flower_target_requires_progress = flower_count > 1
+            self._dead_flower_target_source_y = float(player_y)
+            next_index = self._dead_flower_target_index
+        LOG.info(
+            "DEAD FLOWER: 增益1 confirmed on rope; moving immediately to distinct flower point %d/%d",
+            next_index + 1, flower_count,
+        )
+        return True
+
+    def _dead_flower_route(self) -> Optional[tuple[str, dict[str, Any], list[Point]]]:
+        """Return the first recorded rope layer that owns flower points."""
+
+        # A one-layer 死花 setup is the original Buff/HP/MP-only mode.  Do not
+        # let an incidental rope or flower recording turn that simple setup
+        # into movement; the alternating rope route exists only for maps with
+        # at least two real recorded layers.
+        recorded_layers = sum(
+            1 for layer in self.important_positions.values()
+            if (isinstance(layer, dict)
+                and (_layer_present_actions(layer)
+                     or bool(layer.get("flower_points"))))
+        )
+        if recorded_layers < 2:
+            return None
+        for layer_name in sorted(self.important_positions, key=_layer_number):
+            layer = self.important_positions.get(layer_name)
+            if not isinstance(layer, dict):
+                continue
+            rope = layer.get("rope_pos") or layer.get("flower_rope_pos")
+            raw_points = layer.get("flower_points")
+            if not (isinstance(rope, dict) and isinstance(raw_points, list)):
+                continue
+            try:
+                flowers = [
+                    Point(float(item["x"]), float(item["y"]))
+                    for item in raw_points if isinstance(item, dict)
+                ]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not flowers:
+                continue
+            # Lower minimap Y is physically higher.  Start at the lower point
+            # and alternate upward; a single point is an idle Buff station.
+            flowers.sort(key=lambda point: point.y, reverse=True)
+            return layer_name, layer, flowers[:2]
+        return None
+
+    def _dead_flower_ground_layer(self) -> Optional[dict[str, Any]]:
+        """Return the lowest recorded ground layer for 重置花 traversal."""
+
+        candidates = sorted(self.important_positions, key=_layer_number)
+        for layer_name in candidates:
+            layer = self.important_positions.get(layer_name)
+            if not isinstance(layer, dict):
+                continue
+            if all(isinstance(layer.get(name), dict)
+                   for name in ("left_most_pos", "right_most_pos", "rope_pos")):
+                return layer
+        return None
+
+    @staticmethod
+    def _dead_flower_marker_is_on_layer1(
+        player: Point, ground: Optional[dict[str, Any]],
+    ) -> bool:
+        """Whether the entry marker belongs to the saved ground (layer1) band.
+
+        This is intentionally local to the Dead Flower entry decision.  It
+        uses the saved layer band, which already includes the minimap marker's
+        quantisation allowance; normal patrol layer resolution is untouched.
+        """
+
+        if not isinstance(ground, dict):
+            return False
+        try:
+            tolerance = float(ground.get("y_tolerance", 0.020000))
+        except (TypeError, ValueError):
+            tolerance = 0.020000
+        band = _layer_y_band(ground, tolerance)
+        return bool(band is not None and band[0] <= player.y <= band[1])
+
+    def _dead_flower_resolve_entry(
+        self, player: Point, flowers: list[Point],
+    ) -> None:
+        """Classify only the first Dead Flower marker; never merge same-X flowers."""
+
+        with self._dead_flower_state_lock:
+            if self._dead_flower_entry_checked:
+                return
+            self._dead_flower_entry_checked = True
+            on_layer1 = self._dead_flower_marker_is_on_layer1(
+                player, self._dead_flower_ground_layer(),
+            )
+            self._dead_flower_started_from_layer1 = on_layer1
+            self._dead_flower_rope_attached = not on_layer1
+            # A rope entry does not have to traverse to the lower flower
+            # first.  Start with the closest separately recorded Y waypoint.
+            # ``enumerate`` retains identity even when every flower has the
+            # exact same X (the normal rope configuration).
+            if not on_layer1 and flowers:
+                self._dead_flower_target_index = min(
+                    range(len(flowers)), key=lambda index: abs(flowers[index].y - player.y),
+                )
+            target_index = self._dead_flower_target_index
+
+        if on_layer1:
+            LOG.info(
+                "DEAD FLOWER entry: marker Y=%.6f is in layer1; attaching to the rope before flower point 1/%d",
+                player.y, len(flowers),
+            )
+        else:
+            target = flowers[target_index]
+            LOG.info(
+                "DEAD FLOWER entry: marker Y=%.6f is not layer1; already on rope, targeting distinct flower point %d/%d (x=%.6f y=%.6f)",
+                player.y, target_index + 1, len(flowers), target.x, target.y,
+            )
+
+    def _dead_flower_walk_to(
+        self, player: Point, target_x: float, reason: str,
+        layer: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        if abs(player.x - target_x) <= max(
+            DEAD_FLOWER_X_TOLERANCE, self._current_horizontal_tolerance,
+        ):
+            self._release_walk_hold()
+            return True
+        direction = "right" if target_x > player.x else "left"
+        self._send_walk_hold(MovementDecision(
+            direction, reason, DEAD_FLOWER_WALK_HOLD_SECONDS,
+        ))
+        # 重置花's ground traverse honours the same manually recorded jump
+        # points as patrol.  Each point fires once for this one ground circuit
+        # only; it cannot retrigger while the marker oscillates around it.
+        if isinstance(layer, dict):
+            points = layer.get("jump_points")
+            if isinstance(points, list):
+                for index, point in enumerate(points):
+                    if index in self._dead_flower_ground_jump_tokens or not isinstance(point, dict):
+                        continue
+                    try:
+                        point_x = float(point["x"])
+                        point_direction = str(point.get("direction", "")).casefold()
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (point_direction == direction
+                            and abs(player.x - point_x) <= JUMP_POINT_X_TOLERANCE
+                            and self.perform_stair_jump(direction)):
+                        self._dead_flower_ground_jump_tokens.add(index)
+                        LOG.info("DEAD FLOWER 重置花: fired recorded %s jump %d", direction, index + 1)
+                        break
+        return False
+
+    def _dead_flower_wait_for_buff2(self) -> None:
+        """Hold at a flower point until 增益 1 is actually delivered."""
+
+        self._dead_flower_release_vertical()
+        self._release_walk_hold()
+        self._dead_flower_phase = "flower-await-buff2"
+        if self._dead_flower_buff2_cycle_started:
+            LOG.info("DEAD FLOWER: flower point reached; waiting for the running 增益1 timer")
+            return
+        # The first flower starts the cadence.  All later flower points wait
+        # for that same real 增益1 interval rather than restarting it.
+        request = self._dead_flower_buff2_request
+        accepted = bool(request()) if callable(request) else False
+        if accepted:
+            self._dead_flower_buff2_cycle_started = True
+            self._dead_flower_buff2_unavailable_logged = False
+            LOG.info("DEAD FLOWER: first flower reached; 增益1 cadence started")
+        elif not self._dead_flower_buff2_unavailable_logged:
+            LOG.warning(
+                "DEAD FLOWER: flower route paused at flower point; enable 增益1 with a key and interval first"
+            )
+            self._dead_flower_buff2_unavailable_logged = True
+
+    def _dead_flower_step(self, observation: MinimapObservation) -> None:
+        """Run the rope flower loop and optional 重置花 ground circuit.
+
+        This intentionally has no normal patrol/attack decision path.  It
+        owns only the rope's Up/Down key and short horizontal holds; StatusWorker
+        keeps HP/MP active, while MotionArbiter gets a Buff-safe window only
+        when the marker has reached a flower point.
+        """
+
+        # 重置花 is the explicit Dead Flower movement switch.  With it off,
+        # the player may start anywhere and no recorded rope/flower point is
+        # allowed to create a walk, jump, Up, or Down input.
+        if not self.dead_flower_ground_enabled:
+            self._dead_flower_release_vertical()
+            self._release_walk_hold()
+            self.last_decision = MovementDecision(
+                None, "dead flower: 重置花 disabled; Buff/HP/MP only",
+            )
+            return
+
+        player = observation.player
+        route = self._dead_flower_route()
+        if player is None or route is None:
+            self._dead_flower_release_vertical()
+            self._release_walk_hold()
+            self.last_decision = MovementDecision(None, "dead flower: waiting for marker/flower point")
+            return
+        layer_name, flower_layer, flowers = route
+        rope = flower_layer.get("rope_pos") or flower_layer.get("flower_rope_pos") or {}
+        try:
+            rope_x = float(rope["x"])
+        except (KeyError, TypeError, ValueError):
+            self.last_decision = MovementDecision(None, "dead flower: rope point invalid")
+            return
+        # This happens exactly once after enabling Dead Flower mode.  It
+        # decides whether the current marker begins on layer1 (attach first)
+        # or already on the rope.  Flower records are never keyed by X, so two
+        # same-X points remain two different Y destinations.
+        self._dead_flower_resolve_entry(player, flowers)
+        now = time.monotonic()
+
+        # 重置花 is wall-clock driven, including while a one-flower route is
+        # waiting for the next 增益1 tap.  Check it before the Buff-wait
+        # branch: otherwise a single flower remains in flower-await-buff2
+        # forever and can never leave the rope when its timer becomes due.
+        if (self.dead_flower_ground_enabled
+                and self._dead_flower_phase in ("flower", "flower-await-buff2")
+                and now >= self._dead_flower_ground_next_at):
+            ground = self._dead_flower_ground_layer()
+            if ground is not None:
+                self._dead_flower_phase = "ground-drop"
+                # Leaving the rope invalidates its attachment proof.  The
+                # next flower cycle must re-enter through the normal
+                # patrol-style jump gate, not inherit an old Up/attachment.
+                with self._dead_flower_state_lock:
+                    self._dead_flower_rope_attached = False
+                    self._dead_flower_entry_checked = False
+                    self._dead_flower_started_from_layer1 = False
+                self._dead_flower_entry_climb = ClimbState()
+                self._dead_flower_drop_start_y = float(player.y)
+                self._dead_flower_drop_attempts = 0
+                self._dead_flower_drop_retry_at = 0.0
+                self._dead_flower_ground_jump_tokens.clear()
+                LOG.info("DEAD FLOWER 重置花: timer due; using Alt+Left to leave rope")
+            else:
+                LOG.warning("DEAD FLOWER 重置花 skipped: layer1 needs 左/右/绳索 points")
+                self._dead_flower_ground_next_at = now + self._dead_flower_ground_delay()
+
+        if self._dead_flower_phase == "flower-await-buff2":
+            # StatusWorker owns the real 增益1 interval and calls
+            # notify_dead_flower_buff2_delivered() after a successful tap.
+            # Its event is consumed HERE, so this worker alone changes rope
+            # target/direction state.
+            if self._consume_dead_flower_buff2_delivery(len(flowers), player.y):
+                # Do not return: the same fresh minimap frame can select the
+                # next flower and put Up/Down down immediately.
+                pass
+            elif not self._dead_flower_buff2_cycle_started:
+                # A user may enable/bind 增益1 while already waiting at the
+                # first flower point. Retry the timer-start request on normal
+                # capture ticks; no key is sent from this worker.
+                self._dead_flower_wait_for_buff2()
+                self.last_decision = MovementDecision(None, "dead flower: waiting for 增益1")
+                return
+            else:
+                self.last_decision = MovementDecision(None, "dead flower: waiting for 增益1")
+                return
+
+        if self._dead_flower_phase == "ground-drop":
+            self._dead_flower_release_vertical()
+            self._release_walk_hold()
+            start_y = self._dead_flower_drop_start_y
+            if start_y is not None and player.y >= start_y + DEAD_FLOWER_DROP_PROGRESS_Y:
+                self._dead_flower_phase = "ground-left"
+                LOG.info("DEAD FLOWER 重置花: landing movement detected; crossing layer1")
+                return
+            if now >= self._dead_flower_drop_retry_at:
+                if self._dead_flower_drop_attempts >= DEAD_FLOWER_DROP_MAX_ATTEMPTS:
+                    LOG.warning("DEAD FLOWER 重置花: drop made no progress after %d tries; resuming rope loop",
+                                DEAD_FLOWER_DROP_MAX_ATTEMPTS)
+                    self._dead_flower_phase = "flower"
+                    self._dead_flower_ground_next_at = now + self._dead_flower_ground_delay()
+                    return
+                # A rope departure is a left jump (Alt+Left), not an
+                # Alt+Down drop-through.  It works from the rope itself and
+                # follows the same input path as a recorded left jump.
+                if self.perform_stair_jump("left"):
+                    self._dead_flower_drop_attempts += 1
+                    self._dead_flower_drop_retry_at = now + self.drop_retry_seconds
+                    LOG.info("DEAD FLOWER 重置花: Alt+Left %d/%d",
+                             self._dead_flower_drop_attempts, DEAD_FLOWER_DROP_MAX_ATTEMPTS)
+            self.last_decision = MovementDecision("drop", "dead flower 重置花 dropping")
+            return
+
+        if self._dead_flower_phase.startswith("ground-"):
+            ground = self._dead_flower_ground_layer()
+            if ground is None:
+                self._dead_flower_phase = "flower"
+                return
+            phase_to_point = {
+                "ground-left": "left_most_pos",
+                "ground-right": "right_most_pos",
+                "ground-rope": "rope_pos",
+            }
+            name = phase_to_point.get(self._dead_flower_phase)
+            point = ground.get(name) if name else None
+            if not isinstance(point, dict):
+                self._dead_flower_phase = "flower"
+                return
+            target_x = float(point["x"])
+            arrived = self._dead_flower_walk_to(
+                player, target_x, f"dead flower 重置花 {self._dead_flower_phase}", ground,
+            )
+            self.last_decision = MovementDecision(
+                None if arrived else ("right" if target_x > player.x else "left"),
+                f"dead flower 重置花 {self._dead_flower_phase}",
+            )
+            if not arrived:
+                return
+            if self._dead_flower_phase == "ground-left":
+                self._dead_flower_phase = "ground-right"
+            elif self._dead_flower_phase == "ground-right":
+                self._dead_flower_phase = "ground-rope"
+            else:
+                self._dead_flower_phase = "flower"
+                self._dead_flower_target_index = 0
+                # The next 重置花 countdown begins only after this new rope
+                # entry is independently confirmed, never while walking back
+                # to the rope point on layer1.
+                self._dead_flower_ground_next_at = float("inf")
+                with self._dead_flower_state_lock:
+                    self._dead_flower_rope_attached = False
+                    self._dead_flower_entry_checked = False
+                    self._dead_flower_started_from_layer1 = False
+                self._dead_flower_entry_climb = ClimbState()
+                LOG.info(
+                    "DEAD FLOWER 重置花: ground circuit complete; returning to %s rope via a fresh attachment gate",
+                    layer_name,
+                )
+            return
+
+        # Resolve the flower target before deciding whether this frame belongs
+        # to the layer1 -> rope entry state machine.  The entry state may own
+        # a side-step / Alt+side jump retry, so a normal alignment walk must
+        # never run ahead of it and cancel that retry.
+        target_index = min(self._dead_flower_target_index, len(flowers) - 1)
+        target = flowers[target_index]
+        y_gap = target.y - player.y
+        with self._dead_flower_state_lock:
+            requires_progress = self._dead_flower_target_requires_progress
+            source_y = self._dead_flower_target_source_y
+        if requires_progress and source_y is not None:
+            target_direction = "down" if target.y > source_y else "up"
+            vertical_progress = (
+                player.y - source_y if target_direction == "down"
+                else source_y - player.y
+            )
+            if vertical_progress >= DEAD_FLOWER_NEXT_POINT_PROGRESS_Y:
+                with self._dead_flower_state_lock:
+                    self._dead_flower_target_requires_progress = False
+                    self._dead_flower_target_source_y = None
+                requires_progress = False
+                LOG.info(
+                    "DEAD FLOWER: flower point %d/%d vertical progress %.6f confirmed",
+                    target_index + 1, len(flowers), vertical_progress,
+                )
+        with self._dead_flower_state_lock:
+            rope_attached_for_flower = self._dead_flower_rope_attached
+        # Matching a flower Y is not attachment evidence: a failed jump can
+        # pass through (or land at) the same minimap row.  A layer1 start may
+        # wait for Buff / advance to the next flower only after the private
+        # climb state has independently returned ``climbing-up``.  A route
+        # that started on the rope is already marked attached by its one-time
+        # entry classification.
+        if (rope_attached_for_flower
+                and abs(y_gap) <= DEAD_FLOWER_Y_TOLERANCE
+                and not requires_progress):
+            self._dead_flower_wait_for_buff2()
+            self.last_decision = MovementDecision(
+                None, "dead flower attached at flower point; waiting for 增益1",
+            )
+            return
+        # Immediately after a Buff, target and source acceptance bands may
+        # overlap by one minimap row.  Keep the intended direction from the
+        # two distinct recorded Y values until real progress separates them.
+        if requires_progress and source_y is not None:
+            direction = "down" if target.y > source_y else "up"
+        else:
+            direction = "down" if y_gap > 0.0 else "up"
+
+        # Starting on layer1 is not a simple Up hold: it must go through the
+        # battle-tested jump-to-rope state machine.  That routine owns the
+        # initial Alt+Up / directional attempts and confirms attachment from
+        # fresh minimap movement before this private flower loop takes over.
+        with self._dead_flower_state_lock:
+            started_from_layer1 = self._dead_flower_started_from_layer1
+            rope_attached = self._dead_flower_rope_attached
+        entry_state = self._dead_flower_entry_climb
+        entry_climb_active = bool(
+            entry_state.up_held or entry_state.phase != "idle"
+        )
+        if started_from_layer1 and (not rope_attached or entry_climb_active):
+            rope_gap = rope_x - player.x
+            inside_patrol_rope_gate = (
+                abs(rope_gap) <= self._current_rope_inner_distance + 1e-9
+            )
+            if entry_climb_active or inside_patrol_rope_gate:
+                # This is deliberately the same persistent gate as normal
+                # patrol: once climb() has begun a two-attempt/recovery cycle,
+                # it alone owns all retry input until it reports progress or a
+                # completed failed cycle.  In particular, do not release Up
+                # and replace it with a generic left/right rope alignment.
+                result = self._dead_flower_enter_rope(observation, rope_x)
+                self.last_decision = MovementDecision(
+                    "climb", f"dead flower layer1 -> rope ({result})",
+                )
+                return
+            # Still outside the exact patrol jump band: walking is allowed,
+            # but no jump sequence has started yet.  Re-evaluate from the
+            # next minimap frame until the shared gate is reached.
+            self._dead_flower_walk_to(
+                player, rope_x, "dead flower move to patrol rope gate",
+            )
+            self.last_decision = MovementDecision(
+                "right" if rope_gap > 0.0 else "left",
+                "dead flower move to patrol rope gate",
+            )
+            return
+
+        # On a confirmed rope, flower movement uses its own narrow alignment
+        # tolerance.  This is intentionally after the entry gate above.
+        if not self._dead_flower_walk_to(player, rope_x, "dead flower align to rope"):
+            self._dead_flower_release_vertical()
+            with self._dead_flower_state_lock:
+                self._dead_flower_rope_attached = False
+            self.last_decision = MovementDecision(
+                "right" if rope_x > player.x else "left", "dead flower align to rope",
+            )
+            return
+
+        if self._dead_flower_vertical_key != direction:
+            self._dead_flower_release_vertical()
+            key_down = getattr(self.key_sender, "key_down", None)
+            if callable(key_down) and key_down(direction) is not False:
+                self._dead_flower_vertical_key = direction
+                with self._dead_flower_state_lock:
+                    attached = self._dead_flower_rope_attached
+                LOG.info(
+                    "DEAD FLOWER: %s %s toward flower point %d/%d on %s",
+                    "moving on confirmed rope" if attached else "trying to attach; holding",
+                    direction, target_index + 1,
+                    len(flowers), layer_name,
+                )
+        self.last_decision = MovementDecision(direction, "dead flower rope loop")
 
     def stationary_route_anchor_marker(self) -> Optional[tuple[str, Point, str]]:
         """Temporary layer-axis marker and selected facing for this session."""
@@ -9224,8 +10112,7 @@ class MovementWorker(threading.Thread):
         # Back inside the patrol range: any below-range rescue streak is over.
         self._rescue_cycles = 0
         self._climb_lateral_streak = 0
-        self._route_phase = "left"
-        self._route_patrol_cycle = 1
+        self._choose_route_entry_phase(floor, observation, reason="patrol start")
         self._climb_state = ClimbState()
         self._descending_to_first = False
         self._return_from_floor = None
@@ -11047,7 +11934,9 @@ class MovementWorker(threading.Thread):
 
         self._split_active_part = max(0, int(part_index))
 
-    def _activate_next_split_part(self) -> None:
+    def _activate_next_split_part(
+        self, observation: Optional[MinimapObservation] = None,
+    ) -> None:
         """Switch to the next left-to-right part after returning to layer1."""
 
         if not self._split_enabled or self._split_part_count <= 1:
@@ -11076,8 +11965,9 @@ class MovementWorker(threading.Thread):
             return
         self.first_layer = self._route_layers[0]
         self._route_layer_index = 0
-        self._route_phase = "left"
-        self._route_patrol_cycle = 1
+        self._choose_route_entry_phase(
+            self.first_layer, observation, reason="new split part"
+        )
         self._split_transition_after_drop = False
         LOG.info("split patrol: part %d/%d complete; entering part %d/%d",
                  previous + 1, self._split_part_count,
@@ -11096,10 +11986,18 @@ class MovementWorker(threading.Thread):
         phases: list[str] = []
         if not isinstance(layer, dict):
             return phases
-        if isinstance(layer.get("left_most_pos"), dict):
-            phases.append("left")
-        if isinstance(layer.get("right_most_pos"), dict):
-            phases.append("right")
+        edges = [
+            edge for edge in ("left", "right")
+            if isinstance(layer.get(f"{edge}_most_pos"), dict)
+        ]
+        # The layer-entry decision is stable for the entire layer pass.  It
+        # changes only when a different layer/part is confirmed, never as X
+        # moves between the two endpoints.
+        if self._route_entry_context == (self._split_active_part, name):
+            entry = self._route_entry_phase
+            if entry in edges:
+                edges = [entry, *(edge for edge in edges if edge != entry)]
+        phases.extend(edges)
         is_final = (
             self._route_layer_index is not None
             and self._route_layer_index == len(self._route_layers) - 1
@@ -11359,7 +12257,7 @@ class MovementWorker(threading.Thread):
                          self._split_active_part + 1, self._split_part_count,
                          self.first_layer)
             else:
-                self._activate_next_split_part()
+                self._activate_next_split_part(observation)
             return True
         if (is_final and len(self._route_layers) > 1
                 and (self._patrol_range_configured
@@ -11506,7 +12404,7 @@ class MovementWorker(threading.Thread):
             return False
         return self._on_first_layer(observation)
 
-    def _reset_route_loop(self) -> None:
+    def _reset_route_loop(self, observation: MinimapObservation) -> None:
         """Start a fresh loop on the first layer after the planned descent landed.
 
         This is a fresh patrol start exactly like ``_apply_pending_patrol_start``, but it used to
@@ -11526,8 +12424,8 @@ class MovementWorker(threading.Thread):
         self._rescue_cycles = 0
         self._climb_lateral_streak = 0
         self._route_phase = "left"
-        self._clear_endpoint_turn_rearm()
         self._route_patrol_cycle = 1
+        self._clear_endpoint_turn_rearm()
         self._forced_phase_entry = None
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
@@ -11563,8 +12461,11 @@ class MovementWorker(threading.Thread):
             # patrol climbing/dropping" -> the character never attacks).
             self.dropping_active_event.clear()
         if self._split_transition_after_drop:
-            self._activate_next_split_part()
+            self._activate_next_split_part(observation)
             return
+        self._choose_route_entry_phase(
+            self.first_layer, observation, reason="route loop reset"
+        )
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
 
     def _endpoint_band_timeout(
@@ -11796,11 +12697,17 @@ class MovementWorker(threading.Thread):
         self._climb_restarts = 0
         self._climb_last_x = None
 
-    def _advance_after_climb(self) -> None:
+    def _advance_after_climb(self, observation: MinimapObservation) -> None:
         assert self._route_layer_index is not None
         self._route_layer_index += 1
-        self._route_phase = "left"
-        self._route_patrol_cycle = 1
+        if self._route_layer_index < len(self._route_layers):
+            self._choose_route_entry_phase(
+                self._route_layers[self._route_layer_index], observation,
+                reason="climb verified",
+            )
+        else:
+            self._route_phase = "stand"
+            self._route_patrol_cycle = 1
         self._climb_state = ClimbState()
         self._patrol_busy_until = 0.0
         if self.climbing_active_event is not None:
@@ -12148,11 +13055,20 @@ class MovementWorker(threading.Thread):
                     and self.direction_transition_event.is_set())):
             return False
         if self.dead_flower_mode:
-            # Buff/HP/MP-only mode has no route stage by design.  Its Buff
-            # path is therefore independent of patrol-stage publication; it
-            # waits only for a real, still-active vertical/stair transaction
-            # to finish before tapping the configured Buff key.
-            return not self._movement_busy_now()
+            # 重置花 is the explicit movement switch for 死花模式.  When it
+            # is off, every recording is inert: no rope jump, walk, or
+            # vertical movement is permitted, while Buff/HP/MP stay usable.
+            if not self.dead_flower_ground_enabled:
+                return not self._movement_busy_now()
+            # With 重置花 on, Buffs are released only while the active flower
+            # route waits for its 增益1 cadence to be delivered.
+            route = self._dead_flower_route()
+            if route is None:
+                return not self._movement_busy_now()
+            return bool(
+                self._dead_flower_phase == "flower-await-buff2"
+                and not self._movement_busy_now()
+            )
         if self._movement_busy_now():
             return False
         if self.stationary_attack_enabled:
@@ -12703,14 +13619,6 @@ class MovementWorker(threading.Thread):
                     self._automation_was_active = True
                 if self._patrol_started_at is None:
                     self._patrol_started_at = time.monotonic()
-                if self.dead_flower_mode:
-                    # The automation gate deliberately remains set so
-                    # StatusWorker can cast Buffs and consume HP/MP potions.
-                    # Do not inspect minimap state or issue any movement here.
-                    self.last_decision = MovementDecision(
-                        None, "dead flower mode: Buff/HP/MP only"
-                    )
-                    continue
                 # Attack priority: while the YOLO attack worker reports an
                 # active target, hold patrol movement so the character stands
                 # and fights - but only for a BOUNDED window.  Past
@@ -12905,9 +13813,32 @@ class MovementWorker(threading.Thread):
                     # 卡住阈值固定 0.012（最小地图单位）：X 变化 < 0.012
                     # 连续 3 帧即判定卡住并跳。
                     self._current_stair_jump_stall = 0.012
+                # Keep the Dead Flower entry gate numerically identical to
+                # normal patrol's minimap jump-to-rope inner band.
+                if self.near_rope_inner_range is not None:
+                    self._current_rope_inner_distance = self.near_rope_inner_range
+                elif coordinate_layout is not None and self.near_rope_diamonds is not None:
+                    self._current_rope_inner_distance = (
+                        self.near_rope_diamonds
+                        * coordinate_layout.diamond_width
+                        / coordinate_layout.analysis_width
+                    )
+                else:
+                    self._current_rope_inner_distance = (
+                        self.near_rope_range
+                        if self.near_rope_range is not None
+                        else self.estimated_final_speed * self.near_rope_seconds
+                    )
                 self._sync_patrol_controller(coordinate_layout)
                 self._apply_pending_patrol_start(observation)
                 self._consume_stair_jump_completion()
+                if self.dead_flower_mode:
+                    # The flower route needs the same fresh minimap marker as
+                    # normal patrol, but deliberately bypasses every patrol,
+                    # attack, rescue and stationary decision below it.
+                    self.last_observation = observation
+                    self._dead_flower_step(observation)
+                    continue
                 # 自动重连: the first frame after the reconnect gave the input back decides
                 # whether the character is on the patrol route, before the walk resumes.
                 self._run_pending_route_check(observation, time.monotonic())
@@ -13009,7 +13940,7 @@ class MovementWorker(threading.Thread):
                         self._descending_since = None
                         self._drop_descent_saw = None
                     if self._final_drop_arrived(observation):
-                        self._reset_route_loop()
+                        self._reset_route_loop(observation)
                         self._reanchor_tracker_to_current_layer(observation)
                         route_target_x, route_is_rope, route_label = self._route_target(observation)
                 elif (self.dropping_active_event is not None
@@ -13044,6 +13975,16 @@ class MovementWorker(threading.Thread):
                     and route_target_x is not None
                     and abs(route_target_x - observation.player.x)
                     <= rope_inner_distance + 1e-9
+                )
+                rope_pregrab = (
+                    self._rope_pregrab_jump_decision(
+                        observation,
+                        route_target_x,
+                        rope_inner_distance,
+                        rope_near_distance,
+                        route_label,
+                    )
+                    if route_is_rope else None
                 )
                 if not inside_rope_zone and self._climb_state.failed_shift_used:
                     # A new approach may use one correction again. Staying in
@@ -13155,7 +14096,7 @@ class MovementWorker(threading.Thread):
                     # only refines the jump DIRECTION (straight up vs
                     # left/right) when fresh; it can never trigger a jump
                     # before the character reached the minimap jumping zone.
-                    if inside_rope_zone:
+                    if inside_rope_zone or rope_pregrab is not None:
                         # JUMP-TO-ROPE inside the minimap zone: the YOLO
                         # screen logic decides (straight up when right under
                         # the rope - tight gap or box overlap; left/right
@@ -13163,33 +14104,40 @@ class MovementWorker(threading.Thread):
                         # when YOLO is stale.  In Fixed Attack mode the YOLO
                         # subprocess is not running: the minimap logic owns
                         # the jump (choose by current attack mode).
-                        yolo_action = (
-                            self._yolo_rope_action()
-                            if self._yolo_detection_active else None
-                        )
-                        if yolo_action is not None:
-                            decision = yolo_action
+                        if rope_pregrab is not None:
+                            # The minimap velocity prediction is intentionally
+                            # earlier than the screen detector's physical jump
+                            # gate.  Its direction comes from the locked rope
+                            # target and current marker X.
+                            decision = rope_pregrab
                         else:
-                            rope_plan = move_towards_rope(
-                                observation,
-                                route_target_x,
-                                rope_near_distance,
-                                inner_range=rope_inner_distance,
-                                under_rope_tolerance=self.under_rope_tolerance,
-                                allow_climb=True,
-                                horizontal_tolerance=self._current_horizontal_tolerance,
-                                minimum_confidence=self.minimum_confidence,
-                                movement_hold_seconds=self.movement_hold_seconds,
-                                minimum_final_hold_seconds=self.minimum_final_hold_seconds,
-                                minimum_movement_hold_seconds=self.minimum_movement_hold_seconds,
-                                estimated_minimap_speed=self.estimated_minimap_speed,
-                                final_calculation_distance=self._current_final_calculation_distance,
-                                estimated_final_speed=self.estimated_final_speed,
-                                final_move_safety_gain=self.final_move_safety_gain,
-                                tiny_step_min_seconds=self.rope_tiny_step_min_seconds,
-                                tiny_step_max_seconds=self.rope_tiny_step_max_seconds,
+                            yolo_action = (
+                                self._yolo_rope_action()
+                                if self._yolo_detection_active else None
                             )
-                            decision = rope_plan.decision
+                            if yolo_action is not None:
+                                decision = yolo_action
+                            else:
+                                rope_plan = move_towards_rope(
+                                    observation,
+                                    route_target_x,
+                                    rope_near_distance,
+                                    inner_range=rope_inner_distance,
+                                    under_rope_tolerance=self.under_rope_tolerance,
+                                    allow_climb=True,
+                                    horizontal_tolerance=self._current_horizontal_tolerance,
+                                    minimum_confidence=self.minimum_confidence,
+                                    movement_hold_seconds=self.movement_hold_seconds,
+                                    minimum_final_hold_seconds=self.minimum_final_hold_seconds,
+                                    minimum_movement_hold_seconds=self.minimum_movement_hold_seconds,
+                                    estimated_minimap_speed=self.estimated_minimap_speed,
+                                    final_calculation_distance=self._current_final_calculation_distance,
+                                    estimated_final_speed=self.estimated_final_speed,
+                                    final_move_safety_gain=self.final_move_safety_gain,
+                                    tiny_step_min_seconds=self.rope_tiny_step_min_seconds,
+                                    tiny_step_max_seconds=self.rope_tiny_step_max_seconds,
+                                )
+                                decision = rope_plan.decision
                         # Patrol-start grace: do not jump onto the rope the
                         # character happens to start next to - let it settle
                         # first, then resume the normal jump logic.

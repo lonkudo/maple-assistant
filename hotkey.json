@@ -21,6 +21,7 @@
     {"keys": "ctrl+f", "action": "record_jump_point:right", "block_original": true},
     {"keys": "ctrl+s", "action": "record_split_point", "block_original": true},
     {"keys": "ctrl+e", "action": "record_skill_point", "block_original": true},
+    {"keys": "ctrl+g", "action": "record_flower_point", "block_original": true},
     {"keys": "ctrl+down", "action": "select_next_layer", "block_original": true},
     {"keys": "ctrl+home", "action": "select_next_patrol_start", "block_original": true},
     {"keys": "ctrl+bracketleft", "action": "adjust_fixed_attack_interval:-0.1", "block_original": true},

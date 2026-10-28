@@ -989,9 +989,10 @@ class UiWorker(threading.Thread):
     # TEMPORARY: keep scheduled-shutdown code/settings available, but do not
     # expose its controls or start its worker.
     _SHOW_SHUTDOWN_PANEL = False
-    _FIXED_RANDOM_GAP_STEP = 0.1
+    _FIXED_RANDOM_GAP_STEP = 0.05
     _FIXED_RANDOM_GAP_MAX = 30.0
     _FIXED_ATTACK_INTERVAL_MAX = 30.0
+    _FIXED_ATTACK_INTERVAL_STEP = 0.05
     _OPTIONAL_MOTION_INTERVAL_MAX = 60.0
     # 捡东西 (the stand-still pickup circuit) is deliberately configured in
     # MINUTES: the operator reads and sets that row in "m", except values
@@ -1002,7 +1003,7 @@ class UiWorker(threading.Thread):
     _STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES = 15.0
     _ATTACK_TIMING_SLIDER_LENGTH = 112
     # A DOUBLE click on a 随机 −/+ button moves the gap by this much in one go
-    # (five seconds instead of 0.1), while a single click keeps the precise fine
+    # (five seconds instead of 0.05), while a single click keeps the precise fine
     # step and holding keeps repeating it.
     _RANDOM_GAP_COARSE_STEP = 5.0
     # Two presses closer together than this belong to one click sequence, so a
@@ -1923,8 +1924,13 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left")
+            # These rows configure attacks only.  死花模式 still leaves the
+            # mode selector and its 重置花 controls available, but must make
+            # every normal attack option visibly unavailable.
+            self._dead_flower_attack_rows: list[Any] = []
             fixed_key_row = ttk.Frame(fixed_panel)
             self._fixed_key_row = fixed_key_row
+            self._dead_flower_attack_rows.append(fixed_key_row)
             fixed_key_row.pack(fill="x", pady=(4, 0))
             # 跳打 is shared by patrol and stand-still attacks.  Keep it next
             # to the attack key because it changes that key's atomic delivery
@@ -1968,7 +1974,9 @@ class UiWorker(threading.Thread):
             fixed_interval_slider = ttk.Scale(
                 fixed_interval_group, from_=0.2,
                 to=self._FIXED_ATTACK_INTERVAL_MAX, orient="horizontal",
-                # 0.2..10.0 in 0.1s steps needs at least 98 usable pixels;
+                # The slider is broad adjustment; values are snapped to 0.05s
+                # in _fixed_on_change while the adjacent buttons provide the
+                # exact fine random-gap control.
                 # the former 82px track physically could not land on every
                 # value even with snap rounding.
                 variable=self._fixed_interval_var,
@@ -1991,7 +1999,8 @@ class UiWorker(threading.Thread):
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
             fixed_gap_minus = ttk.Button(fixed_random_group, text="−", width=2)
             self._bind_repeat_step_button(
-                fixed_gap_minus, lambda: self._fixed_adjust_random_gap(-0.1),
+                fixed_gap_minus,
+                lambda: self._fixed_adjust_random_gap(-self._FIXED_RANDOM_GAP_STEP),
                 current=self._fixed_random_gap_seconds,
                 coarse=lambda anchor: self._set_fixed_random_gap(
                     (self._fixed_random_gap_seconds() if anchor is None else anchor)
@@ -2005,7 +2014,8 @@ class UiWorker(threading.Thread):
             self._fixed_random_gap_label.pack(side="left")
             fixed_gap_plus = ttk.Button(fixed_random_group, text="+", width=2)
             self._bind_repeat_step_button(
-                fixed_gap_plus, lambda: self._fixed_adjust_random_gap(0.1),
+                fixed_gap_plus,
+                lambda: self._fixed_adjust_random_gap(self._FIXED_RANDOM_GAP_STEP),
                 current=self._fixed_random_gap_seconds,
                 coarse=lambda anchor: self._set_fixed_random_gap(
                     (self._fixed_random_gap_seconds() if anchor is None else anchor)
@@ -2018,6 +2028,7 @@ class UiWorker(threading.Thread):
             # attack.  A confirmed HP drop asks the arbiter to step away from
             # the hit and then tap this independently bound key.
             counterattack_row = ttk.Frame(fixed_panel)
+            self._dead_flower_attack_rows.append(counterattack_row)
             counterattack_row.pack(fill="x", pady=(2, 0))
             self._counterattack_enabled_var = tk.BooleanVar(value=False)
             counterattack_button = ttk.Checkbutton(
@@ -2051,6 +2062,7 @@ class UiWorker(threading.Thread):
             # 组合攻击 only configures the independent attack scheduler;
             # movement, patrol, and input arbitration keep their own roles.
             combo_row = ttk.Frame(fixed_panel)
+            self._dead_flower_attack_rows.append(combo_row)
             combo_row.pack(fill="x", pady=(2, 0))
             self._combo_attack_enabled_var = tk.BooleanVar(value=False)
             combo_attack_button = ttk.Checkbutton(
@@ -2125,6 +2137,7 @@ class UiWorker(threading.Thread):
             # is applied after an X correction returns to the temporary zone.
             stationary_facing_row = ttk.Frame(fixed_panel)
             self._stationary_facing_row = stationary_facing_row
+            self._dead_flower_attack_rows.append(stationary_facing_row)
             ttk.Label(stationary_facing_row, text="朝向").pack(side="left")
             self._stationary_facing_direction_var = tk.StringVar(value="right")
             stationary_facing_controls = []
@@ -2161,6 +2174,7 @@ class UiWorker(threading.Thread):
                 command=self._fixed_on_change,
             )
             pickup_enabled.pack(side="left", padx=(0, 4))
+            self._stationary_pickup_enabled_button = pickup_enabled
             pickup_interval_group = ttk.Frame(pickup_row)
             pickup_interval_group.pack(side="right")
             ttk.Label(pickup_interval_group, text="每").pack(side="left")
@@ -2218,6 +2232,7 @@ class UiWorker(threading.Thread):
             step_row = ttk.Frame(fixed_panel)
             step_row.pack(fill="x", pady=(4, 0))
             self._small_step_row = step_row
+            self._dead_flower_attack_rows.append(step_row)
             self._small_step_enabled_var = tk.BooleanVar(value=False)
             small_step_button = ttk.Checkbutton(
                 step_row, text="小碎步", width=5,
@@ -2593,7 +2608,8 @@ class UiWorker(threading.Thread):
 
             # 循环 的 间隔/剩余 progress bars sit on the SAME line as the
             # 掉线/测谎/循环 checkboxes (column 1 is 500px wide to fit).
-            ttk.Label(alarm_row, text="间隔").pack(side="left", padx=(4, 0))
+            self._countdown_interval_caption = ttk.Label(alarm_row, text="间隔")
+            self._countdown_interval_caption.pack(side="left", padx=(4, 0))
             self._countdown_interval_var = tk.DoubleVar(value=1.0)
             self._countdown_interval_slider = ttk.Scale(
                 alarm_row, from_=0.1, to=6.0, orient="horizontal",
@@ -2604,10 +2620,25 @@ class UiWorker(threading.Thread):
                 # retaining every 0.1h selection through 6.0h.
                 length=80,
                 variable=self._countdown_interval_var,
-                command=self._countdown_on_change,
+                command=self._countdown_interval_on_drag,
             )
             self._countdown_interval_slider.pack(
                 side="left", padx=(1, 1)
+            )
+            # ttk themes can paint a disabled Scale with an active-looking
+            # blue trough.  Block pointer interaction as a second, theme-
+            # independent guard while 循环 is unselected.
+            self._countdown_interval_slider.bind(
+                "<ButtonPress-1>", self._countdown_interval_press_gate,
+                add="+",
+            )
+            self._countdown_interval_slider.bind(
+                "<B1-Motion>", self._countdown_interval_press_gate,
+                add="+",
+            )
+            self._countdown_interval_slider.bind(
+                "<ButtonRelease-1>", self._countdown_interval_press_gate,
+                add="+",
             )
             self._countdown_interval_label = ttk.Label(
                 alarm_row, text="1.0h", width=4
@@ -5111,6 +5142,9 @@ class UiWorker(threading.Thread):
                 pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
                 if callable(pickup_setter):
                     pickup_setter(False, 0.0, 0.0)
+                flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
+                if callable(flower_cycle_setter):
+                    flower_cycle_setter(False, 0.0, 0.0)
             except Exception:
                 LOG.debug("license lock could disable stationary actions", exc_info=True)
         for variable_name in (
@@ -5412,6 +5446,8 @@ class UiWorker(threading.Thread):
                     self._play_action_sound(self._record_jump_point(direction))
                 elif action == "record_split_point":
                     self._play_action_sound(self._record_split_point())
+                elif action == "record_flower_point":
+                    self._play_action_sound(self._record_flower_point())
                 elif action == "record_skill_point":
                     arm = getattr(self.hotkey_worker, "arm_skill_key_capture", None)
                     if callable(arm) and self._prepare_skill_point_recording():
@@ -8008,6 +8044,26 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         return True
 
+    def _record_flower_point(self) -> bool:
+        """Record one dead-flower rope waypoint from the live marker."""
+
+        snapshot = self._capture_snapshot_for_recording()
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(text="无法录制花点：未检测到黄色菱形标记。")
+            return False
+        try:
+            point = self.patrol_controller.record_flower_point(
+                snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._control_status.configure(text=f"无法录制花点: {exc}")
+            return False
+        self._control_status.configure(
+            text=f"已录制 {point.layer} 花点：X={point.x:.6f}，Y={point.y:.6f}。"
+        )
+        self._refresh_patrol_controls()
+        return True
+
     def _delete_recorded_axis_point(
         self, layer_name: str, point_kind: str, point_x: float,
         point_index: Optional[int] = None,
@@ -8026,12 +8082,12 @@ class UiWorker(threading.Thread):
             removed = self.patrol_controller.delete_axis_point(
                 layer_name, point_kind, point_x, point_index,
             )
-            if point_kind not in ("jump_point", "skill_point"):
+            if point_kind not in ("jump_point", "skill_point", "flower_point"):
                 self._unlocked_points.discard((layer_name, point_kind))
             label = {
                 "left_most_pos": "最左", "rope_pos": "绳索",
                 "right_most_pos": "最右", "jump_point": "跳点",
-                "skill_point": "技能点",
+                "skill_point": "技能点", "flower_point": "花点",
             }.get(point_kind, "录制点")
         except (OSError, ValueError) as exc:
             LOG.warning("axis point delete failed", exc_info=True)
@@ -8067,11 +8123,12 @@ class UiWorker(threading.Thread):
             ("添加最右", "right_most_pos", lambda: self._record_endpoint("right_most_pos")),
             ("添加左跳", "jump_point", lambda: self._record_jump_point("left")),
             ("添加右跳", "jump_point", lambda: self._record_jump_point("right")),
+            ("添加花点", "flower_point", self._record_flower_point),
         )
         final_name = self.patrol_controller.final_layer_name()
         for label, kind, command in entries:
             already_recorded = (
-                kind != "jump_point"
+                kind not in ("jump_point", "flower_point")
                 and self.patrol_controller.endpoint(layer_name, kind) is not None
             )
             unavailable_rope = kind == "rope_pos" and layer_name == final_name
@@ -8221,6 +8278,16 @@ class UiWorker(threading.Thread):
                 for index, point in enumerate(skill_points):
                     if isinstance(point, dict) and "x" in point and "y" in point:
                         entries.append(("skill_point", point, f"技能{point.get('key', '?')}", index))
+            flower_points = source.get("flower_points", [])
+            if isinstance(flower_points, list):
+                for index, point in enumerate(flower_points):
+                    if isinstance(point, dict) and "x" in point and "y" in point:
+                        # The rope normally gives every flower point the same
+                        # X.  Preserve the separate recorded Y identities on
+                        # the one-dimensional axis with explicit 花1 / 花2
+                        # labels instead of making the second marker look
+                        # like a replacement for the first one.
+                        entries.append(("flower_point", point, f"花{index + 1}", index))
         def _axis_x(entry: tuple[str, Any, str, Optional[int]]) -> float:
             try:
                 return float(entry[1].get("x", 0.0))
@@ -8239,6 +8306,7 @@ class UiWorker(threading.Thread):
             "rope_pos": "#d8a400",
             "jump_point": "#1d9b45",
             "skill_point": "#8a2be2",
+            "flower_point": "#d13a8b",
         }
         for kind, point, label, index in entries:
             try:
@@ -8274,6 +8342,18 @@ class UiWorker(threading.Thread):
                     x, axis_y - 9,
                     text=self._skill_key_axis_label(point.get("key", "")),
                     fill="white", font=("TkDefaultFont", 10, "bold"), tags=(tag,),
+                )
+            elif kind == "flower_point":
+                # Two flower points may share one rope X.  The later marker
+                # intentionally reads 花2 at that same X, while each marker's
+                # own hover text still supplies its distinct recorded Y.
+                canvas.create_oval(
+                    x - 8, axis_y - 16, x + 8, axis_y - 2,
+                    fill=colors[kind], outline="", tags=(tag,),
+                )
+                canvas.create_text(
+                    x, axis_y - 9, text=label, fill="white",
+                    font=("TkDefaultFont", 8, "bold"), tags=(tag,),
                 )
             else:
                 direction = str(point.get("direction", "")).casefold()
@@ -8400,7 +8480,7 @@ class UiWorker(threading.Thread):
                 max(0.2, min(
                     self._FIXED_ATTACK_INTERVAL_MAX,
                     float(self._fixed_interval_var.get()),
-                )), 1
+                )), 2
             ),
             "random_gap_seconds": self._fixed_random_gap_seconds(),
             "attack_key": self._fixed_attack_key_var.get().strip(),
@@ -8517,11 +8597,11 @@ class UiWorker(threading.Thread):
             LOG.debug("combo attack outside-click commit failed", exc_info=True)
 
     def _fixed_random_gap_seconds(self) -> float:
-        """Return the clamped, one-decimal random-gap setting."""
+        """Return the clamped random-gap setting in 0.05-second precision."""
 
         var = getattr(self, "_fixed_random_gap_var", None)
         raw = 0.1 if var is None else float(var.get())
-        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 2)
 
     def _bind_repeat_step_button(
         self,
@@ -8631,7 +8711,7 @@ class UiWorker(threading.Thread):
 
         base = self._fixed_random_gap_seconds() if value is None else value
         self._fixed_random_gap_var.set(round(
-            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
+            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 2
         ))
         self._fixed_on_change()
 
@@ -8639,7 +8719,7 @@ class UiWorker(threading.Thread):
         """Adjust the random delay ceiling.
 
         ``delta``'s sign picks the direction and its magnitude the step, so the
-        fine button passes ±0.1 while the double click passes ±5.
+        fine button passes ±0.05 while the double click passes ±5.
         """
 
         step = abs(delta) or self._FIXED_RANDOM_GAP_STEP
@@ -8738,8 +8818,8 @@ class UiWorker(threading.Thread):
         current = float(self._fixed_interval_var.get())
         value = round(max(
             0.2, min(self._FIXED_ATTACK_INTERVAL_MAX, current + float(delta))
-        ), 1)
-        if value == round(current, 1):
+        ), 2)
+        if value == round(current, 2):
             return False
         self._fixed_interval_var.set(value)
         self._fixed_on_change()
@@ -8773,6 +8853,20 @@ class UiWorker(threading.Thread):
             mode in ("fixed", "stationary") and self._license_allowed()
         )
         stationary_enabled = mode == "stationary" and self._license_allowed()
+        flower_cycle_enabled = mode in ("stationary", "dead_flower") and self._license_allowed()
+        dead_flower_mode = mode == "dead_flower"
+        pickup_label = getattr(self, "_stationary_pickup_enabled_button", None)
+        if pickup_label is not None:
+            # The same persisted interval control drives two different route
+            # machines.  Its meaning must describe the selected mode without
+            # changing stationary mode's existing pickup configuration.
+            pickup_label.configure(text="重置花" if dead_flower_mode else "捡东西")
+        for row in getattr(self, "_dead_flower_attack_rows", ()):
+            if row is not None:
+                self._set_panel_state(
+                    row,
+                    disabled=(dead_flower_mode or not self._license_allowed()),
+                )
         for widget in [
             jump_attack_button,
         ]:
@@ -8784,16 +8878,20 @@ class UiWorker(threading.Thread):
                 widget.configure(
                     state="normal" if fixed_attack_enabled else "disabled"
                 )
-        for widget in [
-            *getattr(self, "_stationary_facing_controls", []),
-            *getattr(self, "_stationary_pickup_controls", []),
-        ]:
+        for widget in getattr(self, "_stationary_facing_controls", []):
             if widget is None:
                 continue
             try:
                 widget.state(["!disabled" if stationary_enabled else "disabled"])
             except Exception:
                 widget.configure(state="normal" if stationary_enabled else "disabled")
+        for widget in getattr(self, "_stationary_pickup_controls", []):
+            if widget is None:
+                continue
+            try:
+                widget.state(["!disabled" if flower_cycle_enabled else "disabled"])
+            except Exception:
+                widget.configure(state="normal" if flower_cycle_enabled else "disabled")
 
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
@@ -8811,22 +8909,31 @@ class UiWorker(threading.Thread):
         # disappear.  Only an actual attack-mode change needs a layout pass.
         # ttk.Scale is pixel-continuous: on this compact 82px track, an exact
         # 3.0s position may have no physical pixel at all.  Quantize every
-        # drag to the persisted 0.1s unit so whole values (3.0, 4.0, …) are
-        # reachable and the displayed value is exactly what will be used.
+        # drag to the persisted 0.05s unit so the displayed value is exactly
+        # what will be used.
         raw_interval = max(
             0.2, min(self._FIXED_ATTACK_INTERVAL_MAX,
                      float(self._fixed_interval_var.get()))
         )
-        interval = round(raw_interval, 1)
+        interval = round(
+            round(raw_interval / self._FIXED_ATTACK_INTERVAL_STEP)
+            * self._FIXED_ATTACK_INTERVAL_STEP,
+            2,
+        )
         if abs(raw_interval - interval) > 1e-9:
             self._fixed_interval_var.set(interval)
-        self._fixed_interval_label.configure(text=f"{interval:.1f}s")
+        interval_text = f"{interval:.2f}".rstrip("0").rstrip(".")
+        self._fixed_interval_label.configure(text=f"{interval_text}s")
         random_gap = self._fixed_random_gap_seconds()
         if hasattr(self, "_fixed_random_gap_label"):
-            self._fixed_random_gap_label.configure(text=f"{random_gap:.1f}s")
+            gap_text = f"{random_gap:.2f}".rstrip("0").rstrip(".")
+            self._fixed_random_gap_label.configure(text=f"{gap_text}s")
         if hasattr(self, "_fixed_interval_range_label"):
             self._fixed_interval_range_label.configure(
-                text=f"({interval:.1f}s, {interval + random_gap:.1f}s)"
+                text=(
+                    f"({interval_text}s, "
+                    f"{f'{interval + random_gap:.2f}'.rstrip('0').rstrip('.')}s)"
+                )
             )
         if hasattr(self, "_small_step_interval_var"):
             # 小碎步 is a longer optional motion; allow up to 60 seconds.
@@ -8927,6 +9034,9 @@ class UiWorker(threading.Thread):
                 pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
                 if callable(pickup_setter):
                     pickup_setter(False, 0.0, 0.0)
+                flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
+                if callable(flower_cycle_setter):
+                    flower_cycle_setter(False, 0.0, 0.0)
                 counterattack_setter = getattr(mover, "set_counterattack", None)
                 if callable(counterattack_setter):
                     counterattack_setter(False, "ctrl")
@@ -9008,11 +9118,19 @@ class UiWorker(threading.Thread):
                 )
             pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
             if callable(pickup_setter):
-                # The worker and the configuration keep seconds; the 捡东西 row
+                # The worker and the configuration keep seconds; the 重置花 row
                 # is the only place the interval is read as minutes.
                 pickup_setter(
                     bool(data.get("stationary_pickup_enabled", False))
                     and mode == "stationary",
+                    float(data.get("stationary_pickup_interval_seconds", 900.0)),
+                    float(data.get("stationary_pickup_gap_seconds", 0.0)),
+                )
+            flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
+            if callable(flower_cycle_setter):
+                flower_cycle_setter(
+                    bool(data.get("stationary_pickup_enabled", False))
+                    and dead_flower_mode,
                     float(data.get("stationary_pickup_interval_seconds", 900.0)),
                     float(data.get("stationary_pickup_gap_seconds", 0.0)),
                 )
@@ -9047,7 +9165,7 @@ class UiWorker(threading.Thread):
                 interval = float(self._fixed_interval_var.get())
                 if mode == "dead_flower":
                     self._fixed_status.configure(
-                        text="死花模式已启用 - 不移动、不攻击；仅使用已启用的 Buff 与 HP/MP 药水。"
+                        text="死花模式已启用 - 双层花点按 Buff1 定时上下移动；单层仅 Buff 与 HP/MP。"
                     )
                 elif mode == "stationary":
                     self._fixed_status.configure(
@@ -10103,7 +10221,7 @@ class UiWorker(threading.Thread):
         "left": "←", "right": "→", "up": "↑", "down": "↓",
         "home": "Home", "insert": "Insert", "delete": "Delete",
         "bracketleft": "[", "bracketright": "]", "grave": "`",
-        "d": "D", "e": "E", "f": "F", "s": "S",
+        "d": "D", "e": "E", "f": "F", "s": "S", "g": "G",
         "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
         "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
     }
@@ -10115,6 +10233,7 @@ class UiWorker(threading.Thread):
         "record_jump_point:left": "插入当前图层的 左跳 点 (Ctrl+D)",
         "record_jump_point:right": "插入当前图层的 右跳 点 (Ctrl+F)",
         "record_split_point": "在当前位置添加贯穿全部楼层的波浪分区线 (Ctrl+S)",
+        "record_flower_point": "录制当前绳索层的花点 (Ctrl+G)",
         "record_skill_point": "录制技能点；随后按任意攻击键可绑定按键 (Ctrl+E)",
         "select_next_layer": "选择下一个录制图层 (Ctrl+↓)",
         "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
@@ -10177,7 +10296,7 @@ class UiWorker(threading.Thread):
             return
         self._help_hide_job = root.after(220, self._hide_hotkey_help)
 
-    def _help_cancel_jobs(self) -> None:
+    def _help_cancel_jobs(self, _event: Any = None) -> None:
         """Cancel pending show/hide timers for the hover help popup."""
 
         root = getattr(self, "_root", None)
@@ -10413,6 +10532,9 @@ class UiWorker(threading.Thread):
         if abs(raw_hours - hours) > 1e-9:
             self._countdown_interval_var.set(hours)
         self._countdown_interval_label.configure(text=f"{hours:.1f}h")
+        # Retain the last valid interval so a themed-but-not-really-disabled
+        # Scale cannot alter its value while 循环 is unchecked.
+        self._countdown_interval_locked_hours = hours
         interval_seconds = hours * 3600.0
         self._countdown_remaining_slider.configure(to=interval_seconds)
         self._countdown_remaining_var.set(interval_seconds)
@@ -10450,6 +10572,11 @@ class UiWorker(threading.Thread):
     def _restore_countdown_resume_state(self) -> None:
         """Restore a future saved deadline; expired deadlines stay unselected."""
 
+        # ``countdown_enabled`` is the operator's durable selection.  A
+        # leftover timer.json from a previously armed session must never
+        # override an explicit saved-off 循环 choice at the next launch.
+        if not bool(self._countdown_enabled_var.get()):
+            return
         state = load_timer_state(timer_state_path())
         if not bool(state.get("enabled", False)):
             return
@@ -10524,14 +10651,48 @@ class UiWorker(threading.Thread):
                 except Exception:
                     pass
 
-    def _countdown_drag_start(self, _event: Any = None) -> None:
-        self._countdown_dragging = True
+    def _countdown_interval_press_gate(self, _event: Any = None) -> Optional[str]:
+        """Keep the interval slider inert until 循环 is selected."""
 
-    def _countdown_drag_end(self, _event: Any = None) -> None:
+        if not bool(self._countdown_enabled_var.get()):
+            return "break"
+        return None
+
+    def _countdown_interval_on_drag(self, value: str = "") -> None:
+        """Reject an interval-slider change unless 循环 is enabled.
+
+        Some Windows ttk themes visually accept a disabled Scale drag.  This
+        value-level gate is independent of that appearance and makes such a
+        drag a no-op.
+        """
+
+        if not bool(self._countdown_enabled_var.get()):
+            locked = float(getattr(
+                self, "_countdown_interval_locked_hours",
+                self._countdown_interval_var.get(),
+            ))
+            if abs(float(self._countdown_interval_var.get()) - locked) > 1e-9:
+                self._countdown_interval_var.set(locked)
+            self._countdown_refresh_grey()
+            return
+        self._countdown_on_change(value)
+
+    def _countdown_drag_start(self, _event: Any = None) -> Optional[str]:
+        if not bool(self._countdown_enabled_var.get()):
+            self._countdown_dragging = False
+            return "break"
+        self._countdown_dragging = True
+        return None
+
+    def _countdown_drag_end(self, _event: Any = None) -> Optional[str]:
+        if not bool(self._countdown_enabled_var.get()):
+            self._countdown_dragging = False
+            return "break"
         self._countdown_remaining_on_drag(
             str(self._countdown_remaining_var.get())
         )
         self._countdown_dragging = False
+        return None
 
     def _countdown_remaining_on_drag(self, value: str) -> None:
         """Move the live deadline as the user drags the remaining-time bar."""
@@ -10727,9 +10888,13 @@ class UiWorker(threading.Thread):
                 )
                 self._render_quick_messages()
             if hasattr(self, "_countdown_enabled_var"):
-                # Like scheduled shutdown, do not silently start a timer on
-                # application launch. Preserve only its configured time gap.
-                self._countdown_enabled_var.set(False)
+                # 循环 is an explicit saved choice.  Restore it exactly: an
+                # unchecked saved setting launches with grey inert sliders;
+                # a checked setting launches selected with active sliders and
+                # restores/starts its countdown normally.
+                self._countdown_enabled_var.set(bool(
+                    data.get("countdown_enabled", False)
+                ))
                 if "countdown_interval_hours" in data:
                     self._countdown_interval_var.set(max(
                         0.1, min(6.0, float(data["countdown_interval_hours"]))
@@ -10742,6 +10907,14 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_countdown_enabled_var"):
             self._countdown_on_change()
             self._restore_countdown_resume_state()
+            # Re-apply after Tk has completed widget geometry/style setup.
+            # This uses the same BooleanVar loaded above, not an inferred
+            # worker/timer state, so a saved unchecked 循环 remains grey.
+            root = getattr(self, "_root", None)
+            if root is not None:
+                root.after_idle(self._countdown_refresh_grey)
+            else:
+                self._countdown_refresh_grey()
         LOG.info("additional functions settings loaded from %s",
                  self._shutdown_settings_path())
 
@@ -11283,7 +11456,7 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         if dead_flower_mode:
             self._control_status.configure(
-                text="死花模式已开始：仅 Buff 与 HP/MP 药水运行。"
+                text="死花模式已开始：花点按 Buff1 定时循环；重置花到时才下绳巡逻。"
             )
         elif str(getattr(self, "_attack_mode_var", None).get()
                  if hasattr(self, "_attack_mode_var") else "fixed") == "stationary":

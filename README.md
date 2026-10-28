@@ -523,12 +523,29 @@ Record each map before enabling a route:
 2. Record its rope point when the layer has a rope.
 3. Record the **right endpoint**.
 4. Optionally record directional jump points with `Ctrl+D` (left) or `Ctrl+F` (right).
-5. Add the layer above it and repeat.
-6. Select the patrol start and end layers.
+5. When a map has disconnected patrol areas, record each vertical **split point** with `Ctrl+S`.
+   The UI draws it as a wave line through every layer; splits divide the map into left-to-right
+   patrol parts.
+6. Add the layer above it and repeat.
+7. Select the patrol start and end layers.
 
 Layers are stored from bottom to top. A patrol route can cover any contiguous range; a map does not need exactly three layers.
 
-Each layer's row has an axis band beside its name. **Right-click the axis** to open its point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳); the menu is only available while patrol is stopped, because recording is locked while it runs. Left-clicking does not open the point menu; it only follows normal layer/marker selection behavior.
+Each layer's row has an axis band beside its name. **Right-click the axis** to open its point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳 / 添加花点); the menu is only available while patrol is stopped, because recording is locked while it runs. Left-clicking does not open the point menu; it only follows normal layer/marker selection behavior.
+
+### Split patrol and skill points
+
+Split points are global vertical boundaries, not extra layers. They divide every recorded layer
+into left-to-right parts. A part may omit a layer entirely: that layer is simply skipped in that
+part when it has no recorded support point. For each available layer, the assistant chooses the
+nearer endpoint as the first endpoint on entry; later passes keep that chosen left/right sequence.
+The **巡逻 N 次** menu on the layer row controls how many endpoint traversals finish before the
+next available layer or part begins (default: 1).
+
+`Ctrl+E` records a skill point. After pressing it, press one permitted attack key to bind the
+skill; passing the point releases that key. `Ctrl+G` records a flower point on the selected rope
+layer. The point menu displays separate `花1`, `花2`, … labels even when their X values are the
+same, because their distinct Y positions are meaningful.
 
 The minimap detector first finds the actual map border and calculates marker coordinates relative to that border. A broad search rectangle may help locate a map, but it is never saved as map geometry. This matters when the minimap size changes between maps or when the UI temporarily covers part of the game window.
 
@@ -646,6 +663,17 @@ The landing evidence belongs to one descent. It is cleared on a fresh patrol sta
 **小碎步** is an atomic left/right correction. Each direction is held for 220 ms with a 100 ms neutral gap; normal patrol resumes only after the sequence completes.
 
 **站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
+
+**死花模式** is separate from combat patrol and sends only buffs plus HP/MP items. With
+**重置花** unchecked it never moves, regardless of recorded flower points. With **重置花**
+enabled, one flower point means attach to the rope, buff there, then leave the rope for the reset
+circuit before returning. Two or more flower points mean climb between their distinct Y positions
+and refresh Buff1 at each timer boundary. Normal attack controls and 小碎步 are unavailable in
+this mode.
+
+The fixed **attack interval** slider and its adjacent fine controls use 0.05-second increments.
+Dragging snaps to that interval, and the exact value is retained in configuration: `0.25s` remains
+`0.25s` rather than being rounded to `0.3s`.
 
 HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input.
 

@@ -49,7 +49,7 @@
     "attack_block_max_seconds": 4.0,
     "near_rope_seconds": 0.5,
     "near_rope_range": 0.025,
-    "near_rope_inner_range": 0.018,
+    "near_rope_inner_range": 0.032,
     "near_rope_outer_range": 0.0229,
     "near_rope_diamonds": 0.66,
     "rope_approach_creep_seconds": 0.25,

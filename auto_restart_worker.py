@@ -213,7 +213,9 @@ class AutoRestartWorker(threading.Thread):
                 return False
             if not self._wait(self.GAME_FOCUS_SETTLE_SECONDS):
                 return False
-            self.key_sender.enable_input()
+            if self.key_sender.enable_input() is False:
+                self._report("warning", "键盘清理仍忙，暂不发送下线按键")
+                return False
             if callable(exclusive):
                 exclusive("auto-restart")
             if message:

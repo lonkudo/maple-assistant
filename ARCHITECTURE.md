@@ -398,6 +398,15 @@ Recorded points contain minimap-relative X/Y values. Layer recognition uses reco
 
 Each layer may also own X-sorted, immutable directional jump points. A point records X, Y, and either left or right travel direction. During a horizontal leg, the direction must match the leg. During an active rope climb, either directional record may be selected if the marker matches its X/Y window: the recorded direction is only a preference there (it breaks a tie when a 左跳 and a 右跳 sit at the same height), because a climb has no horizontal leg to compare against. Gating a rope point on the direction the character happened to *walk in* to the rope made a point recorded as a right jump invisible during a return climb that approached from the right — the rope jump point that never fired. The matching policy is intentionally asymmetric: X is ±0.010, while Y is ±0.020 to accommodate vertical rope movement. A matched point is marked passed only after the dedicated jump worker accepts it.
 
+`PatrolController` also stores global X-sorted split points and layer-owned flower and skill
+points. A split is a vertical map boundary rather than a floor: `part_for_x()` assigns records to
+one of the left-to-right parts. Route construction skips a layer in a part with no supporter, so a
+second floor can exist only in one side of a divided map. On entering an available layer/part,
+`MovementWorker` chooses the nearer endpoint as the first target; the selected endpoint order then
+remains fixed for that layer's configured number of patrol passes. Skill points retain a bindable
+key and issue it when the marker crosses the point. Flower points deliberately retain their own Y
+identity even when they share rope X, allowing a rope circuit to distinguish 花1 from 花2.
+
 ### Patrol and movement
 
 `movement_worker.py` owns the patrol state machine. It reads the latest character/map state, resolves the current recorded layer, and emits decisions such as patrol left/right, move-to-rope, climb, return-to-route, recovery, or safe wait.
@@ -513,6 +522,18 @@ ordinary patrol hold is never interrupted by it.
 ### Combat and consumables
 
 `attack_worker.py` performs fixed-interval attack and optional jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
+
+The fixed attack interval is represented in seconds and is quantized at the UI boundary to 0.05 s
+(`0.20`–`30.00`). It remains a two-decimal configuration value end-to-end; formatting removes only
+unneeded display zeroes. This avoids the former one-decimal slider save path silently turning a
+selected 0.25 s cadence into 0.3 s.
+
+Dead-flower mode is a separately gated movement program. It never activates ordinary attack,
+counterattack, or small-step paths. With reset disabled it permits no movement. With reset enabled
+it uses the established rope attachment and jump routes; a single flower point refreshes at that
+point and a multi-point circuit moves vertically between distinct flower Ys. The reset-ground
+routine starts only after attachment is confirmed, so a failed rope jump cannot start its timer or
+simulate a completed flower circuit.
 
 In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer. A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
 

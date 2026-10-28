@@ -327,13 +327,25 @@ class WindowKeySender:
         with self._window_handle_lock:
             return self._window_handle_generation
 
-    def enable_input(self) -> None:
+    def enable_input(self) -> bool:
         """Allow workers to emit keyboard events after explicit UI activation."""
 
         # Start from a neutral game-side keyboard state.  This is intentionally
         # before arming new inputs, so an old worker cannot carry a missed key
         # release into the new patrol session.
-        self.reset_input_session("start patrol")
+        # A previous Stop Patrol may have deferred local bookkeeping while a
+        # sender still owns the ledger.  Never let a Start-button callback
+        # wait indefinitely for that lock: it runs on Tk's main thread and
+        # made the complete dashboard look crashed after a long session.
+        session = self.reset_input_session(
+            "start patrol", lock_timeout_seconds=0.250
+        )
+        if session is None:
+            LOG.warning(
+                "INPUT RESET deferred: keyboard ledger stayed busy for 250ms; "
+                "input remains disarmed"
+            )
+            return False
         self._input_enabled.set()
         # A fresh session reports its first refusal again instead of staying silent inside the burst
         # window of the previous one.
@@ -341,6 +353,7 @@ class WindowKeySender:
         self._input_refusal_count = 0
         self._input_refusal_logged_at = float("-inf")
         LOG.info("live keyboard input enabled")
+        return True
 
     def disable_input(self, *, refocus_before_release: bool = False) -> None:
         """Block input and release every assistant key.
@@ -644,10 +657,23 @@ class WindowKeySender:
             LOG.info("key-up forced=%s reason=%s", key, reason)
         return True
 
-    def reset_input_session(self, reason: str = "reset") -> int:
+    def reset_input_session(
+        self,
+        reason: str = "reset",
+        *,
+        lock_timeout_seconds: Optional[float] = None,
+    ) -> Optional[int]:
         """Create a neutral input generation and scrub all bot motion keys."""
 
-        with self._key_state_lock:
+        if lock_timeout_seconds is None:
+            acquired = self._key_state_lock.acquire()
+        else:
+            acquired = self._key_state_lock.acquire(
+                timeout=max(0.0, float(lock_timeout_seconds))
+            )
+        if not acquired:
+            return None
+        try:
             keys = set(self._key_owners) | self._physical_keys
             # Always include the bot's movement keys.  A missed game-side
             # key-up is precisely the situation where neither local table
@@ -664,6 +690,8 @@ class WindowKeySender:
                 self._emit_locked(key, key_up=True)
             self._input_session += 1
             session = self._input_session
+        finally:
+            self._key_state_lock.release()
         LOG.info(
             "INPUT RESET session=%d reason=%s forced_keys=%s",
             session, reason, ", ".join(sorted(keys)),
@@ -2071,6 +2099,11 @@ class StatusWorker(threading.Thread):
         # clears only when the arbiter reports success/failure.
         self._buff_pending = {"buff2": False, "buff3": False}
         self._buff_timer_lock = threading.Lock()
+        # Optional Dead Flower integration.  UI mapping is fixed: buff1 is
+        # 饲料, buff2 is 增益 1.  The flower cadence owns only 增益 1's timer
+        # at a reached flower point; 饲料 remains an ordinary periodic drug.
+        self.buff2_flower_gate_callback: Any = None
+        self.buff2_flower_completed_callback: Any = None
         # Buff landing verification: the HUD readings before a buff tap, so the
         # next frames can prove whether the game cast anything at all.
         self._buff_verification: dict[str, Optional[dict[str, Any]]] = {
@@ -2217,6 +2250,22 @@ class StatusWorker(threading.Thread):
                 pending["key"],
             )
 
+    def request_buff2_at_flower_point(self) -> bool:
+        """Make 增益 1 due at a recorded Dead Flower point.
+
+        This is intentionally a request, not a key send: the next normal
+        status-frame tick still owns the actual 增益 1 delivery and applies the
+        placement gate.  It returns false when 增益 1 is not configured, so a
+        flower route never silently starts moving without its timing source.
+        """
+
+        config = self.detector.config
+        if not (config.buff2_enabled and config.buff2_key and config.buff2_interval > 0):
+            return False
+        with self._buff_timer_lock:
+            self._last_buff["buff2"] = float("-inf")
+        return True
+
     def _check_buffs(self, now: float) -> None:
         """Tap the periodic buff keys when their timer elapses.
 
@@ -2253,6 +2302,31 @@ class StatusWorker(threading.Thread):
                                 key, interval)
                     self._arm_buff_verification(name, key)
                 continue
+            if name == "buff2":
+                # Dead Flower opens this gate only while waiting at a reached
+                # flower.  In every other mode, buff2 follows its existing
+                # MotionArbiter path below unchanged.
+                gate = self.buff2_flower_gate_callback
+                flower_gate_open = False
+                if callable(gate):
+                    try:
+                        flower_gate_open = bool(gate())
+                    except Exception:
+                        LOG.exception("增益1 flower placement gate failed; keeping timer due")
+                        continue
+                if flower_gate_open:
+                    if self.key_sender.tap(key, hold_seconds=_BUFF_TAP_HOLD_SECONDS):
+                        with self._buff_timer_lock:
+                            self._last_buff[name] = time.monotonic()
+                        LOG.warning("增益1 花点 refresh: used %s (every %.0fs)", key, interval)
+                        self._arm_buff_verification(name, key)
+                        completed = self.buff2_flower_completed_callback
+                        if callable(completed):
+                            try:
+                                completed()
+                            except Exception:
+                                LOG.exception("增益1 flower completion callback failed")
+                    continue
             if self.motion_arbiter is not None:
                 # The timer is deliberately NOT restarted when queued.  It
                 # restarts only after the arbiter has tapped the key, waited

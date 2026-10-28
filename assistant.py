@@ -225,7 +225,12 @@ def _start_live_input(
                 veto_text,
             )
             return False
-        key_sender.enable_input()
+        if key_sender.enable_input() is False:
+            logging.warning(
+                "START PATROL deferred: keyboard cleanup is still busy; "
+                "the UI remains responsive and input stays disarmed"
+            )
+            return False
         automation_active_event.set()
     finally:
         if capture_preparing_event is not None:
@@ -1712,15 +1717,25 @@ def main() -> int:
         # from a stopped patrol remains cancelled until this exact point.
         movement_worker.arm_patrol_input()
         if bool(getattr(movement_worker, "dead_flower_mode", False)):
-            # 死花模式 intentionally has no marker, minimap, recorded-layer,
-            # or route dependency.  It only needs a foreground game window,
-            # then StatusWorker may cast Buffs and use HP/MP potions.
+            # 死花 does not use the normal patrol route, but its private rope
+            # loop still needs a stable minimap crop and a real yellow marker.
+            # Skipping calibration here left the detector alternating between
+            # the header and the actual minimap, so the flower worker never
+            # received a player position.  ``require_layer=False`` keeps this
+            # detection-only: it will not reject a marker on the rope and the
+            # movement worker still bypasses every normal patrol decision.
             logging.info(
-                "DEAD FLOWER startup: skipping minimap/marker/route calibration; "
-                "arming Buff + HP/MP only"
+                "DEAD FLOWER startup: calibrating minimap/marker only; "
+                "normal patrol route remains disabled"
             )
             return _start_live_input(
-                key_sender, automation_active, None, patrol_preparing,
+                key_sender, automation_active,
+                lambda: prepare_map_session(
+                    show_overlays=False,
+                    show_startup_marker=False,
+                    require_layer=False,
+                ),
+                patrol_preparing,
             )
         armed = _start_live_input(
             key_sender, automation_active,
@@ -2563,6 +2578,14 @@ def main() -> int:
     # and the arbiter-backed reaction.  Wire them only after both workers
     # exist; neither worker imports or controls the other directly.
     status_worker.hp_drop_callback = movement_worker.notify_hp_drop
+    # 死花模式 uses 增益 1 (the UI's buff2 row) as its flower-to-flower
+    # cadence. StatusWorker owns its timer/key; MovementWorker owns only the
+    # reached-flower gate and the subsequent private rope movement.
+    status_worker.buff2_flower_gate_callback = movement_worker.dead_flower_buff2_delivery_allowed
+    status_worker.buff2_flower_completed_callback = movement_worker.notify_dead_flower_buff2_delivered
+    movement_worker.set_dead_flower_buff2_request(
+        status_worker.request_buff2_at_flower_point
+    )
     stair_jump_worker = StairJumpWorker(
         stop_event,
         automation_active_event=automation_active,

@@ -738,7 +738,7 @@ class PatrolController:
                     continue
                 old_parts = layer.get("part_points")
                 parts: dict[str, Any] = {}
-                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points"):
+                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points", "flower_points"):
                     values: list[Any] = []
                     if isinstance(old_parts, dict):
                         for old_part in old_parts.values():
@@ -767,7 +767,7 @@ class PatrolController:
                         ):
                             if anchor_key in layer:
                                 target.setdefault(anchor_key, deepcopy(layer[anchor_key]))
-                        if name in ("jump_points", "skill_points"):
+                        if name in ("jump_points", "skill_points", "flower_points"):
                             target.setdefault(name, []).append(deepcopy(item))
                         else:
                             target[name] = deepcopy(item)
@@ -1291,6 +1291,88 @@ class PatrolController:
             self._persist_locked()
             return RecordedEndpoint(layer_name, "jump_point", point["x"], point["y"])
 
+    def record_flower_point(
+        self, player_x: float, player_y: float,
+        layout: Optional[CoordinateLayout] = None,
+    ) -> RecordedEndpoint:
+        """Record one 死花 rope checkpoint on the selected layer.
+
+        Flower points are intentionally marker-only points: their X remains
+        the recorded rope/marker X and their distinct Y values form the
+        up/down loop.  A rope may have one resting point or two alternating
+        points; allowing more would make the route ambiguous and is refused.
+        """
+
+        with self._lock:
+            layer_name = self._selected_layer
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                raise ValueError("没有可录制的楼层；请先点击「添加楼层」")
+            point: dict[str, Any] = {
+                "x": round(max(0.02, min(0.98, float(player_x))), 6),
+                "y": round(max(0.02, min(0.98, float(player_y))), 6),
+                "source": "manual-ui",
+            }
+            if layout is not None:
+                stable_x, stable_y = layout.stable_point(player_x, player_y)
+                point["coordinate_v2"] = {
+                    "x_diamond": round(stable_x, 6),
+                    "y_diamond": round(stable_y, 6),
+                    "recorded_layout": layout.as_dict(),
+                }
+            target = (
+                self._part_layer_locked(
+                    layer, self._part_index_for_x_locked(point["x"]), create=True,
+                ) if self._split_points_locked() else layer
+            )
+            assert target is not None
+            rope = target.get("rope_pos")
+            # Patrol stores a rope on the layer it DEPARTS from.  A flower
+            # point is recorded while attached to that rope, often with the
+            # upper layer selected.  In that ordinary layout inherit the
+            # immediately lower layer's same-part rope instead of rejecting a
+            # perfectly valid layer2 flower recording.
+            if not isinstance(rope, dict) or "x" not in rope:
+                match = re.search(r"(\d+)$", layer_name)
+                lower_name = (
+                    f"layer{int(match.group(1)) - 1}"
+                    if match and int(match.group(1)) > 1 else ""
+                )
+                lower = self._profile.get("layers", {}).get(lower_name)
+                lower_target = lower
+                if isinstance(lower, dict) and self._split_points_locked():
+                    lower_target = self._part_layer_locked(
+                        lower, self._part_index_for_x_locked(point["x"]),
+                        create=False,
+                    )
+                if isinstance(lower_target, dict):
+                    candidate = lower_target.get("rope_pos")
+                    if isinstance(candidate, dict) and "x" in candidate:
+                        rope = candidate
+                        # Keep an immutable local reference so the flower loop
+                        # can use the lower-layer rope without mutating or
+                        # duplicating the normal patrol record.
+                        target["flower_rope_pos"] = deepcopy(candidate)
+            if not isinstance(rope, dict) or "x" not in rope:
+                raise ValueError("请先在同一分区录制绳索点，再添加花点")
+            rope_x = float(rope["x"])
+            if abs(point["x"] - rope_x) > 0.030:
+                raise ValueError("花点必须在绳索旁：与绳索 X 的距离不能超过 0.030")
+            # The marker's current X is authoritative.  Preserve it exactly
+            # rather than applying any display/layout projection to the rope.
+            point["x"] = round(rope_x, 6)
+            points = target.setdefault("flower_points", [])
+            if not isinstance(points, list):
+                points = target["flower_points"] = []
+            if len(points) >= 2:
+                raise ValueError("同一绳索最多录制两个花点；请先双击删除旧花点")
+            if any(abs(float(old.get("y", -9.0)) - point["y"]) < 0.008
+                   for old in points if isinstance(old, dict)):
+                raise ValueError("花点 Y 与已有花点距离不足 0.008")
+            points.append(point)
+            self._persist_locked()
+            return RecordedEndpoint(layer_name, "flower_point", point["x"], point["y"])
+
     def delete_jump_point(self, layer_name: str, index: int) -> bool:
         """Delete one locked jump point by its stored list index.
 
@@ -1324,7 +1406,9 @@ class PatrolController:
         storage order.
         """
 
-        allowed = set(REQUIRED_LAYER_POINTS) | {"jump_point", "skill_point"}
+        allowed = set(REQUIRED_LAYER_POINTS) | {
+            "jump_point", "skill_point", "flower_point",
+        }
         if point_kind not in allowed:
             raise ValueError(f"不支持的点类型：{point_kind}")
         with self._lock:
@@ -1339,7 +1423,7 @@ class PatrolController:
             )
             if not isinstance(target, dict):
                 return False
-            if point_kind in ("jump_point", "skill_point"):
+            if point_kind in ("jump_point", "skill_point", "flower_point"):
                 field = f"{point_kind}s"
                 points = target.get(field)
                 if not isinstance(points, list) or index is None:
@@ -1350,6 +1434,8 @@ class PatrolController:
                 points.pop(point_index)
                 if not points:
                     target.pop(field, None)
+                    if point_kind == "flower_point":
+                        target.pop("flower_rope_pos", None)
             elif target.pop(point_kind, None) is None:
                 return False
             _recalculate_layer_band(target)
