@@ -74,6 +74,7 @@ _CTRL_RELEASE_INTERVAL_SECONDS = 0.02
 _CONFIGURATION_ACTION_PREFIXES = (
     "record:",
     "record_jump_point",
+    "record_dual_stationary",
     "select_next_layer",
     "select_next_patrol_start",
     "add_highest_layer",
@@ -168,9 +169,11 @@ KEY_VK = {
     "f": 0x46,
     "g": 0x47,
     "q": 0x51,
+    "r": 0x52,
     "w": 0x57,
     "z": 0x5A,
     "s": 0x53,
+    "t": 0x54,
     "0": 0x30,
     "1": 0x31,
     "2": 0x32,
@@ -265,6 +268,12 @@ class HotkeyWorker(threading.Thread):
         # that already-held modifier for the requested key; after its physical
         # key-up, a fresh Ctrl press is a legitimate ``ctrl`` binding.
         self._skill_key_capture_wait_for_ctrl_release = False
+        # Ctrl+R records a dual-stationary point in two phases.  The first
+        # phase captures the marker on the UI thread; this hook then consumes
+        # only D/F/G as the point's facing selector.
+        self._dual_stationary_capture_armed = False
+        self._dual_stationary_capture_wait_for_ctrl_release = False
+        self._dual_stationary_capture_slot: Optional[int] = None
         self._load_config()
 
     def arm_skill_key_capture(self) -> None:
@@ -274,6 +283,18 @@ class HotkeyWorker(threading.Thread):
     def cancel_skill_key_capture(self) -> None:
         self._skill_key_capture_armed = False
         self._skill_key_capture_wait_for_ctrl_release = False
+
+    def arm_dual_stationary_capture(self, slot: int) -> None:
+        if slot not in (0, 1):
+            raise ValueError(f"invalid dual stationary slot: {slot!r}")
+        self._dual_stationary_capture_armed = True
+        self._dual_stationary_capture_wait_for_ctrl_release = bool(self._ctrl_down)
+        self._dual_stationary_capture_slot = int(slot)
+
+    def cancel_dual_stationary_capture(self) -> None:
+        self._dual_stationary_capture_armed = False
+        self._dual_stationary_capture_wait_for_ctrl_release = False
+        self._dual_stationary_capture_slot = None
 
     def set_patrol_running(self, running: bool) -> None:
         """Disable all bindings except ``toggle_patrol`` while patrol runs."""
@@ -380,6 +401,7 @@ class HotkeyWorker(threading.Thread):
         "record_flower_point",
         "record_skill_point",
         "record_skill_key:",
+        "record_dual_stationary",
         "select_next_layer",
         "select_next_patrol_start",
         "add_highest_layer",
@@ -647,6 +669,8 @@ class HotkeyWorker(threading.Thread):
                     self._ctrl_down = False
                     if self._skill_key_capture_wait_for_ctrl_release:
                         self._skill_key_capture_wait_for_ctrl_release = False
+                    if self._dual_stationary_capture_wait_for_ctrl_release:
+                        self._dual_stationary_capture_wait_for_ctrl_release = False
                     if self._configuration_wait_for_ctrl_release:
                         self._configuration_wait_for_ctrl_release = False
                     # The hardware key-up normally reaches the game too; one
@@ -671,6 +695,25 @@ class HotkeyWorker(threading.Thread):
                     self._skill_key_capture_armed = False
                     self._skill_key_capture_wait_for_ctrl_release = False
                     self._queue_action("record_skill_key:cancel")
+                    return 1
+
+            if self._dual_stationary_capture_armed and is_down:
+                facing = {ord("D"): "left", ord("F"): "right", ord("G"): "both"}.get(vk)
+                if facing is not None:
+                    slot = self._dual_stationary_capture_slot
+                    self._dual_stationary_capture_armed = False
+                    self._dual_stationary_capture_wait_for_ctrl_release = False
+                    self._dual_stationary_capture_slot = None
+                    if slot in (0, 1):
+                        self._queue_action(
+                            f"record_dual_stationary_facing:{slot}:{facing}"
+                        )
+                    return 1
+                if vk == 0x1B:
+                    self._dual_stationary_capture_armed = False
+                    self._dual_stationary_capture_wait_for_ctrl_release = False
+                    self._dual_stationary_capture_slot = None
+                    self._queue_action("record_dual_stationary_facing:cancel")
                     return 1
 
             if vk not in active_vks:

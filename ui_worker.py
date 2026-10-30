@@ -165,18 +165,20 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1160
+_INITIAL_WINDOW_WIDTH = 1085
 _INITIAL_WINDOW_HEIGHT = 560
-_LEFT_COLUMN_WIDTH = 520
-_RIGHT_COLUMN_WIDTH = 580
-_LAYER_AXIS_WIDTH = 430
+_LEFT_COLUMN_WIDTH = 380
+_RIGHT_COLUMN_WIDTH = 515
+# The 90px left prefix is the layer selector + label + their margins.  Keep
+# the drawing canvas exactly within the fixed compact left column.
+_LAYER_AXIS_WIDTH = 350
 _LAYER_AXIS_HEIGHT = 38
 _LAYER_AXIS_LEFT = 8
 _LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH - 8
 _LAYER_AXIS_Y = 28
-# The columns are fixed at 520px and 580px respectively.  The wider initial
-# geometry leaves room for the expanded split-patrol and skill-point rows on
-# the first launch instead of relying on a prior saved window size.
+# The columns are fixed at 380px and 515px respectively.  The compact initial
+# geometry leaves room for each panel's controls without retaining unused
+# drawing space at the right of the patrol axis.
 # The default height is deliberately compact; users can still enlarge it and
 # their saved window size is never overwritten.
 
@@ -349,7 +351,7 @@ def _clamp_window_geometry(
 # instead of restoring a mismatched size (e.g. 1275x904 / 1620x1050 /
 # 1635x1272 from an older layout, a remembered manual resize, or a
 # DPI-aware run that stored physical-pixel sizes).
-_GEOMETRY_FORMAT = 7
+_GEOMETRY_FORMAT = 17
 
 
 def _load_window_geometry(default_geometry: str) -> str:
@@ -993,6 +995,12 @@ class UiWorker(threading.Thread):
     _FIXED_RANDOM_GAP_MAX = 30.0
     _FIXED_ATTACK_INTERVAL_MAX = 30.0
     _FIXED_ATTACK_INTERVAL_STEP = 0.05
+    # Preserve the full 0.20..30.00s configuration range while dedicating
+    # most of the visible slider travel to the common 0.20..2.00s interval.
+    # A linear 30-second scale cannot expose its 0.05s increments on a
+    # compact UI track (596 values would need 596 usable pixels).
+    _FIXED_ATTACK_INTERVAL_FINE_MAX = 2.0
+    _FIXED_ATTACK_INTERVAL_FINE_TRACK_SHARE = 0.80
     _OPTIONAL_MOTION_INTERVAL_MAX = 60.0
     # 捡东西 (the stand-still pickup circuit) is deliberately configured in
     # MINUTES: the operator reads and sets that row in "m", except values
@@ -1001,7 +1009,18 @@ class UiWorker(threading.Thread):
     _STATIONARY_PICKUP_INTERVAL_MIN_MINUTES = 10.0 / 60.0
     _STATIONARY_PICKUP_INTERVAL_MAX_MINUTES = 30.0
     _STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES = 15.0
-    _ATTACK_TIMING_SLIDER_LENGTH = 112
+    _DUAL_STATIONARY_SWITCH_MIN_MINUTES = 1.0
+    _DUAL_STATIONARY_SWITCH_MAX_MINUTES = 30.0
+    _DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES = 15.0
+    # One visual length for all of the time sliders in the attack panel.  The
+    # former 112px logical track was too short for the 0.05s attack cadence
+    # steps and also left an unnecessary empty gap after the key binding.
+    _ATTACK_TIMING_SLIDER_LENGTH = 150
+    # Potion and buff sliders form their own aligned right-panel column.
+    # 50px shorter than the previous compact right-panel track.  All five
+    # rows keep this same length and aligned endpoint.
+    _DRUG_SLIDER_LENGTH = 76
+    _DRUG_SLIDER_VALUE_WIDTH = 8
     # A DOUBLE click on a 随机 −/+ button moves the gap by this much in one go
     # (five seconds instead of 0.05), while a single click keeps the precise fine
     # step and holding keeps repeating it.
@@ -1593,7 +1612,14 @@ class UiWorker(threading.Thread):
             columns.grid_anchor("nw")
             col1 = ttk.Frame(columns)
             col1.grid(row=0, column=0, sticky="new", padx=(0, 6))
+            # The left stack is locked to its widest real row after the
+            # complete UI has been measured.  Without this, grid preserves a
+            # surplus strip to the right of the patrol canvas and stretches
+            # every left LabelFrame to match it.
+            col1.configure(width=_LEFT_COLUMN_WIDTH)
+            col1.grid_propagate(False)
             self._col1_frame = col1
+
             col2 = ttk.Frame(columns)
             col2.grid(row=0, column=1, sticky="new", padx=(6, 0))
             # Keep the right stack at one stable width.  Its panel contents
@@ -1697,7 +1723,7 @@ class UiWorker(threading.Thread):
             automation_status_slot.pack(fill="x", pady=(5, 0))
             automation_status_slot.pack_propagate(False)
             self._automation_status_label = ttk.Label(
-                automation_status_slot, justify="left", wraplength=440, width=54
+                automation_status_slot, justify="left", wraplength=440, width=54,
             )
             self._automation_status_label.pack(anchor="w", fill="x")
             self._refresh_patrol_controls()
@@ -1900,6 +1926,7 @@ class UiWorker(threading.Thread):
                 value=("yolo" if self._YOLO_MONSTER_DETECTION_ENABLED
                        else "fixed")
             )
+            self._dual_stationary_posts: list[dict[str, Any]] = []
             yolo_mode_button = ttk.Radiobutton(
                 mode_row, text="YOLO 检测", value="yolo",
                 variable=self._attack_mode_var,
@@ -1916,6 +1943,11 @@ class UiWorker(threading.Thread):
             ).pack(side="left")
             ttk.Radiobutton(
                 mode_row, text="站桩攻击", value="stationary",
+                variable=self._attack_mode_var,
+                command=self._fixed_on_mode_change,
+            ).pack(side="left", padx=(0, 8))
+            ttk.Radiobutton(
+                mode_row, text="双桩模式", value="dual_stationary",
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(0, 8))
@@ -1966,22 +1998,19 @@ class UiWorker(threading.Thread):
             # The interval/range controls sit in their own sub-frame so the
             # 跳跃攻击 mode can hide them and leave only the 按键 row.
             fixed_interval_group = ttk.Frame(fixed_key_row)
-            fixed_interval_group.pack(side="right")
-            ttk.Label(fixed_interval_group, text="每").pack(side="left")
-            # A deliberately short slider keeps the full attack row inside
-            # the compact left column without an artificial empty gap.
+            # The first 80% is a fine 0.20..2.00s region.  The final 20%
+            # still exposes the legacy 2.00..30.00s range.
             self._fixed_interval_var = tk.DoubleVar(value=3.0)
+            self._fixed_interval_slider_var = tk.DoubleVar(
+                value=self._fixed_attack_interval_to_slider_value(3.0)
+            )
             fixed_interval_slider = ttk.Scale(
-                fixed_interval_group, from_=0.2,
-                to=self._FIXED_ATTACK_INTERVAL_MAX, orient="horizontal",
-                # The slider is broad adjustment; values are snapped to 0.05s
-                # in _fixed_on_change while the adjacent buttons provide the
-                # exact fine random-gap control.
-                # the former 82px track physically could not land on every
-                # value even with snap rounding.
-                variable=self._fixed_interval_var,
+                fixed_interval_group, from_=0.0, to=1.0, orient="horizontal",
+                # The display-scale value is mapped back to a real interval
+                # by _fixed_interval_slider_on_change.
+                variable=self._fixed_interval_slider_var,
                 length=self._ATTACK_TIMING_SLIDER_LENGTH,
-                command=self._fixed_on_change,
+                command=self._fixed_interval_slider_on_change,
             )
             fixed_interval_slider.pack(side="left", padx=(0, 2))
             self._fixed_interval_label = ttk.Label(
@@ -1995,7 +2024,7 @@ class UiWorker(threading.Thread):
             self._fixed_interval_range_label.pack(side="left")
             self._fixed_interval_group = fixed_interval_group
             fixed_random_group = ttk.Frame(fixed_key_row)
-            fixed_random_group.pack(side="right", padx=(0, 4))
+            fixed_random_group.pack(side="left")
             self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
             fixed_gap_minus = ttk.Button(fixed_random_group, text="−", width=2)
             self._bind_repeat_step_button(
@@ -2023,6 +2052,9 @@ class UiWorker(threading.Thread):
                 ),
             )
             fixed_gap_plus.pack(side="left", padx=(1, 0))
+            # There is intentionally no spacer between the random controls
+            # and the timing scale.
+            fixed_interval_group.pack(side="left")
 
             # 被撞反击 is an event path separate from normal cadence/combo
             # attack.  A confirmed HP drop asks the arbiter to step away from
@@ -2058,6 +2090,44 @@ class UiWorker(threading.Thread):
             counterattack_key_button.pack(side="left")
             self._counterattack_key_button = counterattack_key_button
             self._attach_bind_hint(counterattack_key_button)
+
+            # 双桩模式 owns two explicitly recorded standing posts.  The
+            # slider is intentionally minutes, matching the operator-facing
+            # request: it chooses the post-switch interval, not an attack
+            # cadence.  Ctrl+R then D/F/G records/replaces each post.
+            dual_stationary_row = ttk.Frame(fixed_panel)
+            self._dual_stationary_row = dual_stationary_row
+            dual_stationary_row.pack(fill="x", pady=(2, 0))
+            self._dual_stationary_status_label = ttk.Label(
+                # 24 cells places 换桩时间's slider on the shared timing
+                # column below; the former 29-cell reservation left a wide
+                # dead gap and pushed this second slider to the right.
+                dual_stationary_row, text="双桩: 桩1 Ctrl+R / 桩2 Ctrl+T", width=24,
+            )
+            self._dual_stationary_status_label.pack(side="left")
+            ttk.Label(dual_stationary_row, text="换桩时间").pack(side="left", padx=(2, 3))
+            dual_timing_group = ttk.Frame(dual_stationary_row)
+            dual_timing_group.pack(side="left")
+            # Reserve only the shared trailing range column.  There is no
+            # leading blank cell: the slider starts directly after the row's
+            # own controls, matching the other left timing rows.
+            self._dual_stationary_switch_minutes_var = tk.DoubleVar(
+                value=self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES,
+            )
+            self._dual_stationary_switch_slider = ttk.Scale(
+                dual_timing_group,
+                from_=self._DUAL_STATIONARY_SWITCH_MIN_MINUTES,
+                to=self._DUAL_STATIONARY_SWITCH_MAX_MINUTES,
+                orient="horizontal", length=self._ATTACK_TIMING_SLIDER_LENGTH,
+                variable=self._dual_stationary_switch_minutes_var,
+                command=self._fixed_on_change,
+            )
+            self._dual_stationary_switch_slider.pack(side="left", padx=(0, 2))
+            self._dual_stationary_switch_label = ttk.Label(
+                dual_timing_group, text="15.0m", width=5,
+            )
+            self._dual_stationary_switch_label.pack(side="left", padx=(0, 2))
+            ttk.Label(dual_timing_group, text="", width=14).pack(side="left")
 
             # 组合攻击 only configures the independent attack scheduler;
             # movement, patrol, and input arbitration keep their own roles.
@@ -2175,9 +2245,12 @@ class UiWorker(threading.Thread):
             )
             pickup_enabled.pack(side="left", padx=(0, 4))
             self._stationary_pickup_enabled_button = pickup_enabled
+            # Align the − / value / + controls below the attack-key button.
+            # This is a real layout column, not the former blank square next
+            # to the slider; the timing scale itself follows immediately.
+            pickup_alignment_spacer = ttk.Frame(pickup_row, width=80)
+            pickup_alignment_spacer.pack(side="left")
             pickup_interval_group = ttk.Frame(pickup_row)
-            pickup_interval_group.pack(side="right")
-            ttk.Label(pickup_interval_group, text="每").pack(side="left")
             self._stationary_pickup_interval_var = tk.DoubleVar(
                 value=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES
             )
@@ -2199,7 +2272,7 @@ class UiWorker(threading.Thread):
             )
             self._stationary_pickup_interval_range_label.pack(side="left")
             pickup_random_group = ttk.Frame(pickup_row)
-            pickup_random_group.pack(side="right", padx=(0, 4))
+            pickup_random_group.pack(side="left")
             self._stationary_pickup_gap_var = tk.DoubleVar(value=0.1)
             pickup_gap_minus = ttk.Button(pickup_random_group, text="−", width=2)
             self._bind_repeat_step_button(
@@ -2225,6 +2298,7 @@ class UiWorker(threading.Thread):
                 ),
             )
             pickup_gap_plus.pack(side="left", padx=(1, 0))
+            pickup_interval_group.pack(side="left")
             self._stationary_pickup_controls = [
                 pickup_enabled, pickup_slider, pickup_gap_minus, pickup_gap_plus,
             ]
@@ -2246,9 +2320,9 @@ class UiWorker(threading.Thread):
             )
             small_step_hint.set_enabled(True)
             self._bind_key_tooltips.append(small_step_hint)
+            step_alignment_spacer = ttk.Frame(step_row, width=80)
+            step_alignment_spacer.pack(side="left")
             step_interval_group = ttk.Frame(step_row)
-            step_interval_group.pack(side="right")
-            ttk.Label(step_interval_group, text="每").pack(side="left")
             self._small_step_interval_var = tk.DoubleVar(value=5.0)
             ttk.Scale(
                 step_interval_group, from_=3.0,
@@ -2268,7 +2342,7 @@ class UiWorker(threading.Thread):
             )
             self._small_step_interval_range_label.pack(side="left")
             step_random_group = ttk.Frame(step_row)
-            step_random_group.pack(side="right", padx=(0, 4))
+            step_random_group.pack(side="left")
             self._small_step_gap_var = tk.DoubleVar(value=0.1)
             step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
             self._bind_repeat_step_button(
@@ -2294,6 +2368,7 @@ class UiWorker(threading.Thread):
                 ),
             )
             step_gap_plus.pack(side="left", padx=(1, 0))
+            step_interval_group.pack(side="left")
 
             self._fixed_status = ttk.Label(
                 fixed_panel, text="巡逻攻击未启用。", justify="left",
@@ -2318,7 +2393,7 @@ class UiWorker(threading.Thread):
             hp_row.pack(fill="x")
             self._hp_use_var = tk.BooleanVar(value=True)
             hp_use_button = ttk.Checkbutton(
-                hp_row, text="HP", variable=self._hp_use_var,
+                hp_row, text="HP", width=6, variable=self._hp_use_var,
                 command=self._drug_on_change,
             )
             hp_use_button.pack(side="left")
@@ -2332,29 +2407,30 @@ class UiWorker(threading.Thread):
                     lambda: self._drug_on_change(),
                 ),
             )
-            hp_key_button.pack(side="left", padx=(0, 10))
+            hp_key_button.pack(side="left", padx=(0, 4))
             self._hp_key_button = hp_key_button
             self._attach_bind_hint(hp_key_button)
-            ttk.Label(hp_row, text="HP 低于以下时喝药:").pack(side="left")
             self._hp_threshold_var = tk.IntVar(value=50)
-            # Fixed 500px column: the slider is shortened (length=60) so the
-            # row's total width stays inside the 500px column instead of
-            # pushing it wider.
+            # The right-side time/value column begins directly after the key
+            # binding.  Equal-width control prefixes make every row align.
+            hp_slider_group = ttk.Frame(hp_row)
+            hp_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
             hp_threshold_slider = ttk.Scale(
-                hp_row, from_=5, to=95, orient="horizontal",
+                hp_slider_group, from_=5, to=95, orient="horizontal",
                 variable=self._hp_threshold_var,
                 command=self._drug_on_change,
-                length=60,
+                length=self._DRUG_SLIDER_LENGTH,
             )
-            hp_threshold_slider.pack(side="left", fill="x",
-                                     expand=True, padx=(8, 8))
-            self._hp_threshold_label = ttk.Label(hp_row, text="50%", width=6)
+            hp_threshold_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            self._hp_threshold_label = ttk.Label(
+                hp_slider_group, text="50%", width=self._DRUG_SLIDER_VALUE_WIDTH
+            )
             self._hp_threshold_label.pack(side="left")
             mp_row = ttk.Frame(drug_panel)
             mp_row.pack(fill="x", pady=(6, 0))
             self._mp_use_var = tk.BooleanVar(value=True)
             mp_use_button = ttk.Checkbutton(
-                mp_row, text="MP", variable=self._mp_use_var,
+                mp_row, text="MP", width=6, variable=self._mp_use_var,
                 command=self._drug_on_change,
             )
             mp_use_button.pack(side="left")
@@ -2368,20 +2444,22 @@ class UiWorker(threading.Thread):
                     lambda: self._drug_on_change(),
                 ),
             )
-            mp_key_button.pack(side="left", padx=(0, 10))
+            mp_key_button.pack(side="left", padx=(0, 4))
             self._mp_key_button = mp_key_button
             self._attach_bind_hint(mp_key_button)
-            ttk.Label(mp_row, text="MP 低于以下时喝药:").pack(side="left")
             self._mp_threshold_var = tk.IntVar(value=30)
+            mp_slider_group = ttk.Frame(mp_row)
+            mp_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
             mp_threshold_slider = ttk.Scale(
-                mp_row, from_=5, to=95, orient="horizontal",
+                mp_slider_group, from_=5, to=95, orient="horizontal",
                 variable=self._mp_threshold_var,
                 command=self._drug_on_change,
-                length=60,
+                length=self._DRUG_SLIDER_LENGTH,
             )
-            mp_threshold_slider.pack(side="left", fill="x",
-                                     expand=True, padx=(8, 8))
-            self._mp_threshold_label = ttk.Label(mp_row, text="30%", width=6)
+            mp_threshold_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            self._mp_threshold_label = ttk.Label(
+                mp_slider_group, text="30%", width=self._DRUG_SLIDER_VALUE_WIDTH
+            )
             self._mp_threshold_label.pack(side="left")
             # Periodic buff rows: a bound key tapped on a timer.  Each row has
             # its own 5..600 second slider (default 600 seconds) that decides
@@ -2391,7 +2469,7 @@ class UiWorker(threading.Thread):
             buff1_row.pack(fill="x", pady=(6, 0))
             self._buff1_use_var = tk.BooleanVar(value=False)
             buff1_use_button = ttk.Checkbutton(
-                buff1_row, text="饲料", variable=self._buff1_use_var,
+                buff1_row, text="饲料", width=6, variable=self._buff1_use_var,
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
@@ -2406,30 +2484,30 @@ class UiWorker(threading.Thread):
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff1_key_button.pack(side="left", padx=(0, 10))
+            buff1_key_button.pack(side="left", padx=(0, 4))
             self._buff1_key_button = buff1_key_button
             self._attach_bind_hint(buff1_key_button)
-            ttk.Label(buff1_row, text="每").pack(side="left")
             # Buff refresh period in seconds (default 600): horizontal slider
             # in the same progress-bar style as the other panels.
             self._buff1_interval_var = tk.DoubleVar(value=600.0)
+            buff1_slider_group = ttk.Frame(buff1_row)
+            buff1_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
             buff1_interval_slider = ttk.Scale(
-                buff1_row, from_=5.0, to=600.0, orient="horizontal",
+                buff1_slider_group, from_=5.0, to=600.0, orient="horizontal",
                 variable=self._buff1_interval_var,
                 command=self._drug_on_change,
-                length=60,
+                length=self._DRUG_SLIDER_LENGTH,
             )
-            buff1_interval_slider.pack(side="left", fill="x",
-                                       expand=True, padx=(8, 8))
+            buff1_interval_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
             self._buff1_interval_label = ttk.Label(
-                buff1_row, text="600s", width=8
+                buff1_slider_group, text="600s", width=self._DRUG_SLIDER_VALUE_WIDTH
             )
             self._buff1_interval_label.pack(side="left")
             buff2_row = ttk.Frame(drug_panel)
             buff2_row.pack(fill="x", pady=(6, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
             buff2_use_button = ttk.Checkbutton(
-                buff2_row, text="增益 1", variable=self._buff2_use_var,
+                buff2_row, text="增益 1", width=6, variable=self._buff2_use_var,
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
@@ -2444,28 +2522,28 @@ class UiWorker(threading.Thread):
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff2_key_button.pack(side="left", padx=(0, 10))
+            buff2_key_button.pack(side="left", padx=(0, 4))
             self._buff2_key_button = buff2_key_button
             self._attach_bind_hint(buff2_key_button)
-            ttk.Label(buff2_row, text="每").pack(side="left")
             self._buff2_interval_var = tk.DoubleVar(value=600.0)
+            buff2_slider_group = ttk.Frame(buff2_row)
+            buff2_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
             buff2_interval_slider = ttk.Scale(
-                buff2_row, from_=5.0, to=600.0, orient="horizontal",
+                buff2_slider_group, from_=5.0, to=600.0, orient="horizontal",
                 variable=self._buff2_interval_var,
                 command=self._drug_on_change,
-                length=60,
+                length=self._DRUG_SLIDER_LENGTH,
             )
-            buff2_interval_slider.pack(side="left", fill="x",
-                                       expand=True, padx=(8, 8))
+            buff2_interval_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
             self._buff2_interval_label = ttk.Label(
-                buff2_row, text="600s", width=8
+                buff2_slider_group, text="600s", width=self._DRUG_SLIDER_VALUE_WIDTH
             )
             self._buff2_interval_label.pack(side="left")
             buff3_row = ttk.Frame(drug_panel)
             buff3_row.pack(fill="x", pady=(6, 0))
             self._buff3_use_var = tk.BooleanVar(value=False)
             buff3_use_button = ttk.Checkbutton(
-                buff3_row, text="增益 2", variable=self._buff3_use_var,
+                buff3_row, text="增益 2", width=6, variable=self._buff3_use_var,
                 command=self._drug_on_change,
             )
             buff3_use_button.pack(side="left")
@@ -2480,21 +2558,21 @@ class UiWorker(threading.Thread):
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff3_key_button.pack(side="left", padx=(0, 10))
+            buff3_key_button.pack(side="left", padx=(0, 4))
             self._buff3_key_button = buff3_key_button
             self._attach_bind_hint(buff3_key_button)
-            ttk.Label(buff3_row, text="每").pack(side="left")
             self._buff3_interval_var = tk.DoubleVar(value=600.0)
+            buff3_slider_group = ttk.Frame(buff3_row)
+            buff3_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
             buff3_interval_slider = ttk.Scale(
-                buff3_row, from_=5.0, to=600.0, orient="horizontal",
+                buff3_slider_group, from_=5.0, to=600.0, orient="horizontal",
                 variable=self._buff3_interval_var,
                 command=self._drug_on_change,
-                length=60,
+                length=self._DRUG_SLIDER_LENGTH,
             )
-            buff3_interval_slider.pack(side="left", fill="x",
-                                       expand=True, padx=(8, 8))
+            buff3_interval_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
             self._buff3_interval_label = ttk.Label(
-                buff3_row, text="600s", width=8
+                buff3_slider_group, text="600s", width=self._DRUG_SLIDER_VALUE_WIDTH
             )
             self._buff3_interval_label.pack(side="left")
             # Restore previously saved drug settings and apply them live.
@@ -2516,7 +2594,10 @@ class UiWorker(threading.Thread):
             ).pack(side="left")
             self._quick_message_status = ttk.Label(
                 quick_header, text="单击复制；双击发送；长按 1 秒修改/删除。",
-                justify="left", wraplength=300,
+                # Keep this header inside the compact 380px left column;
+                # its old 300px wrap width was the element stretching the
+                # whole patrol stack beyond the widest real patrol row.
+                justify="left", wraplength=250,
             )
             self._quick_message_status.pack(side="left", padx=(8, 0))
             self._quick_messages_frame = ttk.Frame(quick_panel)
@@ -5448,6 +5529,56 @@ class UiWorker(threading.Thread):
                     self._play_action_sound(self._record_split_point())
                 elif action == "record_flower_point":
                     self._play_action_sound(self._record_flower_point())
+                elif action.startswith("record_dual_stationary_post:"):
+                    slot_name = action.partition(":")[2]
+                    slot = {"first": 0, "second": 1}.get(slot_name)
+                    if slot is None:
+                        LOG.warning("dual stationary hotkey ignored: unknown slot %r", slot_name)
+                        self._play_action_sound(False)
+                        continue
+                    if str(self._attack_mode_var.get()) != "dual_stationary":
+                        self._control_status.configure(text="请先选择双桩模式，再按 Ctrl+R / Ctrl+T 录制。")
+                        self._play_action_sound(False)
+                        continue
+                    if slot == 1 and len(self._dual_stationary_posts_data()) < 1:
+                        self._control_status.configure(text="请先用 Ctrl+R 录制桩1，再用 Ctrl+T 录制桩2。")
+                        self._play_action_sound(False)
+                        continue
+                    snapshot = self._capture_snapshot_for_recording()
+                    if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+                        self._control_status.configure(text="无法录制双桩点：未检测到黄色角色标记。")
+                        self._play_action_sound(False)
+                        continue
+                    self._dual_stationary_pending_point = {
+                        "x": float(snapshot.player_x),
+                        "y": float(snapshot.player_y),
+                    }
+                    arm = getattr(self.hotkey_worker, "arm_dual_stationary_capture", None)
+                    if callable(arm):
+                        arm(slot)
+                        self._control_status.configure(
+                            text=(f"桩{slot + 1}：已记录当前位置，请按 "
+                                  "D=朝左、F=朝右、G=双向（Esc 取消）。")
+                        )
+                    else:
+                        self._play_action_sound(False)
+                elif action.startswith("record_dual_stationary_facing:"):
+                    selector = action.partition(":")[2]
+                    point = getattr(self, "_dual_stationary_pending_point", None)
+                    self._dual_stationary_pending_point = None
+                    if selector == "cancel":
+                        self._control_status.configure(text="双桩点录制已取消。")
+                    else:
+                        try:
+                            slot_text, facing = selector.split(":", 1)
+                            slot = int(slot_text)
+                        except (TypeError, ValueError):
+                            LOG.warning("dual stationary facing ignored: malformed selector %r", selector)
+                            self._play_action_sound(False)
+                            continue
+                        self._play_action_sound(
+                            self._record_dual_stationary_post(point, facing, slot)
+                        )
                 elif action == "record_skill_point":
                     arm = getattr(self.hotkey_worker, "arm_skill_key_capture", None)
                     if callable(arm) and self._prepare_skill_point_recording():
@@ -8288,6 +8419,17 @@ class UiWorker(threading.Thread):
                         # labels instead of making the second marker look
                         # like a replacement for the first one.
                         entries.append(("flower_point", point, f"花{index + 1}", index))
+        # Dual posts are their own marker type, just like 最左 / 最右 / 绳索.
+        # They are not temporary stationary overlays: the two persisted
+        # records must remain separately visible on their recorded layer.
+        dual_mode_var = getattr(self, "_attack_mode_var", None)
+        dual_mode_active = bool(
+            dual_mode_var is not None and str(dual_mode_var.get()) == "dual_stationary"
+        )
+        if dual_mode_active:
+            for index, point in enumerate(self._dual_stationary_posts_data()):
+                if point.get("layer") == layer_name:
+                    entries.append(("dual_stationary_post", point, f"双桩{index + 1}", index))
         def _axis_x(entry: tuple[str, Any, str, Optional[int]]) -> float:
             try:
                 return float(entry[1].get("x", 0.0))
@@ -8307,6 +8449,7 @@ class UiWorker(threading.Thread):
             "jump_point": "#1d9b45",
             "skill_point": "#8a2be2",
             "flower_point": "#d13a8b",
+            "dual_stationary_post": "#cc2222",
         }
         for kind, point, label, index in entries:
             try:
@@ -8355,6 +8498,19 @@ class UiWorker(threading.Thread):
                     x, axis_y - 9, text=label, fill="white",
                     font=("TkDefaultFont", 8, "bold"), tags=(tag,),
                 )
+            elif kind == "dual_stationary_post":
+                # Same red facing glyph as ordinary 站桩攻击, but as a real
+                # recorded axis point so both posts are unique and stable.
+                facing = str(point.get("facing", "right")).casefold()
+                marker_text = {
+                    "left": "<",
+                    "right": ">",
+                    "both": "<>",
+                }.get(facing, ">")
+                canvas.create_text(
+                    x, axis_y - 10, text=marker_text,
+                    fill=colors[kind], font=("TkDefaultFont", 9, "bold"), tags=(tag,),
+                )
             else:
                 direction = str(point.get("direction", "")).casefold()
                 if direction == "left":
@@ -8380,21 +8536,23 @@ class UiWorker(threading.Thread):
                 tag, "<Leave>",
                 lambda _event, canvas=canvas: self._hide_layer_axis_hint(canvas),
             )
-            canvas.tag_bind(
-                tag, "<Double-Button-1>",
-                lambda _event, layer_name=layer_name, kind=kind,
-                point_x=x_value, index=index:
-                self._delete_recorded_axis_point(
-                    layer_name, kind, point_x, index,
-                ),
-            )
+            if kind != "dual_stationary_post":
+                canvas.tag_bind(
+                    tag, "<Double-Button-1>",
+                    lambda _event, layer_name=layer_name, kind=kind,
+                    point_x=x_value, index=index:
+                    self._delete_recorded_axis_point(
+                        layer_name, kind, point_x, index,
+                    ),
+                )
         # The temporary 站桩 anchor is not recording data and therefore has
         # no delete/click action.  When its current location successfully
         # matches a usable route layer, paint a quiet X on that layer's axis.
         mover = getattr(self, "movement_worker", None)
         marker_getter = getattr(mover, "stationary_route_anchor_marker", None)
         marker = marker_getter() if callable(marker_getter) else None
-        if marker is not None and marker[0] == layer_name:
+        if (not dual_mode_active
+                and marker is not None and marker[0] == layer_name):
             try:
                 x_value = max(0.0, min(1.0, float(marker[1].x)))
                 x = left + round((right - left) * x_value)
@@ -8529,7 +8687,107 @@ class UiWorker(threading.Thread):
             "stationary_pickup_gap_seconds": round(
                 self._stationary_pickup_gap_minutes() * 60.0, 1
             ),
+            "dual_stationary_posts": self._dual_stationary_posts_data(),
+            "dual_stationary_switch_seconds": round(
+                self._dual_stationary_switch_minutes() * 60.0, 1
+            ),
         }
+
+    def _dual_stationary_switch_minutes(self) -> float:
+        var = getattr(self, "_dual_stationary_switch_minutes_var", None)
+        try:
+            value = float(var.get()) if var is not None else self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES
+        except (TypeError, ValueError, tk.TclError):
+            value = self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES
+        return min(self._DUAL_STATIONARY_SWITCH_MAX_MINUTES,
+                   max(self._DUAL_STATIONARY_SWITCH_MIN_MINUTES, value))
+
+    def _dual_stationary_posts_data(self) -> list[dict[str, Any]]:
+        raw = getattr(self, "_dual_stationary_posts", ())
+        result: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                x, y = float(item["x"]), float(item["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            facing = str(item.get("facing", "right")).casefold()
+            if facing not in ("left", "right", "both"):
+                facing = "right"
+            normalized = {"x": round(x, 6), "y": round(y, 6), "facing": facing}
+            # The marker belongs on the layer that was selected when Ctrl+R
+            # was pressed.  It is display-only; MovementWorker still chooses
+            # anchors solely by the physical X/Y distance.
+            recorded_layer = item.get("layer")
+            if isinstance(recorded_layer, str) and recorded_layer:
+                normalized["layer"] = recorded_layer
+            result.append(normalized)
+        return result[:2]
+
+    def _refresh_dual_stationary_status(self) -> None:
+        label = getattr(self, "_dual_stationary_status_label", None)
+        if label is not None:
+            posts = self._dual_stationary_posts_data()
+            faces = {"left": "左", "right": "右", "both": "双"}
+            labels = []
+            for index in range(2):
+                if index < len(posts):
+                    labels.append(
+                        f"桩{index + 1}{faces.get(str(posts[index]['facing']), '右')}"
+                    )
+                else:
+                    chord = "Ctrl+R" if index == 0 else "Ctrl+T"
+                    labels.append(f"桩{index + 1} {chord}")
+            label.configure(text="双桩: " + " / ".join(labels))
+
+    def _record_dual_stationary_post(
+        self, point: Any, facing: str, slot: Any,
+    ) -> bool:
+        """Commit a specific dual-stationary post after its D/F/G selector."""
+
+        if str(self._attack_mode_var.get()) != "dual_stationary":
+            self._control_status.configure(text="请先选择双桩模式，再录制双桩点。")
+            return False
+        try:
+            x, y = float(point["x"]), float(point["y"])
+        except (KeyError, TypeError, ValueError):
+            self._control_status.configure(text="无法录制双桩点：黄色角色标记已丢失。")
+            return False
+        if facing not in ("left", "right", "both"):
+            return False
+        if slot not in (0, 1):
+            self._control_status.configure(text="无法录制双桩点：录制槽位无效。")
+            return False
+        posts = self._dual_stationary_posts_data()
+        item = {"x": round(x, 6), "y": round(y, 6), "facing": facing}
+        controller = getattr(self, "patrol_controller", None)
+        selected_layer = getattr(controller, "selected_layer", None)
+        if callable(selected_layer):
+            try:
+                layer_name = str(selected_layer())
+            except Exception:
+                layer_name = ""
+            if layer_name:
+                item["layer"] = layer_name
+        if slot == 0:
+            if posts:
+                posts[0] = item
+            else:
+                posts.append(item)
+        elif len(posts) == 1:
+            posts.append(item)
+        else:
+            posts[1] = item
+        self._dual_stationary_posts = posts
+        self._refresh_dual_stationary_status()
+        self._fixed_on_change()
+        names = {"left": "左", "right": "右", "both": "双向"}
+        self._control_status.configure(
+            text=(f"已录制桩{slot + 1}：X={x:.6f}，Y={y:.6f}，"
+                  f"朝向{names[facing]}（双桩 {len(posts)}/2）。")
+        )
+        return True
 
     def _combo_attack_slots_data(self) -> list[dict]:
         """Return the three normalized combo-slot mappings for persistence."""
@@ -8850,10 +9108,11 @@ class UiWorker(threading.Thread):
         # This method runs again after several ordinary UI refreshes.  It must
         # never reopen stationary controls that the authorization lock closed.
         fixed_attack_enabled = (
-            mode in ("fixed", "stationary") and self._license_allowed()
+            mode in ("fixed", "stationary", "dual_stationary") and self._license_allowed()
         )
         stationary_enabled = mode == "stationary" and self._license_allowed()
-        flower_cycle_enabled = mode in ("stationary", "dead_flower") and self._license_allowed()
+        dual_stationary_enabled = mode == "dual_stationary" and self._license_allowed()
+        flower_cycle_enabled = mode in ("stationary", "dual_stationary", "dead_flower") and self._license_allowed()
         dead_flower_mode = mode == "dead_flower"
         pickup_label = getattr(self, "_stationary_pickup_enabled_button", None)
         if pickup_label is not None:
@@ -8885,6 +9144,9 @@ class UiWorker(threading.Thread):
                 widget.state(["!disabled" if stationary_enabled else "disabled"])
             except Exception:
                 widget.configure(state="normal" if stationary_enabled else "disabled")
+        dual_row = getattr(self, "_dual_stationary_row", None)
+        if dual_row is not None:
+            self._set_panel_state(dual_row, disabled=not dual_stationary_enabled)
         for widget in getattr(self, "_stationary_pickup_controls", []):
             if widget is None:
                 continue
@@ -8893,6 +9155,71 @@ class UiWorker(threading.Thread):
             except Exception:
                 widget.configure(state="normal" if flower_cycle_enabled else "disabled")
 
+    def _fixed_attack_interval_to_slider_value(self, interval: float) -> float:
+        """Map a real cadence value onto the fine/coarse slider track."""
+
+        value = max(0.2, min(self._FIXED_ATTACK_INTERVAL_MAX, float(interval)))
+        fine_max = self._FIXED_ATTACK_INTERVAL_FINE_MAX
+        fine_share = self._FIXED_ATTACK_INTERVAL_FINE_TRACK_SHARE
+        if value <= fine_max:
+            return ((value - 0.2) / (fine_max - 0.2)) * fine_share
+        return fine_share + (
+            (value - fine_max)
+            / (self._FIXED_ATTACK_INTERVAL_MAX - fine_max)
+        ) * (1.0 - fine_share)
+
+    def _slider_value_to_fixed_attack_interval(self, slider_value: float) -> float:
+        """Map the display-scale position back to a snapped cadence value."""
+
+        position = max(0.0, min(1.0, float(slider_value)))
+        fine_max = self._FIXED_ATTACK_INTERVAL_FINE_MAX
+        fine_share = self._FIXED_ATTACK_INTERVAL_FINE_TRACK_SHARE
+        if position <= fine_share:
+            raw = 0.2 + (position / fine_share) * (fine_max - 0.2)
+        else:
+            raw = fine_max + (
+                (position - fine_share) / (1.0 - fine_share)
+            ) * (self._FIXED_ATTACK_INTERVAL_MAX - fine_max)
+        return round(
+            round(raw / self._FIXED_ATTACK_INTERVAL_STEP)
+            * self._FIXED_ATTACK_INTERVAL_STEP,
+            2,
+        )
+
+    def _fixed_interval_slider_on_change(self, _value: str = "") -> None:
+        """Receive a drag on the display slider without losing fine cadence."""
+
+        if getattr(self, "_fixed_interval_slider_syncing", False):
+            return
+        slider_var = getattr(self, "_fixed_interval_slider_var", None)
+        if slider_var is None:
+            return
+        try:
+            interval = self._slider_value_to_fixed_attack_interval(
+                float(slider_var.get())
+            )
+        except (TypeError, ValueError, tk.TclError):
+            return
+        self._fixed_interval_var.set(interval)
+        self._fixed_on_change()
+
+    def _sync_fixed_interval_slider(self, interval: float) -> None:
+        """Move the display slider after buttons/config changed the cadence."""
+
+        slider_var = getattr(self, "_fixed_interval_slider_var", None)
+        if slider_var is None:
+            return
+        desired = self._fixed_attack_interval_to_slider_value(interval)
+        try:
+            if abs(float(slider_var.get()) - desired) <= 1e-9:
+                return
+            self._fixed_interval_slider_syncing = True
+            slider_var.set(desired)
+        except (TypeError, ValueError, tk.TclError):
+            return
+        finally:
+            self._fixed_interval_slider_syncing = False
+
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
 
@@ -8900,17 +9227,16 @@ class UiWorker(threading.Thread):
             return
         mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "stationary", "dead_flower")):
+                and mode not in ("fixed", "stationary", "dual_stationary", "dead_flower")):
             mode = "fixed"
             self._attack_mode_var.set("fixed")
         # Layout is intentionally not refreshed here.  Sliders and long-hold
         # random-gap buttons call this method repeatedly; packing/unpacking
         # their rows on every 0.1 s tick made the visible line flicker or
         # disappear.  Only an actual attack-mode change needs a layout pass.
-        # ttk.Scale is pixel-continuous: on this compact 82px track, an exact
-        # 3.0s position may have no physical pixel at all.  Quantize every
-        # drag to the persisted 0.05s unit so the displayed value is exactly
-        # what will be used.
+        # The visible scale uses a fine 0.20..2.00s section plus a coarse
+        # 2.00..30.00s section.  Quantize every change to the persisted 0.05s
+        # unit so the displayed value is exactly what will be used.
         raw_interval = max(
             0.2, min(self._FIXED_ATTACK_INTERVAL_MAX,
                      float(self._fixed_interval_var.get()))
@@ -8922,6 +9248,7 @@ class UiWorker(threading.Thread):
         )
         if abs(raw_interval - interval) > 1e-9:
             self._fixed_interval_var.set(interval)
+        self._sync_fixed_interval_slider(interval)
         interval_text = f"{interval:.2f}".rstrip("0").rstrip(".")
         self._fixed_interval_label.configure(text=f"{interval_text}s")
         random_gap = self._fixed_random_gap_seconds()
@@ -8968,6 +9295,11 @@ class UiWorker(threading.Thread):
                     f"{self._format_stationary_pickup_interval(pickup_interval + pickup_gap)})"
                 )
             )
+        if hasattr(self, "_dual_stationary_switch_minutes_var"):
+            switch_minutes = self._dual_stationary_switch_minutes()
+            self._dual_stationary_switch_minutes_var.set(switch_minutes)
+            self._dual_stationary_switch_label.configure(text=f"{switch_minutes:.1f}m")
+            self._refresh_dual_stationary_status()
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
@@ -9043,21 +9375,25 @@ class UiWorker(threading.Thread):
             return
         mode = str(data.get("attack_mode", "fixed"))
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "stationary", "dead_flower")):
+                and mode not in ("fixed", "stationary", "dual_stationary", "dead_flower")):
             mode = "fixed"
         dead_flower_mode = mode == "dead_flower"
+        dual_stationary_mode = mode == "dual_stationary"
         jump_attack_enabled = bool(data.get(
             "jump_attack_enabled",
             data.get("stationary_jump_enabled", False),
-        )) and mode in ("fixed", "stationary")
+        )) and mode in ("fixed", "stationary", "dual_stationary")
         worker.jump_attack = jump_attack_enabled
-        worker.enabled = bool(mode in ("fixed", "stationary"))
+        worker.enabled = bool(mode in ("fixed", "stationary", "dual_stationary"))
         # 站桩 shares its beats with the anchor correction and 小碎步, which carry
         # their own attacks; on patrol those are deliberate extras, so only the
         # stand-still cadence keeps the attack-spacing rule (attack_worker).
-        worker.stationary_mode = bool(mode == "stationary")
+        worker.stationary_mode = bool(mode in ("stationary", "dual_stationary"))
         worker.attack_interval = max(
-            0.2, float(data.get("interval_seconds", 3.0))
+            0.2, min(
+                self._FIXED_ATTACK_INTERVAL_MAX,
+                float(data.get("interval_seconds", 3.0)),
+            )
         )
         worker.attack_jitter_seconds = max(
             0.0, float(data.get("random_gap_seconds", 0.0))
@@ -9089,7 +9425,14 @@ class UiWorker(threading.Thread):
                 mover, "set_stationary_attack_enabled", None
             )
             if callable(stationary_setter):
-                stationary_setter(mode == "stationary")
+                stationary_setter(mode in ("stationary", "dual_stationary"))
+            dual_setter = getattr(mover, "set_dual_stationary_configuration", None)
+            if callable(dual_setter):
+                dual_setter(
+                    dual_stationary_mode,
+                    data.get("dual_stationary_posts", ()),
+                    float(data.get("dual_stationary_switch_seconds", 900.0)),
+                )
             # Automatic stuck stair-jumps are intentionally disabled.  The
             # dedicated jump executor remains solely for recorded jump points.
             mover.stair_jump_enabled = False
@@ -9099,7 +9442,7 @@ class UiWorker(threading.Thread):
             # uses it chiefly to finish facing the monster side.
             step_worker.enabled = bool(
                 data.get("small_step_enabled", False)
-            ) and mode in ("fixed", "stationary")
+            ) and mode in ("fixed", "stationary", "dual_stationary")
             step_worker.step_interval = max(
                 3.0,
                 float(data.get("small_step_interval_seconds", 5.0)),
@@ -9122,7 +9465,7 @@ class UiWorker(threading.Thread):
                 # is the only place the interval is read as minutes.
                 pickup_setter(
                     bool(data.get("stationary_pickup_enabled", False))
-                    and mode == "stationary",
+                    and mode in ("stationary", "dual_stationary"),
                     float(data.get("stationary_pickup_interval_seconds", 900.0)),
                     float(data.get("stationary_pickup_gap_seconds", 0.0)),
                 )
@@ -9141,7 +9484,7 @@ class UiWorker(threading.Thread):
         mode = str(self._attack_mode_var.get())
         fixed_mode = (
             not self._YOLO_MONSTER_DETECTION_ENABLED
-            or mode in ("fixed", "stationary", "dead_flower")
+            or mode in ("fixed", "stationary", "dual_stationary", "dead_flower")
         )
         if fixed_mode:
             # Only one attack engine at a time: selecting Fixed Attack stops
@@ -9175,6 +9518,13 @@ class UiWorker(threading.Thread):
                               f"只有正确配置楼层，才能寻路回去；"
                               f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}每 "
                               f"{interval:.1f}s。")
+                    )
+                elif mode == "dual_stationary":
+                    posts = len(self._dual_stationary_posts_data())
+                    self._fixed_status.configure(
+                        text=(f"双桩模式已启用 - 已录制 {posts}/2 桩；"
+                              f"Ctrl+R 后按 D/F/G 录制朝向；每 "
+                              f"{self._dual_stationary_switch_minutes():.1f}m 换桩。")
                     )
                 else:
                     self._fixed_status.configure(
@@ -9230,10 +9580,10 @@ class UiWorker(threading.Thread):
                     self._attack_mode_var.set("stationary")
                     if hasattr(self, "_jump_attack_enabled_var"):
                         self._jump_attack_enabled_var.set(True)
-                elif mode in ("yolo", "fixed", "stationary", "dead_flower"):
+                elif mode in ("yolo", "fixed", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set(mode)
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
-                if self._attack_mode_var.get() not in ("fixed", "stationary", "dead_flower"):
+                if self._attack_mode_var.get() not in ("fixed", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set("fixed")
             if "interval_seconds" in data:
                 self._fixed_interval_var.set(
@@ -9335,6 +9685,17 @@ class UiWorker(threading.Thread):
                     # selector replaces it and defaults to right.
                     direction = "right"
                 self._stationary_facing_direction_var.set(direction)
+            if hasattr(self, "_dual_stationary_switch_minutes_var"):
+                seconds = float(data.get("dual_stationary_switch_seconds", 900.0))
+                self._dual_stationary_switch_minutes_var.set(min(
+                    self._DUAL_STATIONARY_SWITCH_MAX_MINUTES,
+                    max(self._DUAL_STATIONARY_SWITCH_MIN_MINUTES, seconds / 60.0),
+                ))
+            raw_posts = data.get("dual_stationary_posts", ())
+            self._dual_stationary_posts = (
+                [item for item in raw_posts if isinstance(item, dict)][:2]
+                if isinstance(raw_posts, list) else []
+            )
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed fixed attack settings",
                         exc_info=True)
@@ -9878,7 +10239,7 @@ class UiWorker(threading.Thread):
                 self._ttk.Label(
                     row, text=f"Ctrl+{key_number}", width=6, anchor="w"
                 ).pack(side="left", padx=(0, 4))
-                entry = self._ttk.Entry(row, width=34)
+                entry = self._ttk.Entry(row, width=28)
                 entry.insert(0, message)
                 entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
                 self._quick_edit_entry = entry
@@ -10075,8 +10436,9 @@ class UiWorker(threading.Thread):
     def _freeze_column_widths(self) -> Optional[tuple[int, int]]:
         """Freeze both grid tracks after their complete initial layout.
 
-        Both columns have explicit, invariant pixel widths. Text in the patrol
-        stack must never participate in a later grid-width negotiation.
+        The compact left column has an explicit invariant width.  The right
+        column is measured from its widest actual control row so it never
+        clips values or buttons when the window is fitted to the UI.
         """
 
         columns = getattr(self, "_columns_frame", None)
@@ -10086,11 +10448,20 @@ class UiWorker(threading.Thread):
             return None
         try:
             left_width = _LEFT_COLUMN_WIDTH
-            right_width = _RIGHT_COLUMN_WIDTH
+            right_children = tuple(col2.winfo_children())
+            right_width = max(
+                _RIGHT_COLUMN_WIDTH,
+                *(int(child.winfo_reqwidth()) for child in right_children),
+            )
             columns.columnconfigure(0, weight=0, minsize=left_width)
             columns.columnconfigure(1, weight=0, minsize=right_width)
-            # The grid itself is non-propagating. The two constants are the
-            # complete width lock without clipping vertical panel growth.
+            col1.configure(width=left_width)
+            col1.grid_propagate(False)
+            col2.configure(width=right_width)
+            col2.grid_propagate(False)
+            # The grid itself is non-propagating.  These measured/fixed
+            # tracks are the complete width lock without clipping vertical
+            # panel growth.
             self._locked_column_widths = (left_width, right_width)
             return self._locked_column_widths
         except Exception:
@@ -10234,6 +10605,8 @@ class UiWorker(threading.Thread):
         "record_jump_point:right": "插入当前图层的 右跳 点 (Ctrl+F)",
         "record_split_point": "在当前位置添加贯穿全部楼层的波浪分区线 (Ctrl+S)",
         "record_flower_point": "录制当前绳索层的花点 (Ctrl+G)",
+        "record_dual_stationary_post:first": "录制桩1；随后按 D=朝左、F=朝右、G=双向 (Ctrl+R)",
+        "record_dual_stationary_post:second": "录制桩2；随后按 D=朝左、F=朝右、G=双向 (Ctrl+T)",
         "record_skill_point": "录制技能点；随后按任意攻击键可绑定按键 (Ctrl+E)",
         "select_next_layer": "选择下一个录制图层 (Ctrl+↓)",
         "select_next_patrol_start": "选择下一个巡逻起始楼层 (Ctrl+Home)",
@@ -11397,6 +11770,13 @@ class UiWorker(threading.Thread):
         self._fixed_on_change()
         stationary_mode = self._stationary_attack_selected()
         dead_flower_mode = self._dead_flower_selected()
+        mode_var = getattr(self, "_attack_mode_var", None)
+        if (mode_var is not None and str(mode_var.get()) == "dual_stationary"
+                and len(self._dual_stationary_posts_data()) != 2):
+            self._control_status.configure(
+                text="双桩模式开始条件不满足：请用 Ctrl+R 后按 D/F/G 录制两个桩点。"
+            )
+            return False
         if not (stationary_mode or dead_flower_mode) and not self.patrol_controller.can_start():
             route_errors = self.patrol_controller.validate_patrol_route()
             # Logged, not only shown: this refusal used to leave no trace in the log the operator
@@ -11600,7 +11980,7 @@ class UiWorker(threading.Thread):
         mode_var = getattr(self, "_attack_mode_var", None)
         if mode_var is not None:
             try:
-                if str(mode_var.get()) == "stationary":
+                if str(mode_var.get()) in ("stationary", "dual_stationary"):
                     return True
             except Exception:
                 pass
@@ -11767,6 +12147,11 @@ class UiWorker(threading.Thread):
         layer_names.extend(name for name in snapshot.layers if name not in layer_names)
         layer_names = list(layer_display_order(layer_names))
         license_allowed = self._license_allowed()
+        attack_mode_var = getattr(self, "_attack_mode_var", None)
+        try:
+            attack_mode = str(attack_mode_var.get()) if attack_mode_var is not None else ""
+        except (AttributeError, tk.TclError):
+            attack_mode = ""
         # Treat the patrol panel as a tiny declarative view.  This method is
         # called from both explicit actions and the periodic state observer;
         # deleting/recreating every canvas item, combobox value and button
@@ -11775,8 +12160,17 @@ class UiWorker(threading.Thread):
         render_key = (
             running,
             can_start,
+            # 双桩模式 and 站桩模式 both satisfy `_stationary_attack_selected`,
+            # but paint different axis marker sources.  The precise mode must
+            # participate in the cache key or a mode switch can retain the
+            # prior canvas and show the wrong facing marker type.
+            attack_mode,
             self._stationary_attack_selected(),
             self._dead_flower_selected(),
+            tuple(
+                (post.get("x"), post.get("y"), post.get("facing"), post.get("layer"))
+                for post in self._dual_stationary_posts_data()
+            ),
             selected,
             tuple(layer_names),
             repr(snapshot.layers),

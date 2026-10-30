@@ -4240,6 +4240,15 @@ class MovementWorker(threading.Thread):
         # configured recorded route, it borrows that route to climb back after
         # a fall.  It never writes an anchor into the map.
         self.stationary_attack_enabled = False
+        # 双桩模式 deliberately reuses the stationary correction state, but
+        # owns a separate persisted pair of posts and switch clock.  The
+        # active post is copied into ``_stationary_attack_anchor`` only while
+        # it is selected, so the ordinary single-桩 session stays untouched.
+        self.dual_stationary_mode = False
+        self._dual_stationary_posts: tuple[tuple[Point, str], ...] = ()
+        self._dual_stationary_active_index: Optional[int] = None
+        self._dual_stationary_switch_seconds = 900.0
+        self._dual_stationary_next_switch_at = float("inf")
         # 死花模式 keeps the automation session alive for Buff/HP/MP and an
         # optional private rope flower loop.  It never uses normal patrol,
         # jump-point, recovery, rescue or counterattack input.
@@ -7857,6 +7866,80 @@ class MovementWorker(threading.Thread):
                 "enabled; awaiting temporary Start Patrol position" if enabled else "disabled",
             )
 
+    def set_dual_stationary_configuration(
+        self, enabled: bool, raw_posts: Any, switch_seconds: float,
+    ) -> None:
+        """Apply dual-post records without changing ordinary stationary mode.
+
+        Only two valid records are accepted.  This lets the UI refuse Start
+        Patrol deterministically instead of allowing a one-post session to
+        silently behave like ordinary 站桩攻击.
+        """
+
+        posts: list[tuple[Point, str]] = []
+        if isinstance(raw_posts, (list, tuple)):
+            for item in raw_posts[:2]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    point = Point(float(item["x"]), float(item["y"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                facing = str(item.get("facing", "right")).casefold()
+                if facing not in ("left", "right", "both"):
+                    facing = "right"
+                posts.append((point, facing))
+        enabled = bool(enabled)
+        normalized = tuple(posts)
+        normalized_switch_seconds = min(1800.0, max(60.0, float(switch_seconds)))
+        changed = (self.dual_stationary_mode != enabled
+                   or self._dual_stationary_posts != normalized
+                   or self._dual_stationary_switch_seconds != normalized_switch_seconds)
+        self.dual_stationary_mode = enabled
+        self._dual_stationary_posts = normalized
+        self._dual_stationary_switch_seconds = normalized_switch_seconds
+        if changed:
+            self._dual_stationary_active_index = None
+            self._dual_stationary_next_switch_at = float("inf")
+            if enabled:
+                LOG.info("dual stationary mode configured posts=%d switch=%.1fm",
+                         len(normalized), self._dual_stationary_switch_seconds / 60.0)
+            else:
+                LOG.info("dual stationary mode disabled")
+
+    def dual_stationary_ready(self) -> bool:
+        return bool(self.dual_stationary_mode and len(self._dual_stationary_posts) == 2)
+
+    def _activate_dual_stationary_post(
+        self, index: int, *, reason: str, restart_timer: bool,
+    ) -> Optional[Point]:
+        if not self.dual_stationary_ready():
+            return None
+        index = int(index) % len(self._dual_stationary_posts)
+        point, facing = self._dual_stationary_posts[index]
+        self._dual_stationary_active_index = index
+        self._stationary_attack_anchor = Point(point.x, point.y)
+        self.stationary_facing_direction = facing
+        self._stationary_facing_command = None
+        self._stationary_facing_requested = None
+        self._stationary_x_settled = False
+        self._stationary_near_correction_next_at = 0.0
+        self._reset_stationary_y_recovery()
+        if restart_timer:
+            self._dual_stationary_next_switch_at = (
+                time.monotonic() + self._dual_stationary_switch_seconds
+            )
+        LOG.info("DUAL STATIONARY: active post %d/2 x=%.6f y=%.6f facing=%s (%s)",
+                 index + 1, point.x, point.y, facing, reason)
+        return self._stationary_attack_anchor
+
+    def _nearest_dual_stationary_post(self, player: Point) -> int:
+        return min(
+            range(len(self._dual_stationary_posts)),
+            key=lambda index: ((self._dual_stationary_posts[index][0].x - player.x) ** 2
+                               + (self._dual_stationary_posts[index][0].y - player.y) ** 2),
+        )
+
     def set_dead_flower_mode(self, enabled: bool) -> None:
         """Toggle Buff/HP/MP-only mode while preserving queued Buff taps."""
 
@@ -8859,6 +8942,15 @@ class MovementWorker(threading.Thread):
                 travel = "right"
             elif phase == "right":
                 self._stationary_pickup_phase = "anchor"
+                if self.dual_stationary_ready():
+                    nearest_index = self._nearest_dual_stationary_post(player)
+                    selected = self._activate_dual_stationary_post(
+                        nearest_index,
+                        reason="pickup return selected closest post",
+                        restart_timer=False,
+                    )
+                    if selected is not None:
+                        anchor = selected
                 LOG.info(
                     "STATIONARY PICKUP: right edge reached (x=%.6f right_x=%.6f); "
                     "returning to anchor", player.x, right_x,
@@ -9067,6 +9159,25 @@ class MovementWorker(threading.Thread):
             LOG.warning("stationary attack start rejected: yellow marker missing")
             return False
 
+        # 双桩模式 records its two standing spots separately.  A manual
+        # Ctrl+` start chooses the nearest one; it never overwrites either
+        # record with the character's current marker position.
+        dual_start = self.dual_stationary_mode
+        if dual_start:
+            if not self.dual_stationary_ready():
+                LOG.warning("dual stationary start rejected: exactly two posts are required")
+                return False
+            player_marker = Point(float(marker.x), float(marker.y))
+            post_index = self._nearest_dual_stationary_post(marker)
+            post, facing = self._dual_stationary_posts[post_index]
+            marker = Point(post.x, post.y)
+            self._dual_stationary_active_index = post_index
+            self.stationary_facing_direction = facing
+            LOG.info(
+                "DUAL STATIONARY manual start: player x=%.6f y=%.6f selected nearest post %d/2",
+                player_marker.x, player_marker.y, post_index + 1,
+            )
+
         # A button/Ctrl+` start is a new standing session, not a continuation
         # of the previous one.  The old temporary point may have borrowed a
         # recorded route for a pickup circuit or a return climb.  Reusing its
@@ -9139,8 +9250,16 @@ class MovementWorker(threading.Thread):
         self._stationary_facing_requested = None
         self._stationary_bilateral_target = "right"
         self._stationary_bilateral_frames = 0
-        self._stationary_x_settled = True
+        # A normal stand-still start records the player's current point, but
+        # a dual start may need to walk to the nearest recorded post.  Let
+        # the first movement decision confirm arrival rather than allowing a
+        # pickup circuit to start from the place Ctrl+` was pressed.
+        self._stationary_x_settled = not dual_start
         self._reset_stationary_y_recovery()
+        if self.dual_stationary_mode:
+            self._dual_stationary_next_switch_at = (
+                time.monotonic() + self._dual_stationary_switch_seconds
+            )
         LOG.info(
             "STATIONARY ATTACK manual start: cleared prior runtime route and "
             "pickup state; automatic resumes retain their existing session"
@@ -9382,12 +9501,75 @@ class MovementWorker(threading.Thread):
     ) -> MovementDecision:
         """Return recovery against this run's temporary start-position anchor."""
 
-        anchor = self._stationary_attack_anchor
         player = observation.player
-        if anchor is None:
-            return MovementDecision(None, "stationary attack awaiting start position")
         if player is None:
             return MovementDecision(None, "stationary attack waiting for marker")
+        if self.dual_stationary_ready():
+            now = time.monotonic()
+            active_index = self._dual_stationary_active_index
+            if active_index is None:
+                self._activate_dual_stationary_post(
+                    self._nearest_dual_stationary_post(player),
+                    reason="first movement frame selected nearest post",
+                    restart_timer=True,
+                )
+            elif now >= self._dual_stationary_next_switch_at:
+                self._activate_dual_stationary_post(
+                    1 - active_index,
+                    reason="换桩时间 reached",
+                    restart_timer=True,
+                )
+            # A route/fall return is not committed to the post used before
+            # the interruption.  Once a marker is available again, return to
+            # whichever of the two recorded posts is physically closest.
+            elif (self._return_mode is not None
+                  or self._stationary_pickup_return_active):
+                nearest_index = self._nearest_dual_stationary_post(player)
+                if nearest_index != active_index:
+                    self._activate_dual_stationary_post(
+                        nearest_index,
+                        reason="return selected closest post",
+                        restart_timer=False,
+                    )
+        anchor = self._stationary_attack_anchor
+        if anchor is None:
+            return MovementDecision(None, "stationary attack awaiting start position")
+        # A focus dip can interrupt a borrowed route-return immediately after
+        # its last movement decision.  On route-enabled maps the old cleanup
+        # intentionally kept the return/climb latch, so the AttackWorker
+        # could remain blocked forever even after the marker was already back
+        # inside the standing post.  At this exact X/Y arrival a vertical
+        # return is no longer possible or useful: clear only that stale gate
+        # and let the ordinary stationary facing/attack checks continue.
+        at_anchor = bool(
+            self._stationary_anchor_x_accepted(anchor.x, player.x)
+            and abs(anchor.y - player.y) <= STATIONARY_ATTACK_Y_TOLERANCE
+        )
+        vertical_gate_active = bool(
+            self._return_mode is not None
+            or self._climb_state.up_held
+            or self._climb_state.phase != "idle"
+            or (self.dropping_active_event is not None
+                and self.dropping_active_event.is_set())
+        )
+        if (at_anchor and vertical_gate_active
+                and self._stationary_return_dismount_direction is None):
+            LOG.warning(
+                "STATIONARY ATTACK: marker reached anchor x=%.6f y=%.6f; "
+                "clearing stale vertical gate return=%s climb=%s up=%s",
+                player.x, player.y, self._return_mode,
+                self._climb_state.phase, self._climb_state.up_held,
+            )
+            self._release_climb_up()
+            self._climb_state = ClimbState()
+            self._return_mode = None
+            self._return_from_floor = None
+            self._return_arrival_floor = None
+            self._descending_to_first = False
+            self._stationary_pickup_return_active = False
+            self._patrol_busy_until = 0.0
+            if self.dropping_active_event is not None:
+                self.dropping_active_event.clear()
         dismount_direction = self._stationary_return_dismount_direction
         if dismount_direction in ("left", "right"):
             # The preceding return climb reached its layer band but can still
@@ -14461,6 +14643,22 @@ class MovementWorker(threading.Thread):
                     # every beat while the character just stood there.
                     self._clear_stationary_route_state()
                     climbing_now = False
+                elif self.stationary_attack_enabled:
+                    # 站桩 / 双桩 can borrow the normal return machinery, but
+                    # their attack gate must describe INPUT THAT IS ACTUALLY
+                    # ACTIVE.  A focus recovery or a completed rope attempt
+                    # can leave ``phase`` non-idle for bookkeeping after Up
+                    # was released; using that stale phase (or an unrelated
+                    # other-player workflow flag) held the shared event and
+                    # made AttackWorker report "climb/return input is active"
+                    # forever at an already-reached stake.
+                    climbing_now = bool(
+                        climb_decision_active
+                        or self._climb_state.up_held
+                        or self._return_mode is not None
+                        or (self.dropping_active_event is not None
+                            and self.dropping_active_event.is_set())
+                    )
                 else:
                     climbing_now = bool(
                         climb_decision_active
