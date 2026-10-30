@@ -165,17 +165,21 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 1085
+_INITIAL_WINDOW_WIDTH = 890
 _INITIAL_WINDOW_HEIGHT = 560
 _LEFT_COLUMN_WIDTH = 380
-_RIGHT_COLUMN_WIDTH = 515
-# The 90px left prefix is the layer selector + label + their margins.  Keep
-# the drawing canvas exactly within the fixed compact left column.
-_LAYER_AXIS_WIDTH = 350
+# Direct-value controls replaced the wide right-column slider troughs.  The
+# widest visible right row now fits comfortably in this tighter track.
+_RIGHT_COLUMN_WIDTH = 393
+# The outer 10% at each side never contains a recordable layer element. Crop
+# it from the UI axis so the useful middle 80% gets the whole compact canvas.
+_LAYER_AXIS_WIDTH = 280
 _LAYER_AXIS_HEIGHT = 38
-_LAYER_AXIS_LEFT = 8
-_LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH - 8
+_LAYER_AXIS_LEFT = 0
+_LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH
 _LAYER_AXIS_Y = 28
+_LAYER_AXIS_VISIBLE_MIN_X = 0.10
+_LAYER_AXIS_VISIBLE_MAX_X = 0.90
 # The columns are fixed at 380px and 515px respectively.  The compact initial
 # geometry leaves room for each panel's controls without retaining unused
 # drawing space at the right of the patrol axis.
@@ -951,7 +955,7 @@ def normalize_quick_messages(value: Any, limit: int = 20) -> list[str]:
     return messages
 
 
-def quick_message_preview(message: str, max_units: int = 36) -> str:
+def quick_message_preview(message: str, max_units: int = 42) -> str:
     """Fit a quick-message label without wrapping its compact row.
 
     CJK characters use roughly two Latin-character cells. The complete value
@@ -968,6 +972,268 @@ def quick_message_preview(message: str, max_units: int = 36) -> str:
         chars.append(char)
         used += width
     return text
+
+
+class NumericValueRangeControl:
+    """A fixed-height, wheel-editable numeric value or min/max range.
+
+    The surrounding setting label deliberately does not belong to this
+    component.  That keeps labels on a stable baseline while either number
+    grows on hover or selection.  ``unit`` is a display suffix only, so the
+    caller can omit it for unitless values.
+    """
+
+    _NORMAL_STYLE = "NumericValue.TLabel"
+    _HOVER_STYLE = "NumericValueHover.TLabel"
+    _ACTIVE_STYLE = "NumericValueActive.TLabel"
+    _FIXED_HEIGHT = 26
+
+    def __init__(
+        self,
+        parent: Any,
+        *,
+        tk_module: Any,
+        ttk_module: Any,
+        minimum: float | int,
+        maximum: float | int | None = None,
+        range_mode: bool = True,
+        value_type: type[float] | type[int] = float,
+        step: float | int = 1,
+        lower_bound: float | int | None = None,
+        upper_bound: float | int | None = None,
+        unit: str = "",
+        value_width: int = 5,
+        extra_width_px: int = 0,
+        on_change: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.range_mode = bool(range_mode)
+        self._tk = tk_module
+        self._ttk = ttk_module
+        self.value_type = value_type
+        self.step = value_type(step)
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.unit = str(unit)
+        self.on_change = on_change
+        self.selected_side: Optional[str] = None
+        self.hover_side: Optional[str] = None
+        self._leave_job: Any = None
+        variable_type = (tk_module.IntVar if value_type is int
+                         else tk_module.DoubleVar)
+        self.minimum_var = variable_type(value=minimum)
+        self.maximum_var = variable_type(
+            value=(maximum if maximum is not None else minimum)
+        )
+        # Once propagation is disabled to hold a stable height, Tk no longer
+        # derives a width from the child labels.  Reserve the exact cell width
+        # here as well; otherwise the component collapses to a 1px frame.
+        cell_count = 2 if self.range_mode else 1
+        fixed_width = (
+            (cell_count * value_width * 9)
+            + (10 if self.range_mode else 0)
+            + max(0, int(extra_width_px))
+        )
+        self.frame = ttk_module.Frame(
+            parent, width=fixed_width, height=self._FIXED_HEIGHT,
+        )
+        self.frame.pack_propagate(False)
+        self.min_label = ttk_module.Label(
+            self.frame, width=value_width, anchor="center",
+            style=self._NORMAL_STYLE,
+        )
+        self.min_label.pack(side="left", fill="y")
+        self.max_label: Optional[Any] = None
+        if self.range_mode:
+            ttk_module.Label(self.frame, text="-").pack(side="left", fill="y")
+            self.max_label = ttk_module.Label(
+                self.frame, width=value_width, anchor="center",
+                style=self._NORMAL_STYLE,
+            )
+            self.max_label.pack(side="left", fill="y")
+        self._bind_label(self.min_label, "min")
+        if self.max_label is not None:
+            self._bind_label(self.max_label, "max")
+        self.normalize()
+
+    def pack(self, **kwargs: Any) -> None:
+        self.frame.pack(**kwargs)
+
+    def get_bounds(self) -> tuple[float | int, float | int]:
+        self.normalize()
+        return self.minimum_var.get(), self.maximum_var.get()
+
+    def sample(self) -> float | int:
+        """Return one random value from the inclusive configured bounds."""
+
+        minimum, maximum = self.get_bounds()
+        if self.value_type is int:
+            return random.randint(int(minimum), int(maximum))
+        return random.uniform(float(minimum), float(maximum))
+
+    def set_bounds(
+        self, minimum: float | int, maximum: float | int | None = None,
+    ) -> None:
+        target_maximum = maximum if maximum is not None else minimum
+        # Live countdown refreshes call this often.  Do not redraw an
+        # unchanged field: on Windows a label redraw can synthesize Leave and
+        # make an otherwise stable hover appear to blink.
+        try:
+            if (self.minimum_var.get() == minimum
+                    and self.maximum_var.get() == target_maximum):
+                return
+        except Exception:
+            pass
+        self.minimum_var.set(minimum)
+        self.maximum_var.set(target_maximum)
+        self.normalize()
+
+    def normalize(self, changed: Optional[str] = None) -> tuple[float | int, float | int]:
+        minimum = self._normalize_value(self.minimum_var.get())
+        maximum = self._normalize_value(self.maximum_var.get())
+        if not self.range_mode:
+            maximum = minimum
+        elif minimum > maximum:
+            if changed == "max":
+                minimum = maximum
+            else:
+                maximum = minimum
+        self.minimum_var.set(minimum)
+        self.maximum_var.set(maximum)
+        self._refresh_text()
+        return minimum, maximum
+
+    def _normalize_value(self, value: Any) -> float | int:
+        number = self.value_type(value)
+        if self.lower_bound is not None:
+            number = max(self.value_type(self.lower_bound), number)
+        if self.upper_bound is not None:
+            number = min(self.value_type(self.upper_bound), number)
+        if self.value_type is int:
+            return int(number)
+        step = float(self.step)
+        if step > 0.0:
+            number = round(float(number) / step) * step
+        return round(float(number), 6)
+
+    def _display(self, value: float | int) -> str:
+        if self.value_type is int:
+            text = str(int(value))
+        else:
+            text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+        return f"{text}{self.unit}"
+
+    def _refresh_text(self) -> None:
+        self.min_label.configure(text=self._display(self.minimum_var.get()))
+        if self.max_label is not None:
+            self.max_label.configure(text=self._display(self.maximum_var.get()))
+        self._refresh_styles()
+
+    def _bind_label(self, label: Any, side: str) -> None:
+        label.bind("<Enter>", lambda _event: self._hover(side, True))
+        label.bind("<Leave>", lambda _event: self._hover(side, False))
+        # Clicks are coarse direct adjustment.  The wheel remains the
+        # fine-grained one-step input, so both interactions work on every
+        # numeric value without an extra +/- button row.
+        label.bind("<Button-1>", lambda _event: self._click_adjust(side, 1))
+        label.bind("<Button-3>", lambda _event: self._click_adjust(side, -1))
+        label.bind("<MouseWheel>", lambda event: self._wheel(side, event.delta))
+        label.bind("<Button-4>", lambda _event: self._wheel(side, 120))
+        label.bind("<Button-5>", lambda _event: self._wheel(side, -120))
+
+    def _label_for(self, side: str) -> Any:
+        return self.min_label if side == "min" else self.max_label
+
+    def _hover(self, side: str, entered: bool) -> None:
+        if entered:
+            self._cancel_pending_leave()
+            self.hover_side = side
+            self._refresh_styles()
+            return
+        # Resizing a selected value from 10pt to 12pt can make Tk emit a
+        # synthetic Leave although the pointer never left this component.
+        # Wait for the layout to settle, then clear only if the pointer is
+        # genuinely outside the fixed component frame.
+        self._cancel_pending_leave()
+        self._leave_job = self.frame.after(20, self._clear_after_true_leave)
+
+    def _cancel_pending_leave(self) -> None:
+        if self._leave_job is None:
+            return
+        try:
+            self.frame.after_cancel(self._leave_job)
+        except Exception:
+            pass
+        self._leave_job = None
+
+    def _clear_after_true_leave(self) -> None:
+        self._leave_job = None
+        try:
+            pointer_x = int(self.frame.winfo_pointerx())
+            pointer_y = int(self.frame.winfo_pointery())
+            inside = (
+                self.frame.winfo_rootx() <= pointer_x < self.frame.winfo_rootx() + self.frame.winfo_width()
+                and self.frame.winfo_rooty() <= pointer_y < self.frame.winfo_rooty() + self.frame.winfo_height()
+            )
+        except Exception:
+            inside = False
+        if inside:
+            return
+        self.selected_side = None
+        self.hover_side = None
+        self._refresh_styles()
+
+    def _select(self, side: str) -> str:
+        self.selected_side = side
+        self.hover_side = side
+        self._refresh_styles()
+        return "break"
+
+    def _click_adjust(self, side: str, direction: int) -> str:
+        """Apply one coarse click adjustment: exactly ten fine steps."""
+
+        label = self._label_for(side)
+        try:
+            if label is not None and label.instate(["disabled"]):
+                return "break"
+        except Exception:
+            pass
+        self._select(side)
+        variable = self.minimum_var if side == "min" else self.maximum_var
+        coarse_delta = self.value_type(self.step * 10)
+        variable.set(self.value_type(variable.get() + int(direction) * coarse_delta))
+        self.normalize(changed=side)
+        if self.on_change is not None:
+            self.on_change()
+        return "break"
+
+    def _wheel(self, side: str, delta: int) -> str:
+        label = self._label_for(side)
+        try:
+            if label is not None and label.instate(["disabled"]):
+                return "break"
+        except Exception:
+            pass
+        if self.selected_side != side:
+            self._select(side)
+        direction = 1 if float(delta) > 0.0 else -1
+        variable = self.minimum_var if side == "min" else self.maximum_var
+        variable.set(self.value_type(variable.get() + direction * self.step))
+        self.normalize(changed=side)
+        if self.on_change is not None:
+            self.on_change()
+        return "break"
+
+    def _refresh_styles(self) -> None:
+        for side in ("min", "max"):
+            label = self._label_for(side)
+            if label is not None:
+                label.configure(
+                    style=(
+                        self._ACTIVE_STYLE if self.selected_side == side
+                        else self._HOVER_STYLE if self.hover_side == side
+                        else self._NORMAL_STYLE
+                    )
+                )
 
 
 class UiWorker(threading.Thread):
@@ -1215,13 +1481,9 @@ class UiWorker(threading.Thread):
         self._telegram_bot_token = ""
         self._telegram_chat_id = ""
         self._quick_messages: list[str] = []
-        self._quick_message_press_job: Any = None
-        self._quick_message_hold_fired = False
-        self._quick_message_last_click_at = float("-inf")
-        self._quick_message_last_click_index: Optional[int] = None
-        self._quick_delete_press_job: Any = None
-        self._quick_delete_hold_fired = False
         self._quick_edit_entry: Any = None
+        self._quick_edit_index: Optional[int] = None
+        self._quick_edit_blur_job: Any = None
         self.on_patrol_start = on_patrol_start
         self.on_patrol_restart = on_patrol_restart
         self.on_patrol_stop = on_patrol_stop
@@ -1632,6 +1894,15 @@ class UiWorker(threading.Thread):
             controls = ttk.LabelFrame(col1, text="图层校准与巡逻", padding=8)
             controls.pack(fill="x", pady=(0, 8))
             style = ttk.Style(root)
+            # Reusable direct numeric-control styles.  Its containing frame
+            # has a fixed height, so the larger hover/active value cannot
+            # shift neighbouring widgets or flicker its setting label.
+            style.configure("NumericValue.TLabel", font=("Segoe UI", 10))
+            style.configure("NumericValueHover.TLabel", font=("Segoe UI", 12))
+            style.configure(
+                "NumericValueActive.TLabel",
+                font=("Segoe UI", 12), foreground="#007ad9",
+            )
             style.configure("Locked.TButton", foreground="#777777")
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
             # Recorded coordinates are the widest left-side cells. A compact
@@ -1964,19 +2235,27 @@ class UiWorker(threading.Thread):
             self._fixed_key_row = fixed_key_row
             self._dead_flower_attack_rows.append(fixed_key_row)
             fixed_key_row.pack(fill="x", pady=(4, 0))
-            # 跳打 is shared by patrol and stand-still attacks.  Keep it next
-            # to the attack key because it changes that key's atomic delivery
-            # sequence, not patrol movement itself.
+            # Attack delivery is a mutually exclusive group.  Only 跳打 is
+            # implemented today; 蓄力 and 不打 are intentionally visible and
+            # saved now so their behavior can be added without another UI
+            # migration later.
+            self._attack_delivery_var = tk.StringVar(value="stand")
+            self._attack_delivery_buttons: list[Any] = []
+            for delivery_value, delivery_text in (
+                ("stand", "站打"), ("jump", "跳打"),
+                ("charge", "蓄力"), ("none", "不打"),
+            ):
+                button = ttk.Radiobutton(
+                    fixed_key_row, text=delivery_text,
+                    value=delivery_value,
+                    variable=self._attack_delivery_var,
+                    command=self._fixed_on_change,
+                )
+                button.pack(side="left", padx=(0, 3))
+                self._attack_delivery_buttons.append(button)
+            # Compatibility alias: existing worker/apply paths still derive
+            # their active jump flag from the selected delivery value.
             self._jump_attack_enabled_var = tk.BooleanVar(value=False)
-            jump_attack_button = ttk.Checkbutton(
-                fixed_key_row, text="跳打",
-                variable=self._jump_attack_enabled_var,
-                command=self._fixed_on_change,
-            )
-            self._jump_attack_button = jump_attack_button
-            # This slot always exists.  Toggling attack mode only changes
-            # enabled state, never the row's geometry.
-            jump_attack_button.pack(side="left", padx=(0, 4))
             fixed_key_label = ttk.Label(fixed_key_row, text="攻击键:")
             self._fixed_key_label = fixed_key_label
             fixed_key_label.pack(
@@ -1995,73 +2274,43 @@ class UiWorker(threading.Thread):
             fixed_key_button.pack(side="left", padx=(0, 4))
             self._fixed_key_button = fixed_key_button
             self._attach_bind_hint(fixed_key_button)
-            # The interval/range controls sit in their own sub-frame so the
-            # 跳跃攻击 mode can hide them and leave only the 按键 row.
-            fixed_interval_group = ttk.Frame(fixed_key_row)
-            # The first 80% is a fine 0.20..2.00s region.  The final 20%
-            # still exposes the legacy 2.00..30.00s range.
-            self._fixed_interval_var = tk.DoubleVar(value=3.0)
-            self._fixed_interval_slider_var = tk.DoubleVar(
-                value=self._fixed_attack_interval_to_slider_value(3.0)
+            # The cadence is an inclusive min/max range.  The adjacent
+            # "间隔" label is intentionally outside the reusable numeric
+            # component, so it stays still while the values enlarge.
+            ttk.Label(fixed_key_row, text="每").pack(side="left", padx=(0, 2))
+            self._fixed_interval_control = NumericValueRangeControl(
+                fixed_key_row,
+                tk_module=tk,
+                ttk_module=ttk,
+                minimum=3.0,
+                maximum=3.1,
+                range_mode=True,
+                value_type=float,
+                step=self._FIXED_ATTACK_INTERVAL_STEP,
+                lower_bound=0.2,
+                upper_bound=self._FIXED_ATTACK_INTERVAL_MAX,
+                unit="s",
+                value_width=5,
+                on_change=self._fixed_on_change,
             )
-            fixed_interval_slider = ttk.Scale(
-                fixed_interval_group, from_=0.0, to=1.0, orient="horizontal",
-                # The display-scale value is mapped back to a real interval
-                # by _fixed_interval_slider_on_change.
-                variable=self._fixed_interval_slider_var,
-                length=self._ATTACK_TIMING_SLIDER_LENGTH,
-                command=self._fixed_interval_slider_on_change,
-            )
-            fixed_interval_slider.pack(side="left", padx=(0, 2))
-            self._fixed_interval_label = ttk.Label(
-                fixed_interval_group, text="3.0s", width=5
-            )
-            self._fixed_interval_label.pack(side="left", padx=(0, 2))
-            self._fixed_interval_range_label = ttk.Label(
-                fixed_interval_group, text="(3.0s, 3.1s)", width=14,
-                anchor="w",
-            )
-            self._fixed_interval_range_label.pack(side="left")
-            self._fixed_interval_group = fixed_interval_group
-            fixed_random_group = ttk.Frame(fixed_key_row)
-            fixed_random_group.pack(side="left")
-            self._fixed_random_gap_var = tk.DoubleVar(value=0.1)
-            fixed_gap_minus = ttk.Button(fixed_random_group, text="−", width=2)
-            self._bind_repeat_step_button(
-                fixed_gap_minus,
-                lambda: self._fixed_adjust_random_gap(-self._FIXED_RANDOM_GAP_STEP),
-                current=self._fixed_random_gap_seconds,
-                coarse=lambda anchor: self._set_fixed_random_gap(
-                    (self._fixed_random_gap_seconds() if anchor is None else anchor)
-                    - self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            fixed_gap_minus.pack(side="left", padx=(0, 1))
-            self._fixed_random_gap_label = ttk.Label(
-                fixed_random_group, text="0.1s", width=5, anchor="center"
-            )
-            self._fixed_random_gap_label.pack(side="left")
-            fixed_gap_plus = ttk.Button(fixed_random_group, text="+", width=2)
-            self._bind_repeat_step_button(
-                fixed_gap_plus,
-                lambda: self._fixed_adjust_random_gap(self._FIXED_RANDOM_GAP_STEP),
-                current=self._fixed_random_gap_seconds,
-                coarse=lambda anchor: self._set_fixed_random_gap(
-                    (self._fixed_random_gap_seconds() if anchor is None else anchor)
-                    + self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            fixed_gap_plus.pack(side="left", padx=(1, 0))
-            # There is intentionally no spacer between the random controls
-            # and the timing scale.
-            fixed_interval_group.pack(side="left")
+            self._fixed_min_interval_var = self._fixed_interval_control.minimum_var
+            self._fixed_max_interval_var = self._fixed_interval_control.maximum_var
+            # Alias retained for older hotkey/settings paths that represent
+            # the cadence's lower bound.
+            self._fixed_interval_var = self._fixed_min_interval_var
+            self._fixed_min_interval_label = self._fixed_interval_control.min_label
+            self._fixed_max_interval_label = self._fixed_interval_control.max_label
+            self._fixed_interval_group = self._fixed_interval_control.frame
+            self._fixed_interval_control.pack(side="left")
 
             # 被撞反击 is an event path separate from normal cadence/combo
             # attack.  A confirmed HP drop asks the arbiter to step away from
             # the hit and then tap this independently bound key.
-            counterattack_row = ttk.Frame(fixed_panel)
+            counterattack_row = ttk.Frame(fixed_panel, height=34)
             self._dead_flower_attack_rows.append(counterattack_row)
+            self._stationary_action_row = counterattack_row
             counterattack_row.pack(fill="x", pady=(2, 0))
+            counterattack_row.pack_propagate(False)
             self._counterattack_enabled_var = tk.BooleanVar(value=False)
             counterattack_button = ttk.Checkbutton(
                 counterattack_row, text="被撞反击", width=7,
@@ -2091,49 +2340,45 @@ class UiWorker(threading.Thread):
             self._counterattack_key_button = counterattack_key_button
             self._attach_bind_hint(counterattack_key_button)
 
-            # 双桩模式 owns two explicitly recorded standing posts.  The
-            # slider is intentionally minutes, matching the operator-facing
-            # request: it chooses the post-switch interval, not an attack
-            # cadence.  Ctrl+R then D/F/G records/replaces each post.
-            dual_stationary_row = ttk.Frame(fixed_panel)
+            # Stationary-only options share one row.  The visible child is
+            # selected from the current mode rather than leaving disabled
+            # controls and their padding on unrelated modes.
+            stationary_options_row = ttk.Frame(fixed_panel)
+            self._stationary_options_row = stationary_options_row
+            # 双桩的换桩时间 belongs in the shared third action row, next to
+            # 被撞反击.  It is packed only while 双桩模式 is selected.
+            dual_stationary_row = ttk.Frame(counterattack_row)
             self._dual_stationary_row = dual_stationary_row
-            dual_stationary_row.pack(fill="x", pady=(2, 0))
-            self._dual_stationary_status_label = ttk.Label(
-                # 24 cells places 换桩时间's slider on the shared timing
-                # column below; the former 29-cell reservation left a wide
-                # dead gap and pushed this second slider to the right.
-                dual_stationary_row, text="双桩: 桩1 Ctrl+R / 桩2 Ctrl+T", width=24,
+            ttk.Label(dual_stationary_row, text="换桩 每").pack(
+                side="left", padx=(0, 2)
             )
-            self._dual_stationary_status_label.pack(side="left")
-            ttk.Label(dual_stationary_row, text="换桩时间").pack(side="left", padx=(2, 3))
-            dual_timing_group = ttk.Frame(dual_stationary_row)
-            dual_timing_group.pack(side="left")
-            # Reserve only the shared trailing range column.  There is no
-            # leading blank cell: the slider starts directly after the row's
-            # own controls, matching the other left timing rows.
-            self._dual_stationary_switch_minutes_var = tk.DoubleVar(
-                value=self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES,
+            self._dual_stationary_switch_control = NumericValueRangeControl(
+                dual_stationary_row,
+                tk_module=tk, ttk_module=ttk,
+                minimum=self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES,
+                maximum=self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES,
+                range_mode=True, value_type=float, step=0.1,
+                lower_bound=1.0, upper_bound=30.0, unit="m",
+                value_width=5, on_change=self._fixed_on_change,
             )
-            self._dual_stationary_switch_slider = ttk.Scale(
-                dual_timing_group,
-                from_=self._DUAL_STATIONARY_SWITCH_MIN_MINUTES,
-                to=self._DUAL_STATIONARY_SWITCH_MAX_MINUTES,
-                orient="horizontal", length=self._ATTACK_TIMING_SLIDER_LENGTH,
-                variable=self._dual_stationary_switch_minutes_var,
-                command=self._fixed_on_change,
+            self._dual_stationary_switch_minutes_var = (
+                self._dual_stationary_switch_control.minimum_var
             )
-            self._dual_stationary_switch_slider.pack(side="left", padx=(0, 2))
-            self._dual_stationary_switch_label = ttk.Label(
-                dual_timing_group, text="15.0m", width=5,
+            self._dual_stationary_switch_max_minutes_var = (
+                self._dual_stationary_switch_control.maximum_var
             )
-            self._dual_stationary_switch_label.pack(side="left", padx=(0, 2))
-            ttk.Label(dual_timing_group, text="", width=14).pack(side="left")
+            # The group itself is mode-only; its numeric control is always
+            # packed inside that group so it has a real width and height once
+            # the group becomes visible.
+            self._dual_stationary_switch_control.pack(side="left")
 
             # 组合攻击 only configures the independent attack scheduler;
             # movement, patrol, and input arbitration keep their own roles.
             combo_row = ttk.Frame(fixed_panel)
             self._dead_flower_attack_rows.append(combo_row)
-            combo_row.pack(fill="x", pady=(2, 0))
+            # 组合攻击 is the second visual row, directly below the delivery
+            # choice and cadence row.
+            combo_row.pack(fill="x", pady=(2, 0), before=counterattack_row)
             self._combo_attack_enabled_var = tk.BooleanVar(value=False)
             combo_attack_button = ttk.Checkbutton(
                 combo_row, text="组合攻击", width=7,
@@ -2142,31 +2387,26 @@ class UiWorker(threading.Thread):
             )
             combo_attack_button.pack(side="left", padx=(0, 4))
             self._combo_attack_count_vars = []
-            self._combo_attack_count_entries = []
+            self._combo_attack_count_controls = []
             self._combo_attack_key_vars = []
             self._combo_attack_key_buttons = []
             for index in range(3):
                 slot = ttk.Frame(combo_row)
                 slot.pack(side="left", padx=(0, 5))
-                minimum_var = tk.IntVar(value=1)
-                maximum_var = tk.IntVar(value=1)
-                self._combo_attack_count_vars.append((minimum_var, maximum_var))
-                # Plain entries deliberately avoid Spinbox's up/down arrows:
-                # the counts are typed ranges, then clamped on focus-out.
-                minimum = ttk.Entry(
-                    slot, width=3, justify="center", textvariable=minimum_var,
+                count_control = NumericValueRangeControl(
+                    slot,
+                    tk_module=tk, ttk_module=ttk,
+                    minimum=1, maximum=1,
+                    range_mode=True, value_type=int, step=1,
+                    lower_bound=0, upper_bound=30,
+                    value_width=2, on_change=self._fixed_on_change,
                 )
-                minimum.pack(side="left")
-                minimum.bind("<FocusOut>", self._fixed_on_change, add="+")
-                self._combo_attack_count_entries.append(minimum)
-                ttk.Label(slot, text="-").pack(side="left")
-                maximum = ttk.Entry(
-                    slot, width=3, justify="center", textvariable=maximum_var,
+                self._combo_attack_count_controls.append(count_control)
+                self._combo_attack_count_vars.append(
+                    (count_control.minimum_var, count_control.maximum_var)
                 )
-                maximum.pack(side="left")
-                maximum.bind("<FocusOut>", self._fixed_on_change, add="+")
-                self._combo_attack_count_entries.append(maximum)
-                ttk.Label(slot, text="次").pack(side="left", padx=(1, 2))
+                count_control.pack(side="left", padx=(0, 2))
+                ttk.Label(slot, text="次").pack(side="left", padx=(0, 2))
                 key_var = tk.StringVar(value="ctrl")
                 self._combo_attack_key_vars.append(key_var)
                 key_button = ttk.Button(slot, text="ctrl", width=5,
@@ -2194,18 +2434,12 @@ class UiWorker(threading.Thread):
             combo_attack_tooltip.set_enabled(True)
             self._combo_attack_tooltip = combo_attack_tooltip
             self._bind_key_tooltips.append(combo_attack_tooltip)
-            # Labels and empty panel space do not claim focus in Tk.  Commit
-            # a typed count when any other UI target is clicked, just like the
-            # reconnect-channel field does.
-            root.bind_all(
-                "<Button-1>", self._combo_attack_commit_on_outside_click,
-                add="+",
-            )
 
             # Facing is a stand-still recovery option, not part of 小碎步.
             # Left and right are mutually exclusive, and the selected side
             # is applied after an X correction returns to the temporary zone.
-            stationary_facing_row = ttk.Frame(fixed_panel)
+            # 朝向 occupies the same mode-specific third-row slot as 换桩.
+            stationary_facing_row = ttk.Frame(counterattack_row)
             self._stationary_facing_row = stationary_facing_row
             self._dead_flower_attack_rows.append(stationary_facing_row)
             ttk.Label(stationary_facing_row, text="朝向").pack(side="left")
@@ -2233,10 +2467,12 @@ class UiWorker(threading.Thread):
             facing_both.pack(side="left", padx=(4, 0))
             stationary_facing_controls.append(facing_both)
             self._stationary_facing_controls = stationary_facing_controls
-            stationary_facing_row.pack(fill="x", pady=(2, 0))
 
-            pickup_row = ttk.Frame(fixed_panel)
-            pickup_row.pack(fill="x", pady=(2, 0))
+            # The remaining optional actions share the counterattack third
+            # row. There are no alignment spacers: each control begins after
+            # the preceding control's real width.
+            pickup_row = ttk.Frame(stationary_options_row)
+            self._stationary_pickup_row = pickup_row
             self._stationary_pickup_enabled_var = tk.BooleanVar(value=False)
             pickup_enabled = ttk.Checkbutton(
                 pickup_row, text="捡东西", width=5,
@@ -2245,66 +2481,27 @@ class UiWorker(threading.Thread):
             )
             pickup_enabled.pack(side="left", padx=(0, 4))
             self._stationary_pickup_enabled_button = pickup_enabled
-            # Align the − / value / + controls below the attack-key button.
-            # This is a real layout column, not the former blank square next
-            # to the slider; the timing scale itself follows immediately.
-            pickup_alignment_spacer = ttk.Frame(pickup_row, width=80)
-            pickup_alignment_spacer.pack(side="left")
-            pickup_interval_group = ttk.Frame(pickup_row)
-            self._stationary_pickup_interval_var = tk.DoubleVar(
-                value=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES
+            ttk.Label(pickup_row, text="每").pack(side="left", padx=(0, 2))
+            self._stationary_pickup_control = NumericValueRangeControl(
+                pickup_row,
+                tk_module=tk, ttk_module=ttk,
+                minimum=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES,
+                maximum=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES,
+                range_mode=True, value_type=float, step=0.1,
+                lower_bound=1.0, upper_bound=30.0, unit="m",
+                value_width=5, on_change=self._fixed_on_change,
             )
-            pickup_slider = ttk.Scale(
-                pickup_interval_group,
-                from_=self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES,
-                to=self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
-                orient="horizontal", variable=self._stationary_pickup_interval_var,
-                length=self._ATTACK_TIMING_SLIDER_LENGTH,
-                command=self._fixed_on_change,
-            )
-            pickup_slider.pack(side="left", padx=(0, 2))
-            self._stationary_pickup_interval_label = ttk.Label(
-                pickup_interval_group, text="15.0m", width=5
-            )
-            self._stationary_pickup_interval_label.pack(side="left", padx=(0, 2))
-            self._stationary_pickup_interval_range_label = ttk.Label(
-                pickup_interval_group, text="(15.0m, 15.0m)", width=14, anchor="w"
-            )
-            self._stationary_pickup_interval_range_label.pack(side="left")
-            pickup_random_group = ttk.Frame(pickup_row)
-            pickup_random_group.pack(side="left")
-            self._stationary_pickup_gap_var = tk.DoubleVar(value=0.1)
-            pickup_gap_minus = ttk.Button(pickup_random_group, text="−", width=2)
-            self._bind_repeat_step_button(
-                pickup_gap_minus, lambda: self._stationary_pickup_adjust_gap(-0.1),
-                current=self._stationary_pickup_gap_minutes,
-                coarse=lambda anchor: self._set_stationary_pickup_gap(
-                    (self._stationary_pickup_gap_minutes() if anchor is None else anchor)
-                    - self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            pickup_gap_minus.pack(side="left", padx=(0, 1))
-            self._stationary_pickup_gap_label = ttk.Label(
-                pickup_random_group, text="0.1m", width=5, anchor="center"
-            )
-            self._stationary_pickup_gap_label.pack(side="left")
-            pickup_gap_plus = ttk.Button(pickup_random_group, text="+", width=2)
-            self._bind_repeat_step_button(
-                pickup_gap_plus, lambda: self._stationary_pickup_adjust_gap(0.1),
-                current=self._stationary_pickup_gap_minutes,
-                coarse=lambda anchor: self._set_stationary_pickup_gap(
-                    (self._stationary_pickup_gap_minutes() if anchor is None else anchor)
-                    + self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            pickup_gap_plus.pack(side="left", padx=(1, 0))
-            pickup_interval_group.pack(side="left")
+            self._stationary_pickup_interval_var = self._stationary_pickup_control.minimum_var
+            self._stationary_pickup_max_minutes_var = self._stationary_pickup_control.maximum_var
+            self._stationary_pickup_control.pack(side="left")
             self._stationary_pickup_controls = [
-                pickup_enabled, pickup_slider, pickup_gap_minus, pickup_gap_plus,
+                pickup_enabled,
+                self._stationary_pickup_control.min_label,
+                self._stationary_pickup_control.max_label,
             ]
 
-            step_row = ttk.Frame(fixed_panel)
-            step_row.pack(fill="x", pady=(4, 0))
+            step_row = ttk.Frame(stationary_options_row)
+            self._small_step_options_row = step_row
             self._small_step_row = step_row
             self._dead_flower_attack_rows.append(step_row)
             self._small_step_enabled_var = tk.BooleanVar(value=False)
@@ -2320,55 +2517,18 @@ class UiWorker(threading.Thread):
             )
             small_step_hint.set_enabled(True)
             self._bind_key_tooltips.append(small_step_hint)
-            step_alignment_spacer = ttk.Frame(step_row, width=80)
-            step_alignment_spacer.pack(side="left")
-            step_interval_group = ttk.Frame(step_row)
-            self._small_step_interval_var = tk.DoubleVar(value=5.0)
-            ttk.Scale(
-                step_interval_group, from_=3.0,
-                to=self._OPTIONAL_MOTION_INTERVAL_MAX,
-                orient="horizontal",
-                variable=self._small_step_interval_var,
-                length=self._ATTACK_TIMING_SLIDER_LENGTH,
-                command=self._fixed_on_change,
-            ).pack(side="left", padx=(0, 2))
-            self._small_step_interval_label = ttk.Label(
-                step_interval_group, text="5.0s", width=5
+            ttk.Label(step_row, text="每").pack(side="left", padx=(0, 2))
+            self._small_step_control = NumericValueRangeControl(
+                step_row,
+                tk_module=tk, ttk_module=ttk,
+                minimum=5.0, maximum=5.0,
+                range_mode=True, value_type=float, step=0.1,
+                lower_bound=5.0, upper_bound=60.0, unit="s",
+                value_width=5, on_change=self._fixed_on_change,
             )
-            self._small_step_interval_label.pack(side="left", padx=(0, 2))
-            self._small_step_interval_range_label = ttk.Label(
-                step_interval_group, text="(5.0s, 5.1s)", width=14,
-                anchor="w",
-            )
-            self._small_step_interval_range_label.pack(side="left")
-            step_random_group = ttk.Frame(step_row)
-            step_random_group.pack(side="left")
-            self._small_step_gap_var = tk.DoubleVar(value=0.1)
-            step_gap_minus = ttk.Button(step_random_group, text="−", width=2)
-            self._bind_repeat_step_button(
-                step_gap_minus, lambda: self._small_step_adjust_gap(-0.1),
-                current=self._small_step_gap_seconds,
-                coarse=lambda anchor: self._set_small_step_gap(
-                    (self._small_step_gap_seconds() if anchor is None else anchor)
-                    - self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            step_gap_minus.pack(side="left", padx=(0, 1))
-            self._small_step_gap_label = ttk.Label(
-                step_random_group, text="0.1s", width=5, anchor="center"
-            )
-            self._small_step_gap_label.pack(side="left")
-            step_gap_plus = ttk.Button(step_random_group, text="+", width=2)
-            self._bind_repeat_step_button(
-                step_gap_plus, lambda: self._small_step_adjust_gap(0.1),
-                current=self._small_step_gap_seconds,
-                coarse=lambda anchor: self._set_small_step_gap(
-                    (self._small_step_gap_seconds() if anchor is None else anchor)
-                    + self._RANDOM_GAP_COARSE_STEP
-                ),
-            )
-            step_gap_plus.pack(side="left", padx=(1, 0))
-            step_interval_group.pack(side="left")
+            self._small_step_interval_var = self._small_step_control.minimum_var
+            self._small_step_max_seconds_var = self._small_step_control.maximum_var
+            self._small_step_control.pack(side="left")
 
             self._fixed_status = ttk.Label(
                 fixed_panel, text="巡逻攻击未启用。", justify="left",
@@ -2410,22 +2570,19 @@ class UiWorker(threading.Thread):
             hp_key_button.pack(side="left", padx=(0, 4))
             self._hp_key_button = hp_key_button
             self._attach_bind_hint(hp_key_button)
-            self._hp_threshold_var = tk.IntVar(value=50)
-            # The right-side time/value column begins directly after the key
-            # binding.  Equal-width control prefixes make every row align.
-            hp_slider_group = ttk.Frame(hp_row)
-            hp_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
-            hp_threshold_slider = ttk.Scale(
-                hp_slider_group, from_=5, to=95, orient="horizontal",
-                variable=self._hp_threshold_var,
-                command=self._drug_on_change,
-                length=self._DRUG_SLIDER_LENGTH,
+            # Every visible value in the right column uses the same direct,
+            # wheel-editable numeric component.  No Scale widgets remain to
+            # force a wide trough or low-precision pointer drag.
+            self._hp_threshold_control = NumericValueRangeControl(
+                hp_row, tk_module=tk, ttk_module=ttk,
+                minimum=50, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=95, unit="%", value_width=5,
+                on_change=self._drug_on_change,
             )
-            hp_threshold_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self._hp_threshold_label = ttk.Label(
-                hp_slider_group, text="50%", width=self._DRUG_SLIDER_VALUE_WIDTH
-            )
-            self._hp_threshold_label.pack(side="left")
+            self._hp_threshold_var = self._hp_threshold_control.minimum_var
+            self._hp_threshold_label = self._hp_threshold_control.min_label
+            ttk.Label(hp_row, text="小于").pack(side="left", padx=(8, 2))
+            self._hp_threshold_control.pack(side="left")
             mp_row = ttk.Frame(drug_panel)
             mp_row.pack(fill="x", pady=(6, 0))
             self._mp_use_var = tk.BooleanVar(value=True)
@@ -2447,20 +2604,16 @@ class UiWorker(threading.Thread):
             mp_key_button.pack(side="left", padx=(0, 4))
             self._mp_key_button = mp_key_button
             self._attach_bind_hint(mp_key_button)
-            self._mp_threshold_var = tk.IntVar(value=30)
-            mp_slider_group = ttk.Frame(mp_row)
-            mp_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
-            mp_threshold_slider = ttk.Scale(
-                mp_slider_group, from_=5, to=95, orient="horizontal",
-                variable=self._mp_threshold_var,
-                command=self._drug_on_change,
-                length=self._DRUG_SLIDER_LENGTH,
+            self._mp_threshold_control = NumericValueRangeControl(
+                mp_row, tk_module=tk, ttk_module=ttk,
+                minimum=30, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=95, unit="%", value_width=5,
+                on_change=self._drug_on_change,
             )
-            mp_threshold_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self._mp_threshold_label = ttk.Label(
-                mp_slider_group, text="30%", width=self._DRUG_SLIDER_VALUE_WIDTH
-            )
-            self._mp_threshold_label.pack(side="left")
+            self._mp_threshold_var = self._mp_threshold_control.minimum_var
+            self._mp_threshold_label = self._mp_threshold_control.min_label
+            ttk.Label(mp_row, text="小于").pack(side="left", padx=(8, 2))
+            self._mp_threshold_control.pack(side="left")
             # Periodic buff rows: a bound key tapped on a timer.  Each row has
             # its own 5..600 second slider (default 600 seconds) that decides
             # when the key is triggered.  Unlike HP/MP these are time-based,
@@ -2487,22 +2640,16 @@ class UiWorker(threading.Thread):
             buff1_key_button.pack(side="left", padx=(0, 4))
             self._buff1_key_button = buff1_key_button
             self._attach_bind_hint(buff1_key_button)
-            # Buff refresh period in seconds (default 600): horizontal slider
-            # in the same progress-bar style as the other panels.
-            self._buff1_interval_var = tk.DoubleVar(value=600.0)
-            buff1_slider_group = ttk.Frame(buff1_row)
-            buff1_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
-            buff1_interval_slider = ttk.Scale(
-                buff1_slider_group, from_=5.0, to=600.0, orient="horizontal",
-                variable=self._buff1_interval_var,
-                command=self._drug_on_change,
-                length=self._DRUG_SLIDER_LENGTH,
+            self._buff1_interval_control = NumericValueRangeControl(
+                buff1_row, tk_module=tk, ttk_module=ttk,
+                minimum=600, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                on_change=self._drug_on_change,
             )
-            buff1_interval_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self._buff1_interval_label = ttk.Label(
-                buff1_slider_group, text="600s", width=self._DRUG_SLIDER_VALUE_WIDTH
-            )
-            self._buff1_interval_label.pack(side="left")
+            self._buff1_interval_var = self._buff1_interval_control.minimum_var
+            self._buff1_interval_label = self._buff1_interval_control.min_label
+            ttk.Label(buff1_row, text="每隔").pack(side="left", padx=(8, 2))
+            self._buff1_interval_control.pack(side="left")
             buff2_row = ttk.Frame(drug_panel)
             buff2_row.pack(fill="x", pady=(6, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
@@ -2525,20 +2672,16 @@ class UiWorker(threading.Thread):
             buff2_key_button.pack(side="left", padx=(0, 4))
             self._buff2_key_button = buff2_key_button
             self._attach_bind_hint(buff2_key_button)
-            self._buff2_interval_var = tk.DoubleVar(value=600.0)
-            buff2_slider_group = ttk.Frame(buff2_row)
-            buff2_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
-            buff2_interval_slider = ttk.Scale(
-                buff2_slider_group, from_=5.0, to=600.0, orient="horizontal",
-                variable=self._buff2_interval_var,
-                command=self._drug_on_change,
-                length=self._DRUG_SLIDER_LENGTH,
+            self._buff2_interval_control = NumericValueRangeControl(
+                buff2_row, tk_module=tk, ttk_module=ttk,
+                minimum=600, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                on_change=self._drug_on_change,
             )
-            buff2_interval_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self._buff2_interval_label = ttk.Label(
-                buff2_slider_group, text="600s", width=self._DRUG_SLIDER_VALUE_WIDTH
-            )
-            self._buff2_interval_label.pack(side="left")
+            self._buff2_interval_var = self._buff2_interval_control.minimum_var
+            self._buff2_interval_label = self._buff2_interval_control.min_label
+            ttk.Label(buff2_row, text="每隔").pack(side="left", padx=(8, 2))
+            self._buff2_interval_control.pack(side="left")
             buff3_row = ttk.Frame(drug_panel)
             buff3_row.pack(fill="x", pady=(6, 0))
             self._buff3_use_var = tk.BooleanVar(value=False)
@@ -2561,26 +2704,21 @@ class UiWorker(threading.Thread):
             buff3_key_button.pack(side="left", padx=(0, 4))
             self._buff3_key_button = buff3_key_button
             self._attach_bind_hint(buff3_key_button)
-            self._buff3_interval_var = tk.DoubleVar(value=600.0)
-            buff3_slider_group = ttk.Frame(buff3_row)
-            buff3_slider_group.pack(side="left", fill="x", expand=True, padx=(8, 0))
-            buff3_interval_slider = ttk.Scale(
-                buff3_slider_group, from_=5.0, to=600.0, orient="horizontal",
-                variable=self._buff3_interval_var,
-                command=self._drug_on_change,
-                length=self._DRUG_SLIDER_LENGTH,
+            self._buff3_interval_control = NumericValueRangeControl(
+                buff3_row, tk_module=tk, ttk_module=ttk,
+                minimum=600, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                on_change=self._drug_on_change,
             )
-            buff3_interval_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self._buff3_interval_label = ttk.Label(
-                buff3_slider_group, text="600s", width=self._DRUG_SLIDER_VALUE_WIDTH
-            )
-            self._buff3_interval_label.pack(side="left")
+            self._buff3_interval_var = self._buff3_interval_control.minimum_var
+            self._buff3_interval_label = self._buff3_interval_control.min_label
+            ttk.Label(buff3_row, text="每隔").pack(side="left", padx=(8, 2))
+            self._buff3_interval_control.pack(side="left")
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
-            # Persistent clipboard shortcuts. Short click copies, double-click
-            # sends to game chat, and long press edits. The adjacent delete
-            # icon also requires a 1s long press.
+            # Persistent clipboard shortcuts. Rows are edited directly by a
+            # left click; the adjacent × removes the row with one left click.
             # Column 0 sequence: patrol calibration → attack mode → quick
             # messages.  Keeping this utility beside the patrol controls
             # makes the two columns visually balanced.
@@ -2593,15 +2731,18 @@ class UiWorker(threading.Thread):
                 command=self._quick_message_add,
             ).pack(side="left")
             self._quick_message_status = ttk.Label(
-                quick_header, text="单击复制；双击发送；长按 1 秒修改/删除。",
-                # Keep this header inside the compact 380px left column;
-                # its old 300px wrap width was the element stretching the
-                # whole patrol stack beyond the widest real patrol row.
-                justify="left", wraplength=250,
+                quick_header, text="左键修改；左键 × 删除；Ctrl+数字发送。",
+                justify="left", wraplength=0, anchor="w",
             )
-            self._quick_message_status.pack(side="left", padx=(8, 0))
+            self._quick_message_status.pack(
+                side="left", fill="x", expand=True, padx=(8, 0)
+            )
             self._quick_messages_frame = ttk.Frame(quick_panel)
             self._quick_messages_frame.pack(fill="x", pady=(6, 0))
+            root.bind_all(
+                "<Button-1>", self._quick_message_blur_on_outside_click,
+                add="+",
+            )
             self._render_quick_messages()
 
             # Additional Functions panel: optional extras, each gated by its
@@ -2687,69 +2828,62 @@ class UiWorker(threading.Thread):
             countdown_hint.set_enabled(True)
             self._bind_key_tooltips.append(countdown_hint)
 
-            # 循环 的 间隔/剩余 progress bars sit on the SAME line as the
-            # 掉线/测谎/循环 checkboxes (column 1 is 500px wide to fit).
+            # 循环 uses the same direct numeric control as the other right
+            # column values.  The interval is whole minutes: 1..300m.
             self._countdown_interval_caption = ttk.Label(alarm_row, text="间隔")
-            self._countdown_interval_caption.pack(side="left", padx=(4, 0))
-            self._countdown_interval_var = tk.DoubleVar(value=1.0)
-            self._countdown_interval_slider = ttk.Scale(
-                alarm_row, from_=0.1, to=6.0, orient="horizontal",
-                # The usable ttk trough is shorter than its requested length
-                # because the thumb occupies part of it.  60px therefore
-                # cannot represent all 59 tenth-hour steps (for example 3.0h
-                # can be skipped).  80px keeps the control compact while
-                # retaining every 0.1h selection through 6.0h.
-                length=80,
-                variable=self._countdown_interval_var,
-                command=self._countdown_interval_on_drag,
+            self._countdown_interval_caption.pack(side="left", padx=(2, 0))
+            self._countdown_interval_control = NumericValueRangeControl(
+                alarm_row, tk_module=tk, ttk_module=ttk,
+                minimum=60, range_mode=False, value_type=int, step=1,
+                lower_bound=1, upper_bound=300, unit="m", value_width=5,
+                on_change=self._countdown_on_change,
             )
-            self._countdown_interval_slider.pack(
-                side="left", padx=(1, 1)
-            )
-            # ttk themes can paint a disabled Scale with an active-looking
-            # blue trough.  Block pointer interaction as a second, theme-
-            # independent guard while 循环 is unselected.
-            self._countdown_interval_slider.bind(
-                "<ButtonPress-1>", self._countdown_interval_press_gate,
-                add="+",
-            )
-            self._countdown_interval_slider.bind(
-                "<B1-Motion>", self._countdown_interval_press_gate,
-                add="+",
-            )
-            self._countdown_interval_slider.bind(
-                "<ButtonRelease-1>", self._countdown_interval_press_gate,
-                add="+",
-            )
-            self._countdown_interval_label = ttk.Label(
-                alarm_row, text="1.0h", width=4
-            )
-            self._countdown_interval_label.pack(side="left")
+            self._countdown_interval_var = self._countdown_interval_control.minimum_var
+            self._countdown_interval_label = self._countdown_interval_control.min_label
+            self._countdown_interval_control.pack(side="left")
 
-            ttk.Label(alarm_row, text="剩余").pack(side="left", padx=(2, 0))
+            ttk.Label(alarm_row, text="剩余").pack(side="left", padx=(4, 0))
             self._countdown_remaining_var = tk.DoubleVar(value=3600.0)
-            self._countdown_remaining_slider = ttk.Scale(
-                alarm_row, from_=0.0, to=3600.0,
-                orient="horizontal",
-                length=85,
-                variable=self._countdown_remaining_var,
-                command=self._countdown_remaining_on_drag,
+            # Remaining is deliberately three independently editable values,
+            # shown as HH:mm:ss.  Changing one component moves the worker's
+            # live deadline; the countdown itself keeps running.
+            # All three clock fields reserve the exact same compact two-digit
+            # width.  A single physical pixel protects the larger 12pt hover
+            # font without adding a third character cell of blank space.
+            remaining_clock_width = 2
+            remaining_clock_extra_width = 1
+            self._countdown_remaining_hour_control = NumericValueRangeControl(
+                alarm_row, tk_module=tk, ttk_module=ttk,
+                minimum=1, range_mode=False, value_type=int, step=1,
+                lower_bound=0, upper_bound=5, unit="",
+                value_width=remaining_clock_width,
+                extra_width_px=remaining_clock_extra_width,
+                on_change=self._countdown_remaining_components_changed,
             )
-            self._countdown_remaining_slider.pack(
-                side="left", padx=(1, 1)
+            self._countdown_remaining_minute_control = NumericValueRangeControl(
+                alarm_row, tk_module=tk, ttk_module=ttk,
+                minimum=0, range_mode=False, value_type=int, step=1,
+                lower_bound=0, upper_bound=59, unit="",
+                value_width=remaining_clock_width,
+                # Two 12pt minute digits need a few more physical pixels
+                # than the hour's usual single digit, but not a third blank
+                # character cell.
+                extra_width_px=4,
+                on_change=self._countdown_remaining_components_changed,
             )
-            self._countdown_dragging = False
-            self._countdown_remaining_slider.bind(
-                "<ButtonPress-1>", self._countdown_drag_start
+            self._countdown_remaining_second_control = NumericValueRangeControl(
+                alarm_row, tk_module=tk, ttk_module=ttk,
+                minimum=0, range_mode=False, value_type=int, step=1,
+                lower_bound=0, upper_bound=59, unit="",
+                value_width=remaining_clock_width,
+                extra_width_px=4,
+                on_change=self._countdown_remaining_components_changed,
             )
-            self._countdown_remaining_slider.bind(
-                "<ButtonRelease-1>", self._countdown_drag_end
-            )
-            # Clock notation is compact while still keeping every unit clear.
-            self._countdown_remaining_label = ttk.Label(
-                alarm_row, text="1:00:00", width=8
-            )
-            self._countdown_remaining_label.pack(side="left")
+            self._countdown_remaining_hour_control.pack(side="left")
+            ttk.Label(alarm_row, text=":").pack(side="left")
+            self._countdown_remaining_minute_control.pack(side="left")
+            ttk.Label(alarm_row, text=":").pack(side="left")
+            self._countdown_remaining_second_control.pack(side="left")
             self._countdown_status = ttk.Label(
                 extra_panel,
                 text="循环警报: 未启用。",
@@ -2785,7 +2919,8 @@ class UiWorker(threading.Thread):
                 variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
             )
-            telegram_check.pack(side="left")
+            # Temporarily retained as an internal persisted setting, but not
+            # exposed in the compact dashboard UI.
             for widget, hint_text in (
                 (sound_check, "发出dingdong的声音"),
                 (blink_check, "屏幕闪烁红色，适用于没声音的电脑"),
@@ -2795,7 +2930,9 @@ class UiWorker(threading.Thread):
                 tooltip.set_enabled(True)
                 self._bind_key_tooltips.append(tooltip)
             telegram_row = ttk.Frame(extra_panel)
-            telegram_row.pack(fill="x", pady=(4, 0))
+            # 消息推送配置 is intentionally hidden for now.  Keep its widgets
+            # instantiated so existing saved settings and notifier callbacks
+            # remain valid when this surface is restored.
             self._telegram_machine_row = telegram_row
             telegram_label = ttk.Label(telegram_row, text="消息推送配置")
             telegram_label.pack(side="left")
@@ -2947,7 +3084,8 @@ class UiWorker(threading.Thread):
             # The video drill remains available to internal callers, but the
             # operator-facing panel keeps this diagnostic control hidden.
             restart_row = ttk.Frame(extra_panel)
-            restart_row.pack(fill="x", pady=(4, 0))
+            # 清理内存 is temporarily not displayed.  Its setting remains
+            # loaded and available to the worker/configuration paths.
             self._auto_restart_var = tk.BooleanVar(value=False)
             self._auto_restart_check = ttk.Checkbutton(
                 restart_row,
@@ -2955,7 +3093,6 @@ class UiWorker(threading.Thread):
                 variable=self._auto_restart_var,
                 command=self._shutdown_on_change,
             )
-            self._auto_restart_check.pack(side="left")
             restart_hint = HoverTooltip(
                 self._auto_restart_check,
                 "内存达到98%以后，主动发送下线消息 （未配置不发送），然后重连游戏",
@@ -2970,7 +3107,6 @@ class UiWorker(threading.Thread):
                 ),
                 takefocus=False,
             )
-            self._restart_offline_message_button.pack(side="left", padx=(6, 0))
             # Clicking a plain label/panel does not necessarily give Tk a
             # different focus owner, so Spinbox <FocusOut> alone never fires.
             # Watch root clicks as well and explicitly commit/blur this one
@@ -3161,7 +3297,11 @@ class UiWorker(threading.Thread):
                 # inset.  Reserve it before mapping the root so the measured
                 # stationary row cannot be clipped by the previous geometry.
                 required_width = sum(locked_widths) + 36
-                width = max(root.winfo_width(), required_width)
+                # Recalculate the initial width from the compact column
+                # tracks instead of preserving a large geometry saved by a
+                # prior slider-heavy release.  The minimum remains the same
+                # safe measured width, so no panel is clipped.
+                width = max(_INITIAL_WINDOW_WIDTH, required_width)
                 root.minsize(
                     max(_INITIAL_WINDOW_WIDTH, required_width),
                     500 + (_CAPTION_HEIGHT if caption_installed else 0),
@@ -8356,6 +8496,15 @@ class UiWorker(threading.Thread):
             self._hide_layer_axis_hint()
             LOG.debug("layer-axis hover hint unavailable", exc_info=True)
 
+    @staticmethod
+    def _layer_axis_canvas_x(value: float, left: int, right: int) -> int:
+        """Map the visible logical 0.10–0.90 band onto the full UI axis."""
+
+        visible_span = _LAYER_AXIS_VISIBLE_MAX_X - _LAYER_AXIS_VISIBLE_MIN_X
+        normalized = (float(value) - _LAYER_AXIS_VISIBLE_MIN_X) / visible_span
+        normalized = max(0.0, min(1.0, normalized))
+        return left + round((right - left) * normalized)
+
     def _draw_layer_axis(
         self, layer_name: str, layer: Any, split_points: tuple[dict[str, Any], ...] = (),
     ) -> None:
@@ -8377,7 +8526,7 @@ class UiWorker(threading.Thread):
                 split_x = max(0.0, min(1.0, float(split["x"])))
             except (KeyError, TypeError, ValueError):
                 continue
-            center = left + round((right - left) * split_x)
+            center = self._layer_axis_canvas_x(split_x, left, right)
             wave: list[float] = []
             for y in range(1, _LAYER_AXIS_HEIGHT + 2, 2):
                 offset = 3 if ((y // 3) % 2 == 0) else -3
@@ -8456,7 +8605,9 @@ class UiWorker(threading.Thread):
                 x_value = max(0.0, min(1.0, float(point["x"])))
             except (TypeError, ValueError, KeyError):
                 continue
-            x = left + round((right - left) * x_value)
+            if not (_LAYER_AXIS_VISIBLE_MIN_X <= x_value <= _LAYER_AXIS_VISIBLE_MAX_X):
+                continue
+            x = self._layer_axis_canvas_x(x_value, left, right)
             text = self._layer_axis_point_text(label, point)
             tag = f"axis:{layer_name}:{kind}:{'' if index is None else index}"
             # The axis mirrors the native blinker grammar: endpoint bars, a
@@ -8555,7 +8706,9 @@ class UiWorker(threading.Thread):
                 and marker is not None and marker[0] == layer_name):
             try:
                 x_value = max(0.0, min(1.0, float(marker[1].x)))
-                x = left + round((right - left) * x_value)
+                if not (_LAYER_AXIS_VISIBLE_MIN_X <= x_value <= _LAYER_AXIS_VISIBLE_MAX_X):
+                    return
+                x = self._layer_axis_canvas_x(x_value, left, right)
                 facing = str(marker[2] if len(marker) > 2 else "right").casefold()
                 marker_text = {
                     "left": "<",
@@ -8632,15 +8785,11 @@ class UiWorker(threading.Thread):
     def _fixed_collect_data(self) -> dict:
         """Current Fixed Attack panel values as a settings dict."""
 
+        interval_min, interval_max = self._fixed_attack_range()
         return {
             "attack_mode": str(self._attack_mode_var.get()),
-            "interval_seconds": round(
-                max(0.2, min(
-                    self._FIXED_ATTACK_INTERVAL_MAX,
-                    float(self._fixed_interval_var.get()),
-                )), 2
-            ),
-            "random_gap_seconds": self._fixed_random_gap_seconds(),
+            "min_interval_seconds": interval_min,
+            "max_interval_seconds": interval_max,
             "attack_key": self._fixed_attack_key_var.get().strip(),
             "counterattack_enabled": bool(
                 self._counterattack_enabled_var.get()
@@ -8655,6 +8804,10 @@ class UiWorker(threading.Thread):
                 if hasattr(self, "_combo_attack_enabled_var") else False
             ),
             "combo_attack_slots": self._combo_attack_slots_data(),
+            "attack_delivery": str(
+                self._attack_delivery_var.get()
+                if hasattr(self, "_attack_delivery_var") else "stand"
+            ),
             "jump_attack_enabled": bool(
                 getattr(self, "_jump_attack_enabled_var", None).get()
                 if hasattr(self, "_jump_attack_enabled_var") else False
@@ -8663,13 +8816,8 @@ class UiWorker(threading.Thread):
                 getattr(self, "_small_step_enabled_var", None).get()
                 if hasattr(self, "_small_step_enabled_var") else False
             ),
-            "small_step_interval_seconds": round(
-                max(3.0, float(
-                    getattr(self, "_small_step_interval_var", None).get()
-                )) if hasattr(self, "_small_step_interval_var") else 5.0,
-                1,
-            ),
-            "small_step_gap_seconds": self._small_step_gap_seconds(),
+            "small_step_min_seconds": self._small_step_range_seconds()[0],
+            "small_step_max_seconds": self._small_step_range_seconds()[1],
             "stationary_facing_direction": str(
                 getattr(self, "_stationary_facing_direction_var", None).get()
                 if hasattr(self, "_stationary_facing_direction_var") else "right"
@@ -8678,29 +8826,27 @@ class UiWorker(threading.Thread):
                 getattr(self, "_stationary_pickup_enabled_var", None).get()
                 if hasattr(self, "_stationary_pickup_enabled_var") else False
             ),
-            "stationary_pickup_interval_seconds": round(
-                self._stationary_pickup_interval_minutes() * 60.0, 1
-            ),
-            # UI values for 捡东西 are minutes.  Keep the seconds value for
-            # the worker/config compatibility, alongside the explicit unit.
-            "stationary_pickup_gap_minutes": self._stationary_pickup_gap_minutes(),
-            "stationary_pickup_gap_seconds": round(
-                self._stationary_pickup_gap_minutes() * 60.0, 1
-            ),
+            "stationary_pickup_min_minutes": self._stationary_pickup_range_minutes()[0],
+            "stationary_pickup_max_minutes": self._stationary_pickup_range_minutes()[1],
             "dual_stationary_posts": self._dual_stationary_posts_data(),
-            "dual_stationary_switch_seconds": round(
-                self._dual_stationary_switch_minutes() * 60.0, 1
-            ),
+            "dual_stationary_switch_min_minutes": self._dual_stationary_switch_range_minutes()[0],
+            "dual_stationary_switch_max_minutes": self._dual_stationary_switch_range_minutes()[1],
         }
 
     def _dual_stationary_switch_minutes(self) -> float:
-        var = getattr(self, "_dual_stationary_switch_minutes_var", None)
-        try:
-            value = float(var.get()) if var is not None else self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES
-        except (TypeError, ValueError, tk.TclError):
+        control = getattr(self, "_dual_stationary_switch_control", None)
+        if control is None:
+            return self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES
+        minimum, _maximum = control.get_bounds()
+        return float(minimum)
+
+    def _dual_stationary_switch_range_minutes(self) -> tuple[float, float]:
+        control = getattr(self, "_dual_stationary_switch_control", None)
+        if control is None:
             value = self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES
-        return min(self._DUAL_STATIONARY_SWITCH_MAX_MINUTES,
-                   max(self._DUAL_STATIONARY_SWITCH_MIN_MINUTES, value))
+            return value, value
+        minimum, maximum = control.get_bounds()
+        return float(minimum), float(maximum)
 
     def _dual_stationary_posts_data(self) -> list[dict[str, Any]]:
         raw = getattr(self, "_dual_stationary_posts", ())
@@ -8726,20 +8872,13 @@ class UiWorker(threading.Thread):
         return result[:2]
 
     def _refresh_dual_stationary_status(self) -> None:
-        label = getattr(self, "_dual_stationary_status_label", None)
-        if label is not None:
-            posts = self._dual_stationary_posts_data()
-            faces = {"left": "左", "right": "右", "both": "双"}
-            labels = []
-            for index in range(2):
-                if index < len(posts):
-                    labels.append(
-                        f"桩{index + 1}{faces.get(str(posts[index]['facing']), '右')}"
-                    )
-                else:
-                    chord = "Ctrl+R" if index == 0 else "Ctrl+T"
-                    labels.append(f"桩{index + 1} {chord}")
-            label.configure(text="双桩: " + " / ".join(labels))
+        """Retained as a harmless record-refresh hook.
+
+        Dual-post summaries were deliberately removed from both panels; the
+        recorded markers on the layer canvas remain the visual source.
+        """
+
+        return
 
     def _record_dual_stationary_post(
         self, point: Any, facing: str, slot: Any,
@@ -8804,8 +8943,8 @@ class UiWorker(threading.Thread):
                 maximum = int(count_vars[index][1].get())
             except (IndexError, TypeError, ValueError, tk.TclError):
                 maximum = minimum
-            minimum = max(0, min(999, minimum))
-            maximum = max(0, min(999, maximum))
+            minimum = max(0, min(30, minimum))
+            maximum = max(0, min(30, maximum))
             if minimum > maximum:
                 minimum, maximum = maximum, minimum
             if index < len(count_vars):
@@ -8834,25 +8973,6 @@ class UiWorker(threading.Thread):
                 f"{key} {slot['min_count']}-{slot['max_count']}次"
             )
         return "组合攻击: " + ", ".join(pieces) + ", 绑定 - 代表不打"
-
-    def _combo_attack_commit_on_outside_click(self, event: Any) -> None:
-        """Blur, normalize, and save a typed combo count on outside clicks."""
-
-        root = getattr(self, "_root", None)
-        entries = tuple(getattr(self, "_combo_attack_count_entries", ()))
-        if root is None or not entries:
-            return
-        try:
-            focused = root.focus_get()
-            # Clicking a different entry transfers focus normally.  Its own
-            # FocusOut binding persists the previous value once.
-            if focused not in entries or event.widget is focused:
-                return
-            focused.selection_clear()
-            root.focus_set()
-            self._fixed_on_change()
-        except Exception:
-            LOG.debug("combo attack outside-click commit failed", exc_info=True)
 
     def _fixed_random_gap_seconds(self) -> float:
         """Return the clamped random-gap setting in 0.05-second precision."""
@@ -9008,17 +9128,24 @@ class UiWorker(threading.Thread):
         )
 
     def _small_step_gap_seconds(self) -> float:
-        var = getattr(self, "_small_step_gap_var", None)
-        raw = 0.1 if var is None else float(var.get())
-        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+        minimum, maximum = self._small_step_range_seconds()
+        return round(maximum - minimum, 1)
+
+    def _small_step_range_seconds(self) -> tuple[float, float]:
+        control = getattr(self, "_small_step_control", None)
+        if control is None:
+            return 5.0, 5.0
+        minimum, maximum = control.get_bounds()
+        return float(minimum), float(maximum)
 
     def _set_small_step_gap(self, value: Optional[float]) -> None:
-        """Apply an absolute small-step delay ceiling, clamped and rounded."""
-
+        """Compatibility helper: express the old gap as a range maximum."""
         base = self._small_step_gap_seconds() if value is None else value
-        self._small_step_gap_var.set(round(
-            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
-        ))
+        control = getattr(self, "_small_step_control", None)
+        if control is None:
+            return
+        minimum, _maximum = self._small_step_range_seconds()
+        control.set_bounds(minimum, minimum + max(0.0, float(base)))
         self._fixed_on_change()
 
     def _small_step_adjust_gap(self, delta: float) -> None:
@@ -9030,13 +9157,16 @@ class UiWorker(threading.Thread):
     def _stationary_pickup_interval_minutes(self) -> float:
         """Return the 捡东西 trigger interval in MINUTES (this row's unit)."""
 
-        var = getattr(self, "_stationary_pickup_interval_var", None)
-        raw = (self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES
-               if var is None else float(var.get()))
-        return round(min(
-            self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
-            max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES, raw),
-        ), 3)
+        minimum, _maximum = self._stationary_pickup_range_minutes()
+        return minimum
+
+    def _stationary_pickup_range_minutes(self) -> tuple[float, float]:
+        control = getattr(self, "_stationary_pickup_control", None)
+        if control is None:
+            value = self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES
+            return value, value
+        minimum, maximum = control.get_bounds()
+        return float(minimum), float(maximum)
 
     @staticmethod
     def _format_stationary_pickup_interval(minutes: float) -> str:
@@ -9049,16 +9179,16 @@ class UiWorker(threading.Thread):
 
     def _stationary_pickup_gap_minutes(self) -> float:
         """Return the 捡东西 random interval in MINUTES (this row's unit)."""
-
-        var = getattr(self, "_stationary_pickup_gap_var", None)
-        raw = 0.1 if var is None else float(var.get())
-        return round(max(0.0, min(self._FIXED_RANDOM_GAP_MAX, raw)), 1)
+        minimum, maximum = self._stationary_pickup_range_minutes()
+        return round(maximum - minimum, 1)
 
     def _set_stationary_pickup_gap(self, value: Optional[float]) -> None:
         base = self._stationary_pickup_gap_minutes() if value is None else value
-        self._stationary_pickup_gap_var.set(round(
-            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
-        ))
+        control = getattr(self, "_stationary_pickup_control", None)
+        if control is None:
+            return
+        minimum, _maximum = self._stationary_pickup_range_minutes()
+        control.set_bounds(minimum, minimum + max(0.0, float(base)))
         self._fixed_on_change()
 
     def _stationary_pickup_adjust_gap(self, delta: float) -> None:
@@ -9068,18 +9198,23 @@ class UiWorker(threading.Thread):
         )
 
     def _hotkey_adjust_fixed_interval(self, delta: float) -> bool:
-        """Apply one held Ctrl+[ / Ctrl+] fixed-attack interval step."""
+        """Shift both endpoints of the attack range for Ctrl+[ / Ctrl+]."""
 
-        if (not hasattr(self, "_fixed_interval_var")
+        if (not hasattr(self, "_fixed_min_interval_var")
                 or self._root is None):
             return False
-        current = float(self._fixed_interval_var.get())
-        value = round(max(
-            0.2, min(self._FIXED_ATTACK_INTERVAL_MAX, current + float(delta))
+        minimum, maximum = self._fixed_attack_range()
+        span = maximum - minimum
+        shifted_minimum = round(max(
+            0.2, min(self._FIXED_ATTACK_INTERVAL_MAX - span,
+                     minimum + float(delta))
         ), 2)
-        if value == round(current, 2):
+        shifted_maximum = round(shifted_minimum + span, 2)
+        if (shifted_minimum == minimum
+                and shifted_maximum == maximum):
             return False
-        self._fixed_interval_var.set(value)
+        self._fixed_min_interval_var.set(shifted_minimum)
+        self._fixed_max_interval_var.set(shifted_maximum)
         self._fixed_on_change()
 
         previous = self._attack_hotkey_sound_job
@@ -9104,7 +9239,6 @@ class UiWorker(threading.Thread):
 
         mode = str(getattr(self, "_attack_mode_var", None).get()
                    if hasattr(self, "_attack_mode_var") else "fixed")
-        jump_attack_button = getattr(self, "_jump_attack_button", None)
         # This method runs again after several ordinary UI refreshes.  It must
         # never reopen stationary controls that the authorization lock closed.
         fixed_attack_enabled = (
@@ -9126,9 +9260,17 @@ class UiWorker(threading.Thread):
                     row,
                     disabled=(dead_flower_mode or not self._license_allowed()),
                 )
-        for widget in [
-            jump_attack_button,
-        ]:
+        # Counterattack, pickup/reset and 小碎步 are intentionally one fixed
+        # third row.  Outside 站桩/双桩 it remains visible for orientation but
+        # is greyed and cannot alter the live route settings.
+        stationary_action_row = getattr(self, "_stationary_action_row", None)
+        if stationary_action_row is not None:
+            self._set_panel_state(
+                stationary_action_row,
+                disabled=not (mode in ("stationary", "dual_stationary")
+                              and self._license_allowed()),
+            )
+        for widget in getattr(self, "_attack_delivery_buttons", ()):
             if widget is None:
                 continue
             try:
@@ -9144,7 +9286,34 @@ class UiWorker(threading.Thread):
                 widget.state(["!disabled" if stationary_enabled else "disabled"])
             except Exception:
                 widget.configure(state="normal" if stationary_enabled else "disabled")
+        stationary_options = getattr(self, "_stationary_options_row", None)
+        stationary_facing_row = getattr(self, "_stationary_facing_row", None)
+        pickup_row = getattr(self, "_stationary_pickup_row", None)
+        small_step_row = getattr(self, "_small_step_options_row", None)
         dual_row = getattr(self, "_dual_stationary_row", None)
+        # Keep the fourth options row mounted in every mode.  Dead-flower
+        # mode must grey unavailable patrol-attack controls rather than
+        # removing/recreating them: Tk's pack relayout can visibly resize or
+        # flicker the whole panel during a mode switch.  The per-control state
+        # gates above decide which controls can actually be used.
+        #
+        # One compact, mode-specific third-row slot remains: stationary mode
+        # shows 朝向; dual-stationary mode shows 换桩.  That slot has a fixed
+        # parent-row height, so changing its child does not change panel size.
+        if stationary_options is not None and not stationary_options.winfo_manager():
+            stationary_options.pack(fill="x", pady=(2, 0))
+        if pickup_row is not None and not pickup_row.winfo_manager():
+            pickup_row.pack(side="left")
+        if small_step_row is not None and not small_step_row.winfo_manager():
+            small_step_row.pack(side="left", padx=(4, 0))
+        if stationary_facing_row is not None:
+            stationary_facing_row.pack_forget()
+        if dual_row is not None:
+            dual_row.pack_forget()
+        if stationary_enabled and stationary_facing_row is not None:
+            stationary_facing_row.pack(side="left", padx=(8, 0))
+        elif dual_stationary_enabled and dual_row is not None:
+            dual_row.pack(side="left", padx=(8, 0))
         if dual_row is not None:
             self._set_panel_state(dual_row, disabled=not dual_stationary_enabled)
         for widget in getattr(self, "_stationary_pickup_controls", []):
@@ -9155,151 +9324,57 @@ class UiWorker(threading.Thread):
             except Exception:
                 widget.configure(state="normal" if flower_cycle_enabled else "disabled")
 
-    def _fixed_attack_interval_to_slider_value(self, interval: float) -> float:
-        """Map a real cadence value onto the fine/coarse slider track."""
+    def _fixed_attack_range(self, changed: Optional[str] = None) -> tuple[float, float]:
+        """Return the reusable cadence component's ordered range."""
 
-        value = max(0.2, min(self._FIXED_ATTACK_INTERVAL_MAX, float(interval)))
-        fine_max = self._FIXED_ATTACK_INTERVAL_FINE_MAX
-        fine_share = self._FIXED_ATTACK_INTERVAL_FINE_TRACK_SHARE
-        if value <= fine_max:
-            return ((value - 0.2) / (fine_max - 0.2)) * fine_share
-        return fine_share + (
-            (value - fine_max)
-            / (self._FIXED_ATTACK_INTERVAL_MAX - fine_max)
-        ) * (1.0 - fine_share)
+        control = getattr(self, "_fixed_interval_control", None)
+        if control is None:
+            return 3.0, 3.1
+        minimum, maximum = control.normalize(changed=changed)
+        return float(minimum), float(maximum)
 
-    def _slider_value_to_fixed_attack_interval(self, slider_value: float) -> float:
-        """Map the display-scale position back to a snapped cadence value."""
-
-        position = max(0.0, min(1.0, float(slider_value)))
-        fine_max = self._FIXED_ATTACK_INTERVAL_FINE_MAX
-        fine_share = self._FIXED_ATTACK_INTERVAL_FINE_TRACK_SHARE
-        if position <= fine_share:
-            raw = 0.2 + (position / fine_share) * (fine_max - 0.2)
-        else:
-            raw = fine_max + (
-                (position - fine_share) / (1.0 - fine_share)
-            ) * (self._FIXED_ATTACK_INTERVAL_MAX - fine_max)
-        return round(
-            round(raw / self._FIXED_ATTACK_INTERVAL_STEP)
-            * self._FIXED_ATTACK_INTERVAL_STEP,
-            2,
-        )
-
-    def _fixed_interval_slider_on_change(self, _value: str = "") -> None:
-        """Receive a drag on the display slider without losing fine cadence."""
-
-        if getattr(self, "_fixed_interval_slider_syncing", False):
+    def _adjust_fixed_interval_bound(self, side: str, delta: float) -> None:
+        control = getattr(self, "_fixed_interval_control", None)
+        if control is None:
             return
-        slider_var = getattr(self, "_fixed_interval_slider_var", None)
-        if slider_var is None:
-            return
-        try:
-            interval = self._slider_value_to_fixed_attack_interval(
-                float(slider_var.get())
-            )
-        except (TypeError, ValueError, tk.TclError):
-            return
-        self._fixed_interval_var.set(interval)
+        variable = control.minimum_var if side == "min" else control.maximum_var
+        variable.set(float(variable.get()) + float(delta))
+        control.normalize(changed=side)
         self._fixed_on_change()
-
-    def _sync_fixed_interval_slider(self, interval: float) -> None:
-        """Move the display slider after buttons/config changed the cadence."""
-
-        slider_var = getattr(self, "_fixed_interval_slider_var", None)
-        if slider_var is None:
-            return
-        desired = self._fixed_attack_interval_to_slider_value(interval)
-        try:
-            if abs(float(slider_var.get()) - desired) <= 1e-9:
-                return
-            self._fixed_interval_slider_syncing = True
-            slider_var.set(desired)
-        except (TypeError, ValueError, tk.TclError):
-            return
-        finally:
-            self._fixed_interval_slider_syncing = False
 
     def _fixed_on_change(self, _value: str = "") -> None:
         """Update labels, persist, and apply the fixed-attack settings live."""
 
-        if not hasattr(self, "_fixed_interval_label"):
+        if not hasattr(self, "_fixed_min_interval_label"):
             return
         mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
                 and mode not in ("fixed", "stationary", "dual_stationary", "dead_flower")):
             mode = "fixed"
             self._attack_mode_var.set("fixed")
-        # Layout is intentionally not refreshed here.  Sliders and long-hold
-        # random-gap buttons call this method repeatedly; packing/unpacking
-        # their rows on every 0.1 s tick made the visible line flicker or
-        # disappear.  Only an actual attack-mode change needs a layout pass.
-        # The visible scale uses a fine 0.20..2.00s section plus a coarse
-        # 2.00..30.00s section.  Quantize every change to the persisted 0.05s
-        # unit so the displayed value is exactly what will be used.
-        raw_interval = max(
-            0.2, min(self._FIXED_ATTACK_INTERVAL_MAX,
-                     float(self._fixed_interval_var.get()))
+        delivery = str(
+            self._attack_delivery_var.get()
+            if hasattr(self, "_attack_delivery_var") else "stand"
         )
-        interval = round(
-            round(raw_interval / self._FIXED_ATTACK_INTERVAL_STEP)
-            * self._FIXED_ATTACK_INTERVAL_STEP,
-            2,
-        )
-        if abs(raw_interval - interval) > 1e-9:
-            self._fixed_interval_var.set(interval)
-        self._sync_fixed_interval_slider(interval)
-        interval_text = f"{interval:.2f}".rstrip("0").rstrip(".")
-        self._fixed_interval_label.configure(text=f"{interval_text}s")
-        random_gap = self._fixed_random_gap_seconds()
-        if hasattr(self, "_fixed_random_gap_label"):
-            gap_text = f"{random_gap:.2f}".rstrip("0").rstrip(".")
-            self._fixed_random_gap_label.configure(text=f"{gap_text}s")
-        if hasattr(self, "_fixed_interval_range_label"):
-            self._fixed_interval_range_label.configure(
-                text=(
-                    f"({interval_text}s, "
-                    f"{f'{interval + random_gap:.2f}'.rstrip('0').rstrip('.')}s)"
-                )
-            )
-        if hasattr(self, "_small_step_interval_var"):
-            # 小碎步 is a longer optional motion; allow up to 60 seconds.
-            step_interval = min(
-                self._OPTIONAL_MOTION_INTERVAL_MAX,
-                max(3.0, float(self._small_step_interval_var.get())),
-            )
-            self._small_step_interval_var.set(step_interval)
-            self._small_step_interval_label.configure(
-                text=f"{step_interval:.1f}s"
-            )
-            step_gap = self._small_step_gap_seconds()
-            if hasattr(self, "_small_step_gap_label"):
-                self._small_step_gap_label.configure(
-                    text=f"{step_gap:.1f}s"
-                )
-            if hasattr(self, "_small_step_interval_range_label"):
-                self._small_step_interval_range_label.configure(
-                    text=f"({step_interval:.1f}s, {step_interval + step_gap:.1f}s)"
-                )
-        if hasattr(self, "_stationary_pickup_interval_var"):
-            pickup_interval = self._stationary_pickup_interval_minutes()
-            self._stationary_pickup_interval_var.set(pickup_interval)
-            self._stationary_pickup_interval_label.configure(
-                text=self._format_stationary_pickup_interval(pickup_interval)
-            )
-            pickup_gap = self._stationary_pickup_gap_minutes()
-            self._stationary_pickup_gap_label.configure(text=f"{pickup_gap:.1f}m")
-            self._stationary_pickup_interval_range_label.configure(
-                text=(
-                    f"({self._format_stationary_pickup_interval(pickup_interval)}, "
-                    f"{self._format_stationary_pickup_interval(pickup_interval + pickup_gap)})"
-                )
-            )
-        if hasattr(self, "_dual_stationary_switch_minutes_var"):
-            switch_minutes = self._dual_stationary_switch_minutes()
-            self._dual_stationary_switch_minutes_var.set(switch_minutes)
-            self._dual_stationary_switch_label.configure(text=f"{switch_minutes:.1f}m")
-            self._refresh_dual_stationary_status()
+        if delivery not in ("stand", "jump", "charge", "none"):
+            delivery = "stand"
+            self._attack_delivery_var.set(delivery)
+        if hasattr(self, "_jump_attack_enabled_var"):
+            # Existing jump-attack code remains the only implemented special
+            # delivery path. The other two choices are UI-only for now.
+            self._jump_attack_enabled_var.set(delivery == "jump")
+        # Text-value wheels are applied in 0.05s steps.  There is no slider
+        # drag or additive random-gap control on this row anymore.
+        interval_min, interval_max = self._fixed_attack_range()
+        for control_name in (
+            "_small_step_control",
+            "_stationary_pickup_control",
+            "_dual_stationary_switch_control",
+        ):
+            control = getattr(self, control_name, None)
+            if control is not None:
+                control.normalize()
+        self._refresh_dual_stationary_status()
         if hasattr(self, "_fixed_key_button"):
             self._fixed_key_button.configure(
                 text=self._fixed_attack_key_var.get()
@@ -9389,15 +9464,23 @@ class UiWorker(threading.Thread):
         # their own attacks; on patrol those are deliberate extras, so only the
         # stand-still cadence keeps the attack-spacing rule (attack_worker).
         worker.stationary_mode = bool(mode in ("stationary", "dual_stationary"))
-        worker.attack_interval = max(
-            0.2, min(
-                self._FIXED_ATTACK_INTERVAL_MAX,
-                float(data.get("interval_seconds", 3.0)),
-            )
-        )
-        worker.attack_jitter_seconds = max(
-            0.0, float(data.get("random_gap_seconds", 0.0))
-        )
+        # New range fields replace the former base interval + random gap.
+        # Accept old local settings for one launch, then the next save writes
+        # the explicit min/max pair only.
+        legacy_minimum = float(data.get("interval_seconds", 3.0))
+        minimum = float(data.get("min_interval_seconds", legacy_minimum))
+        maximum = float(data.get(
+            "max_interval_seconds",
+            legacy_minimum + float(data.get("random_gap_seconds", 0.0)),
+        ))
+        minimum = max(0.2, min(self._FIXED_ATTACK_INTERVAL_MAX, minimum))
+        maximum = max(minimum, min(self._FIXED_ATTACK_INTERVAL_MAX, maximum))
+        worker.attack_min_interval = minimum
+        worker.attack_max_interval = maximum
+        # Compatibility aliases for integrations which still inspect these
+        # fields; scheduling itself uses the explicit range above.
+        worker.attack_interval = minimum
+        worker.attack_jitter_seconds = maximum - minimum
         key = str(data.get("attack_key", "ctrl")).strip()
         if not worker.set_key(key):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
@@ -9428,10 +9511,20 @@ class UiWorker(threading.Thread):
                 stationary_setter(mode in ("stationary", "dual_stationary"))
             dual_setter = getattr(mover, "set_dual_stationary_configuration", None)
             if callable(dual_setter):
+                legacy_switch_minutes = float(
+                    data.get("dual_stationary_switch_seconds", 900.0)
+                ) / 60.0
+                dual_switch_min = float(data.get(
+                    "dual_stationary_switch_min_minutes", legacy_switch_minutes,
+                ))
+                dual_switch_max = float(data.get(
+                    "dual_stationary_switch_max_minutes", dual_switch_min,
+                ))
                 dual_setter(
                     dual_stationary_mode,
                     data.get("dual_stationary_posts", ()),
-                    float(data.get("dual_stationary_switch_seconds", 900.0)),
+                    dual_switch_min * 60.0,
+                    max(0.0, dual_switch_max - dual_switch_min) * 60.0,
                 )
             # Automatic stuck stair-jumps are intentionally disabled.  The
             # dedicated jump executor remains solely for recorded jump points.
@@ -9443,12 +9536,15 @@ class UiWorker(threading.Thread):
             step_worker.enabled = bool(
                 data.get("small_step_enabled", False)
             ) and mode in ("fixed", "stationary", "dual_stationary")
-            step_worker.step_interval = max(
-                3.0,
-                float(data.get("small_step_interval_seconds", 5.0)),
-            )
+            legacy_step_min = float(data.get("small_step_interval_seconds", 5.0))
+            step_min = float(data.get("small_step_min_seconds", legacy_step_min))
+            step_max = float(data.get(
+                "small_step_max_seconds",
+                step_min + float(data.get("small_step_gap_seconds", 0.0)),
+            ))
+            step_worker.step_interval = max(5.0, step_min)
             step_worker.step_jitter_seconds = max(
-                0.0, float(data.get("small_step_gap_seconds", 0.0))
+                0.0, step_max - step_worker.step_interval
             )
         if mover is not None:
             direction = str(data.get("stationary_facing_direction", "right"))
@@ -9461,21 +9557,39 @@ class UiWorker(threading.Thread):
                 )
             pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
             if callable(pickup_setter):
-                # The worker and the configuration keep seconds; the 重置花 row
-                # is the only place the interval is read as minutes.
+                legacy_pickup_min = float(
+                    data.get("stationary_pickup_interval_seconds", 900.0)
+                ) / 60.0
+                pickup_min = float(data.get(
+                    "stationary_pickup_min_minutes", legacy_pickup_min,
+                ))
+                pickup_max = float(data.get(
+                    "stationary_pickup_max_minutes",
+                    pickup_min + float(data.get(
+                        "stationary_pickup_gap_minutes",
+                        float(data.get("stationary_pickup_gap_seconds", 0.0)) / 60.0,
+                    )),
+                ))
                 pickup_setter(
                     bool(data.get("stationary_pickup_enabled", False))
                     and mode in ("stationary", "dual_stationary"),
-                    float(data.get("stationary_pickup_interval_seconds", 900.0)),
-                    float(data.get("stationary_pickup_gap_seconds", 0.0)),
+                    pickup_min * 60.0,
+                    max(0.0, pickup_max - pickup_min) * 60.0,
                 )
             flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
             if callable(flower_cycle_setter):
+                legacy_pickup_min = float(
+                    data.get("stationary_pickup_interval_seconds", 900.0)
+                ) / 60.0
+                pickup_min = float(data.get(
+                    "stationary_pickup_min_minutes", legacy_pickup_min,
+                ))
+                pickup_max = float(data.get("stationary_pickup_max_minutes", pickup_min))
                 flower_cycle_setter(
                     bool(data.get("stationary_pickup_enabled", False))
                     and dead_flower_mode,
-                    float(data.get("stationary_pickup_interval_seconds", 900.0)),
-                    float(data.get("stationary_pickup_gap_seconds", 0.0)),
+                    pickup_min * 60.0,
+                    max(0.0, pickup_max - pickup_min) * 60.0,
                 )
 
     def _fixed_refresh_grey(self) -> None:
@@ -9505,7 +9619,12 @@ class UiWorker(threading.Thread):
             self._set_panel_state(panel, fixed_mode)
         if hasattr(self, "_fixed_status"):
             if fixed_mode:
-                interval = float(self._fixed_interval_var.get())
+                interval_min, interval_max = self._fixed_attack_range()
+                interval_text = (
+                    f"{interval_min:.2f}".rstrip("0").rstrip(".")
+                    + "–"
+                    + f"{interval_max:.2f}".rstrip("0").rstrip(".")
+                )
                 if mode == "dead_flower":
                     self._fixed_status.configure(
                         text="死花模式已启用 - 双层花点按 Buff1 定时上下移动；单层仅 Buff 与 HP/MP。"
@@ -9516,8 +9635,8 @@ class UiWorker(threading.Thread):
                               f"{self._fixed_attack_key_var.get()}；"
                               f"开始运行时记录临时位置；"
                               f"只有正确配置楼层，才能寻路回去；"
-                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}每 "
-                              f"{interval:.1f}s。")
+                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}间隔 "
+                              f"{interval_text}s。")
                     )
                 elif mode == "dual_stationary":
                     posts = len(self._dual_stationary_posts_data())
@@ -9530,8 +9649,8 @@ class UiWorker(threading.Thread):
                     self._fixed_status.configure(
                         text=(f"巡逻攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；"
-                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}每 "
-                              f"{interval:.1f}s。")
+                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}间隔 "
+                              f"{interval_text}s。")
                     )
             else:
                 self._fixed_status.configure(
@@ -9585,15 +9704,18 @@ class UiWorker(threading.Thread):
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
                 if self._attack_mode_var.get() not in ("fixed", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set("fixed")
-            if "interval_seconds" in data:
-                self._fixed_interval_var.set(
-                    float(data["interval_seconds"])
-                )
-            if ("random_gap_seconds" in data
-                    and hasattr(self, "_fixed_random_gap_var")):
-                self._fixed_random_gap_var.set(
-                    float(data["random_gap_seconds"])
-                )
+            # Migrate old ``interval + random_gap`` values into the new
+            # explicit inclusive interval range.  A legacy 0.90 + 0.10s
+            # setting therefore becomes 0.90–1.00s with identical timing.
+            legacy_minimum = float(data.get("interval_seconds", 3.0))
+            minimum = float(data.get("min_interval_seconds", legacy_minimum))
+            maximum = float(data.get(
+                "max_interval_seconds",
+                legacy_minimum + float(data.get("random_gap_seconds", 0.1)),
+            ))
+            self._fixed_min_interval_var.set(minimum)
+            self._fixed_max_interval_var.set(maximum)
+            self._fixed_attack_range()
             if "attack_key" in data:
                 key = str(data["attack_key"]).strip()
                 if key in BINDABLE_KEYS:
@@ -9620,8 +9742,8 @@ class UiWorker(threading.Thread):
                         maximum = int(slot.get("max_count", minimum))
                     except (TypeError, ValueError):
                         minimum, maximum = 1, 1
-                    minimum = max(0, min(999, minimum))
-                    maximum = max(0, min(999, maximum))
+                    minimum = max(0, min(30, minimum))
+                    maximum = max(0, min(30, maximum))
                     if minimum > maximum:
                         minimum, maximum = maximum, minimum
                     if index < len(getattr(self, "_combo_attack_count_vars", ())):
@@ -9631,53 +9753,53 @@ class UiWorker(threading.Thread):
                     key = raw_key if raw_key in BINDABLE_KEYS else "-"
                     if index < len(getattr(self, "_combo_attack_key_vars", ())):
                         self._combo_attack_key_vars[index].set(key)
-            if hasattr(self, "_jump_attack_enabled_var"):
-                # ``stationary_jump_enabled`` is the pre-shared-option field.
-                # New saves use ``jump_attack_enabled``; retain the old value
-                # only when the new field is absent.
-                self._jump_attack_enabled_var.set(bool(data.get(
-                    "jump_attack_enabled",
-                    data.get("stationary_jump_enabled", False),
-                )))
+            if hasattr(self, "_attack_delivery_var"):
+                # Old configurations had only a jump checkbox.  Preserve it
+                # as 跳打; new configurations persist the full selection.
+                delivery = str(data.get("attack_delivery", "")).casefold()
+                if delivery not in ("stand", "jump", "charge", "none"):
+                    delivery = (
+                        "jump" if bool(data.get(
+                            "jump_attack_enabled",
+                            data.get("stationary_jump_enabled", False),
+                        )) else "stand"
+                    )
+                self._attack_delivery_var.set(delivery)
             if ("small_step_enabled" in data
                     and hasattr(self, "_small_step_enabled_var")):
                 self._small_step_enabled_var.set(bool(
                     data["small_step_enabled"]
                 ))
-            if ("small_step_interval_seconds" in data
-                    and hasattr(self, "_small_step_interval_var")):
-                self._small_step_interval_var.set(max(
-                    3.0, float(data["small_step_interval_seconds"])
+            small_step_control = getattr(self, "_small_step_control", None)
+            if small_step_control is not None:
+                legacy_small_min = float(data.get("small_step_interval_seconds", 5.0))
+                small_min = float(data.get("small_step_min_seconds", legacy_small_min))
+                small_max = float(data.get(
+                    "small_step_max_seconds",
+                    small_min + float(data.get("small_step_gap_seconds", 0.0)),
                 ))
-            if ("small_step_gap_seconds" in data
-                    and hasattr(self, "_small_step_gap_var")):
-                self._small_step_gap_var.set(float(
-                    data["small_step_gap_seconds"]
-                ))
+                small_step_control.set_bounds(small_min, small_max)
             if ("stationary_pickup_enabled" in data
                     and hasattr(self, "_stationary_pickup_enabled_var")):
                 self._stationary_pickup_enabled_var.set(bool(
                     data["stationary_pickup_enabled"]
                 ))
-            if ("stationary_pickup_interval_seconds" in data
-                    and hasattr(self, "_stationary_pickup_interval_var")):
-                # Stored in seconds; this row shows and clamps minutes.
-                self._stationary_pickup_interval_var.set(min(
-                    self._STATIONARY_PICKUP_INTERVAL_MAX_MINUTES,
-                    max(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES,
-                        float(data["stationary_pickup_interval_seconds"]) / 60.0),
+            pickup_control = getattr(self, "_stationary_pickup_control", None)
+            if pickup_control is not None:
+                legacy_pickup_min = float(
+                    data.get("stationary_pickup_interval_seconds", 900.0)
+                ) / 60.0
+                pickup_min = float(data.get(
+                    "stationary_pickup_min_minutes", legacy_pickup_min,
                 ))
-            if hasattr(self, "_stationary_pickup_gap_var"):
-                if "stationary_pickup_gap_minutes" in data:
-                    self._stationary_pickup_gap_var.set(float(
-                        data["stationary_pickup_gap_minutes"]
-                    ))
-                elif "stationary_pickup_gap_seconds" in data:
-                    # Older configs stored this particular UI value in
-                    # seconds.  Convert once when loading them.
-                    self._stationary_pickup_gap_var.set(
-                        float(data["stationary_pickup_gap_seconds"]) / 60.0
-                    )
+                legacy_pickup_gap = float(data.get(
+                    "stationary_pickup_gap_minutes",
+                    float(data.get("stationary_pickup_gap_seconds", 0.0)) / 60.0,
+                ))
+                pickup_max = float(data.get(
+                    "stationary_pickup_max_minutes", pickup_min + legacy_pickup_gap,
+                ))
+                pickup_control.set_bounds(pickup_min, pickup_max)
             if hasattr(self, "_stationary_facing_direction_var"):
                 direction = str(data.get("stationary_facing_direction", ""))
                 if direction not in ("left", "right", "both"):
@@ -9685,12 +9807,15 @@ class UiWorker(threading.Thread):
                     # selector replaces it and defaults to right.
                     direction = "right"
                 self._stationary_facing_direction_var.set(direction)
-            if hasattr(self, "_dual_stationary_switch_minutes_var"):
-                seconds = float(data.get("dual_stationary_switch_seconds", 900.0))
-                self._dual_stationary_switch_minutes_var.set(min(
-                    self._DUAL_STATIONARY_SWITCH_MAX_MINUTES,
-                    max(self._DUAL_STATIONARY_SWITCH_MIN_MINUTES, seconds / 60.0),
-                ))
+            dual_switch_control = getattr(self, "_dual_stationary_switch_control", None)
+            if dual_switch_control is not None:
+                legacy_switch_min = float(
+                    data.get("dual_stationary_switch_seconds", 900.0)
+                ) / 60.0
+                dual_switch_control.set_bounds(
+                    float(data.get("dual_stationary_switch_min_minutes", legacy_switch_min)),
+                    float(data.get("dual_stationary_switch_max_minutes", legacy_switch_min)),
+                )
             raw_posts = data.get("dual_stationary_posts", ())
             self._dual_stationary_posts = (
                 [item for item in raw_posts if isinstance(item, dict)][:2]
@@ -9780,6 +9905,15 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_hp_threshold_label"):
             return
+        for control in (
+            getattr(self, "_hp_threshold_control", None),
+            getattr(self, "_mp_threshold_control", None),
+            getattr(self, "_buff1_interval_control", None),
+            getattr(self, "_buff2_interval_control", None),
+            getattr(self, "_buff3_interval_control", None),
+        ):
+            if control is not None:
+                control.normalize()
         hp_percent = int(self._hp_threshold_var.get())
         mp_percent = int(self._mp_threshold_var.get())
         self._hp_threshold_label.configure(text=f"{hp_percent}%")
@@ -9868,7 +10002,7 @@ class UiWorker(threading.Thread):
                 interval = float(data[name])
                 if legacy_minutes:
                     interval *= 60.0
-                variable.set(min(600.0, max(5.0, interval)))
+                variable.set(int(round(min(600.0, max(5.0, interval)))))
             if "buff1_enabled" in data:
                 self._buff1_use_var.set(bool(data["buff1_enabled"]))
             if "buff2_enabled" in data:
@@ -9943,9 +10077,11 @@ class UiWorker(threading.Thread):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
             )
-            data["countdown_interval_hours"] = round(
-                float(self._countdown_interval_var.get()), 1
-            )
+            # New direct UI: whole minutes, 1..300.  Keep the legacy hours
+            # key too so an older helper can still read this configuration.
+            minutes = int(self._countdown_interval_var.get())
+            data["countdown_interval_minutes"] = minutes
+            data["countdown_interval_hours"] = round(minutes / 60.0, 4)
         if hasattr(self, "_api_auto_lie_var"):
             # 自动过测谎 is part of user_config, like the reconnect selection.
             data["auto_lie_api_enabled"] = bool(self._api_auto_lie_var.get())
@@ -10226,6 +10362,7 @@ class UiWorker(threading.Thread):
         # Clear the active-entry identity before destroying widgets so a
         # destruction-induced FocusOut cannot recursively save/render.
         self._quick_edit_entry = None
+        self._quick_edit_index = None
         for child in frame.winfo_children():
             child.destroy()
         for index, message in enumerate(self._quick_messages):
@@ -10243,6 +10380,7 @@ class UiWorker(threading.Thread):
                 entry.insert(0, message)
                 entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
                 self._quick_edit_entry = entry
+                self._quick_edit_index = index
                 entry.bind(
                     "<FocusOut>",
                     lambda event, i=index, field=entry: (
@@ -10258,13 +10396,16 @@ class UiWorker(threading.Thread):
                 entry.focus_set()
                 entry.selection_range(0, "end")
             else:
-                # ttk.Button/Entry controls in this compact panel can be
-                # elided by certain Windows themes.  A single ttk.Label is
-                # always rendered and still supports the complete click,
-                # double-click, and long-press interaction through bindings.
-                preview = quick_message_preview(message)
+                # ttk.Label remains visible under every Windows theme and a
+                # direct left click opens the inline editor.
+                # This is deliberately wider than the old fixed preview.  A
+                # row itself owns the available width; truncation only starts
+                # near its right-side delete affordance rather than leaving a
+                # conspicuous unused strip in the middle of the panel.
+                preview = quick_message_preview(message, max_units=52)
                 message_label = self._ttk.Label(
-                    row, text=f"Ctrl+{key_number}   {preview}", anchor="w"
+                    row, text=f"Ctrl+{key_number}   {preview}", anchor="w",
+                    wraplength=0,
                 )
                 message_label.pack(
                     side="left", fill="x", expand=True, padx=(0, 4)
@@ -10274,22 +10415,14 @@ class UiWorker(threading.Thread):
                     tooltip.set_enabled(True)
                     self._quick_message_tooltips.append(tooltip)
                 message_label.bind(
-                    "<ButtonPress-1>",
-                    lambda event, i=index: self._quick_message_press(i),
-                )
-                message_label.bind(
-                    "<ButtonRelease-1>",
-                    lambda event, i=index: self._quick_message_release(i),
+                    "<Button-1>",
+                    lambda _event, i=index: self._quick_message_begin_edit(i),
                 )
             delete_button = self._ttk.Label(row, text="×", width=3, anchor="center")
             delete_button.pack(side="left")
             delete_button.bind(
-                "<ButtonPress-1>",
-                lambda event, i=index: self._quick_delete_press(i),
-            )
-            delete_button.bind(
-                "<ButtonRelease-1>",
-                lambda event, i=index: self._quick_delete_release(i),
+                "<Button-1>",
+                lambda _event, i=index: self._quick_delete(i),
             )
 
     def _quick_messages_save(self) -> None:
@@ -10305,38 +10438,15 @@ class UiWorker(threading.Thread):
         self._render_quick_messages(index)
         self._refit_window_to_content()
 
-    def _quick_message_press(self, index: int) -> None:
-        self._quick_message_hold_fired = False
-        if self._root is not None:
-            self._quick_message_press_job = self._root.after(
-                1000, lambda: self._quick_message_begin_edit(index)
-            )
+    def _set_quick_message_status(self, text: str) -> None:
+        """Show one compact, non-wrapping quick-message status line."""
 
-    def _quick_message_release(self, index: int) -> None:
-        if self._root is not None and self._quick_message_press_job is not None:
-            try:
-                self._root.after_cancel(self._quick_message_press_job)
-            except Exception:
-                pass
-        self._quick_message_press_job = None
-        if self._quick_message_hold_fired:
-            self._quick_message_hold_fired = False
-            return
-        if not (0 <= index < len(self._quick_messages)):
-            return
-        now = time.monotonic()
-        last_at = getattr(
-            self, "_quick_message_last_click_at", float("-inf")
-        )
-        last_index = getattr(self, "_quick_message_last_click_index", None)
-        if last_index == index and now - last_at <= 0.60:
-            self._quick_message_last_click_at = float("-inf")
-            self._quick_message_last_click_index = None
-            self._quick_message_double_click(index)
-            return
-        self._quick_message_last_click_at = now
-        self._quick_message_last_click_index = index
-        self._copy_quick_message(index)
+        label = getattr(self, "_quick_message_status", None)
+        if label is not None:
+            # The status row has substantially more usable room than the
+            # former 30-cell preview.  Keep it on one line and ellipsize only
+            # when its actual message is genuinely long.
+            label.configure(text=quick_message_preview(text, max_units=46))
 
     def _copy_quick_message(self, index: int) -> bool:
         if not (0 <= index < len(self._quick_messages)):
@@ -10346,23 +10456,11 @@ class UiWorker(threading.Thread):
             self._root.clipboard_clear()
             self._root.clipboard_append(message)
             self._root.update_idletasks()
-            self._quick_message_status.configure(text=f"已复制：{message}")
+            self._set_quick_message_status(f"已复制：{message}")
             return True
         except Exception as exc:
-            self._quick_message_status.configure(text=f"复制失败：{exc}")
+            self._set_quick_message_status(f"复制失败：{exc}")
             return False
-
-    def _quick_message_double_click(self, index: int) -> str:
-        """Copy and explicitly send the selected message to game chat."""
-
-        if self._root is not None and self._quick_message_press_job is not None:
-            try:
-                self._root.after_cancel(self._quick_message_press_job)
-            except Exception:
-                pass
-        self._quick_message_press_job = None
-        self._send_quick_message(index)
-        return "break"
 
     def _send_quick_message(self, index: int) -> bool:
         """Send one live list item; deletion naturally shifts later keys."""
@@ -10372,24 +10470,20 @@ class UiWorker(threading.Thread):
         sender = getattr(getattr(self, "status_worker", None), "key_sender", None)
         send = getattr(sender, "send_clipboard_message", None)
         if send is None:
-            self._quick_message_status.configure(text="发送失败：游戏输入未接入。")
+            self._set_quick_message_status("发送失败：游戏输入未接入。")
             return False
         try:
             if send() is False:
                 raise OSError("无法聚焦游戏窗口")
-            self._quick_message_status.configure(
-                text=f"已发送：{self._quick_messages[index]}"
+            self._set_quick_message_status(
+                f"已发送：{self._quick_messages[index]}"
             )
             return True
         except Exception as exc:
-            self._quick_message_status.configure(text=f"发送失败：{exc}")
+            self._set_quick_message_status(f"发送失败：{exc}")
             return False
 
     def _quick_message_begin_edit(self, index: int) -> None:
-        self._quick_message_press_job = None
-        self._quick_message_hold_fired = True
-        self._quick_message_last_click_at = float("-inf")
-        self._quick_message_last_click_index = None
         if 0 <= index < len(self._quick_messages):
             self._render_quick_messages(index)
 
@@ -10397,6 +10491,7 @@ class UiWorker(threading.Thread):
         if entry is not self._quick_edit_entry:
             return
         self._quick_edit_entry = None
+        self._quick_edit_index = None
         try:
             text = entry.get().strip()
         except Exception:
@@ -10407,30 +10502,41 @@ class UiWorker(threading.Thread):
         self._render_quick_messages()
         self._refit_window_to_content()
 
-    def _quick_delete_press(self, index: int) -> None:
-        self._quick_delete_hold_fired = False
-        if self._root is not None:
-            self._quick_delete_press_job = self._root.after(
-                1000, lambda: self._quick_delete(index)
-            )
+    def _quick_message_blur_on_outside_click(self, event: Any) -> None:
+        """Commit inline quick-message edits on any click outside the entry.
 
-    def _quick_delete_release(self, _index: int) -> None:
-        if self._root is not None and self._quick_delete_press_job is not None:
+        Labels and blank panel space do not take keyboard focus in Tk, so a
+        plain ``<FocusOut>`` alone leaves an editor visibly active after such
+        clicks.  Deferring the commit until the current mouse dispatch is
+        complete preserves the destination click (including edit/delete).
+        """
+
+        entry = getattr(self, "_quick_edit_entry", None)
+        index = getattr(self, "_quick_edit_index", None)
+        if entry is None or index is None or getattr(event, "widget", None) is entry:
+            return
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        job = getattr(self, "_quick_edit_blur_job", None)
+        if job is not None:
             try:
-                self._root.after_cancel(self._quick_delete_press_job)
+                root.after_cancel(job)
             except Exception:
                 pass
-        self._quick_delete_press_job = None
-        self._quick_delete_hold_fired = False
+
+        def commit_if_still_active() -> None:
+            self._quick_edit_blur_job = None
+            self._quick_message_finish_edit(int(index), entry)
+
+        self._quick_edit_blur_job = root.after_idle(commit_if_still_active)
 
     def _quick_delete(self, index: int) -> None:
-        self._quick_delete_press_job = None
-        self._quick_delete_hold_fired = True
         if 0 <= index < len(self._quick_messages):
             deleted = self._quick_messages.pop(index)
             self._quick_messages_save()
             self._render_quick_messages()
-            self._quick_message_status.configure(text=f"已删除：{deleted}")
+            self._set_quick_message_status(f"已删除：{deleted}")
             self._refit_window_to_content()
 
     def _freeze_column_widths(self) -> Optional[tuple[int, int]]:
@@ -10448,11 +10554,12 @@ class UiWorker(threading.Thread):
             return None
         try:
             left_width = _LEFT_COLUMN_WIDTH
-            right_children = tuple(col2.winfo_children())
-            right_width = max(
-                _RIGHT_COLUMN_WIDTH,
-                *(int(child.winfo_reqwidth()) for child in right_children),
-            )
+            # The compact right track is an explicit design constraint.  Do
+            # not let one long Additional Functions child row (for example
+            # reconnect settings) enlarge the entire application after the
+            # requested width was set.  Children must remain inside this
+            # fixed column just as the left stack does.
+            right_width = _RIGHT_COLUMN_WIDTH
             columns.columnconfigure(0, weight=0, minsize=left_width)
             columns.columnconfigure(1, weight=0, minsize=right_width)
             col1.configure(width=left_width)
@@ -10896,28 +11003,68 @@ class UiWorker(threading.Thread):
     def _countdown_on_change(self, _value: str = "") -> None:
         """Persist/apply the repeating reminder interval and enabled state."""
 
-        if not hasattr(self, "_countdown_interval_label"):
+        control = getattr(self, "_countdown_interval_control", None)
+        if control is None:
             return
-        raw_hours = max(0.1, min(6.0, float(self._countdown_interval_var.get())))
-        # Convert through an integer tenth-hour index so stored/displayed
-        # values are exact selectable grid points rather than slider floats.
-        hours = (int(round((raw_hours - 0.1) * 10.0)) + 1) / 10.0
-        if abs(raw_hours - hours) > 1e-9:
-            self._countdown_interval_var.set(hours)
-        self._countdown_interval_label.configure(text=f"{hours:.1f}h")
-        # Retain the last valid interval so a themed-but-not-really-disabled
-        # Scale cannot alter its value while 循环 is unchecked.
-        self._countdown_interval_locked_hours = hours
-        interval_seconds = hours * 3600.0
-        self._countdown_remaining_slider.configure(to=interval_seconds)
+        minutes, _ = control.normalize()
+        minutes = int(minutes)
+        interval_seconds = float(minutes * 60)
         self._countdown_remaining_var.set(interval_seconds)
-        self._countdown_remaining_label.configure(
-            text=self._format_countdown_seconds(interval_seconds)
-        )
+        self._countdown_set_remaining_components(interval_seconds)
         data = self._shutdown_collect_data()
         self._shutdown_save_settings(data)
         self._countdown_apply_to_worker(data)
         self._countdown_refresh_grey()
+
+    def _countdown_interval_seconds(self) -> float:
+        control = getattr(self, "_countdown_interval_control", None)
+        if control is None:
+            return 60.0
+        minutes, _ = control.normalize()
+        return float(int(minutes) * 60)
+
+    def _countdown_set_remaining_components(self, seconds: float) -> float:
+        """Render the live remaining deadline as independent HH:mm:ss fields."""
+
+        seconds = max(0.0, min(float(seconds), self._countdown_interval_seconds()))
+        whole = int(round(seconds))
+        hours, remainder = divmod(whole, 3600)
+        minutes, seconds_part = divmod(remainder, 60)
+        for control, value in (
+            (getattr(self, "_countdown_remaining_hour_control", None), hours),
+            (getattr(self, "_countdown_remaining_minute_control", None), minutes),
+            (getattr(self, "_countdown_remaining_second_control", None), seconds_part),
+        ):
+            if control is not None:
+                control.set_bounds(value)
+        total = float(whole)
+        if hasattr(self, "_countdown_remaining_var"):
+            self._countdown_remaining_var.set(total)
+        return total
+
+    def _countdown_remaining_components_changed(self) -> None:
+        """Apply a manual HH:mm:ss edit without pausing the countdown."""
+
+        if not bool(getattr(self, "_countdown_enabled_var", None).get()):
+            return
+        controls = (
+            getattr(self, "_countdown_remaining_hour_control", None),
+            getattr(self, "_countdown_remaining_minute_control", None),
+            getattr(self, "_countdown_remaining_second_control", None),
+        )
+        if any(control is None for control in controls):
+            return
+        hours = int(controls[0].minimum_var.get())
+        minutes = int(controls[1].minimum_var.get())
+        seconds = int(controls[2].minimum_var.get())
+        remaining = min(
+            float(hours * 3600 + minutes * 60 + seconds),
+            self._countdown_interval_seconds(),
+        )
+        self._countdown_set_remaining_components(remaining)
+        worker = getattr(self, "countdown_worker", None)
+        if worker is not None:
+            worker.set_remaining_seconds(remaining)
 
     def _save_countdown_resume_state(self) -> None:
         """Save the current reminder's wall-clock deadline on UI close."""
@@ -10964,13 +11111,11 @@ class UiWorker(threading.Thread):
             LOG.info("countdown resume deadline expired; leaving 循环 unselected")
             return
 
-        # The UI's hour slider is the supported interval source. Restoring
-        # the recorded interval first guarantees the remaining slider does
-        # not clamp the durable deadline after a configuration change.
-        hours = max(0.1, min(6.0, interval / 3600.0))
-        interval = hours * 3600.0
+        # Restore against the same 1..300 minute UI range.
+        minutes = max(1, min(300, int(round(interval / 60.0))))
+        interval = float(minutes * 60)
         remaining = min(remaining, interval)
-        self._countdown_interval_var.set(hours)
+        self._countdown_interval_control.set_bounds(minutes)
         self._countdown_enabled_var.set(True)
         data = self._shutdown_collect_data()
         self._shutdown_save_settings(data)
@@ -10978,11 +11123,7 @@ class UiWorker(threading.Thread):
         worker = getattr(self, "countdown_worker", None)
         if worker is not None:
             worker.set_remaining_seconds(remaining)
-        self._countdown_remaining_slider.configure(to=interval)
-        self._countdown_remaining_var.set(remaining)
-        self._countdown_remaining_label.configure(
-            text=self._format_countdown_seconds(remaining)
-        )
+        self._countdown_set_remaining_components(remaining)
         self._countdown_refresh_grey()
         LOG.info("countdown restored from timer.json remaining=%.1fs", remaining)
 
@@ -10993,102 +11134,33 @@ class UiWorker(threading.Thread):
                 text="循环警报: 工作线程未接入 (无界面模式)。"
             )
             return
-        hours = max(
-            0.1, min(6.0, float(data.get("countdown_interval_hours", 1.0)))
-        )
-        worker.set_interval_hours(hours)
+        minutes = int(data.get(
+            "countdown_interval_minutes",
+            round(float(data.get("countdown_interval_hours", 1.0)) * 60.0),
+        ))
+        minutes = max(1, min(300, minutes))
+        worker.set_interval_hours(minutes / 60.0)
         worker.set_enabled(bool(data.get("countdown_enabled", False)))
         if worker.enabled:
             self._countdown_status.configure(
-                text=f"循环警报已启动: 每 {hours:.1f} 小时触发已选提醒。"
+                text=f"循环警报已启动: 每 {minutes} 分钟触发已选提醒。"
             )
         else:
             self._countdown_status.configure(text="循环警报: 未启用。")
 
     def _countdown_refresh_grey(self) -> None:
         enabled = bool(self._countdown_enabled_var.get())
-        state = "!disabled" if enabled else "disabled"
-        for widget in (
-            self._countdown_interval_slider,
-            self._countdown_interval_label,
-            self._countdown_remaining_slider,
-            self._countdown_remaining_label,
+        for control in (
+            getattr(self, "_countdown_interval_control", None),
+            getattr(self, "_countdown_remaining_hour_control", None),
+            getattr(self, "_countdown_remaining_minute_control", None),
+            getattr(self, "_countdown_remaining_second_control", None),
         ):
-            try:
-                widget.state([state])
-            except Exception:
-                try:
-                    widget.configure(
-                        state="normal" if enabled else "disabled"
-                    )
-                except Exception:
-                    pass
-
-    def _countdown_interval_press_gate(self, _event: Any = None) -> Optional[str]:
-        """Keep the interval slider inert until 循环 is selected."""
-
-        if not bool(self._countdown_enabled_var.get()):
-            return "break"
-        return None
-
-    def _countdown_interval_on_drag(self, value: str = "") -> None:
-        """Reject an interval-slider change unless 循环 is enabled.
-
-        Some Windows ttk themes visually accept a disabled Scale drag.  This
-        value-level gate is independent of that appearance and makes such a
-        drag a no-op.
-        """
-
-        if not bool(self._countdown_enabled_var.get()):
-            locked = float(getattr(
-                self, "_countdown_interval_locked_hours",
-                self._countdown_interval_var.get(),
-            ))
-            if abs(float(self._countdown_interval_var.get()) - locked) > 1e-9:
-                self._countdown_interval_var.set(locked)
-            self._countdown_refresh_grey()
-            return
-        self._countdown_on_change(value)
-
-    def _countdown_drag_start(self, _event: Any = None) -> Optional[str]:
-        if not bool(self._countdown_enabled_var.get()):
-            self._countdown_dragging = False
-            return "break"
-        self._countdown_dragging = True
-        return None
-
-    def _countdown_drag_end(self, _event: Any = None) -> Optional[str]:
-        if not bool(self._countdown_enabled_var.get()):
-            self._countdown_dragging = False
-            return "break"
-        self._countdown_remaining_on_drag(
-            str(self._countdown_remaining_var.get())
-        )
-        self._countdown_dragging = False
-        return None
-
-    def _countdown_remaining_on_drag(self, value: str) -> None:
-        """Move the live deadline as the user drags the remaining-time bar."""
-
-        if (
-            not bool(self._countdown_enabled_var.get())
-            or not self._countdown_dragging
-        ):
-            return
-        # A remaining-time drag operates in whole minutes.  The worker still
-        # counts seconds internally; only manual selection is quantized.
-        remaining = max(0.0, round(float(value) / 60.0) * 60.0)
-        if abs(float(self._countdown_remaining_var.get()) - remaining) > 1e-9:
-            self._countdown_remaining_var.set(remaining)
-        self._countdown_remaining_label.configure(
-            text=self._format_countdown_seconds(remaining)
-        )
-        worker = getattr(self, "countdown_worker", None)
-        if worker is not None:
-            worker.set_remaining_seconds(remaining)
+            if control is not None:
+                self._set_panel_state(control.frame, disabled=not enabled)
 
     def _refresh_countdown_status(self) -> None:
-        """Keep the draggable bar synchronized unless it is being dragged."""
+        """Keep HH:mm:ss fields synchronized with the live countdown."""
 
         if not hasattr(self, "_countdown_status"):
             return
@@ -11102,16 +11174,11 @@ class UiWorker(threading.Thread):
         display_state = (round(float(interval), 3), shown_remaining)
         if display_state != self._countdown_display_state:
             self._countdown_display_state = display_state
-            self._countdown_remaining_slider.configure(to=interval)
-            if not self._countdown_dragging:
-                self._countdown_remaining_var.set(remaining)
-                self._configure_text_if_changed(
-                    self._countdown_remaining_label, "countdown_remaining", shown_remaining
-                )
+            self._countdown_set_remaining_components(remaining)
         self._configure_text_if_changed(
             self._countdown_status, "countdown_status",
             ("循环警报: 剩余 "
-             f"{shown_remaining} / 间隔 {interval / 3600.0:.1f}h；到时提醒并自动重置。")
+             f"{shown_remaining} / 间隔 {int(round(interval / 60.0))}m；到时提醒并自动重置。")
         )
 
     def _shutdown_load_settings(self) -> None:
@@ -11268,10 +11335,13 @@ class UiWorker(threading.Thread):
                 self._countdown_enabled_var.set(bool(
                     data.get("countdown_enabled", False)
                 ))
-                if "countdown_interval_hours" in data:
-                    self._countdown_interval_var.set(max(
-                        0.1, min(6.0, float(data["countdown_interval_hours"]))
-                    ))
+                raw_minutes = data.get("countdown_interval_minutes")
+                if raw_minutes is None and "countdown_interval_hours" in data:
+                    raw_minutes = round(float(data["countdown_interval_hours"]) * 60.0)
+                if raw_minutes is not None:
+                    self._countdown_interval_control.set_bounds(
+                        max(1, min(300, int(raw_minutes)))
+                    )
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed additional functions settings",
                         exc_info=True)
@@ -12421,14 +12491,11 @@ class UiWorker(threading.Thread):
                 ),
             )
             selector.pack(side="left", anchor="center", padx=(0, 1))
-            # This is deliberately a fixed width, sized for the widest normal
-            # display name (for example, 楼层10).  A 4-character Tk width clips
-            # CJK glyphs on some Windows font/DPI combinations and lets the
-            # axis canvas visually cover the final digit.
+            # This fixed width holds the widest ordinary display name
+            # (for example, 楼层10) without clipping CJK glyphs. The cropped
+            # canvas then touches the label directly; there is no dead gutter.
             label = ttk.Label(row, width=13)
-            # Keep the axis marker canvas a further fixed three pixels away;
-            # no row is resized when modes or recordings change.
-            label.pack(side="left", anchor="center", padx=(0, 10))
+            label.pack(side="left", anchor="center")
             self._layer_labels[layer_name] = label
             canvas = self._tk.Canvas(
                 row,

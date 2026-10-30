@@ -523,10 +523,22 @@ ordinary patrol hold is never interrupted by it.
 
 `attack_worker.py` performs fixed-interval attack and optional jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
 
+`NumericValueRangeControl` is the reusable fixed-height UI primitive for direct numeric settings.
+It supports a single value or inclusive min/max range, preserves the surrounding label baseline,
+and owns no setting label itself. Wheel input changes one `step`; left-click changes `10 × step`
+upward; right-click changes `10 × step` downward. It clamps lower/upper bounds and repairs inverted
+min/max values at the component boundary. Hover and selected state are separate: redraws from a live
+countdown do not clear hover, and the state clears only after the pointer truly exits the component.
+
 The fixed attack interval is represented in seconds and is quantized at the UI boundary to 0.05 s
 (`0.20`–`30.00`). It remains a two-decimal configuration value end-to-end; formatting removes only
 unneeded display zeroes. This avoids the former one-decimal slider save path silently turning a
 selected 0.25 s cadence into 0.3 s.
+
+The additional-functions countdown uses a single integer `1–300` minute component and three
+single-value `HH:mm:ss` components. `_refresh_countdown_status()` updates only clock components whose
+numeric value changed; this prevents Tk redraw traffic from cancelling the hovered clock field.
+Manual clock edits call `CountdownWorker.set_remaining_seconds()` directly and do not pause the worker.
 
 Dead-flower mode is a separately gated movement program. It never activates ordinary attack,
 counterattack, or small-step paths. With reset disabled it permits no movement. With reset enabled

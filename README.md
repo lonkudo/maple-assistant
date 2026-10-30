@@ -671,9 +671,11 @@ circuit before returning. Two or more flower points mean climb between their dis
 and refresh Buff1 at each timer boundary. Normal attack controls and 小碎步 are unavailable in
 this mode.
 
-The fixed **attack interval** slider and its adjacent fine controls use 0.05-second increments.
-Dragging snaps to that interval, and the exact value is retained in configuration: `0.25s` remains
-`0.25s` rather than being rounded to `0.3s`.
+Numeric settings use the shared compact direct-value control rather than a slider. Hover enlarges a
+value; the mouse wheel changes it by one configured step; left-click changes it by ten steps upward;
+right-click changes it by ten steps downward. Range controls enforce their ordered inclusive bounds.
+The fixed **attack interval** remains a `0.20–30.00s` range with `0.05s` precision, so `0.25s`
+remains `0.25s` rather than being rounded to `0.3s`.
 
 HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input.
 
@@ -782,6 +784,11 @@ a Telegram notification; **自动重连** reconnects after a verified disconnect
 and **自动测谎** hands the mouse to the automatic lie workflow and consumes one
 lie-detection use even if it is interrupted with Esc. Leave 自动测谎 off when
 manual lie handling is intended.
+
+The compact **循环** controls use an integer interval of `1–300m` and three
+independently editable `HH:mm:ss` remaining-time values. Editing a clock part moves the live
+deadline without stopping the countdown. The message, message-push configuration, and memory-cleanup
+controls are temporarily hidden from the UI; their persisted settings are retained.
 
 When a lie window is detected, TodoHelper targets the first frame upload for
 **three seconds after that detection**, not three seconds after the WebSocket

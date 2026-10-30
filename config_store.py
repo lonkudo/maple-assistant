@@ -59,8 +59,9 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "buff1_enabled": False, "buff2_enabled": False,
     },
     "fixed_attack": {
-        "attack_mode": "fixed", "interval_seconds": 3.0,
-        "random_gap_seconds": .1, "attack_key": "ctrl",
+        "attack_mode": "fixed", "min_interval_seconds": 3.0,
+        "max_interval_seconds": 3.1, "attack_key": "ctrl",
+        "attack_delivery": "stand",
         "combo_attack_enabled": False,
         "combo_attack_slots": [
             {"min_count": 1, "max_count": 1, "key": "ctrl"},
@@ -72,6 +73,12 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "random_jump_gap_seconds": .1,
         "stair_jump_enabled": True,
         "stationary_facing_direction": "right",
+        "small_step_min_seconds": 5.0,
+        "small_step_max_seconds": 5.0,
+        "stationary_pickup_min_minutes": 15.0,
+        "stationary_pickup_max_minutes": 15.0,
+        "dual_stationary_switch_min_minutes": 15.0,
+        "dual_stationary_switch_max_minutes": 15.0,
     },
     "additional_functions": {
         "shutdown_enabled": False, "shutdown_hours": 3.0,

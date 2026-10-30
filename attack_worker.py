@@ -23,8 +23,9 @@ class AttackWorker(threading.Thread):
     """Tap the attack key on a monotonic timer, except during climb input.
 
     ``enabled`` (default True) can be flipped live from the UI: when False
-    the timer keeps running but no key is ever sent.  ``attack_interval``
-    and ``attack_key`` are plain attributes the UI can also update live.
+    the timer keeps running but no key is ever sent.  ``attack_min_interval``
+    / ``attack_max_interval`` and ``attack_key`` are plain attributes the UI
+    can also update live.
 
     The fixed attack NEVER pauses the patrol walk: the character attacks
     while walking (normal MapleStory behavior).  Publishing an attack-active
@@ -43,6 +44,7 @@ class AttackWorker(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         initial_offset: Optional[float] = None,
         attack_jitter_seconds: float = 0.1,
+        attack_max_interval: Optional[float] = None,
         motion_arbiter: Any = None,
         direction_transition_event: Optional[threading.Event] = None,
         jump_attack: bool = False,
@@ -54,9 +56,22 @@ class AttackWorker(threading.Thread):
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
         self.stop_event = stop_event
-        self.attack_interval = max(0.2, attack_interval)
-        # 下一次攻击 = configured interval + UI-configurable random gap.
-        self.attack_jitter_seconds = max(0.0, float(attack_jitter_seconds))
+        # The UI exposes one inclusive random range, not a base delay plus a
+        # second additive "gap".  Keep the old public attributes as aliases
+        # for integrations created before the range control was introduced.
+        self.attack_min_interval = max(0.2, float(attack_interval))
+        legacy_maximum = self.attack_min_interval + max(
+            0.0, float(attack_jitter_seconds),
+        )
+        self.attack_max_interval = max(
+            self.attack_min_interval,
+            float(legacy_maximum if attack_max_interval is None
+                  else attack_max_interval),
+        )
+        self.attack_interval = self.attack_min_interval
+        self.attack_jitter_seconds = (
+            self.attack_max_interval - self.attack_min_interval
+        )
         self.attack_key = str(attack_key).casefold()
         scan_map = getattr(key_sender, "_SCAN", None)
         if scan_map is not None and self.attack_key not in scan_map:
@@ -106,7 +121,7 @@ class AttackWorker(threading.Thread):
         # worker: it only selects a key for an already-approved cadence beat.
         self.combo_attack = ComboAttackPlan()
         self.initial_offset = (
-            self.attack_interval / 2.0
+            self.attack_min_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
         )
 
@@ -207,10 +222,11 @@ class AttackWorker(threading.Thread):
         )
 
     def next_delay(self) -> float:
-        """Configured attack interval plus the configured random gap."""
+        """Return the next delay sampled from the configured inclusive range."""
 
-        random_gap = random.uniform(0.0, self.attack_jitter_seconds)
-        return max(0.05, self.attack_interval + random_gap)
+        minimum = max(0.05, float(self.attack_min_interval))
+        maximum = max(minimum, float(self.attack_max_interval))
+        return random.uniform(minimum, maximum)
 
     def spacing_wait_seconds(self) -> Optional[float]:
         """How long this beat must still wait to keep the attack spacing.
@@ -237,14 +253,16 @@ class AttackWorker(threading.Thread):
         if self.motion_arbiter is None or not self.stationary_mode:
             return None
         since_last_attack = time.monotonic() - self.motion_arbiter.last_attack_at()
-        if since_last_attack >= self.attack_interval:
+        minimum = max(0.2, float(self.attack_min_interval))
+        if since_last_attack >= minimum:
             return None
-        return self.attack_interval - since_last_attack
+        return minimum - since_last_attack
 
     def run(self) -> None:
-        LOG.info("attack worker started offset=%.3fs interval=%.3fs key=%s "
+        LOG.info("attack worker started offset=%.3fs range=%.3f-%.3fs key=%s "
                  "enabled=%s",
-                 self.initial_offset, self.attack_interval, self.attack_key,
+                 self.initial_offset, self.attack_min_interval,
+                 self.attack_max_interval, self.attack_key,
                  self.enabled)
         next_attack = time.monotonic() + self.initial_offset
         while not self.stop_event.is_set():
@@ -277,7 +295,8 @@ class AttackWorker(threading.Thread):
                     "attack beat rescheduled: the last attack was %.2fs ago "
                     "(a 站桩 correction or 小碎步 that carried its own attack); "
                     "the next beat keeps a full %.2fs away",
-                    self.attack_interval - spacing_wait, self.attack_interval,
+                    self.attack_min_interval - spacing_wait,
+                    self.attack_min_interval,
                 )
                 next_attack = time.monotonic() + spacing_wait
                 continue
@@ -344,7 +363,7 @@ class AttackWorker(threading.Thread):
                     "attack beat rescheduled: the motion it waited for attacked "
                     "on its own (a 站桩 correction or 小碎步 carries its own "
                     "attack); the next beat keeps a full %.2fs away",
-                    self.attack_interval,
+                    self.attack_min_interval,
                 )
                 next_attack = time.monotonic() + reschedule_after_wait
                 continue

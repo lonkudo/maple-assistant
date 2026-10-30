@@ -4248,6 +4248,7 @@ class MovementWorker(threading.Thread):
         self._dual_stationary_posts: tuple[tuple[Point, str], ...] = ()
         self._dual_stationary_active_index: Optional[int] = None
         self._dual_stationary_switch_seconds = 900.0
+        self._dual_stationary_switch_jitter_seconds = 0.0
         self._dual_stationary_next_switch_at = float("inf")
         # 死花模式 keeps the automation session alive for Buff/HP/MP and an
         # optional private rope flower loop.  It never uses normal patrol,
@@ -7868,6 +7869,7 @@ class MovementWorker(threading.Thread):
 
     def set_dual_stationary_configuration(
         self, enabled: bool, raw_posts: Any, switch_seconds: float,
+        switch_jitter_seconds: float = 0.0,
     ) -> None:
         """Apply dual-post records without changing ordinary stationary mode.
 
@@ -7892,18 +7894,27 @@ class MovementWorker(threading.Thread):
         enabled = bool(enabled)
         normalized = tuple(posts)
         normalized_switch_seconds = min(1800.0, max(60.0, float(switch_seconds)))
+        normalized_switch_jitter_seconds = max(
+            0.0, float(switch_jitter_seconds),
+        )
         changed = (self.dual_stationary_mode != enabled
                    or self._dual_stationary_posts != normalized
-                   or self._dual_stationary_switch_seconds != normalized_switch_seconds)
+                   or self._dual_stationary_switch_seconds != normalized_switch_seconds
+                   or self._dual_stationary_switch_jitter_seconds
+                   != normalized_switch_jitter_seconds)
         self.dual_stationary_mode = enabled
         self._dual_stationary_posts = normalized
         self._dual_stationary_switch_seconds = normalized_switch_seconds
+        self._dual_stationary_switch_jitter_seconds = normalized_switch_jitter_seconds
         if changed:
             self._dual_stationary_active_index = None
             self._dual_stationary_next_switch_at = float("inf")
             if enabled:
-                LOG.info("dual stationary mode configured posts=%d switch=%.1fm",
-                         len(normalized), self._dual_stationary_switch_seconds / 60.0)
+                LOG.info("dual stationary mode configured posts=%d switch=%.1f-%.1fm",
+                         len(normalized),
+                         self._dual_stationary_switch_seconds / 60.0,
+                         (self._dual_stationary_switch_seconds
+                          + self._dual_stationary_switch_jitter_seconds) / 60.0)
             else:
                 LOG.info("dual stationary mode disabled")
 
@@ -7927,11 +7938,16 @@ class MovementWorker(threading.Thread):
         self._reset_stationary_y_recovery()
         if restart_timer:
             self._dual_stationary_next_switch_at = (
-                time.monotonic() + self._dual_stationary_switch_seconds
+                time.monotonic() + self._dual_stationary_switch_delay()
             )
         LOG.info("DUAL STATIONARY: active post %d/2 x=%.6f y=%.6f facing=%s (%s)",
                  index + 1, point.x, point.y, facing, reason)
         return self._stationary_attack_anchor
+
+    def _dual_stationary_switch_delay(self) -> float:
+        return self._dual_stationary_switch_seconds + random.uniform(
+            0.0, self._dual_stationary_switch_jitter_seconds,
+        )
 
     def _nearest_dual_stationary_post(self, player: Point) -> int:
         return min(
@@ -9258,7 +9274,7 @@ class MovementWorker(threading.Thread):
         self._reset_stationary_y_recovery()
         if self.dual_stationary_mode:
             self._dual_stationary_next_switch_at = (
-                time.monotonic() + self._dual_stationary_switch_seconds
+                time.monotonic() + self._dual_stationary_switch_delay()
             )
         LOG.info(
             "STATIONARY ATTACK manual start: cleared prior runtime route and "
