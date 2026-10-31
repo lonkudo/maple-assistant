@@ -62,6 +62,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "attack_mode": "fixed", "min_interval_seconds": 3.0,
         "max_interval_seconds": 3.1, "attack_key": "ctrl",
         "attack_delivery": "stand",
+        "charge_min_seconds": 0.5, "charge_max_seconds": 0.5,
         "combo_attack_enabled": False,
         "combo_attack_slots": [
             {"min_count": 1, "max_count": 1, "key": "ctrl"},

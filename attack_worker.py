@@ -95,6 +95,12 @@ class AttackWorker(threading.Thread):
         # registered into the motion-arbiter queue.
         self.jump_attack = bool(jump_attack)
         self.jump_attack_delay = max(0.0, float(jump_attack_delay))
+        # Delivery is selected by the shared UI group: stand, jump, charge,
+        # or none.  A charge owns only its combat key; patrol Left/Right stays
+        # outside this lane.
+        self.attack_delivery = "stand"
+        self.charge_min_seconds = 0.5
+        self.charge_max_seconds = 0.5
         # Raised by stand-still recovery after its exclusive off-layer/far-X
         # phase ends.  A skipped beat must not impose another whole attack
         # interval before the first near-anchor attack can fire.
@@ -130,6 +136,9 @@ class AttackWorker(threading.Thread):
 
         scan_map = getattr(self.key_sender, "_SCAN", None)
         key = str(key).casefold()
+        if key == "-":
+            self.attack_key = key
+            return True
         if scan_map is not None and key not in scan_map:
             return False
         self.attack_key = key
@@ -165,17 +174,38 @@ class AttackWorker(threading.Thread):
         """
 
         key = self.attack_key if attack_key is None else attack_key
+        delivery = str(getattr(self, "attack_delivery", "stand")).casefold()
+        if key == "-" or delivery == "none":
+            return False
         runner = self.atomic_motion_runner
         if runner is not None:
             return runner.execute_combat_attack(
                 key,
                 jump_attack_enabled=self.jump_attack,
+                charge_attack_enabled=delivery == "charge",
+                charge_hold_seconds=random.uniform(
+                    self.charge_min_seconds, self.charge_max_seconds,
+                ),
                 allowed=self._combat_input_allowed,
                 label="fixed-cadence",
             )
 
         # Compatibility path for integrations that have not supplied the
         # atomic runner yet.
+        if delivery == "charge":
+            key_down = getattr(self.key_sender, "key_down", None)
+            key_up = getattr(self.key_sender, "key_up", None)
+            if not callable(key_down) or not callable(key_up):
+                return False
+            if key_down(key, owner="charge") is False:
+                return False
+            try:
+                duration = random.uniform(
+                    self.charge_min_seconds, self.charge_max_seconds,
+                )
+                return not self.stop_event.wait(max(0.1, duration))
+            finally:
+                key_up(key, owner="charge")
         if self.jump_attack:
             tap = getattr(self.key_sender, "tap", None)
             if not callable(tap):
@@ -302,6 +332,7 @@ class AttackWorker(threading.Thread):
                 continue
             can_fire = self.enabled
             attack_lease = False
+            charge_lease = False
             handoff_deferred = False
             selected_key: Optional[str] = None
             if can_fire and (self.automation_active_event is not None
@@ -320,10 +351,21 @@ class AttackWorker(threading.Thread):
                 # Advance only for a beat that passed all non-arbiter gates.
                 # A null combo run deliberately consumes this beat without
                 # reserving motion input or emitting a key.
-                normal_key = self.combo_attack.peek_key(self.attack_key)
-                if normal_key is None:
+                delivery = str(getattr(self, "attack_delivery", "stand")).casefold()
+                if self.attack_key == "-" or delivery == "none":
+                    # A literal '-' is the only visible no-attack setting.
+                    # Do not let an old enabled combo plan substitute a key.
+                    can_fire = False
+                else:
+                    normal_key = self.combo_attack.peek_key(self.attack_key)
+                if can_fire and normal_key is None:
                     self.combo_attack.consume()
                     LOG.info("combo attack idle beat")
+                    can_fire = False
+                elif can_fire and (delivery
+                      == "none" or str(normal_key).casefold() == "-"):
+                    # A '-' fixed key is the durable no-attack setting.  Do
+                    # not consume combo slots or reserve action input for it.
                     can_fire = False
             reschedule_after_wait: Optional[float] = None
             if can_fire and self.motion_arbiter is not None:
@@ -331,7 +373,12 @@ class AttackWorker(threading.Thread):
                 # tapping separately allowed a queued 小碎步 to start between
                 # those operations, so a directional sequence could overlap
                 # the attack animation.  One lease owns this whole tap.
-                attack_lease = self.motion_arbiter.try_begin_attack()
+                delivery = str(getattr(self, "attack_delivery", "stand")).casefold()
+                begin = (self.motion_arbiter.try_begin_charge
+                         if delivery == "charge"
+                         else self.motion_arbiter.try_begin_attack)
+                charge_lease = delivery == "charge"
+                attack_lease = begin()
                 if not attack_lease:
                     self.motion_arbiter.wait_until_idle()
                     # The motion we just waited for may have attacked as part
@@ -343,7 +390,7 @@ class AttackWorker(threading.Thread):
                     attack_lease = bool(
                         reschedule_after_wait is None
                         and self.enabled
-                        and self.motion_arbiter.try_begin_attack()
+                        and begin()
                     )
                 can_fire = attack_lease
                 if can_fire and (self.automation_active_event is not None
@@ -356,7 +403,10 @@ class AttackWorker(threading.Thread):
             if not can_fire and attack_lease and self.motion_arbiter is not None:
                 # A Stop/climb edge may happen directly after reservation.
                 # Always return it, otherwise motion input would stay blocked.
-                self.motion_arbiter.finish_attack(False)
+                if charge_lease:
+                    self.motion_arbiter.finish_charge(False)
+                else:
+                    self.motion_arbiter.finish_attack(False)
                 attack_lease = False
             if reschedule_after_wait is not None:
                 LOG.info(
@@ -384,7 +434,10 @@ class AttackWorker(threading.Thread):
                     sent = self.attack_once(selected_key)
                 finally:
                     if self.motion_arbiter is not None and attack_lease:
-                        self.motion_arbiter.finish_attack(sent)
+                        if charge_lease:
+                            self.motion_arbiter.finish_charge(sent)
+                        else:
+                            self.motion_arbiter.finish_attack(sent)
             if handoff_deferred:
                 # A route endpoint turn deliberately reserves a short window
                 # around Left-up -> Right-down (or the reverse).  Treating a

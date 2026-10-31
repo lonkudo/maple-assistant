@@ -664,6 +664,8 @@ The landing evidence belongs to one descent. It is cleared on a fresh patrol sta
 
 **站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
 
+The attack-delivery choice is **站打**, **跳打**, **蓄力**, or **不打**. 站打 taps the configured attack key, 跳打 performs the established jump-then-attack sequence, and 蓄力 holds the configured key for a random inclusive value between its two displayed seconds values before releasing it. During a charge, ordinary patrol Left/Right can still run, but other action-key motions wait; HP/MP recovery can interrupt the hold. Selecting 不打, or setting the attack key to `-`, suppresses normal attack output.
+
 **死花模式** is separate from combat patrol and sends only buffs plus HP/MP items. With
 **重置花** unchecked it never moves, regardless of recorded flower points. With **重置花**
 enabled, one flower point means attach to the rope, buff there, then leave the rope for the reset
@@ -935,7 +937,7 @@ Quick messages are ordered by creation time. Click once to copy, double-click to
 | `Ctrl+Insert` / `Ctrl+Delete` | Add / delete the highest layer. |
 | `Ctrl+[` / `Ctrl+]` | Adjust attack base interval. |
 | `Ctrl+\`` | Start or stop patrol. |
-| `Ctrl+Z` | Toggle quick pickup while patrol is stopped. |
+| `Ctrl+Z` | Undo the most recent recorded/configuration change while patrol is stopped. Keeps up to 10 in-memory steps; it does not persist across restart. |
 
 Hotkeys have cooldown and hold protection so a single held key does not repeatedly trigger actions.
 

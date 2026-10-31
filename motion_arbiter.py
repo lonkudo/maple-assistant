@@ -143,6 +143,10 @@ class MotionArbiter(threading.Thread):
         # motion sees this reservation and waits; a fresh attack sees a queued
         # motion and defers.  Therefore neither can begin inside the other.
         self._attack_reserved = False
+        # A charge is intentionally different from a short attack lease: it
+        # blocks queued action keys (buff/jump/correction/counterattack), but
+        # MovementWorker's ordinary Left/Right holds remain independent.
+        self._charge_reserved = False
         self._executing_token: Optional[str] = None
         # A confirmed stair recovery owns Alt until MovementWorker has seen
         # genuine horizontal travel again.  This prevents the independent
@@ -551,6 +555,7 @@ class MotionArbiter(threading.Thread):
             # observe the disarmed automation gate, while clearing the lease
             # here prevents a stopped session from blocking the next one.
             self._attack_reserved = False
+            self._charge_reserved = False
             callbacks: list[Any] = []
             for token in tokens:
                 callbacks.extend(self._buff_completion_callbacks.pop(token, []))
@@ -608,12 +613,51 @@ class MotionArbiter(threading.Thread):
             )
             if (not self._automation_allowed_locked()
                     or self._attack_reserved
+                    or self._charge_reserved
                     or self._executing_token is not None
                     or pending_blocks
                     or time.monotonic() < self._busy_until):
                 return False
             self._attack_reserved = True
             return True
+
+    def try_begin_charge(self) -> bool:
+        """Reserve queued action input for one held attack-key charge.
+
+        This does not affect MovementWorker's direct ordinary Left/Right
+        patrol holds.  It only prevents another queued action from inserting
+        a key during the charge.
+        """
+
+        with self._cv:
+            pending_blocks = bool(self._pending) and (
+                any(not token.startswith("buff:") for token in self._pending)
+                or self._motion_gate_allows_locked()
+            )
+            if (not self._automation_allowed_locked()
+                    or self._attack_reserved
+                    or self._charge_reserved
+                    or self._executing_token is not None
+                    or pending_blocks
+                    or time.monotonic() < self._busy_until):
+                return False
+            self._charge_reserved = True
+            return True
+
+    def finish_charge(self, sent: bool) -> None:
+        """Release a held-charge reservation after its key is up."""
+
+        with self._cv:
+            if sent:
+                self._last_attack_at = time.monotonic()
+            self._charge_reserved = False
+            self._cv.notify_all()
+
+    def charge_active(self) -> bool:
+        """Whether a charge reservation is active or about to emit its key."""
+
+        with self._cv:
+            return self._charge_reserved
 
     def finish_attack(self, sent: bool) -> None:
         """Release an attack reservation and start its grace window if sent."""
@@ -662,6 +706,7 @@ class MotionArbiter(threading.Thread):
         with self._cv:
             return (not self._pending
                     and not self._attack_reserved
+                    and not self._charge_reserved
                     and self._executing_token is None
                     and time.monotonic() >= self._busy_until)
 
@@ -672,6 +717,7 @@ class MotionArbiter(threading.Thread):
             while not self.stop_event.is_set():
                 if (not self._pending
                         and not self._attack_reserved
+                        and not self._charge_reserved
                         and self._executing_token is None
                         and time.monotonic() >= self._busy_until):
                     return True
@@ -781,7 +827,7 @@ class MotionArbiter(threading.Thread):
                     self._cv.notify_all()
                     self._notify_buff_completion(callbacks, False)
                     return
-                if self._attack_reserved:
+                if self._attack_reserved or self._charge_reserved:
                     self._cv.wait(0.05)
                     continue
                 self._executing_token = token

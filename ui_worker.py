@@ -87,7 +87,7 @@ AUTO_LIE_LOG = logging.getLogger("auto-lie")
 # to its explicit dialog sequence and works while general patrol input is
 # disarmed.  They must not be included here: re-arming general input on
 # Ctrl+Q/Ctrl+W can wake unrelated attack workers while patrol is stopped.
-TYPING_HOTKEY_PREFIXES = ("quick_message:", "quick_pickup:")
+TYPING_HOTKEY_PREFIXES = ("quick_message:",)
 
 # The auto-lie result dialog needs both measured confirmation points, twice
 # each.  Wider clients follow the 1366 reference by width.  The 1080 preset
@@ -165,21 +165,29 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 890
+_INITIAL_WINDOW_WIDTH = 886
 _INITIAL_WINDOW_HEIGHT = 560
-_LEFT_COLUMN_WIDTH = 380
+# Every panel in the left stack follows this single compact track.  The
+# right-side controls retain their own wider track because their key bindings
+# and numeric values need it.
+_LEFT_COLUMN_WIDTH = 375
 # Direct-value controls replaced the wide right-column slider troughs.  The
 # widest visible right row now fits comfortably in this tighter track.
 _RIGHT_COLUMN_WIDTH = 393
-# The outer 10% at each side never contains a recordable layer element. Crop
-# it from the UI axis so the useful middle 80% gets the whole compact canvas.
-_LAYER_AXIS_WIDTH = 280
+# The outer 8% at each side never contains a recordable layer element. Crop
+# it from the UI axis so the useful middle 84% gets a wider canvas.
+# The layer row also contains a radio selector and its label.  296px left the
+# row itself requesting more than the 360px column and silently widening every
+# left-side panel.  This leaves the axis a 216px requested lane; Tk may still
+# distribute spare space inside the fixed 360px track, but it can no longer
+# grow the track past that width.
+_LAYER_AXIS_WIDTH = 216
 _LAYER_AXIS_HEIGHT = 38
 _LAYER_AXIS_LEFT = 0
 _LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH
 _LAYER_AXIS_Y = 28
-_LAYER_AXIS_VISIBLE_MIN_X = 0.10
-_LAYER_AXIS_VISIBLE_MAX_X = 0.90
+_LAYER_AXIS_VISIBLE_MIN_X = 0.08
+_LAYER_AXIS_VISIBLE_MAX_X = 0.92
 # The columns are fixed at 380px and 515px respectively.  The compact initial
 # geometry leaves room for each panel's controls without retaining unused
 # drawing space at the right of the patrol axis.
@@ -986,6 +994,7 @@ class NumericValueRangeControl:
     _NORMAL_STYLE = "NumericValue.TLabel"
     _HOVER_STYLE = "NumericValueHover.TLabel"
     _ACTIVE_STYLE = "NumericValueActive.TLabel"
+    _DISABLED_STYLE = "NumericValueDisabled.TLabel"
     _FIXED_HEIGHT = 26
 
     def __init__(
@@ -1004,6 +1013,7 @@ class NumericValueRangeControl:
         unit: str = "",
         value_width: int = 5,
         extra_width_px: int = 0,
+        before_change: Optional[Callable[[], None]] = None,
         on_change: Optional[Callable[[], None]] = None,
     ) -> None:
         self.range_mode = bool(range_mode)
@@ -1014,9 +1024,11 @@ class NumericValueRangeControl:
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         self.unit = str(unit)
+        self.before_change = before_change
         self.on_change = on_change
         self.selected_side: Optional[str] = None
         self.hover_side: Optional[str] = None
+        self.enabled = True
         self._leave_job: Any = None
         variable_type = (tk_module.IntVar if value_type is int
                          else tk_module.DoubleVar)
@@ -1028,9 +1040,13 @@ class NumericValueRangeControl:
         # derives a width from the child labels.  Reserve the exact cell width
         # here as well; otherwise the component collapses to a 1px frame.
         cell_count = 2 if self.range_mode else 1
+        # ``ttk.Label(width=N)`` already reserves the glyph width.  The old
+        # 9px estimate added a second, visibly empty cell after every range
+        # value.  7px leaves room for the 12pt hover value without stretching
+        # compact attack rows.
         fixed_width = (
-            (cell_count * value_width * 9)
-            + (10 if self.range_mode else 0)
+            (cell_count * value_width * 7)
+            + (8 if self.range_mode else 0)
             + max(0, int(extra_width_px))
         )
         self.frame = ttk_module.Frame(
@@ -1086,6 +1102,19 @@ class NumericValueRangeControl:
         self.minimum_var.set(minimum)
         self.maximum_var.set(target_maximum)
         self.normalize()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable/grey only the editable number labels in this component."""
+
+        self.enabled = bool(enabled)
+        state = ["!disabled"] if self.enabled else ["disabled"]
+        for label in (self.min_label, self.max_label):
+            if label is not None:
+                label.state(state)
+        if not self.enabled:
+            self.selected_side = None
+            self.hover_side = None
+        self._refresh_styles()
 
     def normalize(self, changed: Optional[str] = None) -> tuple[float | int, float | int]:
         minimum = self._normalize_value(self.minimum_var.get())
@@ -1198,6 +1227,8 @@ class NumericValueRangeControl:
         except Exception:
             pass
         self._select(side)
+        if self.before_change is not None:
+            self.before_change()
         variable = self.minimum_var if side == "min" else self.maximum_var
         coarse_delta = self.value_type(self.step * 10)
         variable.set(self.value_type(variable.get() + int(direction) * coarse_delta))
@@ -1215,6 +1246,8 @@ class NumericValueRangeControl:
             pass
         if self.selected_side != side:
             self._select(side)
+        if self.before_change is not None:
+            self.before_change()
         direction = 1 if float(delta) > 0.0 else -1
         variable = self.minimum_var if side == "min" else self.maximum_var
         variable.set(self.value_type(variable.get() + direction * self.step))
@@ -1229,7 +1262,8 @@ class NumericValueRangeControl:
             if label is not None:
                 label.configure(
                     style=(
-                        self._ACTIVE_STYLE if self.selected_side == side
+                        self._DISABLED_STYLE if not self.enabled
+                        else self._ACTIVE_STYLE if self.selected_side == side
                         else self._HOVER_STYLE if self.hover_side == side
                         else self._NORMAL_STYLE
                     )
@@ -1316,8 +1350,6 @@ class UiWorker(threading.Thread):
         hotkey_worker: Any = None,
         on_hotkey_stop_prearmed: Optional[Callable[[], bool]] = None,
         hotkey_stop_cleanup_done_event: Optional[threading.Event] = None,
-        quick_pickup_worker: Any = None,
-        quick_pickup_results: Optional["queue.Queue[tuple[str, str]]"] = None,
         reconnect_worker: Any = None,
         auto_restart_worker: Any = None,
         reconnect_results: Optional["queue.Queue[tuple[str, str]]"] = None,
@@ -1383,10 +1415,6 @@ class UiWorker(threading.Thread):
         # later consumes this marker only to refresh its controls/status.
         self.on_hotkey_stop_prearmed = on_hotkey_stop_prearmed
         self._hotkey_stop_cleanup_done_event = hotkey_stop_cleanup_done_event
-        # Manual-only rapid Z pickup has its own worker/result channel so it
-        # cannot arm the normal patrol automation workers.
-        self.quick_pickup_worker = quick_pickup_worker
-        self.quick_pickup_results = quick_pickup_results
         # 自动重连: armed from the Additional Functions panel, triggered by the 掉线
         # event and confirmed by the login-page template check.
         self.reconnect_worker = reconnect_worker
@@ -1493,6 +1521,16 @@ class UiWorker(threading.Thread):
         self.log_queue = log_queue
         self.ui_log_handler = ui_log_handler
         self.user_config_path = user_config_path
+        # Ctrl+Z undo is deliberately local-only: it keeps up to ten complete
+        # user configuration documents in RAM and never writes a history file.
+        # Settings loaders run while the dashboard is being built, so capture
+        # begins only after the first completed UI layout.
+        self._undo_history: collections.deque[tuple[str, bytes]] = collections.deque(maxlen=10)
+        self._undo_recording_enabled = False
+        self._undo_restoring = False
+        self._undo_last_key = ""
+        self._undo_last_at = 0.0
+        self._undo_skip_next_change_key = ""
         self.automation_active_event = automation_active_event
         self.lie_watch_armed_event = lie_watch_armed_event
         self.disconnect_watch_armed_event = disconnect_watch_armed_event
@@ -1903,6 +1941,10 @@ class UiWorker(threading.Thread):
                 "NumericValueActive.TLabel",
                 font=("Segoe UI", 12), foreground="#007ad9",
             )
+            style.configure(
+                "NumericValueDisabled.TLabel",
+                font=("Segoe UI", 10), foreground="#a0a0a0",
+            )
             style.configure("Locked.TButton", foreground="#777777")
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
             # Recorded coordinates are the widest left-side cells. A compact
@@ -1985,16 +2027,14 @@ class UiWorker(threading.Thread):
             self._control_status = ttk.Label(
                 control_status_slot,
                 text="先录制 最左、绳索、最右，然后添加上方图层。",
-                justify="left",
-                wraplength=440,
-                width=54,
+                justify="left", wraplength=330,
             )
             self._control_status.pack(anchor="w", fill="x")
             automation_status_slot = ttk.Frame(controls, height=21)
             automation_status_slot.pack(fill="x", pady=(5, 0))
             automation_status_slot.pack_propagate(False)
             self._automation_status_label = ttk.Label(
-                automation_status_slot, justify="left", wraplength=440, width=54,
+                automation_status_slot, justify="left", wraplength=330,
             )
             self._automation_status_label.pack(anchor="w", fill="x")
             self._refresh_patrol_controls()
@@ -2235,15 +2275,14 @@ class UiWorker(threading.Thread):
             self._fixed_key_row = fixed_key_row
             self._dead_flower_attack_rows.append(fixed_key_row)
             fixed_key_row.pack(fill="x", pady=(4, 0))
-            # Attack delivery is a mutually exclusive group.  Only 跳打 is
-            # implemented today; 蓄力 and 不打 are intentionally visible and
-            # saved now so their behavior can be added without another UI
-            # migration later.
+            # Attack delivery is a mutually exclusive group.  A literal '-'
+            # attack binding is the durable no-attack configuration; it does
+            # not need a separate visible radio option.
             self._attack_delivery_var = tk.StringVar(value="stand")
             self._attack_delivery_buttons: list[Any] = []
             for delivery_value, delivery_text in (
                 ("stand", "站打"), ("jump", "跳打"),
-                ("charge", "蓄力"), ("none", "不打"),
+                ("charge", "蓄力"),
             ):
                 button = ttk.Radiobutton(
                     fixed_key_row, text=delivery_text,
@@ -2251,7 +2290,7 @@ class UiWorker(threading.Thread):
                     variable=self._attack_delivery_var,
                     command=self._fixed_on_change,
                 )
-                button.pack(side="left", padx=(0, 3))
+                button.pack(side="left", padx=(0, 1))
                 self._attack_delivery_buttons.append(button)
             # Compatibility alias: existing worker/apply paths still derive
             # their active jump flag from the selected delivery value.
@@ -2259,25 +2298,26 @@ class UiWorker(threading.Thread):
             fixed_key_label = ttk.Label(fixed_key_row, text="攻击键:")
             self._fixed_key_label = fixed_key_label
             fixed_key_label.pack(
-                side="left", padx=(0, 4)
+                side="left", padx=(0, 0)
             )
             self._fixed_attack_key_var = tk.StringVar(value="ctrl")
             fixed_key_button = ttk.Button(
                 fixed_key_row, text=self._fixed_attack_key_var.get(),
-                width=5, style="Locked.TButton",
+                width=4, style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     fixed_key_button, self._fixed_attack_key_var,
                     "_fixed_attack_key_previous",
                     lambda: self._fixed_on_change(),
+                    allow_null=True,
                 ),
             )
-            fixed_key_button.pack(side="left", padx=(0, 4))
+            fixed_key_button.pack(side="left", padx=(0, 0))
             self._fixed_key_button = fixed_key_button
             self._attach_bind_hint(fixed_key_button)
             # The cadence is an inclusive min/max range.  The adjacent
             # "间隔" label is intentionally outside the reusable numeric
             # component, so it stays still while the values enlarge.
-            ttk.Label(fixed_key_row, text="每").pack(side="left", padx=(0, 2))
+            ttk.Label(fixed_key_row, text="每").pack(side="left", padx=(0, 0))
             self._fixed_interval_control = NumericValueRangeControl(
                 fixed_key_row,
                 tk_module=tk,
@@ -2291,6 +2331,11 @@ class UiWorker(threading.Thread):
                 upper_bound=self._FIXED_ATTACK_INTERVAL_MAX,
                 unit="s",
                 value_width=5,
+                # The cadence can display two full five-character values
+                # (for example 0.25s - 7.55s).  Keep their paint inside this
+                # frame so it cannot overlap the following 蓄力 label.
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("攻击间隔"),
                 on_change=self._fixed_on_change,
             )
             self._fixed_min_interval_var = self._fixed_interval_control.minimum_var
@@ -2302,6 +2347,28 @@ class UiWorker(threading.Thread):
             self._fixed_max_interval_label = self._fixed_interval_control.max_label
             self._fixed_interval_group = self._fixed_interval_control.frame
             self._fixed_interval_control.pack(side="left")
+            self._charge_hold_label = ttk.Label(fixed_key_row, text="蓄力")
+            self._charge_hold_label.pack(side="left", padx=(0, 0))
+            self._charge_hold_control = NumericValueRangeControl(
+                fixed_key_row,
+                tk_module=tk,
+                ttk_module=ttk,
+                minimum=0.5,
+                maximum=0.5,
+                range_mode=True,
+                value_type=float,
+                step=0.1,
+                lower_bound=0.1,
+                upper_bound=5.0,
+                unit="s",
+                value_width=4,
+                # Two 4-character values plus the separator need this final
+                # 8px reserve; column width alone cannot unclip a fixed frame.
+                extra_width_px=8,
+                before_change=lambda: self._undo_capture_callback("蓄力时间"),
+                on_change=self._fixed_on_change,
+            )
+            self._charge_hold_control.pack(side="left", padx=(0, 0))
 
             # 被撞反击 is an event path separate from normal cadence/combo
             # attack.  A confirmed HP drop asks the arbiter to step away from
@@ -2359,7 +2426,12 @@ class UiWorker(threading.Thread):
                 maximum=self._DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES,
                 range_mode=True, value_type=float, step=0.1,
                 lower_bound=1.0, upper_bound=30.0, unit="m",
-                value_width=5, on_change=self._fixed_on_change,
+                value_width=5,
+                # Two values such as 11.1m - 11.1m need their full glyph
+                # width inside this fixed component.
+                extra_width_px=16,
+                before_change=lambda: self._undo_capture_callback("换桩时间"),
+                on_change=self._fixed_on_change,
             )
             self._dual_stationary_switch_minutes_var = (
                 self._dual_stationary_switch_control.minimum_var
@@ -2399,7 +2471,13 @@ class UiWorker(threading.Thread):
                     minimum=1, maximum=1,
                     range_mode=True, value_type=int, step=1,
                     lower_bound=0, upper_bound=30,
-                    value_width=2, on_change=self._fixed_on_change,
+                    # Both integer endpoints (for example 30 - 30) must
+                    # remain inside the count component, not overpaint 次.
+                    value_width=2, extra_width_px=8,
+                    before_change=lambda index=index: self._undo_capture_callback(
+                        f"组合攻击{index + 1}"
+                    ),
+                    on_change=self._fixed_on_change,
                 )
                 self._combo_attack_count_controls.append(count_control)
                 self._combo_attack_count_vars.append(
@@ -2489,7 +2567,12 @@ class UiWorker(threading.Thread):
                 maximum=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES,
                 range_mode=True, value_type=float, step=0.1,
                 lower_bound=1.0, upper_bound=30.0, unit="m",
-                value_width=5, on_change=self._fixed_on_change,
+                value_width=5,
+                # Keep the full second value inside the pickup component so
+                # it cannot paint underneath the following 小碎步 checkbox.
+                extra_width_px=24,
+                before_change=lambda: self._undo_capture_callback("捡东西间隔"),
+                on_change=self._fixed_on_change,
             )
             self._stationary_pickup_interval_var = self._stationary_pickup_control.minimum_var
             self._stationary_pickup_max_minutes_var = self._stationary_pickup_control.maximum_var
@@ -2524,7 +2607,11 @@ class UiWorker(threading.Thread):
                 minimum=5.0, maximum=5.0,
                 range_mode=True, value_type=float, step=0.1,
                 lower_bound=5.0, upper_bound=60.0, unit="s",
-                value_width=5, on_change=self._fixed_on_change,
+                value_width=5,
+                # Same five-character range requirement as 捡东西 above.
+                extra_width_px=16,
+                before_change=lambda: self._undo_capture_callback("小碎步间隔"),
+                on_change=self._fixed_on_change,
             )
             self._small_step_interval_var = self._small_step_control.minimum_var
             self._small_step_max_seconds_var = self._small_step_control.maximum_var
@@ -2548,6 +2635,7 @@ class UiWorker(threading.Thread):
             drug_panel = ttk.LabelFrame(
                 col2, text="药品 (HP/MP 药水)", padding=(8, 6)
             )
+            self._drug_panel = drug_panel
             drug_panel.pack(fill="x", pady=(0, 8))
             hp_row = ttk.Frame(drug_panel)
             hp_row.pack(fill="x")
@@ -2577,6 +2665,7 @@ class UiWorker(threading.Thread):
                 hp_row, tk_module=tk, ttk_module=ttk,
                 minimum=50, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=95, unit="%", value_width=5,
+                before_change=lambda: self._undo_capture_callback("HP阈值"),
                 on_change=self._drug_on_change,
             )
             self._hp_threshold_var = self._hp_threshold_control.minimum_var
@@ -2608,6 +2697,7 @@ class UiWorker(threading.Thread):
                 mp_row, tk_module=tk, ttk_module=ttk,
                 minimum=30, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=95, unit="%", value_width=5,
+                before_change=lambda: self._undo_capture_callback("MP阈值"),
                 on_change=self._drug_on_change,
             )
             self._mp_threshold_var = self._mp_threshold_control.minimum_var
@@ -2644,6 +2734,8 @@ class UiWorker(threading.Thread):
                 buff1_row, tk_module=tk, ttk_module=ttk,
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("宠物食品间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff1_interval_var = self._buff1_interval_control.minimum_var
@@ -2676,6 +2768,8 @@ class UiWorker(threading.Thread):
                 buff2_row, tk_module=tk, ttk_module=ttk,
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("增益1间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff2_interval_var = self._buff2_interval_control.minimum_var
@@ -2708,6 +2802,8 @@ class UiWorker(threading.Thread):
                 buff3_row, tk_module=tk, ttk_module=ttk,
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("增益2间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff3_interval_var = self._buff3_interval_control.minimum_var
@@ -2752,6 +2848,7 @@ class UiWorker(threading.Thread):
             extra_panel = ttk.LabelFrame(
                 col2, text="附加功能", padding=(8, 6)
             )
+            self._extra_panel = extra_panel
             # This is constructed after the drug rows for code locality, but
             # packed ahead of them: column 1 reads 附加功能 → 药品 → 运行日志.
             extra_panel.pack(fill="x", pady=(0, 8), before=drug_panel)
@@ -2836,6 +2933,8 @@ class UiWorker(threading.Thread):
                 alarm_row, tk_module=tk, ttk_module=ttk,
                 minimum=60, range_mode=False, value_type=int, step=1,
                 lower_bound=1, upper_bound=300, unit="m", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("倒计时间隔"),
                 on_change=self._countdown_on_change,
             )
             self._countdown_interval_var = self._countdown_interval_control.minimum_var
@@ -2851,13 +2950,14 @@ class UiWorker(threading.Thread):
             # width.  A single physical pixel protects the larger 12pt hover
             # font without adding a third character cell of blank space.
             remaining_clock_width = 2
-            remaining_clock_extra_width = 1
+            remaining_clock_extra_width = 8
             self._countdown_remaining_hour_control = NumericValueRangeControl(
                 alarm_row, tk_module=tk, ttk_module=ttk,
                 minimum=1, range_mode=False, value_type=int, step=1,
                 lower_bound=0, upper_bound=5, unit="",
                 value_width=remaining_clock_width,
                 extra_width_px=remaining_clock_extra_width,
+                before_change=lambda: self._undo_capture_callback("倒计时剩余时间"),
                 on_change=self._countdown_remaining_components_changed,
             )
             self._countdown_remaining_minute_control = NumericValueRangeControl(
@@ -2868,7 +2968,8 @@ class UiWorker(threading.Thread):
                 # Two 12pt minute digits need a few more physical pixels
                 # than the hour's usual single digit, but not a third blank
                 # character cell.
-                extra_width_px=4,
+                extra_width_px=10,
+                before_change=lambda: self._undo_capture_callback("倒计时剩余时间"),
                 on_change=self._countdown_remaining_components_changed,
             )
             self._countdown_remaining_second_control = NumericValueRangeControl(
@@ -2876,7 +2977,8 @@ class UiWorker(threading.Thread):
                 minimum=0, range_mode=False, value_type=int, step=1,
                 lower_bound=0, upper_bound=59, unit="",
                 value_width=remaining_clock_width,
-                extra_width_px=4,
+                extra_width_px=10,
+                before_change=lambda: self._undo_capture_callback("倒计时剩余时间"),
                 on_change=self._countdown_remaining_components_changed,
             )
             self._countdown_remaining_hour_control.pack(side="left")
@@ -3053,25 +3155,23 @@ class UiWorker(threading.Thread):
                 "<FocusOut>", lambda _event: self._reconnect_on_change()
             )
             ttk.Label(reconnect_row, text="频道").pack(side="left")
-            # Only an integer 1-60 may be typed (validated again on every change).
-            channel_check = self._register_validator(
-                reconnect_row, self._validate_reconnect_channel
-            )
-            self._reconnect_channel_var = tk.StringVar(value=str(saved_channel))
-            self._reconnect_channel_box = ttk.Spinbox(
+            self._reconnect_channel_control = NumericValueRangeControl(
                 reconnect_row,
-                from_=CHANNEL_MIN,
-                to=CHANNEL_MAX,
-                width=4,
-                textvariable=self._reconnect_channel_var,
-                validate="key",
-                validatecommand=channel_check,
-                command=self._reconnect_on_change,
+                tk_module=tk,
+                ttk_module=ttk,
+                minimum=saved_channel,
+                range_mode=False,
+                value_type=int,
+                step=1,
+                lower_bound=CHANNEL_MIN,
+                upper_bound=CHANNEL_MAX,
+                unit="",
+                value_width=3,
+                before_change=lambda: self._undo_capture_callback("自动重连频道"),
+                on_change=self._reconnect_on_change,
             )
-            self._reconnect_channel_box.pack(side="left", padx=(4, 0))
-            self._reconnect_channel_box.bind(
-                "<FocusOut>", lambda _event: self._reconnect_on_change()
-            )
+            self._reconnect_channel_var = self._reconnect_channel_control.minimum_var
+            self._reconnect_channel_control.pack(side="left", padx=(4, 0))
             self._reconnect_message_var = tk.StringVar(value="")
             self._reconnect_message_button = ttk.Button(
                 reconnect_row, text="重连消息",
@@ -3106,14 +3206,6 @@ class UiWorker(threading.Thread):
                     "restart_offline", "下线消息", self._restart_offline_message_var
                 ),
                 takefocus=False,
-            )
-            # Clicking a plain label/panel does not necessarily give Tk a
-            # different focus owner, so Spinbox <FocusOut> alone never fires.
-            # Watch root clicks as well and explicitly commit/blur this one
-            # field when the click lands outside it.
-            root.bind_all(
-                "<Button-1>", self._reconnect_channel_commit_on_outside_click,
-                add="+",
             )
             # Retain invisible status sinks for workflow callbacks.  The
             # Additional Functions panel intentionally shows controls only;
@@ -3172,23 +3264,31 @@ class UiWorker(threading.Thread):
             self._player_room_code_button.pack(side="left", padx=(6, 0))
             player_wait_label = ttk.Label(player_row, text="多等")
             player_wait_label.pack(side="left", padx=(6, 0))
-            self._player_channel_wait_var = tk.StringVar(value="300")
-            player_wait_check = self._register_validator(
-                player_row, self._validate_player_channel_wait
+            self._player_channel_wait_control = NumericValueRangeControl(
+                player_row,
+                tk_module=tk,
+                ttk_module=ttk,
+                minimum=300,
+                range_mode=False,
+                value_type=int,
+                step=1,
+                lower_bound=1,
+                upper_bound=1200,
+                unit="秒",
+                value_width=5,
+                # ``1200秒`` contains a wide CJK suffix; reserve its final
+                # pixels inside the fixed-width numeric component.
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("换线等待时间"),
+                on_change=self._player_channel_wait_commit,
             )
-            self._player_channel_wait_box = ttk.Spinbox(
-                player_row, from_=0, to=1200, width=4,
-                textvariable=self._player_channel_wait_var,
-                validate="key", validatecommand=player_wait_check,
-                command=self._shutdown_on_change,
-            )
-            self._player_channel_wait_box.pack(side="left", padx=(3, 0))
-            self._player_channel_wait_box.bind(
-                "<FocusOut>", self._player_channel_wait_on_blur
-            )
-            ttk.Label(player_row, text="秒").pack(side="left", padx=(2, 0))
+            self._player_channel_wait_var = self._player_channel_wait_control.minimum_var
+            self._player_channel_wait_control.pack(side="left", padx=(3, 0))
             self._player_wait_tooltips = []
-            for widget in (player_wait_label, self._player_channel_wait_box):
+            for widget in (
+                player_wait_label,
+                self._player_channel_wait_control.min_label,
+            ):
                 tooltip = HoverTooltip(
                     widget, "", wraplength=_HOVER_TOOLTIP_MAX_WIDTH
                 )
@@ -3196,10 +3296,6 @@ class UiWorker(threading.Thread):
                 self._bind_key_tooltips.append(tooltip)
                 self._player_wait_tooltips.append(tooltip)
             self._refresh_player_wait_hint()
-            root.bind_all(
-                "<Button-1>", self._player_channel_wait_commit_on_outside_click,
-                add="+",
-            )
 
             # 自动过测谎 (the local Cutie/YOLO lie pass) is gone: lie detection is done by the
             # remote RoiTrack service through 测试api (see api_lie_video.py), so neither the
@@ -3227,6 +3323,7 @@ class UiWorker(threading.Thread):
             # I/O per line.  Import/export have text buttons so their purpose
             # remains clear without relying on an unlabeled icon.
             log_panel = ttk.LabelFrame(col2, text="运行日志", padding=(6, 4))
+            self._log_panel = log_panel
             log_panel.pack(fill="x", pady=(10, 0))
             log_actions = ttk.Frame(log_panel)
             log_actions.pack(fill="x")
@@ -3317,6 +3414,10 @@ class UiWorker(threading.Thread):
             # sees only the compact finished layout.
             self._refit_window_to_content()
             root.deiconify()
+            # A few saved-setting callbacks are deliberately scheduled during
+            # startup.  They apply initial values only and must not become
+            # fake Ctrl+Z steps.
+            root.after(500, self._enable_undo_history)
 
             # Mapping the dashboard can make Windows give it foreground even
             # though the assistant has not been started.  Return foreground to
@@ -3431,7 +3532,22 @@ class UiWorker(threading.Thread):
             if image is not None:
                 button.configure(image=image, compound="center")
             button.pack(side="right", fill="y")
+            _bind_caption_hover(button)
             return button
+
+        def _bind_caption_hover(widget: Any) -> None:
+            """Give every caption action the book icon's visible hover shade."""
+
+            widget.bind(
+                "<Enter>",
+                lambda _event: widget.configure(bg="#dcdcdc"),
+                add="+",
+            )
+            widget.bind(
+                "<Leave>",
+                lambda _event: widget.configure(bg="#f0f0f0"),
+                add="+",
+            )
 
         self._caption_close_button = _button("×", self._on_debug_window_close)
         self._caption_max_button = _button("□", self._caption_toggle_maximize)
@@ -3455,16 +3571,7 @@ class UiWorker(threading.Thread):
         self._teaching_button.bind(
             "<Button-1>", lambda _event: self._show_teaching_viewer()
         )
-        self._teaching_button.bind(
-            "<Enter>",
-            lambda _event: self._teaching_button.configure(bg="#dcdcdc"),
-            add="+",
-        )
-        self._teaching_button.bind(
-            "<Leave>",
-            lambda _event: self._teaching_button.configure(bg="#f0f0f0"),
-            add="+",
-        )
+        _bind_caption_hover(self._teaching_button)
         self._teaching_button_tooltip = HoverTooltip(
             self._teaching_button, "教学"
         )
@@ -3489,8 +3596,10 @@ class UiWorker(threading.Thread):
         self._teaching_button.pack(side="right", fill="y")
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
-        self._help_button.bind("<Enter>", self._help_hover_show)
-        self._help_button.bind("<Leave>", self._help_hover_leave)
+        # Keep the caption hover shade registered by ``_button`` while also
+        # showing/hiding the binding-table popup.
+        self._help_button.bind("<Enter>", self._help_hover_show, add="+")
+        self._help_button.bind("<Leave>", self._help_hover_leave, add="+")
 
         # Dragging any empty part of the bar moves the window (manual
         # geometry drag: after WS_CAPTION is removed the OS caption hit-test
@@ -4196,7 +4305,6 @@ class UiWorker(threading.Thread):
             self._drain_lie_accounting_results,
             self._drain_channel_update_events,
             self._drain_other_player_stop_events,
-            self._drain_quick_pickup_results,
             self._drain_reconnect_results,
             self._drain_logs,
             self._refresh_automation_status,
@@ -5554,6 +5662,16 @@ class UiWorker(threading.Thread):
                         prearmed_stop = bool(consume_prearmed())
                     except Exception:
                         LOG.exception("could not consume pre-armed hotkey stop")
+            # Ctrl+Z restores only this process's in-memory local settings.
+            # It sends no game input, so it remains safe and useful even when
+            # a heartbeat has temporarily locked licensed automation.
+            if action == "undo:last_change":
+                self._play_action_sound(self._undo_latest_change())
+                try:
+                    actions.task_done()
+                except (AttributeError, ValueError):
+                    pass
+                continue
             if not self._license_allowed():
                 # Stopping is always permitted.  The hook has already stopped
                 # live input; keep the dashboard consistent even if an
@@ -5613,52 +5731,6 @@ class UiWorker(threading.Thread):
                         self._quick_message_status.configure(
                             text="交易：正在接受邀请。"
                         )
-                elif action == "quick_pickup:toggle":
-                    root = getattr(self, "_root", None)
-                    if (getattr(self, "_native_dialog_open", False)
-                            or (root is not None and root.grab_current() is not None)):
-                        # A dialog of this app is open in front (for example the
-                        # 测试测谎 video picker).  Ctrl+Z there is the dialog's own
-                        # key, not a request to select the game window and start
-                        # tapping Z.
-                        self._control_status.configure(
-                            text="快速拾取：对话框打开时忽略（请先关闭对话窗口）。"
-                        )
-                        continue
-                    sender = getattr(self.quick_pickup_worker, "key_sender", None)
-                    probe = getattr(sender, "game_window_present", None)
-                    if callable(probe):
-                        try:
-                            present = bool(probe())
-                        except Exception:
-                            present = True
-                        if not present:
-                            # The operator is not in the game (testing a 测试测谎
-                            # video, for example): there is nothing to pick up, and
-                            # hunting for the game window here only produced an
-                            # error in the log.  Say so once, move no window, send
-                            # no key.
-                            LOG.info(
-                                "quick pickup ignored: no game window on screen "
-                                "(testing a video?)"
-                            )
-                            self._control_status.configure(
-                                text="快速拾取：没有找到游戏窗口（正在测试视频？）。"
-                            )
-                            self._play_action_sound(False)
-                            continue
-                    patrol_running = bool(
-                        self.patrol_controller is not None
-                        and self.patrol_controller.is_enabled()
-                    )
-                    worker = self.quick_pickup_worker
-                    if patrol_running or worker is None or not worker.request_toggle():
-                        self._control_status.configure(
-                            text="快速拾取失败：请先停止巡逻。"
-                        )
-                        self._play_action_sound(False)
-                    else:
-                        self._control_status.configure(text="快速拾取：正在切换…")
                 elif action.startswith("record:"):
                     boundary = action.partition(":")[2]
                     self._play_action_sound(self._record_endpoint(boundary))
@@ -5775,62 +5847,15 @@ class UiWorker(threading.Thread):
                 except (AttributeError, ValueError):
                     pass
 
-    def _drain_quick_pickup_results(self) -> None:
-        """Apply manual-pickup worker results on Tk's owning thread."""
-
-        results = self.quick_pickup_results
-        if results is None:
-            return
-        while True:
-            try:
-                state, detail = results.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                if state == "started":
-                    self._control_status.configure(
-                        text="快速拾取已开启；再次按 Ctrl+Z 关闭。"
-                    )
-                    self._play_action_sound(True)
-                elif state == "failed":
-                    suffix = f"：{detail}" if detail else "。"
-                    self._control_status.configure(text=f"快速拾取失败{suffix}")
-                    self._play_action_sound(False)
-                elif state == "stopped":
-                    suffix = f"（{detail}）" if detail else ""
-                    self._control_status.configure(text=f"快速拾取已关闭{suffix}。")
-            finally:
-                try:
-                    results.task_done()
-                except (AttributeError, ValueError):
-                    pass
-
-    def _validate_reconnect_channel(self, proposed: str) -> bool:
-        """Tk validator: the 自动重连 channel box accepts only 1-60 (or an empty edit)."""
-
-        text = str(proposed).strip()
-        if text == "":
-            return True                      # mid-edit: the value is checked on change
-        if not text.isdigit():
-            return False
-        return CHANNEL_MIN <= int(text) <= CHANNEL_MAX
-
-    @staticmethod
-    def _validate_player_channel_wait(proposed: str) -> bool:
-        """Tk validator for the 0–1200 second other-player switch delay."""
-
-        text = str(proposed).strip()
-        return text == "" or (text.isdigit() and 0 <= int(text) <= 1200)
-
     def _normalized_player_channel_wait_seconds(self) -> int:
-        """Read the editable delay as a durable 0–1200 second value."""
+        """Read the selectable delay as a durable 1–1200 second value."""
 
         variable = getattr(self, "_player_channel_wait_var", None)
         try:
             value = int(variable.get()) if variable is not None else 300
         except Exception:
             value = 300
-        return max(0, min(1200, value))
+        return max(1, min(1200, value))
 
     def _refresh_player_wait_hint(self) -> None:
         """Keep every channel-wait hint synchronized to the displayed value."""
@@ -5856,59 +5881,22 @@ class UiWorker(threading.Thread):
     def _player_channel_wait_commit(self) -> None:
         """Normalize, save, and apply the wait field after it loses focus."""
 
+        self._undo_capture_panel_change("附加功能设置")
         seconds = self._normalized_player_channel_wait_seconds()
-        variable = getattr(self, "_player_channel_wait_var", None)
-        if variable is not None:
-            variable.set(str(seconds))
+        control = getattr(self, "_player_channel_wait_control", None)
+        if control is not None:
+            control.set_bounds(seconds)
+        else:
+            variable = getattr(self, "_player_channel_wait_var", None)
+            if variable is not None:
+                variable.set(seconds)
         self._refresh_player_wait_hint()
         self._shutdown_on_change()
 
-    def _player_channel_wait_on_blur(self, _event: Any = None) -> None:
-        self._player_channel_wait_commit()
-
-    def _player_channel_wait_commit_on_outside_click(self, event: Any) -> None:
-        """Commit the wait field even when a label/panel is clicked."""
-
-        box = getattr(self, "_player_channel_wait_box", None)
-        root = getattr(self, "_root", None)
-        if box is None or root is None:
-            return
-        try:
-            if event.widget is box or root.focus_get() is not box:
-                return
-            box.selection_clear()
-            root.focus_set()
-            self._player_channel_wait_commit()
-        except Exception:
-            LOG.debug("other-player channel wait outside-click commit failed", exc_info=True)
-
-    def _reconnect_channel_commit_on_outside_click(self, event: Any) -> None:
-        """Commit the channel when a click leaves its Spinbox without focus.
-
-        Labels, panels, and canvas-like areas generally do not claim keyboard
-        focus in Tk.  Without this explicit blur, clicking those areas left a
-        partially edited channel in the Spinbox and never wrote it to the
-        user configuration.
-        """
-
-        box = getattr(self, "_reconnect_channel_box", None)
-        root = getattr(self, "_root", None)
-        if box is None or root is None:
-            return
-        try:
-            if event.widget is box or root.focus_get() is not box:
-                return
-            # The click is outside the field.  Release the text selection and
-            # move focus to the toplevel so the native <FocusOut> semantics
-            # are also preserved for other Tk bindings.
-            box.selection_clear()
-            root.focus_set()
-            self._reconnect_on_change()
-        except Exception:
-            LOG.debug("auto reconnect channel outside-click commit failed", exc_info=True)
-
     def _reconnect_on_change(self) -> None:
         """Apply the 自动重连 selection (enable + world + channel) to its worker."""
+
+        self._undo_capture_panel_change("自动重连设置")
 
         # Changing or blurring a settings field must not perform a fresh
         # license-file read.  The startup/activation result is the session's
@@ -5942,8 +5930,11 @@ class UiWorker(threading.Thread):
         channel = valid_channel(channel_text)
         if channel is None:
             channel = CHANNEL_DEFAULT
-            if hasattr(self, "_reconnect_channel_var"):
-                self._reconnect_channel_var.set(str(channel))
+            control = getattr(self, "_reconnect_channel_control", None)
+            if control is not None:
+                control.set_bounds(channel)
+            elif hasattr(self, "_reconnect_channel_var"):
+                self._reconnect_channel_var.set(channel)
         if worker is None:
             if hasattr(self, "_reconnect_status"):
                 self._reconnect_status.configure(
@@ -7531,8 +7522,11 @@ class UiWorker(threading.Thread):
         channel = valid_channel(latest)
         if channel is None:
             return
-        if hasattr(self, "_reconnect_channel_var"):
-            self._reconnect_channel_var.set(str(channel))
+        control = getattr(self, "_reconnect_channel_control", None)
+        if control is not None:
+            control.set_bounds(channel)
+        elif hasattr(self, "_reconnect_channel_var"):
+            self._reconnect_channel_var.set(channel)
         licensed = bool(
             getattr(self, "_license_status", None)
             and self._license_status.valid
@@ -8031,6 +8025,103 @@ class UiWorker(threading.Thread):
         self._patrol_controls_render_key = None
         self._refresh_patrol_controls()
 
+    def _undo_capture(self, change_name: str, *, coalesce: bool = False) -> bool:
+        """Remember the pre-change user configuration for local Ctrl+Z.
+
+        Numeric controls call their normal panel callback repeatedly while the
+        wheel turns.  Adjacent events for the same numeric control within
+        750 ms share one pre-change snapshot; buttons and recording operations
+        always make a distinct history entry.  The history never leaves
+        process memory.
+        """
+
+        if (not getattr(self, "_undo_recording_enabled", False)
+                or getattr(self, "_undo_restoring", False)
+                or not getattr(self, "user_config_path", None)):
+            return False
+        now = time.monotonic()
+        key = str(change_name)
+        if (coalesce and key == getattr(self, "_undo_last_key", "")
+                and now - getattr(self, "_undo_last_at", 0.0) <= 0.75):
+            self._undo_last_at = now
+            return False
+        try:
+            content = Path(self.user_config_path).read_bytes()
+        except OSError:
+            LOG.warning("undo snapshot skipped: user configuration is unavailable")
+            return False
+        history = getattr(self, "_undo_history", None)
+        if history is None:
+            return False
+        history.append((key, content))
+        self._undo_last_key = key
+        self._undo_last_at = now
+        LOG.info("undo snapshot saved: %s (%d/10)", key, len(history))
+        return True
+
+    def _undo_discard_latest(self, change_name: str) -> None:
+        """Discard a pre-change snapshot when its mutation was rejected."""
+
+        history = getattr(self, "_undo_history", None)
+        if history and history[-1][0] == str(change_name):
+            history.pop()
+            self._undo_last_key = ""
+            self._undo_last_at = 0.0
+
+    def _enable_undo_history(self) -> None:
+        """Enable user-change snapshots after startup callbacks have settled."""
+
+        if not self.stop_event.is_set():
+            self._undo_recording_enabled = True
+
+    def _undo_capture_callback(self, change_name: str) -> None:
+        """Capture one numeric-control sequence before its value mutates."""
+
+        self._undo_capture(change_name, coalesce=True)
+        self._undo_skip_next_change_key = str(change_name)
+
+    def _undo_capture_panel_change(self, change_name: str) -> None:
+        """Capture a non-numeric panel action unless its numeric control did."""
+
+        key = str(change_name)
+        if getattr(self, "_undo_skip_next_change_key", ""):
+            self._undo_skip_next_change_key = ""
+            return
+        self._undo_capture(key)
+
+    def _undo_latest_change(self) -> bool:
+        """Restore the latest in-memory configuration snapshot safely."""
+
+        controller = self.patrol_controller
+        if controller is not None and controller.is_enabled():
+            self._control_status.configure(text="撤销前请先停止巡逻。")
+            return False
+        if not getattr(self, "_undo_history", None):
+            self._control_status.configure(text="没有可撤销的更改。")
+            return False
+        if not self.user_config_path:
+            self._control_status.configure(text="撤销失败：用户配置不可用。")
+            return False
+        change_name, content = self._undo_history.pop()
+        try:
+            self._undo_restoring = True
+            restore_user_config_bytes(Path(self.user_config_path), content)
+            self._reload_imported_user_config()
+        except Exception as exc:
+            LOG.exception("undo restore failed: %s", change_name)
+            self._undo_history.append((change_name, content))
+            self._control_status.configure(text=f"撤销失败：{exc}")
+            return False
+        finally:
+            self._undo_restoring = False
+        self._undo_last_key = ""
+        self._undo_last_at = 0.0
+        self._control_status.configure(
+            text=f"已撤销最近更改（{change_name}）；还可撤销 {len(self._undo_history)} 步。"
+        )
+        LOG.info("undo restored: %s (%d/10 remaining)", change_name, len(self._undo_history))
+        return True
+
     def _export_user_config(self) -> None:
         """Export the live configuration to ``桌面\\助手配置\\新配置.json``."""
 
@@ -8197,6 +8288,7 @@ class UiWorker(threading.Thread):
         try:
             # Border calibration is an independent recording output. Save it
             # before route coordinates so patrol never depends on UI timing.
+            undo_saved = self._undo_capture("录制巡逻点")
             if self.on_recording_verified is not None:
                 self.on_recording_verified(snapshot)
             if self.map_identity_store is not None and self.configured_map_name:
@@ -8214,6 +8306,8 @@ class UiWorker(threading.Thread):
                 tracking_confidence=snapshot.structure_confidence,
             )
         except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制巡逻点")
             LOG.warning("record rejected: layer=%s point=%s error=%s",
                         self.patrol_controller.selected_layer(), boundary, exc)
             self._control_status.configure(text=f"无法录制: {exc}")
@@ -8254,11 +8348,14 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text=f"无法录制{label}: 未检测到可保存的小地图边框。")
             return False
         try:
+            undo_saved = self._undo_capture("录制跳点")
             recorded = self.patrol_controller.record_jump_point(
                 snapshot.player_x, snapshot.player_y, direction=direction,
                 layout=snapshot.coordinate_layout,
             )
         except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制跳点")
             self._control_status.configure(text=f"无法录制{label}: {exc}")
             return False
         self._control_status.configure(
@@ -8279,10 +8376,13 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="无法添加分区线：未检测到黄色菱形标记。")
             return False
         try:
+            undo_saved = self._undo_capture("录制分区线")
             point = self.patrol_controller.record_split_point(
                 snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
             )
         except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制分区线")
             self._control_status.configure(text=f"无法添加分区线: {exc}")
             return False
         self._control_status.configure(
@@ -8303,10 +8403,13 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="无法录制技能点：未检测到黄色菱形标记。")
             return False
         try:
+            undo_saved = self._undo_capture("录制技能点")
             point = self.patrol_controller.record_skill_point(
                 snapshot.player_x, snapshot.player_y, key, snapshot.coordinate_layout,
             )
         except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制技能点")
             self._control_status.configure(text=f"无法录制技能点: {exc}")
             return False
         self._control_status.configure(
@@ -8323,10 +8426,13 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="无法录制花点：未检测到黄色菱形标记。")
             return False
         try:
+            undo_saved = self._undo_capture("录制花点")
             point = self.patrol_controller.record_flower_point(
                 snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
             )
         except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制花点")
             self._control_status.configure(text=f"无法录制花点: {exc}")
             return False
         self._control_status.configure(
@@ -8350,6 +8456,7 @@ class UiWorker(threading.Thread):
         # remain as a stale floating hint.
         self._hide_layer_axis_hint()
         try:
+            undo_saved = self._undo_capture("删除录制点")
             removed = self.patrol_controller.delete_axis_point(
                 layer_name, point_kind, point_x, point_index,
             )
@@ -8361,6 +8468,8 @@ class UiWorker(threading.Thread):
                 "skill_point": "技能点", "flower_point": "花点",
             }.get(point_kind, "录制点")
         except (OSError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("删除录制点")
             LOG.warning("axis point delete failed", exc_info=True)
             self._control_status.configure(text=f"无法删除录制点: {exc}")
             return
@@ -8380,6 +8489,8 @@ class UiWorker(threading.Thread):
             LOG.info("layer axis point deleted layer=%s kind=%s x=%.6f index=%s",
                      layer_name, point_kind, point_x, point_index)
             self._refresh_patrol_controls()
+        elif undo_saved:
+            self._undo_discard_latest("删除录制点")
 
     def _layer_axis_menu(self, event: Any, layer_name: str) -> None:
         """Show point-recording choices for one single-clicked layer axis."""
@@ -8498,7 +8609,7 @@ class UiWorker(threading.Thread):
 
     @staticmethod
     def _layer_axis_canvas_x(value: float, left: int, right: int) -> int:
-        """Map the visible logical 0.10–0.90 band onto the full UI axis."""
+        """Map the visible logical 0.08–0.92 band onto the full UI axis."""
 
         visible_span = _LAYER_AXIS_VISIBLE_MAX_X - _LAYER_AXIS_VISIBLE_MIN_X
         normalized = (float(value) - _LAYER_AXIS_VISIBLE_MIN_X) / visible_span
@@ -8514,7 +8625,17 @@ class UiWorker(threading.Thread):
         if canvas is None:
             return
         canvas.delete("all")
-        left, right, axis_y = _LAYER_AXIS_LEFT, _LAYER_AXIS_RIGHT, _LAYER_AXIS_Y
+        # The canvas expands to consume the usable part of the left column.
+        # Its recorded drawing used a stale fixed right edge, which left a
+        # blank tail whenever the application had spare width.  Map the axis
+        # and every marker to the actual canvas width instead.
+        try:
+            rendered_width = int(canvas.winfo_width())
+        except Exception:
+            rendered_width = _LAYER_AXIS_WIDTH
+        left = _LAYER_AXIS_LEFT
+        right = max(_LAYER_AXIS_RIGHT, rendered_width)
+        axis_y = _LAYER_AXIS_Y
         canvas.create_line(left, axis_y, right, axis_y, fill="#6b6b6b", width=1)
         if not isinstance(layer, dict):
             return
@@ -8808,6 +8929,8 @@ class UiWorker(threading.Thread):
                 self._attack_delivery_var.get()
                 if hasattr(self, "_attack_delivery_var") else "stand"
             ),
+            "charge_min_seconds": self._charge_hold_range_seconds()[0],
+            "charge_max_seconds": self._charge_hold_range_seconds()[1],
             "jump_attack_enabled": bool(
                 getattr(self, "_jump_attack_enabled_var", None).get()
                 if hasattr(self, "_jump_attack_enabled_var") else False
@@ -8832,6 +8955,21 @@ class UiWorker(threading.Thread):
             "dual_stationary_switch_min_minutes": self._dual_stationary_switch_range_minutes()[0],
             "dual_stationary_switch_max_minutes": self._dual_stationary_switch_range_minutes()[1],
         }
+
+    def _charge_hold_range_seconds(self) -> tuple[float, float]:
+        """Return the inclusive randomized charge-hold range in seconds."""
+
+        control = getattr(self, "_charge_hold_control", None)
+        if control is None:
+            return 0.5, 0.5
+        minimum, maximum = control.get_bounds()
+        try:
+            minimum, maximum = float(minimum), float(maximum)
+        except (TypeError, ValueError, tk.TclError):
+            minimum, maximum = 0.5, 0.5
+        minimum = max(0.1, min(5.0, round(minimum, 1)))
+        maximum = max(minimum, min(5.0, round(maximum, 1)))
+        return minimum, maximum
 
     def _dual_stationary_switch_minutes(self) -> float:
         control = getattr(self, "_dual_stationary_switch_control", None)
@@ -8899,6 +9037,7 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="无法录制双桩点：录制槽位无效。")
             return False
         posts = self._dual_stationary_posts_data()
+        self._undo_capture("录制双桩点")
         item = {"x": round(x, 6), "y": round(y, 6), "facing": facing}
         controller = getattr(self, "patrol_controller", None)
         selected_layer = getattr(controller, "selected_layer", None)
@@ -8920,6 +9059,9 @@ class UiWorker(threading.Thread):
             posts[1] = item
         self._dual_stationary_posts = posts
         self._refresh_dual_stationary_status()
+        # The dual-post save uses the fixed-attack panel persistence path;
+        # its snapshot is already the recording snapshot above.
+        self._undo_skip_next_change_key = "攻击设置"
         self._fixed_on_change()
         names = {"left": "左", "right": "右", "both": "双向"}
         self._control_status.configure(
@@ -9279,6 +9421,21 @@ class UiWorker(threading.Thread):
                 widget.configure(
                     state="normal" if fixed_attack_enabled else "disabled"
                 )
+        delivery_var = getattr(self, "_attack_delivery_var", None)
+        charge_enabled = bool(
+            fixed_attack_enabled
+            and delivery_var is not None
+            and str(delivery_var.get()) == "charge"
+        )
+        charge_label = getattr(self, "_charge_hold_label", None)
+        if charge_label is not None:
+            try:
+                charge_label.state(["!disabled" if charge_enabled else "disabled"])
+            except Exception:
+                charge_label.configure(state="normal" if charge_enabled else "disabled")
+        charge_control = getattr(self, "_charge_hold_control", None)
+        if charge_control is not None:
+            charge_control.set_enabled(charge_enabled)
         for widget in getattr(self, "_stationary_facing_controls", []):
             if widget is None:
                 continue
@@ -9347,6 +9504,7 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_fixed_min_interval_label"):
             return
+        self._undo_capture_panel_change("攻击设置")
         mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
                 and mode not in ("fixed", "stationary", "dual_stationary", "dead_flower")):
@@ -9356,7 +9514,7 @@ class UiWorker(threading.Thread):
             self._attack_delivery_var.get()
             if hasattr(self, "_attack_delivery_var") else "stand"
         )
-        if delivery not in ("stand", "jump", "charge", "none"):
+        if delivery not in ("stand", "jump", "charge"):
             delivery = "stand"
             self._attack_delivery_var.set(delivery)
         if hasattr(self, "_jump_attack_enabled_var"):
@@ -9366,6 +9524,7 @@ class UiWorker(threading.Thread):
         # Text-value wheels are applied in 0.05s steps.  There is no slider
         # drag or additive random-gap control on this row anymore.
         interval_min, interval_max = self._fixed_attack_range()
+        self._charge_hold_range_seconds()
         for control_name in (
             "_small_step_control",
             "_stationary_pickup_control",
@@ -9394,6 +9553,9 @@ class UiWorker(threading.Thread):
         data = self._fixed_collect_data()
         self._fixed_save_settings(data)
         self._fixed_apply_to_worker(data)
+        # Delivery radio buttons call this method directly, not the mode
+        # change handler.  Refresh its dependent charge-only control here.
+        self._fixed_refresh_rows()
         self._fixed_refresh_grey()
 
     def _fixed_on_mode_change(self) -> None:
@@ -9454,11 +9616,25 @@ class UiWorker(threading.Thread):
             mode = "fixed"
         dead_flower_mode = mode == "dead_flower"
         dual_stationary_mode = mode == "dual_stationary"
-        jump_attack_enabled = bool(data.get(
-            "jump_attack_enabled",
-            data.get("stationary_jump_enabled", False),
-        )) and mode in ("fixed", "stationary", "dual_stationary")
+        delivery = str(data.get("attack_delivery", "stand")).casefold()
+        if delivery not in ("stand", "jump", "charge", "none"):
+            delivery = "jump" if bool(data.get(
+                "jump_attack_enabled", data.get("stationary_jump_enabled", False),
+            )) else "stand"
+        jump_attack_enabled = delivery == "jump" and mode in (
+            "fixed", "stationary", "dual_stationary",
+        )
+        legacy_charge = float(data.get("charge_hold_seconds", 0.5))
+        charge_min_seconds = max(0.1, min(
+            5.0, float(data.get("charge_min_seconds", legacy_charge)),
+        ))
+        charge_max_seconds = max(charge_min_seconds, min(
+            5.0, float(data.get("charge_max_seconds", charge_min_seconds)),
+        ))
         worker.jump_attack = jump_attack_enabled
+        worker.attack_delivery = delivery
+        worker.charge_min_seconds = charge_min_seconds
+        worker.charge_max_seconds = charge_max_seconds
         worker.enabled = bool(mode in ("fixed", "stationary", "dual_stationary"))
         # 站桩 shares its beats with the anchor correction and 小碎步, which carry
         # their own attacks; on patrol those are deliberate extras, so only the
@@ -9486,7 +9662,8 @@ class UiWorker(threading.Thread):
             LOG.warning("fixed attack key %r unsupported; keeping %r",
                         key, worker.attack_key)
         worker.set_combo_attack(
-            bool(data.get("combo_attack_enabled", False)) and not dead_flower_mode,
+            bool(data.get("combo_attack_enabled", False)) and not dead_flower_mode
+            and key != "-" and delivery != "none",
             data.get("combo_attack_slots", ()),
         )
         mover = getattr(self, "movement_worker", None)
@@ -9495,9 +9672,13 @@ class UiWorker(threading.Thread):
             if callable(dead_flower_setter):
                 dead_flower_setter(dead_flower_mode)
             mover.small_step_attack_key = worker.attack_key
-            jump_setter = getattr(mover, "set_jump_attack_enabled", None)
-            if callable(jump_setter):
-                jump_setter(jump_attack_enabled)
+            delivery_setter = getattr(mover, "set_attack_delivery", None)
+            if callable(delivery_setter):
+                delivery_setter(delivery, charge_min_seconds, charge_max_seconds)
+            else:
+                jump_setter = getattr(mover, "set_jump_attack_enabled", None)
+                if callable(jump_setter):
+                    jump_setter(jump_attack_enabled)
             counterattack_setter = getattr(mover, "set_counterattack", None)
             if callable(counterattack_setter):
                 counterattack_setter(
@@ -9718,7 +9899,7 @@ class UiWorker(threading.Thread):
             self._fixed_attack_range()
             if "attack_key" in data:
                 key = str(data["attack_key"]).strip()
-                if key in BINDABLE_KEYS:
+                if key in BINDABLE_KEYS or key == "-":
                     self._fixed_attack_key_var.set(key)
             if hasattr(self, "_counterattack_enabled_var"):
                 self._counterattack_enabled_var.set(bool(
@@ -9757,7 +9938,7 @@ class UiWorker(threading.Thread):
                 # Old configurations had only a jump checkbox.  Preserve it
                 # as 跳打; new configurations persist the full selection.
                 delivery = str(data.get("attack_delivery", "")).casefold()
-                if delivery not in ("stand", "jump", "charge", "none"):
+                if delivery not in ("stand", "jump", "charge"):
                     delivery = (
                         "jump" if bool(data.get(
                             "jump_attack_enabled",
@@ -9765,6 +9946,15 @@ class UiWorker(threading.Thread):
                         )) else "stand"
                     )
                 self._attack_delivery_var.set(delivery)
+            charge_control = getattr(self, "_charge_hold_control", None)
+            if charge_control is not None:
+                try:
+                    legacy_charge = float(data.get("charge_hold_seconds", 0.5))
+                    charge_min = float(data.get("charge_min_seconds", legacy_charge))
+                    charge_max = float(data.get("charge_max_seconds", charge_min))
+                except (TypeError, ValueError):
+                    charge_min, charge_max = 0.5, 0.5
+                charge_control.set_bounds(charge_min, charge_max)
             if ("small_step_enabled" in data
                     and hasattr(self, "_small_step_enabled_var")):
                 self._small_step_enabled_var.set(bool(
@@ -9905,6 +10095,7 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_hp_threshold_label"):
             return
+        self._undo_capture_panel_change("药品与增益设置")
         for control in (
             getattr(self, "_hp_threshold_control", None),
             getattr(self, "_mp_threshold_control", None),
@@ -10132,6 +10323,7 @@ class UiWorker(threading.Thread):
 
         if not hasattr(self, "_shutdown_hours_label"):
             return
+        self._undo_capture_panel_change("附加功能设置")
         # The 掉线 checkbox cannot be turned off underneath an active 自动重连
         # selection.  Restore it here as well as in _reconnect_on_change so
         # a direct click on 掉线 cannot leave an apparently armed reconnect
@@ -10376,7 +10568,9 @@ class UiWorker(threading.Thread):
                 self._ttk.Label(
                     row, text=f"Ctrl+{key_number}", width=6, anchor="w"
                 ).pack(side="left", padx=(0, 4))
-                entry = self._ttk.Entry(row, width=28)
+                # The editor expands into the row's real available width;
+                # its requested width must not widen column 0 by itself.
+                entry = self._ttk.Entry(row, width=20)
                 entry.insert(0, message)
                 entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
                 self._quick_edit_entry = entry
@@ -10402,10 +10596,17 @@ class UiWorker(threading.Thread):
                 # row itself owns the available width; truncation only starts
                 # near its right-side delete affordance rather than leaving a
                 # conspicuous unused strip in the middle of the panel.
-                preview = quick_message_preview(message, max_units=52)
+                # The compact row still has room after its Ctrl label and ×.
+                # Use it before ellipsizing so a normal message does not look
+                # artificially short beside a large blank stretch.
+                # One additional CJK character (two display units) fills the
+                # requested ~15px of remaining quick-message row width.
+                preview = quick_message_preview(message, max_units=54)
                 message_label = self._ttk.Label(
                     row, text=f"Ctrl+{key_number}   {preview}", anchor="w",
-                    wraplength=0,
+                    # The label fills its row, but its intrinsic request is
+                    # kept tiny so a long preview cannot dictate panel width.
+                    width=1, wraplength=0,
                 )
                 message_label.pack(
                     side="left", fill="x", expand=True, padx=(0, 4)
@@ -10432,6 +10633,7 @@ class UiWorker(threading.Thread):
         if len(self._quick_messages) >= 20:
             self._quick_message_status.configure(text="快捷消息最多 20 条。")
             return
+        self._undo_capture("快捷消息")
         self._quick_messages.append("新快捷消息")
         index = len(self._quick_messages) - 1
         self._quick_messages_save()
@@ -10446,7 +10648,7 @@ class UiWorker(threading.Thread):
             # The status row has substantially more usable room than the
             # former 30-cell preview.  Keep it on one line and ellipsize only
             # when its actual message is genuinely long.
-            label.configure(text=quick_message_preview(text, max_units=46))
+            label.configure(text=quick_message_preview(text, max_units=60))
 
     def _copy_quick_message(self, index: int) -> bool:
         if not (0 <= index < len(self._quick_messages)):
@@ -10497,6 +10699,7 @@ class UiWorker(threading.Thread):
         except Exception:
             text = ""
         if 0 <= index < len(self._quick_messages) and text:
+            self._undo_capture("快捷消息")
             self._quick_messages[index] = text[:500]
             self._quick_messages_save()
         self._render_quick_messages()
@@ -10533,6 +10736,7 @@ class UiWorker(threading.Thread):
 
     def _quick_delete(self, index: int) -> None:
         if 0 <= index < len(self._quick_messages):
+            self._undo_capture("快捷消息")
             deleted = self._quick_messages.pop(index)
             self._quick_messages_save()
             self._render_quick_messages()
@@ -10554,11 +10758,6 @@ class UiWorker(threading.Thread):
             return None
         try:
             left_width = _LEFT_COLUMN_WIDTH
-            # The compact right track is an explicit design constraint.  Do
-            # not let one long Additional Functions child row (for example
-            # reconnect settings) enlarge the entire application after the
-            # requested width was set.  Children must remain inside this
-            # fixed column just as the left stack does.
             right_width = _RIGHT_COLUMN_WIDTH
             columns.columnconfigure(0, weight=0, minsize=left_width)
             columns.columnconfigure(1, weight=0, minsize=right_width)
@@ -10722,7 +10921,7 @@ class UiWorker(threading.Thread):
         "toggle_patrol": "开始 / 停止巡逻 (Ctrl+`)",
         "adjust_fixed_attack_interval:-0.1": "缩短巡逻攻击间隔 0.1 秒",
         "adjust_fixed_attack_interval:+0.1": "加长巡逻攻击间隔 0.1 秒",
-        "quick_pickup:toggle": "开启 / 关闭快速拾取（仅停止巡逻时）",
+        "undo:last_change": "撤销最近一次更改（最多 10 步）",
         "trade:invite": "向鼠标所在角色发起交易",
         "trade:accept": "接受交易邀请",
     }
@@ -10852,28 +11051,6 @@ class UiWorker(threading.Thread):
         popup.attributes("-topmost", False)
         self._help_popup = popup
 
-        enabled = bool(data.get("enabled", True))
-        state_text = "已启用（配置文件 hotkey.json：enabled=true）" if enabled \
-            else "已停用（配置文件 hotkey.json：enabled=false）"
-        header_text = (
-            f"快捷键总开关: {state_text}\n"
-            "巡逻运行时，除 Ctrl+` (开始/停止巡逻) 和 Ctrl+[ / Ctrl+] "
-            "(固定攻击间隔) 外，其余快捷键都会临时停用，停止巡逻后恢复。\n"
-            "按快捷键后会自动松开 Ctrl，避免游戏里的 Ctrl 攻击持续触发"
-            "（配置项 release_ctrl_after_chord=true，默认开启）。\n"
-            "日文/中文/韩文输入法开启时会吞掉 Ctrl 组合键；"
-            "请把输入法切到「英数/半角英数」或关闭。\n"
-            "修改快捷键配置文件后需重启程序生效。"
-        )
-        footer_text = (
-            "启用/停用：配置文件的 enabled 控制总开关；"
-            "巡逻中除 Ctrl+` 与攻击间隔外的快捷键会暂时停用；"
-            "ignore_injected=true 表示只响应真实物理按键；"
-            "delivery=hook 表示使用低级键盘钩子（默认，输入法开启时仍可用），"
-            "delivery=native 表示使用系统热键。\n"
-            "移开鼠标即自动关闭本提示。"
-        )
-
         # Binding list as an aligned two-column table: keys on the left
         # (right-aligned), explanations on the right (left-aligned).  Each
         # column is one multi-line Label so every row lines up.
@@ -10913,15 +11090,9 @@ class UiWorker(threading.Thread):
             popup, bg="#fffbd6", padx=7, pady=4, bd=1, relief="solid"
         )
         content.pack(fill="x")
-        tk.Label(
-            content, text=header_text, justify="left",
-            background="#fffbd6", foreground="#202020",
-            wraplength=430, anchor="w",
-        ).pack(fill="x", pady=(0, 4))
-
         if key_lines:
             table = tk.Frame(content, bg="#fffbd6")
-            table.pack(fill="x", pady=(2, 4))
+            table.pack(fill="x")
             tk.Label(
                 table, text="按键", background="#fffbd6",
                 foreground="#202020", font=("", 9, "bold"),
@@ -10943,12 +11114,6 @@ class UiWorker(threading.Thread):
                 background="#fffbd6", foreground="#202020",
                 anchor="w",
             ).grid(row=1, column=1, sticky="w")
-
-        tk.Label(
-            content, text=footer_text, justify="left",
-            background="#fffbd6", foreground="#202020",
-            wraplength=430, anchor="w",
-        ).pack(fill="x", pady=(4, 0))
 
         # Stay open while the pointer is over the popup; hover-out closes it.
         self._help_bind_popup_hover(popup)
@@ -11006,6 +11171,7 @@ class UiWorker(threading.Thread):
         control = getattr(self, "_countdown_interval_control", None)
         if control is None:
             return
+        self._undo_capture_panel_change("倒计时设置")
         minutes, _ = control.normalize()
         minutes = int(minutes)
         interval_seconds = float(minutes * 60)
@@ -11047,6 +11213,7 @@ class UiWorker(threading.Thread):
 
         if not bool(getattr(self, "_countdown_enabled_var", None).get()):
             return
+        self._undo_capture_panel_change("倒计时设置")
         controls = (
             getattr(self, "_countdown_remaining_hour_control", None),
             getattr(self, "_countdown_remaining_minute_control", None),
@@ -11246,7 +11413,11 @@ class UiWorker(threading.Thread):
                     # a reconnect checkbox that can never trigger.
                     self._disconnect_alert_var.set(True)
                 self._reconnect_world_var.set(saved_world)
-                self._reconnect_channel_var.set(str(saved_channel))
+                control = getattr(self, "_reconnect_channel_control", None)
+                if control is not None:
+                    control.set_bounds(saved_channel)
+                else:
+                    self._reconnect_channel_var.set(saved_channel)
             if hasattr(self, "_auto_restart_var"):
                 self._auto_restart_var.set(bool(data.get("auto_restart_enabled", False)))
             if hasattr(self, "_restart_offline_message_var"):
@@ -11292,9 +11463,12 @@ class UiWorker(threading.Thread):
                         ) * 60
                 except (TypeError, ValueError):
                     wait_seconds = 300
-                self._player_channel_wait_var.set(
-                    str(max(0, min(1200, wait_seconds)))
-                )
+                normalized_wait = max(1, min(1200, wait_seconds))
+                control = getattr(self, "_player_channel_wait_control", None)
+                if control is not None:
+                    control.set_bounds(normalized_wait)
+                else:
+                    self._player_channel_wait_var.set(normalized_wait)
                 self._refresh_player_wait_hint()
             if hasattr(self, "_api_test_status"):
                 # 测试api has no panel settings; the line only states the backend it will reach.
@@ -12078,8 +12252,11 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="巡逻控制器不可用。")
             return False
         try:
+            undo_saved = self._undo_capture("添加楼层")
             layer_name = self.patrol_controller.add_layer_above()
         except (OSError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("添加楼层")
             self._control_status.configure(text=f"无法添加楼层: {exc}")
             return False
         self._control_status.configure(
@@ -12118,8 +12295,11 @@ class UiWorker(threading.Thread):
 
         self._patrol_intent = False
         try:
+            undo_saved = self._undo_capture("重置录制")
             controller.reset_recording()
         except PermissionError:
+            if undo_saved:
+                self._undo_discard_latest("重置录制")
             # A configuration copied from an older extracted release can
             # still be owned by that release/Explorer.  Do not expose a raw
             # WinError path; the old recording must be recreated for the
@@ -12133,6 +12313,8 @@ class UiWorker(threading.Thread):
                 LOG.debug("could not display reset compatibility refusal", exc_info=True)
             return
         except Exception as exc:
+            if undo_saved:
+                self._undo_discard_latest("重置录制")
             # The reset must never take down the UI.  A locked config/reference
             # file, malformed on-disk profile, or a transient Windows error is
             # reported as a normal refusal the operator can retry.
@@ -12370,9 +12552,12 @@ class UiWorker(threading.Thread):
             self._control_status.configure(text="巡逻控制器不可用。")
             return False
         try:
+            undo_saved = self._undo_capture("删除楼层")
             removed = self.patrol_controller.remove_highest_layer()
             selected = self.patrol_controller.selected_layer()
         except (OSError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("删除楼层")
             self._control_status.configure(text=f"无法删除楼层: {exc}")
             return False
         if selected:
@@ -12420,6 +12605,7 @@ class UiWorker(threading.Thread):
                 < int("".join(filter(str.isdigit, next_start)) or 0)):
             end = next_start
         try:
+            undo_saved = self._undo_capture("巡逻范围")
             self.patrol_controller.set_patrol_range(next_start, end)
             # Ctrl+Home changes the patrol's lower bound, so make the same
             # layer visibly selected for recording as well.  Otherwise the
@@ -12427,6 +12613,8 @@ class UiWorker(threading.Thread):
             # appear to have done nothing.
             self.patrol_controller.select_layer(next_start)
         except (OSError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("巡逻范围")
             self._control_status.configure(text=f"无法设置巡逻起始楼层: {exc}")
             return False
         self._control_status.configure(
@@ -12456,8 +12644,11 @@ class UiWorker(threading.Thread):
             else:
                 start = end
         try:
+            undo_saved = self._undo_capture("巡逻范围")
             self.patrol_controller.set_patrol_range(start, end)
         except ValueError as exc:
+            if undo_saved:
+                self._undo_discard_latest("巡逻范围")
             self._control_status.configure(text=f"无法选择巡逻楼层: {exc}")
             self._refresh_patrol_controls()
             return
@@ -12494,7 +12685,9 @@ class UiWorker(threading.Thread):
             # This fixed width holds the widest ordinary display name
             # (for example, 楼层10) without clipping CJK glyphs. The cropped
             # canvas then touches the label directly; there is no dead gutter.
-            label = ttk.Label(row, width=13)
+            # ``楼层10 巡逻10次`` is the widest normal label.  Eleven cells
+            # hold it while avoiding a permanently oversized canvas row.
+            label = ttk.Label(row, width=11)
             label.pack(side="left", anchor="center")
             self._layer_labels[layer_name] = label
             canvas = self._tk.Canvas(
@@ -12506,6 +12699,13 @@ class UiWorker(threading.Thread):
                 cursor="hand2",
             )
             canvas.pack(side="left", fill="x", expand=True)
+            # Redraw after Tk assigns the expanded width so the logical
+            # 8%–92% range fills the whole visible layer canvas.
+            canvas.bind(
+                "<Configure>",
+                lambda _event: self._root.after_idle(self._refresh_patrol_controls),
+                add="+",
+            )
             # Recording choices are intentionally right-click only.  Left
             # clicks remain free for normal UI selection and marker double-
             # click deletion, never opening an add-recording menu.

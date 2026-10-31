@@ -1,7 +1,6 @@
 """Retired automatic route-pickup worker.
 
-Automatic Z pickup has been retired.  Manual Ctrl+Z quick pickup is provided
-by ``quick_pickup_worker.py`` and is the only component allowed to send Z.
+Automatic pickup has been retired.  No helper component sends the Z key.
 
 The worker owns no screenshots and no direction keys; it only drives the Z
 key through the shared key sender, gated by events published by the movement

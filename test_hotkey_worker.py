@@ -50,7 +50,7 @@ class HotkeyWorkerTests(unittest.TestCase):
             worker._bindings[KEY_VK["right"]][0], "record:right_most_pos"
         )
         self.assertEqual(
-            worker._bindings[KEY_VK["z"]][0], "quick_pickup:toggle"
+            worker._bindings[KEY_VK["z"]][0], "undo:last_change"
         )
         self.assertEqual(
             worker._bindings[KEY_VK["grave"]][0], "toggle_patrol"
@@ -69,7 +69,7 @@ class HotkeyWorkerTests(unittest.TestCase):
         # interval adjustment stay live.
         self.assertFalse(worker._binding_allowed("quick_message:0"))
         self.assertFalse(worker._binding_allowed("record:left_most_pos"))
-        self.assertFalse(worker._binding_allowed("quick_pickup:toggle"))
+        self.assertFalse(worker._binding_allowed("undo:last_change"))
         self.assertTrue(
             worker._binding_allowed("adjust_fixed_attack_interval:+0.1")
         )
@@ -135,7 +135,7 @@ class HotkeyWorkerTests(unittest.TestCase):
         self.assertTrue(worker._cooldown_exempt("record:right_most_pos"))
         self.assertTrue(worker._cooldown_exempt("select_next_layer"))
         self.assertTrue(worker._cooldown_exempt("select_next_patrol_start"))
-        self.assertFalse(worker._cooldown_exempt("quick_pickup:toggle"))
+        self.assertFalse(worker._cooldown_exempt("undo:last_change"))
         self.assertFalse(worker._cooldown_exempt("toggle_patrol"))
 
         for action in ("record:right_most_pos", "record:right_most_pos",
@@ -144,8 +144,8 @@ class HotkeyWorkerTests(unittest.TestCase):
         self.assertEqual(worker.action_queue.qsize(), 4)
 
         # Everything else keeps the cooldown.
-        worker._queue_action("quick_pickup:toggle")
-        worker._queue_action("quick_pickup:toggle")
+        worker._queue_action("undo:last_change")
+        worker._queue_action("undo:last_change")
         self.assertEqual(worker.action_queue.qsize(), 5)
 
 if __name__ == "__main__":

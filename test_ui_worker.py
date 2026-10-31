@@ -2214,9 +2214,9 @@ class HotkeyInputRearmTests(unittest.TestCase):
         UiWorker._arm_input_for_hotkey(self._ui(sender, reconnect=True), "trade:accept")
         self.assertEqual(sender.armed, 0)
 
-    def test_patrol_running_leaves_the_input_state_alone(self) -> None:
+    def test_undo_is_not_a_typing_hotkey(self) -> None:
         sender = self._Sender(enabled=False)
-        UiWorker._arm_input_for_hotkey(self._ui(sender, patrol=True), "quick_pickup:toggle")
+        UiWorker._arm_input_for_hotkey(self._ui(sender, patrol=True), "undo:last_change")
         self.assertEqual(sender.armed, 0)
 
     def test_a_background_game_is_not_armed(self) -> None:
@@ -2285,7 +2285,6 @@ class PollResilienceTests(unittest.TestCase):
     def test_a_malformed_hotkey_item_does_not_break_the_drain(self) -> None:
         ui = object.__new__(UiWorker)
         ui.hotkey_queue = queue.Queue()
-        ui._drain_quick_pickup_results = lambda: None
         ui._drain_reconnect_results = lambda: None
         ui.patrol_controller = None
         ui._play_action_sound = lambda _success: None

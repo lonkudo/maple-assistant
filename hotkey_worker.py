@@ -72,6 +72,7 @@ _CTRL_RELEASE_INTERVAL_SECONDS = 0.02
 # arrow press look like a recording chord. A new physical Ctrl-down explicitly
 # re-arms the configuration bindings.
 _CONFIGURATION_ACTION_PREFIXES = (
+    "undo:",
     "record:",
     "record_jump_point",
     "record_dual_stationary",

@@ -521,7 +521,7 @@ ordinary patrol hold is never interrupted by it.
 
 ### Combat and consumables
 
-`attack_worker.py` performs fixed-interval attack and optional jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
+`attack_worker.py` performs fixed-interval attack in one selected delivery form: stand tap, jump attack, charge hold, or no attack. Charge holds the attack key for an inclusive random value between `charge_min_seconds` and `charge_max_seconds` (0.1–5.0 s), through `AtomicMotionRunner`. Its charge gate admits only the owning charge key and ordinary patrol Left/Right; queued buffs and other action-key motions defer until release. HP/MP recovery may cancel the charge, waits at most 80 ms for the handoff plus 100 ms for release, and then takes priority. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
 
 `NumericValueRangeControl` is the reusable fixed-height UI primitive for direct numeric settings.
 It supports a single value or inclusive min/max range, preserves the surrounding label baseline,
@@ -668,7 +668,9 @@ One optional control deliberately uses its own unit: the 捡东西 (stand-still 
 
 The other-player 多等 delay is the mirror image of that rule: it is a **seconds** control (its validator accepts 0–1200 and `_normalized_player_channel_wait_seconds()` clamps to the same range), published as `player_channel_wait_seconds` and consumed by the movement worker in real seconds. A configuration written before the seconds UI stored whole minutes, so loading migrates it by ×60 rather than reading the old number as seconds — a stored five meant five minutes, and reading it as five seconds would have turned the operator's hand-over delay into a no-op. The field commits on blur and on an outside click, because clicking a label or a panel does not move Tk focus, and its hint text is rebuilt from the displayed value so the row never explains a different number than it shows.
 
-Combat panel state is applied in both directions. The 被撞反击 checkbox and its 攻击键 button live on the 巡逻攻击 row and publish `counterattack_enabled` / `counterattack_key` into `fixed_attack_settings.json`; the mode handler pushes them through `MovementWorker.set_counterattack()` for 巡逻攻击 and 站桩攻击 and clears them when no attack mode is active. The stationary-only lock is re-applied after a settings load and after an authorization unlock, because the generic unlock enables every product widget and previously left a saved 巡逻攻击 session exposing 跳打/朝向 controls until the operator switched modes once.
+Combat panel state is applied in both directions. The selected `attack_delivery` (`stand`, `jump`, `charge`, or `none`), its charge range, and the 被撞反击 checkbox/key are kept in the unified `user_config.json` fixed-attack section. The mode handler pushes counterattack state through `MovementWorker.set_counterattack()` for 巡逻攻击 and 站桩攻击 and clears it when no attack mode is active. The stationary-only lock is re-applied after a settings load and after an authorization unlock, because the generic unlock enables every product widget and previously left a saved 巡逻攻击 session exposing mode-specific controls until the operator switched modes once.
+
+`Ctrl+Z` is local configuration undo, not a game-input action. `UiWorker` stores at most ten pre-change `user_config.json` byte snapshots in memory. Recording mutations and ordinary settings changes create one snapshot each; a contiguous sequence on the same numeric control is coalesced for 0.75 seconds into one undo step. Undo is refused while patrol is running, atomically restores the latest snapshot, then reloads the UI and workers from it. The history is intentionally cleared on process exit and is never written to disk.
 
 Personal settings are stored in `user_config.json`; application defaults are stored in `system_config.json`. Runtime scratch data belongs under `work/`, including patrol state and timer persistence. Critical exceptions additionally go to `error.log`. **Configuration import is an in-process refresh:** the UI validates the selected JSON, immediately stops patrol, then a background task waits for the key-release cleanup, copies through a same-folder temporary file, atomically replaces `user_config.json`, reloads user-owned settings, and redraws the panels. The helper remains running; importing never needs a manual restart. The status line is set to `↻ 正在刷新导入配置…` until completion. If Reset Recording encounters an inaccessible configuration from an older package, the UI reports `配置版本与当前助手版本不匹配，请重新录制以后导出新配置。` instead of presenting a raw access-denied path.
 
@@ -691,7 +693,7 @@ pre-armed physical Stop Patrol
 
 The physical hotkey hook disarms automation before Tk is involved, so game
 input stops even if the UI thread is late. The Tk half then updates controls
-without waiting for reconnect, quick-pickup, license/accounting, channel, or
+without waiting for reconnect, license/accounting, channel, or
 other-player result drains. Automatic-lie startup follows the urgent hotkey
 path and therefore cannot wait behind those routine handlers. The handlers
 remain on Tk only for their widget work; network communication and worker I/O
@@ -724,7 +726,7 @@ their ordinary lifecycle logging.
 | `user_config.json` | UI/config callbacks | User choices, keys, patrol layers, message list, alerts. |
 | `system_config.json` | Application defaults | Internal defaults and non-personal settings. |
 | `hotkey.json` | Hotkey worker | Ordered hotkey bindings. |
-| `fixed_attack_settings.json` | UI / fixed-attack panel | Interval, attack key, combo slots, 跳打/小碎步/朝向, 被撞反击 enable + key. |
+| `user_config.json` fixed-attack section | UI / combat panel | Attack delivery, interval and charge ranges, attack key, combo slots, 跳打/小碎步/朝向, 被撞反击 enable + key. |
 | `work/` | Runtime workers | Recoverable patrol/timer/session state. |
 | `lie_accounting_pending.json` | `lie_accounting.py` | Durable auto-lie event outbox: one row per unresolved `started`/terminal report. |
 | `error.log` | Error reporting | Critical unexpected-error record. |

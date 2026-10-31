@@ -3703,8 +3703,7 @@ class MovementWorker(threading.Thread):
                             self._endpoint_turn_rearm_start_x = float(current_player.x)
                             self._endpoint_turn_rearm_waiting_for_attack = True
                             self._endpoint_turn_rearm_attempted = False
-                # Automatic pickup no longer sends Z.  Ctrl+Z is the sole
-                # pickup input and belongs to QuickPickupWorker, so movement
+                # Automatic pickup no longer sends Z.  Movement therefore
                 # holds only the requested direction.
                 self._walk_hold_until = time.monotonic() + max(
                     0.01, float(decision.duration)
@@ -4135,6 +4134,9 @@ class MovementWorker(threading.Thread):
         # it only while their existing arbiter token already owns admission.
         self.atomic_motion_runner = atomic_motion_runner
         self.jump_attack_enabled = False
+        self.attack_delivery = "stand"
+        self.charge_min_seconds = 0.5
+        self.charge_max_seconds = 0.5
         # Stair detection stays on this minimap-consuming worker, but the
         # direction+Alt action runs on its own worker.  It waits for attack
         # motion without making patrol release its current Left/Right hold.
@@ -13323,6 +13325,25 @@ class MovementWorker(threading.Thread):
 
         self.jump_attack_enabled = bool(enabled)
 
+    def set_attack_delivery(
+        self, delivery: str, charge_min_seconds: float = 0.5,
+        charge_max_seconds: float = 0.5,
+    ) -> None:
+        """Apply the shared attack delivery without coupling route decisions.
+
+        This affects only attacks that are already part of a stationary
+        correction, 小碎步, or counterattack motion.  It never changes how the
+        patrol chooses or holds Left/Right.
+        """
+
+        delivery = str(delivery).casefold()
+        self.attack_delivery = delivery if delivery in ("stand", "jump", "charge", "none") else "stand"
+        self.jump_attack_enabled = self.attack_delivery == "jump"
+        minimum = max(0.1, min(5.0, float(charge_min_seconds)))
+        maximum = max(minimum, min(5.0, float(charge_max_seconds)))
+        self.charge_min_seconds = minimum
+        self.charge_max_seconds = maximum
+
     def _perform_combat_attack(self, attack_key: str, *, label: str) -> bool:
         """Run a correction/counter combat tap through the atomic runner.
 
@@ -13330,11 +13351,20 @@ class MovementWorker(threading.Thread):
         not add a second queued motion and does not release Left/Right.
         """
 
+        delivery = str(getattr(self, "attack_delivery", "stand")).casefold()
+        if str(attack_key).strip().casefold() == "-" or delivery == "none":
+            # The route movement remains valid in 不打 mode; only the key tap
+            # is deliberately omitted.
+            return True
         runner = self.atomic_motion_runner
         if runner is not None:
             return bool(runner.execute_combat_attack(
                 attack_key,
                 jump_attack_enabled=self.jump_attack_enabled,
+                charge_attack_enabled=delivery == "charge",
+                charge_hold_seconds=random.uniform(
+                    self.charge_min_seconds, self.charge_max_seconds,
+                ),
                 allowed=lambda: (
                     self._patrol_input_allowed()
                     and not self._movement_busy_now()

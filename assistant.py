@@ -513,7 +513,6 @@ def main() -> int:
     from small_step_worker import SmallStepWorker
     from stair_jump_worker import StairJumpWorker
     from hotkey_worker import HotkeyWorker
-    from quick_pickup_worker import QuickPickupWorker
     from reconnect_worker import CHANNEL_DEFAULT, ReconnectWorker
     from auto_restart_worker import AutoRestartWorker
     from trade_worker import TradeWorker
@@ -1811,6 +1810,16 @@ def main() -> int:
         stop_event,
         automation_active_event=automation_active,
     )
+    # The shared keyboard sender is the final authority for every worker's
+    # key-down.  During a charge it permits only the charge key itself and
+    # normal patrol Left/Right, so a direct buff/rope/pickup send cannot race
+    # the long hold.
+    charge_gate = getattr(key_sender, "set_charge_gate", None)
+    if callable(charge_gate):
+        charge_gate(lambda: (
+            atomic_motion_runner.charge_active()
+            or motion_arbiter.charge_active()
+        ))
     # The fixed-rate attack worker always exists so the UI can toggle it
     # live (Fixed Attack panel).  Without --enable-attack it starts disabled
     # and only waits; the panel flips ``enabled`` when the mode is selected.
@@ -1947,14 +1956,6 @@ def main() -> int:
         on_chord=release_hotkey_ctrl,
         keep_ctrl_released=keep_hotkey_ctrl_released,
     )
-    quick_pickup_results: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=8)
-    quick_pickup_worker = QuickPickupWorker(
-        key_sender,
-        stop_event,
-        quick_pickup_results,
-        patrol_running=patrol_controller.is_enabled,
-    )
-
     # 自动重连: armed from the Additional Functions panel; the 掉线 event is its trigger and
     # the login page's base colour (screenshots/login_page_target.jpg) its confirmation
     # (see reconnect_worker.py).
@@ -2326,6 +2327,8 @@ def main() -> int:
             Path(__file__).with_name("work") / "status_state.json"
         ),
         motion_arbiter=motion_arbiter,
+        charge_active_callback=atomic_motion_runner.charge_active,
+        charge_interrupt_callback=atomic_motion_runner.interrupt_charge,
     )
     trade_worker = TradeWorker(
         trade_frames,
@@ -2699,7 +2702,6 @@ def main() -> int:
         small_step_worker,
         stair_jump_worker,
         *([hotkey_worker] if hotkey_worker is not None else []),
-        quick_pickup_worker,
         reconnect_worker,
         auto_restart_worker,
         trade_worker,
@@ -2728,8 +2730,6 @@ def main() -> int:
             hotkey_worker=hotkey_worker,
             on_hotkey_stop_prearmed=consume_hotkey_stop_prearmed,
             hotkey_stop_cleanup_done_event=hotkey_stop_cleanup_done,
-            quick_pickup_worker=quick_pickup_worker,
-            quick_pickup_results=quick_pickup_results,
             reconnect_worker=reconnect_worker,
             auto_restart_worker=auto_restart_worker,
             reconnect_results=reconnect_results,

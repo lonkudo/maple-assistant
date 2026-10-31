@@ -268,6 +268,12 @@ class WindowKeySender:
         self._input_refusal_reason = ""
         self._input_refusal_logged_at = float("-inf")
         self._input_refusal_count = 0
+        # A charge attack owns its attack key for up to five seconds.  Keep
+        # the rule at this shared sender rather than trusting every worker to
+        # remember it: ordinary patrol Left/Right remains legal, while a new
+        # action/buff/rope key-down cannot land inside that held attack.
+        self._charge_active_callback: Optional[Callable[[], bool]] = None
+        self._charge_gate_logged_at = float("-inf")
         if input_enabled:
             self._input_enabled.set()
         self.hwnd: Optional[int] = None
@@ -282,6 +288,34 @@ class WindowKeySender:
         self._next_handle_discovery_at = 0.0
         # Logged once per unresponsive episode, not on every 0.2s poll.
         self._game_unresponsive_logged = False
+
+    def set_charge_gate(self, active_callback: Optional[Callable[[], bool]]) -> None:
+        """Install the optional charge-attack admission gate.
+
+        ``key_up`` is deliberately never gated: an emergency release must
+        always be able to clear a physical key.  The charge owner and normal
+        horizontal patrol movement are the only new key-downs allowed while a
+        charge is active.
+        """
+
+        self._charge_active_callback = active_callback
+
+    def _charge_allows_key_down(self, key: str, owner: str) -> bool:
+        callback = self._charge_active_callback
+        if not callable(callback):
+            return True
+        try:
+            active = bool(callback())
+        except Exception:
+            LOG.exception("charge gate state callback failed; refusing action input")
+            return False
+        if not active or owner == "charge" or key in self._HORIZONTAL_DIRECTION_KEYS:
+            return True
+        now = time.monotonic()
+        if now - self._charge_gate_logged_at >= 1.0:
+            self._charge_gate_logged_at = now
+            LOG.info("charge gate deferred key-down=%s owner=%s", key, owner or "unknown")
+        return False
 
     def _remember_game_window_handle(self, hwnd: int) -> int:
         """Publish a recreated game HWND without treating first discovery as one."""
@@ -1163,6 +1197,8 @@ class WindowKeySender:
             LOG.info("blocked key-down=%s: the keyboard is owned by %r", key,
                      self._exclusive_owner)
             return False
+        if not self._charge_allows_key_down(key, owner):
+            return False
         if not self.input_is_enabled():
             self._note_input_refused(key, INPUT_NOT_ENABLED_REASON)
             return False
@@ -1228,6 +1264,8 @@ class WindowKeySender:
         if self._exclusive_blocks(owner):
             LOG.info("blocked chord=%s: keyboard owned by %r",
                      "+".join(normalized), self._exclusive_owner)
+            return False
+        if any(not self._charge_allows_key_down(key, owner) for key in normalized):
             return False
         if not self.input_is_enabled():
             self._note_input_refused("+".join(normalized), INPUT_NOT_ENABLED_REASON)
@@ -1440,6 +1478,8 @@ class WindowKeySender:
             raise ValueError(f"unsupported key: {key}")
         if self._exclusive_blocks(owner):
             LOG.info("blocked tap=%s: the keyboard is owned by %r", key, self._exclusive_owner)
+            return False
+        if not self._charge_allows_key_down(key, owner):
             return False
         for attempt in range(1, _ACTION_TAP_ATTEMPTS + 1):
             if not self.input_is_enabled():
@@ -1657,6 +1697,9 @@ class WindowKeySender:
             if not keys or any(key not in self._SCAN for key in keys):
                 raise ValueError(f"unsupported direct key chord: {chord!r}")
             normalized.append(keys)
+        if any(not self._charge_allows_key_down(key, "direct")
+               for keys in normalized for key in keys):
+            return False
         if self.dry_run:
             LOG.info("DRY-RUN direct keys: %s", ", ".join(chords))
             return True
@@ -2049,6 +2092,8 @@ class StatusWorker(threading.Thread):
         potion_verify_retries: int = 1,
         status_state_path: Optional[str] = None,
         motion_arbiter: Any = None,
+        charge_active_callback: Any = None,
+        charge_interrupt_callback: Any = None,
         hp_drop_callback: Any = None,
     ) -> None:
         super().__init__(name="status-worker", daemon=True)
@@ -2062,6 +2107,11 @@ class StatusWorker(threading.Thread):
         # whatever action motion is playing.  HP/MP potions stay urgent and
         # keep their direct, bar-verified path.
         self.motion_arbiter = motion_arbiter
+        # Ordinary timed buffs defer while the attack key is held for a
+        # charge.  HP/MP recovery instead interrupts that hold first: health
+        # must never wait for a configured multi-second charge to finish.
+        self.charge_active_callback = charge_active_callback
+        self.charge_interrupt_callback = charge_interrupt_callback
         self.potion_cooldown = max(0.0, potion_cooldown)
         self.low_frames_required = max(1, low_frames_required)
         # Potions are the highest-priority action: if a tap is blocked
@@ -2121,12 +2171,35 @@ class StatusWorker(threading.Thread):
         timestamp stale, so the next low frame retries again anyway.
         """
 
+        interrupt = self.charge_interrupt_callback
+        if callable(interrupt):
+            try:
+                released = bool(interrupt(0.08))
+                # The charge loop checks its cancellation event every 10 ms.
+                # Give the final key-up a bounded extra handoff before the
+                # priority potion tap reaches the shared sender gate.
+                if not released:
+                    deadline = time.monotonic() + 0.10
+                    while self._charge_active() and time.monotonic() < deadline:
+                        time.sleep(0.010)
+            except Exception:
+                LOG.exception("potion could not interrupt active charge")
         for _ in range(self.potion_retry_attempts):
             if self.key_sender.tap(key):
                 return True
             if self.potion_retry_delay_seconds > 0:
                 time.sleep(self.potion_retry_delay_seconds)
         return False
+
+    def _charge_active(self) -> bool:
+        callback = self.charge_active_callback
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            LOG.exception("charge state probe failed")
+            return False
 
     def _check_resource(self, name: str, ratio: Optional[float],
                         threshold_ratio: float, key: str, now: float) -> None:
@@ -2295,6 +2368,8 @@ class StatusWorker(threading.Thread):
                 # 宠物食品 is a periodic drug, not an action buff.  It is
                 # intentionally sent directly and never pauses patrol or
                 # joins MotionArbiter's directional handoff.
+                if self._charge_active():
+                    continue
                 if self.key_sender.tap(key, hold_seconds=_BUFF_TAP_HOLD_SECONDS):
                     with self._buff_timer_lock:
                         self._last_buff[name] = time.monotonic()
@@ -2315,6 +2390,8 @@ class StatusWorker(threading.Thread):
                         LOG.exception("增益1 flower placement gate failed; keeping timer due")
                         continue
                 if flower_gate_open:
+                    if self._charge_active():
+                        continue
                     if self.key_sender.tap(key, hold_seconds=_BUFF_TAP_HOLD_SECONDS):
                         with self._buff_timer_lock:
                             self._last_buff[name] = time.monotonic()
