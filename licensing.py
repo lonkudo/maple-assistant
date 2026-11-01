@@ -110,6 +110,20 @@ class LicenseStatus:
     lie_detect_yesterday: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ActivationTransferPreview:
+    """One server-authorized, expiring activation-replacement preview."""
+
+    ok: bool
+    code: str
+    message: str
+    transfer_token: str = ""
+    bound_elsewhere: bool = False
+    bound_equipment_id: str = ""
+    expires_in_seconds: int = 0
+    device_status: LicenseStatus | None = None
+
+
 class DeviceNotReadyError(ValueError):
     """Stable device signals are not yet available after Windows startup."""
 
@@ -120,8 +134,17 @@ def runtime_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def user_data_root(root: Optional[Path] = None) -> Path:
+    """Return the user-owned configuration root selected by the installer."""
+
+    if root is not None:
+        return Path(root)
+    configured = os.environ.get("MOONECLIPSE_CONFIG_DIR")
+    return Path(configured) if configured else runtime_root()
+
+
 def license_path(root: Optional[Path] = None) -> Path:
-    return Path(root or runtime_root()) / LICENSE_FILE
+    return user_data_root(root) / LICENSE_FILE
 
 
 def revoke_license(root: Optional[Path] = None) -> bool:
@@ -635,6 +658,67 @@ def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus
     return persisted
 
 
+def preview_activation_transfer_via_server(code: str, root: Optional[Path] = None) -> ActivationTransferPreview:
+    """Ask the server whether a code would replace another device binding.
+
+    This is deliberately read-only as far as the activation binding is
+    concerned.  Its token is mandatory for the later mutating request.
+    """
+
+    clean_code = "".join(str(code or "").upper().split())
+    try:
+        SERVER_LOG.info("activation transfer preview requested")
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/activation-transfer/preview",
+            {"activation_code": clean_code, "fingerprint": machine_fingerprint_hash()},
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
+        status = _with_server_device(verify_license(root), answer)
+        return ActivationTransferPreview(
+            True, str(answer.get("code", "TRANSFER_PREVIEW")),
+            str(answer.get("message", "授权码可激活。")),
+            transfer_token=str(answer.get("transfer_token", "")),
+            bound_elsewhere=bool(answer.get("bound_elsewhere", False)),
+            bound_equipment_id=str(answer.get("bound_equipment_id", "")),
+            expires_in_seconds=int(answer.get("expires_in_seconds", 0) or 0),
+            device_status=status,
+        )
+    except PinnedTlsResponseError as exc:
+        return ActivationTransferPreview(False, f"server:{exc.code}", exc.message)
+    except DeviceNotReadyError:
+        return ActivationTransferPreview(False, "device_not_ready", "设备未就绪，稍后重试")
+    except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("activation transfer preview failed category=%s", type(exc).__name__)
+        return ActivationTransferPreview(False, "server", "激活验证失败")
+
+
+def confirm_activation_transfer_via_server(token: str, root: Optional[Path] = None) -> LicenseStatus:
+    """Consume a preview token and persist the newly-issued entitlement."""
+
+    try:
+        SERVER_LOG.info("activation transfer confirmation requested")
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/activation-transfer/confirm",
+            {"transfer_token": str(token), "fingerprint": machine_fingerprint_hash()},
+            runtime_root() / ACTIVATION_SERVER_PIN_FILE,
+        )
+        document = answer["license"]
+    except PinnedTlsResponseError as exc:
+        SERVER_LOG.warning("activation transfer rejected status=%s code=%s", exc.status, exc.code)
+        return _with_server_device(LicenseStatus(False, f"server:{exc.code}", exc.message), exc.data)
+    except DeviceNotReadyError:
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
+    except (ValueError, KeyError, OSError, PinnedTlsError, json.JSONDecodeError) as exc:
+        SERVER_LOG.warning("activation transfer failed category=%s", type(exc).__name__)
+        return LicenseStatus(False, "server", "激活验证失败")
+    parsed = _parse_document(document, root)
+    if not parsed.valid:
+        return parsed
+    return _with_server_device(_persist_document(document, parsed, root), answer)
+
+
 def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
     """Revalidate the saved entitlement through the pinned activation server.
 
@@ -839,8 +923,8 @@ def report_lie_event_via_server(
 
 __all__ = [
     "ACTIVATION_PREFIX", "LICENSE_FORMAT",
-    "DEVICE_REQUEST_PREFIX", "LicenseStatus", "activate", "activation_code",
-    "activate_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
+    "DEVICE_REQUEST_PREFIX", "LicenseStatus", "ActivationTransferPreview", "activate", "activation_code",
+    "activate_via_server", "preview_activation_transfer_via_server", "confirm_activation_transfer_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
     "report_lie_event_via_server", "set_device_memo_via_server", "unbind_device_via_server", "validate_via_server",
 ]

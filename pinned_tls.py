@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 import ssl
-from typing import Optional
+from typing import BinaryIO, Callable, Optional
 from urllib.parse import urlsplit
 
 from cryptography import x509
@@ -99,5 +99,54 @@ def post_json(
     except (OSError, ssl.SSLError, json.JSONDecodeError) as exc:
         log.warning("secure request failed category=%s endpoint=%s", type(exc).__name__, safe_endpoint)
         raise PinnedTlsError("无法建立安全授权连接。") from exc
+    finally:
+        connection.close()
+
+
+def download_binary(
+    endpoint: str, path: str, pin_path: Path, authorization: str,
+    output: BinaryIO, progress: Optional[Callable[[int], None]] = None,
+    timeout: float = 30.0,
+) -> int:
+    """Stream one protected installer artifact after the normal TLS pin check."""
+
+    parts = urlsplit(endpoint)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        raise PinnedTlsError("授权服务器必须使用 HTTPS。")
+    expected = load_pin(pin_path)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=timeout)
+    try:
+        connection.connect()
+        certificate = x509.load_der_x509_certificate(connection.sock.getpeercert(binary_form=True))
+        spki = certificate.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        actual = base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+        if not hmac.compare_digest(expected, actual):
+            raise PinnedTlsError("服务器身份校验失败，连接已拒绝。")
+        target = parts.path.rstrip("/") + "/" + path.lstrip("/")
+        connection.request("GET", target, headers={"Authorization": f"Bearer {authorization}"})
+        response = connection.getresponse()
+        if response.status >= 400:
+            try:
+                data = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                data = {}
+            raise PinnedTlsResponseError(response.status, str(data.get("code", "DOWNLOAD_FAILED")), str(data.get("message", "下载失败。")), data)
+        total = 0
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+            total += len(chunk)
+            if progress is not None:
+                progress(len(chunk))
+        return total
+    except PinnedTlsError:
+        raise
+    except (OSError, ssl.SSLError) as exc:
+        raise PinnedTlsError("无法下载更新文件。") from exc
     finally:
         connection.close()

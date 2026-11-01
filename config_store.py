@@ -53,10 +53,13 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "drug": {
         "hp_key": "delete", "mp_key": "end", "hp_threshold": 50,
         "mp_threshold": 30, "hp_enabled": True, "mp_enabled": True,
-        "buff1_key": "home", "buff2_key": "insert",
+        "buff1_key": "home", "buff2_key": "insert", "buff3_key": "pageup",
+        "buff4_key": "pagedown",
         "buff_interval_unit": "seconds",
         "buff1_interval": 600.0, "buff2_interval": 600.0,
+        "buff3_interval": 600.0, "buff4_interval": 600.0,
         "buff1_enabled": False, "buff2_enabled": False,
+        "buff3_enabled": False, "buff4_enabled": False,
     },
     "fixed_attack": {
         "attack_mode": "fixed", "min_interval_seconds": 3.0,
@@ -406,7 +409,8 @@ def get_config_store(
     system_path: Optional[Path] = None,
 ) -> ConfigStore:
     package_root = Path(__file__).resolve().parent
-    requested = Path(path or package_root / USER_CONFIG_NAME).resolve()
+    user_root = Path(os.environ.get("MOONECLIPSE_CONFIG_DIR") or package_root)
+    requested = Path(path or user_root / USER_CONFIG_NAME).resolve()
     # Preserve --config config.json compatibility while migrating writes to
     # user_config.json. The old unified file remains untouched as a backup.
     if requested.name.casefold() == LEGACY_UNIFIED_NAME:

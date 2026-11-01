@@ -8,6 +8,7 @@ from dataclasses import replace
 import json
 import logging
 import math
+import os
 import queue
 import signal
 import sys
@@ -297,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ui-refresh-ms", type=int, default=100,
                         help="debug UI queue polling interval (default: 100 ms)")
     parser.add_argument("--config", type=Path,
-                        default=Path(__file__).with_name("user_config.json"),
+                        default=Path(os.environ.get("MOONECLIPSE_CONFIG_DIR") or Path(__file__).parent) / "user_config.json",
                         help="persistent UI/user configuration file")
     parser.add_argument("--rope-calibration", type=Path, default=None,
                         help="legacy one-run rope calibration override")

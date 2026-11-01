@@ -351,25 +351,19 @@ def remove_consumed_update_package(package: DesktopUpdate) -> bool:
 
 
 def export_user_config(source: Path, roots: Optional[Iterable[Path]] = None) -> Path:
-    """Export the live configuration to ``Desktop\\助手配置\\新配置.json``.
+    """Export beside the selected installation's user-data folder.
 
-    ``pathlib.Path`` keeps the Unicode directory and filename intact on every
-    supported Windows locale, including Chinese desktop paths.
+    ``roots`` remains accepted for source compatibility, but the user-selected
+    install location is now the authority; Desktop is never used implicitly.
     """
 
     source = Path(source).resolve()
     if not source.is_file():
         raise UpdateError("当前运行目录找不到 user_config.json，无法导出。")
-    desktops = list(desktop_roots() if roots is None else roots)
-    if desktops:
-        desktop = Path(desktops[0])
-    else:
-        desktop = Path.home() / "Desktop"
-        try:
-            desktop.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise UpdateError(f"无法创建桌面导出目录: {exc}") from exc
-    target_directory = desktop / "助手配置"
+    del roots
+    target_directory = source.parent
+    if target_directory.name != "助手配置":
+        target_directory = target_directory / "助手配置"
     try:
         target_directory.mkdir(parents=True, exist_ok=True)
         target = target_directory / "新配置.json"

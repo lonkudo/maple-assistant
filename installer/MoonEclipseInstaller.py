@@ -1,0 +1,315 @@
+"""Standalone MoonEclipse installer and incremental updater.
+
+It is intentionally not imported by the running game helper.  It downloads
+only changed, SHA-256-verified files into a user-chosen root and remembers
+that root in a small LocalAppData pointer, never in the Windows Registry.
+"""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from typing import Any
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+HERE = Path(__file__).resolve().parent
+SOURCE_ROOT = HERE.parent
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+# In source form the pin lives beside the repository files.  In the standalone
+# installer Nuitka places it beside the executable; do not infer this from a
+# Registry entry or the user's selected installation folder.
+_exe_root = Path(sys.argv[0]).resolve().parent
+PIN_ROOT = next(
+    (candidate for candidate in (HERE, _exe_root, SOURCE_ROOT)
+     if (candidate / "activation_server_pin.json").is_file()),
+    SOURCE_ROOT,
+)
+
+from licensing import ACTIVATION_SERVER_ENDPOINT, machine_fingerprint_hash  # noqa: E402
+from pinned_tls import download_binary, post_json  # noqa: E402
+
+
+INSTALL_MARKER = ".mooneclipse-install.json"
+POINTER_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MoonEclipseInstaller"
+POINTER_FILE = POINTER_DIR / "last-install.json"
+APP_DIRECTORY = "app"
+CONFIG_DIRECTORY = "助手配置"
+MAX_DOWNLOAD_WORKERS = 4
+
+
+def _pointer_root() -> Path | None:
+    try:
+        payload = json.loads(POINTER_FILE.read_text(encoding="utf-8"))
+        root = Path(str(payload.get("install_root", ""))).resolve()
+        if (root / INSTALL_MARKER).is_file():
+            return root
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _save_pointer(root: Path) -> None:
+    POINTER_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = POINTER_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"install_root": str(root), "updated_at": int(time.time())}, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(POINTER_FILE)
+
+
+def _safe_path(value: Any) -> Path:
+    relative = PurePosixPath(str(value or "").replace("\\", "/"))
+    if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("unsafe manifest path")
+    return Path(*relative.parts)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(512 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_local_manifest(root: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((root / INSTALL_MARKER).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _write_launcher(root: Path) -> None:
+    """Keep user configuration beside the selected root, outside app updates."""
+
+    launcher = root / "启动 MoonEclipse.bat"
+    content = "\r\n".join((
+        "@echo off",
+        "setlocal",
+        "set \"MOONECLIPSE_CONFIG_DIR=%~dp0助手配置\"",
+        "call \"%~dp0app\\启动助手.bat\"",
+        "",
+    ))
+    launcher.write_text(content, encoding="ascii")
+
+
+def _start_first_install_setup(app_root: Path) -> bool:
+    """Start the existing dependency setup only when this is a fresh install.
+
+    Updates never recreate or replace ``.venv``.  A new installation keeps the
+    familiar elevated setup window because it may need to install Python.
+    """
+
+    if (app_root / ".venv" / "Scripts" / "pythonw.exe").is_file():
+        return False
+    setup = app_root / "安装.bat"
+    if not setup.is_file():
+        raise RuntimeError("安装包缺少首次安装程序。")
+    subprocess.Popen(
+        ["cmd.exe", "/c", str(setup)],
+        cwd=str(app_root),
+        shell=False,
+    )
+    return True
+
+
+class InstallerWindow:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("MoonEclipse 安装与更新")
+        self.root.resizable(False, False)
+        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.running = False
+        self.progress_value = 0.0
+        default_root = _pointer_root() or (Path.home() / "MoonEclipse")
+
+        outer = ttk.Frame(self.root, padding=18)
+        outer.grid(sticky="nsew")
+        ttk.Label(outer, text="MoonEclipse", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(outer, text="输入授权码后下载或更新已变更的文件。配置与录制内容不会被覆盖。").grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 14))
+        ttk.Label(outer, text="授权码").grid(row=2, column=0, sticky="w")
+        self.code = ttk.Entry(outer, width=48, show="*")
+        self.code.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+        ttk.Label(outer, text="安装位置").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.install_root = tk.StringVar(value=str(default_root))
+        ttk.Entry(outer, textvariable=self.install_root, width=42).grid(row=3, column=1, sticky="ew", padx=(8, 6), pady=(10, 0))
+        ttk.Button(outer, text="选择…", command=self._choose_root).grid(row=3, column=2, pady=(10, 0))
+
+        self.eclipse = tk.Canvas(outer, width=52, height=52, highlightthickness=0, background="#f6f7f9")
+        self.eclipse.grid(row=4, column=0, pady=(18, 0), sticky="w")
+        self.progress = ttk.Progressbar(outer, mode="determinate", length=340)
+        self.progress.grid(row=4, column=1, columnspan=2, pady=(18, 0), sticky="ew")
+        self.status = ttk.Label(outer, text="准备就绪")
+        self.status.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.install = ttk.Button(outer, text="开始安装 / 更新", command=self._start)
+        self.install.grid(row=6, column=2, sticky="e", pady=(16, 0))
+        self._paint_eclipse(0.0)
+        self.root.after(50, self._drain_events)
+
+    def _choose_root(self) -> None:
+        chosen = filedialog.askdirectory(parent=self.root, title="选择 MoonEclipse 安装位置", initialdir=self.install_root.get() or str(Path.home()))
+        if chosen:
+            self.install_root.set(chosen)
+
+    def _paint_eclipse(self, fraction: float) -> None:
+        self.eclipse.delete("all")
+        self.eclipse.create_oval(6, 6, 46, 46, fill="#f4d35e", outline="")
+        # The dark moon crosses the sun exactly with verified byte progress.
+        offset = -42 + max(0.0, min(1.0, fraction)) * 52
+        self.eclipse.create_oval(6 + offset, 6, 46 + offset, 46, fill="#202b3c", outline="")
+
+    def _start(self) -> None:
+        if self.running:
+            return
+        code = self.code.get().strip()
+        if not code:
+            messagebox.showwarning("缺少授权码", "请输入授权码。", parent=self.root)
+            return
+        root = Path(self.install_root.get()).expanduser()
+        self.running = True
+        self.install.state(["disabled"])
+        self.status.configure(text="正在验证授权码…")
+        threading.Thread(target=self._install_worker, args=(code, root), name="installer-download", daemon=True).start()
+
+    def _install_worker(self, code: str, root: Path) -> None:
+        try:
+            answer = post_json(
+                ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/session",
+                {"activation_code": "".join(code.upper().split()), "fingerprint": machine_fingerprint_hash()},
+                PIN_ROOT / "activation_server_pin.json",
+            )
+            manifest = answer.get("manifest")
+            token = str(answer.get("session_token", ""))
+            if not isinstance(manifest, dict) or not token:
+                raise RuntimeError("服务器返回的安装清单无效。")
+            files = manifest.get("files")
+            if not isinstance(files, list):
+                raise RuntimeError("服务器返回的安装清单无效。")
+            root = root.resolve()
+            app_root = root / APP_DIRECTORY
+            local = _load_local_manifest(root)
+            old = {str(item.get("path")): item for item in local.get("files", []) if isinstance(item, dict)}
+            planned = []
+            for item in files:
+                if not isinstance(item, dict):
+                    raise RuntimeError("服务器返回的安装清单无效。")
+                relative = _safe_path(item.get("path"))
+                existing = app_root / relative
+                if old.get(str(item.get("path")), {}).get("sha256") == item.get("sha256") and existing.is_file() and _sha256(existing) == item.get("sha256"):
+                    continue
+                planned.append((item, relative))
+            total = sum(int(item.get("size", 0)) for item, _ in planned)
+            self.events.put(("plan", (len(planned), total)))
+            staging = root / "updates" / ("stage-" + uuid.uuid4().hex)
+            staging.mkdir(parents=True, exist_ok=True)
+            completed = 0
+            completed_lock = threading.Lock()
+
+            def fetch(item: dict[str, Any], relative: Path) -> tuple[dict[str, Any], Path]:
+                nonlocal completed
+                target = staging / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                last_report = 0
+                def on_bytes(count: int) -> None:
+                    nonlocal completed, last_report
+                    with completed_lock:
+                        completed += count
+                        if completed - last_report >= 128 * 1024:
+                            last_report = completed
+                            self.events.put(("bytes", completed))
+                with target.open("wb") as output:
+                    received = download_binary(
+                        ACTIVATION_SERVER_ENDPOINT,
+                        "/api/v1/installer/files/" + "/".join(relative.parts),
+                        PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                    )
+                if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):
+                    raise RuntimeError(f"文件校验失败：{relative}")
+                return item, target
+
+            with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
+                futures = [pool.submit(fetch, item, relative) for item, relative in planned]
+                for future in as_completed(futures):
+                    future.result()
+            self.events.put(("bytes", total))
+            app_root.mkdir(parents=True, exist_ok=True)
+            # Only verified staging output reaches the live folder.
+            for item, relative in planned:
+                source = staging / relative
+                target = app_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(target)
+            # Remove files that a previous manifest owned but the current one
+            # no longer does.  User folders live outside app/ and are untouched.
+            current_paths = {str(item["path"]) for item in files}
+            for old_path in old:
+                if old_path not in current_paths:
+                    candidate = app_root / _safe_path(old_path)
+                    if candidate.is_file():
+                        candidate.unlink()
+            root.mkdir(parents=True, exist_ok=True)
+            (root / CONFIG_DIRECTORY).mkdir(parents=True, exist_ok=True)
+            install_state = {"format": "moon-eclipse-install/v1", "install_id": local.get("install_id") or uuid.uuid4().hex, "app_directory": APP_DIRECTORY, "version": manifest.get("version", ""), "files": files}
+            temporary = root / (INSTALL_MARKER + ".tmp")
+            temporary.write_text(json.dumps(install_state, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(root / INSTALL_MARKER)
+            _save_pointer(root)
+            _write_launcher(root)
+            shutil.rmtree(staging, ignore_errors=True)
+            first_setup = _start_first_install_setup(app_root)
+            self.events.put(("done", (root, first_setup)))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                kind, value = self.events.get_nowait()
+                if kind == "plan":
+                    count, total = value
+                    self._total_bytes = max(1, total)
+                    self.progress.configure(maximum=self._total_bytes, value=0)
+                    self.status.configure(text=f"正在下载 {count} 个已更新文件…")
+                elif kind == "bytes":
+                    self.progress_value = float(value) / float(getattr(self, "_total_bytes", 1))
+                    self.progress.configure(value=value)
+                    self._paint_eclipse(self.progress_value)
+                elif kind == "done":
+                    self.running = False
+                    self.install.state(["!disabled"])
+                    self._paint_eclipse(1.0)
+                    root, first_setup = value
+                    self.status.configure(text=f"安装完成：{root}")
+                    message = (
+                        "程序文件已下载。首次环境安装窗口已打开；完成后可双击“启动 MoonEclipse.bat”启动。"
+                        if first_setup else "安装/更新完成。可双击“启动 MoonEclipse.bat”启动。"
+                    )
+                    messagebox.showinfo("完成", message, parent=self.root)
+                elif kind == "error":
+                    self.running = False
+                    self.install.state(["!disabled"])
+                    self.status.configure(text="安装失败")
+                    messagebox.showerror("安装失败", str(value), parent=self.root)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._drain_events)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    InstallerWindow().run()

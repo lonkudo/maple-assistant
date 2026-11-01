@@ -36,7 +36,8 @@ from config_store import config_section_file
 from game_chat import send_game_chat_message
 from countdown_worker import play_mp3
 from licensing import (
-    LicenseStatus, activate as activate_license, activate_via_server,
+    LicenseStatus,
+    preview_activation_transfer_via_server, confirm_activation_transfer_via_server,
     revoke_license, set_device_memo_via_server, unbind_device_via_server,
     validate_via_server, verify_license,
 )
@@ -1060,7 +1061,7 @@ class NumericValueRangeControl:
         self.min_label.pack(side="left", fill="y")
         self.max_label: Optional[Any] = None
         if self.range_mode:
-            ttk_module.Label(self.frame, text="-").pack(side="left", fill="y")
+            ttk_module.Label(self.frame, text="~").pack(side="left", fill="y")
             self.max_label = ttk_module.Label(
                 self.frame, width=value_width, anchor="center",
                 style=self._NORMAL_STYLE,
@@ -1218,7 +1219,7 @@ class NumericValueRangeControl:
         return "break"
 
     def _click_adjust(self, side: str, direction: int) -> str:
-        """Apply one coarse click adjustment: exactly ten fine steps."""
+        """Apply one coarse click adjustment: exactly fifty fine steps."""
 
         label = self._label_for(side)
         try:
@@ -1230,7 +1231,7 @@ class NumericValueRangeControl:
         if self.before_change is not None:
             self.before_change()
         variable = self.minimum_var if side == "min" else self.maximum_var
-        coarse_delta = self.value_type(self.step * 10)
+        coarse_delta = self.value_type(self.step * 50)
         variable.set(self.value_type(variable.get() + int(direction) * coarse_delta))
         self.normalize(changed=side)
         if self.on_change is not None:
@@ -2810,6 +2811,40 @@ class UiWorker(threading.Thread):
             self._buff3_interval_label = self._buff3_interval_control.min_label
             ttk.Label(buff3_row, text="每隔").pack(side="left", padx=(8, 2))
             self._buff3_interval_control.pack(side="left")
+            buff4_row = ttk.Frame(drug_panel)
+            buff4_row.pack(fill="x", pady=(6, 0))
+            self._buff4_use_var = tk.BooleanVar(value=False)
+            buff4_use_button = ttk.Checkbutton(
+                buff4_row, text="增益 3", width=6, variable=self._buff4_use_var,
+                command=self._drug_on_change,
+            )
+            buff4_use_button.pack(side="left")
+            ttk.Label(buff4_row, text="按键:").pack(side="left", padx=(8, 4))
+            self._buff4_key_var = tk.StringVar(value="pagedown")
+            buff4_key_button = ttk.Button(
+                buff4_row, text=self._buff4_key_var.get(), width=14,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    buff4_key_button, self._buff4_key_var,
+                    "_buff4_key_previous",
+                    lambda: self._drug_on_change(),
+                ),
+            )
+            buff4_key_button.pack(side="left", padx=(0, 4))
+            self._buff4_key_button = buff4_key_button
+            self._attach_bind_hint(buff4_key_button)
+            self._buff4_interval_control = NumericValueRangeControl(
+                buff4_row, tk_module=tk, ttk_module=ttk,
+                minimum=600, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("增益3间隔"),
+                on_change=self._drug_on_change,
+            )
+            self._buff4_interval_var = self._buff4_interval_control.minimum_var
+            self._buff4_interval_label = self._buff4_interval_control.min_label
+            ttk.Label(buff4_row, text="每隔").pack(side="left", padx=(8, 2))
+            self._buff4_interval_control.pack(side="left")
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
@@ -3334,6 +3369,9 @@ class UiWorker(threading.Thread):
                 command=self._copy_running_log,
                 takefocus=False,
             )
+            running_log_hint = HoverTooltip(self._copy_log_button, "运行日志")
+            running_log_hint.set_enabled(True)
+            self._bind_key_tooltips.append(running_log_hint)
             self._import_config_button = ttk.Button(
                 log_actions, text="导入配置",
                 command=self._import_user_config,
@@ -3357,6 +3395,9 @@ class UiWorker(threading.Thread):
                 command=self._copy_server_client_log,
                 takefocus=False,
             )
+            server_log_hint = HoverTooltip(self._copy_server_log_button, "授权日志")
+            server_log_hint.set_enabled(True)
+            self._bind_key_tooltips.append(server_log_hint)
             self._copy_server_log_button.pack(side="left", padx=(0, 3))
             self._log_auto_lie_photo = _make_log_icon("auto_lie", root)
             self._copy_auto_lie_log_button = ttk.Button(
@@ -3365,6 +3406,9 @@ class UiWorker(threading.Thread):
                 command=self._copy_auto_lie_log,
                 takefocus=False,
             )
+            auto_lie_log_hint = HoverTooltip(self._copy_auto_lie_log_button, "自动测谎日志")
+            auto_lie_log_hint.set_enabled(True)
+            self._bind_key_tooltips.append(auto_lie_log_hint)
             self._copy_auto_lie_log_button.pack(side="left", padx=(0, 3))
             self._import_config_button.pack(side="left", padx=(0, 3))
             self._export_config_button.pack(side="left")
@@ -5581,18 +5625,50 @@ class UiWorker(threading.Thread):
         if not code:
             return
         code = str(code).strip()
-        # Supersede an initial/previous heartbeat that may still be awaiting a
-        # response.  The explicit activation result is the new session state.
+        prior_status = self._license_status
+        # Every code uses the same two-step transfer protocol.  Previewing is
+        # read-only; only the customer-confirmed request can change bindings.
+        preview = preview_activation_transfer_via_server(code)
+        if not preview.ok or not preview.transfer_token:
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("授权失败", preview.message, parent=self._root)
+            except Exception:
+                LOG.debug("activation preview refusal alert could not open", exc_info=True)
+            return
+        try:
+            from tkinter import messagebox
+            if preview.bound_elsewhere:
+                old_id = preview.bound_equipment_id or "未知设备"
+                prompt = (
+                    f"该授权码当前绑定设备：{old_id}。\n\n"
+                    "确认后将解绑该设备并绑定到当前设备。"
+                    "原设备将在下一次授权校验时停止运行。\n\n"
+                    "确定要更换授权吗？"
+                )
+            else:
+                prompt = "该授权码尚未绑定设备。\n\n确定要激活到当前设备吗？"
+            if not messagebox.askyesno("确认授权", prompt, parent=self._root):
+                return
+        except Exception:
+            LOG.exception("activation transfer confirmation dialog could not open")
+            return
+        # Supersede a pending heartbeat only after the customer has
+        # deliberately confirmed the server's preview.
         self._license_heartbeat_generation += 1
         self._license_online_validation_pending = False
-        # Save the new code before contacting a local or online validator.  A
-        # rejected value must not silently leave the previous submitted code
-        # in user_config.json.
-        self._save_license_attempt(code)
-        if str(code).strip().upper().startswith("MAL-"):
-            activation_status = activate_via_server(code)
-        else:
-            activation_status = activate_license(code)
+        activation_status = confirm_activation_transfer_via_server(preview.transfer_token)
+        if not activation_status.valid:
+            # A stale/failed transfer must never remove a still-valid local
+            # entitlement merely because the server rejected phase two.
+            self._license_status = prior_status
+            self._refresh_license_ui()
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("授权失败", activation_status.message, parent=self._root)
+            except Exception:
+                LOG.debug("activation transfer refusal alert could not open", exc_info=True)
+            return
         # An explicit replacement attempt must not hide a device ID that was
         # already known for this installation.  Current servers return it on
         # every rejection; this fallback also keeps the header correct while
@@ -7845,19 +7921,65 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.exception("clipboard copy failed")
 
+    def _save_log_file_and_copy(self, filename: str, text: str, log_type: str) -> None:
+        """Write one shareable log file under the selected ``助手配置`` folder.
+
+        The icon actions intentionally export a concrete ``.txt`` file rather
+        than only text: it can be pasted into a chat or attached elsewhere
+        without asking the operator to locate a transient program log.
+        """
+
+        try:
+            config_path = Path(self.user_config_path) if self.user_config_path else None
+            folder = config_path.parent if config_path is not None else application_root(__file__) / "助手配置"
+            if folder.name != "助手配置":
+                folder = folder / "助手配置"
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / filename
+            temporary = target.with_suffix(target.suffix + ".tmp")
+            temporary.write_text(text, encoding="utf-8")
+            temporary.replace(target)
+        except OSError:
+            LOG.exception("%s导出失败：无法写入助手配置文件夹", log_type)
+            return
+
+        copied_file = False
+        try:
+            import win32clipboard
+
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                # pywin32 accepts a tuple of absolute paths for CF_HDROP;
+                # Windows then pastes the file itself, rather than its name.
+                win32clipboard.SetClipboardData(
+                    win32clipboard.CF_HDROP, (str(target.resolve()),)
+                )
+                copied_file = True
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            # The export remains useful even when another program has the
+            # clipboard locked.  Leave its full path in the normal text
+            # clipboard as a usable fallback.
+            LOG.warning("%s文件复制失败，已复制路径：%s", log_type, target, exc_info=True)
+            self._copy_to_clipboard(str(target))
+
+        if copied_file:
+            LOG.info("%s已导出并复制文件：%s", log_type, target)
+
     def _copy_running_log(self) -> None:
-        """Archive button: copy the in-memory running log to the clipboard."""
+        """Export the in-memory running log and copy its text file."""
 
         text = ""
         if self.ui_log_handler is not None:
             text = self.ui_log_handler.history_text()
         if not text.strip():
             text = "(暂无运行日志)"
-        self._copy_to_clipboard(text)
-        LOG.info("运行日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
+        self._save_log_file_and_copy("运行日志.txt", text, "运行日志")
 
     def _copy_server_client_log(self) -> None:
-        """Linked-nodes button: copy the safe server-client interaction log."""
+        """Export the safe server-client interaction log and copy its file."""
 
         path = Path(__file__).resolve().parent / "server_client.log"
         try:
@@ -7868,11 +7990,10 @@ class UiWorker(threading.Thread):
             text = raw.decode("utf-8", errors="replace")
         if not text.strip():
             text = "(server_client.log 为空或不存在)"
-        self._copy_to_clipboard(text)
-        LOG.info("server_client.log 已复制到剪贴板（%d 行）", text.count("\n") + 1)
+        self._save_log_file_and_copy("授权日志.txt", text, "授权日志")
 
     def _copy_auto_lie_log(self) -> None:
-        """Copy the dedicated automatic lie-detector/API trace for pasting."""
+        """Export the automatic-lie trace and copy its file."""
 
         path = application_root(__file__) / "auto_lie.log"
         try:
@@ -7883,8 +8004,7 @@ class UiWorker(threading.Thread):
             text = raw.decode("utf-8", errors="replace")
         if not text.strip():
             text = "(自动过测谎日志为空或不存在)"
-        self._copy_to_clipboard(text)
-        LOG.info("自动过测谎日志已复制到剪贴板（%d 行）", text.count("\n") + 1)
+        self._save_log_file_and_copy("自动测谎日志.txt", text, "自动测谎日志")
 
     def _import_user_config(self) -> None:
         """Choose a saved configuration and refresh the running helper."""
@@ -7895,9 +8015,9 @@ class UiWorker(threading.Thread):
         try:
             from tkinter import filedialog
 
-            desktops = desktop_roots()
-            desktop = desktops[0] if desktops else Path.home() / "Desktop"
-            config_folder = desktop / "助手配置"
+            config_folder = Path(self.user_config_path).parent
+            if config_folder.name != "助手配置":
+                config_folder = config_folder / "助手配置"
             config_folder.mkdir(parents=True, exist_ok=True)
             source = filedialog.askopenfilename(
                 parent=self._root,
@@ -8123,7 +8243,7 @@ class UiWorker(threading.Thread):
         return True
 
     def _export_user_config(self) -> None:
-        """Export the live configuration to ``桌面\\助手配置\\新配置.json``."""
+        """Export the live configuration to the selected ``助手配置`` folder."""
 
         if not self.user_config_path:
             LOG.warning("%s失败：当前用户配置路径不可用", LOG_CONFIG_EXPORT)
@@ -8138,7 +8258,7 @@ class UiWorker(threading.Thread):
         except UpdateError as exc:
             LOG.warning("%s失败：%s", LOG_CONFIG_EXPORT, exc)
             return
-        LOG.info("%s成功：已导出到桌面 %s", LOG_CONFIG_EXPORT, target)
+        LOG.info("%s成功：已导出到 %s", LOG_CONFIG_EXPORT, target)
 
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
@@ -10102,6 +10222,7 @@ class UiWorker(threading.Thread):
             getattr(self, "_buff1_interval_control", None),
             getattr(self, "_buff2_interval_control", None),
             getattr(self, "_buff3_interval_control", None),
+            getattr(self, "_buff4_interval_control", None),
         ):
             if control is not None:
                 control.normalize()
@@ -10125,12 +10246,18 @@ class UiWorker(threading.Thread):
             self._buff3_interval_label.configure(
                 text=f"{int(round(self._buff3_interval_var.get()))}s"
             )
+        if hasattr(self, "_buff4_interval_label"):
+            self._buff4_interval_label.configure(
+                text=f"{int(round(self._buff4_interval_var.get()))}s"
+            )
         if hasattr(self, "_buff1_key_button"):
             self._buff1_key_button.configure(text=self._buff1_key_var.get())
         if hasattr(self, "_buff2_key_button"):
             self._buff2_key_button.configure(text=self._buff2_key_var.get())
         if hasattr(self, "_buff3_key_button"):
             self._buff3_key_button.configure(text=self._buff3_key_var.get())
+        if hasattr(self, "_buff4_key_button"):
+            self._buff4_key_button.configure(text=self._buff4_key_var.get())
         data = {
             "hp_key": self._hp_key_var.get().strip(),
             "mp_key": self._mp_key_var.get().strip(),
@@ -10141,13 +10268,16 @@ class UiWorker(threading.Thread):
             "buff1_key": self._buff1_key_var.get().strip(),
             "buff2_key": self._buff2_key_var.get().strip(),
             "buff3_key": self._buff3_key_var.get().strip(),
+            "buff4_key": self._buff4_key_var.get().strip(),
             "buff_interval_unit": "seconds",
             "buff1_interval": int(round(float(self._buff1_interval_var.get()))),
             "buff2_interval": int(round(float(self._buff2_interval_var.get()))),
             "buff3_interval": int(round(float(self._buff3_interval_var.get()))),
+            "buff4_interval": int(round(float(self._buff4_interval_var.get()))),
             "buff1_enabled": bool(self._buff1_use_var.get()),
             "buff2_enabled": bool(self._buff2_use_var.get()),
             "buff3_enabled": bool(self._buff3_use_var.get()),
+            "buff4_enabled": bool(self._buff4_use_var.get()),
         }
         self._drug_save_settings(data)
         self._drug_apply_to_worker(data)
@@ -10180,6 +10310,8 @@ class UiWorker(threading.Thread):
                 self._buff2_key_var.set(str(data["buff2_key"]))
             if "buff3_key" in data:
                 self._buff3_key_var.set(str(data["buff3_key"]))
+            if "buff4_key" in data:
+                self._buff4_key_var.set(str(data["buff4_key"]))
             # Older configuration files stored minutes.  The explicit unit
             # tag makes the one-time conversion unambiguous, including 5s.
             legacy_minutes = data.get("buff_interval_unit") != "seconds"
@@ -10187,6 +10319,7 @@ class UiWorker(threading.Thread):
                 ("buff1_interval", self._buff1_interval_var),
                 ("buff2_interval", self._buff2_interval_var),
                 ("buff3_interval", self._buff3_interval_var),
+                ("buff4_interval", self._buff4_interval_var),
             ):
                 if name not in data:
                     continue
@@ -10200,6 +10333,8 @@ class UiWorker(threading.Thread):
                 self._buff2_use_var.set(bool(data["buff2_enabled"]))
             if "buff3_enabled" in data:
                 self._buff3_use_var.set(bool(data["buff3_enabled"]))
+            if "buff4_enabled" in data:
+                self._buff4_use_var.set(bool(data["buff4_enabled"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed drug settings", exc_info=True)
             return
@@ -12657,6 +12792,46 @@ class UiWorker(threading.Thread):
         )
         self._refresh_patrol_controls()
 
+    def _schedule_layer_axis_redraw(self) -> None:
+        """Redraw axes after Tk assigns their final row width.
+
+        Adding or removing a layer recreates its Canvas.  During that same
+        callback it temporarily reports only its requested width; the final
+        width arrives in ``<Configure>`` one idle turn later.  This redraw is
+        intentionally independent of the normal patrol-controls render key,
+        because the recording data did not change merely because geometry did.
+        """
+
+        root = getattr(self, "_root", None)
+        if root is None or getattr(self, "_layer_axis_redraw_job", None) is not None:
+            return
+        try:
+            self._layer_axis_redraw_job = root.after_idle(
+                self._redraw_layer_axes_after_layout
+            )
+        except Exception:
+            self._layer_axis_redraw_job = None
+
+    def _redraw_layer_axes_after_layout(self) -> None:
+        """Paint all current axes using their settled canvas dimensions."""
+
+        self._layer_axis_redraw_job = None
+        controller = getattr(self, "patrol_controller", None)
+        if controller is None:
+            return
+        try:
+            snapshot = controller.snapshot()
+            for layer_name in tuple(getattr(self, "_layer_row_names", ())):
+                canvas = self._layer_axis_canvases.get(layer_name)
+                if canvas is None or not bool(canvas.winfo_exists()):
+                    continue
+                self._draw_layer_axis(
+                    layer_name, snapshot.layers.get(layer_name, {}),
+                    snapshot.split_points,
+                )
+        except Exception:
+            LOG.debug("layer-axis post-layout redraw failed", exc_info=True)
+
     def _ensure_layer_rows(self, layer_names: tuple[str, ...]) -> None:
         if layer_names == self._layer_row_names:
             return
@@ -12703,7 +12878,7 @@ class UiWorker(threading.Thread):
             # 8%–92% range fills the whole visible layer canvas.
             canvas.bind(
                 "<Configure>",
-                lambda _event: self._root.after_idle(self._refresh_patrol_controls),
+                lambda _event: self._schedule_layer_axis_redraw(),
                 add="+",
             )
             # Recording choices are intentionally right-click only.  Left
@@ -12714,6 +12889,7 @@ class UiWorker(threading.Thread):
                 lambda event, layer=layer_name: self._layer_axis_menu(event, layer),
             )
             self._layer_axis_canvases[layer_name] = canvas
+        self._schedule_layer_axis_redraw()
 
 
 __all__ = [

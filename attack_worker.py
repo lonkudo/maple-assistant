@@ -340,7 +340,7 @@ class AttackWorker(threading.Thread):
                 can_fire = False
             if can_fire and (self.climbing_active_event is not None
                     and self.climbing_active_event.is_set()):
-                LOG.info("attack skipped: climb/return input is active")
+                LOG.info("attack skipped: movement recovery/action input is active")
                 can_fire = False
             if (can_fire and self.direction_transition_event is not None
                     and self.direction_transition_event.is_set()):
@@ -398,7 +398,7 @@ class AttackWorker(threading.Thread):
                     can_fire = False
                 if can_fire and (self.climbing_active_event is not None
                         and self.climbing_active_event.is_set()):
-                    LOG.info("attack skipped: climb/return input is active")
+                    LOG.info("attack skipped: movement recovery/action input is active")
                     can_fire = False
             if not can_fire and attack_lease and self.motion_arbiter is not None:
                 # A Stop/climb edge may happen directly after reservation.

@@ -1861,12 +1861,15 @@ class StatusConfig:
     buff1_key: str = "home"
     buff2_key: str = "insert"
     buff3_key: str = "pageup"
+    buff4_key: str = "pagedown"
     buff1_interval: float = 600.0
     buff2_interval: float = 600.0
     buff3_interval: float = 600.0
+    buff4_interval: float = 600.0
     buff1_enabled: bool = False
     buff2_enabled: bool = False
     buff3_enabled: bool = False
+    buff4_enabled: bool = False
     # Three side-by-side bars in the fixed-pixel info bar.  Measured on the
     # current real client at the 1080x768 preset (425x32 capture): HP red
     # x 367-499, MP blue x 502-631, EXP yellow x 641-771 - each bar is ~130 px
@@ -2143,11 +2146,11 @@ class StatusWorker(threading.Thread):
         # 增益为"定时触发"，不从开局立即触发：起始时间戳设为当前时刻，
         # 第一个增益会在 interval 秒后才按（用户会先手动触发第一次增益）。
         self._last_buff = {"buff1": time.monotonic(), "buff2": time.monotonic(),
-                          "buff3": time.monotonic()}
-        # Buff 2/3 can wait in MotionArbiter while climbing.  Keep one local
+                          "buff3": time.monotonic(), "buff4": time.monotonic()}
+        # Buff 2/3/4 can wait in MotionArbiter while climbing.  Keep one local
         # in-flight marker so an elapsed timer cannot enqueue duplicates; it
         # clears only when the arbiter reports success/failure.
-        self._buff_pending = {"buff2": False, "buff3": False}
+        self._buff_pending = {"buff2": False, "buff3": False, "buff4": False}
         self._buff_timer_lock = threading.Lock()
         # Optional Dead Flower integration.  UI mapping is fixed: buff1 is
         # 饲料, buff2 is 增益 1.  The flower cadence owns only 增益 1's timer
@@ -2157,7 +2160,7 @@ class StatusWorker(threading.Thread):
         # Buff landing verification: the HUD readings before a buff tap, so the
         # next frames can prove whether the game cast anything at all.
         self._buff_verification: dict[str, Optional[dict[str, Any]]] = {
-            "buff1": None, "buff2": None, "buff3": None,
+            "buff1": None, "buff2": None, "buff3": None, "buff4": None,
         }
         self._last_hp: Optional[int] = None
         self._last_mp: Optional[int] = None
@@ -2356,6 +2359,8 @@ class StatusWorker(threading.Thread):
              config.buff2_enabled),
             ("buff3", config.buff3_key, config.buff3_interval,
              config.buff3_enabled),
+            ("buff4", config.buff4_key, config.buff4_interval,
+             config.buff4_enabled),
         ):
             if not enabled or not key or interval <= 0:
                 continue
@@ -2577,7 +2582,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
 
     ``data`` uses the UI's form: key names, integer percents (0..100) for
     ``hp_threshold``/``mp_threshold``, and seconds for the periodic buff
-    ``buff1_interval``/``buff2_interval``/``buff3_interval``. Unsupported or
+    ``buff1_interval``/``buff2_interval``/``buff3_interval``/``buff4_interval``. Unsupported or
     unknown keys are ignored (the existing binding stays).
     """
 
@@ -2587,9 +2592,11 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         ("hp_enabled", "hp_enabled"), ("mp_enabled", "mp_enabled"),
         ("buff1_key", "buff1_key"), ("buff2_key", "buff2_key"),
         ("buff3_key", "buff3_key"),
+        ("buff4_key", "buff4_key"),
         ("buff1_enabled", "buff1_enabled"),
         ("buff2_enabled", "buff2_enabled"),
         ("buff3_enabled", "buff3_enabled"),
+        ("buff4_enabled", "buff4_enabled"),
     ):
         if data_key not in data:
             continue
@@ -2617,6 +2624,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         ("buff1_interval", "buff1_interval"),
         ("buff2_interval", "buff2_interval"),
         ("buff3_interval", "buff3_interval"),
+        ("buff4_interval", "buff4_interval"),
     ):
         if data_key not in data:
             continue
