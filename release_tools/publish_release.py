@@ -84,7 +84,17 @@ def multipart_publish(endpoint: str, token: str, manifest: dict, files: list[Pat
             raise PinnedTlsError("server certificate pin mismatch")
         connection.request("POST", parts.path.rstrip("/") + "/api/v1/operator/releases/publish", body=body, headers={"Authorization": f"Bearer {token}", "Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body))})
         response = connection.getresponse()
-        payload = json.loads(response.read().decode("utf-8"))
+        raw_payload = response.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError:
+            # Reverse proxies commonly return an HTML error page (for example
+            # a request-body limit) before Django can emit its JSON response.
+            # Preserve the useful status without dumping a whole page.
+            snippet = " ".join(raw_payload.split())[:300] or "empty response"
+            raise RuntimeError(
+                f"publish rejected HTTP {response.status}: {snippet}"
+            ) from None
         if response.status >= 400:
             raise RuntimeError(payload.get("message", "publish rejected"))
         return payload
