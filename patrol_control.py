@@ -419,6 +419,10 @@ class PatrolController:
             # first changed floor and would leave the rest of the profile on
             # the legacy per-frame calculation.
             migrated = _recalculate_layer_band(layer) or migrated
+        # Older recordings may have two boundaries but only retain buckets
+        # which happened to receive a point.  Normalize them once at load so
+        # parts are always 0..N and a three-part map cannot collapse to two.
+        migrated = self._ensure_split_part_buckets_locked() or migrated
         if migrated:
             self._persist_locked()
 
@@ -680,6 +684,54 @@ class PatrolController:
         return sum(1 for point in self._split_points_locked()
                    if float(x) >= float(point["x"]))
 
+    def _split_part_count_locked(self) -> int:
+        """Return every geometric map section, including empty ones.
+
+        Two wave boundaries produce three sections.  Do not derive this from
+        ``part_points``: a section may legitimately have no recorded layer2
+        supporters, while still needing a stable index for layer1 and for the
+        later left-to-right patrol pass.
+        """
+
+        return len(self._split_points_locked()) + 1
+
+    @staticmethod
+    def _new_split_part(layer: dict[str, Any]) -> dict[str, Any]:
+        """Create an empty part retaining its layer-level band defaults."""
+
+        part = {
+            "y_tolerance": float(layer.get("y_tolerance", 0.020000)),
+            "world_y_tolerance": float(layer.get("world_y_tolerance", 0.75)),
+        }
+        for anchor_key in (
+            "layer_y", "layer_world_y", "y_tolerance_diamonds",
+            "world_y_tolerance",
+        ):
+            if anchor_key in layer:
+                part[anchor_key] = deepcopy(layer[anchor_key])
+        return part
+
+    def _ensure_split_part_buckets_locked(self) -> bool:
+        """Ensure every layer has a stable bucket for every split section."""
+
+        count = self._split_part_count_locked()
+        if count <= 1:
+            return False
+        changed = False
+        for layer in self._profile.get("layers", {}).values():
+            if not isinstance(layer, dict):
+                continue
+            parts = layer.get("part_points")
+            if not isinstance(parts, dict):
+                parts = layer["part_points"] = {}
+                changed = True
+            for index in range(count):
+                key = str(index)
+                if not isinstance(parts.get(key), dict):
+                    parts[key] = self._new_split_part(layer)
+                    changed = True
+        return changed
+
     def _part_layer_locked(
         self, layer: dict[str, Any], part_index: int, *, create: bool = False,
     ) -> Optional[dict[str, Any]]:
@@ -691,10 +743,7 @@ class PatrolController:
         key = str(max(0, int(part_index)))
         part = parts.get(key)
         if not isinstance(part, dict) and create:
-            part = parts[key] = {
-                "y_tolerance": float(layer.get("y_tolerance", 0.020000)),
-                "world_y_tolerance": float(layer.get("world_y_tolerance", 0.75)),
-            }
+            part = parts[key] = self._new_split_part(layer)
         return part if isinstance(part, dict) else None
 
     def record_split_point(
@@ -753,10 +802,9 @@ class PatrolController:
                         if not isinstance(item, dict) or "x" not in item:
                             continue
                         index = self._part_index_for_x_locked(float(item["x"]))
-                        target = parts.setdefault(str(index), {
-                            "y_tolerance": float(layer.get("y_tolerance", 0.020000)),
-                            "world_y_tolerance": float(layer.get("world_y_tolerance", 0.75)),
-                        })
+                        target = parts.setdefault(
+                            str(index), self._new_split_part(layer)
+                        )
                         # Existing flat recordings already have the canonical
                         # layer anchors.  Preserve them per part so a newly
                         # split map can start patrol immediately instead of
@@ -771,10 +819,19 @@ class PatrolController:
                             target.setdefault(name, []).append(deepcopy(item))
                         else:
                             target[name] = deepcopy(item)
+                # Keep an explicit bucket for *every* geometric section.
+                # In particular, adding a second wave must create part 3
+                # even before the operator records points there.  The
+                # movement worker uses this stable numbering to pass
+                # part1 -> part2 -> part3 -> part1; it does not mistake an
+                # empty higher layer for a missing map section.
+                for index in range(self._split_part_count_locked()):
+                    parts.setdefault(str(index), self._new_split_part(layer))
                 for part in parts.values():
                     _recalculate_layer_band(part)
                 layer["part_points"] = parts
                 layer.setdefault("patrol_times", 1)
+            self._ensure_split_part_buckets_locked()
             self._persist_locked()
             return RecordedEndpoint(self._selected_layer, "split_point", x, point["y"])
 
@@ -827,7 +884,9 @@ class PatrolController:
             layer = self._profile.get("layers", {}).get(layer_name)
             if not isinstance(layer, dict):
                 raise ValueError(f"未知楼层：{layer_name}")
-            layer["patrol_times"] = max(1, min(99, int(times)))
+            # One independent repeat count belongs to each logical layer.
+            # Split parts deliberately inherit their parent layer's count.
+            layer["patrol_times"] = max(1, min(20, int(times)))
             self._persist_locked()
 
     def _adaptive_ready_locked(self, name: str) -> bool:

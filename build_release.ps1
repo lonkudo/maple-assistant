@@ -52,7 +52,7 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
                    # user_config.json and must never be overwritten by an
                    # application update. system_config.json is intentionally
                    # included so internal calibration follows each version.
-                   "config.json", "user_config.json", "license.json",
+                   "config.json", "user_config.json", "license.json", "auth.json",
                    "release_no_trade.ps1",
                    "trade_config.json",
                    "recording-configuration.json",

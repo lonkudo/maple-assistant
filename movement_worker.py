@@ -211,6 +211,12 @@ JUMP_POINT_Y_TOLERANCE = 0.015
 # between frames, so give it one extra half-marker step without making nearby
 # skill points overlap during a single traversal.
 SKILL_POINT_X_TOLERANCE = 0.016
+# Ctrl+E records a release key at each skill point.  The runtime cooldown is
+# owned here, at the actual patrol emission boundary: a key such as ``2`` may
+# be recorded at many points, but it is emitted at most once every ten seconds
+# regardless of which point/leg requested it.  Ctrl+E itself is only a recorder
+# hotkey and deliberately has no part in this cooldown.
+SKILL_POINT_KEY_COOLDOWN_SECONDS = 6.0
 # A left/right point that lands on a horizontal platform needs only a brief
 # post-Alt guard, then two stable 5-FPS samples before its Up claim releases.
 # A point that really grabbed a rope hands over earlier, on its first upward
@@ -903,6 +909,17 @@ LAYER_NEAREST_FLOOR_MAX_DISTANCE = 0.050
 # knock-down and return-to-route logic wait.  A healthy descent needs one chord per floor (about 1-2 s
 # each), so this is generous.
 DROP_TO_FIRST_MAX_SECONDS = 10.0
+
+# A failed Alt+Down can attach the character to a rope instead of dropping
+# through the platform.  The minimap signature is deliberately narrower than
+# a normal fall: two 5-FPS samples with only a tiny, steady Y increase while
+# the marker stays on the rope X.  A real drop crosses substantially more Y
+# per sample and must never be mistaken for the rope escape.
+DROP_ROPE_ESCAPE_MIN_Y_STEP = 0.001
+DROP_ROPE_ESCAPE_MAX_Y_STEP = 0.012
+DROP_ROPE_ESCAPE_MAX_X_DRIFT = 0.004
+DROP_ROPE_ESCAPE_FRAMES = 2
+DROP_ROPE_ESCAPE_WINDOW_SECONDS = 1.2
 
 
 def _layer_y_distance(layer: Any, player_y: float) -> Optional[float]:
@@ -4038,6 +4055,9 @@ class MovementWorker(threading.Thread):
         self._split_route_order: tuple[str, ...] = ()
         self._split_transition_after_drop = False
         self._skill_fired_tokens: set[tuple[int, str, str, int]] = set()
+        self._skill_pending_tokens: set[tuple[int, str, str, int]] = set()
+        self._skill_delivery_lock = threading.Lock()
+        self._skill_key_last_emitted_at: dict[str, float] = {}
         # A layer patrols with any non-empty subset of Left/Rope/Right; a
         # layer with NO recorded action (or an empty profile) stands still
         # and only attacks.
@@ -4242,6 +4262,9 @@ class MovementWorker(threading.Thread):
         # configured recorded route, it borrows that route to climb back after
         # a fall.  It never writes an anchor into the map.
         self.stationary_attack_enabled = False
+        # 跑花模式 retains the ordinary patrol state machine.  This flag only
+        # gates combat actions against the movement-owned confirmed layer.
+        self.flower_patrol_mode = False
         # 双桩模式 deliberately reuses the stationary correction state, but
         # owns a separate persisted pair of posts and switch clock.  The
         # active post is copied into ``_stationary_attack_anchor`` only while
@@ -4285,6 +4308,11 @@ class MovementWorker(threading.Thread):
         self._dead_flower_buff2_request: Any = None
         self._dead_flower_buff2_cycle_started = False
         self._dead_flower_buff2_unavailable_logged = False
+        # Log each reached flower waypoint once.  The route still evaluates it
+        # at 5 FPS, but the diagnostic file should show the real point rather
+        # than hundreds of indistinguishable timer-wait lines.
+        self._dead_flower_logged_wait_target: Optional[int] = None
+        self._dead_flower_log_signature: Optional[tuple[Any, ...]] = None
         self._dead_flower_vertical_key: Optional[str] = None
         self._dead_flower_drop_start_y: Optional[float] = None
         self._dead_flower_drop_attempts = 0
@@ -4570,6 +4598,10 @@ class MovementWorker(threading.Thread):
         self._last_minimap_box: Optional[tuple[int, int, int, int]] = None
         self._last_structure_mode: Optional[str] = None
         self._debug_last_layer: Optional[str] = None
+        # Published by the movement-owned layer resolver.  AttackWorker reads
+        # it only through ``flower_patrol_attack_allowed``; it never attempts
+        # to reconstruct a floor from frames or route state itself.
+        self._confirmed_attack_layer: Optional[str] = None
         self._movement_status_log_signature: Optional[tuple[Any, ...]] = None
         self._movement_status_log_at = float("-inf")
         self._movement_status_log_position: Optional[tuple[float, float]] = None
@@ -4600,6 +4632,13 @@ class MovementWorker(threading.Thread):
         # shared fallbacks log their evidence once per reading.
         self._drop_relaxed_y: Optional[float] = None
         self._drop_relaxed_floor: Optional[str] = None
+        # Per-Alt+Down safety watch.  This is intentionally separate from the
+        # route drop-arrival evidence above: it only identifies an accidental
+        # rope attachment immediately after a drop chord.
+        self._drop_rope_escape_armed = False
+        self._drop_rope_escape_last_position: Optional[Point] = None
+        self._drop_rope_escape_tiny_rise_frames = 0
+        self._drop_rope_escape_deadline = float("-inf")
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
         # StatusWorker reports a confirmed HP decrease with the shared capture
@@ -5574,9 +5613,112 @@ class MovementWorker(threading.Thread):
         """Emit Alt+Down while excluding patrol and 小碎步 directions."""
 
         with self._direction_lock:
-            return _drop_through_platform(
+            sent = _drop_through_platform(
                 self.key_sender, self.drop_chord_hold_seconds
             )
+        if sent:
+            player = getattr(getattr(self, "last_observation", None), "player", None)
+            self._drop_rope_escape_armed = player is not None
+            self._drop_rope_escape_last_position = (
+                Point(float(player.x), float(player.y)) if player is not None else None
+            )
+            self._drop_rope_escape_tiny_rise_frames = 0
+            self._drop_rope_escape_deadline = (
+                time.monotonic() + DROP_ROPE_ESCAPE_WINDOW_SECONDS
+            )
+        return sent
+
+    def _clear_drop_rope_escape_watch(self) -> None:
+        self._drop_rope_escape_armed = False
+        self._drop_rope_escape_last_position = None
+        self._drop_rope_escape_tiny_rise_frames = 0
+        self._drop_rope_escape_deadline = float("-inf")
+
+    def _escape_accidental_rope_after_drop(
+        self, observation: MinimapObservation
+    ) -> bool:
+        """Escape the rope-only Alt+Down failure signature, if confirmed.
+
+        A platform fall moves markedly down the minimap.  The accidental rope
+        attachment reported by the operator instead advances in two tiny,
+        stable-X Y increments.  Two fresh transitions are the minimum usable
+        confirmation at the shared 5-FPS capture pace.
+        """
+
+        if not self._drop_rope_escape_armed:
+            return False
+        if time.monotonic() > self._drop_rope_escape_deadline:
+            self._clear_drop_rope_escape_watch()
+            return False
+        player = observation.player
+        if player is None:
+            return False
+        previous = self._drop_rope_escape_last_position
+        current = Point(float(player.x), float(player.y))
+        if previous is None:
+            self._drop_rope_escape_last_position = current
+            return False
+        delta_y = current.y - previous.y
+        delta_x = current.x - previous.x
+        tiny_rope_progress = bool(
+            DROP_ROPE_ESCAPE_MIN_Y_STEP <= delta_y <= DROP_ROPE_ESCAPE_MAX_Y_STEP
+            and abs(delta_x) <= DROP_ROPE_ESCAPE_MAX_X_DRIFT
+        )
+        self._drop_rope_escape_last_position = current
+        if not tiny_rope_progress:
+            # A material downward movement is normal drop evidence.  Do not
+            # leave a stale watch armed for a later, unrelated rope approach.
+            if delta_y > DROP_ROPE_ESCAPE_MAX_Y_STEP:
+                self._clear_drop_rope_escape_watch()
+            else:
+                self._drop_rope_escape_tiny_rise_frames = 0
+            return False
+        self._drop_rope_escape_tiny_rise_frames += 1
+        if self._drop_rope_escape_tiny_rise_frames < DROP_ROPE_ESCAPE_FRAMES:
+            return False
+
+        # Side-local escape: on the left half jump left; on the right half
+        # jump right.  Key-down is a real SendInput chord so neither key is
+        # delayed behind the other.
+        direction = "left" if current.x <= 0.5 else "right"
+        self._clear_drop_rope_escape_watch()
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning(
+                "DROP ROPE ESCAPE suppressed: target window is not safely selected"
+            )
+            return False
+        key_down_chord = getattr(self.key_sender, "key_down_chord", None)
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if key_up is None:
+            return False
+        alt_claimed = direction_claimed = False
+        try:
+            if callable(key_down_chord):
+                claimed = key_down_chord("alt", direction)
+                alt_claimed = direction_claimed = claimed is not False
+            elif callable(key_down):
+                alt_claimed = key_down("alt") is not False
+                direction_claimed = key_down(direction) is not False
+            if not (alt_claimed and direction_claimed):
+                return False
+            time.sleep(max(0.025, self.drop_chord_hold_seconds))
+            LOG.warning(
+                "DROP ROPE ESCAPE: Alt+Down attached to rope; tiny Y rise "
+                "confirmed %d/%d (last dY=%+.6f dX=%+.6f), sent Alt+%s at X=%.6f",
+                DROP_ROPE_ESCAPE_FRAMES,
+                DROP_ROPE_ESCAPE_FRAMES,
+                delta_y,
+                delta_x,
+                direction,
+                current.x,
+            )
+            return True
+        finally:
+            if direction_claimed:
+                key_up(direction)
+            if alt_claimed:
+                key_up("alt")
 
     def _attack_should_defer(self) -> bool:
         """True when an active attack must wait for a rope climb, a drop, or
@@ -7869,6 +8011,28 @@ class MovementWorker(threading.Thread):
                 "enabled; awaiting temporary Start Patrol position" if enabled else "disabled",
             )
 
+    def flower_patrol_attack_allowed(self) -> bool:
+        """Whether 跑花模式 may send a cadence attack right now.
+
+        ``_confirmed_attack_layer`` is refreshed only after the normal route
+        resolver has accepted the latest minimap observation.  Treating no
+        result as false prevents an upper-layer attack during a lost marker or
+        an in-between climb frame.
+        """
+
+        return self._confirmed_attack_layer == "layer1"
+
+    def set_flower_patrol_mode(self, enabled: bool) -> None:
+        """Toggle layer1-only combat without changing patrol movement."""
+
+        enabled = bool(enabled)
+        if self.flower_patrol_mode != enabled:
+            self.flower_patrol_mode = enabled
+            LOG.info(
+                "跑花模式 %s",
+                "enabled; attacks are limited to layer1" if enabled else "disabled",
+            )
+
     def set_dual_stationary_configuration(
         self, enabled: bool, raw_posts: Any, switch_seconds: float,
         switch_jitter_seconds: float = 0.0,
@@ -8074,6 +8238,8 @@ class MovementWorker(threading.Thread):
             self._dead_flower_started_from_layer1 = False
         self._dead_flower_buff2_cycle_started = False
         self._dead_flower_buff2_unavailable_logged = False
+        self._dead_flower_logged_wait_target = None
+        self._dead_flower_log_signature = None
         self._dead_flower_drop_start_y = None
         self._dead_flower_drop_attempts = 0
         self._dead_flower_drop_retry_at = 0.0
@@ -8327,14 +8493,22 @@ class MovementWorker(threading.Thread):
                         break
         return False
 
-    def _dead_flower_wait_for_buff2(self) -> None:
+    def _dead_flower_wait_for_buff2(
+        self, target_index: int, flower_count: int, target: Point,
+    ) -> None:
         """Hold at a flower point until 增益 1 is actually delivered."""
 
         self._dead_flower_release_vertical()
         self._release_walk_hold()
+        newly_reached = self._dead_flower_logged_wait_target != target_index
         self._dead_flower_phase = "flower-await-buff2"
+        self._dead_flower_logged_wait_target = target_index
         if self._dead_flower_buff2_cycle_started:
-            LOG.info("DEAD FLOWER: flower point reached; waiting for the running 增益1 timer")
+            if newly_reached:
+                LOG.info(
+                    "DEAD FLOWER: reached flower point %d/%d (x=%.6f y=%.6f); waiting for 增益1 timer",
+                    target_index + 1, flower_count, target.x, target.y,
+                )
             return
         # The first flower starts the cadence.  All later flower points wait
         # for that same real 增益1 interval rather than restarting it.
@@ -8343,12 +8517,44 @@ class MovementWorker(threading.Thread):
         if accepted:
             self._dead_flower_buff2_cycle_started = True
             self._dead_flower_buff2_unavailable_logged = False
-            LOG.info("DEAD FLOWER: first flower reached; 增益1 cadence started")
+            LOG.info(
+                "DEAD FLOWER: first flower point %d/%d (x=%.6f y=%.6f); 增益1 cadence started",
+                target_index + 1, flower_count, target.x, target.y,
+            )
         elif not self._dead_flower_buff2_unavailable_logged:
             LOG.warning(
                 "DEAD FLOWER: flower route paused at flower point; enable 增益1 with a key and interval first"
             )
             self._dead_flower_buff2_unavailable_logged = True
+
+    def _log_dead_flower_analysis(
+        self, player: Point, target: Point, target_index: int,
+        flower_count: int, direction: str, y_gap: float,
+        *, state: str,
+    ) -> None:
+        """Write a compact, state-complete Dead Flower analysis line.
+
+        Normal patrol deliberately samples identical 5-FPS frames.  Flower
+        routing needs its own explicit trail, however: the selected point,
+        measured marker, intended vertical direction and phase are the exact
+        evidence needed to diagnose a rope loop.  Emit on a real decision
+        change only, never once per capture.
+        """
+
+        signature = (
+            state, self._dead_flower_phase, target_index, direction,
+            round(float(target.x), 4), round(float(target.y), 4),
+            round(float(player.x), 3), round(float(player.y), 3),
+        )
+        if signature == self._dead_flower_log_signature:
+            return
+        self._dead_flower_log_signature = signature
+        LOG.info(
+            "DEAD FLOWER ANALYSIS state=%s phase=%s flower=%d/%d "
+            "player=(%.6f, %.6f) target=(%.6f, %.6f) y_gap=%+.6f direction=%s",
+            state, self._dead_flower_phase, target_index + 1, flower_count,
+            player.x, player.y, target.x, target.y, y_gap, direction,
+        )
 
     def _dead_flower_step(self, observation: MinimapObservation) -> None:
         """Run the rope flower loop and optional 重置花 ground circuit.
@@ -8431,7 +8637,10 @@ class MovementWorker(threading.Thread):
                 # A user may enable/bind 增益1 while already waiting at the
                 # first flower point. Retry the timer-start request on normal
                 # capture ticks; no key is sent from this worker.
-                self._dead_flower_wait_for_buff2()
+                target_index = min(self._dead_flower_target_index, len(flowers) - 1)
+                self._dead_flower_wait_for_buff2(
+                    target_index, len(flowers), flowers[target_index],
+                )
                 self.last_decision = MovementDecision(None, "dead flower: waiting for 增益1")
                 return
             else:
@@ -8547,7 +8756,11 @@ class MovementWorker(threading.Thread):
         if (rope_attached_for_flower
                 and abs(y_gap) <= DEAD_FLOWER_Y_TOLERANCE
                 and not requires_progress):
-            self._dead_flower_wait_for_buff2()
+            self._log_dead_flower_analysis(
+                player, target, target_index, len(flowers), "hold", y_gap,
+                state="flower-reached",
+            )
+            self._dead_flower_wait_for_buff2(target_index, len(flowers), target)
             self.last_decision = MovementDecision(
                 None, "dead flower attached at flower point; waiting for 增益1",
             )
@@ -8559,6 +8772,11 @@ class MovementWorker(threading.Thread):
             direction = "down" if target.y > source_y else "up"
         else:
             direction = "down" if y_gap > 0.0 else "up"
+
+        self._log_dead_flower_analysis(
+            player, target, target_index, len(flowers), direction, y_gap,
+            state="rope-travel" if rope_attached_for_flower else "rope-attach",
+        )
 
         # Starting on layer1 is not a simple Up hold: it must go through the
         # battle-tested jump-to-rope state machine.  That routine owns the
@@ -12010,7 +12228,7 @@ class MovementWorker(threading.Thread):
         if observation.player is None or self._route_phase not in ("left", "right"):
             return
         points = layer.get("skill_points", []) if isinstance(layer, dict) else []
-        request = getattr(self.motion_arbiter, "request_buff", None)
+        request = getattr(self.motion_arbiter, "request_skill", None)
         if not isinstance(points, list) or not callable(request):
             return
         for index, point in enumerate(points):
@@ -12022,14 +12240,62 @@ class MovementWorker(threading.Thread):
             except (KeyError, TypeError, ValueError):
                 continue
             token = (self._split_active_part, layer_name, self._route_phase, index)
-            if (token in self._skill_fired_tokens
-                    or abs(observation.player.x - point_x) > SKILL_POINT_X_TOLERANCE):
+            if abs(observation.player.x - point_x) > SKILL_POINT_X_TOLERANCE:
                 continue
-            if request(key):
-                self._skill_fired_tokens.add(token)
-                LOG.info("skill point fired: part=%d %s phase=%s key=%s",
+            with self._skill_delivery_lock:
+                if (token in self._skill_fired_tokens
+                        or token in self._skill_pending_tokens):
+                    continue
+            now = time.monotonic()
+            with self._skill_delivery_lock:
+                last_emitted = self._skill_key_last_emitted_at.get(key)
+            if (last_emitted is not None
+                    and now - last_emitted < SKILL_POINT_KEY_COOLDOWN_SECONDS):
+                with self._skill_delivery_lock:
+                    self._skill_fired_tokens.add(token)
+                LOG.info(
+                    "skill point skipped: key=%s cooldown %.1fs remains",
+                    key.upper(),
+                    SKILL_POINT_KEY_COOLDOWN_SECONDS - (now - last_emitted),
+                )
+                continue
+            point_id = ":".join(map(str, token))
+
+            def _completed(
+                succeeded: bool, *, skill_token: tuple[int, str, str, int] = token,
+                skill_key: str = key, skill_part: int = self._split_active_part,
+                skill_layer: str = layer_name, skill_phase: str = self._route_phase,
+            ) -> None:
+                with self._skill_delivery_lock:
+                    self._skill_pending_tokens.discard(skill_token)
+                    if succeeded:
+                        self._skill_fired_tokens.add(skill_token)
+                        self._skill_key_last_emitted_at[skill_key] = time.monotonic()
+                if succeeded:
+                    LOG.info(
+                        "skill point executed: part=%d %s phase=%s key=%s",
+                        skill_part + 1, skill_layer, skill_phase,
+                        skill_key.upper(),
+                    )
+                else:
+                    LOG.warning(
+                        "skill point not delivered: part=%d %s phase=%s key=%s; "
+                        "it remains eligible while the marker stays in range",
+                        skill_part + 1, skill_layer, skill_phase,
+                        skill_key.upper(),
+                    )
+
+            with self._skill_delivery_lock:
+                # Mark before handing work to the arbiter: a very fast worker
+                # may deliver the tap and invoke ``_completed`` immediately.
+                self._skill_pending_tokens.add(token)
+            if request(key, point_id, _completed):
+                LOG.info("skill point queued: part=%d %s phase=%s key=%s",
                          self._split_active_part + 1, layer_name,
                          self._route_phase, key.upper())
+            else:
+                with self._skill_delivery_lock:
+                    self._skill_pending_tokens.discard(token)
 
     def _sync_patrol_controller(
         self, coordinate_layout: Optional[CoordinateLayout] = None
@@ -12132,7 +12398,12 @@ class MovementWorker(threading.Thread):
     def select_split_start_part(self, part_index: int) -> None:
         """Accept startup's X-resolved split part before the next frame sync."""
 
-        self._split_active_part = max(0, int(part_index))
+        # ``part_index`` is geometric, not an index into populated records:
+        # a three-part map can have no layer2 supporters in its middle part.
+        # Keep it in the complete [0, boundary_count] domain so the next
+        # transition still visits every part in left-to-right order.
+        maximum = max(0, self._split_part_count - 1)
+        self._split_active_part = max(0, min(int(part_index), maximum))
 
     def _activate_next_split_part(
         self, observation: Optional[MinimapObservation] = None,
@@ -12142,8 +12413,13 @@ class MovementWorker(threading.Thread):
         if not self._split_enabled or self._split_part_count <= 1:
             return
         previous = self._split_active_part
+        # Try each geometric section exactly once.  This intentionally allows
+        # parts without a higher floor: their layer1 route remains valid while
+        # missing unsupported layers are omitted by _materialize_split_part.
+        attempted_parts: list[int] = []
         for _attempt in range(self._split_part_count):
             self._split_active_part = (self._split_active_part + 1) % self._split_part_count
+            attempted_parts.append(self._split_active_part)
             self.important_positions = self._materialize_split_part(self._split_active_part)
             routable = {
                 name for name, layer in self.important_positions.items()
@@ -12158,10 +12434,17 @@ class MovementWorker(threading.Thread):
             )
             if self._route_layers:
                 break
-            LOG.warning("split part %d has no patrol supporters; skipping", self._split_active_part + 1)
+            LOG.warning(
+                "split part %d/%d has no patrol supporters; skipping",
+                self._split_active_part + 1, self._split_part_count,
+            )
         else:
             self._route_layers = []
             self._split_transition_after_drop = False
+            LOG.warning(
+                "split patrol: no supported route in sections=%s",
+                ",".join(str(index + 1) for index in attempted_parts),
+            )
             return
         self.first_layer = self._route_layers[0]
         self._route_layer_index = 0
@@ -12219,7 +12502,9 @@ class MovementWorker(threading.Thread):
                 or next_direction not in ("left", "right")
                 or previous == next_direction):
             return
-        self._skill_fired_tokens.clear()
+        with self._skill_delivery_lock:
+            self._skill_fired_tokens.clear()
+            self._skill_pending_tokens.clear()
         self._clear_endpoint_turn_rearm()
         self._endpoint_turn_expected_direction = next_direction
         self._endpoint_turn_neutral_until = (
@@ -13049,7 +13334,9 @@ class MovementWorker(threading.Thread):
         intended facing.
         """
 
-        if not self._patrol_input_allowed():
+        if (not self._patrol_input_allowed()
+                or (self.flower_patrol_mode
+                    and not self.flower_patrol_attack_allowed())):
             return False
         if not _sender_is_safe(self.key_sender):
             LOG.info("small-step blocked: target window is not safely selected")
@@ -13352,6 +13639,8 @@ class MovementWorker(threading.Thread):
         """
 
         delivery = str(getattr(self, "attack_delivery", "stand")).casefold()
+        if self.flower_patrol_mode and not self.flower_patrol_attack_allowed():
+            return False
         if str(attack_key).strip().casefold() == "-" or delivery == "none":
             # The route movement remains valid in 不打 mode; only the key tap
             # is deliberately omitted.
@@ -13397,7 +13686,9 @@ class MovementWorker(threading.Thread):
         only after it has retained the marker X for the same frame sequence.
         """
 
-        if not self.counterattack_enabled or not self._patrol_input_allowed():
+        if (not self.counterattack_enabled or not self._patrol_input_allowed()
+                or (self.flower_patrol_mode
+                    and not self.flower_patrol_attack_allowed())):
             return
         if frame_sequence < 0:
             return
@@ -13604,6 +13895,8 @@ class MovementWorker(threading.Thread):
                 or not attack_key
                 or not self.counterattack_enabled
                 or not self._patrol_input_allowed()
+                or (self.flower_patrol_mode
+                    and not self.flower_patrol_attack_allowed())
                 or self._movement_busy_now()
                 or not _sender_is_safe(self.key_sender)):
             return False
@@ -14084,7 +14377,18 @@ class MovementWorker(threading.Thread):
                 # genuinely enters another route layer's band is followed
                 # frame by frame.
                 detected_layer_name = self._resync_route_layer(observation)
+                self._confirmed_attack_layer = detected_layer_name
                 self._log_detected_layer(detected_layer_name, observation)
+                # A just-issued Alt+Down can occasionally grab a rope.  Give
+                # that narrowly-defined escape priority over ordinary route
+                # planning for this frame; otherwise the planner could add a
+                # second Alt+Down/walk while the rope escape chord is active.
+                if self._escape_accidental_rope_after_drop(observation):
+                    self.last_observation = observation
+                    self.last_decision = MovementDecision(
+                        None, "escaped accidental rope after Alt+Down"
+                    )
+                    continue
                 observation = self._pin_stationary_layer_world_y(observation)
                 # Falling recovery: track rapid diamond-Y drops (an unexpected
                 # fall - knocked down / missed a stair / walked off an edge).

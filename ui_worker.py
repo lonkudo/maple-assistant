@@ -166,7 +166,7 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 886
+_INITIAL_WINDOW_WIDTH = 896
 _INITIAL_WINDOW_HEIGHT = 560
 # Every panel in the left stack follows this single compact track.  The
 # right-side controls retain their own wider track because their key bindings
@@ -532,13 +532,13 @@ class UiLogHandler(logging.Handler):
 
     The UI panel shows only SIGNIFICANT events - patrol started, patrol
     ended, and ERROR+ (critical bugs) - while a bounded in-memory history
-    keeps the latest ``history`` formatted lines (default 600) for the
+    keeps the latest ``history`` formatted lines (default 500) for the
     "copy running log" action.  Oldest lines are dropped like garbage once
     the history is full; nothing is written to disk here (the ordinary file
     handler owns the on-disk log).
     """
 
-    def __init__(self, capacity: int = 300, history: int = 600) -> None:
+    def __init__(self, capacity: int = 300, history: int = 500) -> None:
         super().__init__()
         self.messages: "queue.Queue[str]" = queue.Queue(maxsize=max(20, capacity))
         self._history: "collections.deque[str]" = collections.deque(
@@ -586,7 +586,7 @@ class UiLogHandler(logging.Handler):
 
 # The 运行日志 panel displays only significant events: patrol started /
 # patrol ended and ERROR+ records (critical bugs).  The full recent stream
-# is retained in memory (UiLogHandler history, default 600 lines) and is
+# is retained in memory (UiLogHandler history, default 500 lines) and is
 # copied to the clipboard by the archive icon button.
 LOG_RUN_START = "巡逻已开始"
 LOG_RUN_STOP = "巡逻已停止"
@@ -1630,6 +1630,7 @@ class UiWorker(threading.Thread):
         self._bind_key_tooltips: list[HoverTooltip] = []
         self._quick_message_tooltips: list[HoverTooltip] = []
         self._layer_labels: dict[str, Any] = {}
+        self._layer_patrol_time_controls: dict[str, NumericValueRangeControl] = {}
         self._layer_row_names: tuple[str, ...] = ()
         # Only explicit unlocks need UI state. Locking itself is derived from
         # the controller's saved endpoint, so dynamically created rows behave
@@ -2268,6 +2269,11 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left")
+            ttk.Radiobutton(
+                mode_row, text="跑花模式", value="flower_patrol",
+                variable=self._attack_mode_var,
+                command=self._fixed_on_mode_change,
+            ).pack(side="left", padx=(8, 0))
             # These rows configure attacks only.  死花模式 still leaves the
             # mode selector and its 重置花 controls available, but must make
             # every normal attack option visibly unavailable.
@@ -3353,7 +3359,7 @@ class UiWorker(threading.Thread):
             # the panel's top-left and appear once patrol has ended (report
             # time): the archive button copies the running log, the user
             # button copies user settings.  Only significant events are
-            # shown (the latest few lines); the full 600-line in-memory
+            # shown (the latest few lines); the full 500-line in-memory
             # history stays available through the archive button - no disk
             # I/O per line.  Import/export have text buttons so their purpose
             # remains clear without relying on an unlabeled icon.
@@ -4957,7 +4963,7 @@ class UiWorker(threading.Thread):
             LOG.debug("activation code copy failed", exc_info=True)
 
     def _save_local_device_memo(self, memo: str) -> bool:
-        """Persist the safe display note in the user-owned license section."""
+        """Persist the safe display note in the local-only auth section."""
 
         try:
             path = self._license_settings_path()
@@ -4971,7 +4977,7 @@ class UiWorker(threading.Thread):
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             return True
         except OSError:
-            LOG.warning("could not save device memo to user_config", exc_info=True)
+            LOG.warning("could not save device memo to auth.json", exc_info=True)
             return False
 
     def _edit_device_memo(self, _event: Any = None) -> None:
@@ -5345,7 +5351,7 @@ class UiWorker(threading.Thread):
 
     @staticmethod
     def _license_settings_path() -> Path:
-        """Return the user-owned activation-attempt settings section."""
+        """Return the local-only activation-attempt settings in auth.json."""
 
         return config_section_file("license")
 
@@ -5439,7 +5445,7 @@ class UiWorker(threading.Thread):
         """Persist the submitted code regardless of whether validation succeeds.
 
         ``license.json`` is the signed authorization document.  This
-        user-config entry records the last code the operator chose to submit
+        auth.json records the last code the operator chose to submit
         and the outcome of that exact validation attempt.
         """
 
@@ -5467,7 +5473,7 @@ class UiWorker(threading.Thread):
                 encoding="utf-8",
             )
         except OSError:
-            LOG.warning("could not save activation attempt to user_config", exc_info=True)
+            LOG.warning("could not save activation attempt to auth.json", exc_info=True)
 
     def _lock_license_ui_only(self) -> None:
         """Immediately grey all product controls without interrupting work."""
@@ -5868,13 +5874,20 @@ class UiWorker(threading.Thread):
                             self._record_dual_stationary_post(point, facing, slot)
                         )
                 elif action == "record_skill_point":
-                    arm = getattr(self.hotkey_worker, "arm_skill_key_capture", None)
-                    if callable(arm) and self._prepare_skill_point_recording():
-                        arm()
+                    # Ctrl+E has already armed phase two in HotkeyWorker.
+                    # Do not arm again here: a fast selected key can reach
+                    # the queue before Tk processes this action, and a second
+                    # UI-side arm would leave a stale capture behind.
+                    if self._prepare_skill_point_recording():
                         self._control_status.configure(
                             text="技能点：请按一个可绑定为攻击键的按键作为释放键（Esc 取消）。"
                         )
                     else:
+                        cancel = getattr(
+                            self.hotkey_worker, "cancel_skill_key_capture", None
+                        )
+                        if callable(cancel):
+                            cancel()
                         self._play_action_sound(False)
                 elif action.startswith("record_skill_key:"):
                     key = action.partition(":")[2]
@@ -7863,7 +7876,7 @@ class UiWorker(threading.Thread):
             return
         # Hint-style display (same look as the plain message hints): only the
         # latest few significant events, one compact line each.  The full
-        # 600-line in-memory history stays available through the copy action.
+        # 500-line in-memory history stays available through the copy action.
         for message in messages:
             line = " ".join(message.splitlines())
             if len(line) > 220:
@@ -7921,90 +7934,137 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.exception("clipboard copy failed")
 
-    def _save_log_file_and_copy(self, filename: str, text: str, log_type: str) -> None:
-        """Write one shareable log file under the selected ``助手配置`` folder.
+    def _copy_log_file(self, target: Path, log_type: str) -> None:
+        """Copy an existing root log file as a file object, not its path.
 
-        The icon actions intentionally export a concrete ``.txt`` file rather
-        than only text: it can be pasted into a chat or attached elsewhere
-        without asking the operator to locate a transient program log.
+        Each live log already has one fixed file maintained by the asynchronous
+        logger.  The toolbar therefore must copy that exact file after checking
+        it exists; producing a second export under ``助手配置`` made the visible
+        path and the actual log source diverge.
         """
 
         try:
-            config_path = Path(self.user_config_path) if self.user_config_path else None
-            folder = config_path.parent if config_path is not None else application_root(__file__) / "助手配置"
-            if folder.name != "助手配置":
-                folder = folder / "助手配置"
-            folder.mkdir(parents=True, exist_ok=True)
-            target = folder / filename
-            temporary = target.with_suffix(target.suffix + ".tmp")
-            temporary.write_text(text, encoding="utf-8")
-            temporary.replace(target)
+            target = target.resolve(strict=True)
+            if not target.is_file():
+                raise OSError(f"not a regular file: {target}")
         except OSError:
-            LOG.exception("%s导出失败：无法写入助手配置文件夹", log_type)
+            LOG.exception("%s复制失败：日志文件不存在", log_type)
             return
 
         copied_file = False
         try:
-            import win32clipboard
+            # Use CF_HDROP directly instead of a text clipboard path.  This
+            # works in both the source run and the packaged EXE without a
+            # pywin32 dependency: chat clients and Explorer receive the
+            # actual just-written file.
+            import ctypes
+            from ctypes import wintypes
 
-            win32clipboard.OpenClipboard()
+            class _DROPFILES(ctypes.Structure):
+                _fields_ = [
+                    ("pFiles", wintypes.DWORD),
+                    ("pt_x", wintypes.LONG),
+                    ("pt_y", wintypes.LONG),
+                    ("fNC", wintypes.BOOL),
+                    ("fWide", wintypes.BOOL),
+                ]
+
+            path_text = str(target.resolve()) + "\0\0"
+            payload = path_text.encode("utf-16-le")
+            payload_size = ctypes.sizeof(_DROPFILES) + len(payload)
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            # ctypes otherwise assumes 32-bit ``int`` returns, which can
+            # truncate a GlobalAlloc pointer in the 64-bit packaged helper.
+            kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+            kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+            kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+            user32.SetClipboardData.argtypes = (wintypes.UINT, ctypes.c_void_p)
+            user32.SetClipboardData.restype = ctypes.c_void_p
+            handle = kernel32.GlobalAlloc(0x0002, payload_size)  # GMEM_MOVEABLE
+            if not handle:
+                raise OSError("GlobalAlloc failed for CF_HDROP")
             try:
-                win32clipboard.EmptyClipboard()
-                # pywin32 accepts a tuple of absolute paths for CF_HDROP;
-                # Windows then pastes the file itself, rather than its name.
-                win32clipboard.SetClipboardData(
-                    win32clipboard.CF_HDROP, (str(target.resolve()),)
-                )
+                pointer = kernel32.GlobalLock(handle)
+                if not pointer:
+                    raise OSError("GlobalLock failed for CF_HDROP")
+                try:
+                    drop = _DROPFILES(
+                        ctypes.sizeof(_DROPFILES), 0, 0, False, True,
+                    )
+                    ctypes.memmove(pointer, ctypes.byref(drop), ctypes.sizeof(drop))
+                    ctypes.memmove(
+                        int(pointer) + ctypes.sizeof(_DROPFILES), payload, len(payload),
+                    )
+                finally:
+                    kernel32.GlobalUnlock(handle)
+                if not user32.OpenClipboard(None):
+                    raise OSError("OpenClipboard failed")
+                try:
+                    if not user32.EmptyClipboard():
+                        raise OSError("EmptyClipboard failed")
+                    # CF_HDROP=15.  On success Windows owns ``handle``.
+                    if not user32.SetClipboardData(15, handle):
+                        raise OSError("SetClipboardData(CF_HDROP) failed")
+                    handle = None
+                finally:
+                    user32.CloseClipboard()
                 copied_file = True
             finally:
-                win32clipboard.CloseClipboard()
+                if handle:
+                    kernel32.GlobalFree(handle)
         except Exception:
-            # The export remains useful even when another program has the
-            # clipboard locked.  Leave its full path in the normal text
-            # clipboard as a usable fallback.
-            LOG.warning("%s文件复制失败，已复制路径：%s", log_type, target, exc_info=True)
+            # Keep a usable fallback only when Windows has another owner for
+            # the clipboard.  The file was still written and verified above.
+            LOG.warning("%s文件存在，但文件复制失败；改为复制路径：%s", log_type, target, exc_info=True)
             self._copy_to_clipboard(str(target))
 
         if copied_file:
             LOG.info("%s已导出并复制文件：%s", log_type, target)
 
     def _copy_running_log(self) -> None:
-        """Export the in-memory running log and copy its text file."""
+        """Write and copy the latest complete 500-record diagnostic snapshot.
 
+        ``work/assistant.log`` is owned by the asynchronous live file writer,
+        so overwriting or copying it directly can produce a partial log.  The
+        dashboard handler already receives every normal root-worker record
+        (movement, attack, status, hotkey, etc.) in memory.  Export that
+        bounded history to one stable root-level file, then place that file on
+        the clipboard for the operator.
+        """
+
+        target = application_root(__file__) / "运行日志.txt"
         text = ""
         if self.ui_log_handler is not None:
             text = self.ui_log_handler.history_text()
-        if not text.strip():
-            text = "(暂无运行日志)"
-        self._save_log_file_and_copy("运行日志.txt", text, "运行日志")
+        lines = text.splitlines()[-500:]
+        snapshot = "\n".join(lines) if lines else "(暂无运行日志)"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(snapshot + "\n", encoding="utf-8")
+            temporary.replace(target)
+        except OSError:
+            LOG.error("运行日志快照写入失败：%s", target, exc_info=True)
+            return
+        self._copy_log_file(target, "运行日志")
 
     def _copy_server_client_log(self) -> None:
         """Export the safe server-client interaction log and copy its file."""
 
-        path = Path(__file__).resolve().parent / "server_client.log"
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            text = ""
-        else:
-            text = raw.decode("utf-8", errors="replace")
-        if not text.strip():
-            text = "(server_client.log 为空或不存在)"
-        self._save_log_file_and_copy("授权日志.txt", text, "授权日志")
+        self._copy_log_file(
+            application_root(__file__) / "server_client.log", "授权日志",
+        )
 
     def _copy_auto_lie_log(self) -> None:
         """Export the automatic-lie trace and copy its file."""
 
-        path = application_root(__file__) / "auto_lie.log"
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            text = ""
-        else:
-            text = raw.decode("utf-8", errors="replace")
-        if not text.strip():
-            text = "(自动过测谎日志为空或不存在)"
-        self._save_log_file_and_copy("自动测谎日志.txt", text, "自动测谎日志")
+        self._copy_log_file(
+            application_root(__file__) / "auto_lie.log", "自动测谎日志",
+        )
 
     def _import_user_config(self) -> None:
         """Choose a saved configuration and refresh the running helper."""
@@ -8636,17 +8696,6 @@ class UiWorker(threading.Thread):
             unavailable_rope = kind == "rope_pos" and layer_name == final_name
             state = "disabled" if already_recorded or unavailable_rope else "normal"
             menu.add_command(label=label, command=command, state=state)
-        menu.add_separator()
-        repeat_menu = self._tk.Menu(menu, tearoff=False)
-        current_layer = self.patrol_controller.snapshot().layers.get(layer_name, {})
-        current_times = max(1, int(current_layer.get("patrol_times", 1))) if isinstance(current_layer, dict) else 1
-        for times in range(1, 6):
-            prefix = "✓ " if times == current_times else ""
-            repeat_menu.add_command(
-                label=f"{prefix}巡逻 {times} 次",
-                command=lambda times=times, layer_name=layer_name: self._set_layer_patrol_times(layer_name, times),
-            )
-        menu.add_cascade(label="本层巡逻次数", menu=repeat_menu)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -8662,6 +8711,18 @@ class UiWorker(threading.Thread):
             text=f"{self._patrol_display_name(layer_name)} 将巡逻 {times} 次后再进入下一层/分区。"
         )
         self._refresh_patrol_controls()
+
+    def _layer_patrol_times_changed(self, layer_name: str) -> None:
+        """Persist the independent 1..20 repeat count for one layer row."""
+
+        control = self._layer_patrol_time_controls.get(layer_name)
+        if control is None:
+            return
+        try:
+            times = int(control.get_bounds()[0])
+        except (TypeError, ValueError):
+            return
+        self._set_layer_patrol_times(layer_name, times)
 
     @staticmethod
     def _layer_axis_point_text(label: str, point: Any) -> str:
@@ -9504,7 +9565,7 @@ class UiWorker(threading.Thread):
         # This method runs again after several ordinary UI refreshes.  It must
         # never reopen stationary controls that the authorization lock closed.
         fixed_attack_enabled = (
-            mode in ("fixed", "stationary", "dual_stationary") and self._license_allowed()
+            mode in ("fixed", "flower_patrol", "stationary", "dual_stationary") and self._license_allowed()
         )
         stationary_enabled = mode == "stationary" and self._license_allowed()
         dual_stationary_enabled = mode == "dual_stationary" and self._license_allowed()
@@ -9627,7 +9688,7 @@ class UiWorker(threading.Thread):
         self._undo_capture_panel_change("攻击设置")
         mode = str(self._attack_mode_var.get())
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "stationary", "dual_stationary", "dead_flower")):
+                and mode not in ("fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower")):
             mode = "fixed"
             self._attack_mode_var.set("fixed")
         delivery = str(
@@ -9726,13 +9787,16 @@ class UiWorker(threading.Thread):
                 flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
                 if callable(flower_cycle_setter):
                     flower_cycle_setter(False, 0.0, 0.0)
+                flower_patrol_setter = getattr(mover, "set_flower_patrol_mode", None)
+                if callable(flower_patrol_setter):
+                    flower_patrol_setter(False)
                 counterattack_setter = getattr(mover, "set_counterattack", None)
                 if callable(counterattack_setter):
                     counterattack_setter(False, "ctrl")
             return
         mode = str(data.get("attack_mode", "fixed"))
         if (not self._YOLO_MONSTER_DETECTION_ENABLED
-                and mode not in ("fixed", "stationary", "dual_stationary", "dead_flower")):
+                and mode not in ("fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower")):
             mode = "fixed"
         dead_flower_mode = mode == "dead_flower"
         dual_stationary_mode = mode == "dual_stationary"
@@ -9742,7 +9806,7 @@ class UiWorker(threading.Thread):
                 "jump_attack_enabled", data.get("stationary_jump_enabled", False),
             )) else "stand"
         jump_attack_enabled = delivery == "jump" and mode in (
-            "fixed", "stationary", "dual_stationary",
+            "fixed", "flower_patrol", "stationary", "dual_stationary",
         )
         legacy_charge = float(data.get("charge_hold_seconds", 0.5))
         charge_min_seconds = max(0.1, min(
@@ -9755,7 +9819,11 @@ class UiWorker(threading.Thread):
         worker.attack_delivery = delivery
         worker.charge_min_seconds = charge_min_seconds
         worker.charge_max_seconds = charge_max_seconds
-        worker.enabled = bool(mode in ("fixed", "stationary", "dual_stationary"))
+        flower_patrol_mode = mode == "flower_patrol"
+        worker.enabled = bool(mode in ("fixed", "flower_patrol", "stationary", "dual_stationary"))
+        gate_setter = getattr(worker, "set_layer_attack_gate", None)
+        if callable(gate_setter):
+            gate_setter(flower_patrol_mode)
         # 站桩 shares its beats with the anchor correction and 小碎步, which carry
         # their own attacks; on patrol those are deliberate extras, so only the
         # stand-still cadence keeps the attack-spacing rule (attack_worker).
@@ -9791,6 +9859,9 @@ class UiWorker(threading.Thread):
             dead_flower_setter = getattr(mover, "set_dead_flower_mode", None)
             if callable(dead_flower_setter):
                 dead_flower_setter(dead_flower_mode)
+            flower_patrol_setter = getattr(mover, "set_flower_patrol_mode", None)
+            if callable(flower_patrol_setter):
+                flower_patrol_setter(flower_patrol_mode)
             mover.small_step_attack_key = worker.attack_key
             delivery_setter = getattr(mover, "set_attack_delivery", None)
             if callable(delivery_setter):
@@ -9836,7 +9907,7 @@ class UiWorker(threading.Thread):
             # uses it chiefly to finish facing the monster side.
             step_worker.enabled = bool(
                 data.get("small_step_enabled", False)
-            ) and mode in ("fixed", "stationary", "dual_stationary")
+            ) and mode in ("fixed", "flower_patrol", "stationary", "dual_stationary")
             legacy_step_min = float(data.get("small_step_interval_seconds", 5.0))
             step_min = float(data.get("small_step_min_seconds", legacy_step_min))
             step_max = float(data.get(
@@ -9899,7 +9970,7 @@ class UiWorker(threading.Thread):
         mode = str(self._attack_mode_var.get())
         fixed_mode = (
             not self._YOLO_MONSTER_DETECTION_ENABLED
-            or mode in ("fixed", "stationary", "dual_stationary", "dead_flower")
+            or mode in ("fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower")
         )
         if fixed_mode:
             # Only one attack engine at a time: selecting Fixed Attack stops
@@ -9945,6 +10016,12 @@ class UiWorker(threading.Thread):
                         text=(f"双桩模式已启用 - 已录制 {posts}/2 桩；"
                               f"Ctrl+R 后按 D/F/G 录制朝向；每 "
                               f"{self._dual_stationary_switch_minutes():.1f}m 换桩。")
+                    )
+                elif mode == "flower_patrol":
+                    self._fixed_status.configure(
+                        text=(f"跑花模式已启用 - 正常巡逻；仅楼层1攻击；按键 "
+                              f"{self._fixed_attack_key_var.get()}；"
+                              f"间隔 {interval_text}s。")
                     )
                 else:
                     self._fixed_status.configure(
@@ -10000,10 +10077,10 @@ class UiWorker(threading.Thread):
                     self._attack_mode_var.set("stationary")
                     if hasattr(self, "_jump_attack_enabled_var"):
                         self._jump_attack_enabled_var.set(True)
-                elif mode in ("yolo", "fixed", "stationary", "dual_stationary", "dead_flower"):
+                elif mode in ("yolo", "fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set(mode)
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
-                if self._attack_mode_var.get() not in ("fixed", "stationary", "dual_stationary", "dead_flower"):
+                if self._attack_mode_var.get() not in ("fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set("fixed")
             # Migrate old ``interval + random_gap`` values into the new
             # explicit inclusive interval range.  A legacy 0.90 + 0.10s
@@ -12218,6 +12295,11 @@ class UiWorker(threading.Thread):
                 text="死花模式已开始：花点按 Buff1 定时循环；重置花到时才下绳巡逻。"
             )
         elif str(getattr(self, "_attack_mode_var", None).get()
+                 if hasattr(self, "_attack_mode_var") else "fixed") == "flower_patrol":
+            self._control_status.configure(
+                text="跑花模式已开始：正常巡逻；仅在楼层1攻击。"
+            )
+        elif str(getattr(self, "_attack_mode_var", None).get()
                  if hasattr(self, "_attack_mode_var") else "fixed") == "stationary":
             self._control_status.configure(text="运行已开始。")
         else:
@@ -12573,10 +12655,13 @@ class UiWorker(threading.Thread):
             self._selected_layer_var.set(selected)
         for layer_name in layer_names:
             layer = snapshot.layers.get(layer_name, {})
-            patrol_times = max(1, int(layer.get("patrol_times", 1))) if isinstance(layer, dict) else 1
+            patrol_times = max(1, min(20, int(layer.get("patrol_times", 1)))) if isinstance(layer, dict) else 1
             self._layer_labels[layer_name].configure(
-                text=f"{self._patrol_display_name(layer_name)} 巡逻{patrol_times}次"
+                text=f"{self._patrol_display_name(layer_name)} 巡逻"
             )
+            control = self._layer_patrol_time_controls.get(layer_name)
+            if control is not None:
+                control.set_bounds(patrol_times)
             self._draw_layer_axis(
                 layer_name, layer, snapshot.split_points,
             )
@@ -12842,6 +12927,7 @@ class UiWorker(threading.Thread):
         self._record_buttons.clear()
         self._rope_tooltips.clear()
         self._layer_labels.clear()
+        self._layer_patrol_time_controls.clear()
         self._layer_axis_canvases.clear()
         self._layer_row_names = layer_names
         ttk = self._ttk
@@ -12857,14 +12943,30 @@ class UiWorker(threading.Thread):
                 ),
             )
             selector.pack(side="left", anchor="center", padx=(0, 1))
-            # This fixed width holds the widest ordinary display name
-            # (for example, 楼层10) without clipping CJK glyphs. The cropped
-            # canvas then touches the label directly; there is no dead gutter.
-            # ``楼层10 巡逻10次`` is the widest normal label.  Eleven cells
-            # hold it while avoiding a permanently oversized canvas row.
-            label = ttk.Label(row, width=11)
+            # The layer name stays independent of the fixed-height numeric
+            # component, so hovering a value never shifts the label or axis.
+            label = ttk.Label(row, width=8)
             label.pack(side="left", anchor="center")
             self._layer_labels[layer_name] = label
+            repeat_control = NumericValueRangeControl(
+                row,
+                tk_module=self._tk,
+                ttk_module=ttk,
+                minimum=1,
+                range_mode=False,
+                value_type=int,
+                step=1,
+                lower_bound=1,
+                upper_bound=20,
+                value_width=2,
+                before_change=lambda layer=layer_name: self._undo_capture_callback(
+                    f"{self._patrol_display_name(layer)}巡逻次数"
+                ),
+                on_change=lambda layer=layer_name: self._layer_patrol_times_changed(layer),
+            )
+            repeat_control.pack(side="left", padx=(0, 0))
+            ttk.Label(row, text="次").pack(side="left", padx=(0, 1))
+            self._layer_patrol_time_controls[layer_name] = repeat_control
             canvas = self._tk.Canvas(
                 row,
                 width=_LAYER_AXIS_WIDTH,

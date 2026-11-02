@@ -269,6 +269,10 @@ class HotkeyWorker(threading.Thread):
         # that already-held modifier for the requested key; after its physical
         # key-up, a fresh Ctrl press is a legitimate ``ctrl`` binding.
         self._skill_key_capture_wait_for_ctrl_release = False
+        # A phase-two recorder key must be blocked for its entire physical
+        # down/up lifecycle.  Blocking only key-down lets Maple receive the
+        # matching key-up and can leave an existing binding in a bad state.
+        self._phase_capture_consumed_vks: set[int] = set()
         # Ctrl+R records a dual-stationary point in two phases.  The first
         # phase captures the marker on the UI thread; this hook then consumes
         # only D/F/G as the point's facing selector.
@@ -389,7 +393,7 @@ class HotkeyWorker(threading.Thread):
 
     # Actions that must never be rate limited.  These are the recording/selection steps the
     # operator drives by hand while mapping a floor (Ctrl+arrows, Ctrl+Down, Ctrl+Home,
-    # Ctrl+Insert, Ctrl+Delete): the two-second cooldown silently swallowed fast presses and looked
+    # Ctrl+Insert, Ctrl+Delete): the generic cooldown silently swallowed fast presses and looked
     # like a dead hotkey (observed: four "hotkey cooldown: record:right_most_pos" in a row right
     # after the recordings stopped landing).  Both delivery paths already fire at most once per
     # physical press - MOD_NOREPEAT natively and the hook's per-key latch - so the cooldown adds
@@ -400,22 +404,30 @@ class HotkeyWorker(threading.Thread):
         "record_jump_point",
         "record_split_point",
         "record_flower_point",
-        "record_skill_point",
-        "record_skill_key:",
         "record_dual_stationary",
+        "record_skill_key:",
         "select_next_layer",
         "select_next_patrol_start",
         "add_highest_layer",
         "delete_highest_layer",
         "adjust_fixed_attack_interval:",
     )
-    _COOLDOWN_EXEMPT_ACTIONS = ("trade:invite",)
+    _COOLDOWN_EXEMPT_ACTIONS = ("trade:invite", "record_skill_point")
 
     def _cooldown_exempt(self, action: str) -> bool:
         return (
             action in self._COOLDOWN_EXEMPT_ACTIONS
             or action.startswith(self._COOLDOWN_EXEMPT_PREFIXES)
         )
+
+    @staticmethod
+    def _cooldown_seconds_for(action: str) -> float:
+        """Return the action-specific debounce window.
+
+        The generic hotkey cooldown remains two seconds for ordinary actions.
+        """
+
+        return 2.0
 
     def _note_suppressed(self, action: str, why: str) -> None:
         """Say out loud that a recognized chord is deliberately not delivered.
@@ -536,6 +548,24 @@ class HotkeyWorker(threading.Thread):
         while Ctrl+Q/Ctrl+W is held. A passive low-level hook tracks the real
         Ctrl-up and ends this guard as soon as the operator releases it.
         """
+        now = time.monotonic()
+        # Exempt actions bypass the normal cooldown; MOD_NOREPEAT / the hook
+        # key-up state still prevent a held chord from firing repeatedly.
+        repeatable = self._cooldown_exempt(action)
+        last = self._last_action_at.get(action)
+        cooldown_seconds = self._cooldown_seconds_for(action)
+        if (not repeatable and last is not None
+                and now - last < cooldown_seconds):
+            LOG.info("hotkey cooldown %.1fs: %s", cooldown_seconds, action)
+            return
+
+        # Arm phase two in this input worker immediately, not after the Tk
+        # thread has taken a capture and drained the action queue.  That closes
+        # the short native-hotkey-to-UI gap in which a fast second key (for
+        # example 2) could otherwise reach the game before the recorder armed.
+        if action == "record_skill_point":
+            self.arm_skill_key_capture()
+
         # Ctrl+[ / Ctrl+] are intentionally repeatable while the operator keeps
         # Ctrl held.  An injected Ctrl-up after the first press makes Windows
         # drop the modifier, so every later bracket press is lost.  Native
@@ -569,15 +599,6 @@ class HotkeyWorker(threading.Thread):
                 self._ctrl_down = True
             if release_ctrl and not preserve_modifier:
                 self._arm_ctrl_release(action)
-        # Exempt actions bypass the two-second cooldown; MOD_NOREPEAT / the hook key-up state still
-        # prevent a held chord from firing repeatedly.
-        repeatable = self._cooldown_exempt(action)
-        now = time.monotonic()
-        last = self._last_action_at.get(action)
-        if (not repeatable and last is not None
-                and now - last < self.cooldown_seconds):
-            LOG.info("hotkey cooldown: %s", action)
-            return
         try:
             self.action_queue.put_nowait(action)
             if not repeatable:
@@ -646,11 +667,20 @@ class HotkeyWorker(threading.Thread):
             vk = int(event.vkCode)
             is_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
             is_up = message in (WM_KEYUP, WM_SYSKEYUP)
+            # Consume the matching physical release too.  The selected second
+            # phase key must never be delivered to the game as an attack,
+            # buff, or normal key binding.
+            consumed_phase_key_up = (
+                is_up and vk in self._phase_capture_consumed_vks
+            )
+            if consumed_phase_key_up:
+                self._phase_capture_consumed_vks.discard(vk)
             if vk in (VK_CONTROL, VK_LCONTROL, VK_RCONTROL):
                 if is_down:
                     if (self._skill_key_capture_armed
                             and not self._skill_key_capture_wait_for_ctrl_release):
                         self._skill_key_capture_armed = False
+                        self._phase_capture_consumed_vks.add(vk)
                         self._queue_action("record_skill_key:ctrl")
                         return 1
                     self._ctrl_down = True
@@ -683,18 +713,40 @@ class HotkeyWorker(threading.Thread):
                         except Exception:
                             LOG.debug("final physical Ctrl release cleanup failed", exc_info=True)
                         self._ctrl_repeat_active = False
+                if consumed_phase_key_up:
+                    return 1
                 return user32.CallNextHookEx(self._hook, code, message, l_param)
 
             if self._skill_key_capture_armed and is_down:
+                # A repeated Ctrl+E while phase two is armed must remain the
+                # same recording chord, not be mistaken for an ``E`` skill
+                # binding.  Leave capture armed so the operator can still
+                # choose a real release key after the ten-second debounce.
+                bound = self._bindings.get(vk)
+                if (self._ctrl_down and bound is not None
+                        and bound[0] == "record_skill_point"):
+                    LOG.info(
+                        "skill point capture: Ctrl+E ignored while phase two is armed"
+                    )
+                    return 1
+                if self._skill_key_capture_wait_for_ctrl_release:
+                    # The Ctrl+E release is still in flight.  Swallow any
+                    # early second key instead of leaking it into Maple; the
+                    # user can select the key after releasing Ctrl.
+                    self._phase_capture_consumed_vks.add(vk)
+                    return 1
                 skill_key = _SKILL_CAPTURE_KEYS_BY_VK.get(vk)
                 if skill_key is not None:
+                    action = f"record_skill_key:{skill_key}"
                     self._skill_key_capture_armed = False
                     self._skill_key_capture_wait_for_ctrl_release = False
-                    self._queue_action(f"record_skill_key:{skill_key}")
+                    self._phase_capture_consumed_vks.add(vk)
+                    self._queue_action(action)
                     return 1
                 if vk == 0x1B:  # Esc cancels a partially entered Ctrl+E.
                     self._skill_key_capture_armed = False
                     self._skill_key_capture_wait_for_ctrl_release = False
+                    self._phase_capture_consumed_vks.add(vk)
                     self._queue_action("record_skill_key:cancel")
                     return 1
 
@@ -705,6 +757,7 @@ class HotkeyWorker(threading.Thread):
                     self._dual_stationary_capture_armed = False
                     self._dual_stationary_capture_wait_for_ctrl_release = False
                     self._dual_stationary_capture_slot = None
+                    self._phase_capture_consumed_vks.add(vk)
                     if slot in (0, 1):
                         self._queue_action(
                             f"record_dual_stationary_facing:{slot}:{facing}"
@@ -714,6 +767,7 @@ class HotkeyWorker(threading.Thread):
                     self._dual_stationary_capture_armed = False
                     self._dual_stationary_capture_wait_for_ctrl_release = False
                     self._dual_stationary_capture_slot = None
+                    self._phase_capture_consumed_vks.add(vk)
                     self._queue_action("record_dual_stationary_facing:cancel")
                     return 1
 

@@ -33,9 +33,9 @@
   "drop_chord_hold_seconds": 0.1,
   "drop_retry_seconds": 1.5,
   "near_rope_seconds": 0.5,
-  "near_rope_range": 0.025,
+  "near_rope_range": 0.040,
   "near_rope_inner_range": 0.032,
-  "near_rope_outer_range": 0.0229,
+  "near_rope_outer_range": 0.036,
   "near_rope_diamonds": 0.66,
   "patrol_enabled": false,
   "note": "默认配置不绑定任何地图：请先在界面录制 最左/绳索/最右，巡逻与地图校验才会生效。"

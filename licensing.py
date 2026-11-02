@@ -49,7 +49,12 @@ LICENSE_FORMAT = "maple-assistant-license/v1"
 ACTIVATION_PREFIX = "MA1-"
 DEVICE_REQUEST_PREFIX = "MADR1-"
 PUBLIC_KEY_FILE = "license_public_key.json"
-LICENSE_FILE = "license.json"
+# ``auth.json`` is the single local authorization document.  It supersedes
+# ``license.json`` so a normal file-overwrite update can leave one clearly
+# named private file untouched.
+LICENSE_FILE = "auth.json"
+LEGACY_LICENSE_FILE = "license.json"
+AUTH_LOCAL_STATE_KEY = "_local"
 ACTIVATION_SERVER_ENDPOINT = "https://211.149.169.194:8443"
 ACTIVATION_SERVER_PIN_FILE = "activation_server_pin.json"
 # The signed legacy document keeps an edition field for wire compatibility,
@@ -140,11 +145,79 @@ def user_data_root(root: Optional[Path] = None) -> Path:
     if root is not None:
         return Path(root)
     configured = os.environ.get("MOONECLIPSE_CONFIG_DIR")
-    return Path(configured) if configured else runtime_root()
+    if configured:
+        return Path(configured)
+    package_root = runtime_root()
+    # Keep entitlement and user_config together even when an update is
+    # launched directly from the overlaid ``app`` folder rather than through
+    # the installer-created launcher that sets MOONECLIPSE_CONFIG_DIR.
+    for candidate in (package_root / "助手配置", package_root.parent / "助手配置"):
+        if candidate.is_dir():
+            return candidate
+    return package_root
 
 
 def license_path(root: Optional[Path] = None) -> Path:
     return user_data_root(root) / LICENSE_FILE
+
+
+def _legacy_license_path(root: Optional[Path] = None) -> Path:
+    return user_data_root(root) / LEGACY_LICENSE_FILE
+
+
+def _migrate_legacy_license_document(root: Optional[Path] = None) -> None:
+    """Move a pre-auth.json entitlement once, retaining local display state.
+
+    A prior build may already have created an unsigned auth.json containing
+    only activation-code/memo display state.  Merge that ``_local`` object
+    into the signed legacy document, then atomically replace auth.json and
+    remove the old license.json.  This is local migration only; releases do
+    not ship either file.
+    """
+
+    legacy = _legacy_license_path(root)
+    if not legacy.is_file():
+        return
+    target = license_path(root)
+    try:
+        legacy_document = json.loads(legacy.read_text(encoding="utf-8"))
+        if not isinstance(legacy_document, dict):
+            return
+        existing = {}
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            existing = {}
+        # v1.2.269 briefly used a flat auth.json for this local-only state.
+        # Accept both shapes while moving the signed entitlement into auth.json.
+        # Never copy an already-signed document over the legacy entitlement.
+        if isinstance(existing, dict) and {
+            "payload", "signature"
+        }.issubset(existing):
+            return
+        local = existing.get(AUTH_LOCAL_STATE_KEY, {}) if isinstance(existing, dict) else {}
+        if not isinstance(local, dict) and isinstance(existing, dict):
+            local = {}
+        if isinstance(existing, dict) and not local:
+            local = {
+                key: value
+                for key, value in existing.items()
+                if key not in {"payload", "signature", AUTH_LOCAL_STATE_KEY}
+            }
+        if isinstance(local, dict) and local:
+            legacy_document[AUTH_LOCAL_STATE_KEY] = local
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, delete=False
+        ) as handle:
+            json.dump(legacy_document, handle, ensure_ascii=True, sort_keys=True, indent=2)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+        legacy.unlink(missing_ok=True)
+        SERVER_LOG.info("authorization migrated from license.json to auth.json")
+    except OSError:
+        SERVER_LOG.warning("authorization migration to auth.json failed", exc_info=True)
 
 
 def revoke_license(root: Optional[Path] = None) -> bool:
@@ -158,6 +231,7 @@ def revoke_license(root: Optional[Path] = None) -> bool:
     target = license_path(root)
     try:
         target.unlink(missing_ok=True)
+        _legacy_license_path(root).unlink(missing_ok=True)
         return True
     except OSError:
         return False
@@ -426,12 +500,18 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
 def verify_license(root: Optional[Path] = None) -> LicenseStatus:
     """Verify the installed license without throwing into the application."""
 
+    _migrate_legacy_license_document(root)
     try:
         document = json.loads(license_path(root).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return LicenseStatus(False, "missing", "未授权：请激活授权码。")
     except (OSError, ValueError):
         return LicenseStatus(False, "unreadable", "授权文件无法读取。")
+    # An interrupted older upgrade may have left only local UI metadata in
+    # auth.json.  It is not a corrupt license and should simply invite a new
+    # activation if no legacy license.json remains to migrate.
+    if not isinstance(document, dict) or "payload" not in document:
+        return LicenseStatus(False, "missing", "未授权：请激活授权码。")
     status = _parse_document(document, root)
     return status
 
@@ -475,8 +555,31 @@ def _persist_document(document: dict[str, Any], status: LicenseStatus, root: Opt
     target = license_path(root)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        # A fresh activation replaces only the signed entitlement.  Preserve
+        # the local UI state stored alongside it in auth.json.
+        local: dict[str, Any] = {}
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            candidate = existing.get(AUTH_LOCAL_STATE_KEY, {}) if isinstance(existing, dict) else {}
+            if isinstance(existing, dict) and not isinstance(candidate, dict):
+                candidate = {}
+            # Preserve the short-lived flat auth.json layout too.  This lets a
+            # user update directly from that release without losing memo/UI
+            # display state during the first successful activation.
+            if isinstance(existing, dict) and not candidate and "payload" not in existing:
+                candidate = {
+                    key: value for key, value in existing.items()
+                    if key not in {"payload", "signature", AUTH_LOCAL_STATE_KEY}
+                }
+            if isinstance(candidate, dict):
+                local = candidate
+        except (OSError, ValueError):
+            pass
+        output = dict(document)
+        if local:
+            output[AUTH_LOCAL_STATE_KEY] = local
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, delete=False) as handle:
-            json.dump(document, handle, ensure_ascii=True, sort_keys=True, indent=2)
+            json.dump(output, handle, ensure_ascii=True, sort_keys=True, indent=2)
             handle.write("\n")
             temporary = Path(handle.name)
         os.replace(temporary, target)

@@ -6,7 +6,7 @@ buff timers collide and the jump or buff tap silently does nothing.
 
 ``MotionArbiter`` is the single executor for those motion keys:
 
-- a FIFO queue temporarily registers jump and buff events (requests are
+- a FIFO queue temporarily registers jump, buff, and recorded-skill events (requests are
   non-blocking; duplicate pending events collapse to one);
 - one worker thread dequeues and executes them one at a time;
 - a jump locks out further motion for ``jump_motion_seconds`` (default 0.9s)
@@ -47,6 +47,7 @@ FACING = "facing"
 # otherwise lose while correcting its position.
 STEP = "step"
 COUNTERATTACK = "counterattack"
+SKILL = "skill"
 
 # A tap can be refused by the input layer (game window not foreground, input
 # disarmed, focus stolen mid-tap).  A jump/micro-step is stale by then and is
@@ -156,6 +157,10 @@ class MotionArbiter(threading.Thread):
         # Completion callbacks belong to periodic-buff timers.  They are
         # invoked only once the key has completed its full motion window.
         self._buff_completion_callbacks: dict[str, list[Any]] = {}
+        # Recorded skill-point taps use their own token identity and callback
+        # path.  They must never merge with a periodic ``buff:<key>`` merely
+        # because both happen to use the same physical key.
+        self._skill_completion_callbacks: dict[str, list[Any]] = {}
         # Stair detection must know whether its one queued action actually
         # pressed Alt.  A failed/aborted queue entry is not a completed stair
         # recovery and must be eligible for a later retry.
@@ -227,6 +232,48 @@ class MotionArbiter(threading.Thread):
             self._queued.add(token)
             if callable(on_complete):
                 self._buff_completion_callbacks[token] = [on_complete]
+            self._cv.notify_all()
+            return True
+
+    def request_skill(
+        self, key: str, point_id: str, on_complete: Any = None,
+    ) -> bool:
+        """Queue a recorded point skill without sharing periodic-buff state.
+
+        A skill may use the same physical key as 增益 1/2/3, but is a distinct
+        one-time traversal action.  It uses a direct tap while patrol keeps
+        its current left/right hold, and it is inserted ahead of waiting buffs
+        so a closed buff safe-stage gate cannot postpone it past the point.
+        It still respects active attack/charge reservations and the one-key
+        sender, so no two injected action keys overlap.
+        """
+
+        normalized_key = str(key).strip().casefold()
+        normalized_point = str(point_id).strip()
+        if not normalized_key or not normalized_point:
+            return False
+        token = f"{SKILL}:{normalized_key}:{normalized_point}"
+        with self._cv:
+            if not self._automation_allowed_locked():
+                return False
+            if token in self._queued:
+                if callable(on_complete):
+                    self._skill_completion_callbacks.setdefault(token, []).append(
+                        on_complete
+                    )
+                return True
+            # A waiting periodic buff is deliberately allowed to remain queued,
+            # but must not become a head-of-line block for a location-bound
+            # skill that is only meaningful while the character passes it.
+            insert_at = next(
+                (index for index, queued in enumerate(self._pending)
+                 if queued.startswith("buff:")),
+                len(self._pending),
+            )
+            self._pending.insert(insert_at, token)
+            self._queued.add(token)
+            if callable(on_complete):
+                self._skill_completion_callbacks[token] = [on_complete]
             self._cv.notify_all()
             return True
 
@@ -729,6 +776,10 @@ class MotionArbiter(threading.Thread):
     # ------------------------------------------------------------------ #
 
     def _duration_for(self, token: str) -> float:
+        if token.startswith(f"{SKILL}:"):
+            # The physical tap itself is serialized, but a point skill must
+            # not create a periodic-buff-sized quiet window after passing it.
+            return 0.0
         if token == JUMP:
             return self.jump_motion_seconds
         if token == MICRO_STEP:
@@ -750,6 +801,7 @@ class MotionArbiter(threading.Thread):
             self._pending.popleft()
         self._queued.discard(token)
         callbacks = self._buff_completion_callbacks.pop(token, [])
+        callbacks.extend(self._skill_completion_callbacks.pop(token, []))
         callbacks.extend(self._stair_jump_completion_callbacks.pop(token, []))
         return callbacks
 
@@ -779,6 +831,7 @@ class MotionArbiter(threading.Thread):
         # before the automation gate was cleared.
         is_stair_jump = token.startswith(f"{STAIR_JUMP}:")
         is_counterattack = token.startswith(f"{COUNTERATTACK}:")
+        is_skill = token.startswith(f"{SKILL}:")
         waiting_since = time.monotonic()
         wait_warned_at = 0.0
         with self._cv:
@@ -788,9 +841,14 @@ class MotionArbiter(threading.Thread):
                     self._cv.notify_all()
                     self._notify_buff_completion(callbacks, False)
                     return
-                if (not is_stair_jump and not is_counterattack
+                if (not is_stair_jump and not is_counterattack and not is_skill
                         and not self._motion_gate_allows_locked()):
                     if token.startswith("buff:"):
+                        # A point skill may have been inserted before this
+                        # waiting buff. Yield immediately so the executor
+                        # picks that live location-bound event next.
+                        if self._pending and self._pending[0] != token:
+                            return
                         # A buff stays registered through climb/drop/landing
                         # and wakes itself as soon as ordinary travel returns.
                         # It must never wait silently: this is the one state
@@ -881,7 +939,7 @@ class MotionArbiter(threading.Thread):
                 callbacks = self._pop_locked(token)
                 self._cv.notify_all()
                 dropped = True
-            elif (not is_stair_jump and not is_counterattack
+            elif (not is_stair_jump and not is_counterattack and not is_skill
                   and not self._motion_gate_allows_locked()):
                 self._executing_token = None
                 if token.startswith("buff:"):
@@ -1050,7 +1108,12 @@ class MotionArbiter(threading.Thread):
                 )
             return
         else:
-            key = token.partition(":")[2]
+            if is_skill:
+                # ``skill:<key>:<point-id>``; point-id keeps same-key points
+                # distinct while the second split recovers the actual key.
+                key = token.split(":", 2)[1]
+            else:
+                key = token.partition(":")[2]
 
         tap_ok = False
         try:

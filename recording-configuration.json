@@ -16,9 +16,9 @@
   ],
   "rope": {
     "x": 0.5,
-    "near_range": 0.025,
+    "near_range": 0.040,
     "inner_range": 0.032,
-    "outer_range": 0.0229
+    "outer_range": 0.036
   },
   "layers": {
     "layer1": {

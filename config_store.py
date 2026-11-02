@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 USER_CONFIG_NAME = "user_config.json"
 USER_CONFIG_VERSION_KEY = "user_config_updated_at"
+AUTH_CONFIG_NAME = "auth.json"
+AUTH_LOCAL_STATE_KEY = "_local"
 SYSTEM_CONFIG_NAME = "system_config.json"
 LEGACY_UNIFIED_NAME = "config.json"
 _CONFIG_REPLACE_ATTEMPTS = 15
@@ -116,17 +118,21 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     # picker opens in the right folder instead of always falling back to the
     # bundled demo clip.
     "tracking_test": {"video": ""},
-    # The most recently submitted activation code is user-owned state.  The
-    # signed license document remains the authorization authority; this
-    # section only remembers what the operator last submitted and its result.
-    "license": {
-        "activation_code": "",
-        "memo": "",
-        "last_validation_valid": False,
-        "last_validation_code": "",
-        "last_validation_message": "",
-        "last_validation_at": "",
-    },
+}
+
+# Authorization is deliberately excluded from user_config.json.  Route
+# recordings can therefore be exported/shared without exposing the operator's
+# activation code, public equipment identity, memo, or validation history.
+# ``auth.json`` is the signed local entitlement document; these values are its
+# unsigned, local-only display state under ``_local``.
+DEFAULT_AUTH_CONFIG: dict[str, Any] = {
+    "activation_code": "",
+    "memo": "",
+    "equipment_id": "",
+    "last_validation_valid": False,
+    "last_validation_code": "",
+    "last_validation_message": "",
+    "last_validation_at": "",
 }
 
 DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
@@ -184,6 +190,7 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
 
 USER_SECTIONS = frozenset(DEFAULT_USER_CONFIG)
 SYSTEM_SECTIONS = frozenset(DEFAULT_SYSTEM_CONFIG)
+AUTH_SECTIONS = frozenset({"license"})
 DEFAULT_CONFIG: dict[str, Any] = {
     **deepcopy(DEFAULT_USER_CONFIG), **deepcopy(DEFAULT_SYSTEM_CONFIG),
 }
@@ -283,6 +290,7 @@ class ConfigStore:
         user_path: Path,
         *,
         system_path: Optional[Path] = None,
+        auth_path: Optional[Path] = None,
         legacy_root: Optional[Path] = None,
         legacy_unified_path: Optional[Path] = None,
     ) -> None:
@@ -290,6 +298,9 @@ class ConfigStore:
         self.path = self.user_path  # compatibility for existing callers
         self.system_path = Path(
             system_path or self.user_path.with_name(SYSTEM_CONFIG_NAME)
+        )
+        self.auth_path = Path(
+            auth_path or self.user_path.with_name(AUTH_CONFIG_NAME)
         )
         self.legacy_root = Path(legacy_root or self.user_path.parent)
         self.legacy_unified_path = Path(
@@ -334,6 +345,12 @@ class ConfigStore:
                 if section in data:
                     del data[section]
                     changed = True
+            # Authorization used to be embedded in the shareable recording.
+            # Its actual signed document is now auth.json; the import/export
+            # boundaries independently scrub this legacy shape too.
+            if "license" in data:
+                del data["license"]
+                changed = True
             if not user_config_version(self.user_path):
                 changed = True
             if changed:
@@ -349,17 +366,24 @@ class ConfigStore:
                     )
 
     def _document_for_section(self, section: str) -> dict[str, Any]:
+        if section in AUTH_SECTIONS:
+            return _read_json(self.auth_path)
         if section in SYSTEM_SECTIONS:
             document = _read_json(self.system_path)
             return document or deepcopy(DEFAULT_SYSTEM_CONFIG)
         return _read_json(self.user_path)
 
     def path_for_section(self, section: str) -> Path:
+        if section in AUTH_SECTIONS:
+            return self.auth_path
         return self.system_path if section in SYSTEM_SECTIONS else self.user_path
 
     def read_section(self, section: str) -> dict[str, Any]:
         with self._lock:
             data = self._document_for_section(section)
+            if section in AUTH_SECTIONS:
+                local = data.get(AUTH_LOCAL_STATE_KEY, {})
+                return deepcopy(local) if isinstance(local, dict) else {}
             value = data.get(section, DEFAULT_CONFIG.get(section, {}))
             return deepcopy(value) if isinstance(value, dict) else {}
 
@@ -368,9 +392,14 @@ class ConfigStore:
             raise PermissionError(
                 f"{section} is update-owned in {self.system_path.name}"
             )
-        if section not in USER_SECTIONS:
+        if section not in USER_SECTIONS and section not in AUTH_SECTIONS:
             raise KeyError(f"unknown configuration section: {section}")
         with self._lock:
+            if section in AUTH_SECTIONS:
+                document = _read_json(self.auth_path)
+                document[AUTH_LOCAL_STATE_KEY] = deepcopy(value)
+                _write_json(self.auth_path, document)
+                return
             data = _read_json(self.user_path)
             previous = deepcopy(data)
             data[section] = deepcopy(value)
@@ -403,13 +432,32 @@ _stores: dict[tuple[Path, Path], ConfigStore] = {}
 _stores_lock = threading.Lock()
 
 
+def _default_user_root(package_root: Path) -> Path:
+    """Find the persistent configuration folder for both launch paths.
+
+    The installer launches from ``<install>\\助手配置`` through an
+    environment variable.  A manual overlay update can also start the app
+    executable directly, where that variable is absent; in that case retain
+    the installed sibling folder instead of silently creating a new identity
+    under ``app``.
+    """
+
+    configured = os.environ.get("MOONECLIPSE_CONFIG_DIR")
+    if configured:
+        return Path(configured)
+    for candidate in (package_root / "助手配置", package_root.parent / "助手配置"):
+        if candidate.is_dir():
+            return candidate
+    return package_root
+
+
 def get_config_store(
     path: Optional[Path] = None,
     *,
     system_path: Optional[Path] = None,
 ) -> ConfigStore:
     package_root = Path(__file__).resolve().parent
-    user_root = Path(os.environ.get("MOONECLIPSE_CONFIG_DIR") or package_root)
+    user_root = _default_user_root(package_root)
     requested = Path(path or user_root / USER_CONFIG_NAME).resolve()
     # Preserve --config config.json compatibility while migrating writes to
     # user_config.json. The old unified file remains untouched as a backup.
@@ -443,7 +491,7 @@ def config_section_file(
 
 
 __all__ = [
-    "ConfigSectionFile", "ConfigStore", "DEFAULT_CONFIG",
+    "AUTH_CONFIG_NAME", "AUTH_LOCAL_STATE_KEY", "AUTH_SECTIONS", "ConfigSectionFile", "ConfigStore", "DEFAULT_AUTH_CONFIG", "DEFAULT_CONFIG",
     "DEFAULT_SYSTEM_CONFIG", "DEFAULT_USER_CONFIG", "LEGACY_UNIFIED_NAME",
     "SECTION_FILES", "SYSTEM_CONFIG_NAME", "SYSTEM_SECTIONS",
     "USER_CONFIG_NAME", "USER_CONFIG_VERSION_KEY", "USER_SECTIONS",

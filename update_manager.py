@@ -367,7 +367,17 @@ def export_user_config(source: Path, roots: Optional[Iterable[Path]] = None) -> 
     try:
         target_directory.mkdir(parents=True, exist_ok=True)
         target = target_directory / "新配置.json"
-        shutil.copy2(source, target)
+        # A recording export is intentionally shareable.  Older clients may
+        # still have embedded authorization data, so scrub it here as a
+        # second boundary in addition to ConfigStore's migration.
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise UpdateError("当前 user_config.json 格式错误。")
+        payload.pop("license", None)
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     except OSError as exc:
         raise UpdateError(f"导出配置失败: {exc}") from exc
     return target
@@ -395,6 +405,9 @@ def import_user_config(source: Path, destination: Path) -> Path:
         raise UpdateError(f"配置文件不是有效 JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise UpdateError("配置文件格式错误：根内容必须是 JSON 对象。")
+    # Never accept a legacy embedded activation block into the shareable
+    # recording document.  Authorization is local-only in auth.json.
+    payload.pop("license", None)
     missing_sections = sorted(section for section in USER_SECTIONS if section not in payload)
     invalid_sections = sorted(
         section for section in USER_SECTIONS
@@ -409,7 +422,10 @@ def import_user_config(source: Path, destination: Path) -> Path:
     )
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, temporary)
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         last_error: Optional[PermissionError] = None
         for attempt in range(_CONFIG_IMPORT_REPLACE_ATTEMPTS):
             try:

@@ -298,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ui-refresh-ms", type=int, default=100,
                         help="debug UI queue polling interval (default: 100 ms)")
     parser.add_argument("--config", type=Path,
-                        default=Path(os.environ.get("MOONECLIPSE_CONFIG_DIR") or Path(__file__).parent) / "user_config.json",
+                        default=None,
                         help="persistent UI/user configuration file")
     parser.add_argument("--rope-calibration", type=Path, default=None,
                         help="legacy one-run rope calibration override")
@@ -368,7 +368,11 @@ def main() -> int:
     root_logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
     # INFO and ERROR tracking are persisted in work/assistant.log; the UI
     # running log remains an in-memory convenience view.
-    trace_log_path = Path(__file__).resolve().parent / "work" / "assistant.log"
+    # Keep the writer and the UI's copy-file action on the exact same
+    # installed root.  ``__file__`` may be an internal Nuitka module path,
+    # whereas application_root() always resolves to the EXE folder.
+    log_root = application_root(__file__)
+    trace_log_path = log_root / "work" / "assistant.log"
     try:
         trace_log_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -394,7 +398,7 @@ def main() -> int:
     # The licensing/server boundary gets its own compact, safe-to-share trace.
     # It deliberately records no activation code, fingerprint, token, or secret.
     server_log_writer = AsyncBatchLogWriter(
-        Path(__file__).with_name("server_client.log"),
+        log_root / "server_client.log",
         max_bytes=500_000,
         backup_count=2,
         formatter=_compact_log_formatter(),
@@ -414,7 +418,7 @@ def main() -> int:
     # raw frames.  These named loggers do not propagate to the root logger:
     # automatic lie activity belongs in auto_lie.log, not assistant.log.
     auto_lie_log_writer = AsyncBatchLogWriter(
-        Path(__file__).with_name("auto_lie.log"),
+        log_root / "auto_lie.log",
         max_bytes=1_000_000,
         backup_count=2,
         formatter=_compact_log_formatter(),
@@ -440,7 +444,7 @@ def main() -> int:
     # one phase even before that phase returns.  Keep this stream out of both
     # assistant.log and the Tk log history, and batch its writes independently.
     ui_poll_log_writer = AsyncBatchLogWriter(
-        Path(__file__).with_name("ui_poll.log"),
+        log_root / "ui_poll.log",
         max_bytes=8_000_000,
         backup_count=2,
         capacity=20_000,
@@ -888,7 +892,7 @@ def main() -> int:
         if args.recording_configuration is not None
         else config_store.read_section("recording")
     )
-    profile_path = args.recording_configuration or args.config
+    profile_path = args.recording_configuration or config_store.user_path
     patrol_controller = PatrolController(
         profile_path, map_profile,
         config_store=None if args.recording_configuration is not None
@@ -2568,6 +2572,11 @@ def main() -> int:
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
     movement_worker.set_attack_slot(attack_slot)
+    # 跑花模式 uses the normal patrol route.  Only its combat cadence is
+    # gated, through the movement-owned confirmed-layer snapshot.
+    attack_worker.set_layer_attack_gate(
+        False, movement_worker.flower_patrol_attack_allowed,
+    )
     motion_arbiter.set_facing_callback(movement_worker.perform_stationary_facing)
     # 站桩攻击's final correction onto the 桩: one tiny step, deliberately
     # concurrent with the fixed attack cadence (see

@@ -10,7 +10,7 @@ import logging
 import random
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from atomic_motion import AtomicMotionRunner
 from combo_attack import ComboAttackPlan
@@ -52,6 +52,7 @@ class AttackWorker(threading.Thread):
         attack_resume_event: Optional[threading.Event] = None,
         attack_slot: Any = None,
         atomic_motion_runner: Optional[AtomicMotionRunner] = None,
+        layer_attack_allowed_callback: Optional[Callable[[], bool]] = None,
     ) -> None:
         super().__init__(name="attack-worker", daemon=True)
         self.key_sender = key_sender
@@ -114,6 +115,12 @@ class AttackWorker(threading.Thread):
         # MotionArbiter attack lease around that call; the sequence is not a
         # second queued arbiter motion and never touches patrol Left/Right.
         self.atomic_motion_runner = atomic_motion_runner
+        # 跑花模式 keeps ordinary patrol movement intact, but permits this
+        # worker's combat cadence only on the confirmed first layer.  The
+        # callback belongs to MovementWorker, which owns layer recognition;
+        # this worker merely asks the gate at the moment a beat is due.
+        self.layer_attack_only = False
+        self.layer_attack_allowed_callback = layer_attack_allowed_callback
         # 站桩攻击 only.  In stand-still mode the anchor correction and 小碎步
         # carry their own attack as the beat itself, so the cadence must not add
         # a second one right after them (see ``spacing_wait_seconds``).  On
@@ -130,6 +137,31 @@ class AttackWorker(threading.Thread):
             self.attack_min_interval / 2.0
             if initial_offset is None else max(0.0, initial_offset)
         )
+
+    def set_layer_attack_gate(
+        self, enabled: bool, callback: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Set the optional movement-owned layer gate for cadence attacks.
+
+        A missing or failing callback is deliberately fail-closed while the
+        gate is active: running on an unconfirmed layer must not attack.
+        """
+
+        self.layer_attack_only = bool(enabled)
+        if callback is not None:
+            self.layer_attack_allowed_callback = callback
+
+    def _layer_attack_allowed(self) -> bool:
+        if not self.layer_attack_only:
+            return True
+        callback = self.layer_attack_allowed_callback
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            LOG.exception("跑花模式 layer gate failed; suppressing attack")
+            return False
 
     def set_key(self, key: str) -> bool:
         """Validate + apply a new attack key; False when unsupported."""
@@ -246,6 +278,8 @@ class AttackWorker(threading.Thread):
         if (self.automation_active_event is not None
                 and not self.automation_active_event.is_set()):
             return False
+        if not self._layer_attack_allowed():
+            return False
         return not (
             self.climbing_active_event is not None
             and self.climbing_active_event.is_set()
@@ -347,6 +381,11 @@ class AttackWorker(threading.Thread):
                 LOG.info("attack skipped: patrol direction handoff is active")
                 can_fire = False
                 handoff_deferred = True
+            if can_fire and not self._layer_attack_allowed():
+                # The patrol route continues as normal on upper layers; only
+                # this cadence beat is suppressed until MovementWorker has a
+                # fresh, confirmed layer1 reading.
+                can_fire = False
             if can_fire:
                 # Advance only for a beat that passed all non-arbiter gates.
                 # A null combo run deliberately consumes this beat without
