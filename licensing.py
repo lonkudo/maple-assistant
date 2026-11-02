@@ -23,6 +23,7 @@ import time
 from typing import Any, Optional
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json
 from auto_lie_secret import clear_server_secret, set_server_secret
+from runtime_paths import application_root
 
 
 SERVER_LOG = logging.getLogger("server-client")
@@ -136,7 +137,11 @@ class DeviceNotReadyError(ValueError):
 def runtime_root() -> Path:
     """Return the installed package directory for source and Nuitka builds."""
 
-    return Path(__file__).resolve().parent
+    # ``__file__`` is correct from source, but a frozen build can resolve it
+    # inside the one-file/standalone runtime rather than beside the launcher.
+    # The latter is where the installer keeps ``助手配置``.  Use the same
+    # executable-aware root policy as the rest of the installed application.
+    return application_root(__file__)
 
 
 def user_data_root(root: Optional[Path] = None) -> Path:
@@ -163,6 +168,70 @@ def license_path(root: Optional[Path] = None) -> Path:
 
 def _legacy_license_path(root: Optional[Path] = None) -> Path:
     return user_data_root(root) / LEGACY_LICENSE_FILE
+
+
+def _signed_document_at(path: Path) -> Optional[dict[str, Any]]:
+    """Read a candidate entitlement only when it has the signed shape."""
+
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    if not {"payload", "signature"}.issubset(document):
+        return None
+    return document
+
+
+def _migrate_displaced_auth_document(root: Optional[Path] = None) -> None:
+    """Recover one prior app-side auth.json into the selected config folder.
+
+    Older overlay builds could write the signed entitlement beside the app,
+    while the installer launcher selects ``<install>\\助手配置``.  On the next
+    boot that makes the user appear unlicensed even though the valid document
+    is still present.  If the chosen config destination does not already have
+    a signed document, copy the former app-side one there atomically and keep
+    it in place as an untouched fallback.
+    """
+
+    target = license_path(root)
+    if _signed_document_at(target) is not None:
+        return
+    app_side = runtime_root() / LICENSE_FILE
+    try:
+        if app_side.resolve() == target.resolve():
+            return
+    except OSError:
+        return
+    document = _signed_document_at(app_side)
+    if document is None:
+        return
+    try:
+        # Preserve display metadata already created in the chosen config
+        # folder, such as its locally stored original activation code/memo.
+        local: dict[str, Any] = {}
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            candidate = existing.get(AUTH_LOCAL_STATE_KEY, {}) if isinstance(existing, dict) else {}
+            if isinstance(candidate, dict):
+                local = candidate
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        output = dict(document)
+        if local:
+            output[AUTH_LOCAL_STATE_KEY] = local
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, delete=False,
+        ) as handle:
+            json.dump(output, handle, ensure_ascii=True, sort_keys=True, indent=2)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+        SERVER_LOG.info("authorization migrated from previous app-side auth.json")
+    except OSError:
+        SERVER_LOG.warning("authorization migration from app-side auth.json failed", exc_info=True)
 
 
 def _migrate_legacy_license_document(root: Optional[Path] = None) -> None:
@@ -501,6 +570,9 @@ def verify_license(root: Optional[Path] = None) -> LicenseStatus:
     """Verify the installed license without throwing into the application."""
 
     _migrate_legacy_license_document(root)
+    # A same-folder legacy license is the direct predecessor and therefore
+    # takes precedence over an app-side fallback left by an overlay build.
+    _migrate_displaced_auth_document(root)
     try:
         document = json.loads(license_path(root).read_text(encoding="utf-8"))
     except FileNotFoundError:

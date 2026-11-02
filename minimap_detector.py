@@ -150,6 +150,12 @@ INNER_CANVAS_EDGE_MARGIN = 1
 # Adopting a newly measured canvas that only jitters by a few pixels would shift
 # every normalized marker coordinate with it.  Keep the remembered one instead.
 INNER_CANVAS_JITTER_TOLERANCE = 3
+# A substantially different inner canvas is not safe to adopt from one
+# capture.  A partial OpenCV contour changes the normalization of the yellow
+# marker, the patrol targets, and the map-structure tracker all at once.  Two
+# matching 5-FPS captures are enough to accept a real HUD/map change, while a
+# one-frame false contour keeps using the last verified coordinate frame.
+INNER_CANVAS_REPLACEMENT_CONFIRM_FRAMES = 2
 
 
 def _box_text(box: Box) -> str:
@@ -352,6 +358,8 @@ class MinimapDetector:
         # so the map coordinate frame never falls back to the whole window.
         self._measured_canvas: Optional[Box] = None
         self._measured_canvas_size: Optional[tuple[int, int]] = None
+        self._pending_canvas: Optional[Box] = None
+        self._pending_canvas_count = 0
         self._last_canvas_log: Optional[str] = None
         self._state_lock = threading.Lock()
         # The outer minimap window is useful for finding the widget, but its
@@ -399,6 +407,8 @@ class MinimapDetector:
             self._last_good_at = float("-inf")
             self._measured_canvas = None
             self._measured_canvas_size = None
+            self._pending_canvas = None
+            self._pending_canvas_count = 0
             self._last_canvas_log = None
         if self._canvas_detector is not None:
             self._canvas_detector.reset_geometry()
@@ -423,6 +433,13 @@ class MinimapDetector:
             self._last_good = detection
             self._last_good_image_size = image_size
             self._last_good_at = time.monotonic()
+            # The startup validator has already selected this minimap frame.
+            # Make its inner canvas the active coordinate frame immediately;
+            # later contours must pass the replacement gate below.
+            self._measured_canvas = detection.canvas_box
+            self._measured_canvas_size = image_size
+            self._pending_canvas = None
+            self._pending_canvas_count = 0
 
     def retained_geometry(
         self, image_size: tuple[int, int]
@@ -652,16 +669,48 @@ class MinimapDetector:
             return self._measured_canvas
 
     def _remember_canvas(self, box: Box, image_size: tuple[int, int]) -> Box:
-        """Remember a measured canvas, keeping the frame stable while it jitters."""
+        """Return the accepted inner canvas, gating geometry replacements.
+
+        A single false contour must never remap the marker coordinates.  Keep
+        the last accepted canvas until the new candidate has appeared on two
+        compatible captures.  Small edge wobble is still folded into the
+        existing active canvas immediately.
+        """
 
         with self._state_lock:
             remembered = self._measured_canvas
             if (remembered is not None
-                    and self._measured_canvas_size == image_size
-                    and max(
+                    and self._measured_canvas_size == image_size):
+                if max(
                         abs(box[index] - remembered[index]) for index in range(4)
-                    ) <= INNER_CANVAS_JITTER_TOLERANCE):
-                return remembered
+                ) <= INNER_CANVAS_JITTER_TOLERANCE:
+                    self._pending_canvas = None
+                    self._pending_canvas_count = 0
+                    return remembered
+                pending = self._pending_canvas
+                if (pending is not None
+                        and max(
+                            abs(box[index] - pending[index])
+                            for index in range(4)
+                        ) <= INNER_CANVAS_JITTER_TOLERANCE):
+                    self._pending_canvas_count += 1
+                else:
+                    self._pending_canvas = box
+                    self._pending_canvas_count = 1
+                if self._pending_canvas_count < INNER_CANVAS_REPLACEMENT_CONFIRM_FRAMES:
+                    self._note_canvas(
+                        "holding " + _box_text(remembered)
+                        + " while confirming " + _box_text(box)
+                    )
+                    return remembered
+                box = self._pending_canvas
+                self._note_canvas(
+                    "adopted " + _box_text(box)
+                    + " after %d matching captures"
+                    % INNER_CANVAS_REPLACEMENT_CONFIRM_FRAMES
+                )
+                self._pending_canvas = None
+                self._pending_canvas_count = 0
             self._measured_canvas = box
             self._measured_canvas_size = image_size
             return box
@@ -1104,14 +1153,17 @@ class MinimapDetector:
                 # This box begins below the title/header strip and ends at
                 # the actual map-panel border.  It is the only coordinate
                 # frame used for marker, patrol, rope, and layer logic.
-                analysis_box = canvas_detection.window_box
-                canvas_box = canvas_detection.canvas_box
+                analysis_box = self._remember_canvas(
+                    canvas_detection.canvas_box, original_size
+                )
+                canvas_box = analysis_box
                 canvas_measured = True
             elif canvas_box != window_box:
                 # The outer pass sometimes already found an inner contour;
                 # retain that measured candidate rather than enlarging the
                 # analysis area back to the complete minimap window.
-                analysis_box = canvas_box
+                analysis_box = self._remember_canvas(canvas_box, original_size)
+                canvas_box = analysis_box
                 canvas_measured = True
             else:
                 # Neither pass produced a closed inner border on this frame.

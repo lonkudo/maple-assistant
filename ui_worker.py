@@ -8635,6 +8635,9 @@ class UiWorker(threading.Thread):
         # backing recording is deleted so its former coordinate can never
         # remain as a stale floating hint.
         self._hide_layer_axis_hint()
+        if point_kind == "dual_stationary_post":
+            self._delete_dual_stationary_post(point_index)
+            return
         try:
             undo_saved = self._undo_capture("删除录制点")
             removed = self.patrol_controller.delete_axis_point(
@@ -8671,6 +8674,61 @@ class UiWorker(threading.Thread):
             self._refresh_patrol_controls()
         elif undo_saved:
             self._undo_discard_latest("删除录制点")
+
+    def _delete_dual_stationary_post(self, point_index: Optional[int]) -> None:
+        """Remove one persisted 双桩 marker and synchronise the live pair."""
+
+        try:
+            index = int(point_index) if point_index is not None else -1
+        except (TypeError, ValueError):
+            index = -1
+        posts = self._dual_stationary_posts_data()
+        if not 0 <= index < len(posts):
+            self._control_status.configure(text="无法删除双桩点：录制索引无效。")
+            return
+        undo_saved = self._undo_capture("删除双桩点")
+        try:
+            removed = posts.pop(index)
+            self._dual_stationary_posts = posts
+            # Dual posts live in the fixed-attack section, not the map
+            # profile.  Use its ordinary persistence path so MovementWorker
+            # immediately drops a deleted post from its live anchor pair.
+            self._undo_skip_next_change_key = "攻击设置"
+            self._fixed_on_change()
+        except Exception as exc:
+            if undo_saved:
+                self._undo_discard_latest("删除双桩点")
+            LOG.warning("dual stationary post delete failed", exc_info=True)
+            self._control_status.configure(text=f"无法删除双桩点: {exc}")
+            return
+        self._control_status.configure(
+            text=(f"已删除双桩{index + 1}：X={removed['x']:.6f}，Y={removed['y']:.6f}；"
+                  f"当前剩余 {len(posts)}/2 桩。")
+        )
+        LOG.info("dual stationary post deleted index=%d remaining=%d", index, len(posts))
+        self._refresh_patrol_controls()
+
+    def _delete_temporary_stationary_anchor(self) -> None:
+        """Delete the session-only 站桩 marker selected on the layer canvas."""
+
+        controller = self.patrol_controller
+        if controller is None or controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法删除站桩位置，请先停止巡逻。")
+            return
+        mover = getattr(self, "movement_worker", None)
+        clear = getattr(mover, "clear_stationary_attack_anchor", None)
+        if not callable(clear):
+            self._control_status.configure(text="无法删除站桩位置：移动工作线程不可用。")
+            return
+        try:
+            clear("stationary anchor deleted from layer axis")
+        except Exception as exc:
+            LOG.warning("temporary stationary anchor delete failed", exc_info=True)
+            self._control_status.configure(text=f"无法删除站桩位置: {exc}")
+            return
+        self._control_status.configure(text="已删除临时站桩位置；下次开始运行将重新记录当前位置。")
+        LOG.info("temporary stationary anchor deleted from layer axis")
+        self._refresh_patrol_controls()
 
     def _layer_axis_menu(self, event: Any, layer_name: str) -> None:
         """Show point-recording choices for one single-clicked layer axis."""
@@ -8989,18 +9047,17 @@ class UiWorker(threading.Thread):
                 tag, "<Leave>",
                 lambda _event, canvas=canvas: self._hide_layer_axis_hint(canvas),
             )
-            if kind != "dual_stationary_post":
-                canvas.tag_bind(
-                    tag, "<Double-Button-1>",
-                    lambda _event, layer_name=layer_name, kind=kind,
-                    point_x=x_value, index=index:
-                    self._delete_recorded_axis_point(
-                        layer_name, kind, point_x, index,
-                    ),
-                )
-        # The temporary 站桩 anchor is not recording data and therefore has
-        # no delete/click action.  When its current location successfully
-        # matches a usable route layer, paint a quiet X on that layer's axis.
+            canvas.tag_bind(
+                tag, "<Double-Button-1>",
+                lambda _event, layer_name=layer_name, kind=kind,
+                point_x=x_value, index=index:
+                self._delete_recorded_axis_point(
+                    layer_name, kind, point_x, index,
+                ),
+            )
+        # The temporary 站桩 anchor is session-only rather than map-recording
+        # data, but it is still a visible user point and can be deleted by a
+        # double click just like other axis markers.
         mover = getattr(self, "movement_worker", None)
         marker_getter = getattr(mover, "stationary_route_anchor_marker", None)
         marker = marker_getter() if callable(marker_getter) else None
@@ -9017,9 +9074,14 @@ class UiWorker(threading.Thread):
                     "right": ">",
                     "both": "<>",
                 }.get(facing, ">")
+                tag = f"axis:{layer_name}:stationary_anchor"
                 canvas.create_text(
                     x, axis_y - 10, text=marker_text,
-                    fill="#cc2222", font=("TkDefaultFont", 9, "bold"),
+                    fill="#cc2222", font=("TkDefaultFont", 9, "bold"), tags=(tag,),
+                )
+                canvas.tag_bind(
+                    tag, "<Double-Button-1>",
+                    lambda _event: self._delete_temporary_stationary_anchor(),
                 )
             except (AttributeError, TypeError, ValueError):
                 LOG.debug("stationary route axis marker unavailable", exc_info=True)
@@ -12514,6 +12576,19 @@ class UiWorker(threading.Thread):
         try:
             undo_saved = self._undo_capture("重置录制")
             controller.reset_recording()
+            # 双桩点 are persisted by the fixed-attack section, not by the
+            # map recording.  A true reset must clear those anchors as part of
+            # the same action, then immediately remove them from the live
+            # MovementWorker configuration as well.
+            self._dual_stationary_posts = []
+            self._undo_skip_next_change_key = "攻击设置"
+            self._fixed_on_change()
+            clear_stationary = getattr(
+                getattr(self, "movement_worker", None),
+                "clear_stationary_attack_anchor", None,
+            )
+            if callable(clear_stationary):
+                clear_stationary("recording reset")
         except PermissionError:
             if undo_saved:
                 self._undo_discard_latest("重置录制")
@@ -12621,6 +12696,25 @@ class UiWorker(threading.Thread):
             attack_mode = str(attack_mode_var.get()) if attack_mode_var is not None else ""
         except (AttributeError, tk.TclError):
             attack_mode = ""
+        # Ordinary 站桩 uses a session-only anchor rather than a map-recorded
+        # point.  It must nevertheless be part of the canvas cache identity:
+        # otherwise deleting it would leave the old red marker painted until
+        # some unrelated route setting happened to refresh the canvas.
+        stationary_marker_key = None
+        mover = getattr(self, "movement_worker", None)
+        marker_getter = getattr(mover, "stationary_route_anchor_marker", None)
+        if callable(marker_getter):
+            try:
+                marker = marker_getter()
+                if marker is not None:
+                    stationary_marker_key = (
+                        str(marker[0]),
+                        round(float(marker[1].x), 6),
+                        round(float(marker[1].y), 6),
+                        str(marker[2] if len(marker) > 2 else "right"),
+                    )
+            except (AttributeError, IndexError, TypeError, ValueError):
+                LOG.debug("stationary route marker unavailable for canvas cache", exc_info=True)
         # Treat the patrol panel as a tiny declarative view.  This method is
         # called from both explicit actions and the periodic state observer;
         # deleting/recreating every canvas item, combobox value and button
@@ -12640,6 +12734,7 @@ class UiWorker(threading.Thread):
                 (post.get("x"), post.get("y"), post.get("facing"), post.get("layer"))
                 for post in self._dual_stationary_posts_data()
             ),
+            stationary_marker_key,
             selected,
             tuple(layer_names),
             repr(snapshot.layers),

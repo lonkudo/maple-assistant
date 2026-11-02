@@ -2405,8 +2405,10 @@ def main() -> int:
             climb_lateral_cycles_reset=int(
                 calibration.get("climb_lateral_cycles_reset", 3)
             ),
+            # Each layer owns its persisted ``patrol_times``.  This remains a
+            # compatibility fallback only for incomplete legacy recordings.
             patrol_cycles_per_layer=int(
-                calibration.get("patrol_cycles_per_layer", 2)
+                calibration.get("patrol_cycles_per_layer", 1)
             ),
             near_rope_seconds=float(calibration.get("near_rope_seconds", 0.5)),
             near_rope_range=float(rope_profile["near_range"]),

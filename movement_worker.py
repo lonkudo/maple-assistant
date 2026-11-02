@@ -3788,7 +3788,7 @@ class MovementWorker(threading.Thread):
         # confirm a rope-top/layer arrival.  The explicit target layer band
         # supplies the spatial guard, so a third sample only delays route
         # continuation without adding useful protection.
-        climb_layer_confirm_frames: int = 2,
+        climb_layer_confirm_frames: int = 4,
         climb_layer_confirm_seconds: float = 0.3,
         climb_arrival_world_tolerance: float = 0.20,
         climb_nudge_seconds: float = 0.20,
@@ -3804,7 +3804,10 @@ class MovementWorker(threading.Thread):
         # edge) - same ladder as climb_failed_cycles_reset but for the
         # lateral recovery, which is NOT reset by the walk back to the rope.
         climb_lateral_cycles_reset: int = 3,
-        patrol_cycles_per_layer: int = 2,
+        # Compatibility fallback for a legacy layer without its saved
+        # per-layer ``patrol_times``.  New and migrated recordings always
+        # persist the value on the logical layer, defaulting to one pass.
+        patrol_cycles_per_layer: int = 1,
         near_rope_seconds: float = 0.5,
         near_rope_range: Optional[float] = None,
         near_rope_inner_range: Optional[float] = None,
@@ -8015,6 +8018,46 @@ class MovementWorker(threading.Thread):
                 "enabled; awaiting temporary Start Patrol position" if enabled else "disabled",
             )
 
+    def clear_stationary_attack_anchor(
+        self, reason: str = "stationary anchor cleared",
+    ) -> None:
+        """Forget the current session-only 站桩 anchor without changing mode.
+
+        The ordinary 站桩 marker is not map-recording data, but it is still a
+        user-visible point. Removing it must clear every recovery/facing latch
+        attached to that point, otherwise a later Start Patrol can inherit an
+        invisible old anchor.
+        """
+
+        had_anchor = self._stationary_attack_anchor is not None
+        self._stationary_attack_anchor = None
+        self._stationary_runtime_layer_support = None
+        self._stationary_ui_anchor_layer = None
+        self._stationary_route_anchor_layer = None
+        self._stationary_return_route_ready = False
+        self._stationary_route_validation_error = ""
+        self._stationary_facing_command = None
+        self._stationary_facing_requested = None
+        self._stationary_x_settled = False
+        self._stationary_near_correction_next_at = 0.0
+        self._stationary_step_target_x = None
+        self._stationary_facing_confirm_frames_remaining = 0
+        self._stationary_pickup_phase = None
+        self._stationary_pickup_failures = 0
+        self._stationary_pickup_retry_after_return = False
+        self._stationary_pickup_next_at = float("inf")
+        self._stationary_pickup_return_active = False
+        self._clear_stationary_pickup_leg_progress()
+        self._stationary_return_dismount_direction = None
+        self._reset_stationary_y_recovery()
+        cancel = getattr(
+            self.motion_arbiter, "cancel_pending_stationary_post_actions", None,
+        )
+        if callable(cancel):
+            cancel(reason)
+        if had_anchor:
+            LOG.info("STATIONARY ATTACK: temporary anchor cleared (%s)", reason)
+
     def flower_patrol_attack_allowed(self) -> bool:
         """Whether 跑花模式 may send a cadence attack right now.
 
@@ -8097,6 +8140,7 @@ class MovementWorker(threading.Thread):
         if not self.dual_stationary_ready():
             return None
         index = int(index) % len(self._dual_stationary_posts)
+        previous_index = self._dual_stationary_active_index
         point, facing = self._dual_stationary_posts[index]
         self._dual_stationary_active_index = index
         self._stationary_attack_anchor = Point(point.x, point.y)
@@ -8110,6 +8154,26 @@ class MovementWorker(threading.Thread):
             self._dual_stationary_next_switch_at = (
                 time.monotonic() + self._dual_stationary_switch_delay()
             )
+        # A switch is an anchor/facing ownership boundary.  Do not let a
+        # queued correction or 小碎步, planned for the former post, run after
+        # this anchor became active.  In particular, a 被撞反击 replacement
+        # remains in AttackSlot: the fresh correction toward *this* post is
+        # the action that must consume it.  Buff tokens must also survive.
+        if previous_index is not None and previous_index != index:
+            cancel_former_post = getattr(
+                self.motion_arbiter,
+                "cancel_pending_stationary_post_actions",
+                None,
+            )
+            if callable(cancel_former_post):
+                cancelled = int(cancel_former_post(
+                    f"dual stationary post {previous_index + 1}-> {index + 1}: {reason}"
+                ) or 0)
+                if cancelled:
+                    LOG.info(
+                        "DUAL STATIONARY: discarded %d queued action(s) owned by post %d before activating post %d",
+                        cancelled, previous_index + 1, index + 1,
+                    )
         LOG.info("DUAL STATIONARY: active post %d/2 x=%.6f y=%.6f facing=%s (%s)",
                  index + 1, point.x, point.y, facing, reason)
         return self._stationary_attack_anchor
@@ -8281,11 +8345,31 @@ class MovementWorker(threading.Thread):
                 straight_up_tolerance=self.under_rope_tolerance,
             )
         if result == "climbing-up":
+            newly_attached = False
             with self._dead_flower_state_lock:
                 if not self._dead_flower_rope_attached:
                     self._dead_flower_rope_attached = True
+                    newly_attached = True
                     LOG.info("DEAD FLOWER entry: rope attachment confirmed; climbing toward flower point")
                     self._dead_flower_arm_ground_timer("rope attachment confirmed")
+            if newly_attached:
+                # ``climb(..., persistent_up=True)`` correctly owns Up until
+                # the rope grab is proven.  Unlike a normal route climb, a
+                # flower point is not a platform/layer arrival, so this
+                # private path must hand Up ownership back immediately after
+                # the proof.  Otherwise the generic climb state has no
+                # arrival_y and keeps climbing through the flower coordinate
+                # all the way to the next real layer.
+                #
+                # The next 5-FPS Dead Flower tick uses the selected flower's
+                # Y as a *private* virtual support: it either stops within
+                # DEAD_FLOWER_Y_TOLERANCE or holds Up/Down toward that point.
+                # No normal layer band, patrol resolver, or other mode is
+                # modified by this handoff.
+                self._dead_flower_release_vertical()
+                LOG.info(
+                    "DEAD FLOWER entry: rope confirmed; released entry Up and handed control to flower point Y"
+                )
         elif result in ("climb-stalled-retry", "failed-cycle-no-more-shift"):
             # Keep retry ownership private to Dead Flower instead of allowing
             # the ordinary patrol escalation to restart/drop the route.
@@ -8461,6 +8545,13 @@ class MovementWorker(threading.Thread):
                 "DEAD FLOWER entry: marker Y=%.6f is not layer1; already on rope, targeting distinct flower point %d/%d (x=%.6f y=%.6f)",
                 player.y, target_index + 1, len(flowers), target.x, target.y,
             )
+            # This entry classification is the positive rope-attachment proof
+            # for a run that begins on the rope.  The layer1->rope path arms
+            # the reset clock in _dead_flower_enter_rope(), but this branch
+            # bypasses that routine.  Without arming here, 重置花 remains
+            # ``inf`` forever: Buffs work at the flower point but the
+            # Alt+Left departure and layer1 circuit can never start.
+            self._dead_flower_arm_ground_timer("initial on-rope entry")
 
     def _dead_flower_walk_to(
         self, player: Point, target_x: float, reason: str,
@@ -12781,9 +12872,9 @@ class MovementWorker(threading.Thread):
         movement_phases = [phase for phase in phases if phase in ("left", "right")]
         layer = self.important_positions.get(name, {})
         try:
-            repeat_limit = max(1, int(layer.get("patrol_times", self.patrol_cycles_per_layer)))
+            repeat_limit = max(1, int(layer.get("patrol_times", 1)))
         except (AttributeError, TypeError, ValueError):
-            repeat_limit = self.patrol_cycles_per_layer
+            repeat_limit = 1
         if (not movement_phases
                 or current != movement_phases[-1]
                 or self._route_patrol_cycle >= repeat_limit):

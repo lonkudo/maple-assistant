@@ -413,7 +413,11 @@ class PatrolController:
         # Materialise the explicit detection envelopes for profiles recorded
         # before this schema existed.  Later UI recordings recalculate only
         # their own layer below.
-        migrated = False
+        # ``patrol_times`` is a logical-layer setting, shared deliberately by
+        # all of that layer's split parts.  Older imported recordings do not
+        # carry it; materialise one pass at load time so the UI, persisted
+        # profile and movement worker cannot disagree about its default.
+        migrated = self._ensure_layer_patrol_times_locked()
         for layer in self._profile.get("layers", {}).values():
             # Do not use ``any(generator)`` here: it short-circuits after the
             # first changed floor and would leave the rest of the profile on
@@ -730,6 +734,32 @@ class PatrolController:
                 if not isinstance(parts.get(key), dict):
                     parts[key] = self._new_split_part(layer)
                     changed = True
+        return changed
+
+    def _ensure_layer_patrol_times_locked(self) -> bool:
+        """Persist a valid 1..20 patrol count on every logical layer.
+
+        Split parts inherit this top-level value.  This migration is also
+        used for a one-off ``--recording-configuration`` file, so opening an
+        old exported recording cannot display one pass while runtime falls
+        back to the old global two-pass setting.
+        """
+
+        changed = False
+        layers = self._profile.get("layers", {})
+        if not isinstance(layers, dict):
+            return False
+        for layer in layers.values():
+            if not isinstance(layer, dict):
+                continue
+            try:
+                value = int(layer.get("patrol_times", 1))
+            except (TypeError, ValueError):
+                value = 1
+            value = max(1, min(20, value))
+            if layer.get("patrol_times") != value:
+                layer["patrol_times"] = value
+                changed = True
         return changed
 
     def _part_layer_locked(

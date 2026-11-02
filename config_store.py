@@ -11,6 +11,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Optional
+from runtime_paths import application_root
 
 
 USER_CONFIG_NAME = "user_config.json"
@@ -145,7 +146,10 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "climb_arrival_world_tolerance": .2,
         "climb_world_y_change_required": .75,
         "climb_world_y_stall_change_required": .15,
-        "climb_world_y_stall_frames": 2, "patrol_cycles_per_layer": 2,
+        # Patrol repeats are now owned and persisted by each logical layer.
+        # Keep the legacy fallback at one pass so an old, incomplete recording
+        # can never silently run a layer twice.
+        "climb_world_y_stall_frames": 2, "patrol_cycles_per_layer": 1,
         "potion_retry_attempts": 3, "potion_retry_delay_seconds": .05,
         "stair_jump_stall_frames": 7,
         "movement_hold_seconds": 2.0, "minimum_final_hold_seconds": .08,
@@ -456,7 +460,11 @@ def get_config_store(
     *,
     system_path: Optional[Path] = None,
 ) -> ConfigStore:
-    package_root = Path(__file__).resolve().parent
+    # Match licensing's executable-aware root.  In a frozen build ``__file__``
+    # can refer to an internal runtime directory; the launcher/config folder
+    # is beside the executable instead.  A split root here would make the UI
+    # write activation metadata somewhere other than licensing reads it.
+    package_root = application_root(__file__)
     user_root = _default_user_root(package_root)
     requested = Path(path or user_root / USER_CONFIG_NAME).resolve()
     # Preserve --config config.json compatibility while migrating writes to

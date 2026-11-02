@@ -13,7 +13,7 @@
     "climb_world_y_change_required": 0.75,
     "climb_world_y_stall_change_required": 0.15,
     "climb_world_y_stall_frames": 2,
-    "patrol_cycles_per_layer": 2,
+    "patrol_cycles_per_layer": 1,
     "potion_retry_attempts": 3,
     "potion_retry_delay_seconds": 0.05,
     "stair_jump_stall_frames": 7,

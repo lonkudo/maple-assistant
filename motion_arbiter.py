@@ -432,6 +432,48 @@ class MotionArbiter(threading.Thread):
         )
         return len(removed)
 
+    def cancel_pending_stationary_post_actions(
+        self, reason: str = "stationary post changed",
+    ) -> int:
+        """Discard unstarted actions that belong to a former stationary post.
+
+        A 双桩 switch changes both the recovery anchor and its facing.  A
+        correction, facing tap, or 小碎步 that was queued for the former post
+        must not run afterwards: it can turn the character toward the old 桩
+        and consume the next stationary attack slot there.  Buffs and a
+        pending 被撞反击 slot deliberately survive; neither contains a physical
+        direction of its own and the next valid action at the new 桩 may spend
+        that attack replacement.
+
+        Never interrupt a token that is already sending input.  The key ledger
+        remains balanced and the next movement frame recovers against the new
+        post.
+        """
+
+        prefixes = (STEP, FACING)
+        with self._cv:
+            executing = self._executing_token
+            removed = [
+                token for token in self._pending
+                if token != executing and (
+                    token == MICRO_STEP
+                    or any(token.startswith(f"{prefix}:") for prefix in prefixes)
+                )
+            ]
+            if not removed:
+                return 0
+            self._pending = deque(
+                token for token in self._pending if token not in removed
+            )
+            for token in removed:
+                self._queued.discard(token)
+            self._cv.notify_all()
+        LOG.info(
+            "motion arbiter cancelled %d former-stationary-post action(s): %s",
+            len(removed), reason,
+        )
+        return len(removed)
+
     def cancel_pending_counterattacks(self, reason: str = "counterattack disabled") -> int:
         """Discard unstarted hit reactions that are no longer permitted.
 
