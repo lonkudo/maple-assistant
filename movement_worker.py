@@ -3784,7 +3784,11 @@ class MovementWorker(threading.Thread):
         estimated_final_speed: float = 0.205,
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 3,
-        climb_layer_confirm_frames: int = 4,
+        # Two fresh minimap captures at the shared 5-FPS cadence (~200 ms)
+        # confirm a rope-top/layer arrival.  The explicit target layer band
+        # supplies the spatial guard, so a third sample only delays route
+        # continuation without adding useful protection.
+        climb_layer_confirm_frames: int = 2,
         climb_layer_confirm_seconds: float = 0.3,
         climb_arrival_world_tolerance: float = 0.20,
         climb_nudge_seconds: float = 0.20,
