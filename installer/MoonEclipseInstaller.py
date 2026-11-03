@@ -41,7 +41,7 @@ PIN_ROOT = next(
 )
 
 from licensing import ACTIVATION_SERVER_ENDPOINT, machine_fingerprint_hash  # noqa: E402
-from pinned_tls import download_binary, post_json  # noqa: E402
+from pinned_tls import download_binary, download_url, post_json  # noqa: E402
 
 
 INSTALL_MARKER = ".mooneclipse-install.json"
@@ -55,6 +55,54 @@ PROTECTED_EXECUTABLE = "MoonEclipse.exe"
 MAX_DOWNLOAD_WORKERS = 4
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
+# Folder created on the Desktop for a first install.
+DEFAULT_FOLDER_NAME = "MoonEclipse"
+
+
+def _desktop_directory() -> Path:
+    """Return the user's real Desktop folder.
+
+    ``Path.home() / "Desktop"`` is wrong often enough to matter: OneDrive
+    redirects the folder to ``.../OneDrive/Desktop``, and a localized Windows
+    names it 桌面.  Ask the shell for the known folder instead and fall back
+    only when that fails.
+    """
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        folder_id = _GUID(
+            0xB4BFCC3A, 0xDB2C, 0x424C,
+            (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41),
+        )
+        buffer = ctypes.c_wchar_p()
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetKnownFolderPath.argtypes = [
+            ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(buffer)) == 0:
+            resolved = str(buffer.value or "")
+            ctypes.windll.ole32.CoTaskMemFree(buffer)
+            if resolved:
+                path = Path(resolved)
+                if path.is_dir():
+                    return path
+    except (AttributeError, OSError, ValueError):
+        pass
+    fallback = Path.home() / "Desktop"
+    return fallback if fallback.is_dir() else Path.home()
 
 
 def _pointer_root() -> Path | None:
@@ -154,7 +202,9 @@ class InstallerWindow:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.running = False
         self.progress_value = 0.0
-        default_root = _pointer_root() or (Path.home() / "MoonEclipse")
+        # An existing install stays where it is; a first install defaults to
+        # Desktop\MoonEclipse.
+        default_root = _pointer_root() or (_desktop_directory() / DEFAULT_FOLDER_NAME)
 
         outer = ttk.Frame(self.root, padding=18)
         outer.grid(sticky="nsew")
@@ -251,11 +301,18 @@ class InstallerWindow:
                             last_report = completed
                             self.events.put(("bytes", completed))
                 with target.open("wb") as output:
-                    received = download_binary(
-                        ACTIVATION_SERVER_ENDPOINT,
-                        "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
-                        PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
-                    )
+                    cdn_url = item.get("url")
+                    if isinstance(cdn_url, str) and cdn_url.startswith("https://"):
+                        # CDN copy.  The pin is deliberately not applied here;
+                        # the SHA-256 check below is what trusts these bytes,
+                        # because the manifest came from the pinned origin.
+                        received = download_url(cdn_url, output, on_bytes)
+                    else:
+                        received = download_binary(
+                            ACTIVATION_SERVER_ENDPOINT,
+                            "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
+                            PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                        )
                 if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):
                     raise RuntimeError(f"文件校验失败：{relative}")
                 return item, target

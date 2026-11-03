@@ -9,6 +9,7 @@ import json
 import logging
 from pathlib import Path
 import ssl
+import threading
 from typing import BinaryIO, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
@@ -154,6 +155,94 @@ def download_binary(
         raise PinnedTlsError("无法下载更新文件。") from exc
     finally:
         connection.close()
+
+
+_thread_state = threading.local()
+
+
+def _pooled_connection(host: str, port: int, timeout: float) -> http.client.HTTPSConnection:
+    """Reuse one connection per thread instead of a handshake per file.
+
+    A release is over a thousand files, and every fresh connection paid a full
+    TLS handshake (measured at ~96 ms each, ~100 s per release).  The server
+    answers HTTP/1.1 keep-alive, so hold the connection for the next file.
+    """
+
+    existing = getattr(_thread_state, "connection", None)
+    if existing is not None and getattr(_thread_state, "key", None) == (host, port):
+        return existing
+    _drop_pooled_connection()
+    context = ssl.create_default_context()
+    connection = http.client.HTTPSConnection(host, port, context=context, timeout=timeout)
+    connection.connect()
+    _thread_state.connection = connection
+    _thread_state.key = (host, port)
+    return connection
+
+
+def _drop_pooled_connection() -> None:
+    connection = getattr(_thread_state, "connection", None)
+    if connection is not None:
+        try:
+            connection.close()
+        except OSError:
+            pass
+    _thread_state.connection = None
+    _thread_state.key = None
+
+
+def download_url(
+    url: str, output: BinaryIO, progress: Optional[Callable[[int], None]] = None,
+    timeout: float = 30.0,
+) -> int:
+    """Stream one release file from an absolute HTTPS URL without the server pin.
+
+    Only CDN copies are fetched this way.  Integrity does not depend on this
+    connection: the installer verifies every file against the SHA-256 in the
+    manifest that the *pinned* origin issued.  Transport still uses the system
+    CA store, so this is weaker than the pin but not unauthenticated, and a CDN
+    certificate can never be used to change what a client installs.
+    """
+
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        raise PinnedTlsError("发布文件地址无效。")
+    target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    host, port = parts.hostname, parts.port or 443
+    total = 0
+    for attempt in (1, 2):
+        try:
+            connection = _pooled_connection(host, port, timeout)
+            connection.request("GET", target)
+            response = connection.getresponse()
+            if response.status >= 400:
+                data: dict = {}
+                try:
+                    data = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                raise PinnedTlsResponseError(
+                    response.status, "DOWNLOAD_FAILED", "发布文件下载失败。", data
+                )
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                total += len(chunk)
+                if progress is not None:
+                    progress(len(chunk))
+            return total
+        except PinnedTlsResponseError:
+            raise
+        except (OSError, ssl.SSLError) as exc:
+            # A pooled connection the peer already closed fails before any byte
+            # arrives; reconnect once for that case only, because a retry after
+            # partial output would corrupt the staged file.
+            _drop_pooled_connection()
+            if attempt == 2 or total:
+                raise PinnedTlsError("无法下载发布文件。") from exc
+    raise PinnedTlsError("无法下载发布文件。")
 
 
 def upload_binary(
