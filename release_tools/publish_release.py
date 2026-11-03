@@ -49,7 +49,19 @@ TOKEN_ENVIRONMENT = "MOONECLIPSE_RELEASE_PUBLISH_TOKEN"
 EXCLUDED_PARTS = {".git", ".venv", "__pycache__", "work", "release", "助手配置", "data", "recordings", "updates", "logs"}
 # Local scratch the packaging step leaves beside the staged sources.  These are
 # not part of the product, so they must never reach an installer manifest.
-EXCLUDED_FILES = {"新配置.json", "运行日志.txt"}
+EXCLUDED_FILES = {
+    "新配置.json",
+    "运行日志.txt",
+    # The YOLO panel is disabled in this build (_SHOW_YOLO_PANEL = False) and no
+    # shipped module references either weight file; both are 17.5 MB of dead
+    # payload.
+    "yolo-detection/weights/best.pt",
+    "yolo-detection/weights/best.onnx",
+    # AVIF codec for a project whose images are JPG only.
+    "PIL/_avif.pyd",
+    # Developer instructions belong to the repository, never to a customer.
+    "AGENTS.md",
+}
 
 
 def sha256(path: Path) -> str:

@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from typing import Any
 from urllib.parse import quote
 
@@ -52,7 +53,11 @@ CONFIG_DIRECTORY = "助手配置"
 # A protected package carries this executable and its own Python runtime, so it
 # needs neither a .venv nor 安装.bat.
 PROTECTED_EXECUTABLE = "MoonEclipse.exe"
-MAX_DOWNLOAD_WORKERS = 4
+MAX_DOWNLOAD_WORKERS = 8
+# A one-request archive is ~37% of the payload (74 MB vs 199 MB), but it must
+# never be used for a small update.  Only plan files this large, and at least
+# half the archive, take the bundle path.
+BUNDLE_MIN_BYTES = 24 * 1024 * 1024
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
 # Folder created on the Desktop for a first install.
@@ -136,6 +141,38 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(512 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _bundle_worth_it(bundle: dict[str, Any], planned_bytes: int) -> bool:
+    """Use the archive only when it really saves transfer."""
+
+    try:
+        size = int(bundle.get("size", 0))
+    except (TypeError, ValueError):
+        return False
+    if not str(bundle.get("name") or "") or size <= 0:
+        return False
+    return planned_bytes >= max(BUNDLE_MIN_BYTES, size // 2)
+
+
+def _extract_bundle(archive: Path, target_root: Path) -> None:
+    """Extract a version archive, refusing any path that escapes the root."""
+
+    root = target_root.resolve()
+    with zipfile.ZipFile(archive) as bundle:
+        for info in bundle.infolist():
+            if info.is_dir():
+                continue
+            try:
+                relative = _safe_path(info.filename)
+            except ValueError:
+                raise RuntimeError(f"安装包内容无效：{info.filename}") from None
+            destination = (root / relative).resolve()
+            if root not in destination.parents:
+                raise RuntimeError(f"安装包内容无效：{info.filename}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.open(info) as source, destination.open("wb") as output:
+                shutil.copyfileobj(source, output)
 
 
 def _load_local_manifest(root: Path) -> dict[str, Any]:
@@ -317,10 +354,49 @@ class InstallerWindow:
                     raise RuntimeError(f"文件校验失败：{relative}")
                 return item, target
 
-            with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
-                futures = [pool.submit(fetch, item, relative) for item, relative in planned]
-                for future in as_completed(futures):
-                    future.result()
+            def fetch_bundle() -> None:
+                """Fetch the whole version in one request and unpack it."""
+
+                archive = staging / "bundle.zip"
+                last_report = 0
+
+                def on_bytes(count: int) -> None:
+                    nonlocal completed, last_report
+                    with completed_lock:
+                        completed += count
+                        if completed - last_report >= 128 * 1024:
+                            last_report = completed
+                            self.events.put(("bytes", completed))
+
+                bundle_url = bundle.get("url")
+                with archive.open("wb") as output:
+                    if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
+                        received = download_url(bundle_url, output, on_bytes)
+                    else:
+                        received = download_binary(
+                            ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/bundle",
+                            PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                        )
+                if received != int(bundle.get("size", 0)) or _sha256(archive) != str(bundle.get("sha256", "")):
+                    raise RuntimeError("安装包整包校验失败。")
+                _extract_bundle(archive, staging)
+                archive.unlink(missing_ok=True)
+
+            bundle = manifest.get("bundle")
+            if planned and isinstance(bundle, dict) and _bundle_worth_it(bundle, total):
+                # One request instead of one per file, carrying 37% of the bytes.
+                fetch_bundle()
+                # The archive is only transport, so every planned file must still
+                # match the per-file SHA-256 the pinned origin issued.
+                for item, relative in planned:
+                    staged = staging / relative
+                    if not staged.is_file() or _sha256(staged) != str(item["sha256"]):
+                        raise RuntimeError(f"文件校验失败：{relative}")
+            else:
+                with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
+                    futures = [pool.submit(fetch, item, relative) for item, relative in planned]
+                    for future in as_completed(futures):
+                        future.result()
             self.events.put(("bytes", total))
             app_root.mkdir(parents=True, exist_ok=True)
             # Only verified staging output reaches the live folder.
