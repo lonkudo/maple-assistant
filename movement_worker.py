@@ -404,10 +404,10 @@ STATIONARY_RETURN_ROPE_DISMOUNT_HOLD_SECONDS = 0.40
 # 双向 alternates the final stationary facing after this many settled
 # minimap frames. At the shared 5 FPS capture cadence this is about 16s.
 STATIONARY_ATTACK_BILATERAL_FACING_FRAMES = 80
-# The stand-still pickup run is a complete left -> right -> anchor circuit.
+# The timed stand-still patrol borrows the normal recorded all-layer route.
 # It uses the same timing vocabulary as the optional motion controls, but is
 # kept in this worker because it owns the temporary stationary anchor.
-# 捡东西 is configured in MINUTES on its UI row ("m") except for the short
+# 定时巡逻 is configured in MINUTES on its UI row ("m") except for the short
 # end, which is displayed in seconds.  The trigger range is 10s .. 30m.
 STATIONARY_PICKUP_MIN_INTERVAL_SECONDS = 10.0
 STATIONARY_PICKUP_MAX_INTERVAL_SECONDS = 1800.0  # 30.0m
@@ -1841,13 +1841,13 @@ def climb(
         # Focus loss can release Up while the character is visibly attached
         # to a rope.  World Y alone is not enough to distinguish that from a
         # re-anchor, so require the raw minimap X *and* Y to be unchanged for
-        # four fresh captures.  A left climb jump then reacquires the rope
+        # three fresh captures. A left climb jump then reacquires the rope
         # rather than leaving the character stranded at the same rope point.
         if marker_position_static:
             state.position_stalled_frames += 1
         else:
             state.position_stalled_frames = 0
-        if state.position_stalled_frames >= 4:
+        if state.position_stalled_frames >= 3:
             key_up = getattr(sender, "key_up", None)
 
             def restart_left_climb() -> bool:
@@ -1885,7 +1885,7 @@ def climb(
                 state.position_stalled_frames = 0
                 state.arrival_frames = 0
                 LOG.warning(
-                    "CLIMB rope-point stall: marker X/Y unchanged for 4 frames; "
+                    "CLIMB rope-point stall: marker X/Y unchanged for 3 frames; "
                     "restarting with Alt+Left"
                 )
                 return "left-position-stall-retry"
@@ -2832,7 +2832,7 @@ class MovementWorker(threading.Thread):
             self._rescue_off_route_frames = 0
             self._rescue_last_pos = None
             return
-        if self.stationary_attack_enabled:
+        if self.stationary_attack_enabled and not self._stationary_timed_patrol_active:
             # 站桩攻击 stands still BY DESIGN: every frame is "stuck" for this
             # detector, which would probe the character (walk right then left,
             # with attacks blocked) and, when the probe cannot move it at a
@@ -3784,11 +3784,10 @@ class MovementWorker(threading.Thread):
         estimated_final_speed: float = 0.205,
         final_move_safety_gain: float = 0.95,
         aligned_frames_required: int = 3,
-        # Two fresh minimap captures at the shared 5-FPS cadence (~200 ms)
-        # confirm a rope-top/layer arrival.  The explicit target layer band
-        # supplies the spatial guard, so a third sample only delays route
-        # continuation without adding useful protection.
-        climb_layer_confirm_frames: int = 4,
+        # Two fresh minimap captures at the shared 5-FPS cadence (~400 ms)
+        # confirm a rope-top/layer arrival. The explicit target layer band
+        # supplies the spatial guard while avoiding a long pause at the lip.
+        climb_layer_confirm_frames: int = 2,
         climb_layer_confirm_seconds: float = 0.3,
         climb_arrival_world_tolerance: float = 0.20,
         climb_nudge_seconds: float = 0.20,
@@ -4352,6 +4351,13 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_failures = 0
         self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_return_active = False
+        # A timed stationary patrol temporarily borrows the normal route
+        # engine.  It is deliberately separate from the ordinary stationary
+        # return latch: while true, the route owns movement and normal attack
+        # cadence is suppressed until the anchor layer has been reached again.
+        self._stationary_timed_patrol_active = False
+        self._stationary_timed_patrol_returning = False
+        self._stationary_timed_patrol_pending_rearm = False
         # One pickup leg's progress toward its recorded endpoint: which leg,
         # the closest distance seen, and how many frames it has not improved.
         self._stationary_pickup_leg_key: Optional[tuple[str, float]] = None
@@ -8010,6 +8016,9 @@ class MovementWorker(threading.Thread):
             self._stationary_pickup_failures = 0
             self._stationary_pickup_retry_after_return = False
             self._stationary_pickup_return_active = False
+            self._stationary_timed_patrol_active = False
+            self._stationary_timed_patrol_returning = False
+            self._stationary_timed_patrol_pending_rearm = False
             self._clear_stationary_pickup_leg_progress()
             self._stationary_return_dismount_direction = None
             self._reset_stationary_y_recovery()
@@ -8047,6 +8056,9 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_retry_after_return = False
         self._stationary_pickup_next_at = float("inf")
         self._stationary_pickup_return_active = False
+        self._stationary_timed_patrol_active = False
+        self._stationary_timed_patrol_returning = False
+        self._stationary_timed_patrol_pending_rearm = False
         self._clear_stationary_pickup_leg_progress()
         self._stationary_return_dismount_direction = None
         self._reset_stationary_y_recovery()
@@ -9093,6 +9105,35 @@ class MovementWorker(threading.Thread):
                 anchor.y, anchor_layer, runtime_band[0], runtime_band[1],
                 ("[%.6f, %.6f]" % saved_band) if saved_band is not None else "none",
             )
+        # 定时巡逻 is intentionally a full selected patrol route, not the
+        # old one-layer left -> right -> 桩 loop.  Keep the controller's
+        # configured range intact so that its ordinary rope/jump/drop route
+        # can be borrowed when the timer fires.
+        if self.stationary_pickup_enabled:
+            route_errors = self.patrol_controller.validate_patrol_route()
+            self._sync_patrol_controller()
+            if route_errors:
+                self._stationary_route_validation_error = "; ".join(route_errors)
+                LOG.warning(
+                    "TIMED STATIONARY PATROL: configured route is not ready: %s",
+                    self._stationary_route_validation_error,
+                )
+                return False
+            if anchor_layer not in self._route_layers:
+                self._stationary_route_validation_error = (
+                    f"桩点所在的 {anchor_layer} 不在当前巡逻路线内"
+                )
+                LOG.warning("TIMED STATIONARY PATROL: %s",
+                            self._stationary_route_validation_error)
+                return False
+            self._stationary_route_anchor_layer = anchor_layer
+            self._stationary_return_route_ready = True
+            LOG.info(
+                "TIMED STATIONARY PATROL armed: anchor on %s; full route=%s",
+                anchor_layer, " -> ".join(self._route_layers),
+            )
+            return True
+
         previous_start, previous_end = self.patrol_controller.patrol_range()
         try:
             # The standing point defines this mode's route.  It does not
@@ -9187,7 +9228,7 @@ class MovementWorker(threading.Thread):
         """Configure the optional station-point pickup circuit live.
 
         ``interval_seconds`` and ``jitter_seconds`` stay seconds here (they are
-        the configuration's own keys); the 捡东西 row presents the interval in
+        the backwards-compatible configuration keys); the 定时巡逻 row presents the interval in
         minutes and converts before publishing.  Both bounds are enforced so a
         hand-edited configuration cannot schedule a circuit every few seconds.
         """
@@ -9204,12 +9245,15 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_return_active = False
         self._clear_stationary_pickup_leg_progress()
         self._stationary_return_dismount_direction = None
+        self._stationary_timed_patrol_active = False
+        self._stationary_timed_patrol_returning = False
+        self._stationary_timed_patrol_pending_rearm = False
         self._stationary_pickup_next_at = (
             time.monotonic() + self._stationary_pickup_delay()
             if self.stationary_pickup_enabled else float("inf")
         )
         LOG.info(
-            "stationary pickup circuit %s interval=%.1fm random_gap=%.1fs",
+            "timed stationary patrol %s interval=%.1fm random_gap=%.1fs",
             "enabled" if self.stationary_pickup_enabled else "disabled",
             self.stationary_pickup_interval_seconds / 60.0,
             self.stationary_pickup_jitter_seconds,
@@ -9223,94 +9267,66 @@ class MovementWorker(threading.Thread):
     def _stationary_pickup_decision(
         self, anchor: Point, player: Point,
     ) -> Optional[MovementDecision]:
-        """Run one stationary pickup circuit without changing the anchor.
+        """Start the timed full-route patrol when its stationary timer is due.
 
-        The normal Z-with-walk path collects items.  This state machine only
-        supplies its three horizontal destinations: left edge, right edge,
-        then the temporary attack point.
+        The historical same-layer pickup circuit is intentionally retired.
+        This function only owns the timer; the ordinary route engine owns the
+        actual all-layer traversal, with no Z input and no attack cadence.
         """
 
         if (not self.stationary_pickup_enabled
                 or not self._stationary_return_route_ready
                 or not self._stationary_route_anchor_layer):
             return None
-        layer = self.important_positions.get(self._stationary_route_anchor_layer)
-        if not isinstance(layer, dict):
-            return None
-        left, right = layer.get("left_most_pos"), layer.get("right_most_pos")
-        if not (isinstance(left, dict) and isinstance(right, dict)):
-            return None
-        try:
-            left_x, right_x = float(left["x"]), float(right["x"])
-        except (KeyError, TypeError, ValueError):
+        if self._stationary_timed_patrol_active:
             return None
         now = time.monotonic()
-        if self._stationary_pickup_phase is None:
-            if now < self._stationary_pickup_next_at:
-                return None
-            self._stationary_pickup_phase = "left"
-            self._clear_stationary_pickup_leg_progress()
-            # Each pickup circuit is a new directional traversal.  Its jump
-            # points must be available again even if the previous circuit
-            # already crossed the same point before returning or falling.
-            self._begin_jump_point_pass("stationary pickup circuit")
-            self._jump_point_inside_tokens.clear()
-            self._jump_point_suppressed_tokens.clear()
-            self._jump_point_candidate = None
-            LOG.info("STATIONARY PICKUP: starting %s left -> right -> anchor",
-                     self._stationary_route_anchor_layer)
-        phase = self._stationary_pickup_phase
-        target = left_x if phase == "left" else right_x if phase == "right" else anchor.x
-        travel = self._stationary_pickup_leg_travel(phase, anchor.x, player.x)
-        if self._stationary_pickup_leg_arrived(phase, target, player.x, travel):
-            if phase == "left":
-                self._stationary_pickup_phase = "right"
-                LOG.info(
-                    "STATIONARY PICKUP: left edge reached (x=%.6f left_x=%.6f); "
-                    "crossing right", player.x, left_x,
-                )
-                target = right_x
-                travel = "right"
-            elif phase == "right":
-                self._stationary_pickup_phase = "anchor"
-                if self.dual_stationary_ready():
-                    nearest_index = self._nearest_dual_stationary_post(player)
-                    selected = self._activate_dual_stationary_post(
-                        nearest_index,
-                        reason="pickup return selected closest post",
-                        restart_timer=False,
-                    )
-                    if selected is not None:
-                        anchor = selected
-                LOG.info(
-                    "STATIONARY PICKUP: right edge reached (x=%.6f right_x=%.6f); "
-                    "returning to anchor", player.x, right_x,
-                )
-                target = anchor.x
-                travel = self._stationary_pickup_leg_travel(
-                    self._stationary_pickup_phase, anchor.x, player.x
-                )
-            else:
-                self._stationary_pickup_phase = None
-                self._stationary_pickup_failures = 0
+        if self._stationary_timed_patrol_pending_rearm:
+            # The next interval begins only after the normal stationary
+            # recovery has placed the character back on a usable post.
+            if self._stationary_x_settled:
+                self._stationary_timed_patrol_pending_rearm = False
                 self._stationary_pickup_next_at = now + self._stationary_pickup_delay()
-                self._clear_stationary_pickup_leg_progress()
-                LOG.info(
-                    "STATIONARY PICKUP: anchor restored (x=%.6f anchor_x=%.6f); "
-                    "next run scheduled", player.x, anchor.x,
-                )
-                return None
-        # One leg walks ONE way.  The direction is the leg's own travel
-        # direction, never re-derived from the live gap: the old
-        # "right if target > player.x else left" turned the character around
-        # whenever the marker had already stepped over its endpoint, which is
-        # how the pickup ping-ponged in the 12:30 field log (phase "right",
-        # recorded right_x=0.46, marker at 0.469298 -> walked left again).
-        return MovementDecision(
-            travel,
-            f"stationary pickup {self._stationary_pickup_phase} {travel}",
-            self.movement_hold_seconds,
-        )
+                LOG.info("TIMED STATIONARY PATROL: anchor settled; next route scheduled")
+            return None
+        if now < self._stationary_pickup_next_at:
+            return None
+        self._start_stationary_timed_patrol(anchor, player)
+        return MovementDecision(None, "timed stationary patrol starting")
+
+    def _start_stationary_timed_patrol(self, anchor: Point, player: Point) -> None:
+        """Hand one timer round to the normal all-layer patrol engine."""
+
+        if self._stationary_timed_patrol_active or not self._route_layers:
+            return
+        anchor_layer = self._stationary_route_anchor_layer
+        if anchor_layer not in self._route_layers:
+            LOG.warning("TIMED STATIONARY PATROL: anchor layer %s is no longer in route",
+                        anchor_layer)
+            self._stationary_pickup_next_at = time.monotonic() + self._stationary_pickup_delay()
+            return
+        self._stationary_timed_patrol_active = True
+        self._stationary_timed_patrol_returning = False
+        self._stationary_pickup_phase = "route"
+        self._stationary_pickup_next_at = float("inf")
+        self._route_patrol_cycle = 1
+        self._begin_jump_point_pass("timed stationary patrol")
+        self._jump_point_inside_tokens.clear()
+        self._jump_point_suppressed_tokens.clear()
+        self._jump_point_candidate = None
+        anchor_index = self._route_layers.index(anchor_layer)
+        first_index = 0
+        self._route_layer_index = anchor_index
+        if anchor_index > first_index:
+            # The regular drop state already has the correct repeated
+            # Alt+Down and first-floor confirmation behaviour.
+            self._route_phase = "drop"
+            LOG.info("TIMED STATIONARY PATROL: timer due; dropping from %s to %s",
+                     anchor_layer, self._route_layers[first_index])
+        else:
+            self._start_patrol_on(self._route_layers[first_index], self.last_observation)
+            LOG.info("TIMED STATIONARY PATROL: timer due; starting route at %s",
+                     self._route_layers[first_index])
 
     @staticmethod
     def _stationary_pickup_leg_travel(
@@ -9930,17 +9946,9 @@ class MovementWorker(threading.Thread):
             # attempt would earn a second jump without the character ever
             # leaving its post.
             self._reset_stationary_y_recovery()
-        # 捡东西 owns the whole left -> right -> anchor circuit.  Do this
-        # before normal anchor recovery so crossing either side cannot be
-        # pulled back to 桩 mid-run.  A wrong-Y observation still goes through
-        # the vertical recovery below instead of walking a pickup route on a
-        # different platform.
-        # Once a pickup leg has started it owns movement regardless of a
-        # transient marker-Y change (jump arc, platform edge, or minimap
-        # jitter).  The route detector aborts it as soon as a real fall onto
-        # another layer is confirmed.  Restrict the Y check only when *first*
-        # starting a new pickup round, otherwise the normal 桩 return takes
-        # over mid-leg the moment the marker leaves the exact launch Y.
+        # 定时巡逻 starts only from a confirmed, settled 桩. Once it starts,
+        # the normal route engine owns movement until it returns to this
+        # anchor layer; stationary recovery cannot pull it back mid-route.
         pickup_is_active = self._stationary_pickup_phase is not None
         # A freshly due pickup may only start from a confirmed, settled 桩.
         # A fall used to retain the previous settled-X flag for a few frames;
@@ -11322,6 +11330,48 @@ class MovementWorker(threading.Thread):
         return mode pointed at the next step."""
         self._return_from_floor = floor
         stationary_anchor_layer = self._stationary_route_anchor_layer
+        if (self._stationary_timed_patrol_active
+                and self._stationary_timed_patrol_returning
+                and stationary_anchor_layer):
+            if floor == stationary_anchor_layer:
+                # Re-enter the established stationary return path after the
+                # all-layer circuit reaches its shared anchor layer.  In dual
+                # mode it will subsequently choose the closest of the two
+                # posts; both posts deliberately share this one layer.
+                self._stationary_timed_patrol_active = False
+                self._stationary_timed_patrol_returning = False
+                self._stationary_pickup_phase = None
+                self._stationary_timed_patrol_pending_rearm = True
+                if self.dual_stationary_ready() and observation is not None and observation.player is not None:
+                    self._activate_dual_stationary_post(
+                        self._nearest_dual_stationary_post(observation.player),
+                        reason="timed patrol return selected closest post",
+                        restart_timer=False,
+                    )
+                LOG.info("TIMED STATIONARY PATROL: route return reached %s", floor)
+                self._finish_return(floor, observation)
+                return
+            self._return_mode = (
+                "climb-to-route"
+                if _layer_number(floor) < _layer_number(stationary_anchor_layer)
+                else "drop-to-route"
+            )
+            # This floor is now the departure floor for the *next* rope.
+            # The previous rope's Up ownership must end before horizontal
+            # movement toward this floor's own rope begins; otherwise the
+            # next sample is mistaken for another layer arrival and the
+            # position-stall watchdog re-jumps at the platform top.
+            self._release_climb_up()
+            self._climb_state = ClimbState()
+            self._return_from_floor = floor
+            self._return_arrival_floor = None
+            if floor in self._route_layers:
+                self._route_layer_index = self._route_layers.index(floor)
+            self._climb_state.target_layer_frames = 0
+            self._climb_state.target_layer_since = None
+            LOG.info("TIMED STATIONARY PATROL: reached intermediate %s; returning to %s",
+                     floor, stationary_anchor_layer)
+            return
         if (self.stationary_attack_enabled
                 and self._stationary_return_route_ready
                 and stationary_anchor_layer):
@@ -11358,7 +11408,7 @@ class MovementWorker(threading.Thread):
                     self._route_layer_index = self._route_layers.index(floor)
                 self._route_phase = "left"
                 self._reanchor_tracker_to_layer(floor, observation)
-                if self.stationary_pickup_enabled:
+                if self.stationary_pickup_enabled and not self._stationary_timed_patrol_pending_rearm:
                     # A confirmed fall discarded the old pickup plan.  Only
                     # after the normal route return reaches this layer do we
                     # begin a completely new interval.
@@ -11367,8 +11417,8 @@ class MovementWorker(threading.Thread):
                         + self._stationary_pickup_delay()
                     )
                     LOG.info(
-                        "STATIONARY PICKUP: route return reached 桩; "
-                        "fresh pickup interval armed"
+                        "TIMED STATIONARY PATROL: route return reached 桩; "
+                        "fresh interval armed"
                     )
                 LOG.warning(
                     "STATIONARY RETURN: reached anchor layer %s; resuming stand-still attack",
@@ -11383,6 +11433,11 @@ class MovementWorker(threading.Thread):
                 if _layer_number(floor) < _layer_number(stationary_anchor_layer)
                 else "drop-to-route"
             )
+            # An intermediate floor ends the prior rope climb. Release its
+            # Up claim before walking to this floor's rope, rather than
+            # carrying an attached/climbing state into the next climb.
+            self._release_climb_up()
+            self._climb_state = ClimbState()
             self._return_from_floor = floor
             self._return_arrival_floor = None
             if floor in self._route_layers:
@@ -11526,6 +11581,17 @@ class MovementWorker(threading.Thread):
             state.target_layer_since = None
             return False
         state.blank_arrival_frames = 0
+
+        # ``_finish_return`` promotes an accepted intermediate floor to the
+        # next rope's departure floor. Its ordinary, stable marker samples
+        # are not a second climb arrival. Without this guard layer2 was
+        # repeatedly reconfirmed immediately after a layer1 -> layer2 climb,
+        # so Up stayed held until the rope-stall watchdog restarted it.
+        if floor == self._return_from_floor:
+            self._return_arrival_floor = None
+            state.target_layer_frames = 0
+            state.target_layer_since = None
+            return False
 
         arrival_is_route_or_stationary_anchor = accepted(floor)
         if (state.target_layer_since is not None
@@ -12195,7 +12261,7 @@ class MovementWorker(threading.Thread):
 
         if not self.patrol_enabled:
             return None, False, "patrol-paused"
-        if self.stationary_attack_enabled:
+        if self.stationary_attack_enabled and not self._stationary_timed_patrol_active:
             if self._stationary_attack_anchor is None:
                 return None, False, "stationary-attack-awaiting-anchor"
             if self._stationary_return_route_ready:
@@ -12219,7 +12285,8 @@ class MovementWorker(threading.Thread):
             # restarts patrol or keeps climbing.
             detected_floor = self._detect_stationary_return_floor(
                 observation
-            ) if self.stationary_attack_enabled else self._detect_floor_all(observation)
+            ) if (self.stationary_attack_enabled
+                  and not self._stationary_timed_patrol_active) else self._detect_floor_all(observation)
             climb_in_progress = bool(
                 self._climb_state.up_held
                 or self._climb_state.phase != "idle"
@@ -12825,6 +12892,9 @@ class MovementWorker(threading.Thread):
                          current, next_phase)
                 return True
         # End of this layer's recorded actions.
+        if is_final and self._stationary_timed_patrol_active:
+            self._begin_stationary_timed_patrol_return(observation)
+            return True
         if is_final and self._split_enabled:
             # Each part is a complete mini-route.  Higher final layers must
             # fall back to that part's bottom layer before changing sides;
@@ -12859,6 +12929,48 @@ class MovementWorker(threading.Thread):
         self._route_phase = "stand"
         return True
 
+    def _begin_stationary_timed_patrol_return(
+        self, observation: MinimapObservation,
+    ) -> None:
+        """Return from one completed timed route circuit to the shared 桩 layer."""
+
+        anchor_layer = self._stationary_route_anchor_layer
+        current = (
+            self._route_layers[self._route_layer_index]
+            if self._route_layer_index is not None
+            and self._route_layer_index < len(self._route_layers)
+            else None
+        )
+        if not anchor_layer or current is None:
+            self._stationary_timed_patrol_active = False
+            self._stationary_pickup_phase = None
+            self._stationary_pickup_next_at = time.monotonic() + self._stationary_pickup_delay()
+            LOG.warning("TIMED STATIONARY PATROL: route ended without a return anchor")
+            return
+        if current == anchor_layer:
+            self._stationary_timed_patrol_active = False
+            self._stationary_pickup_phase = None
+            self._stationary_timed_patrol_pending_rearm = True
+            self._stationary_pickup_next_at = float("inf")
+            if self.dual_stationary_ready() and observation.player is not None:
+                self._activate_dual_stationary_post(
+                    self._nearest_dual_stationary_post(observation.player),
+                    reason="timed patrol selected closest post",
+                    restart_timer=False,
+                )
+            LOG.info("TIMED STATIONARY PATROL: completed on anchor layer; restoring stationary attack")
+            return
+        self._stationary_timed_patrol_returning = True
+        self._return_from_floor = current
+        self._return_arrival_floor = None
+        self._return_mode = (
+            "climb-to-route"
+            if _layer_number(current) < _layer_number(anchor_layer)
+            else "drop-to-route"
+        )
+        LOG.info("TIMED STATIONARY PATROL: full route complete on %s; returning to %s",
+                 current, anchor_layer)
+
     def _repeat_patrol_cycle_if_needed(
         self, name: str, phases: list[str], current: str
     ) -> bool:
@@ -12871,10 +12983,15 @@ class MovementWorker(threading.Thread):
 
         movement_phases = [phase for phase in phases if phase in ("left", "right")]
         layer = self.important_positions.get(name, {})
-        try:
-            repeat_limit = max(1, int(layer.get("patrol_times", 1)))
-        except (AttributeError, TypeError, ValueError):
+        if self._stationary_timed_patrol_active:
+            # 定时巡逻 is exactly one pass per layer, independent of the
+            # user-selected patrol repeat count for normal patrol.
             repeat_limit = 1
+        else:
+            try:
+                repeat_limit = max(1, int(layer.get("patrol_times", 1)))
+            except (AttributeError, TypeError, ValueError):
+                repeat_limit = 1
         if (not movement_phases
                 or current != movement_phases[-1]
                 or self._route_patrol_cycle >= repeat_limit):
@@ -14501,7 +14618,8 @@ class MovementWorker(threading.Thread):
                 route_target_x = self._stabilize_rope_target(
                     route_target_x, route_is_rope, route_label
                 )
-                if (not self.stationary_attack_enabled
+                if ((not self.stationary_attack_enabled
+                        or self._stationary_timed_patrol_active)
                         and self._advance_route_endpoint(observation, route_target_x)):
                     route_target_x, route_is_rope, route_label = self._route_target(observation)
                     route_target_x = self._stabilize_rope_target(

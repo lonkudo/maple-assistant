@@ -179,10 +179,9 @@ _RIGHT_COLUMN_WIDTH = 393
 # it from the UI axis so the useful middle 84% gets a wider canvas.
 # The layer row also contains a radio selector and its label.  296px left the
 # row itself requesting more than the 360px column and silently widening every
-# left-side panel.  This leaves the axis a 216px requested lane; Tk may still
-# distribute spare space inside the fixed 360px track, but it can no longer
-# grow the track past that width.
-_LAYER_AXIS_WIDTH = 216
+# left-side panel. The patrol-count value needs 10px more room for its hover
+# text, so the axis uses a fixed 206px lane rather than taking that space.
+_LAYER_AXIS_WIDTH = 206
 _LAYER_AXIS_HEIGHT = 38
 _LAYER_AXIS_LEFT = 0
 _LAYER_AXIS_RIGHT = _LAYER_AXIS_WIDTH
@@ -2560,7 +2559,7 @@ class UiWorker(threading.Thread):
             self._stationary_pickup_row = pickup_row
             self._stationary_pickup_enabled_var = tk.BooleanVar(value=False)
             pickup_enabled = ttk.Checkbutton(
-                pickup_row, text="捡东西", width=5,
+                pickup_row, text="定时巡逻", width=7,
                 variable=self._stationary_pickup_enabled_var,
                 command=self._fixed_on_change,
             )
@@ -2578,7 +2577,7 @@ class UiWorker(threading.Thread):
                 # Keep the full second value inside the pickup component so
                 # it cannot paint underneath the following 小碎步 checkbox.
                 extra_width_px=24,
-                before_change=lambda: self._undo_capture_callback("捡东西间隔"),
+                before_change=lambda: self._undo_capture_callback("定时巡逻间隔"),
                 on_change=self._fixed_on_change,
             )
             self._stationary_pickup_interval_var = self._stationary_pickup_control.minimum_var
@@ -3225,8 +3224,7 @@ class UiWorker(threading.Thread):
             # The video drill remains available to internal callers, but the
             # operator-facing panel keeps this diagnostic control hidden.
             restart_row = ttk.Frame(extra_panel)
-            # 清理内存 is temporarily not displayed.  Its setting remains
-            # loaded and available to the worker/configuration paths.
+            restart_row.pack(fill="x", pady=(4, 0))
             self._auto_restart_var = tk.BooleanVar(value=False)
             self._auto_restart_check = ttk.Checkbutton(
                 restart_row,
@@ -3248,6 +3246,8 @@ class UiWorker(threading.Thread):
                 ),
                 takefocus=False,
             )
+            self._auto_restart_check.pack(side="left")
+            self._restart_offline_message_button.pack(side="left", padx=(6, 0))
             # Retain invisible status sinks for workflow callbacks.  The
             # Additional Functions panel intentionally shows controls only;
             # progress and failures are reported in the running log instead.
@@ -9636,9 +9636,9 @@ class UiWorker(threading.Thread):
         pickup_label = getattr(self, "_stationary_pickup_enabled_button", None)
         if pickup_label is not None:
             # The same persisted interval control drives two different route
-            # machines.  Its meaning must describe the selected mode without
-            # changing stationary mode's existing pickup configuration.
-            pickup_label.configure(text="重置花" if dead_flower_mode else "捡东西")
+            # machines. Its meaning follows the active mode without changing
+            # the backwards-compatible saved configuration fields.
+            pickup_label.configure(text="重置花" if dead_flower_mode else "定时巡逻")
         for row in getattr(self, "_dead_flower_attack_rows", ()):
             if row is not None:
                 self._set_panel_state(
@@ -13053,7 +13053,8 @@ class UiWorker(threading.Thread):
                 step=1,
                 lower_bound=1,
                 upper_bound=20,
-                value_width=2,
+                value_width=3,
+                extra_width_px=3,
                 before_change=lambda layer=layer_name: self._undo_capture_callback(
                     f"{self._patrol_display_name(layer)}巡逻次数"
                 ),
@@ -13070,6 +13071,10 @@ class UiWorker(threading.Thread):
                 background="#f0f0f0",
                 cursor="hand2",
             )
+            # Restore the expanding canvas so its axis uses the full visible
+            # lane. The patrol-count control already owns the recovered 10px,
+            # therefore this expanded lane is still 10px shorter than before
+            # without leaving a blank area at the right.
             canvas.pack(side="left", fill="x", expand=True)
             # Redraw after Tk assigns the expanded width so the logical
             # 8%–92% range fills the whole visible layer canvas.

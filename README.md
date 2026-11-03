@@ -754,9 +754,9 @@ Two related rules protect that motion:
 - While the optional **小碎步** pair is queued or running, nothing is queued behind it. The pair deliberately steps away from and back to the selected 朝向 and sets the facing itself when it finishes, so a correction or facing tap queued during it used to land as an extra step (and an extra attack) immediately after 小碎步.
 - The **朝向** tap is a 30 ms turn. It is long enough for the game to turn the character and short enough to stay inside the anchor band; a longer hold walks the character out of the band, and the correction that answers it turns the character back — the face/walk twitch.
 
-### 捡东西 (stand-still pickup circuit)
+### 定时巡逻 (stand-still timed route)
 
-**捡东西** walks the recorded left endpoint, then the right endpoint, then back to the 桩. Its trigger interval is set in **minutes** on its own row (`每 … m`, from 2.0m to 30.0m); the random gap beside it stays in seconds. That row is the only place minutes are used — the configuration file and the movement worker keep seconds, and the interval is clamped to the same 2–30 minutes when it is loaded.
+**定时巡逻** is available in 站桩模式 and 双桩模式. When its timer fires from a settled 桩, it borrows the selected recorded patrol route, patrols every route layer exactly once with the normal rope/jump/drop logic, then returns to the anchor layer and the nearest valid 桩. It sends no `Z` pickup input while moving. Its inclusive random interval is displayed in minutes (`每 … m`, 1.0m to 30.0m); persisted configuration and the movement worker continue to use seconds.
 
 ## Alerts and recovery
 
@@ -789,8 +789,9 @@ manual lie handling is intended.
 
 The compact **循环** controls use an integer interval of `1–300m` and three
 independently editable `HH:mm:ss` remaining-time values. Editing a clock part moves the live
-deadline without stopping the countdown. The message, message-push configuration, and memory-cleanup
-controls are temporarily hidden from the UI; their persisted settings are retained.
+deadline without stopping the countdown. **清理内存** is available in the panel: at 98% system
+memory it optionally sends the configured offline message, signs out, and hands the game to the
+normal reconnect workflow.
 
 When a lie window is detected, TodoHelper targets the first frame upload for
 **three seconds after that detection**, not three seconds after the WebSocket

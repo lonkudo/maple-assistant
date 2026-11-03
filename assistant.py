@@ -1203,7 +1203,7 @@ def main() -> int:
                         # catches OSError and shows the text; nothing should
                         # escape the callback or crash the dashboard.
                         raise OSError(
-                            "已启用捡东西：桩点楼层必须录制最左和最右点（"
+                            "已启用定时巡逻：请检查巡逻路线配置（"
                             + detail + "）"
                         )
                     logging.warning(
@@ -2367,12 +2367,10 @@ def main() -> int:
             aligned_frames_required=five_fps_frames(
                 calibration.get("aligned_frames_required", 2), 2
             ),
-            climb_layer_confirm_frames=five_fps_frames(
-                # Arrival is already verified by the explicit target band;
-                # two fresh 5-FPS samples are enough and avoid a visibly long
-                # pause at the platform lip.  Cap old saved calibrations too.
-                min(2, calibration.get("climb_layer_confirm_frames", 2)), 2
-            ),
+            # Two actual 5-FPS captures (~400 ms) confirm the new layer.
+            # Do not rescale this legacy 4-FPS value: that silently turned
+            # the requested two-frame confirmation into three frames.
+            climb_layer_confirm_frames=2,
             climb_layer_confirm_seconds=float(
                 # The two independent arrival frames are the safety gate.
                 # Do not add a timed hold after them: at 5 FPS the next route
