@@ -36,6 +36,10 @@ from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json, upload
 PIN_PATH = ROOT / "activation_server_pin.json"
 MANIFEST_FORMAT = "moon-eclipse-release-manifest/v1"
 UPLOAD_PATH = "/api/v1/operator/releases/files"
+# Only the compiled package may be published: shipping the Python sources to
+# every installer client is what the protected build exists to prevent.
+PROTECTED_EXECUTABLE = "MoonEclipse.exe"
+SOURCE_MARKER = "assistant.py"
 # Matches release_api.VERSION_PATTERN so a bad version fails here instead of
 # after a full upload.
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:[A-Za-z0-9._-]{0,16})$")
@@ -43,6 +47,9 @@ MAX_UPLOAD_WORKERS = 4
 TOKEN_ENVIRONMENT = "MOONECLIPSE_RELEASE_PUBLISH_TOKEN"
 
 EXCLUDED_PARTS = {".git", ".venv", "__pycache__", "work", "release", "助手配置", "data", "recordings", "updates", "logs"}
+# Local scratch the packaging step leaves beside the staged sources.  These are
+# not part of the product, so they must never reach an installer manifest.
+EXCLUDED_FILES = {"新配置.json", "运行日志.txt"}
 
 
 def sha256(path: Path) -> str:
@@ -60,6 +67,8 @@ def manifest_for(source: Path, version: str) -> tuple[dict, list[Path]]:
         if not path.is_file() or any(part in EXCLUDED_PARTS for part in path.relative_to(source).parts):
             continue
         relative = path.relative_to(source).as_posix()
+        if relative in EXCLUDED_FILES:
+            continue
         rows.append({"path": relative, "sha256": sha256(path), "size": path.stat().st_size, "file_version": version})
         files.append(path)
     if not rows:
@@ -99,23 +108,31 @@ def publish_release(token: str, manifest: dict) -> dict:
     )
 
 
-def _refuse_repository_root(source: Path) -> None:
-    """The help text says "finished package", so enforce it.
+def _require_protected_payload(source: Path) -> None:
+    """Refuse anything that is not the compiled package.
 
-    Publishing the desktop repository itself would ship its tests, tools and
-    local configuration as a release, and the manifest would still validate.
+    The manifest validates either way, so nothing else stops a source tree from
+    being published: pointing --source at release\\MoonEclipse shipped every
+    .py file to installer clients.  Require the executable and reject the
+    source markers explicitly.
     """
 
-    if (source / "release_tools").is_dir() and (source / "installer").is_dir():
+    if (source / SOURCE_MARKER).is_file():
         raise SystemExit(
-            "--source looks like the repository root; point it at the finished "
-            "package directory (for example release\\MoonEclipse)"
+            f"--source contains {SOURCE_MARKER}: that is the source package. "
+            "Publish the protected build instead, for example "
+            "release\\MoonEclipse-Protected\\assistant.dist"
+        )
+    if not (source / PROTECTED_EXECUTABLE).is_file():
+        raise SystemExit(
+            f"--source has no {PROTECTED_EXECUTABLE}, so it is not a protected "
+            "package (expected release\\MoonEclipse-Protected\\assistant.dist)"
         )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Publish MoonEclipse installer files")
-    parser.add_argument("--source", type=Path, required=True, help="finished package directory, not repository root")
+    parser.add_argument("--source", type=Path, required=True, help="protected package directory, for example release\\MoonEclipse-Protected\\assistant.dist")
     parser.add_argument("--version", required=True)
     parser.add_argument(
         "--jobs", type=int, default=MAX_UPLOAD_WORKERS,
@@ -133,7 +150,7 @@ def main() -> int:
     source = args.source.resolve()
     if not source.is_dir():
         raise SystemExit("--source must be a package directory")
-    _refuse_repository_root(source)
+    _require_protected_payload(source)
 
     manifest, files = manifest_for(source, version)
     total = len(manifest["files"])

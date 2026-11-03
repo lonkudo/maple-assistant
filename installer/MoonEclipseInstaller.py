@@ -49,6 +49,9 @@ POINTER_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MoonEclipse
 POINTER_FILE = POINTER_DIR / "last-install.json"
 APP_DIRECTORY = "app"
 CONFIG_DIRECTORY = "助手配置"
+# A protected package carries this executable and its own Python runtime, so it
+# needs neither a .venv nor 安装.bat.
+PROTECTED_EXECUTABLE = "MoonEclipse.exe"
 MAX_DOWNLOAD_WORKERS = 4
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
@@ -122,8 +125,14 @@ def _start_first_install_setup(app_root: Path) -> bool:
 
     Updates never recreate or replace ``.venv``.  A new installation keeps the
     familiar elevated setup window because it may need to install Python.
+
+    A protected package ships the compiled executable and a bundled runtime, so
+    it has no ``安装.bat`` and needs no ``.venv`` at all; requiring one there
+    turned every fresh protected install into 安装包缺少首次安装程序。
     """
 
+    if (app_root / PROTECTED_EXECUTABLE).is_file():
+        return False
     if (app_root / ".venv" / "Scripts" / "pythonw.exe").is_file():
         return False
     setup = app_root / "安装.bat"
