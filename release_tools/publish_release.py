@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,13 +105,28 @@ def prepare_staging(token: str, manifest: dict) -> dict:
     return answer
 
 
-def _put_file(token: str, version: str, item: dict, source: Path) -> str:
+def _put_file(token: str, version: str, item: dict, source: Path, attempts: int = 3) -> str:
     # The path is percent-encoded because a release contains Chinese filenames
     # (安装.bat, 启动助手.bat) and http.client writes the request line as ASCII.
     target = f"{UPLOAD_PATH}/{quote(version, safe='')}/" + quote(str(item["path"]), safe="/")
-    with source.open("rb") as handle:
-        upload_binary(ACTIVATION_SERVER_ENDPOINT, target, PIN_PATH, token, handle, int(item["size"]))
-    return str(item["path"])
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # A fresh handle per attempt: a failed upload consumes the stream.
+            with source.open("rb") as handle:
+                upload_binary(ACTIVATION_SERVER_ENDPOINT, target, PIN_PATH, token, handle, int(item["size"]))
+            return str(item["path"])
+        except PinnedTlsResponseError:
+            # An authorization or validation refusal will not improve by retrying.
+            raise
+        except (PinnedTlsError, OSError) as exc:
+            # A release is over a thousand PUTs across the public internet; one
+            # reset must not throw away the whole transfer.  PUT is idempotent, so
+            # retrying the same path simply overwrites an incomplete file.
+            last = exc
+            if attempt < attempts:
+                time.sleep(1.5 * attempt)
+    raise PinnedTlsError(f"{item['path']}: {last!r}")
 
 
 def publish_release(token: str, manifest: dict) -> dict:
@@ -195,7 +211,20 @@ def main() -> int:
         raise SystemExit(f"upload failed after {done}/{total} files: {exc}") from None
 
     result = publish_release(token, manifest)
-    print(json.dumps({"version": result.get("version"), "files": result.get("files")}, ensure_ascii=False))
+    bundle_bytes = int(result.get("bundle_bytes") or 0)
+    print(json.dumps({
+        "version": result.get("version"),
+        "files": result.get("files"),
+        "bundle_bytes": bundle_bytes,
+    }, ensure_ascii=False))
+    if bundle_bytes <= 0:
+        # The manifest is published, but every installer will fetch one file at a
+        # time until the archive exists.  Say so instead of printing success only.
+        print(
+            "WARNING: the server reported no bundle (bundle_bytes=0); installers will "
+            "fall back to one request per file. See DEPLOY_RELEASE.md section 7.",
+            file=sys.stderr,
+        )
     return 0
 
 
