@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -49,6 +50,8 @@ POINTER_FILE = POINTER_DIR / "last-install.json"
 APP_DIRECTORY = "app"
 CONFIG_DIRECTORY = "助手配置"
 MAX_DOWNLOAD_WORKERS = 4
+# Encoding for the generated .bat launcher; see _write_launcher().
+LAUNCHER_ENCODING = "gbk"
 
 
 def _pointer_root() -> Path | None:
@@ -103,7 +106,15 @@ def _write_launcher(root: Path) -> None:
         "call \"%~dp0app\\启动助手.bat\"",
         "",
     ))
-    launcher.write_text(content, encoding="ascii")
+    # A batch file's own literals are read in the console codepage, so this
+    # cannot be written as ascii or utf-8.  Writing it as ascii used to raise
+    # UnicodeEncodeError here (after every application file had already been
+    # replaced) and turn a completed install into a 安装失败 dialog with no
+    # launcher and no first-run setup.  GBK is the codepage cmd.exe and the
+    # Windows ANSI file APIs use on the Chinese systems this build targets, so
+    # the helper is handed the same 助手配置 folder name the installer created
+    # instead of a mojibake path that would become a second configuration tree.
+    launcher.write_text(content, encoding=LAUNCHER_ENCODING)
 
 
 def _start_first_install_setup(app_root: Path) -> bool:
@@ -233,7 +244,7 @@ class InstallerWindow:
                 with target.open("wb") as output:
                     received = download_binary(
                         ACTIVATION_SERVER_ENDPOINT,
-                        "/api/v1/installer/files/" + "/".join(relative.parts),
+                        "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
                         PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
                     )
                 if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):

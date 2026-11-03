@@ -9,7 +9,7 @@ import json
 import logging
 from pathlib import Path
 import ssl
-from typing import BinaryIO, Callable, Optional
+from typing import BinaryIO, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
 from cryptography import x509
@@ -48,6 +48,7 @@ def load_pin(path: Path) -> str:
 def post_json(
     endpoint: str, path: str, payload: dict, pin_path: Path,
     timeout: float = 10.0, logger: Optional[logging.Logger] = None,
+    headers: Optional[Mapping[str, str]] = None,
 ) -> dict:
     """Pin before transmitting the request body; never silently fall back.
 
@@ -79,7 +80,10 @@ def post_json(
         log.info("secure request certificate pin verified endpoint=%s", safe_endpoint)
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         target = (parts.path.rstrip("/") + "/" + path.lstrip("/"))
-        connection.request("POST", target, body=body, headers={"Content-Type": "application/json"})
+        request_headers = {"Content-Type": "application/json"}
+        if headers:
+            request_headers.update(headers)
+        connection.request("POST", target, body=body, headers=request_headers)
         response = connection.getresponse()
         data = json.loads(response.read().decode("utf-8"))
         if response.status >= 400:
@@ -148,5 +152,67 @@ def download_binary(
         raise
     except (OSError, ssl.SSLError) as exc:
         raise PinnedTlsError("无法下载更新文件。") from exc
+    finally:
+        connection.close()
+
+
+def upload_binary(
+    endpoint: str, path: str, pin_path: Path, authorization: str,
+    source: BinaryIO, size: int, timeout: float = 120.0,
+) -> int:
+    """PUT one release artifact through Nginx after the normal pin check."""
+
+    parts = urlsplit(endpoint)
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        raise PinnedTlsError("授权服务器必须使用 HTTPS。")
+    expected = load_pin(pin_path)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(
+        parts.hostname, parts.port or 443, context=context, timeout=timeout
+    )
+    try:
+        connection.connect()
+        certificate = x509.load_der_x509_certificate(
+            connection.sock.getpeercert(binary_form=True)
+        )
+        spki = certificate.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        actual = base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+        if not hmac.compare_digest(expected, actual):
+            raise PinnedTlsError("服务器身份校验失败，连接已拒绝。")
+        target = parts.path.rstrip("/") + "/" + path.lstrip("/")
+        connection.putrequest("PUT", target)
+        connection.putheader("Authorization", f"Bearer {authorization}")
+        connection.putheader("Content-Type", "application/octet-stream")
+        connection.putheader("Content-Length", str(max(0, int(size))))
+        connection.endheaders()
+        sent = 0
+        while True:
+            chunk = source.read(256 * 1024)
+            if not chunk:
+                break
+            connection.send(chunk)
+            sent += len(chunk)
+        response = connection.getresponse()
+        raw = response.read()
+        if response.status >= 400:
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                data = {}
+            raise PinnedTlsResponseError(
+                response.status, str(data.get("code", "UPLOAD_FAILED")),
+                str(data.get("message", "上传失败。")), data,
+            )
+        if sent != int(size):
+            raise PinnedTlsError("发布文件读取不完整。")
+        return sent
+    except PinnedTlsError:
+        raise
+    except (OSError, ssl.SSLError) as exc:
+        raise PinnedTlsError("无法上传发布文件。") from exc
     finally:
         connection.close()
