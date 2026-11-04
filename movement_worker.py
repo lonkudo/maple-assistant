@@ -223,6 +223,16 @@ SKILL_POINT_KEY_COOLDOWN_SECONDS = 6.0
 # marker advance, to the normal climb state machine.
 JUMP_POINT_LANDING_GUARD_SECONDS = 0.25
 JUMP_POINT_LANDING_STABLE_FRAMES = 2
+# A jump-point session releases its Up only on a real landing, a rope handoff,
+# or a climb that keeps owning the key - and a jump point that fires and FAILS
+# (the character comes back down on its departure floor, same marker Y) reaches
+# none of them.  Such a claim then outlives its jump: the physical Up stays down,
+# and every later rope climb yields to that dead session with
+# "wait (recorded directional jump point owns Up; waiting for landing)" - his
+# 16:48 and 17:33 logs both ended up wedged that way.  A jump arc plus landing
+# settles well inside this window, and handoff/climb-owned sessions are exempt,
+# so the bound can only cut a session that has already failed.
+JUMP_POINT_SESSION_MAX_SECONDS = 3.0
 # A recorded jump point is a trigger for a LEG, not for every entry into its
 # X/Y zone.  The zone covers about one X pixel and two Y pixels, so a
 # character that jumps, lands, walks back over the same spot, or is climbed past
@@ -253,9 +263,54 @@ ROUTE_CHECK_MIN_STRUCTURE_CONFIDENCE = 0.12
 
 # Reconnect-only recovery for a character standing on an upper platform that
 # refuses the normal Alt+Down chord.  The minimap Y axis grows downward.
-RECONNECT_DROP_STALLED_ATTEMPTS = 3
-RECONNECT_DROP_Y_PROGRESS = 0.006
+# Two stalled chords are the operator's rule ("alt+down twice"), matching the
+# unresolved-floor recovery, and they are still enough evidence that the spot
+# has no drop under it - a real chord crosses a whole floor.
+RECONNECT_DROP_STALLED_ATTEMPTS = 2
+# One minimap marker row is 1/96 of the analysis canvas (0.010417), so the
+# recovery must ask for more than ONE row of descent before calling it progress.
+# At 0.006 a single quantisation row counted as "the character went down": his
+# 14:19 reconnect log read 0.661458 -> 0.671875 as progress, cleared the stall
+# counter and restarted the whole 3-attempt cycle, so the character sat on
+# layer1 alternating Alt+Down and an edge walk for 20 s while the attack stayed
+# blocked.  The value sits between one row and two, so a genuine one-floor drop
+# (about 15 rows) is never delayed and a standing marker's wobble never counts.
+RECONNECT_DROP_Y_PROGRESS = 0.015
 RECONNECT_DROP_EDGE_HOLD_SECONDS = 5.0
+# The recovery walks to one edge, then the other, and each pass may resume the
+# Alt+Down attempts.  When neither edge descends the character is standing on a
+# floor the marker cannot confirm as a drop target, and repeating the cycle only
+# costs HP (attack skipped, motion arbiter gate shut, buffs never emitted).  It
+# is therefore bounded exactly like the planned descent to the first layer:
+# after this many full pass pairs, or this many seconds from arming, the
+# recovery hands the vertical state back to the normal route planner.
+RECONNECT_DROP_MAX_EDGE_CYCLES = 3
+RECONNECT_DROP_RECOVERY_MAX_SECONDS = 30.0
+
+# Unresolved-floor recovery (operator: "when we meet with unresolved floor we
+# shall alt+down to change layer").  A marker that matches no recorded band and
+# is not even near one leaves the worker with no floor at all: the stationary
+# recovery refuses to act ("marker outside anchor layer band"), the route has no
+# target and the character just walks a floor that belongs to no layer - his
+# 17:46 log shows PATROL| ... action=right with every frame refused as
+# "0.1284 away from layer2".
+#
+# The remedy is the reconnect respawn's own shape, scaled to two chords: send
+# Alt+Down, and when that makes no downward progress twice, walk to the nearer
+# outer side (X > 0.5 -> left, X < 0.5 -> right) for a few seconds to find a
+# drop edge, then try the opposite side.  A descent during the walk hands back
+# to dropping, which is what actually changes the layer.
+#
+# It is bounded like every other drop: the reading must hold for
+# ``UNRESOLVED_FLOOR_DROP_FRAMES`` settled frames (a falling marker sweeps and is
+# never "settled"), a genuine descent (>= RECONNECT_DROP_Y_PROGRESS) clears the
+# stall count so a multi-floor descent keeps going, and a run of stalls - or too
+# many attempts/edge cycles - ends the recovery instead of hopping forever.
+UNRESOLVED_FLOOR_DROP_FRAMES = 4
+UNRESOLVED_DROP_STALLED_ATTEMPTS = 2
+UNRESOLVED_EDGE_HOLD_SECONDS = 5.0
+UNRESOLVED_DROP_MAX_EDGE_CYCLES = 3
+UNRESOLVED_DROP_MAX_ATTEMPTS = 12
 
 # Landing confirmation for the drop-to-route return (``_drop_landing_floor``).
 # A drop can land the character on a floor whose recorded Y band cannot contain
@@ -605,6 +660,21 @@ CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED = 3
 # point keep climbing past the platform Y instead of releasing Up early.
 CLIMB_ARRIVAL_SETTLED_Y_GAP = 0.0001
 CLIMB_ARRIVAL_SETTLED_GAPS_REQUIRED = 2
+
+# A stale direction-jump Up claim is released only by a proven landing on a
+# floor OUTSIDE the active route (see ``_track_fall``).  Ordinary fall recovery
+# needs ``fall_detect_frames`` (3) consecutive downward marker frames; this
+# stale jump/respawn path may use two, because the release additionally requires
+# the settled reading to sit strictly inside that lower floor's own recorded
+# band.  The operator's 17:07 respawn produced exactly two material transitions
+# (0.765385 -> 0.780769 -> 0.796154, each 0.0154) and then held 0.796154 inside
+# layer1's band (0.751385-0.803846); demanding a third frame kept the stale Up
+# claim and the CLIMB / MOVE-TO-ROPE state in charge indefinitely, so the
+# character never returned to the stationary point.  Two frames remain safe
+# evidence: a normal jump arc lands back on its own floor (whose band the active
+# layer's marker stays inside), and a marker merely passing a floor mid-rope is
+# never strictly inside that floor's band on a settled frame.
+STALE_JUMP_DROP_FRAMES = 2
 
 
 def _layer_marker_row(layer: Any) -> Optional[float]:
@@ -3469,6 +3539,36 @@ class MovementWorker(threading.Thread):
                 "".join(traceback.format_stack(frame)),
             )
 
+    def _forget_up_claims(self) -> None:
+        """Forget every worker belief that it is holding Up.  Lock-free.
+
+        Callers are the paths that have just released (or are about to release)
+        the physical key, so this only drops the BOOKKEEPING.  Keeping the two
+        in step matters: a claim with no key press behind it makes the next rope
+        climb yield Up to a jump-point session that will never finish.
+
+        The 17:32/17:33 log is exactly that: a recorded layer2 jump point held
+        Up at 17:32:49 "until landing Y settles", the patrol-start key scrub
+        force-released the key at 17:33:20 without clearing this flag, and every
+        following layer1 -> route climb was replaced by
+        ``action=wait (recorded directional jump point owns Up; waiting for
+        landing)`` until the operator stopped patrol.  The landing detector
+        (``_update_jump_point_landing``) can never finish such a session: it
+        releases only after a real, higher, settled landing.
+        """
+
+        self._climb_state.up_held = False
+        if not self._jump_point_up_held:
+            return
+        self._jump_point_up_held = False
+        self._jump_point_up_started_at = 0.0
+        self._jump_point_y_samples.clear()
+        self._jump_point_start_y = None
+        self._jump_point_last_y = None
+        self._jump_point_rise_frames = 0
+        self._jump_point_rope_handoff = False
+        self._jump_point_preserved_climb = False
+
     def _release_stuck_keys(self) -> None:
         """Release EVERY key the bot may be holding at a stuck detection.
 
@@ -3480,6 +3580,11 @@ class MovementWorker(threading.Thread):
         sender no longer owns) plus the sender's release-all (clears whatever
         the bot still owns).  The next frame's decisions re-press only what
         is actually needed.  Never runs on a timer - stuck events only.
+
+        The vertical ownership claims are dropped in the same breath: a forced
+        release that left a worker believing it still owns Up is worse than the
+        stuck key it replaces, because no key press will ever come back to end
+        that claim (see ``_forget_up_claims``).
         """
 
         with self._direction_lock:
@@ -3494,6 +3599,7 @@ class MovementWorker(threading.Thread):
             release_all = getattr(self.key_sender, "release_all_keys", None)
             if callable(release_all):
                 release_all()
+            self._forget_up_claims()
 
     def _send_walk_hold(self, decision: MovementDecision) -> bool:
         """Schedule a direction-key hold: press now, release after the
@@ -3838,7 +3944,7 @@ class MovementWorker(threading.Thread):
         # climb) counts as an unexpected fall; when it stops the floor is
         # re-detected and patrol restarts there (or the character returns to
         # the patrol range).
-        fall_detect_frames: int = 4,
+        fall_detect_frames: int = 3,
         fall_marker_y_gain: float = 0.015,
         # Landing reconciliation after a fall/knock-down: the raw marker Y is
         # screen-relative on a scrolling minimap and the OpenCV world-Y
@@ -4624,6 +4730,8 @@ class MovementWorker(threading.Thread):
         # reconnect start.  Ordinary Start Patrol and ordinary fall recovery
         # continue to use their existing drop behaviour unchanged.
         self._reconnect_drop_recovery_armed = False
+        self._reconnect_drop_armed_at = float("-inf")
+        self._reconnect_drop_edge_cycles = 0
         self._reconnect_drop_attempt_y: Optional[float] = None
         self._reconnect_drop_attempt_at = float("-inf")
         self._reconnect_drop_assessed_at = float("-inf")
@@ -4632,6 +4740,32 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_edge_second_pass = False
         self._reconnect_drop_edge_started_at = 0.0
         self._reconnect_drop_edge_start_y: Optional[float] = None
+        # Unresolved-floor recovery: how long the marker has matched no recorded
+        # floor while standing, and the Alt+Down attempt bookkeeping that changes
+        # the layer instead of walking a floor nobody recorded.
+        self._unresolved_floor_settled_frames = 0
+        self._unresolved_floor_last_y: Optional[float] = None
+        self._unresolved_drop_attempts = 0
+        self._unresolved_drop_stalls = 0
+        self._unresolved_drop_attempt_y: Optional[float] = None
+        self._unresolved_drop_attempt_at: Optional[float] = None
+        self._unresolved_drop_gave_up = False
+        self._unresolved_edge_phase: Optional[str] = None
+        self._unresolved_edge_second_pass = False
+        self._unresolved_edge_started_at = 0.0
+        self._unresolved_edge_start_y: Optional[float] = None
+        self._unresolved_edge_cycles = 0
+        self._unresolved_blocked_reason: Optional[str] = None
+        # The scroll-compensated world-Y value is an offset from an origin the
+        # tracker is GIVEN (``reanchor_world_y``/``start_session``), not a
+        # map-fixed coordinate.  自动重连 respawns the character in mid-air and the
+        # login screens hide the minimap for the whole sequence, so an origin
+        # taken before (or during) it is offset by the respawn height: his 14:19
+        # log anchored on layer2 and then read world Y 5.387 while standing on
+        # layer1, whose recorded anchor is 1.25.  Until the MARKER confirms a
+        # standing floor, world Y is not consulted and never sets the origin.
+        self._world_y_anchor_untrusted = False
+        self._world_y_untrusted_reason = ""
         # Drop-to-route landing evidence (see ``_drop_landing_floor``): where
         # the descent started, how far it has really moved the marker, and the
         # settled confirmation of a floor whose band cannot contain the reading.
@@ -5282,8 +5416,23 @@ class MovementWorker(threading.Thread):
         operator's rule: points are allowed once per movement pass, never once
         per application lifetime, so a point that fired on the first run is
         available on the next Start Patrol.
+
+        A new pass also cannot inherit the previous pass's Up claim: that claim
+        belongs to a jump session which has ended with the old pass.  Leaving it
+        behind made the first climb of the new run unreachable - the route
+        yielded its Up to the finished jump point instead of climbing (17:33
+        log, fixed the same way as the forced key release).
         """
 
+        if self._jump_point_up_held or self._climb_state.up_held:
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(key_up):
+                key_up("up")
+            self._forget_up_claims()
+            LOG.info(
+                "JUMP POINT pass: released a stale Up claim left by the "
+                "previous movement pass before re-arming the points"
+            )
         self._jump_point_pass_id += 1
         self._jump_point_fired.clear()
         LOG.info(
@@ -5528,8 +5677,50 @@ class MovementWorker(threading.Thread):
             "JUMP POINT rope grab confirmed; handed existing Up hold to normal climb tracking"
         )
 
+    def _jump_point_session_expired(self) -> bool:
+        """Release a jump-point Up claim that never produced a landing.
+
+        The normal exits of a jump-point session are the settled higher landing,
+        the rope handoff, or a climb state that still owns Up.  A jump point that
+        fires and fails reaches none of them, so without this bound the claim -
+        and the physical Up - would last for the rest of the session and every
+        later climb would yield its Up to it.  Returns True when it fired.
+        """
+
+        if not self._jump_point_up_held or self._jump_point_up_started_at <= 0.0:
+            return False
+        # Exempt only a point that is genuinely carrying a live climb: a climb
+        # state that owns Up, both claims alive for a rope-2 transfer, or a
+        # marker that is rising right now (``_jump_point_rise_frames`` is
+        # zeroed by the next non-rising sample).  The mere INTENT to reach a
+        # rope (``_jump_point_rope_handoff``) is not evidence of one - a grab
+        # that never happens must expire like any other failed jump.
+        if self._jump_point_preserved_climb:
+            return False
+        if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
+            return False
+        if self._jump_point_rise_frames > 0:
+            return False
+        held_for = time.monotonic() - self._jump_point_up_started_at
+        if held_for < JUMP_POINT_SESSION_MAX_SECONDS:
+            return False
+        key_up = getattr(self.key_sender, "key_up", None)
+        if callable(key_up):
+            key_up("up")
+        self._forget_up_claims()
+        LOG.warning(
+            "JUMP POINT: released a %.1fs Up claim that never produced a "
+            "landing (limit %.1fs): the jump is over, so the claim must not "
+            "outlive it and block the next climb",
+            held_for,
+            JUMP_POINT_SESSION_MAX_SECONDS,
+        )
+        return True
+
     def _update_jump_point_landing(self, observation: MinimapObservation) -> None:
         if not self._jump_point_up_held or observation.player is None:
+            return
+        if self._jump_point_session_expired():
             return
         current_y = float(observation.player.y)
         if self._jump_point_start_y is None:
@@ -6946,8 +7137,9 @@ class MovementWorker(threading.Thread):
         whose recorded points do not cover its whole vertical extent (his layer1 is one: its points were
         saved at 0.676829 while the character stands at 0.713415 further down the same platform), for a
         character that walked a step down, and for a marker just above the top floor's band (on a rope).
-        Only floors the patrol range uses are considered - a floor outside it is the out-of-range return
-        logic's business.
+        Only floors the caller hands in are considered.  Patrol-frame callers pass every recorded floor
+        (:meth:`_landing_candidate_layers`) because a landing floor can lie outside the patrol range; an
+        answer outside the range is still the out-of-range return logic's business.
 
         The distance is ``_layer_y_distance`` (to the nearest RECORDED position), the same measure the
         candidate ranking uses, so the two never disagree.  The session's temporary 站桩 point counts as
@@ -6959,27 +7151,35 @@ class MovementWorker(threading.Thread):
             self._route_layers
         )
         best: Optional[tuple[float, str]] = None
+        considered: list[str] = []
         for name, layer in source.items():
             if not isinstance(layer, dict):
                 continue
             distance = _layer_y_distance(layer, marker_y)
             if distance is None:
                 continue
+            considered.append(name)
             if best is None or distance < best[0]:
                 best = (distance, name)
         if best is None:
             return None
+        # Name the floors that were actually compared.  A refusal ("0.1248 away
+        # from layer2") is indistinguishable from "the floor the character stood
+        # on was not a candidate at all" unless the evaluated set is printed; his
+        # 14:19 reconnect log refused layer1 at 0.0104 only because it was never
+        # in the set (the route was the single floor layer2).
+        evaluated = ", ".join(considered)
         if max_distance is not None and best[0] > max_distance:
             LOG.info(
                 "LAYER nearest-floor fallback refused: marker y=%.6f is %.4f away from %s "
-                "(maximum %.4f); keeping the floor unresolved",
-                marker_y, best[0], best[1], max_distance,
+                "(maximum %.4f; evaluated %s); keeping the floor unresolved",
+                marker_y, best[0], best[1], max_distance, evaluated,
             )
             return None
         LOG.info(
             "LAYER nearest-floor fallback: marker y=%.6f matches no band; the nearest recorded floor is "
-            "%s (%.4f normalised away)",
-            marker_y, best[1], best[0],
+            "%s (%.4f normalised away; evaluated %s)",
+            marker_y, best[1], best[0], evaluated,
         )
         return best[1]
 
@@ -7028,7 +7228,12 @@ class MovementWorker(threading.Thread):
             isinstance(layer, dict) and "layer_world_y" in layer
             for layer in layers.values()
         )
-        if (has_world_calibration
+        # 自动重连 leaves the world-Y origin describe the respawn's mid-air height,
+        # not a floor the character stands on (see ``_note_world_y_untrusted``).
+        # Until the marker confirms a floor the whole world branch is closed, so a
+        # poisoned tracker cannot name - or cap - a floor during that window.
+        if (self._world_y_trusted()
+                and has_world_calibration
                 and observation.world_y_diamonds is not None
                 and observation.structure_confidence >= 0.12):
             detected = detect_layer_by_world_y(observation.world_y_diamonds, layers)
@@ -7059,9 +7264,14 @@ class MovementWorker(threading.Thread):
                 # while the character is falling through one or more other
                 # recorded floors, preventing the all-layer resolver from
                 # handing that fall to return recovery.
+                #
+                # The candidate set is every RECORDED floor, not the patrol
+                # range: the floor a drop lands on can be outside the range
+                # (see ``_landing_candidate_layers``), and a route-only set made
+                # the base layer unrecognisable while the character stood on it.
                 nearest = self._nearest_floor_by_marker_y(
                     observation.player.y,
-                    layers,
+                    self._landing_candidate_layers(),
                     max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
                 )
                 if nearest is not None:
@@ -7082,7 +7292,7 @@ class MovementWorker(threading.Thread):
             return bottom
         nearest = self._nearest_floor_by_marker_y(
             observation.player.y,
-            layers,
+            self._landing_candidate_layers(),
             max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
         )
         if nearest is not None:
@@ -7170,6 +7380,18 @@ class MovementWorker(threading.Thread):
                 (f"{observation.world_y_diamonds:.3f}"
                  if observation.world_y_diamonds is not None else "unknown"),
                 observation.structure_confidence,
+            )
+            return
+        if detected_name not in self._route_layers:
+            # An out-of-range floor (his 14:19 profile: layer1 while the patrol
+            # range is the single floor layer2) must never be indexed into the
+            # route - ``list.index`` would raise ValueError and, worse, the route
+            # would start patrolling a floor the range excludes.  The return
+            # logic owns this case, as it does in ``_resync_route_layer``.
+            LOG.warning(
+                "route start: the marker is on %s, outside the patrol route %s; "
+                "leaving the floor to the out-of-range return logic",
+                detected_name, " -> ".join(self._route_layers),
             )
             return
         self._route_layer_index = self._route_layers.index(detected_name)
@@ -9049,6 +9271,30 @@ class MovementWorker(threading.Thread):
             if name in self.important_positions
         }
 
+    def _landing_candidate_layers(self) -> dict[str, Any]:
+        """Every recorded floor a landing may be recognised on - not the route only.
+
+        The patrol range is deliberately narrower than the map: a single-floor
+        range (his 14:19 profile: ``patrol_start_layer = patrol_end_layer =
+        layer2``) leaves the floor the drop is heading FOR outside
+        ``_route_layers``, and the return drop to ``first_layer`` lands on it.
+        Handing the route-only set to :meth:`_nearest_floor_by_marker_y` then made
+        the base layer unrecognisable: the refusal reported "0.1248 away from
+        layer2" for a marker standing 0.0104 from layer1, which was simply not a
+        candidate.  The operator's rule ("if the character can't find a layer he
+        should anchor to the nearest layer") is applied over everything recorded;
+        a floor outside the route is the out-of-range return logic's business, as
+        before.
+        """
+
+        return {
+            name: layer
+            for name, layer in self._stationary_detection_layers(
+                self.important_positions
+            ).items()
+            if _has_layer_y_supporter(layer)
+        }
+
     def configure_stationary_return_route(self) -> bool:
         """Make the anchor's existing layer the one-layer stationary route.
 
@@ -10546,6 +10792,10 @@ class MovementWorker(threading.Thread):
         # A manual start never inherits a reconnect fallback.  An automatic
         # reconnect start is the sole caller allowed to arm it.
         self._reconnect_drop_recovery_armed = bool(reconnect_restart)
+        # The bound is measured from arming: a recovery that keeps cycling cannot
+        # own the vertical state forever (see RECONNECT_DROP_MAX_EDGE_CYCLES).
+        self._reconnect_drop_armed_at = time.monotonic()
+        self._reconnect_drop_edge_cycles = 0
         self._reconnect_drop_attempt_y = None
         self._reconnect_drop_attempt_at = float("-inf")
         self._reconnect_drop_assessed_at = float("-inf")
@@ -10557,6 +10807,9 @@ class MovementWorker(threading.Thread):
         # A fresh start owns a fresh descent: no landing evidence from the run
         # that just ended may prove this one has moved down.
         self._reset_drop_arrival()
+        # The unresolved-floor layer change is per run as well: a recovery that
+        # already gave up must not stay given up across Start Patrol.
+        self._reset_unresolved_drop_recovery()
 
         self._release_climb_up()
         self._release_walk_hold()
@@ -10750,18 +11003,28 @@ class MovementWorker(threading.Thread):
         is a real supporter of its layer and cannot be answered with "no floor"
         plus a nearest-floor refusal.
         """
-        layers = {
-            name: layer
-            for name, layer in self._stationary_detection_layers(
-                self.important_positions
-            ).items()
-            if _has_layer_y_supporter(layer)
-        }
+
+        return self._detect_floor_all_with_source(observation)[0]
+
+    def _detect_floor_all_with_source(
+        self, observation: MinimapObservation,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """``_detect_floor_all`` plus the evidence that produced the answer.
+
+        The source is ``"marker"`` (the marker's own recorded band), ``"world"``
+        (the scroll-compensated world Y) or ``"bottom"`` (the at/below-bottom
+        rule).  Only marker and bottom evidence describe a floor the character is
+        actually standing on, so only those may re-anchor the world-Y origin
+        (see ``_confirm_world_y_anchor``).
+        """
+
+        layers = self._landing_candidate_layers()
         if observation.player is not None:
             name = detect_layer_by_y(observation.player.y, layers)
             if name is not None:
-                return name
-        if (observation.world_y_diamonds is not None
+                return name, "marker"
+        if (self._world_y_trusted()
+                and observation.world_y_diamonds is not None
                 and observation.structure_confidence >= 0.12):
             world_layers = {
                 name: layer for name, layer in layers.items()
@@ -10774,8 +11037,11 @@ class MovementWorker(threading.Thread):
                 # A lagging world-Y tracker reports the floor the character came FROM.  The marker
                 # position is the physical limit: the answer may not be a floor the character is
                 # visibly standing below.
-                return self._cap_landing_floor(
-                    world_name, observation, source="the world-Y tracker"
+                return (
+                    self._cap_landing_floor(
+                        world_name, observation, source="the world-Y tracker"
+                    ),
+                    "world",
                 )
         # At/below the lowest recorded band: the character is on (or under)
         # the bottom floor - nothing lower exists.  This guarantees the
@@ -10797,8 +11063,8 @@ class MovementWorker(threading.Thread):
                 if isinstance(bottom_layer, dict) else None
             )
             if band is not None and observation.player.y >= band[1] - 1e-9:
-                return bottom_floor
-        return None
+                return bottom_floor, "bottom"
+        return None, None
 
     def _detect_stationary_return_floor(
         self,
@@ -10844,13 +11110,7 @@ class MovementWorker(threading.Thread):
         if not after_confirmed_fall:
             return anchor_layer if anchor_match else self._detect_floor_all(observation)
 
-        layers = {
-            name: layer
-            for name, layer in self._stationary_detection_layers(
-                self.important_positions
-            ).items()
-            if _has_layer_y_supporter(layer)
-        }
+        layers = self._landing_candidate_layers()
         candidates = _layer_y_candidates(observation.player.y, layers)
         off_anchor = [name for name in candidates if name != anchor_layer]
         if off_anchor:
@@ -10964,6 +11224,49 @@ class MovementWorker(threading.Thread):
         self._maybe_begin_return_if_out_of_range(observation)
         return self._return_mode is not None
 
+    def _world_y_trusted(self) -> bool:
+        """False while the world-Y origin has no marker-confirmed anchor."""
+
+        return not self._world_y_anchor_untrusted
+
+    def _note_world_y_untrusted(self, reason: str) -> None:
+        """Stop trusting the scroll-compensated world Y until the marker confirms a floor.
+
+        The world-Y value is an offset from an origin the tracker is given, so it
+        only means something relative to a floor the character is KNOWN to stand
+        on.  自动重连 respawns the character in mid-air and the login screens hide
+        the minimap for the whole sequence; his 14:19 log then anchored on layer2
+        from a mid-air reading and reported world Y 5.387 while the character
+        stood on layer1 (recorded anchor 1.25).  Layers must therefore be decided
+        by the marker alone until the marker itself confirms a floor.
+        """
+
+        if self._world_y_anchor_untrusted:
+            return
+        self._world_y_anchor_untrusted = True
+        self._world_y_untrusted_reason = reason
+        LOG.info(
+            "WORLD-Y: the scroll-compensated value is not trustworthy (%s); "
+            "floor decisions use the marker until it confirms a standing floor",
+            reason,
+        )
+
+    def _confirm_world_y_anchor(
+        self, floor: str, observation: Optional[MinimapObservation],
+    ) -> None:
+        """A marker-confirmed standing floor: the only place the origin may be taken."""
+
+        self._reanchor_tracker_to_layer(floor, observation)
+        if self._world_y_anchor_untrusted:
+            reason = self._world_y_untrusted_reason or "an unknown respawn offset"
+            self._world_y_anchor_untrusted = False
+            self._world_y_untrusted_reason = ""
+            LOG.info(
+                "WORLD-Y: the marker confirmed %s; re-anchored there and trusting "
+                "the scroll-compensated value again (it was off because of %s)",
+                floor, reason,
+            )
+
     def _track_reconnect_window(self, now: float) -> None:
         """Arm one route check on the falling edge of 自动重连.
 
@@ -10971,6 +11274,10 @@ class MovementWorker(threading.Thread):
         is taken at all during the sequence (the login screens also hide the minimap, so there is
         nothing to measure).  The moment patrol input comes back, the character may have been put
         somewhere else - this makes the route check the first thing that happens.
+
+        Both edges also mark the world-Y origin untrusted: the character respawns in mid-air, so
+        neither the origin from before the disconnect nor one taken while airborne describes a floor
+        it is standing on (see ``_note_world_y_untrusted``).
         """
 
         event = self.reconnect_active_event
@@ -10979,12 +11286,16 @@ class MovementWorker(threading.Thread):
         if event.is_set():
             self._reconnect_was_active = True
             self._route_check_pending = False
+            self._note_world_y_untrusted("the 自动重连 sequence is running")
             return
         if not self._reconnect_was_active:
             return
         self._reconnect_was_active = False
         self._route_check_pending = True
         self._route_check_deadline = float(now) + ROUTE_CHECK_AFTER_RECONNECT_SECONDS
+        self._note_world_y_untrusted(
+            "the character respawns mid-air after the reconnect"
+        )
         LOG.info("RECONNECT: input returned; checking the patrol route")
 
     def _note_reconnect_drop_attempt(
@@ -10998,6 +11309,339 @@ class MovementWorker(threading.Thread):
             return
         self._reconnect_drop_attempt_y = float(observation.player.y)
         self._reconnect_drop_attempt_at = float(now)
+
+    def _reconnect_drop_abandon(self, reason: str) -> None:
+        """Stop the reconnect edge-walk recovery and hand the vertical state back.
+
+        Mirrors ``DROP TO FIRST``'s bounded hand-back: the normal route planner
+        keeps the return mode, and the marker-only landing test
+        (``_drop_landing_floor``) owns the descent from here.  Idempotent.
+        """
+
+        if not self._reconnect_drop_recovery_armed:
+            return
+        LOG.warning(
+            "RECONNECT DROP RECOVERY: abandoning the edge-walk recovery (%s); the "
+            "normal drop keeps the marker-only landing test - a character that cannot "
+            "descend is standing on a floor, not above one",
+            reason,
+        )
+        self._reconnect_drop_recovery_armed = False
+        self._reconnect_drop_stalled_attempts = 0
+        self._reconnect_drop_attempt_y = None
+        self._reconnect_drop_edge_phase = None
+        self._reconnect_drop_edge_second_pass = False
+        self._reconnect_drop_edge_start_y = None
+        self._reconnect_drop_edge_cycles = 0
+
+    def _reset_unresolved_drop_recovery(self) -> None:
+        """Forget the unresolved-floor drop recovery (floor known, or gated off)."""
+
+        self._unresolved_floor_settled_frames = 0
+        self._unresolved_floor_last_y = None
+        self._unresolved_drop_attempts = 0
+        self._unresolved_drop_stalls = 0
+        self._unresolved_drop_attempt_y = None
+        self._unresolved_drop_attempt_at = None
+        self._unresolved_drop_gave_up = False
+        self._unresolved_edge_phase = None
+        self._unresolved_edge_second_pass = False
+        self._unresolved_edge_started_at = 0.0
+        self._unresolved_edge_start_y = None
+        self._unresolved_edge_cycles = 0
+
+    def _unresolved_floor_drop_decision(
+        self, observation: MinimapObservation, now: float,
+    ) -> Optional[MovementDecision]:
+        """Change layer with Alt+Down when the marker matches no recorded floor.
+
+        The operator's rule: "when we meet with unresolved floor we shall
+        alt+down to change layer", with the reconnect respawn's own shape - two
+        Alt+Down chords, then walk toward the nearer outer side (X > 0.5 left,
+        X < 0.5 right) to find a drop edge, then the opposite side.  With no
+        floor there is no route, no anchor band and no landing test, so every
+        other recovery is inert and the worker would just walk a floor that
+        belongs to no layer (his 17:46 log: ``action=right`` while every frame
+        was refused as "0.1284 away from layer2").
+
+        Returns a decision that either holds still, drops, or holds a direction,
+        or ``None`` when the recovery does not apply this frame.
+        """
+
+        player = observation.player
+        if player is None:
+            return self._note_unresolved_drop_blocked("no character marker")
+        blocked = self._unresolved_drop_blocker()
+        if blocked is not None:
+            self._reset_unresolved_drop_recovery()
+            return self._note_unresolved_drop_blocked(blocked)
+        self._unresolved_blocked_reason = None
+        y = float(player.y)
+        # MARKER evidence only.  The floor is resolved when the marker itself
+        # matches a recorded band, or when it is within the nearest-floor
+        # quantisation allowance of a recorded row (a marker alias between two
+        # bands is not a foreign floor and must not start a drop).  World Y is
+        # deliberately not consulted: it can claim a floor the marker is nowhere
+        # near, and such a floor cannot be walked to anyway.
+        layers = self._landing_candidate_layers()
+        band_floor = detect_layer_by_y(y, layers) if layers else None
+        if band_floor is not None or self._marker_near_recorded_floor(y, layers):
+            if self._unresolved_drop_attempts:
+                LOG.info(
+                    "UNRESOLVED FLOOR: the marker resolved as %s after %d "
+                    "layer-change attempt(s); resuming normal routing",
+                    band_floor or "a nearby recorded floor",
+                    self._unresolved_drop_attempts,
+                )
+            self._reset_unresolved_drop_recovery()
+            return None
+        previous = self._unresolved_floor_last_y
+        self._unresolved_floor_last_y = y
+        if (previous is not None
+                and abs(y - previous) >= self._fall_marker_y_gain):
+            # Still sweeping (a fall/knock-down in flight): not a standing
+            # position, so this is not the moment to choose a layer by moving.
+            self._unresolved_floor_settled_frames = 0
+            return None
+        self._unresolved_floor_settled_frames += 1
+        if self._unresolved_floor_settled_frames < UNRESOLVED_FLOOR_DROP_FRAMES:
+            return None
+        if self._unresolved_drop_gave_up:
+            return None
+
+        # Phase 2: walk to a drop edge.  A descent during the walk means this
+        # side has somewhere to drop, so hand back to Alt+Down immediately.
+        phase = self._unresolved_edge_phase
+        if phase is not None:
+            start_y = self._unresolved_edge_start_y
+            if (start_y is not None
+                    and y >= start_y + RECONNECT_DROP_Y_PROGRESS):
+                LOG.info(
+                    "UNRESOLVED FLOOR: Y increased from %.6f to %.6f while "
+                    "moving %s; resuming Alt+Down",
+                    start_y, y, phase,
+                )
+                self._unresolved_edge_phase = None
+                self._unresolved_edge_second_pass = False
+                self._unresolved_edge_start_y = None
+                self._unresolved_drop_stalls = 0
+                return self._unresolved_drop_chord(observation, now)
+            if now < self._unresolved_edge_started_at + UNRESOLVED_EDGE_HOLD_SECONDS:
+                remaining = (
+                    self._unresolved_edge_started_at
+                    + UNRESOLVED_EDGE_HOLD_SECONDS - now
+                )
+                return MovementDecision(
+                    phase,
+                    f"unresolved floor; holding {phase} to find a layer-changing "
+                    "drop edge",
+                    max(0.05, remaining),
+                )
+            next_phase = "left" if phase == "right" else "right"
+            if not self._unresolved_edge_second_pass:
+                self._unresolved_edge_phase = next_phase
+                self._unresolved_edge_second_pass = True
+                self._unresolved_edge_started_at = now
+                self._unresolved_edge_start_y = y
+                LOG.warning(
+                    "UNRESOLVED FLOOR: %s edge found no descent; holding %s for "
+                    "%.1fs",
+                    phase, next_phase, UNRESOLVED_EDGE_HOLD_SECONDS,
+                )
+                return MovementDecision(
+                    next_phase,
+                    f"unresolved floor: {phase} edge did not descend; seeking "
+                    f"{next_phase} edge",
+                    UNRESOLVED_EDGE_HOLD_SECONDS,
+                )
+            self._unresolved_edge_cycles += 1
+            if self._unresolved_edge_cycles >= UNRESOLVED_DROP_MAX_EDGE_CYCLES:
+                return self._abandon_unresolved_drop(
+                    f"{self._unresolved_edge_cycles} edge-walk cycles produced "
+                    "no descent"
+                )
+            LOG.warning(
+                "UNRESOLVED FLOOR: neither edge produced a descent; resuming "
+                "Alt+Down attempts (edge cycle %d/%d)",
+                self._unresolved_edge_cycles,
+                UNRESOLVED_DROP_MAX_EDGE_CYCLES,
+            )
+            self._unresolved_edge_phase = None
+            self._unresolved_edge_second_pass = False
+            self._unresolved_edge_start_y = None
+            self._unresolved_drop_stalls = 0
+            return self._unresolved_drop_chord(observation, now)
+
+        # Phase 1: Alt+Down, assessed once per chord.
+        attempt_y = self._unresolved_drop_attempt_y
+        attempt_at = self._unresolved_drop_attempt_at
+        if attempt_y is not None and attempt_at is not None:
+            if now - attempt_at < self.drop_retry_seconds:
+                # The chord needs its settle window; hold still instead of
+                # handing the frame back to the walking planner.
+                return MovementDecision(
+                    None,
+                    "unresolved floor; waiting for the Alt+Down layer change",
+                )
+            if y >= attempt_y + RECONNECT_DROP_Y_PROGRESS:
+                # The drop is working: it changed the reading, so keep going and
+                # let the layer detection resolve on the way down.
+                self._unresolved_drop_stalls = 0
+                self._unresolved_drop_attempt_y = None
+                self._unresolved_drop_attempt_at = None
+            else:
+                self._unresolved_drop_stalls += 1
+                self._unresolved_drop_attempt_y = None
+                self._unresolved_drop_attempt_at = None
+                if (self._unresolved_drop_stalls
+                        >= UNRESOLVED_DROP_STALLED_ATTEMPTS):
+                    return self._begin_unresolved_edge_walk(observation, y, now)
+        return self._unresolved_drop_chord(observation, now)
+
+    def _marker_near_recorded_floor(
+        self, marker_y: float, layers: dict[str, Any],
+    ) -> bool:
+        """True when the marker is within the nearest-floor allowance of a row."""
+
+        for layer in layers.values():
+            distance = _layer_y_distance(layer, marker_y)
+            if (distance is not None
+                    and distance <= LAYER_NEAREST_FLOOR_MAX_DISTANCE):
+                return True
+        return False
+
+    def _unresolved_drop_blocker(self) -> Optional[str]:
+        """The owner that keeps the unresolved-floor layer change from running.
+
+        Only INPUT THAT IS ACTUALLY ACTIVE counts.  ``_climb_state.phase`` is
+        deliberately not consulted: a completed rope attempt or a focus recovery
+        leaves the phase non-idle after Up was released (the file records that
+        same stale-phase problem for the attack gate), and treating it as a
+        climb kept this recovery from ever running - his 17:55 log: the floor was
+        unresolved for four seconds, yet the character kept doing stationary X
+        correction steps instead of Alt+Down.
+        """
+
+        if not self.patrol_enabled:
+            return "patrol is not enabled"
+        if self._return_mode is not None:
+            return f"the {self._return_mode} return owns the layer"
+        if self._descending_to_first:
+            return "the planned descent to the first layer owns the layer"
+        if self._climb_state.up_held:
+            return "an attached climb holds Up"
+        if self._jump_point_up_held:
+            return "a recorded jump point holds Up"
+        if self._reconnect_drop_recovery_armed:
+            if self._return_mode == "drop-to-route":
+                # Only while that recovery is actually driving the descent.
+                return "the reconnect drop recovery owns the layer"
+            # The flag outlived its mode: it is armed by a reconnect start and
+            # cleared only by a return that finishes, so a reconnect that came
+            # back by CLIMBING leaves it set forever - and this recovery then
+            # deferred for good.  His 17:59 log: the marker was unresolved for
+            # ten seconds with the route on ``stationary-attack`` (no return at
+            # all) and every frame deferred as "the reconnect drop recovery owns
+            # the layer".  Its only entry point is the drop-to-route branch, so a
+            # flag outside that mode can never act again: drop it and continue.
+            self._reconnect_drop_abandon("the drop-to-route return is over")
+        if self._stationary_pickup_phase is not None:
+            return "a stationary pickup leg is running"
+        if self._route_check_pending:
+            return "the post-reconnect route check is deciding"
+        return None
+
+    def _note_unresolved_drop_blocked(self, reason: str) -> Optional[MovementDecision]:
+        """Log (once per change) what keeps the unresolved-floor drop from running."""
+
+        if self._unresolved_blocked_reason != reason:
+            self._unresolved_blocked_reason = reason
+            LOG.info(
+                "UNRESOLVED FLOOR: layer change deferred while %s", reason
+            )
+        return None
+
+    def _unresolved_drop_chord(
+        self, observation: MinimapObservation, now: float,
+    ) -> Optional[MovementDecision]:
+        """Send the next Alt+Down chord of the unresolved-floor recovery."""
+
+        if self._unresolved_drop_attempts >= UNRESOLVED_DROP_MAX_ATTEMPTS:
+            return self._abandon_unresolved_drop(
+                f"{self._unresolved_drop_attempts} Alt+Down chords without a "
+                "recorded floor"
+            )
+        player = observation.player
+        if player is None:
+            return MovementDecision(None, "unresolved floor; waiting for the marker")
+        self._unresolved_drop_attempts += 1
+        self._unresolved_drop_attempt_y = float(player.y)
+        self._unresolved_drop_attempt_at = float(now)
+        LOG.info(
+            "UNRESOLVED FLOOR: marker y=%.6f matched no recorded floor for %d "
+            "settled frames; Alt+Down to change layer (attempt %d/%d)",
+            float(player.y),
+            self._unresolved_floor_settled_frames,
+            self._unresolved_drop_attempts,
+            UNRESOLVED_DROP_MAX_ATTEMPTS,
+        )
+        return MovementDecision(
+            "drop",
+            "unresolved floor; Alt+Down to change layer",
+            self.drop_chord_hold_seconds,
+        )
+
+    def _begin_unresolved_edge_walk(
+        self, observation: MinimapObservation, y: float, now: float,
+    ) -> Optional[MovementDecision]:
+        """After two stalled chords, walk to the nearer outer side first.
+
+        Same rule as the reconnect respawn recovery: a marker right of centre
+        (X > 0.5) walks LEFT and one left of centre walks RIGHT, i.e. toward the
+        side its own platform edge is nearest to; the opposite side is tried
+        afterwards when this one produces no descent.
+        """
+
+        player = observation.player
+        first_phase = "left" if float(player.x) > 0.5 else "right"
+        self._unresolved_edge_phase = first_phase
+        self._unresolved_edge_second_pass = False
+        self._unresolved_edge_started_at = now
+        self._unresolved_edge_start_y = y
+        self._unresolved_drop_stalls = 0
+        LOG.warning(
+            "UNRESOLVED FLOOR: %d Alt+Down attempts made no downward progress; "
+            "marker X=%.6f; holding %s first for %.1fs",
+            UNRESOLVED_DROP_STALLED_ATTEMPTS,
+            float(player.x),
+            first_phase,
+            UNRESOLVED_EDGE_HOLD_SECONDS,
+        )
+        return MovementDecision(
+            first_phase,
+            f"unresolved floor: Alt+Down stalled; seeking a {first_phase} drop edge",
+            UNRESOLVED_EDGE_HOLD_SECONDS,
+        )
+
+    def _abandon_unresolved_drop(self, reason: str) -> Optional[MovementDecision]:
+        """Stop the unresolved-floor layer change and hand the frame back."""
+
+        if not self._unresolved_drop_gave_up:
+            self._unresolved_drop_gave_up = True
+            LOG.warning(
+                "UNRESOLVED FLOOR: stopping the layer change (%s); the marker "
+                "still matches no recorded floor, so the normal route/stationary "
+                "recovery keeps watching",
+                reason,
+            )
+        self._unresolved_drop_attempts = 0
+        self._unresolved_drop_stalls = 0
+        self._unresolved_drop_attempt_y = None
+        self._unresolved_drop_attempt_at = None
+        self._unresolved_edge_phase = None
+        self._unresolved_edge_second_pass = False
+        self._unresolved_edge_start_y = None
+        return None
 
     def _reconnect_drop_recovery_decision(
         self, observation: MinimapObservation, now: float,
@@ -11016,6 +11660,20 @@ class MovementWorker(threading.Thread):
                 or player is None):
             return None
         current_y = float(player.y)
+
+        # The recovery is bounded like the planned descent to the first layer.
+        # A character that is already standing on a floor cannot satisfy "more
+        # marker Y every chord", so an unbounded recovery would keep alternating
+        # Alt+Down and edge walks while the attack stays blocked - his 14:19 log
+        # did exactly that for 20 s, at HP 30 % -> 21 %, without ever ending.
+        if (self._reconnect_drop_armed_at > float("-inf")
+                and now - self._reconnect_drop_armed_at
+                >= RECONNECT_DROP_RECOVERY_MAX_SECONDS):
+            self._reconnect_drop_abandon(
+                "%.0fs without a confirmed landing floor"
+                % RECONNECT_DROP_RECOVERY_MAX_SECONDS
+            )
+            return None
 
         phase = self._reconnect_drop_edge_phase
         if phase is not None:
@@ -11060,9 +11718,17 @@ class MovementWorker(threading.Thread):
                     f"reconnect drop recovery: {phase} edge did not descend; seeking {next_phase} edge",
                     RECONNECT_DROP_EDGE_HOLD_SECONDS,
                 )
+            self._reconnect_drop_edge_cycles += 1
+            if self._reconnect_drop_edge_cycles >= RECONNECT_DROP_MAX_EDGE_CYCLES:
+                self._reconnect_drop_abandon(
+                    f"{self._reconnect_drop_edge_cycles} edge-walk cycles produced no descent"
+                )
+                return None
             LOG.warning(
                 "RECONNECT DROP RECOVERY: neither edge produced downward Y progress; "
-                "resuming normal Alt+Down attempts",
+                "resuming normal Alt+Down attempts (edge cycle %d/%d)",
+                self._reconnect_drop_edge_cycles,
+                RECONNECT_DROP_MAX_EDGE_CYCLES,
             )
             self._reconnect_drop_stalled_attempts = 0
             self._reconnect_drop_attempt_y = None
@@ -11182,17 +11848,19 @@ class MovementWorker(threading.Thread):
         """The floor the drop-to-route descent has landed on, or ``None``.
 
         The marker's own recorded band is direct evidence and is still accepted
-        immediately.  A landing away from the recorded row matches no band at
-        all, and that is where the character used to stay in the drop phase
-        forever, sending one Alt+Down chord after another while already standing
-        on a patrol floor.  The same marker-only answers ordinary patrol uses
+        immediately, for the floors the patrol range uses.  A landing away from
+        the recorded row matches no band at all, and that is where the character
+        used to stay in the drop phase forever, sending one Alt+Down chord after
+        another while already standing on a floor.  The same marker-only answers ordinary patrol uses
         for that reading resolve it here:
 
         1. at/below the bottom recorded floor - nothing is recorded lower, so
            the descent cannot continue; the floor is handed to ``_finish_return``
            (patrol it, or climb back when the patrol range starts above it);
-        2. the bounded nearest recorded patrol floor ("if the character can't
-           find a layer he should anchor to the nearest layer").
+        2. the bounded nearest recorded floor ("if the character can't find a
+           layer he should anchor to the nearest layer") over EVERY recorded
+           floor, so the floor the descent is aimed at stays a candidate even
+           when the patrol range excludes it.
 
         Both need real drop evidence first, and the answer must hold while the
         marker is settled: reading a floor that the character is merely falling
@@ -11209,8 +11877,11 @@ class MovementWorker(threading.Thread):
             for name in self._route_layers
             if name in self.important_positions
         }
-        # 1) The marker's own recorded band is direct evidence of the visible
-        #    floor and is still accepted at once, exactly as before.
+        # Step 1 needs no evidence at all, so it stays exactly as wide as the
+        # patrol range: an out-of-route band hit while the character is still
+        # falling THROUGH that floor must not end the drop on a transit frame.
+        # The floors outside the range are resolved by the evidence-gated
+        # fallback in step 2 (``_landing_candidate_layers``) below.
         floor = detect_layer_by_y(marker_y, route_layers)
         if floor is not None:
             self._drop_arrival_candidate = None
@@ -11220,9 +11891,17 @@ class MovementWorker(threading.Thread):
         #    chord was sent, the marker really moved down from where the descent
         #    started, and the reading is no longer sweeping (a character falling
         #    THROUGH the floor moves by ``fall_marker_y_gain`` per frame and must
-        #    never be read as a landing).  With no recorded patrol floor there is
+        #    never be read as a landing).  With no recorded floor there is
         #    nothing to anchor to, so the drop keeps its previous behaviour.
-        if (not route_layers
+        #
+        #    The candidate set is EVERY recorded floor, not the patrol range: the
+        #    descent can be aimed at a floor the range excludes (the operator's
+        #    14:19 profile: a single-floor route on layer2 with
+        #    ``first_layer = layer1`` as the drop target), and a route-only set
+        #    left the base layer out of the question entirely - see
+        #    ``_landing_candidate_layers``.
+        landing_layers = self._landing_candidate_layers()
+        if (not landing_layers
                 or not self._drop_descended()
                 or not self._drop_settled):
             self._drop_arrival_candidate = None
@@ -11238,7 +11917,7 @@ class MovementWorker(threading.Thread):
             if landing is None or landing not in self.important_positions:
                 landing = self._nearest_floor_by_marker_y(
                     marker_y,
-                    route_layers,
+                    landing_layers,
                     max_distance=LAYER_NEAREST_FLOOR_MAX_DISTANCE,
                 )
             self._drop_relaxed_y = marker_y
@@ -11265,13 +11944,18 @@ class MovementWorker(threading.Thread):
         )
         LOG.warning(
             "DROP TO ROUTE: accepting %s as the landing floor (marker y=%.6f "
-            "matches no patrol-floor band; the drop moved the marker %.6f down "
+            "matches no recorded floor band; the drop moved the marker %.6f down "
             "and the reading held for %d frames); restarting patrol",
             landing,
             marker_y,
             moved,
             DROP_ARRIVAL_CONFIRM_FRAMES,
         )
+        # The marker just confirmed a standing floor: this is the only evidence
+        # the scroll-compensated world-Y origin may be re-taken from after a
+        # reconnect (a respawn puts the character in mid-air, so any anchor taken
+        # before that is offset by its height).
+        self._confirm_world_y_anchor(landing, observation)
         return landing
 
     def _run_pending_route_check(
@@ -11308,7 +11992,7 @@ class MovementWorker(threading.Thread):
                     ROUTE_CHECK_AFTER_RECONNECT_SECONDS,
                 )
             return False
-        floor = self._detect_floor_all(observation)
+        floor, source = self._detect_floor_all_with_source(observation)
         if floor is None:
             if now >= self._route_check_deadline:
                 self._route_check_pending = False
@@ -11317,10 +12001,22 @@ class MovementWorker(threading.Thread):
                     "keeping the current route state"
                 )
             return False
-        # The world-Y origin was anchored before the disconnect; the login screens hid the minimap
-        # for the whole sequence, so re-anchor it to the floor the marker shows now BEFORE any
-        # layer decision is taken from world Y.
-        self._reanchor_tracker_to_layer(floor, observation)
+        if source in ("marker", "bottom"):
+            # Only marker/bottom evidence describes a floor the character is
+            # actually standing on: re-anchor the world-Y origin there (and trust
+            # the scroll-compensated value again).
+            self._confirm_world_y_anchor(floor, observation)
+        else:
+            # A world answer can only reach this point while the origin is already
+            # trusted, so it may decide the route - but it must never re-anchor
+            # itself (that would be circular).
+            LOG.info(
+                "RECONNECT: on %s from the trusted world-Y signal (world_y=%.6f); "
+                "not re-anchoring from a world-only answer",
+                floor,
+                observation.world_y_diamonds
+                if observation.world_y_diamonds is not None else float("nan"),
+            )
         if floor in self._route_layers:
             self._route_check_pending = False
             LOG.info(
@@ -11968,10 +12664,102 @@ class MovementWorker(threading.Thread):
         ``_resolve_fall`` restarts patrol or starts the return.
         """
         if self._jump_point_up_held:
-            # Keep the fall samples intact. Once the jump landing routine
-            # releases Up after stable Y, the next frame can distinguish a
-            # genuine lower-floor landing from a successful rope/platform
-            # arrival and start a return only if it is still needed.
+            # A directional jump normally owns its entire take-off/landing
+            # session, so fall recovery must not steal it from one airborne
+            # sample.  It can, however, become stale: the 16:48 trace kept
+            # that Up claim after the jump had finished, then a real fall
+            # through layer2 to layer1 was invisible because this early
+            # return suppressed every fall sample forever.
+            #
+            # Require an observed floor outside the active route, and either the
+            # ordinary three downward frames or ``STALE_JUMP_DROP_FRAMES`` (two)
+            # when the settled reading is strictly inside that floor's band.
+            # Thus a normal jump arc on layer2 keeps its Up claim, while a
+            # confirmed descent toward layer1 releases the stale claim and hands
+            # control to stationary return.
+            if observation.player is None:
+                self._fall_frames = 0
+                self._fall_last_y = None
+                return
+            y = observation.player.y
+            last = self._fall_last_y
+            self._fall_last_y = y
+            if last is None:
+                self._fall_frames = 0
+                return
+            if y - last >= self._fall_marker_y_gain:
+                if self._fall_frames == 0 and not self._fall_pending:
+                    self._fall_floor_candidate = None
+                self._fall_frames += 1
+                floor = self._detect_floor_all(observation)
+                if floor is not None and floor not in self._route_layers:
+                    self._note_fall_floor_candidate(floor)
+                # Enough downward frames to prove this is not a normal jump
+                # arc (see ``STALE_JUMP_DROP_FRAMES``), but the marker is still
+                # airborne.  Keep Up until the first non-descending capture
+                # confirms that the character has actually settled onto the
+                # lower platform.
+                return
+            # Two downward samples are enough when this settled frame sits
+            # strictly inside the candidate floor's own recorded band: that is
+            # the proof the character is standing on it, rather than passing it
+            # mid-rope.  Without that proof the ordinary three-frame
+            # requirement stands, so a normal jump arc keeps its Up session.
+            candidate = self._fall_floor_candidate
+            settled_on_floor = bool(
+                candidate is not None
+                and self._layer_band_contains(candidate, y)
+            )
+            required_frames = (
+                STALE_JUMP_DROP_FRAMES
+                if settled_on_floor
+                else self._fall_detect_frames
+            )
+            if (self._fall_frames < required_frames
+                    or candidate is None
+                    or not self.stationary_attack_enabled
+                    or not self._stationary_return_route_ready):
+                # This was not a confirmed fall toward another floor; retain
+                # the ordinary jump-point session unchanged.
+                self._fall_frames = 0
+                self._fall_floor_candidate = None
+                return
+
+            # The first settled capture after the downward samples proves a
+            # real out-of-route landing (three frames generally, two when the
+            # settled reading is strictly inside the lower floor's band).
+            # Relinquish only the jump point's Up ownership before starting the
+            # existing strict stationary return; no nearest-floor shortcut is
+            # used.
+            key_up = getattr(self.key_sender, "key_up", None)
+            if callable(key_up):
+                key_up("up")
+            self._jump_point_up_held = False
+            self._jump_point_up_started_at = 0.0
+            self._jump_point_y_samples.clear()
+            self._jump_point_start_y = None
+            self._jump_point_last_y = None
+            self._jump_point_rise_frames = 0
+            self._jump_point_rope_handoff = False
+            self._jump_point_preserved_climb = False
+            floor = candidate
+            LOG.warning(
+                "FALL RECOVERY: cancelled stale jump-point Up after %d "
+                "downward frames toward %s (%s); starting stationary return",
+                self._fall_frames, floor,
+                "marker settled inside its band"
+                if settled_on_floor else "ordinary frame evidence",
+            )
+            self._stationary_x_settled = False
+            self._abort_stationary_pickup_for_route_return()
+            self._begin_stationary_return(
+                observation, after_confirmed_fall=True
+            )
+            self._fall_pending = False
+            self._fall_frames = 0
+            self._fall_last_y = None
+            self._fall_keys_released = False
+            self._reset_fall_settle()
             return
         if (self._descending_to_first
                 or self._return_mode is not None
@@ -14777,6 +15565,16 @@ class MovementWorker(threading.Thread):
                         and route_label == "return.climb")
                     else route_label.partition(".")[0]
                 )
+                # Unresolved floor: a marker that matches NO recorded floor has
+                # no route, no anchor band and no landing test, so every other
+                # branch below would just walk a floor nobody recorded.  This
+                # takes precedence over the stationary/anchor walking (his 17:46
+                # log: action=right while every frame was refused as "0.1284
+                # away from layer2") and changes the layer instead: Alt+Down
+                # twice, then the respawn's edge walk.
+                unresolved_drop = self._unresolved_floor_drop_decision(
+                    observation, time.monotonic()
+                )
                 if route_label == "patrol-paused":
                     if self.dropping_active_event is not None:
                         self.dropping_active_event.clear()
@@ -14784,6 +15582,9 @@ class MovementWorker(threading.Thread):
                     active_target_x = None
                 elif route_label == "route-complete":
                     decision = MovementDecision(None, "waiting for next layer calibration")
+                elif unresolved_drop is not None:
+                    decision = unresolved_drop
+                    active_target_x = None
                 elif route_label == "stationary-attack":
                     decision = self._stationary_attack_decision(observation)
                     active_target_x = self._stationary_attack_anchor.x if (
@@ -14908,17 +15709,26 @@ class MovementWorker(threading.Thread):
                                     tiny_step_max_seconds=self.rope_tiny_step_max_seconds,
                                 )
                                 decision = rope_plan.decision
-                        # Patrol-start grace: do not jump onto the rope the
-                        # character happens to start next to - let it settle
-                        # first, then resume the normal jump logic.
-                        started = self._patrol_started_at
-                        if (started is not None and decision.key
-                                and decision.key.startswith("jump_climb_")
-                                and time.monotonic()
-                                < started + self.patrol_start_grace_seconds):
-                            decision = MovementDecision(
-                                None, "patrol start grace; no jump yet"
-                            )
+                        # No patrol-start grace on a rope jump.  This used to
+                        # hold the jump for ``patrol_start_grace_seconds`` with
+                        # the reasoning "do not jump onto the rope the character
+                        # happens to start next to".  That premise is wrong for
+                        # the operator: standing inside the rope band means the
+                        # jump onto that rope is exactly the wanted action, and
+                        # the hold cost three seconds of every Start Patrol at a
+                        # rope while the attack stayed blocked ("movement
+                        # recovery/action input is active") - his 17:22 log shows
+                        # CLIMB| ... action=wait from Start Patrol until he
+                        # stopped.  The grace keeps its other job: the stair-jump
+                        # stall detector still ignores the first seconds after a
+                        # start (``_stair_jump_decision``), because a character
+                        # that has not moved yet is not a character stuck at a
+                        # stair.
+                        #
+                        # The jump branch is only reached from inside the rope
+                        # band of the floor the route is currently using, so this
+                        # cannot fire during an ordinary left/right walk.
+                        #
                         # A jump attempt has been made in this rope phase:
                         # any later re-approach is a RETRY (small steps).
                         self._rope_attempted = True
@@ -15372,12 +16182,27 @@ class MovementWorker(threading.Thread):
                         )
                 self._consume_counterattack_events()
                 if observation.player is not None:
-                    gap = ((active_target_x - observation.player.x)
-                           if active_target_x is not None else None)
+                    # Inside the rope zone the *active* target is deliberately
+                    # blank (the jump plan owns the movement, see the
+                    # ``inside_rope_zone`` branch above).  Printing "----" for it
+                    # made "CLIMB| ... target=----" read as "no target" in the
+                    # field log while the route target was in fact locked.  Show
+                    # the rope X the plan is aiming at, marked with '*' so it is
+                    # still distinguishable from a plain walk target.
+                    effective_target = (
+                        active_target_x if active_target_x is not None
+                        else route_target_x
+                    )
+                    gap = ((effective_target - observation.player.x)
+                           if effective_target is not None else None)
                     stage = ("CLIMB" if route_is_rope and inside_rope_zone else
                              "MOVE TO ROPE" if route_is_rope else "PATROL")
-                    target_text = (f"{active_target_x:.6f}"
-                                   if active_target_x is not None else "----")
+                    if active_target_x is not None:
+                        target_text = f"{active_target_x:.6f}"
+                    elif route_target_x is not None:
+                        target_text = f"{route_target_x:.6f}*"
+                    else:
+                        target_text = "----"
                     gap_text = f"{gap:+.6f}" if gap is not None else "----"
                     # A stationary anchor has no movement key once it is
                     # settled, but it is not idle: the independent attack
@@ -15442,6 +16267,20 @@ class MovementWorker(threading.Thread):
                             action_text = "attack"
                     if action_text is None:
                         action_text = "wait"
+                        # A None key means "hold this frame".  The bare "wait"
+                        # made a deliberate hold (patrol-start grace, an
+                        # unresolved endpoint, a jump point still owning Up)
+                        # indistinguishable from a wedged worker - the 17:22
+                        # field log needed a code audit to tell them apart.  The
+                        # decision's own reason is exactly that difference, so it
+                        # is printed with the action (and is part of the log
+                        # identity below, so a reason change is a visible
+                        # transition rather than a silent steady frame).
+                        hold_reason = (decision.reason or "").strip() or None
+                        if hold_reason is not None and len(hold_reason) > 80:
+                            hold_reason = hold_reason[:77] + "..."
+                        if hold_reason is not None:
+                            action_text = f"wait ({hold_reason})"
                     # The routing calculation above is deliberately still
                     # performed for every capture.  Only its repetitive INFO
                     # rendering is sampled: a new route/action/target/layer

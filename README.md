@@ -210,6 +210,56 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   focus thief, another window's ghost, or a vanished game window still count as a
   loss. A hang is reported once (`foreground: the game window is not responding …`).
 
+### Current release behavior (v1.2.278 – v1.2.280)
+
+- **An unresolved floor changes layer instead of walking it.** When the marker
+  matches no recorded band and is farther than the nearest-floor allowance from
+  every recorded row for four settled frames, TodoHelper presses Alt+Down. After
+  two chords that produce no downward progress it walks toward the nearer outer
+  side (X > 0.5 → left, X < 0.5 → right) for 5 s to find a drop edge, then tries
+  the opposite side; a descent during either walk resumes Alt+Down immediately.
+  The recovery is bounded (3 edge cycles or 12 chords) and yields to every other
+  vertical owner — a return, the planned descent to the first layer, an attached
+  climb, a jump-point Up claim, the reconnect drop recovery, a pickup leg, or a
+  pending reconnect route check (`UNRESOLVED FLOOR: layer change deferred while …`
+  names the owner). It resets on Start Patrol and whenever the marker resolves.
+- **The landing floor is recognised over every recorded floor.** The bounded
+  nearest-floor answer now considers all recorded floors, not only the patrol
+  range: with a single-floor range (`patrol_start_layer = patrol_end_layer`) the
+  floor a descent is heading to was not even a candidate, so a marker standing
+  0.0104 from layer1 was refused as `0.1248 away from layer2`. The per-frame
+  resolver's fallback uses the same set.
+- **The world-Y origin is only taken from the marker.** 自动重连 respawns the
+  character in mid-air, so the scroll-compensated world Y is untrusted
+  (`WORLD-Y: the scroll-compensated value is not trustworthy (…)`) until the
+  marker itself confirms a standing floor. The post-reconnect route check
+  re-anchors only on marker/bottom evidence, and a world-only answer may decide
+  the route but never re-anchor itself.
+- **A jump-point Up claim can no longer outlive its jump.** A claim that produces
+  no settled landing, no rope handoff and no rising marker is released after 3 s
+  (`JUMP POINT: released a N.Ns Up claim that never produced a landing`); every
+  forced key release drops the claim together with the key, a new Start Patrol
+  cannot inherit it, and the stale-session handoff after a fall accepts two
+  downward frames when the settled reading is strictly inside the lower floor's
+  band.
+- **No patrol-start grace on rope jumps.** The three-second "do not jump onto the
+  rope the character happens to start next to" hold is gone: standing inside the
+  rope band means that jump is the wanted action, and the hold cost three seconds
+  of every Start Patrol at a rope while attack stayed blocked. The stair-jump
+  stall detector keeps its own start grace.
+- **The reconnect drop recovery walks an edge after two stalled chords** (was
+  three) and yields to the unresolved-floor recovery unless a `drop-to-route`
+  return is actually running.
+- **Five timed buffs, and a stated post-tap window.** A buff tap holds the key
+  200 ms, then reserves a 1.0 s quiet window
+  (`motion arbiter executed buff:<key> (lock 1.00s)`) during which no other motion
+  and no attack can run; the timer restarts only after it. The cast check compares
+  HP/MP 2.5 s after the tap, so a buff that moves neither bar always reports
+  `no HP/MP change within 2.5s after the tap`.
+- **The movement log states why it is idle.** A held frame prints its own reason
+  (`action=wait (unresolved floor; waiting for the Alt+Down layer change)`), and a
+  rope-zone target prints as `target=0.188596*` instead of `----`.
+
 ### Current release behavior (v1.2.252)
 
 - **Customers can securely解绑 a counting-mode authorization from their own
@@ -591,6 +641,10 @@ At patrol start, all recorded points are displayed together for five seconds: bl
 
 When a jump point holds Up into a rope climb, the climb's own Up hold and gate are left alone (v1.2.21): the jump-point session releases only its own key claim, so a settled landing Y cannot un-gate attacks or 小碎步 while the character is still attached to the rope.
 
+The Up claim a point takes is itself bounded (v1.2.280). Its normal exits are a settled landing on a higher floor, a rope handoff, or a climb state that still owns Up; a point that fires and **fails** — the character comes back down on its departure floor — reaches none of them, so a claim that produces no landing, no handoff and no rising marker is released after `JUMP_POINT_SESSION_MAX_SECONDS` (3 s) with `JUMP POINT: released a N.Ns Up claim that never produced a landing`. Every forced key release drops the claim together with the key, because `_release_stuck_keys()` — the path used by a Start Patrol, a confirmed fall, and the global `INPUT RESET` — forgets the claim in the same breath as it releases Up; a new movement pass cannot inherit the previous pass's claim either. Without those rules a dead claim outlived its jump and replaced every later climb with `action=wait (recorded directional jump point owns Up; waiting for landing)`.
+
+After a fall, a stale session is handed over as soon as two downward marker frames *and* a settled reading strictly inside the lower floor's band prove a landing (`_track_fall`); ordinary fall recovery keeps its own three-frame requirement, so a normal jump arc never loses its Up claim.
+
 ### Layer bands and one-supporter layers
 
 A layer may legitimately record a single supporter — a rope point only, or a left-most or right-most endpoint only. Such a layer keeps the one-sided band `[y, y + small_gap]`, and `small_gap` is now `max(y_tolerance / 3, 1 / analysis_height)`: one marker row (`0.007143` on the 114×140 minimap), never less (v1.2.20). The old fixed `0.002` is 0.28 px, smaller than the marker's own one-pixel quantisation, so it could only match a reading that landed on the recorded row exactly — a character walking that very floor read `matches no band`. Jump points never widen or shift a band; they are not patrol supporters.
@@ -606,6 +660,7 @@ A one-row band is a reference row, not the whole floor: on a floor whose canvas 
 - Movement is sent only while the selected game window is safely foregrounded.
 - Left, right, up, and down are serialized. Direction switches release the old direction before arming the new one.
 - Patrol, rope return, recovery, small-step, buffs, and special motions use coordinated input ownership so a stale key cannot keep the character moving.
+- Every vertical claim is released together with the physical key. A climb or jump-point claim that outlived its key press is what replaced later climbs with `action=wait`: a forced key release now drops the claim (`_forget_up_claims`), a new movement pass cannot inherit one, and a jump-point claim that never produced a landing is bounded to 3 s.
 - A queued buff is not discarded merely because a short stationary return temporarily owns the movement stage. It remains queued until that return settles; only an actual Stop Patrol clears queued buff motions.
 - If patrol has no recorded route, the assistant remains in a safe stand-still state and combat functions can still operate.
 
@@ -650,11 +705,27 @@ A return is still a return: the patrol range selected in the layer panel decides
 A return drop (a reconnect or a fall that left the character above the patrol range) ends only when the landing floor is recognised, and it is recognised from the marker:
 
 - The marker's own recorded band is direct evidence and is accepted immediately, exactly as before.
-- A landing away from the recorded row matches no band at all — the operator's own map: layer1's points were saved at 0.676829 while the character stands at 0.713415 further down the same platform. The same marker-only answers ordinary patrol already uses resolve it: first the bottom recorded floor when the marker reads at or below its band (nothing is recorded lower, so the descent cannot continue; `_finish_return` then either patrols that floor or climbs back when the patrol range starts above it), then the bounded nearest recorded patrol floor (`if the character can't find a layer he should anchor to the nearest layer`).
-- Both relaxed answers need real drop evidence first: at least one Alt+Down chord actually sent, and the marker moved down by at least `RECONNECT_DROP_Y_PROGRESS` (0.006) from where the descent began. They also need the reading to be **settled**: a character falling *through* the floor sweeps the marker down the minimap (the 14:38 log ran 0.372 → 0.397 → 0.409 → 0.445 → 0.482, about 0.027 per frame) and must never be read as a landing. The answer must hold for two consecutive settled frames (`DROP_ARRIVAL_CONFIRM_FRAMES`).
-- The scroll-compensated world-Y tracker is deliberately **never** consulted for the landing: at a fresh start above the route its origin is anchored to the route's *top* floor while the character is still above it, so it would end the drop before the first Alt+Down chord.
+- A landing away from the recorded row matches no band at all — the operator's own map: layer1's points were saved at 0.676829 while the character stands at 0.713415 further down the same platform. The same marker-only answers ordinary patrol already uses resolve it: first the bottom recorded floor when the marker reads at or below its band (nothing is recorded lower, so the descent cannot continue; `_finish_return` then either patrols that floor or climbs back when the patrol range starts above it), then the bounded nearest recorded floor over **every recorded floor** — not only the patrol range, because a single-floor range would otherwise leave the floor the descent is aimed at out of the question (v1.2.280).
+- Both relaxed answers need real drop evidence first: at least one Alt+Down chord actually sent, and the marker moved down by at least `RECONNECT_DROP_Y_PROGRESS` (0.015, one and a half marker rows) from where the descent began. They also need the reading to be **settled**: a character falling *through* the floor sweeps the marker down the minimap (the 14:38 log ran 0.372 → 0.397 → 0.409 → 0.445 → 0.482, about 0.027 per frame) and must never be read as a landing. The answer must hold for two consecutive settled frames (`DROP_ARRIVAL_CONFIRM_FRAMES`).
+- The scroll-compensated world-Y tracker is deliberately **never** consulted for the landing: at a fresh start above the route its origin is anchored to the route's *top* floor while the character is still above it, so it would end the drop before the first Alt+Down chord. Since v1.2.280 the same distrust applies globally after 自动重连: the world-Y origin is re-taken only from a marker-confirmed floor.
+
+The drop itself is bounded the same way a standing character's layer change is (v1.2.280): two Alt+Down chords without downward progress send the character to the nearer outer edge (X > 0.5 → left, X < 0.5 → right) to look for a drop edge, then the opposite one, and the recovery abandons after three cycles or a 30-second window. A marker that matches no recorded floor at all is handled by the unresolved-floor recovery below.
 
 The landing evidence belongs to one descent. It is cleared on a fresh patrol start and once the return mode ends, and it survives a frame in which the marker is momentarily lost so one missing reading cannot restart the measured descent. The log names the floor and the evidence: `DROP TO ROUTE: accepting layer3 as the landing floor (marker y=0.408000 matches no patrol-floor band; the drop moved the marker 0.078000 down and the reading held for 2 frames); restarting patrol`.
+
+### Unresolved floor (no recorded layer matches)
+
+A marker that matches no recorded band and is farther than the nearest-floor allowance (`LAYER_NEAREST_FLOOR_MAX_DISTANCE`, 0.05) from every recorded row leaves the worker with no floor at all: the route has no target, the 站桩 recovery refuses to act (`marker outside anchor layer band`), and the character would simply walk a platform nobody recorded. The 17:46 field log is that state — `action=right` while every frame was refused as `0.1284 away from layer2`.
+
+The floor is therefore changed deliberately (v1.2.280), with the reconnect respawn's own shape:
+
+- Alt+Down repeatedly while the character stands still. Each chord is assessed once `drop_retry_seconds` (1.5 s) has passed; a descent of at least `RECONNECT_DROP_Y_PROGRESS` (0.015) clears the stall count, so a real multi-floor descent keeps dropping.
+- After two chords without downward progress, walk to the nearer outer side for `UNRESOLVED_EDGE_HOLD_SECONDS` (5 s): **X > 0.5 → left, X < 0.5 → right**, the same rule the reconnect respawn uses. That side's platform edge is the one the character is closest to. A descent during the walk returns straight to Alt+Down.
+- The opposite side is tried next. If neither edge descends, the chords resume; after `UNRESOLVED_DROP_MAX_EDGE_CYCLES` (3) cycles or `UNRESOLVED_DROP_MAX_ATTEMPTS` (12) chords the recovery stops and logs why, instead of hopping on one spot forever.
+- Four settled frames are required before the first chord (a falling marker sweeps the minimap and is never "settled"), and the recovery yields to every other vertical owner: a return, the planned descent to the first layer, an attached climb, a jump-point Up claim, the reconnect drop recovery (only while its `drop-to-route` return is actually running), a pickup leg, or a pending post-reconnect route check. The log names the owner once per change: `UNRESOLVED FLOOR: layer change deferred while the drop-to-route return is over` / `… while an attached climb holds Up`.
+- The moment the marker resolves, everything resets and normal routing resumes: `UNRESOLVED FLOOR: the marker resolved as layer1 after 2 layer-change attempt(s); resuming normal routing`. A fresh Start Patrol also resets it.
+
+A reading that is merely *between* two bands but within the nearest-floor allowance of a recorded row is a marker alias, not a foreign floor, and never starts a drop.
 
 ### Attack modes
 

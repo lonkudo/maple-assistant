@@ -166,7 +166,7 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 896
+_INITIAL_WINDOW_WIDTH = 980
 _INITIAL_WINDOW_HEIGHT = 560
 # Every panel in the left stack follows this single compact track.  The
 # right-side controls retain their own wider track because their key bindings
@@ -2643,7 +2643,15 @@ class UiWorker(threading.Thread):
             )
             self._drug_panel = drug_panel
             drug_panel.pack(fill="x", pady=(0, 8))
-            hp_row = ttk.Frame(drug_panel)
+            # Keep this panel dense: two independent four-row columns rather
+            # than one long column that widens the entire right side.
+            drug_columns = ttk.Frame(drug_panel)
+            drug_columns.pack(anchor="w")
+            drug_left = ttk.Frame(drug_columns)
+            drug_left.pack(side="left", anchor="n")
+            drug_right = ttk.Frame(drug_columns)
+            drug_right.pack(side="left", anchor="n", padx=(12, 0))
+            hp_row = ttk.Frame(drug_left)
             hp_row.pack(fill="x")
             self._hp_use_var = tk.BooleanVar(value=True)
             hp_use_button = ttk.Checkbutton(
@@ -2651,10 +2659,9 @@ class UiWorker(threading.Thread):
                 command=self._drug_on_change,
             )
             hp_use_button.pack(side="left")
-            ttk.Label(hp_row, text="按键:").pack(side="left", padx=(8, 4))
             self._hp_key_var = tk.StringVar(value="delete")
             hp_key_button = ttk.Button(
-                hp_row, text=self._hp_key_var.get(), width=14,
+                hp_row, text=self._hp_key_var.get(), width=10,
                 style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     hp_key_button, self._hp_key_var, "_hp_key_previous",
@@ -2678,18 +2685,17 @@ class UiWorker(threading.Thread):
             self._hp_threshold_label = self._hp_threshold_control.min_label
             ttk.Label(hp_row, text="小于").pack(side="left", padx=(8, 2))
             self._hp_threshold_control.pack(side="left")
-            mp_row = ttk.Frame(drug_panel)
-            mp_row.pack(fill="x", pady=(6, 0))
+            mp_row = ttk.Frame(drug_left)
+            mp_row.pack(fill="x", pady=(2, 0))
             self._mp_use_var = tk.BooleanVar(value=True)
             mp_use_button = ttk.Checkbutton(
                 mp_row, text="MP", width=6, variable=self._mp_use_var,
                 command=self._drug_on_change,
             )
             mp_use_button.pack(side="left")
-            ttk.Label(mp_row, text="按键:").pack(side="left", padx=(8, 4))
             self._mp_key_var = tk.StringVar(value="end")
             mp_key_button = ttk.Button(
-                mp_row, text=self._mp_key_var.get(), width=14,
+                mp_row, text=self._mp_key_var.get(), width=10,
                 style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     mp_key_button, self._mp_key_var, "_mp_key_previous",
@@ -2714,18 +2720,17 @@ class UiWorker(threading.Thread):
             # its own 5..600 second slider (default 600 seconds) that decides
             # when the key is triggered.  Unlike HP/MP these are time-based,
             # not bar-percent based.
-            buff1_row = ttk.Frame(drug_panel)
-            buff1_row.pack(fill="x", pady=(6, 0))
+            buff1_row = ttk.Frame(drug_left)
+            buff1_row.pack(fill="x", pady=(2, 0))
             self._buff1_use_var = tk.BooleanVar(value=False)
             buff1_use_button = ttk.Checkbutton(
                 buff1_row, text="饲料", width=6, variable=self._buff1_use_var,
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
-            ttk.Label(buff1_row, text="按键:").pack(side="left", padx=(8, 4))
             self._buff1_key_var = tk.StringVar(value="home")
             buff1_key_button = ttk.Button(
-                buff1_row, text=self._buff1_key_var.get(), width=14,
+                buff1_row, text=self._buff1_key_var.get(), width=10,
                 style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff1_key_button, self._buff1_key_var,
@@ -2748,18 +2753,17 @@ class UiWorker(threading.Thread):
             self._buff1_interval_label = self._buff1_interval_control.min_label
             ttk.Label(buff1_row, text="每隔").pack(side="left", padx=(8, 2))
             self._buff1_interval_control.pack(side="left")
-            buff2_row = ttk.Frame(drug_panel)
-            buff2_row.pack(fill="x", pady=(6, 0))
+            buff2_row = ttk.Frame(drug_left)
+            buff2_row.pack(fill="x", pady=(2, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
             buff2_use_button = ttk.Checkbutton(
                 buff2_row, text="增益 1", width=6, variable=self._buff2_use_var,
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
-            ttk.Label(buff2_row, text="按键:").pack(side="left", padx=(8, 4))
             self._buff2_key_var = tk.StringVar(value="insert")
             buff2_key_button = ttk.Button(
-                buff2_row, text=self._buff2_key_var.get(), width=14,
+                buff2_row, text=self._buff2_key_var.get(), width=10,
                 style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff2_key_button, self._buff2_key_var,
@@ -2782,18 +2786,17 @@ class UiWorker(threading.Thread):
             self._buff2_interval_label = self._buff2_interval_control.min_label
             ttk.Label(buff2_row, text="每隔").pack(side="left", padx=(8, 2))
             self._buff2_interval_control.pack(side="left")
-            buff3_row = ttk.Frame(drug_panel)
-            buff3_row.pack(fill="x", pady=(6, 0))
+            buff3_row = ttk.Frame(drug_right)
+            buff3_row.pack(fill="x")
             self._buff3_use_var = tk.BooleanVar(value=False)
             buff3_use_button = ttk.Checkbutton(
                 buff3_row, text="增益 2", width=6, variable=self._buff3_use_var,
                 command=self._drug_on_change,
             )
             buff3_use_button.pack(side="left")
-            ttk.Label(buff3_row, text="按键:").pack(side="left", padx=(8, 4))
             self._buff3_key_var = tk.StringVar(value="pageup")
             buff3_key_button = ttk.Button(
-                buff3_row, text=self._buff3_key_var.get(), width=14,
+                buff3_row, text=self._buff3_key_var.get(), width=10,
                 style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff3_key_button, self._buff3_key_var,
@@ -2816,18 +2819,17 @@ class UiWorker(threading.Thread):
             self._buff3_interval_label = self._buff3_interval_control.min_label
             ttk.Label(buff3_row, text="每隔").pack(side="left", padx=(8, 2))
             self._buff3_interval_control.pack(side="left")
-            buff4_row = ttk.Frame(drug_panel)
-            buff4_row.pack(fill="x", pady=(6, 0))
+            buff4_row = ttk.Frame(drug_right)
+            buff4_row.pack(fill="x", pady=(2, 0))
             self._buff4_use_var = tk.BooleanVar(value=False)
             buff4_use_button = ttk.Checkbutton(
                 buff4_row, text="增益 3", width=6, variable=self._buff4_use_var,
                 command=self._drug_on_change,
             )
             buff4_use_button.pack(side="left")
-            ttk.Label(buff4_row, text="按键:").pack(side="left", padx=(8, 4))
             self._buff4_key_var = tk.StringVar(value="pagedown")
             buff4_key_button = ttk.Button(
-                buff4_row, text=self._buff4_key_var.get(), width=14,
+                buff4_row, text=self._buff4_key_var.get(), width=10,
                 style="Locked.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff4_key_button, self._buff4_key_var,
@@ -2850,6 +2852,39 @@ class UiWorker(threading.Thread):
             self._buff4_interval_label = self._buff4_interval_control.min_label
             ttk.Label(buff4_row, text="每隔").pack(side="left", padx=(8, 2))
             self._buff4_interval_control.pack(side="left")
+            buff5_row = ttk.Frame(drug_right)
+            buff5_row.pack(fill="x", pady=(2, 0))
+            self._buff5_use_var = tk.BooleanVar(value=False)
+            buff5_use_button = ttk.Checkbutton(
+                buff5_row, text="增益 4", width=6, variable=self._buff5_use_var,
+                command=self._drug_on_change,
+            )
+            buff5_use_button.pack(side="left")
+            self._buff5_key_var = tk.StringVar(value="-")
+            buff5_key_button = ttk.Button(
+                buff5_row, text=self._buff5_key_var.get(), width=10,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    buff5_key_button, self._buff5_key_var,
+                    "_buff5_key_previous",
+                    lambda: self._drug_on_change(),
+                ),
+            )
+            buff5_key_button.pack(side="left", padx=(0, 4))
+            self._buff5_key_button = buff5_key_button
+            self._attach_bind_hint(buff5_key_button)
+            self._buff5_interval_control = NumericValueRangeControl(
+                buff5_row, tk_module=tk, ttk_module=ttk,
+                minimum=600, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("增益4间隔"),
+                on_change=self._drug_on_change,
+            )
+            self._buff5_interval_var = self._buff5_interval_control.minimum_var
+            self._buff5_interval_label = self._buff5_interval_control.min_label
+            ttk.Label(buff5_row, text="每隔").pack(side="left", padx=(8, 2))
+            self._buff5_interval_control.pack(side="left")
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
@@ -8026,22 +8061,46 @@ class UiWorker(threading.Thread):
             LOG.info("%s已导出并复制文件：%s", log_type, target)
 
     def _copy_running_log(self) -> None:
-        """Write and copy the latest complete 500-record diagnostic snapshot.
+        """Write and copy the live log plus the recording needed to read it.
 
-        ``work/assistant.log`` is owned by the asynchronous live file writer,
-        so overwriting or copying it directly can produce a partial log.  The
-        dashboard handler already receives every normal root-worker record
-        (movement, attack, status, hotkey, etc.) in memory.  Export that
-        bounded history to one stable root-level file, then place that file on
-        the clipboard for the operator.
+        The export deliberately has only two sources: the currently written
+        ``work\\assistant.log`` and ``recording`` from user_config.json.  The
+        latter supplies layers, endpoints, ropes and jump points needed to
+        interpret movement decisions, while avoiding unrelated user settings
+        such as bot credentials.  ``运行日志.txt`` is a stable, shareable file
+        rebuilt only when its toolbar button is clicked.
         """
 
         target = application_root(__file__) / "运行日志.txt"
-        text = ""
-        if self.ui_log_handler is not None:
-            text = self.ui_log_handler.history_text()
-        lines = text.splitlines()[-500:]
-        snapshot = "\n".join(lines) if lines else "(暂无运行日志)"
+        assistant_log = application_root(__file__) / "work" / "assistant.log"
+        try:
+            log_text = assistant_log.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            log_text = f"(无法读取 work\\assistant.log: {exc})"
+
+        recording: object = "(未找到录制配置)"
+        if self.user_config_path:
+            try:
+                document = json.loads(
+                    Path(self.user_config_path).read_text(encoding="utf-8")
+                )
+                if isinstance(document, dict):
+                    value = document.get("recording")
+                    if isinstance(value, dict):
+                        recording = value
+                    else:
+                        recording = "(user_config.json 中没有录制配置)"
+            except (OSError, ValueError, TypeError) as exc:
+                recording = f"(无法读取录制配置: {exc})"
+        else:
+            recording = "(当前运行未提供 user_config.json 路径)"
+
+        snapshot = (
+            "===== work\\assistant.log =====\n"
+            + log_text.rstrip()
+            + "\n\n===== user_config.json :: recording =====\n"
+            + json.dumps(recording, ensure_ascii=False, indent=2)
+        )
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_suffix(".tmp")
@@ -10362,6 +10421,7 @@ class UiWorker(threading.Thread):
             getattr(self, "_buff2_interval_control", None),
             getattr(self, "_buff3_interval_control", None),
             getattr(self, "_buff4_interval_control", None),
+            getattr(self, "_buff5_interval_control", None),
         ):
             if control is not None:
                 control.normalize()
@@ -10389,6 +10449,10 @@ class UiWorker(threading.Thread):
             self._buff4_interval_label.configure(
                 text=f"{int(round(self._buff4_interval_var.get()))}s"
             )
+        if hasattr(self, "_buff5_interval_label"):
+            self._buff5_interval_label.configure(
+                text=f"{int(round(self._buff5_interval_var.get()))}s"
+            )
         if hasattr(self, "_buff1_key_button"):
             self._buff1_key_button.configure(text=self._buff1_key_var.get())
         if hasattr(self, "_buff2_key_button"):
@@ -10397,6 +10461,8 @@ class UiWorker(threading.Thread):
             self._buff3_key_button.configure(text=self._buff3_key_var.get())
         if hasattr(self, "_buff4_key_button"):
             self._buff4_key_button.configure(text=self._buff4_key_var.get())
+        if hasattr(self, "_buff5_key_button"):
+            self._buff5_key_button.configure(text=self._buff5_key_var.get())
         data = {
             "hp_key": self._hp_key_var.get().strip(),
             "mp_key": self._mp_key_var.get().strip(),
@@ -10408,15 +10474,18 @@ class UiWorker(threading.Thread):
             "buff2_key": self._buff2_key_var.get().strip(),
             "buff3_key": self._buff3_key_var.get().strip(),
             "buff4_key": self._buff4_key_var.get().strip(),
+            "buff5_key": self._buff5_key_var.get().strip(),
             "buff_interval_unit": "seconds",
             "buff1_interval": int(round(float(self._buff1_interval_var.get()))),
             "buff2_interval": int(round(float(self._buff2_interval_var.get()))),
             "buff3_interval": int(round(float(self._buff3_interval_var.get()))),
             "buff4_interval": int(round(float(self._buff4_interval_var.get()))),
+            "buff5_interval": int(round(float(self._buff5_interval_var.get()))),
             "buff1_enabled": bool(self._buff1_use_var.get()),
             "buff2_enabled": bool(self._buff2_use_var.get()),
             "buff3_enabled": bool(self._buff3_use_var.get()),
             "buff4_enabled": bool(self._buff4_use_var.get()),
+            "buff5_enabled": bool(self._buff5_use_var.get()),
         }
         self._drug_save_settings(data)
         self._drug_apply_to_worker(data)
@@ -10451,6 +10520,8 @@ class UiWorker(threading.Thread):
                 self._buff3_key_var.set(str(data["buff3_key"]))
             if "buff4_key" in data:
                 self._buff4_key_var.set(str(data["buff4_key"]))
+            if "buff5_key" in data:
+                self._buff5_key_var.set(str(data["buff5_key"]))
             # Older configuration files stored minutes.  The explicit unit
             # tag makes the one-time conversion unambiguous, including 5s.
             legacy_minutes = data.get("buff_interval_unit") != "seconds"
@@ -10459,6 +10530,7 @@ class UiWorker(threading.Thread):
                 ("buff2_interval", self._buff2_interval_var),
                 ("buff3_interval", self._buff3_interval_var),
                 ("buff4_interval", self._buff4_interval_var),
+                ("buff5_interval", self._buff5_interval_var),
             ):
                 if name not in data:
                     continue
@@ -10474,6 +10546,8 @@ class UiWorker(threading.Thread):
                 self._buff3_use_var.set(bool(data["buff3_enabled"]))
             if "buff4_enabled" in data:
                 self._buff4_use_var.set(bool(data["buff4_enabled"]))
+            if "buff5_enabled" in data:
+                self._buff5_use_var.set(bool(data["buff5_enabled"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed drug settings", exc_info=True)
             return
