@@ -598,7 +598,7 @@ LAYER_SINGLE_SUPPORTER_GAP_FALLBACK = 0.002
 # as "not arrived" zeroed the streak, so arrival could never be confirmed and the
 # climb restarted forever.  A longer blank run is real evidence and still resets.
 CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED = 3
-# A marker merely PASSING through the next floor's Y band while it is still
+# A marker merely passing through the next floor's Y band while it is still
 # climbing a rope is not a landing.  Arrival evidence is allowed only after
 # three fresh readings produce two consecutive normalized-Y gaps no larger
 # than this value.  That lets a route whose platform is below its rope-exit
@@ -7293,17 +7293,32 @@ class MovementWorker(threading.Thread):
             # layer2 repeating instead of advancing to layer3.
             self._clear_layer_resync_candidate()
             return self._detect_floor_all(observation)
+        # A rope attempt owns route indexing from its first Alt+side/Up chord
+        # until it returns to idle.  Before attachment is proved, the marker
+        # can briefly pass through a platform band while falling, jumping, or
+        # sliding alongside the rope.  Letting ordinary layer resolution run
+        # in that interval advances the route index one floor too early.
+        climb_input_active = bool(
+            self._climb_state.up_held
+            or self._climb_state.phase != "idle"
+        )
+        # Only a verified attached climb may begin the next-layer arrival
+        # gate.  ``holding-up-awaiting-progress`` is an input attempt, not
+        # evidence that the character is on the rope yet.
+        climb_arrival_active = bool(
+            self._climb_state.up_held
+            and self._climb_state.phase == "climbing-up"
+        )
         support = self._stationary_runtime_layer_support
-        if (support is not None and observation.player is not None
+        if (not climb_input_active
+                and support is not None and observation.player is not None
                 and self._layer_band_contains(support[0], observation.player.y)):
-            # The session-only stationary supporter is direct marker evidence.
-            # It must beat a stale world-Y estimate on a two-height bench.
+            # The session-only stationary supporter is direct marker evidence
+            # while standing.  It must never bypass an active rope arrival:
+            # the 02:25 trace returned layer2 here between candidate 1/2 and
+            # its second sample, leaving Up held forever.
             self._clear_layer_resync_candidate()
             return support[0]
-        climb_input_active = (
-            self._climb_state.up_held
-            or self._climb_state.phase == "climbing-up"
-        )
         # Evidence for the transition logs, filled by the non-climb path below; empty while climbing so
         # the tail can always name what the marker matched.
         marker_candidates_all: list[str] = []
@@ -7318,7 +7333,7 @@ class MovementWorker(threading.Thread):
         # route advances.  This is timestamped (not a blocking sleep), so the
         # worker continues consuming frames and coordinating other actions.
         compensating = bool(
-            climb_input_active
+            climb_arrival_active
             and self._climb_state.target_layer_since is not None
             and 0 <= expected_next_index < len(self._route_layers)
         )
@@ -7336,7 +7351,7 @@ class MovementWorker(threading.Thread):
             # The target was already frame-confirmed before compensation
             # began.  Do not let one rope-top animation frame undo it.
             detected_name = expected_name
-        elif climb_input_active:
+        elif climb_arrival_active:
             # A climb can only arrive at the immediate next route layer.  The
             # old nearest-anchor rule switched at the midpoint between floors,
             # released Up while the character was still on the rope, and then
@@ -7476,6 +7491,16 @@ class MovementWorker(threading.Thread):
                 if marker_unambiguous or world_expected
                 else marker_route_name if marker_lower_fall
                 else current_name if marker_current else None
+            )
+        elif climb_input_active:
+            # The rope-grab attempt still owns movement, but it has not
+            # attached.  Preserve the current route floor rather than letting
+            # a transient marker row re-index the route prematurely.
+            detected_name = (
+                self._route_layers[self._route_layer_index]
+                if (self._route_layer_index is not None
+                    and 0 <= self._route_layer_index < len(self._route_layers))
+                else None
             )
         else:
             detected_name = self._detected_layer(observation)
