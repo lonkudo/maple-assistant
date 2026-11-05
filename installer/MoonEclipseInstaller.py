@@ -93,22 +93,16 @@ DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
 LAUNCHER_ENCODING = "gbk"
 # Folder created on the Desktop for a first install.
 DEFAULT_FOLDER_NAME = "MoonEclipse"
-# One bar, two phases: the download fills the first PROGRESS_DOWNLOAD_SHARE by
-# real bytes and the install fills the rest by files actually moved into place.
-# Scaling the bar to the download size alone made it claim completion during
-# extraction and the file move - and a failed source kept its bytes, so a
-# fallback download ran behind a bar that was already full.
+# The bar is the download and nothing else: it fills from real socket bytes, and
+# the phases after it (extraction, verification, the move) report their real
+# counts in the status text without moving it.  A bar that slid on during
+# verification claimed progress that no byte stream was making.
 PROGRESS_UNITS = 1000
-PROGRESS_DOWNLOAD_SHARE = 0.62
-# Every phase after the download walks a countable list of files, so each one
-# owns a slice of the bar instead of leaving it parked at "done" while 1,000+
-# hashes are computed.
-PROGRESS_PHASES: dict[str, tuple[float, float]] = {
-    "解压": (0.62, 0.72),
-    "校验": (0.72, 0.85),
-    "安装": (0.85, 1.0),
-}
+PROGRESS_DOWNLOAD_SHARE = 1.0
 PROGRESS_LABELS = {"解压": "正在解压安装包", "校验": "正在校验文件", "安装": "正在安装文件"}
+# A mirror slower than this is abandoned when another source is still available
+# (0.1 MB/s is 16 minutes for the 93.6 MB archive); the last source is never cut.
+MIRROR_MIN_RATE_BPS = 1536 * 1024
 
 
 def _desktop_candidates() -> list[Path]:
@@ -433,12 +427,17 @@ def _download_planned_files(
     # 1) Whole package from a share link.
     if want_archive and shares and lanzou_download is not None:
         archive = staging / "bundle.zip"
-        for mirror in shares:
+        for index, mirror in enumerate(shares):
             try:
                 share = lanzou_resolve(mirror)
                 phase_reset(int(getattr(share, "size", 0) or 0) or planned_bytes)
                 stage("正在下载更新安装包…")
-                lanzou_download(share, archive, parts=8, progress=phase_progress)
+                lanzou_download(
+                    share, archive, parts=8, progress=phase_progress,
+                    # Only gate when a fallback exists: the last mirror may be
+                    # slow but it is still the one that can finish the install.
+                    min_rate_bps=MIRROR_MIN_RATE_BPS if index + 1 < len(shares) else 0,
+                )
                 version = _archive_version(archive)
                 if expected_version and version and version != expected_version:
                     raise RuntimeError(
@@ -838,12 +837,10 @@ class InstallerWindow:
                     self._stage_text = str(value)
                     self.status.configure(text=self._stage_text)
                 elif kind == "files":
+                    # Text only: the bar belongs to the byte stream, and these
+                    # phases have none, so they must not move it.
                     phase, done, total = value
                     total = max(1, int(total))
-                    low, high = PROGRESS_PHASES.get(
-                        str(phase), (PROGRESS_DOWNLOAD_SHARE, 1.0)
-                    )
-                    self._set_progress(low + (high - low) * min(1.0, done / total))
                     label = PROGRESS_LABELS.get(str(phase), "正在处理文件")
                     self.status.configure(text=f"{label} {done}/{total}…")
                 elif kind == "done":

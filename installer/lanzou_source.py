@@ -1,4 +1,4 @@
-"""Resolve a lanzou share link (优享 ilanzou or classic lanzoup) to a direct URL.
+"""Resolve a netdisk share link (lanzou 优享/classic, 123云盘) to a direct URL.
 
 The flow is the one qaiu/netdisk-fast-download implements in ``IzTool.java`` +
 ``AESUtils.java`` + ``AcwScV2Generator.java``; it was reproduced and verified
@@ -40,6 +40,8 @@ import random
 import re
 import ssl
 import string
+import zlib
+from datetime import datetime, timedelta, timezone
 import tempfile
 import threading
 import time
@@ -47,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -67,6 +69,20 @@ SHARE_HOSTS = ("ilanzou.com", "www.ilanzou.com")
 CLASSIC_HOSTS = (
     "lanzoup.com", "lanzoux.com", "lanzoui.com", "lanzouw.com", "lanzou.com",
 )
+# 123云盘 share hosts; every one of them is answered by the same API host.
+PAN_HOSTS = (
+    "123pan.com", "123684.com", "123865.com", "123912.com", "123pan.cn",
+    "123682.com", "123pan.cc",
+)
+PAN_API = "https://yun.123pan.com/b/api"
+PAN_SHARE_REFERER = "https://yun.123pan.com/"
+PAN_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+# signPath(): digit -> letter table from the 123pan web client.
+_PAN_TABLE = "adefghlmyijnopkqrstubcvwsz"
+PAN_API_INTERVAL = 0.7
 
 # acw_sc__v2 (edge anti-bot cookie) constants from AcwScV2Generator.java.
 _ACW_POSITION = (
@@ -325,6 +341,183 @@ def _follow_cdn(url: str, *, jar: dict[str, str], referer: str, hops: int = 6) -
     raise LanzouError("蓝奏直链跳转次数过多")
 
 
+def _pan_sign(api_path: str, os_name: str = "web", version: str = "3") -> tuple[str, str]:
+    """The signed query parameter every 123pan API call needs."""
+
+    stamp = str(int(time.time()))
+    random_part = str(round(1e7 * random.random()))
+    now = datetime.now(timezone(timedelta(hours=8)))
+    mapped = "".join(_PAN_TABLE[int(char)] for char in now.strftime("%Y%m%d%H%M"))
+    time_sign = str(zlib.crc32(mapped.encode("ascii")))
+    payload = "|".join([stamp, random_part, api_path, os_name, version, time_sign])
+    return time_sign, f"{stamp}-{random_part}-{zlib.crc32(payload.encode('ascii'))}"
+
+
+def _pan_call(
+    subpath: str, *, query: Optional[dict[str, Any]] = None,
+    body: Optional[dict[str, Any]] = None, timeout: float = 30.0,
+) -> dict[str, Any]:
+    """One signed 123pan API call; returns ``data`` from the envelope."""
+
+    api_path = "/b/api" + subpath
+    url = PAN_API + subpath
+    sign_key, sign_value = _pan_sign(api_path)
+    pairs = [(str(name), str(value)) for name, value in (query or {}).items()]
+    pairs.append((sign_key, sign_value))
+    target = api_path + "?" + urlencode(pairs, quote_via=quote)
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+
+    context = ssl.create_default_context()
+    connection = http.client.HTTPSConnection(
+        "yun.123pan.com", 443, context=context, timeout=timeout
+    )
+    try:
+        headers = {
+            "User-Agent": PAN_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": PAN_SHARE_REFERER.rstrip("/"),
+            "Referer": PAN_SHARE_REFERER,
+            "platform": "web",
+            "app-version": "3",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json;charset=UTF-8"
+        connection.request("POST" if payload is not None else "GET", target,
+                           body=payload, headers=headers)
+        response = connection.getresponse()
+        raw = response.read()
+        status = response.status
+    finally:
+        connection.close()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    try:
+        envelope = json.loads(raw.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise LanzouError(f"123云盘接口返回非 JSON (HTTP {status})") from exc
+    if int(envelope.get("code", -1)) != 0:
+        raise LanzouError(
+            f"123云盘: {envelope.get('message') or envelope.get('code')}"
+        )
+    data = envelope.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _pan_files(share_key: str, share_pwd: str) -> list[dict[str, Any]]:
+    """Every file in the share, folders walked (the API pages by folder)."""
+
+    found: list[dict[str, Any]] = []
+    pending = ["0"]
+    while pending and len(found) < 500:
+        parent = pending.pop(0)
+        page = 1
+        while True:
+            data = _pan_call("/share/get", query={
+                "limit": 100, "next": "0", "orderBy": "file_id",
+                "orderDirection": "desc", "parentFileId": parent,
+                "Page": page, "shareKey": share_key, "SharePwd": share_pwd,
+            })
+            entries = data.get("InfoList") or []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                is_folder = str(entry.get("Type")) == "1" or int(entry.get("Size") or 0) == 0
+                if is_folder and int(entry.get("Size") or 0) == 0:
+                    pending.append(str(entry.get("FileId")))
+                else:
+                    found.append(entry)
+            page += 1
+            time.sleep(PAN_API_INTERVAL)
+            if not entries or str(data.get("Next")) == "-1":
+                break
+    return found
+
+
+def _pan_final(url: str, timeout: float = 30.0) -> tuple[str, int, str]:
+    """Resolve the 123pan download URL to the CDN URL and its real size."""
+
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise LanzouError(f"123云盘下载地址无效: {url[:120]}")
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    status, raw, info = _http(
+        parts.hostname, path, referer=PAN_SHARE_REFERER,
+        extra={"Accept": "*/*", "Range": "bytes=0-0"}, read_limit=65536,
+        timeout=timeout,
+    )
+    final = url
+    if status in (301, 302, 303, 307, 308) and info["location"]:
+        final = urljoin(url, info["location"])
+    elif 200 <= status < 300 and b"redirect_url" in raw:
+        try:
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            payload = {}
+        candidate = str(((payload.get("data") or {}) if isinstance(payload, dict) else {})
+                         .get("redirect_url") or "")
+        if candidate:
+            final = candidate
+    final_parts = urlsplit(final)
+    total = 0
+    if final_parts.hostname:
+        status, _raw, info = _http(
+            final_parts.hostname,
+            (final_parts.path or "/")
+            + (f"?{final_parts.query}" if final_parts.query else ""),
+            referer=PAN_SHARE_REFERER,
+            extra={"Accept": "*/*", "Range": "bytes=0-0"}, read_limit=4096,
+            timeout=timeout,
+        )
+        total = _range_total(info["content_range"])
+        if not total and status == 200 and info["content_length"].isdigit():
+            total = int(info["content_length"])
+    return final, total, status
+
+
+def _resolve_pan(share_key: str, code: Optional[str]) -> ShareFile:
+    """123云盘 share -> direct CDN URL of the release archive."""
+
+    share_pwd = code or ""
+    files = _pan_files(share_key, share_pwd)
+    if not files:
+        raise LanzouError("123云盘分享里没有文件")
+    zips = [item for item in files if str(item.get("FileName", "")).lower().endswith(".zip")]
+    entry = max(zips or files, key=lambda item: int(item.get("Size") or 0))
+    name = str(entry.get("FileName") or f"{share_key}.zip")
+    size = int(entry.get("Size") or 0)
+
+    data = _pan_call("/share/download/info", body={
+        "shareKey": share_key,
+        "SharePwd": share_pwd,
+        "etag": entry.get("Etag") or "",
+        "fileId": int(entry.get("FileId") or 0),
+        "s3keyFlag": entry.get("S3KeyFlag") or "",
+        "size": size,
+    })
+    download_url = str(data.get("DownloadURL") or "")
+    if not download_url:
+        raise LanzouError("123云盘没有返回下载地址")
+    # The web client sometimes hides the real URL behind params=<base64>.
+    params = parse_qs(urlsplit(download_url).query).get("params") or []
+    if params:
+        try:
+            decoded = base64.b64decode(params[0]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            decoded = ""
+        if decoded.startswith("http"):
+            download_url = decoded
+
+    final_url, total, _status = _pan_final(download_url)
+    LOG.info(
+        "123云盘: share %s -> %s (%.1f MB)",
+        share_key, urlsplit(final_url).hostname, (total or size) / 1024 / 1024,
+    )
+    return ShareFile(
+        name=name, size=total or size, direct_url=final_url,
+        file_id=str(entry.get("FileId") or ""), user_id="", password=code,
+    )
+
+
 def _resolve_classic(host: str, share_id: str, code: Optional[str]) -> ShareFile:
     """Classic share (lanzoup.com/<id>) -> direct CDN URL."""
 
@@ -418,6 +611,17 @@ def parse_share_url(url: str) -> tuple[str, str, str, Optional[str]]:
             raise LanzouError(f"链接中没有分享标识: {url}")
         code = (parse_qs(parts.query).get("pwd") or [None])[0]
         return "classic", host, segments[0], (code.strip() or None) if code else None
+    if any(host == known or host.endswith("." + known) for known in PAN_HOSTS):
+        # https://www.123pan.com/s/<shareKey> (the "s" segment is optional in
+        # some of the mirror hosts)
+        key = segments[1] if len(segments) > 1 and segments[0] == "s" else (
+            segments[0] if segments else ""
+        )
+        if not key:
+            raise LanzouError(f"链接中没有分享标识: {url}")
+        query = parse_qs(parts.query)
+        code = (query.get("pwd") or query.get("code") or [None])[0]
+        return "pan", host, key, (code.strip() or None) if code else None
     raise LanzouError(f"不是蓝奏分享链接: {url}")
 
 
@@ -430,6 +634,8 @@ def resolve(
     code = password if password is not None else url_code
     if kind == "classic":
         return _resolve_classic(host, share_key, code)
+    if kind == "pan":
+        return _resolve_pan(share_key, code)
     uuid = _new_uuid()
     ts = encode_hex(str(int(time.time() * 1000)))
 
@@ -519,6 +725,12 @@ PARTS_MAX = 16
 MIN_RANGE = 1024 * 1024
 SLOW_RATE_BPS = 8 * 1024 * 1024
 WAVE_MIN_BYTES = 8 * 1024 * 1024
+# Below this a mirror is unusable *if* the caller has another one to try.
+UNUSABLE_RATE_BPS = 1.5 * 1024 * 1024
+# How long the watchdog waits before judging a running download (seconds and
+# bytes), so a slow start does not abort a source that is merely warming up.
+MIN_RATE_SAMPLE_SECONDS = 5.0
+MIN_RATE_SAMPLE_BYTES = 256 * 1024
 
 
 def file_sha256(path: Path) -> str:
@@ -532,6 +744,7 @@ def file_sha256(path: Path) -> str:
 def _range_into(
     url: str, start: int, end: int, target: Path,
     progress: Optional[Callable[[int], None]], failures: list,
+    stop: Optional[threading.Event] = None,
 ) -> None:
     """Write ``bytes=start-end`` of ``url`` into ``target`` at that offset."""
 
@@ -554,6 +767,8 @@ def _range_into(
                 with target.open("r+b") as handle:
                     handle.seek(start)
                     while remaining > 0:
+                        if stop is not None and stop.is_set():
+                            raise LanzouError("该来源速度过低，已放弃")
                         chunk = response.read(min(READ_SIZE, remaining))
                         if not chunk:
                             break
@@ -567,6 +782,9 @@ def _range_into(
                 return
             raise LanzouError("分段下载不完整")
         except Exception as exc:  # noqa: BLE001 - retried below
+            if stop is not None and stop.is_set():
+                failures.append(f"{start}-{end}: aborted")
+                return
             if attempt == RETRY_ATTEMPTS:
                 failures.append(f"{start}-{end}: {exc}")
                 LOG.warning("lanzou: range %d-%d failed: %s", start, end, exc)
@@ -577,6 +795,7 @@ def _range_into(
 def _parallel_ranges(
     url: str, target: Path, total: int, *,
     parts: Optional[int], progress: Optional[Callable[[int], None]],
+    min_rate_bps: int = 0,
 ) -> None:
     """Fill ``target`` from ``url`` in slices, escalating when a slice is slow."""
 
@@ -600,6 +819,38 @@ def _parallel_ranges(
         failures: list = []
         threads = []
         started = time.monotonic()
+        stop = threading.Event()
+        watch = {"bytes": 0}
+        watch_lock = threading.Lock()
+
+        def counted(chunk_bytes: int) -> None:
+            with watch_lock:
+                watch["bytes"] += max(0, int(chunk_bytes))
+            if progress is not None:
+                progress(chunk_bytes)
+
+        def watchdog() -> None:
+            while not stop.wait(0.5):
+                elapsed = time.monotonic() - started
+                if elapsed < MIN_RATE_SAMPLE_SECONDS:
+                    continue
+                with watch_lock:
+                    current = watch["bytes"]
+                if current < MIN_RATE_SAMPLE_BYTES:
+                    continue
+                rate = current / elapsed
+                if rate < min_rate_bps:
+                    LOG.warning(
+                        "lanzou: %.1f MB/s after %.0fs, abandoning this source",
+                        rate / 1024 / 1024, elapsed,
+                    )
+                    stop.set()
+                    return
+
+        watcher = None
+        if min_rate_bps > 0:
+            watcher = threading.Thread(target=watchdog, daemon=True)
+            watcher.start()
         for slot in range(count):
             range_start = slice_start + slot * chunk
             if range_start > slice_end:
@@ -607,13 +858,19 @@ def _parallel_ranges(
             range_end = min(slice_end, range_start + chunk - 1)
             thread = threading.Thread(
                 target=_range_into,
-                args=(url, range_start, range_end, target, progress, failures),
+                args=(url, range_start, range_end, target, counted, failures, stop),
                 daemon=True,
             )
             thread.start()
             threads.append(thread)
         for thread in threads:
             thread.join()
+        stop.set()
+        if watcher is not None:
+            watcher.join(timeout=1.0)
+        if (min_rate_bps and watch["bytes"] < total
+                and any("aborted" in failure for failure in failures)):
+            raise LanzouError("该来源速度过低，改用其它来源")
         if failures:
             raise LanzouError(f"蓝奏分段下载失败：{failures[0]}")
         elapsed = max(1e-6, time.monotonic() - started)
@@ -627,6 +884,12 @@ def _parallel_ranges(
             # This machine's per-connection ceiling is the limit: ask for more.
             streams = min(PARTS_MAX, streams * 2)
             LOG.info("lanzou: slow slice, raising to %d stream(s)", streams)
+        if min_rate_bps and rate < min_rate_bps:
+            # Only set when the caller has another mirror to try: the route is
+            # unusable (10 minutes for 93 MB), so do not spend it here.
+            raise LanzouError(
+                f"该来源速度过低（{rate / 1024 / 1024:.1f} MB/s），改用其它来源"
+            )
 
 
 def _probe_direct_url(url: str, timeout: float = 30.0) -> tuple[bool, int]:
@@ -703,6 +966,7 @@ def download(
     expected_size: Optional[int] = None,
     parts: Optional[int] = None,
     progress: Optional[Callable[[int], None]] = None,
+    min_rate_bps: int = 0,
 ) -> Path:
     """Download the share into ``target`` (parallel ranges, then verify).
 
@@ -724,6 +988,7 @@ def download(
         if range_supported and total > 0:
             _parallel_ranges(
                 share.direct_url, target, total, parts=parts, progress=progress,
+                min_rate_bps=min_rate_bps,
             )
         else:
             LOG.info("lanzou: the CDN does not support Range; using one stream")
