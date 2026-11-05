@@ -587,12 +587,13 @@ class InstallerWindow:
             self.install_root.set(chosen)
 
     def _paint_eclipse(self, fraction: float) -> None:
-        """The moon appears on the sun and eats it, leaving a black disc.
+        """The moon travels in from outside and covers the sun.
 
-        A disc sliding across the yellow circle is a transit, not an eclipse.
-        Here the dark disc grows from the centre of the sun - the yellow is eaten
-        outwards through a shrinking ring - and at 1.0 the whole glyph is the
-        black disc.
+        Two wrong shapes to avoid: a disc that grows out of the sun's centre (an
+        iris, not an eclipse) and a disc that keeps sliding after it has covered
+        the sun (a transit).  The moon here is the sun's own size, starts fully
+        outside the visible zone, and stops exactly on the sun: at 1.0 the visible
+        result is a single black circle.
         """
 
         self.eclipse.delete("all")
@@ -602,11 +603,11 @@ class InstallerWindow:
             centre - radius, centre - radius, centre + radius, centre + radius,
             fill="#f4d35e", outline="",
         )
-        if fraction <= 0.0:
-            return
-        eaten = radius * fraction
+        # Two radii of travel plus a margin keeps the starting moon off-canvas.
+        travel = 2.0 * radius + 8.0
+        moon_x = centre - travel * (1.0 - fraction)
         self.eclipse.create_oval(
-            centre - eaten, centre - eaten, centre + eaten, centre + eaten,
+            moon_x - radius, centre - radius, moon_x + radius, centre + radius,
             fill="#202b3c", outline="",
         )
 
