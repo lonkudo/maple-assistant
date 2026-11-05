@@ -29,17 +29,27 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from licensing import ACTIVATION_SERVER_ENDPOINT, machine_fingerprint_hash  # noqa: E402
+from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json  # noqa: E402
+
 
 HERE = Path(__file__).resolve().parent
 SOURCE_ROOT = HERE.parent
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-# Where an operator can drop installer_mirrors.json: beside the executable
-# first (a Nuitka onefile build puts the payload beside it), then the source
-# tree.  Nothing is read from the Windows Registry.
+# The activation-server pin lives beside the source files or the executable.  In
+# a standalone installer Nuitka places it beside the executable; nothing is read
+# from the Windows Registry.
 _exe_root = Path(sys.argv[0]).resolve().parent
-PIN_ROOT = _exe_root
+PIN_ROOT = next(
+    (candidate for candidate in (HERE, _exe_root, SOURCE_ROOT)
+     if (candidate / "activation_server_pin.json").is_file()),
+    SOURCE_ROOT,
+)
+# Where an operator can drop installer_mirrors.json: beside the executable
+# first, then the source tree.
+CONFIG_ROOTS = (_exe_root, HERE)
 
 # Share parsing (share link -> CDN direct URL -> parallel Range download).  This
 # is the only payload path: without it there is nothing to install.
@@ -67,9 +77,9 @@ MIRRORS_FILE = "installer_mirrors.json"
 # this URL per release, or override it with installer_mirrors.json
 # ({"shares": ["https://..."]}) next to the installer.
 DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
-    # QQ 邮箱文件中转站 upload.  中转站 links expire (~30 days), so keep
-    # installer_mirrors.json handy for a fresh upload when this one dies.
-    "https://wx.mail.qq.com/s?k=oSi9hR7qY0Qlu10Gcb",
+    # VIP 蓝奏云 classic share.  蓝奏 links do not expire like a 邮件中转站 does;
+    # keep installer_mirrors.json for an ad-hoc source swap.
+    "https://wwblt.lanzoup.com/iiLxV4esmo5i",
 )
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
@@ -270,7 +280,7 @@ def _share_sources(manifest: dict[str, Any]) -> list[str]:
     # The build's own share comes after anything the server issued, so a server
     # update can retarget the installer without a new build.
     add(DEFAULT_SHARE_MIRRORS)
-    for folder in (PIN_ROOT, Path(sys.argv[0]).resolve().parent, HERE):
+    for folder in CONFIG_ROOTS:
         candidate = folder / MIRRORS_FILE
         try:
             if not candidate.is_file():
@@ -297,6 +307,37 @@ def _archive_version(archive: Path) -> str:
     except (OSError, zipfile.BadZipFile):
         return ""
     return ""
+
+
+def _activate(code: str) -> tuple[str, str]:
+    """Validate this copy against the activation server.
+
+    Returns ``(session_token, catalogue_version)``.  Authentication only: the
+    installer never downloads payload from that server, so the catalogue version
+    is informational (it is logged, not enforced).
+    """
+
+    payload = {
+        "activation_code": "".join(code.upper().split()),
+        "fingerprint": machine_fingerprint_hash(),
+    }
+    try:
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/session",
+            payload, PIN_ROOT / "activation_server_pin.json",
+        )
+    except PinnedTlsResponseError as exc:
+        raise RuntimeError(f"授权失败：{getattr(exc, 'message', str(exc))}") from exc
+    except PinnedTlsError as exc:
+        raise RuntimeError(f"授权失败：无法连接到授权服务器（{exc}）") from exc
+    token = str((answer or {}).get("session_token") or "")
+    if not token:
+        raise RuntimeError("授权失败：服务器未返回会话。")
+    manifest = answer.get("manifest")
+    version = ""
+    if isinstance(manifest, dict):
+        version = str(manifest.get("version") or "")
+    return token, version
 
 
 def _version_from_name(name: str) -> str:
@@ -520,20 +561,23 @@ class InstallerWindow:
         outer = ttk.Frame(self.root, padding=18)
         outer.grid(sticky="nsew")
         ttk.Label(outer, text="MoonEclipse", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(outer, text="从分享链接下载最新版本，只替换有变化的文件。配置与录制内容不会被覆盖。").grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 14))
-        ttk.Label(outer, text="安装位置").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(outer, text="验证授权码后，从分享链接下载最新版本并只替换有变化的文件。").grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 14))
+        ttk.Label(outer, text="授权码").grid(row=2, column=0, sticky="w")
+        self.code = ttk.Entry(outer, width=48, show="*")
+        self.code.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+        ttk.Label(outer, text="安装位置").grid(row=3, column=0, sticky="w", pady=(10, 0))
         self.install_root = tk.StringVar(value=str(default_root))
-        ttk.Entry(outer, textvariable=self.install_root, width=48).grid(row=2, column=1, sticky="ew", padx=(8, 6), pady=(6, 0))
-        ttk.Button(outer, text="选择…", command=self._choose_root).grid(row=2, column=2, pady=(6, 0))
+        ttk.Entry(outer, textvariable=self.install_root, width=42).grid(row=3, column=1, sticky="ew", padx=(8, 6), pady=(10, 0))
+        ttk.Button(outer, text="选择…", command=self._choose_root).grid(row=3, column=2, pady=(10, 0))
 
         self.eclipse = tk.Canvas(outer, width=52, height=52, highlightthickness=0, background="#f6f7f9")
-        self.eclipse.grid(row=3, column=0, pady=(18, 0), sticky="w")
+        self.eclipse.grid(row=4, column=0, pady=(18, 0), sticky="w")
         self.progress = ttk.Progressbar(outer, mode="determinate", length=340)
-        self.progress.grid(row=3, column=1, columnspan=2, pady=(18, 0), sticky="ew")
+        self.progress.grid(row=4, column=1, columnspan=2, pady=(18, 0), sticky="ew")
         self.status = ttk.Label(outer, text="准备就绪")
-        self.status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.status.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self.install = ttk.Button(outer, text="开始安装 / 更新", command=self._start)
-        self.install.grid(row=5, column=2, sticky="e", pady=(16, 0))
+        self.install.grid(row=6, column=2, sticky="e", pady=(16, 0))
         self._paint_eclipse(0.0)
         self.root.after(50, self._drain_events)
 
@@ -543,26 +587,51 @@ class InstallerWindow:
             self.install_root.set(chosen)
 
     def _paint_eclipse(self, fraction: float) -> None:
+        """The moon appears on the sun and eats it, leaving a black disc.
+
+        A disc sliding across the yellow circle is a transit, not an eclipse.
+        Here the dark disc grows from the centre of the sun - the yellow is eaten
+        outwards through a shrinking ring - and at 1.0 the whole glyph is the
+        black disc.
+        """
+
         self.eclipse.delete("all")
-        self.eclipse.create_oval(6, 6, 46, 46, fill="#f4d35e", outline="")
-        # The dark moon crosses the sun exactly with verified byte progress.
-        offset = -42 + max(0.0, min(1.0, fraction)) * 52
-        self.eclipse.create_oval(6 + offset, 6, 46 + offset, 46, fill="#202b3c", outline="")
+        fraction = max(0.0, min(1.0, fraction))
+        centre, radius = 26.0, 20.0
+        self.eclipse.create_oval(
+            centre - radius, centre - radius, centre + radius, centre + radius,
+            fill="#f4d35e", outline="",
+        )
+        if fraction <= 0.0:
+            return
+        eaten = radius * fraction
+        self.eclipse.create_oval(
+            centre - eaten, centre - eaten, centre + eaten, centre + eaten,
+            fill="#202b3c", outline="",
+        )
 
     def _start(self) -> None:
         if self.running:
             return
+        code = self.code.get().strip()
+        if not code:
+            messagebox.showwarning("缺少授权码", "请输入授权码。", parent=self.root)
+            return
         root = Path(self.install_root.get()).expanduser()
         self.running = True
         self.install.state(["disabled"])
-        self.status.configure(text="正在准备下载…")
+        self.status.configure(text="正在验证授权码…")
         threading.Thread(
-            target=self._install_worker, args=(root,),
+            target=self._install_worker, args=(code, root),
             name="installer-download", daemon=True,
         ).start()
 
-    def _install_worker(self, root: Path) -> None:
+    def _install_worker(self, code: str, root: Path) -> None:
         try:
+            # Authentication first: an invalid code stops before any download.
+            _token, catalogue_version = _activate(code)
+            if catalogue_version:
+                logging.info("installer: activation ok, catalogue version %s", catalogue_version)
             root = root.resolve()
             app_root = root / APP_DIRECTORY
             local = _load_local_manifest(root)
