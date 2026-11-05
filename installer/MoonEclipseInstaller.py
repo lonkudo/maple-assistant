@@ -91,15 +91,33 @@ LAUNCHER_ENCODING = "gbk"
 DEFAULT_FOLDER_NAME = "MoonEclipse"
 
 
-def _desktop_directory() -> Path:
-    """Return the user's real Desktop folder.
+def _desktop_candidates() -> list[Path]:
+    """Every place the user's Desktop plausibly lives, most authoritative first."""
 
-    ``Path.home() / "Desktop"`` is wrong often enough to matter: OneDrive
-    redirects the folder to ``.../OneDrive/Desktop``, and a localized Windows
-    names it 桌面.  Ask the shell for the known folder instead and fall back
-    only when that fails.
-    """
+    home = Path.home()
+    found: list[Path] = []
 
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            try:
+                found.append(Path(os.path.expandvars(value.strip())))
+            except (OSError, ValueError):
+                pass
+
+    # 1) The value the shell itself uses: %USERPROFILE%\Desktop normally,
+    #    %OneDrive%\Desktop when redirected, 桌面 on a localized system.
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            add(winreg.QueryValueEx(key, "Desktop")[0])
+    except (ImportError, OSError, ValueError):
+        pass
+
+    # 2) The known-folder API, for a machine whose registry value is missing.
     try:
         import ctypes
         from ctypes import wintypes
@@ -124,17 +142,45 @@ def _desktop_directory() -> Path:
             ctypes.POINTER(ctypes.c_wchar_p),
         ]
         shell32.SHGetKnownFolderPath.restype = ctypes.c_long
-        if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(buffer)) == 0:
+        if shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(buffer)
+        ) == 0:
             resolved = str(buffer.value or "")
             ctypes.windll.ole32.CoTaskMemFree(buffer)
-            if resolved:
-                path = Path(resolved)
-                if path.is_dir():
-                    return path
-    except (AttributeError, OSError, ValueError):
+            add(resolved)
+    except Exception:  # noqa: BLE001 - a failed lookup just falls through
         pass
-    fallback = Path.home() / "Desktop"
-    return fallback if fallback.is_dir() else Path.home()
+
+    # 3) Conventional names, including the localized folder of a redirected or
+    #    renamed Desktop.
+    add(str(home / "Desktop"))
+    add(str(home / "桌面"))
+    try:
+        for child in home.iterdir():
+            if child.is_dir() and child.name.strip().lower() in {"desktop", "桌面"}:
+                add(str(child))
+    except OSError:
+        pass
+    return found
+
+
+def _desktop_directory() -> Path:
+    """Return the user's real Desktop folder.
+
+    ``Path.home() / "Desktop"`` is wrong often enough to matter: OneDrive
+    redirects the folder to ``.../OneDrive/Desktop`` and a localized Windows
+    names it 桌面.  Returning the profile root when both lookups failed used to
+    install the whole app into ``C:\\Users\\<user>\\MoonEclipse``.
+    """
+
+    for candidate in _desktop_candidates():
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            continue
+    # Nothing resolved: use the conventional path; the install creates it.
+    return Path.home() / "Desktop"
 
 
 def _pointer_root() -> Path | None:
@@ -604,6 +650,7 @@ class InstallerWindow:
             with completed_lock:
                 done_bytes = completed
             self.events.put(("bytes", max(done_bytes, total)))
+            self.events.put(("stage", "正在安装已下载的文件…"))
             app_root.mkdir(parents=True, exist_ok=True)
 
             # Only verified staging output reaches the live folder.  The chain
@@ -663,6 +710,10 @@ class InstallerWindow:
                     self.progress_value = float(value) / float(getattr(self, "_total_bytes", 1))
                     self.progress.configure(value=value)
                     self._paint_eclipse(self.progress_value)
+                elif kind == "stage":
+                    # The download is over but the install still runs: without a
+                    # stage line the label froze on 正在下载更新安装包.
+                    self.status.configure(text=str(value))
                 elif kind == "done":
                     self.running = False
                     self.install.state(["!disabled"])
