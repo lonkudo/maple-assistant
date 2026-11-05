@@ -83,9 +83,12 @@ MIRRORS_FILE = "installer_mirrors.json"
 # only cost the fallback - never a wrong install.  Update this URL per release,
 # or override it with installer_mirrors.json next to the installer.
 DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
-    # The operator's VIP upload (classic lanzou share).  The manifest's own
-    # VERSION gate still decides: a share holding another version is rejected
-    # before anything is extracted, and the next source is tried.
+    # QQ 邮箱文件中转站 upload.  The manifest's own VERSION gate still decides:
+    # a share holding another version is rejected before anything is extracted,
+    # and the next source is tried.  中转站 links expire, which is exactly why
+    # the next two are kept.
+    "https://wx.mail.qq.com/s?k=oSi9hR7qY0Qlu10Gcb",
+    # The operator's VIP upload (classic lanzou share).
     "https://wwblt.lanzoup.com/iiLxV4esmo5i",
     "https://www.ilanzou.com/s/1DnyKoclO?code=ru3v",
 )

@@ -46,7 +46,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
@@ -69,6 +69,9 @@ SHARE_HOSTS = ("ilanzou.com", "www.ilanzou.com")
 CLASSIC_HOSTS = (
     "lanzoup.com", "lanzoux.com", "lanzoui.com", "lanzouw.com", "lanzou.com",
 )
+# QQ 邮箱文件中转 share hosts.
+QQ_HOSTS = ("mail.qq.com", "wx.mail.qq.com", "iwx.mail.qq.com")
+QQ_SHARE_URL = "https://wx.mail.qq.com/s"
 # 123云盘 share hosts; every one of them is answered by the same API host.
 PAN_HOSTS = (
     "123pan.com", "123684.com", "123865.com", "123912.com", "123pan.cn",
@@ -107,6 +110,9 @@ class ShareFile:
     file_id: str
     user_id: str
     password: Optional[str] = None
+    # Extra request headers the CDN requires on every connection (QQ 文件中转
+    # rejects ranges without its mail5k cookie).
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- crypto
@@ -518,6 +524,76 @@ def _resolve_pan(share_key: str, code: Optional[str]) -> ShareFile:
     )
 
 
+def _resolve_qq(key: str, share_url: str, code: Optional[str]) -> ShareFile:
+    """QQ 邮箱文件中转 share -> CDN URL plus the cookie its ranges need."""
+
+    status, raw, info = _http(
+        "wx.mail.qq.com", "/s", method="POST",
+        body=f"f=json&k={key}".encode("utf-8"),
+        referer=share_url,
+        extra={"Accept": "application/json, text/plain, */*"},
+    )
+    try:
+        envelope = json.loads(raw.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise LanzouError(f"QQ 中转站接口返回非 JSON (HTTP {status})") from exc
+    head = envelope.get("head") or {}
+    if int(head.get("ret", -1)) != 0:
+        raise LanzouError(f"QQ 中转站: {head.get('msg') or head.get('ret')}")
+    body = envelope.get("body") or {}
+    direct = str(body.get("url") or "").replace("\\x26", "&")
+    if not direct:
+        raise LanzouError("QQ 中转站没有返回下载地址")
+    name = str(body.get("name") or f"{key}.zip")
+    size = int(body.get("size") or 0)
+
+    # The share URL itself only redirects; the CDN link comes with a cookie
+    # that every range request has to repeat.
+    parts = urlsplit(direct)
+    status, _raw, info = _http(
+        parts.hostname or "", (parts.path or "/") + (f"?{parts.query}" if parts.query else ""),
+        referer=share_url,
+    )
+    cookie = ""
+    for chunk in (info["set_cookie"] or "").split(","):
+        pair = chunk.strip().split(";")[0]
+        if pair.startswith("mail5k="):
+            cookie = pair
+            break
+    if status in (301, 302, 303, 307, 308) and info["location"]:
+        cdn = urljoin(direct, info["location"])
+    elif status in (200, 206):
+        cdn = direct
+    else:
+        raise LanzouError(f"QQ 中转站下载页返回 HTTP {status}")
+
+    headers = {"Referer": share_url, "Accept": "*/*"}
+    if cookie:
+        headers["Cookie"] = cookie
+    else:
+        LOG.warning("qq: no mail5k cookie in the redirect; ranges may be refused")
+
+    # Probe the CDN for the authoritative size (and prove ranges work).
+    target = urlsplit(cdn)
+    _status, _raw, probe = _http(
+        target.hostname or "",
+        (target.path or "/") + (f"?{target.query}" if target.query else ""),
+        referer=share_url, extra={**headers, "Range": "bytes=0-0"}, read_limit=4096,
+    )
+    total = _range_total(probe["content_range"])
+    if not total and probe["content_length"].isdigit():
+        total = int(probe["content_length"])
+    LOG.info(
+        "qq: 文件中转 %s -> %s (%.1f MB, cookie %s)",
+        key, target.hostname, (total or size) / 1024 / 1024,
+        "yes" if cookie else "MISSING",
+    )
+    return ShareFile(
+        name=name, size=total or size, direct_url=cdn, file_id=key,
+        user_id="", password=code, headers=headers,
+    )
+
+
 def _resolve_classic(host: str, share_id: str, code: Optional[str]) -> ShareFile:
     """Classic share (lanzoup.com/<id>) -> direct CDN URL."""
 
@@ -611,6 +687,13 @@ def parse_share_url(url: str) -> tuple[str, str, str, Optional[str]]:
             raise LanzouError(f"链接中没有分享标识: {url}")
         code = (parse_qs(parts.query).get("pwd") or [None])[0]
         return "classic", host, segments[0], (code.strip() or None) if code else None
+    if any(host == known or host.endswith("." + known) for known in QQ_HOSTS):
+        query = parse_qs(parts.query)
+        key = (query.get("k") or query.get("key") or [""])[0].strip()
+        if not key:
+            raise LanzouError(f"QQ 中转站链接缺少 k 参数: {url}")
+        code = (query.get("code") or [None])[0]
+        return "qq", host, key, (code.strip() or None) if code else None
     if any(host == known or host.endswith("." + known) for known in PAN_HOSTS):
         # https://www.123pan.com/s/<shareKey> (the "s" segment is optional in
         # some of the mirror hosts)
@@ -636,6 +719,8 @@ def resolve(
         return _resolve_classic(host, share_key, code)
     if kind == "pan":
         return _resolve_pan(share_key, code)
+    if kind == "qq":
+        return _resolve_qq(share_key, share_url, code)
     uuid = _new_uuid()
     ts = encode_hex(str(int(time.time() * 1000)))
 
@@ -721,7 +806,7 @@ def resolve(
 # parallel ranges are what make it fast; escalation finds the machine's ceiling.
 READ_SIZE = 1024 * 1024
 PARTS_BASE = 8
-PARTS_MAX = 16
+PARTS_MAX = 24
 MIN_RANGE = 1024 * 1024
 SLOW_RATE_BPS = 8 * 1024 * 1024
 WAVE_MIN_BYTES = 8 * 1024 * 1024
@@ -741,10 +826,30 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _download_headers(
+    host: str, extra: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+    """Headers for a byte-range request.
+
+    A source that supplied ``headers`` (QQ 中转站: Referer + mail5k cookie) uses
+    exactly those plus a neutral Accept; the lanzou defaults only apply when the
+    source asked for nothing.
+    """
+
+    if extra:
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+        headers.update(extra)
+        return headers
+    headers = _headers(host)
+    headers["Accept"] = "*/*"
+    return headers
+
+
 def _range_into(
     url: str, start: int, end: int, target: Path,
     progress: Optional[Callable[[int], None]], failures: list,
     stop: Optional[threading.Event] = None,
+    headers: Optional[dict[str, str]] = None,
 ) -> None:
     """Write ``bytes=start-end`` of ``url`` into ``target`` at that offset."""
 
@@ -756,7 +861,7 @@ def _range_into(
             connection = _connection(host, 30.0)
             try:
                 connection.request("GET", path, headers={
-                    **_headers(host), "Range": f"bytes={start}-{end}",
+                    **_download_headers(host, headers), "Range": f"bytes={start}-{end}",
                 })
                 response = connection.getresponse()
                 if response.status not in (200, 206):
@@ -795,7 +900,7 @@ def _range_into(
 def _parallel_ranges(
     url: str, target: Path, total: int, *,
     parts: Optional[int], progress: Optional[Callable[[int], None]],
-    min_rate_bps: int = 0,
+    min_rate_bps: int = 0, headers: Optional[dict[str, str]] = None,
 ) -> None:
     """Fill ``target`` from ``url`` in slices, escalating when a slice is slow."""
 
@@ -858,7 +963,7 @@ def _parallel_ranges(
             range_end = min(slice_end, range_start + chunk - 1)
             thread = threading.Thread(
                 target=_range_into,
-                args=(url, range_start, range_end, target, counted, failures, stop),
+                args=(url, range_start, range_end, target, counted, failures, stop, headers),
                 daemon=True,
             )
             thread.start()
@@ -892,7 +997,9 @@ def _parallel_ranges(
             )
 
 
-def _probe_direct_url(url: str, timeout: float = 30.0) -> tuple[bool, int]:
+def _probe_direct_url(
+    url: str, timeout: float = 30.0, headers: Optional[dict[str, str]] = None,
+) -> tuple[bool, int]:
     """Return ``(range_supported, total_bytes)`` for the CDN URL.
 
     Lanzou's ``fileSize`` is expressed in whole KB and is rounded UP, so it can
@@ -908,7 +1015,7 @@ def _probe_direct_url(url: str, timeout: float = 30.0) -> tuple[bool, int]:
     connection = _connection(host, timeout)
     try:
         connection.request("GET", path, headers={
-            **_headers(host), "Range": "bytes=0-0",
+            **_download_headers(host, headers), "Range": "bytes=0-0",
         })
         response = connection.getresponse()
         status = response.status
@@ -932,7 +1039,7 @@ def _probe_direct_url(url: str, timeout: float = 30.0) -> tuple[bool, int]:
 
 def _stream_download(
     url: str, target: Path, *, progress: Optional[Callable[[int], None]] = None,
-    timeout: float = 30.0,
+    timeout: float = 30.0, headers: Optional[dict[str, str]] = None,
 ) -> int:
     """Single-connection download, used when the CDN ignores Range."""
 
@@ -942,7 +1049,7 @@ def _stream_download(
     connection = _connection(host, timeout)
     written = 0
     try:
-        connection.request("GET", path, headers=_headers(host))
+        connection.request("GET", path, headers=_download_headers(host, headers))
         response = connection.getresponse()
         if response.status >= 400:
             raise LanzouError(f"CDN 返回 HTTP {response.status}")
@@ -976,7 +1083,7 @@ def download(
 
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    range_supported, total = _probe_direct_url(share.direct_url)
+    range_supported, total = _probe_direct_url(share.direct_url, headers=share.headers)
     if expected_size and total and abs(total - int(expected_size)) > 4096:
         LOG.warning(
             "lanzou: the CDN reports %d bytes while the share listed %d",
@@ -988,7 +1095,7 @@ def download(
         if range_supported and total > 0:
             _parallel_ranges(
                 share.direct_url, target, total, parts=parts, progress=progress,
-                min_rate_bps=min_rate_bps,
+                min_rate_bps=min_rate_bps, headers=share.headers,
             )
         else:
             LOG.info("lanzou: the CDN does not support Range; using one stream")
@@ -996,7 +1103,10 @@ def download(
                 prefix="lanzou-", dir=str(target.parent)
             ) as tmp:
                 assembled = Path(tmp) / "assembled.bin"
-                _stream_download(share.direct_url, assembled, progress=progress)
+                _stream_download(
+                    share.direct_url, assembled, progress=progress,
+                    headers=share.headers,
+                )
                 os.replace(assembled, target)
 
         elapsed = max(1e-6, time.monotonic() - started)
