@@ -190,6 +190,30 @@ def _desktop_directory() -> Path:
     return Path.home() / "Desktop"
 
 
+def _configure_logging() -> Path:
+    """Log to a file beside the install pointer and keep it small."""
+
+    directory = POINTER_FILE.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return POINTER_FILE
+    target = directory / "installer.log"
+    try:
+        if target.is_file() and target.stat().st_size > 2 * 1024 * 1024:
+            target.replace(directory / "installer.old.log")
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(target, encoding="utf-8")],
+        force=True,
+    )
+    logging.info("installer: start, executable %s", sys.argv[0])
+    return target
+
+
 def _pointer_root() -> Path | None:
     try:
         payload = json.loads(POINTER_FILE.read_text(encoding="utf-8"))
@@ -816,4 +840,5 @@ class InstallerWindow:
 
 
 if __name__ == "__main__":
+    _configure_logging()
     InstallerWindow().run()
