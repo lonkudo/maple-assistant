@@ -95,7 +95,16 @@ DEFAULT_FOLDER_NAME = "MoonEclipse"
 # extraction and the file move - and a failed source kept its bytes, so a
 # fallback download ran behind a bar that was already full.
 PROGRESS_UNITS = 1000
-PROGRESS_DOWNLOAD_SHARE = 0.8
+PROGRESS_DOWNLOAD_SHARE = 0.62
+# Every phase after the download walks a countable list of files, so each one
+# owns a slice of the bar instead of leaving it parked at "done" while 1,000+
+# hashes are computed.
+PROGRESS_PHASES: dict[str, tuple[float, float]] = {
+    "解压": (0.62, 0.72),
+    "校验": (0.72, 0.85),
+    "安装": (0.85, 1.0),
+}
+PROGRESS_LABELS = {"解压": "正在解压安装包", "校验": "正在校验文件", "安装": "正在安装文件"}
 
 
 def _desktop_candidates() -> list[Path]:
@@ -353,6 +362,7 @@ def _download_planned_files(
     per_file: bool = True,
     on_total: Any = None,
     on_stage: Any = None,
+    on_files: Any = None,
 ) -> int:
     """Fetch every planned file into ``staging``; returns the per-file count used.
 
@@ -412,6 +422,10 @@ def _download_planned_files(
         if on_stage is not None:
             on_stage(text_value)
 
+    def files(phase: str, done: int, total: int) -> None:
+        if on_files is not None:
+            on_files(phase, done, total)
+
     # 1) Whole package from a share link.
     if want_archive and shares and lanzou_download is not None:
         archive = staging / "bundle.zip"
@@ -435,13 +449,22 @@ def _download_planned_files(
                     # hash is the integrity proof, no per-file work is needed.
                     archive_trusted = True
                 stage("正在解压安装包…")
-                _extract_bundle(archive, staging)
+                _extract_bundle(archive, staging, on_entry=lambda done, total: files("解压", done, total))
                 archive.unlink(missing_ok=True)
                 if archive_trusted:
                     remaining = []
                 else:
+                    stage("正在校验文件…")
                     with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
-                        verdicts = list(pool.map(lambda entry: matches(*entry), remaining))
+                        pending = {
+                            pool.submit(matches, item, relative): index
+                            for index, (item, relative) in enumerate(remaining)
+                        }
+                        verdicts = [False] * len(remaining)
+                        for count, future in enumerate(as_completed(pending), start=1):
+                            verdicts[pending[future]] = bool(future.result())
+                            if count % 16 == 0 or count == len(remaining):
+                                files("校验", count, len(remaining))
                     satisfied = sum(1 for ok in verdicts if ok)
                     logging.info(
                         "installer: whole package %s from the share "
@@ -475,7 +498,7 @@ def _download_planned_files(
                 or _sha256(archive) != str(bundle.get("sha256", ""))):
             raise RuntimeError("安装包整包校验失败。")
         stage("正在解压安装包…")
-        _extract_bundle(archive, staging)
+        _extract_bundle(archive, staging, on_entry=lambda done, total: files("解压", done, total))
         archive.unlink(missing_ok=True)
         archive_trusted = True
         remaining = []
@@ -513,14 +536,13 @@ def _download_planned_files(
     return fetched_per_file
 
 
-def _extract_bundle(archive: Path, target_root: Path) -> None:
+def _extract_bundle(archive: Path, target_root: Path, on_entry: Any = None) -> None:
     """Extract a version archive, refusing any path that escapes the root."""
 
     root = target_root.resolve()
     with zipfile.ZipFile(archive) as bundle:
-        for info in bundle.infolist():
-            if info.is_dir():
-                continue
+        members = [info for info in bundle.infolist() if not info.is_dir()]
+        for index, info in enumerate(members, start=1):
             try:
                 relative = _safe_path(info.filename)
             except ValueError:
@@ -531,6 +553,8 @@ def _extract_bundle(archive: Path, target_root: Path) -> None:
             destination.parent.mkdir(parents=True, exist_ok=True)
             with bundle.open(info) as source, destination.open("wb") as output:
                 shutil.copyfileobj(source, output)
+            if on_entry is not None and (index % 32 == 0 or index == len(members)):
+                on_entry(index, len(members))
 
 
 def _load_local_manifest(root: Path) -> dict[str, Any]:
@@ -699,6 +723,8 @@ class InstallerWindow:
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
+                on_files=lambda phase, done, total:
+                    self.events.put(("files", (str(phase), int(done), int(total)))),
             )
             if fetched_per_file:
                 logging.info(
@@ -726,7 +752,7 @@ class InstallerWindow:
                     moved += 1
                     current = moved
                 if current % 25 == 0 or current == len(planned):
-                    self.events.put(("files", (current, len(planned))))
+                    self.events.put(("files", ("安装", current, len(planned))))
 
             if planned:
                 with ThreadPoolExecutor(
@@ -808,13 +834,14 @@ class InstallerWindow:
                     self._stage_text = str(value)
                     self.status.configure(text=self._stage_text)
                 elif kind == "files":
-                    done, total = value
+                    phase, done, total = value
                     total = max(1, int(total))
-                    self._set_progress(
-                        PROGRESS_DOWNLOAD_SHARE
-                        + (1.0 - PROGRESS_DOWNLOAD_SHARE) * min(1.0, done / total)
+                    low, high = PROGRESS_PHASES.get(
+                        str(phase), (PROGRESS_DOWNLOAD_SHARE, 1.0)
                     )
-                    self.status.configure(text=f"正在安装文件 {done}/{total}…")
+                    self._set_progress(low + (high - low) * min(1.0, done / total))
+                    label = PROGRESS_LABELS.get(str(phase), "正在处理文件")
+                    self.status.configure(text=f"{label} {done}/{total}…")
                 elif kind == "done":
                     self.running = False
                     self.install.state(["!disabled"])

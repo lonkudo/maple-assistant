@@ -292,6 +292,16 @@ def resolve(
 # --------------------------------------------------------------------------- download
 
 
+# Download tuning.  The share CDN limits each connection, not the account, so
+# parallel ranges are what make it fast; escalation finds the machine's ceiling.
+READ_SIZE = 1024 * 1024
+PARTS_BASE = 8
+PARTS_MAX = 16
+MIN_RANGE = 1024 * 1024
+SLOW_RATE_BPS = 8 * 1024 * 1024
+WAVE_MIN_BYTES = 8 * 1024 * 1024
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -300,46 +310,104 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _range_part(
-    url: str, index: int, start: int, end: int, folder: Path,
-    results: list, progress: Optional[Callable[[int], None]],
+def _range_into(
+    url: str, start: int, end: int, target: Path,
+    progress: Optional[Callable[[int], None]], failures: list,
 ) -> None:
-    host = urlsplit(url).hostname or ""
+    """Write ``bytes=start-end`` of ``url`` into ``target`` at that offset."""
+
     parts = urlsplit(url)
+    host = parts.hostname or ""
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-    target = folder / f"part{index:03d}"
-    written = 0
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             connection = _connection(host, 30.0)
-            connection.request("GET", path, headers={
-                **_headers(host), "Range": f"bytes={start}-{end}",
-            })
-            response = connection.getresponse()
-            if response.status not in (200, 206):
-                raise LanzouError(f"CDN 返回 HTTP {response.status}")
-            with target.open("wb") as handle:
+            try:
+                connection.request("GET", path, headers={
+                    **_headers(host), "Range": f"bytes={start}-{end}",
+                })
+                response = connection.getresponse()
+                if response.status not in (200, 206):
+                    raise LanzouError(f"CDN 返回 HTTP {response.status}")
                 remaining = end - start + 1
-                while remaining > 0:
-                    chunk = response.read(min(256 * 1024, remaining))
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-                    remaining -= len(chunk)
-                    written += len(chunk)
-                    if progress is not None:
-                        progress(len(chunk))
-            connection.close()
+                # One handle per range, seeked to its own offset: the parts never
+                # see each other, so no lock is needed and no temp file is copied.
+                with target.open("r+b") as handle:
+                    handle.seek(start)
+                    while remaining > 0:
+                        chunk = response.read(min(READ_SIZE, remaining))
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        remaining -= len(chunk)
+                        if progress is not None:
+                            progress(len(chunk))
+            finally:
+                connection.close()
             if remaining == 0:
-                results[index] = target
                 return
             raise LanzouError("分段下载不完整")
         except Exception as exc:  # noqa: BLE001 - retried below
             if attempt == RETRY_ATTEMPTS:
-                results[index] = None
-                LOG.warning("lanzou: part %d failed: %s", index, exc)
+                failures.append(f"{start}-{end}: {exc}")
+                LOG.warning("lanzou: range %d-%d failed: %s", start, end, exc)
                 return
             time.sleep(RETRY_DELAY_SECONDS * attempt)
+
+
+def _parallel_ranges(
+    url: str, target: Path, total: int, *,
+    parts: Optional[int], progress: Optional[Callable[[int], None]],
+) -> None:
+    """Fill ``target`` from ``url`` in slices, escalating when a slice is slow."""
+
+    with target.open("wb") as handle:
+        handle.truncate(total)
+    streams = PARTS_BASE if parts is None else max(1, min(int(parts), PARTS_MAX))
+    slices = 1
+    if streams > 1 and total >= 3 * WAVE_MIN_BYTES:
+        slices = 3
+    elif streams > 1 and total >= WAVE_MIN_BYTES:
+        slices = 2
+    span = (total + slices - 1) // slices
+    for index in range(slices):
+        slice_start = index * span
+        slice_end = min(total - 1, slice_start + span - 1)
+        if slice_start > slice_end:
+            break
+        length = slice_end - slice_start + 1
+        count = max(1, min(streams, max(1, length // MIN_RANGE)))
+        chunk = (length + count - 1) // count
+        failures: list = []
+        threads = []
+        started = time.monotonic()
+        for slot in range(count):
+            range_start = slice_start + slot * chunk
+            if range_start > slice_end:
+                break
+            range_end = min(slice_end, range_start + chunk - 1)
+            thread = threading.Thread(
+                target=_range_into,
+                args=(url, range_start, range_end, target, progress, failures),
+                daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        if failures:
+            raise LanzouError(f"蓝奏分段下载失败：{failures[0]}")
+        elapsed = max(1e-6, time.monotonic() - started)
+        rate = length / elapsed
+        LOG.info(
+            "lanzou: slice %d/%d %.1f MB in %.1fs (%.1f MB/s, %d stream(s))",
+            index + 1, slices, length / 1024 / 1024, elapsed,
+            rate / 1024 / 1024, count,
+        )
+        if index + 1 < slices and rate < SLOW_RATE_BPS and streams < PARTS_MAX:
+            # This machine's per-connection ceiling is the limit: ask for more.
+            streams = min(PARTS_MAX, streams * 2)
+            LOG.info("lanzou: slow slice, raising to %d stream(s)", streams)
 
 
 def _probe_direct_url(url: str, timeout: float = 30.0) -> tuple[bool, int]:
@@ -414,7 +482,7 @@ def download(
     share: ShareFile, target: Path, *,
     expected_sha256: Optional[str] = None,
     expected_size: Optional[int] = None,
-    parts: int = 8,
+    parts: Optional[int] = None,
     progress: Optional[Callable[[int], None]] = None,
 ) -> Path:
     """Download the share into ``target`` (parallel ranges, then verify).
@@ -432,53 +500,41 @@ def download(
             total, int(expected_size),
         )
 
-    with tempfile.TemporaryDirectory(prefix="lanzou-", dir=str(target.parent)) as tmp:
-        folder = Path(tmp)
-        assembled = folder / "assembled.bin"
-        started = time.monotonic()
+    started = time.monotonic()
+    try:
         if range_supported and total > 0:
-            parts = max(1, min(int(parts), 16))
-            chunk = (total + parts - 1) // parts
-            results: list = [None] * parts
-            threads = []
-            for index in range(parts):
-                start = index * chunk
-                end = min(total - 1, start + chunk - 1)
-                thread = threading.Thread(
-                    target=_range_part,
-                    args=(share.direct_url, index, start, end, folder, results, progress),
-                    daemon=True,
-                )
-                thread.start()
-                threads.append(thread)
-            for thread in threads:
-                thread.join()
-            if any(result is None for result in results):
-                raise LanzouError("蓝奏分段下载失败（某个分段多次重试后仍失败）")
-            with assembled.open("wb") as out:
-                for index in range(parts):
-                    out.write(results[index].read_bytes())
+            _parallel_ranges(
+                share.direct_url, target, total, parts=parts, progress=progress,
+            )
         else:
             LOG.info("lanzou: the CDN does not support Range; using one stream")
-            _stream_download(share.direct_url, assembled, progress=progress)
+            with tempfile.TemporaryDirectory(
+                prefix="lanzou-", dir=str(target.parent)
+            ) as tmp:
+                assembled = Path(tmp) / "assembled.bin"
+                _stream_download(share.direct_url, assembled, progress=progress)
+                os.replace(assembled, target)
 
         elapsed = max(1e-6, time.monotonic() - started)
-        got = assembled.stat().st_size
+        got = target.stat().st_size
         LOG.info(
-            "lanzou: downloaded %.1f MB in %.1fs (%.1f MB/s, %s parts)",
+            "lanzou: downloaded %.1f MB in %.1fs (%.1f MB/s, %s)",
             got / 1024 / 1024, elapsed, got / 1024 / 1024 / elapsed,
-            parts if range_supported else "single",
+            "parallel ranges" if range_supported else "single stream",
         )
         if total and got != total:
             raise LanzouError(f"蓝奏下载大小不符: {got} != {total}")
         if expected_sha256:
-            digest = file_sha256(assembled)
+            digest = file_sha256(target)
             if digest.lower() != expected_sha256.strip().lower():
                 raise LanzouError(
                     f"蓝奏文件 SHA-256 不符（期望 {expected_sha256[:16]}…，"
                     f"实得 {digest[:16]}…）；已拒绝安装"
                 )
-        os.replace(assembled, target)
+    except BaseException:
+        # A partial file at the target path must never look like a download.
+        target.unlink(missing_ok=True)
+        raise
     return target
 
 
@@ -492,7 +548,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--password", default=None, help="提取码 (overrides ?code=)")
     parser.add_argument("--out", default=None, help="download here (default: name)")
     parser.add_argument("--sha256", default=None, help="expected SHA-256 to verify")
-    parser.add_argument("--parts", type=int, default=8)
+    parser.add_argument("--parts", type=int, default=None)
     parser.add_argument("--resolve-only", action="store_true")
     args = parser.parse_args(argv)
 
