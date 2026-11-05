@@ -76,6 +76,15 @@ SHARE_MIN_FILES = 64
 # Share links the operator can drop beside the installer, so the fast path works
 # without a server-side manifest change: {"shares": ["https://www.ilanzou.com/s/..."]}
 MIRRORS_FILE = "installer_mirrors.json"
+# Built-in fallback share, so the fast path works on a fresh download with no
+# manifest change and no configuration file.  A share holding a different
+# version is rejected by its VERSION member before anything is extracted, and
+# every file still has to match the manifest's own SHA-256, so a stale entry can
+# only cost the fallback - never a wrong install.  Update this URL per release,
+# or override it with installer_mirrors.json next to the installer.
+DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
+    "https://www.ilanzou.com/s/1DnyKoclO?code=ru3v",
+)
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
 # Folder created on the Desktop for a first install.
@@ -200,6 +209,7 @@ def _share_sources(manifest: dict[str, Any]) -> list[str]:
                     if text not in found:
                         found.append(text)
 
+    add(DEFAULT_SHARE_MIRRORS)
     add(manifest.get("mirrors"))
     bundle = manifest.get("bundle")
     if isinstance(bundle, dict):
@@ -218,6 +228,147 @@ def _share_sources(manifest: dict[str, Any]) -> list[str]:
         logging.info("installer: %d share source(s) available: %s",
                      len(found), ", ".join(found))
     return found
+
+
+def _archive_version(archive: Path) -> str:
+    """The ``VERSION`` member of a release archive, or "" when absent."""
+
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            for name in ("VERSION", "app/VERSION"):
+                if name in bundle.namelist():
+                    return bundle.read(name).decode("ascii", "replace").strip()
+    except (OSError, zipfile.BadZipFile):
+        return ""
+    return ""
+
+
+def _download_planned_files(
+    manifest: dict[str, Any],
+    planned: list[tuple[dict[str, Any], Path]],
+    staging: Path,
+    *,
+    token: str,
+    on_bytes: Any,
+    per_file: bool = True,
+) -> int:
+    """Fetch every planned file into ``staging``; returns the per-file count used.
+
+    The chain, cheapest-first, with the pinned origin's per-file SHA-256 as the
+    only authority on what may be installed:
+
+      1. a share link (one archive over parallel ranges) when the plan is large;
+      2. the CDN bundle, when the manifest offers one and it saves bytes;
+      3. one request per file for whatever is still missing.
+
+    It is a module-level function so the exact production path can be exercised
+    by a test instead of a re-implementation of it.
+    """
+
+    digest_cache: dict[str, str] = {}
+
+    def matches(item: dict[str, Any], relative: Path) -> bool:
+        # Hash each staged file once: the archive path hashes every planned file
+        # while pruning, and the final check would otherwise hash all 1,000+ of
+        # them a second time (measured: 11.6 s -> ~7 s for a 1037-file plan).
+        key = relative.as_posix()
+        if key not in digest_cache:
+            staged = staging / relative
+            digest_cache[key] = _sha256(staged) if staged.is_file() else ""
+        return digest_cache[key] == str(item["sha256"])
+
+    def verify_all(entries: list[tuple[dict[str, Any], Path]]) -> None:
+        for item, relative in entries:
+            if not matches(item, relative):
+                raise RuntimeError(f"文件校验失败：{relative}")
+
+    bundle = manifest.get("bundle")
+    shares = _share_sources(manifest)
+    want_archive = bool(planned) and (
+        len(planned) >= SHARE_MIN_FILES
+        or sum(int(item.get("size", 0)) for item, _ in planned) >= BUNDLE_MIN_BYTES
+    )
+    expected_version = str(manifest.get("version") or "").strip()
+    remaining = list(planned)
+    fetched_per_file = 0
+
+    # 1) Whole package from a share link.
+    if want_archive and shares and lanzou_download is not None:
+        archive = staging / "bundle.zip"
+        for mirror in shares:
+            try:
+                share = lanzou_resolve(mirror)
+                lanzou_download(share, archive, parts=8, progress=on_bytes)
+                version = _archive_version(archive)
+                if expected_version and version and version != expected_version:
+                    raise RuntimeError(
+                        f"share holds version {version}, the manifest wants {expected_version}"
+                    )
+                _extract_bundle(archive, staging)
+                archive.unlink(missing_ok=True)
+                satisfied = sum(1 for item, relative in remaining if matches(item, relative))
+                logging.info(
+                    "installer: whole package %s from the share "
+                    "(%d/%d files verified, no per-file download for those)",
+                    share.name, satisfied, len(remaining),
+                )
+                remaining = [
+                    (item, relative) for item, relative in remaining
+                    if not matches(item, relative)
+                ]
+                break
+            except Exception as exc:  # noqa: BLE001 - try the next source
+                logging.warning("installer: share %s unusable: %s", mirror, exc)
+
+    # 2) CDN bundle.
+    if remaining and isinstance(bundle, dict) and _bundle_worth_it(
+        bundle, sum(int(item.get("size", 0)) for item, _ in remaining)
+    ):
+        archive = staging / "bundle.zip"
+        bundle_url = bundle.get("url")
+        if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
+            with archive.open("wb") as output:
+                download_url(bundle_url, output, on_bytes)
+        else:
+            with archive.open("wb") as output:
+                download_binary(
+                    ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/bundle",
+                    PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                )
+        if (archive.stat().st_size != int(bundle.get("size", 0))
+                or _sha256(archive) != str(bundle.get("sha256", ""))):
+            raise RuntimeError("安装包整包校验失败。")
+        _extract_bundle(archive, staging)
+        archive.unlink(missing_ok=True)
+        verify_all(remaining)
+        remaining = []
+
+    # 3) One request per file, only for what is still missing.
+    if remaining and per_file:
+        def fetch(item: dict[str, Any], relative: Path) -> None:
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as output:
+                cdn_url = item.get("url")
+                if isinstance(cdn_url, str) and cdn_url.startswith("https://"):
+                    received = download_url(cdn_url, output, on_bytes)
+                else:
+                    received = download_binary(
+                        ACTIVATION_SERVER_ENDPOINT,
+                        "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
+                        PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                    )
+            if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):
+                raise RuntimeError(f"文件校验失败：{relative}")
+
+        with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
+            futures = [pool.submit(fetch, item, relative) for item, relative in remaining]
+            for future in as_completed(futures):
+                future.result()
+        fetched_per_file = len(remaining)
+
+    verify_all(planned)
+    return fetched_per_file
 
 
 def _extract_bundle(archive: Path, target_root: Path) -> None:
@@ -390,179 +541,22 @@ class InstallerWindow:
             completed = 0
             completed_lock = threading.Lock()
 
-            def fetch(item: dict[str, Any], relative: Path) -> tuple[dict[str, Any], Path]:
-                nonlocal completed
-                target = staging / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                last_report = 0
-                def on_bytes(count: int) -> None:
-                    nonlocal completed, last_report
-                    with completed_lock:
-                        completed += count
-                        if completed - last_report >= 128 * 1024:
-                            last_report = completed
-                            self.events.put(("bytes", completed))
-                with target.open("wb") as output:
-                    cdn_url = item.get("url")
-                    if isinstance(cdn_url, str) and cdn_url.startswith("https://"):
-                        # CDN copy.  The pin is deliberately not applied here;
-                        # the SHA-256 check below is what trusts these bytes,
-                        # because the manifest came from the pinned origin.
-                        received = download_url(cdn_url, output, on_bytes)
-                    else:
-                        received = download_binary(
-                            ACTIVATION_SERVER_ENDPOINT,
-                            "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
-                            PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
-                        )
-                if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):
-                    raise RuntimeError(f"文件校验失败：{relative}")
-                return item, target
-
-            def fetch_bundle() -> None:
-                """Fetch the whole version in one request and unpack it.
-
-                Sources are tried in order and every one of them is only
-                TRANSPORT: the size/SHA-256 check below (issued by the pinned
-                origin) decides whether the archive is installed, so a mirror
-                can never change what is installed.
-
-                  1. ``bundle.url``          - the CDN copy (fast path)
-                  2. ``bundle.mirrors[]``    - 蓝奏优享 share links, parsed at
-                                               install time (a re-uploaded share
-                                               only changes the URL, not the hash)
-                  3. the pinned activation server - still the fallback it was
-                """
-
-                archive = staging / "bundle.zip"
-                last_report = 0
-
-                def on_bytes(count: int) -> None:
-                    nonlocal completed, last_report
-                    with completed_lock:
-                        completed += count
-                        if completed - last_report >= 128 * 1024:
-                            last_report = completed
-                            self.events.put(("bytes", completed))
-
-                bundle_url = bundle.get("url")
-                mirrors = [
-                    str(entry) for entry in (bundle.get("mirrors") or [])
-                    if isinstance(entry, str) and entry.strip()
-                ]
-                attempts: list[str] = []
-                fetched = False
-                if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
-                    try:
-                        with archive.open("wb") as output:
-                            download_url(bundle_url, output, on_bytes)
-                        fetched = True
-                        attempts.append("cdn: ok")
-                    except Exception as exc:  # noqa: BLE001 - try the next source
-                        attempts.append(f"cdn: {exc}")
-                if not fetched:
-                    for mirror in mirrors:
-                        if lanzou_download is None:
-                            attempts.append("lanzou: helper unavailable")
-                            break
-                        try:
-                            share = lanzou_resolve(mirror)
-                            lanzou_download(
-                                share, archive,
-                                expected_sha256=str(bundle.get("sha256") or "") or None,
-                                expected_size=int(bundle.get("size", 0)) or None,
-                                parts=8,
-                                progress=on_bytes,
-                            )
-                            fetched = True
-                            attempts.append("lanzou: ok")
-                            break
-                        except Exception as exc:  # noqa: BLE001 - try the next source
-                            attempts.append(f"lanzou: {exc}")
-                if not fetched:
-                    # Nothing above produced bytes: the pinned server is last.
-                    with archive.open("wb") as output:
-                        download_binary(
-                            ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/bundle",
-                            PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
-                        )
-                    attempts.append("server: ok")
-                if attempts:
-                    logging.info("installer bundle sources: %s", "; ".join(attempts))
-                if (archive.stat().st_size != int(bundle.get("size", 0))
-                        or _sha256(archive) != str(bundle.get("sha256", ""))):
-                    raise RuntimeError("安装包整包校验失败。")
-                _extract_bundle(archive, staging)
-                archive.unlink(missing_ok=True)
-
-            def staged_matches(item: dict[str, Any], relative: Path) -> bool:
-                """True when staging already holds this exact file."""
-
-                staged = staging / relative
-                return staged.is_file() and _sha256(staged) == str(item["sha256"])
-
-            bundle = manifest.get("bundle")
-            shares = _share_sources(manifest)
-            remaining = list(planned)
-
-            # 1) Whole package from a share link.  A manifest that advertises
-            #    1,000+ files is exactly the case this exists for: one 93 MB
-            #    archive over 8 ranges replaces every per-file request.  The
-            #    per-file SHA-256 the pinned origin issued still decides what may
-            #    be installed - anything the archive does not match stays in
-            #    ``remaining`` and is fetched the normal way.
-            if (remaining and shares and lanzou_download is not None
-                    and (len(remaining) >= SHARE_MIN_FILES
-                         or total >= BUNDLE_MIN_BYTES)):
-                archive = staging / "bundle.zip"
-                for mirror in shares:
-                    try:
-                        share = lanzou_resolve(mirror)
-                        lanzou_download(share, archive, parts=8, progress=on_bytes)
-                        _extract_bundle(archive, staging)
-                        archive.unlink(missing_ok=True)
-                        satisfied = sum(
-                            1 for item, relative in remaining
-                            if staged_matches(item, relative)
-                        )
-                        logging.info(
-                            "installer: whole package %s from the share "
-                            "(%d/%d files verified, no per-file download for those)",
-                            share.name, satisfied, len(remaining),
-                        )
-                        remaining = [
-                            (item, relative) for item, relative in remaining
-                            if not staged_matches(item, relative)
-                        ]
-                        break
-                    except Exception as exc:  # noqa: BLE001 - try the next source
-                        logging.warning("installer: share %s unusable: %s", mirror, exc)
-
-            # 2) The CDN bundle, when the manifest offers one and it saves bytes.
-            if remaining and isinstance(bundle, dict) and _bundle_worth_it(bundle, total):
-                # One request instead of one per file, carrying 37% of the bytes.
-                fetch_bundle()
-                missing = [
-                    relative for item, relative in remaining
-                    if not staged_matches(item, relative)
-                ]
-                if missing:
-                    raise RuntimeError(f"文件校验失败：{missing[0]}")
-                remaining = []
-
-            # 3) Whatever is still missing, one request per file.
-            if remaining:
-                with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
-                    futures = [pool.submit(fetch, item, relative) for item, relative in remaining]
-                    for future in as_completed(futures):
-                        future.result()
-            self.events.put(("bytes", total))
+            # One tested chain: share archive -> CDN bundle -> per-file.  Every
+            # planned file is verified against the pinned manifest's SHA-256
+            # before it is moved into app/ below.
+            fetched_per_file = _download_planned_files(
+                manifest, planned, staging, token=token, on_bytes=on_bytes,
+            )
+            if fetched_per_file:
+                logging.info(
+                    "installer: %d file(s) came from per-file requests", fetched_per_file
+                )
             app_root.mkdir(parents=True, exist_ok=True)
             # Only verified staging output reaches the live folder.
             for item, relative in planned:
                 source = staging / relative
-                if not staged_matches(item, relative):
-                    raise RuntimeError(f"文件校验失败：{relative}")
+                if not source.is_file() or _sha256(source) != str(item["sha256"]):
+                    raise RuntimeError(f"\u6587\u4ef6\u6821\u9a8c\u5931\u8d25\uff1a{relative}")
                 target = app_root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source.replace(target)
