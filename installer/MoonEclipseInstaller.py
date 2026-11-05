@@ -9,6 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import queue
@@ -43,6 +44,16 @@ PIN_ROOT = next(
 
 from licensing import ACTIVATION_SERVER_ENDPOINT, machine_fingerprint_hash  # noqa: E402
 from pinned_tls import download_binary, download_url, post_json  # noqa: E402
+
+# 蓝奏优享 share parsing (share link -> CDN direct URL -> parallel Range download).
+# Optional: a manifest without ``bundle.mirrors`` behaves exactly as before, and
+# every byte still has to match the SHA-256 the pinned origin issued.
+try:  # noqa: WPS229 - the installer must start even without the helper
+    from lanzou_source import download as lanzou_download
+    from lanzou_source import resolve as lanzou_resolve
+except Exception:  # pragma: no cover - reported when a mirror is actually used
+    lanzou_download = None  # type: ignore[assignment]
+    lanzou_resolve = None  # type: ignore[assignment]
 
 
 INSTALL_MARKER = ".mooneclipse-install.json"
@@ -355,7 +366,19 @@ class InstallerWindow:
                 return item, target
 
             def fetch_bundle() -> None:
-                """Fetch the whole version in one request and unpack it."""
+                """Fetch the whole version in one request and unpack it.
+
+                Sources are tried in order and every one of them is only
+                TRANSPORT: the size/SHA-256 check below (issued by the pinned
+                origin) decides whether the archive is installed, so a mirror
+                can never change what is installed.
+
+                  1. ``bundle.url``          - the CDN copy (fast path)
+                  2. ``bundle.mirrors[]``    - 蓝奏优享 share links, parsed at
+                                               install time (a re-uploaded share
+                                               only changes the URL, not the hash)
+                  3. the pinned activation server - still the fallback it was
+                """
 
                 archive = staging / "bundle.zip"
                 last_report = 0
@@ -369,15 +392,53 @@ class InstallerWindow:
                             self.events.put(("bytes", completed))
 
                 bundle_url = bundle.get("url")
-                with archive.open("wb") as output:
-                    if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
-                        received = download_url(bundle_url, output, on_bytes)
-                    else:
-                        received = download_binary(
+                mirrors = [
+                    str(entry) for entry in (bundle.get("mirrors") or [])
+                    if isinstance(entry, str) and entry.strip()
+                ]
+                attempts: list[str] = []
+                fetched = False
+                if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
+                    try:
+                        with archive.open("wb") as output:
+                            download_url(bundle_url, output, on_bytes)
+                        fetched = True
+                        attempts.append("cdn: ok")
+                    except Exception as exc:  # noqa: BLE001 - try the next source
+                        attempts.append(f"cdn: {exc}")
+                if not fetched:
+                    for mirror in mirrors:
+                        if lanzou_download is None:
+                            attempts.append("lanzou: helper unavailable")
+                            break
+                        try:
+                            share = lanzou_resolve(mirror)
+                            lanzou_download(
+                                share, archive,
+                                expected_sha256=str(bundle.get("sha256") or "") or None,
+                                expected_size=int(bundle.get("size", 0)) or None,
+                                parts=8,
+                                progress=on_bytes,
+                            )
+                            fetched = True
+                            attempts.append("lanzou: ok")
+                            break
+                        except Exception as exc:  # noqa: BLE001 - try the next source
+                            attempts.append(f"lanzou: {exc}")
+                if not fetched:
+                    # Nothing above produced bytes: the pinned server is last.
+                    with archive.open("wb") as output:
+                        download_binary(
                             ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/bundle",
                             PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
                         )
-                if received != int(bundle.get("size", 0)) or _sha256(archive) != str(bundle.get("sha256", "")):
+                    attempts.append("server: ok")
+                if attempts:
+                    logging.info("installer bundle sources: %s", "; ".join(attempts))
+                if attempts:
+                    logging.info("installer bundle sources: %s", "; ".join(attempts))
+                if (archive.stat().st_size != int(bundle.get("size", 0))
+                        or _sha256(archive) != str(bundle.get("sha256", ""))):
                     raise RuntimeError("安装包整包校验失败。")
                 _extract_bundle(archive, staging)
                 archive.unlink(missing_ok=True)
