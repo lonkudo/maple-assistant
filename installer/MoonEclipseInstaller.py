@@ -89,6 +89,13 @@ DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
 LAUNCHER_ENCODING = "gbk"
 # Folder created on the Desktop for a first install.
 DEFAULT_FOLDER_NAME = "MoonEclipse"
+# One bar, two phases: the download fills the first PROGRESS_DOWNLOAD_SHARE by
+# real bytes and the install fills the rest by files actually moved into place.
+# Scaling the bar to the download size alone made it claim completion during
+# extraction and the file move - and a failed source kept its bytes, so a
+# fallback download ran behind a bar that was already full.
+PROGRESS_UNITS = 1000
+PROGRESS_DOWNLOAD_SHARE = 0.8
 
 
 def _desktop_candidates() -> list[Path]:
@@ -320,7 +327,8 @@ def _download_planned_files(
     token: str,
     on_bytes: Any,
     per_file: bool = True,
-    on_archive_size: Any = None,
+    on_total: Any = None,
+    on_stage: Any = None,
 ) -> int:
     """Fetch every planned file into ``staging``; returns the per-file count used.
 
@@ -331,8 +339,11 @@ def _download_planned_files(
       2. the CDN bundle, when the manifest offers one and it saves bytes;
       3. one request per file for whatever is still missing.
 
-    It is a module-level function so the exact production path can be exercised
-    by a test instead of a re-implementation of it.
+    ``on_bytes`` is the position of the transport running *right now* - it
+    restarts at 0 whenever a new source begins - ``on_total`` the expected size
+    of that phase and ``on_stage`` the line for the operator.  Reporting a
+    cumulative total across sources made the bar lie: a share attempt that died
+    at 40 MB left the per-file fallback with a full bar.
     """
 
     digest_cache: dict[str, str] = {}
@@ -348,14 +359,34 @@ def _download_planned_files(
 
     bundle = manifest.get("bundle")
     shares = _share_sources(manifest)
+    planned_bytes = sum(int(item.get("size", 0)) for item, _ in planned)
     want_archive = bool(planned) and (
-        len(planned) >= SHARE_MIN_FILES
-        or sum(int(item.get("size", 0)) for item, _ in planned) >= BUNDLE_MIN_BYTES
+        len(planned) >= SHARE_MIN_FILES or planned_bytes >= BUNDLE_MIN_BYTES
     )
     expected_version = str(manifest.get("version") or "").strip()
     remaining = list(planned)
     fetched_per_file = 0
     archive_trusted = False
+
+    meter = {"bytes": 0}
+    meter_lock = threading.Lock()
+
+    def phase_reset(total: int) -> None:
+        with meter_lock:
+            meter["bytes"] = 0
+        if on_total is not None:
+            on_total(max(0, int(total)))
+        on_bytes(0)
+
+    def phase_progress(count: int) -> None:
+        with meter_lock:
+            meter["bytes"] += max(0, int(count))
+            position = meter["bytes"]
+        on_bytes(position)
+
+    def stage(text_value: str) -> None:
+        if on_stage is not None:
+            on_stage(text_value)
 
     # 1) Whole package from a share link.
     if want_archive and shares and lanzou_download is not None:
@@ -363,22 +394,23 @@ def _download_planned_files(
         for mirror in shares:
             try:
                 share = lanzou_resolve(mirror)
-                archive_size = int(getattr(share, "size", 0) or 0)
-                if archive_size > 0 and on_archive_size is not None:
-                    # The bar must be sized by the package, not by the per-file
-                    # total: otherwise it can never reach 100% (223.7 vs 93.6 MB).
-                    on_archive_size(archive_size)
-                lanzou_download(share, archive, parts=8, progress=on_bytes)
+                phase_reset(int(getattr(share, "size", 0) or 0) or planned_bytes)
+                stage("正在下载更新安装包…")
+                lanzou_download(share, archive, parts=8, progress=phase_progress)
                 version = _archive_version(archive)
                 if expected_version and version and version != expected_version:
                     raise RuntimeError(
                         f"share holds version {version}, the manifest wants {expected_version}"
                     )
-                published = str((bundle or {}).get("sha256") or "").strip().lower() if isinstance(bundle, dict) else ""
+                published = (
+                    str((bundle or {}).get("sha256") or "").strip().lower()
+                    if isinstance(bundle, dict) else ""
+                )
                 if published and _sha256(archive) == published:
                     # The manifest publishes this archive's own SHA-256: that one
                     # hash is the integrity proof, no per-file work is needed.
                     archive_trusted = True
+                stage("正在解压安装包…")
                 _extract_bundle(archive, staging)
                 archive.unlink(missing_ok=True)
                 if archive_trusted:
@@ -396,25 +428,29 @@ def _download_planned_files(
                 break
             except Exception as exc:  # noqa: BLE001 - try the next source
                 logging.warning("installer: share %s unusable: %s", mirror, exc)
+                stage(f"安装包获取失败（{str(exc)[:60]}），正在换来源…")
 
     # 2) CDN bundle.
     if remaining and isinstance(bundle, dict) and _bundle_worth_it(
         bundle, sum(int(item.get("size", 0)) for item, _ in remaining)
     ):
         archive = staging / "bundle.zip"
+        phase_reset(int(bundle.get("size", 0) or 0))
+        stage("正在下载更新安装包…")
         bundle_url = bundle.get("url")
         if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
             with archive.open("wb") as output:
-                download_url(bundle_url, output, on_bytes)
+                download_url(bundle_url, output, phase_progress)
         else:
             with archive.open("wb") as output:
                 download_binary(
                     ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/bundle",
-                    PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                    PIN_ROOT / "activation_server_pin.json", token, output, phase_progress,
                 )
         if (archive.stat().st_size != int(bundle.get("size", 0))
                 or _sha256(archive) != str(bundle.get("sha256", ""))):
             raise RuntimeError("安装包整包校验失败。")
+        stage("正在解压安装包…")
         _extract_bundle(archive, staging)
         archive.unlink(missing_ok=True)
         archive_trusted = True
@@ -422,18 +458,22 @@ def _download_planned_files(
 
     # 3) One request per file, only for what is still missing.
     if remaining and per_file:
+        phase_reset(sum(int(item.get("size", 0)) for item, _ in remaining))
+        stage(f"正在逐文件下载（{len(remaining)} 个）…")
+
         def fetch(item: dict[str, Any], relative: Path) -> None:
             target = staging / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("wb") as output:
                 cdn_url = item.get("url")
                 if isinstance(cdn_url, str) and cdn_url.startswith("https://"):
-                    received = download_url(cdn_url, output, on_bytes)
+                    received = download_url(cdn_url, output, phase_progress)
                 else:
                     received = download_binary(
                         ACTIVATION_SERVER_ENDPOINT,
                         "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
-                        PIN_ROOT / "activation_server_pin.json", token, output, on_bytes,
+                        PIN_ROOT / "activation_server_pin.json", token, output,
+                        phase_progress,
                     )
             if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):
                 raise RuntimeError(f"文件校验失败：{relative}")
@@ -533,6 +573,9 @@ class InstallerWindow:
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.running = False
         self.progress_value = 0.0
+        self._total_bytes = 1
+        self._stage_text = "准备就绪"
+        self._phase_started: float | None = None
         # An existing install stays where it is; a first install defaults to
         # Desktop\MoonEclipse.
         default_root = _pointer_root() or (_desktop_directory() / DEFAULT_FOLDER_NAME)
@@ -622,41 +665,32 @@ class InstallerWindow:
                 self.events.put(("plan", (len(planned), total)))
             staging = root / "updates" / ("stage-" + uuid.uuid4().hex)
             staging.mkdir(parents=True, exist_ok=True)
-            completed = 0
-            completed_lock = threading.Lock()
 
-            def on_bytes(count: int) -> None:
-                """Every transport reports through here (archive or per file)."""
-
-                nonlocal completed
-                with completed_lock:
-                    completed += max(0, int(count))
-                    snapshot = completed
-                self.events.put(("bytes", snapshot))
-
-            # One tested chain: share archive -> CDN bundle -> per-file.  Every
-            # planned file is verified against the pinned manifest's SHA-256
-            # before it is moved into app/ below.
+            # The chain reports the position of the source it is running *now*,
+            # the expected size of that phase, and a stage line.  A cumulative
+            # total used to survive a failed source, so the bar went full while a
+            # fallback download was still running.
             fetched_per_file = _download_planned_files(
-                manifest, planned, staging, token=token, on_bytes=on_bytes,
-                on_archive_size=lambda size: self.events.put(("plan", (1, int(size)))),
+                manifest, planned, staging, token=token,
+                on_bytes=lambda position: self.events.put(("bytes", int(position))),
+                on_total=lambda size: self.events.put(("scale", int(size))),
+                on_stage=lambda line: self.events.put(("stage", str(line))),
             )
             if fetched_per_file:
                 logging.info(
                     "installer: %d file(s) came from per-file requests", fetched_per_file
                 )
-            # The download phase is over: without this the bar sits at the
-            # archive's share of the per-file total while files are moved in.
-            with completed_lock:
-                done_bytes = completed
-            self.events.put(("bytes", max(done_bytes, total)))
             self.events.put(("stage", "正在安装已下载的文件…"))
             app_root.mkdir(parents=True, exist_ok=True)
 
             # Only verified staging output reaches the live folder.  The chain
             # above already proved every planned file (a parallel sweep, or the
             # archive's own SHA-256), so moving a file does not hash it again.
+            moved = 0
+            move_lock = threading.Lock()
+
             def move_one(entry: tuple[dict[str, Any], Path]) -> None:
+                nonlocal moved
                 item, relative = entry
                 source = staging / relative
                 if not source.is_file():
@@ -664,6 +698,11 @@ class InstallerWindow:
                 target = app_root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source.replace(target)
+                with move_lock:
+                    moved += 1
+                    current = moved
+                if current % 25 == 0 or current == len(planned):
+                    self.events.put(("files", (current, len(planned))))
 
             if planned:
                 with ThreadPoolExecutor(
@@ -694,30 +733,68 @@ class InstallerWindow:
         except Exception as exc:
             self.events.put(("error", str(exc)))
 
+    def _set_progress(self, fraction: float) -> None:
+        fraction = max(0.0, min(1.0, fraction))
+        self.progress_value = fraction
+        self.progress.configure(maximum=PROGRESS_UNITS, value=fraction * PROGRESS_UNITS)
+        self._paint_eclipse(fraction)
+
     def _drain_events(self) -> None:
         try:
             while True:
                 kind, value = self.events.get_nowait()
                 if kind == "plan":
                     count, total = value
-                    self._total_bytes = max(1, total)
-                    self.progress.configure(maximum=self._total_bytes, value=0)
-                    if count <= 1:
-                        self.status.configure(text="正在下载更新安装包…")
-                    else:
-                        self.status.configure(text=f"正在下载 {count} 个已更新文件…")
+                    self._total_bytes = max(1, int(total))
+                    self._stage_text = (
+                        "正在下载更新安装包…" if count <= 1
+                        else f"正在下载 {count} 个已更新文件…"
+                    )
+                    self._phase_started = None
+                    self._set_progress(0.0)
+                    self.status.configure(text=self._stage_text)
+                elif kind == "scale":
+                    # A different transport: the share fell back to per-file (or
+                    # the bundle replaced it), so the bar restarts on the new
+                    # expected size instead of carrying the old head start.
+                    self._total_bytes = max(1, int(value))
+                    self._phase_started = None
+                    self._set_progress(0.0)
                 elif kind == "bytes":
-                    self.progress_value = float(value) / float(getattr(self, "_total_bytes", 1))
-                    self.progress.configure(value=value)
-                    self._paint_eclipse(self.progress_value)
+                    position = max(0, int(value))
+                    total = max(1, int(self._total_bytes))
+                    now = time.monotonic()
+                    if position == 0 or self._phase_started is None:
+                        self._phase_started = now
+                        self._set_progress(0.0)
+                        self.status.configure(text=self._stage_text)
+                        continue
+                    # Real bytes: what the sockets actually delivered, with the
+                    # bar reserving the last fifth of the scale for the install.
+                    self._set_progress(
+                        PROGRESS_DOWNLOAD_SHARE * min(1.0, position / total)
+                    )
+                    elapsed = max(1e-6, now - self._phase_started)
+                    self.status.configure(text=(
+                        f"{self._stage_text} "
+                        f"{position / 1048576:.1f}/{total / 1048576:.1f} MB"
+                        f" · {position / 1048576 / elapsed:.1f} MB/s"
+                    ))
                 elif kind == "stage":
-                    # The download is over but the install still runs: without a
-                    # stage line the label froze on 正在下载更新安装包.
-                    self.status.configure(text=str(value))
+                    self._stage_text = str(value)
+                    self.status.configure(text=self._stage_text)
+                elif kind == "files":
+                    done, total = value
+                    total = max(1, int(total))
+                    self._set_progress(
+                        PROGRESS_DOWNLOAD_SHARE
+                        + (1.0 - PROGRESS_DOWNLOAD_SHARE) * min(1.0, done / total)
+                    )
+                    self.status.configure(text=f"正在安装文件 {done}/{total}…")
                 elif kind == "done":
                     self.running = False
                     self.install.state(["!disabled"])
-                    self._paint_eclipse(1.0)
+                    self._set_progress(1.0)
                     root, first_setup = value
                     self.status.configure(text=f"安装完成：{root}")
                     message = (
