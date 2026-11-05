@@ -20,6 +20,8 @@ from before that conversion is simply no longer found.
 from __future__ import annotations
 
 import logging
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -99,6 +101,139 @@ def save_reference(path: Path, image: Any, *,
     return save_screenshot(path, image, quality=quality)
 
 
+def read_image(
+    path: Path, flags: int = cv2.IMREAD_COLOR,
+) -> Optional[np.ndarray]:
+    """Read an image file through Python's Unicode-aware filesystem API.
+
+    ``cv2.imread`` uses the C file API, which cannot open a path containing
+    non-ASCII characters on Windows: it returns ``None`` without raising.  An
+    install or extraction folder like ``D:\\辅助\\`` (and the test fixture
+    ``D:\\蛇夫G\\``) therefore made every bundled reference image "missing" -
+    the reconnector then logged ``no page signature is available`` and clicked
+    preset coordinates blind, because ``login_page_target.jpg`` happened to be
+    read by a hand-written Unicode-safe branch while the five ``page_*_target``
+    crops were not.  This helper is the one read path every reference uses.
+    """
+
+    target = Path(path)
+    try:
+        encoded = np.fromfile(str(target), dtype=np.uint8)
+    except (OSError, ValueError):
+        LOG.warning("could not read image bytes: %s", target, exc_info=True)
+        return None
+    if not encoded.size:
+        return None
+    try:
+        image = cv2.imdecode(encoded, flags)
+    except cv2.error:
+        LOG.warning("could not decode image: %s", target, exc_info=True)
+        return None
+    return image if image is not None and image.size else None
+
+
+def _path_is_ascii(path: Path) -> bool:
+    try:
+        str(Path(path).resolve()).encode("ascii")
+    except (UnicodeEncodeError, OSError):
+        return False
+    return True
+
+
+class VideoCapture:
+    """``cv2.VideoCapture`` that also opens a video under a non-ASCII folder.
+
+    OpenCV's capture opens the path through the C file API, so a Chinese install
+    folder (``D:\\辅助\\screenshots\\...mp4``) fails with ``isOpened() == False``.
+    A non-ASCII source is copied to a temporary ASCII path first; the copy is
+    removed when the capture is released.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self._path = Path(source)
+        self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
+        open_path = self._path
+        if not _path_is_ascii(self._path):
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="me-video-")
+            copy = Path(self._temp_dir.name) / ("source" + self._path.suffix)
+            shutil.copyfile(self._path, copy)
+            open_path = copy
+            LOG.info("video capture: copied %s to an ASCII path for OpenCV",
+                     self._path.name)
+        self._capture = cv2.VideoCapture(str(open_path))
+
+    # Delegate the small surface the project uses.
+    def isOpened(self) -> bool:  # noqa: N802 - OpenCV spelling
+        return bool(self._capture.isOpened())
+
+    def read(self):
+        return self._capture.read()
+
+    def get(self, prop: int) -> float:
+        return float(self._capture.get(prop))
+
+    def release(self) -> None:
+        try:
+            self._capture.release()
+        finally:
+            if self._temp_dir is not None:
+                self._temp_dir.cleanup()
+                self._temp_dir = None
+
+    def __enter__(self) -> "VideoCapture":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.release()
+
+
+class VideoWriter:
+    """``cv2.VideoWriter`` that also writes into a non-ASCII folder.
+
+    The writer is created on a temporary ASCII path and moved onto ``target``
+    when it is released, so the mp4 lands in ``screenshots\\…`` even when the
+    install folder is Chinese.
+    """
+
+    def __init__(
+        self, target: Any, fourcc: str, fps: float, size: tuple[int, int],
+    ) -> None:
+        self._target = Path(target)
+        self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
+        self._target.parent.mkdir(parents=True, exist_ok=True)
+        write_path = self._target
+        if not _path_is_ascii(self._target):
+            self._temp_dir = tempfile.TemporaryDirectory(prefix="me-video-")
+            write_path = Path(self._temp_dir.name) / ("output" + self._target.suffix)
+        self._writer = cv2.VideoWriter(
+            str(write_path), cv2.VideoWriter_fourcc(*fourcc), fps, size,
+        )
+
+    def isOpened(self) -> bool:  # noqa: N802 - OpenCV spelling
+        return bool(self._writer.isOpened())
+
+    def write(self, frame: Any) -> None:
+        self._writer.write(frame)
+
+    def release(self) -> None:
+        self._writer.release()
+        if self._temp_dir is None:
+            return
+        try:
+            produced = next(iter(Path(self._temp_dir.name).glob("output.*")), None)
+            if produced is not None and produced.is_file():
+                shutil.move(str(produced), str(self._target))
+        finally:
+            self._temp_dir.cleanup()
+            self._temp_dir = None
+
+    def __enter__(self) -> "VideoWriter":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.release()
+
+
 def to_bgr(image: Any) -> Optional[np.ndarray]:
     """Any supported image -> BGR numpy array (None when the type is unknown)."""
 
@@ -151,8 +286,11 @@ __all__ = [
     "SCREENSHOT_QUALITY",
     "SCREENSHOT_SUFFIX",
     "SUPPORTED_SUFFIXES",
+    "VideoCapture",
+    "VideoWriter",
     "frame_files",
     "matches_frame_name",
+    "read_image",
     "save_frame",
     "save_reference",
     "save_screenshot",

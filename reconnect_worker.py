@@ -513,6 +513,14 @@ PAGE_LABELS = {
     None: "游戏内",
 }
 PAGE_MIN_SCORE = 0.60
+# The channel grid is rendered with slightly different antialiasing on some
+# clients.  Its two grid-only references remain far below this threshold on
+# the world page (0.077 in the shipped comparison), but the known 1368 client
+# channel screen scores 0.590.  Keep login/world strict and accept that known
+# channel variation without treating the world list as a channel page.
+PAGE_MIN_SCORE_BY_PAGE = {
+    PAGE_CHANNEL: 0.55,
+}
 # Window names that ARE the game's login UI: measured on the operator's machine, the login board
 # (with 连接 and 结束游戏) is drawn in a separate process window called `igwUserLoginDialog`.  It is
 # accepted by name because refusing it blocks every login click (field log 19:40 and 19:46).
@@ -534,11 +542,11 @@ PAGE_LOGIN_CONNECT_BOX = (780, 380, 160, 40)     # the 连接 label
 PAGE_LOGIN_EXIT_BOX = (1060, 565, 190, 45)       # the 结束游戏 label - NOT a signature any more
 PAGE_GRID_BOX = (500, 368, 420, 40)              # the channel grid, first row
 PAGE_GRID_LOWER_BOX = (500, 430, 420, 80)        # the channel grid, lower rows
-# The operator's 1080 channel-window pick (613, 333, 107x27), mapped back to the 1366 preset space.
-# It replaces the two 1366 channel crops (500,368) and (500,430) as the channel signature: on his
-# 1080 client those two only reached 0.622/0.641 - the page would have been "recognised" with 0.02 of
-# margin - while his own crop is exact there (1.000) and low on the other pages (world +0.001).
-PAGE_CHANNEL_GRID_BOX = (775, 320, 135, 34)
+# The channel state is identified from two glyph-dense strips of the channel
+# grid.  Unlike the old "到选择的世界去" button crop, these strips exist only
+# after a world has been selected and remain readable on both client presets.
+PAGE_CHANNEL_GRID_BOX = (500, 368, 420, 40)
+PAGE_CHANNEL_GRID_LOWER_BOX = (500, 430, 420, 80)
 # Each entry carries the anchor space its box is measured in, so the box can be mapped onto the
 # client that is really on screen (see the two mapping families above).
 #
@@ -551,7 +559,8 @@ PAGE_REFERENCES = (
     (PAGE_LOGIN, PAGE_LOGIN_CONNECT_BOX, "page_login_connect_target.jpg", ANCHOR_SPACE_LOGIN),
     (PAGE_WORLD, PAGE_GRID_BOX, "page_world_grid1_target.jpg", ANCHOR_SPACE_WINDOW),
     (PAGE_WORLD, (500, 400, 420, 60), "page_world_grid2_target.jpg", ANCHOR_SPACE_WINDOW),
-    (PAGE_CHANNEL, PAGE_CHANNEL_GRID_BOX, "page_channel_grid_target.jpg", ANCHOR_SPACE_WINDOW),
+    (PAGE_CHANNEL, PAGE_CHANNEL_GRID_BOX, "page_channel_grid1_target.jpg", ANCHOR_SPACE_WINDOW),
+    (PAGE_CHANNEL, PAGE_CHANNEL_GRID_LOWER_BOX, "page_channel_grid2_target.jpg", ANCHOR_SPACE_WINDOW),
 )
 # How often a step is repeated when the page did not change.
 PAGE_STEP_ATTEMPTS = 3
@@ -618,7 +627,7 @@ def detect_page(frame, references) -> tuple[Optional[str], float]:
         return (None, 0.0)
     best_page = max(scores, key=lambda page: scores[page])
     best_score = scores[best_page]
-    if best_score < PAGE_MIN_SCORE:
+    if best_score < PAGE_MIN_SCORE_BY_PAGE.get(best_page, PAGE_MIN_SCORE):
         return (None, best_score)
     return (best_page, best_score)
 
@@ -632,14 +641,20 @@ def load_page_references() -> dict:
 
     import cv2
 
+    from image_io import read_image
+
     loaded: dict = {}
     for page, box, name, space in PAGE_REFERENCES:
         for folder in (SCREENSHOTS_DIR, ASSETS_DIR):
             path = folder / name
             if not path.is_file():
                 continue
-            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            # Not ``cv2.imread``: it cannot open a non-ASCII path, so an install
+            # under a Chinese folder (D:\辅助\) reported every signature missing
+            # and the reconnect then ran blind on preset coordinates.
+            image = read_image(path, cv2.IMREAD_COLOR)
             if image is None or not image.size:
+                LOG.warning("auto reconnect: page signature %s unreadable: %s", page, path)
                 continue
             loaded.setdefault(page, []).append((image, tuple(int(value) for value in box), space))
             LOG.info("auto reconnect: page signature %s loaded from %s (%dx%d, box %s, %s space)",
@@ -653,11 +668,13 @@ def load_offline_prompt_square():
 
     import cv2
 
+    from image_io import read_image
+
     for folder in (SCREENSHOTS_DIR, ASSETS_DIR):
         path = folder / OFFLINE_PROMPT_SQUARE_NAME
         if not path.is_file():
             continue
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        image = read_image(path, cv2.IMREAD_COLOR)
         if image is not None and image.size:
             LOG.info(
                 "auto reconnect: offline prompt square loaded from %s (%dx%d)",
@@ -666,6 +683,7 @@ def load_offline_prompt_square():
                 image.shape[0],
             )
             return image
+        LOG.warning("auto reconnect: offline prompt square unreadable: %s", path)
     LOG.warning(
         "auto reconnect: offline prompt square is missing; refusing prompt clicks"
     )
@@ -3300,10 +3318,13 @@ class ReconnectWorker(threading.Thread):
         self._connect_template_loaded = True
         import cv2
 
+        from image_io import read_image
+
         for folder in (SCREENSHOTS_DIR, ASSETS_DIR):
             path = folder / CONNECT_BUTTON_REFERENCE_NAME
             if path.is_file():
-                image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+                # Unicode-safe read: cv2.imread cannot open a Chinese install path.
+                image = read_image(path, cv2.IMREAD_COLOR)
                 if image is not None and image.size:
                     LOG.info("auto reconnect: 连接 template loaded from %s (%dx%d)",
                              path, image.shape[1], image.shape[0])

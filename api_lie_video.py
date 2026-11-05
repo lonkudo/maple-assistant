@@ -30,6 +30,8 @@ from typing import Any, Callable, Optional
 import cv2
 import numpy as np
 
+from image_io import VideoCapture as SafeVideoCapture
+
 from autolie_api.connect import BackendError, open_backend
 from autolie_api.intergration import (
     JPEG_QUALITY,
@@ -509,7 +511,8 @@ class VideoDrillWorker(threading.Thread):
                 return
             self._running = True
         self._stop_request.clear()
-        capture = cv2.VideoCapture(str(self.video))
+        # Unicode-safe: cv2.VideoCapture cannot open a Chinese install path.
+        capture = SafeVideoCapture(self.video)
         client = None
         mimic = None
         self.log = RunLog(name=CLIP, folder=self.log_folder)

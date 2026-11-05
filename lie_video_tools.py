@@ -20,6 +20,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from image_io import VideoCapture as SafeVideoCapture
+from image_io import VideoWriter as SafeVideoWriter
 from image_io import frame_files
 
 LOG = logging.getLogger("lie-video-tools")
@@ -54,7 +56,8 @@ def load_frames(
             raise FileNotFoundError(f"no {pattern} frames in {path}")
         return [Image.open(item).convert("RGB") for item in files], files
     if path.is_file():
-        capture = cv2.VideoCapture(str(path))
+        # Unicode-safe: cv2.VideoCapture cannot open a Chinese install path.
+        capture = SafeVideoCapture(path)
         if not capture.isOpened():
             raise FileNotFoundError(f"cannot open video: {path}")
         images: list[Image.Image] = []
@@ -150,9 +153,9 @@ class VideoSink:
                 self._process = None
         if self._process is None:
             for fourcc in VIDEO_CODECS:
-                writer = cv2.VideoWriter(
-                    str(self.path), cv2.VideoWriter_fourcc(*fourcc),
-                    self.fps, self.size,
+                # Unicode-safe: an mp4 under a Chinese folder needs the temp-path writer.
+                writer = SafeVideoWriter(
+                    self.path, fourcc, self.fps, self.size,
                 )
                 if writer.isOpened():
                     self._writer = writer

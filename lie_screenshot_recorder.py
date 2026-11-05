@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from image_io import VideoCapture as SafeVideoCapture
 from image_io import frame_files, save_frame, screenshot_name
 
 LOG = logging.getLogger(__name__)
@@ -337,7 +338,8 @@ class LieScreenshotRecorder:
         try:
             if not video.is_file() or video.stat().st_size <= 0:
                 return False
-            capture = cv2.VideoCapture(str(video))
+            # Unicode-safe: the run folder may live under a Chinese install path.
+            capture = SafeVideoCapture(video)
             try:
                 return int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) >= expected
             finally:
