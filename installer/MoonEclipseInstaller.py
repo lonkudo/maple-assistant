@@ -43,7 +43,7 @@ PIN_ROOT = next(
 )
 
 from licensing import ACTIVATION_SERVER_ENDPOINT, machine_fingerprint_hash  # noqa: E402
-from pinned_tls import download_binary, download_url, post_json  # noqa: E402
+from pinned_tls import post_json  # noqa: E402
 
 # 蓝奏优享 share parsing (share link -> CDN direct URL -> parallel Range download).
 # Optional: a manifest without ``bundle.mirrors`` behaves exactly as before, and
@@ -68,11 +68,11 @@ MAX_DOWNLOAD_WORKERS = 8
 # A one-request archive is ~37% of the payload (74 MB vs 199 MB), but it must
 # never be used for a small update.  Only plan files this large, and at least
 # half the archive, take the bundle path.
-BUNDLE_MIN_BYTES = 24 * 1024 * 1024
+
 # A share link is fetched as ONE archive, so it is only worth the extra resolve
 # when the manifest would otherwise hand out many per-file requests.  Below this
 # the ordinary per-file path is cheaper than a 90 MB whole package.
-SHARE_MIN_FILES = 64
+
 # Share links the operator can drop beside the installer, so the fast path works
 # without a server-side manifest change: {"shares": ["https://www.ilanzou.com/s/..."]}
 MIRRORS_FILE = "installer_mirrors.json"
@@ -255,18 +255,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _bundle_worth_it(bundle: dict[str, Any], planned_bytes: int) -> bool:
-    """Use the archive only when it really saves transfer."""
-
-    try:
-        size = int(bundle.get("size", 0))
-    except (TypeError, ValueError):
-        return False
-    if not str(bundle.get("name") or "") or size <= 0:
-        return False
-    return planned_bytes >= max(BUNDLE_MIN_BYTES, size // 2)
-
-
 def _share_sources(manifest: dict[str, Any]) -> list[str]:
     """Share links the installer may fetch the whole package from.
 
@@ -333,22 +321,11 @@ def _archive_version(archive: Path) -> str:
 def _planned_via_archive(
     manifest: dict[str, Any], planned: list[tuple[dict[str, Any], Path]],
 ) -> Optional[int]:
-    """Expected archive size when this plan will be fetched as one package."""
+    """Expected package size for the plan bar (the payload is always one archive)."""
 
     if not planned:
         return None
-    sizes = sum(int(item.get("size", 0)) for item, _ in planned)
-    if len(planned) < SHARE_MIN_FILES and sizes < BUNDLE_MIN_BYTES:
-        return None
-    bundle = manifest.get("bundle")
-    has_bundle = isinstance(bundle, dict) and _bundle_worth_it(bundle, sizes)
-    if not _share_sources(manifest) and not has_bundle:
-        return None
-    try:
-        size = int((bundle or {}).get("size") or 0)
-    except (TypeError, ValueError, AttributeError):
-        size = 0
-    return size or sizes
+    return sum(int(item.get("size", 0)) for item, _ in planned)
 
 
 def _download_planned_files(
@@ -356,50 +333,39 @@ def _download_planned_files(
     planned: list[tuple[dict[str, Any], Path]],
     staging: Path,
     *,
-    token: str,
     on_bytes: Any,
-    per_file: bool = True,
     on_total: Any = None,
     on_stage: Any = None,
     on_files: Any = None,
 ) -> int:
-    """Fetch every planned file into ``staging``; returns the per-file count used.
+    """Stage the release archive fetched from the share link; returns 0.
 
-    The chain, cheapest-first, with the pinned origin's per-file SHA-256 as the
-    only authority on what may be installed:
+    The share link is the only payload source.  The activation server issues the
+    manifest - file list, per-file SHA-256 and the version - and nothing else is
+    fetched from it.
 
-      1. a share link (one archive over parallel ranges) when the plan is large;
-      2. the CDN bundle, when the manifest offers one and it saves bytes;
-      3. one request per file for whatever is still missing.
-
-    ``on_bytes`` is the position of the transport running *right now* - it
-    restarts at 0 whenever a new source begins - ``on_total`` the expected size
-    of that phase and ``on_stage`` the line for the operator.  Reporting a
-    cumulative total across sources made the bar lie: a share attempt that died
-    at 40 MB left the per-file fallback with a full bar.
+    The archive's ``VERSION`` must equal the manifest's: the manifest hashes are
+    the only authority, so an archive from another version could never pass the
+    per-file check.  A mismatch is reported by name instead of being papered
+    over with a slower transport.
     """
 
+    if not planned:
+        return 0
+    shares = _share_sources(manifest)
+    if not shares:
+        raise RuntimeError("没有配置分享链接来源：安装包只能从分享链接下载。")
+
+    expected_version = str(manifest.get("version") or "").strip()
+    planned_bytes = sum(int(item.get("size", 0)) for item, _ in planned)
     digest_cache: dict[str, str] = {}
 
     def matches(item: dict[str, Any], relative: Path) -> bool:
-        # Hash each staged file at most once: the share branch prunes with this
-        # and a retried mirror would otherwise re-hash all 1,000+ files.
         key = relative.as_posix()
         if key not in digest_cache:
             staged = staging / relative
             digest_cache[key] = _sha256(staged) if staged.is_file() else ""
         return digest_cache[key] == str(item["sha256"])
-
-    bundle = manifest.get("bundle")
-    shares = _share_sources(manifest)
-    planned_bytes = sum(int(item.get("size", 0)) for item, _ in planned)
-    want_archive = bool(planned) and (
-        len(planned) >= SHARE_MIN_FILES or planned_bytes >= BUNDLE_MIN_BYTES
-    )
-    expected_version = str(manifest.get("version") or "").strip()
-    remaining = list(planned)
-    fetched_per_file = 0
-    archive_trusted = False
 
     meter = {"bytes": 0}
     meter_lock = threading.Lock()
@@ -425,119 +391,64 @@ def _download_planned_files(
         if on_files is not None:
             on_files(phase, done, total)
 
-    # 1) Whole package from a share link.
-    if want_archive and shares and lanzou_download is not None:
-        archive = staging / "bundle.zip"
-        for index, mirror in enumerate(shares):
-            try:
-                share = lanzou_resolve(mirror)
-                phase_reset(int(getattr(share, "size", 0) or 0) or planned_bytes)
-                stage("正在下载更新安装包…")
-                lanzou_download(
-                    share, archive, parts=8, progress=phase_progress,
-                    # Only gate when a fallback exists: the last mirror may be
-                    # slow but it is still the one that can finish the install.
-                    min_rate_bps=MIRROR_MIN_RATE_BPS if index + 1 < len(shares) else 0,
+    archive = staging / "bundle.zip"
+    problems: list[str] = []
+
+    for index, mirror in enumerate(shares):
+        try:
+            share = lanzou_resolve(mirror)
+            phase_reset(int(getattr(share, "size", 0) or 0) or planned_bytes)
+            stage("正在下载更新安装包…")
+            lanzou_download(
+                share, archive, parts=8, progress=phase_progress,
+                min_rate_bps=MIRROR_MIN_RATE_BPS if index + 1 < len(shares) else 0,
+            )
+            version = _archive_version(archive)
+            if expected_version and version and version != expected_version:
+                raise RuntimeError(
+                    f"分享链接中的安装包是 {version}，而授权服务器清单要求 "
+                    f"{expected_version}；请先把同一版本发布到授权服务器"
                 )
-                version = _archive_version(archive)
-                if expected_version and version and version != expected_version:
-                    raise RuntimeError(
-                        f"share holds version {version}, the manifest wants {expected_version}"
-                    )
-                published = (
-                    str((bundle or {}).get("sha256") or "").strip().lower()
-                    if isinstance(bundle, dict) else ""
+            published = str((manifest.get("bundle") or {}).get("sha256") or "").strip().lower() \
+                if isinstance(manifest.get("bundle"), dict) else ""
+            trusted = bool(published) and _sha256(archive) == published
+
+            stage("正在解压安装包…")
+            _extract_bundle(
+                archive, staging,
+                on_entry=lambda done, total: files("解压", done, total),
+            )
+            archive.unlink(missing_ok=True)
+
+            if trusted:
+                return 0
+            stage("正在校验文件…")
+            with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
+                pending = {
+                    pool.submit(matches, item, relative): position
+                    for position, (item, relative) in enumerate(planned)
+                }
+                verdicts = [False] * len(planned)
+                for count, future in enumerate(as_completed(pending), start=1):
+                    verdicts[pending[future]] = bool(future.result())
+                    if count % 16 == 0 or count == len(planned):
+                        files("校验", count, len(planned))
+            missing = sum(1 for ok in verdicts if not ok)
+            if missing:
+                raise RuntimeError(
+                    f"安装包与清单不一致：{missing} 个文件校验失败"
                 )
-                if published and _sha256(archive) == published:
-                    # The manifest publishes this archive's own SHA-256: that one
-                    # hash is the integrity proof, no per-file work is needed.
-                    archive_trusted = True
-                stage("正在解压安装包…")
-                _extract_bundle(archive, staging, on_entry=lambda done, total: files("解压", done, total))
-                archive.unlink(missing_ok=True)
-                if archive_trusted:
-                    remaining = []
-                else:
-                    stage("正在校验文件…")
-                    with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
-                        pending = {
-                            pool.submit(matches, item, relative): index
-                            for index, (item, relative) in enumerate(remaining)
-                        }
-                        verdicts = [False] * len(remaining)
-                        for count, future in enumerate(as_completed(pending), start=1):
-                            verdicts[pending[future]] = bool(future.result())
-                            if count % 16 == 0 or count == len(remaining):
-                                files("校验", count, len(remaining))
-                    satisfied = sum(1 for ok in verdicts if ok)
-                    logging.info(
-                        "installer: whole package %s from the share "
-                        "(%d/%d files verified, no per-file download for those)",
-                        share.name, satisfied, len(remaining),
-                    )
-                    remaining = [entry for entry, ok in zip(remaining, verdicts) if not ok]
-                break
-            except Exception as exc:  # noqa: BLE001 - try the next source
-                logging.warning("installer: share %s unusable: %s", mirror, exc)
-                stage(f"安装包获取失败（{str(exc)[:60]}），正在换来源…")
+            return 0
+        except Exception as exc:  # noqa: BLE001 - try the next mirror
+            logging.warning("installer: share %s unusable: %s", mirror, exc)
+            problems.append(str(exc))
+            stage(f"安装包获取失败（{str(exc)[:60]}）")
 
-    # 2) CDN bundle.
-    if remaining and isinstance(bundle, dict) and _bundle_worth_it(
-        bundle, sum(int(item.get("size", 0)) for item, _ in remaining)
-    ):
-        archive = staging / "bundle.zip"
-        phase_reset(int(bundle.get("size", 0) or 0))
-        stage("正在下载更新安装包…")
-        bundle_url = bundle.get("url")
-        if isinstance(bundle_url, str) and bundle_url.startswith("https://"):
-            with archive.open("wb") as output:
-                download_url(bundle_url, output, phase_progress)
-        else:
-            with archive.open("wb") as output:
-                download_binary(
-                    ACTIVATION_SERVER_ENDPOINT, "/api/v1/installer/bundle",
-                    PIN_ROOT / "activation_server_pin.json", token, output, phase_progress,
-                )
-        if (archive.stat().st_size != int(bundle.get("size", 0))
-                or _sha256(archive) != str(bundle.get("sha256", ""))):
-            raise RuntimeError("安装包整包校验失败。")
-        stage("正在解压安装包…")
-        _extract_bundle(archive, staging, on_entry=lambda done, total: files("解压", done, total))
-        archive.unlink(missing_ok=True)
-        archive_trusted = True
-        remaining = []
+    raise RuntimeError(
+        "无法从分享链接获取安装包："
+        + ("；".join(problems) if problems else "没有可用来源")
+    )
 
-    # 3) One request per file, only for what is still missing.
-    if remaining and per_file:
-        phase_reset(sum(int(item.get("size", 0)) for item, _ in remaining))
-        stage(f"正在逐文件下载（{len(remaining)} 个）…")
-
-        def fetch(item: dict[str, Any], relative: Path) -> None:
-            target = staging / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("wb") as output:
-                cdn_url = item.get("url")
-                if isinstance(cdn_url, str) and cdn_url.startswith("https://"):
-                    received = download_url(cdn_url, output, phase_progress)
-                else:
-                    received = download_binary(
-                        ACTIVATION_SERVER_ENDPOINT,
-                        "/api/v1/installer/files/" + quote(relative.as_posix(), safe="/"),
-                        PIN_ROOT / "activation_server_pin.json", token, output,
-                        phase_progress,
-                    )
-            if received != int(item["size"]) or _sha256(target) != str(item["sha256"]):
-                raise RuntimeError(f"文件校验失败：{relative}")
-
-        with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
-            futures = [pool.submit(fetch, item, relative) for item, relative in remaining]
-            for future in as_completed(futures):
-                future.result()
-        fetched_per_file = len(remaining)
-
-    # No final sweep: each transport above proved its own output against the
-    # pinned manifest, so re-hashing everything would repeat that work.
-    return fetched_per_file
 
 
 def _extract_bundle(archive: Path, target_root: Path, on_entry: Any = None) -> None:
@@ -722,18 +633,14 @@ class InstallerWindow:
             # the expected size of that phase, and a stage line.  A cumulative
             # total used to survive a failed source, so the bar went full while a
             # fallback download was still running.
-            fetched_per_file = _download_planned_files(
-                manifest, planned, staging, token=token,
+            _download_planned_files(
+                manifest, planned, staging,
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
                 on_files=lambda phase, done, total:
                     self.events.put(("files", (str(phase), int(done), int(total)))),
             )
-            if fetched_per_file:
-                logging.info(
-                    "installer: %d file(s) came from per-file requests", fetched_per_file
-                )
             self.events.put(("stage", "正在安装已下载的文件…"))
             app_root.mkdir(parents=True, exist_ok=True)
 
@@ -808,9 +715,8 @@ class InstallerWindow:
                     self._set_progress(0.0)
                     self.status.configure(text=self._stage_text)
                 elif kind == "scale":
-                    # A different transport: the share fell back to per-file (or
-                    # the bundle replaced it), so the bar restarts on the new
-                    # expected size instead of carrying the old head start.
+                    # The parsed share reports its own size: restart the bar on
+                    # that instead of the plan's planned-bytes estimate.
                     self._total_bytes = max(1, int(value))
                     self._phase_started = None
                     self._set_progress(0.0)
