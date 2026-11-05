@@ -209,11 +209,13 @@ def _share_sources(manifest: dict[str, Any]) -> list[str]:
                     if text not in found:
                         found.append(text)
 
-    add(DEFAULT_SHARE_MIRRORS)
     add(manifest.get("mirrors"))
     bundle = manifest.get("bundle")
     if isinstance(bundle, dict):
         add(bundle.get("mirrors"))
+    # The build's own share comes after anything the server issued, so a server
+    # update can retarget the installer without a new build.
+    add(DEFAULT_SHARE_MIRRORS)
     for folder in (PIN_ROOT, Path(sys.argv[0]).resolve().parent, HERE):
         candidate = folder / MIRRORS_FILE
         try:
@@ -243,6 +245,27 @@ def _archive_version(archive: Path) -> str:
     return ""
 
 
+def _planned_via_archive(
+    manifest: dict[str, Any], planned: list[tuple[dict[str, Any], Path]],
+) -> Optional[int]:
+    """Expected archive size when this plan will be fetched as one package."""
+
+    if not planned:
+        return None
+    sizes = sum(int(item.get("size", 0)) for item, _ in planned)
+    if len(planned) < SHARE_MIN_FILES and sizes < BUNDLE_MIN_BYTES:
+        return None
+    bundle = manifest.get("bundle")
+    has_bundle = isinstance(bundle, dict) and _bundle_worth_it(bundle, sizes)
+    if not _share_sources(manifest) and not has_bundle:
+        return None
+    try:
+        size = int((bundle or {}).get("size") or 0)
+    except (TypeError, ValueError, AttributeError):
+        size = 0
+    return size or sizes
+
+
 def _download_planned_files(
     manifest: dict[str, Any],
     planned: list[tuple[dict[str, Any], Path]],
@@ -251,6 +274,7 @@ def _download_planned_files(
     token: str,
     on_bytes: Any,
     per_file: bool = True,
+    on_archive_size: Any = None,
 ) -> int:
     """Fetch every planned file into ``staging``; returns the per-file count used.
 
@@ -268,19 +292,13 @@ def _download_planned_files(
     digest_cache: dict[str, str] = {}
 
     def matches(item: dict[str, Any], relative: Path) -> bool:
-        # Hash each staged file once: the archive path hashes every planned file
-        # while pruning, and the final check would otherwise hash all 1,000+ of
-        # them a second time (measured: 11.6 s -> ~7 s for a 1037-file plan).
+        # Hash each staged file at most once: the share branch prunes with this
+        # and a retried mirror would otherwise re-hash all 1,000+ files.
         key = relative.as_posix()
         if key not in digest_cache:
             staged = staging / relative
             digest_cache[key] = _sha256(staged) if staged.is_file() else ""
         return digest_cache[key] == str(item["sha256"])
-
-    def verify_all(entries: list[tuple[dict[str, Any], Path]]) -> None:
-        for item, relative in entries:
-            if not matches(item, relative):
-                raise RuntimeError(f"文件校验失败：{relative}")
 
     bundle = manifest.get("bundle")
     shares = _share_sources(manifest)
@@ -291,6 +309,7 @@ def _download_planned_files(
     expected_version = str(manifest.get("version") or "").strip()
     remaining = list(planned)
     fetched_per_file = 0
+    archive_trusted = False
 
     # 1) Whole package from a share link.
     if want_archive and shares and lanzou_download is not None:
@@ -298,24 +317,36 @@ def _download_planned_files(
         for mirror in shares:
             try:
                 share = lanzou_resolve(mirror)
+                archive_size = int(getattr(share, "size", 0) or 0)
+                if archive_size > 0 and on_archive_size is not None:
+                    # The bar must be sized by the package, not by the per-file
+                    # total: otherwise it can never reach 100% (223.7 vs 93.6 MB).
+                    on_archive_size(archive_size)
                 lanzou_download(share, archive, parts=8, progress=on_bytes)
                 version = _archive_version(archive)
                 if expected_version and version and version != expected_version:
                     raise RuntimeError(
                         f"share holds version {version}, the manifest wants {expected_version}"
                     )
+                published = str((bundle or {}).get("sha256") or "").strip().lower() if isinstance(bundle, dict) else ""
+                if published and _sha256(archive) == published:
+                    # The manifest publishes this archive's own SHA-256: that one
+                    # hash is the integrity proof, no per-file work is needed.
+                    archive_trusted = True
                 _extract_bundle(archive, staging)
                 archive.unlink(missing_ok=True)
-                satisfied = sum(1 for item, relative in remaining if matches(item, relative))
-                logging.info(
-                    "installer: whole package %s from the share "
-                    "(%d/%d files verified, no per-file download for those)",
-                    share.name, satisfied, len(remaining),
-                )
-                remaining = [
-                    (item, relative) for item, relative in remaining
-                    if not matches(item, relative)
-                ]
+                if archive_trusted:
+                    remaining = []
+                else:
+                    with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
+                        verdicts = list(pool.map(lambda entry: matches(*entry), remaining))
+                    satisfied = sum(1 for ok in verdicts if ok)
+                    logging.info(
+                        "installer: whole package %s from the share "
+                        "(%d/%d files verified, no per-file download for those)",
+                        share.name, satisfied, len(remaining),
+                    )
+                    remaining = [entry for entry, ok in zip(remaining, verdicts) if not ok]
                 break
             except Exception as exc:  # noqa: BLE001 - try the next source
                 logging.warning("installer: share %s unusable: %s", mirror, exc)
@@ -340,7 +371,7 @@ def _download_planned_files(
             raise RuntimeError("安装包整包校验失败。")
         _extract_bundle(archive, staging)
         archive.unlink(missing_ok=True)
-        verify_all(remaining)
+        archive_trusted = True
         remaining = []
 
     # 3) One request per file, only for what is still missing.
@@ -367,7 +398,8 @@ def _download_planned_files(
                 future.result()
         fetched_per_file = len(remaining)
 
-    verify_all(planned)
+    # No final sweep: each transport above proved its own output against the
+    # pinned manifest, so re-hashing everything would repeat that work.
     return fetched_per_file
 
 
@@ -535,31 +567,64 @@ class InstallerWindow:
                     continue
                 planned.append((item, relative))
             total = sum(int(item.get("size", 0)) for item, _ in planned)
-            self.events.put(("plan", (len(planned), total)))
+            # An archive install fetches ONE package: telling the operator that
+            # 1,000+ files are downloading was wrong as well as slow-looking.
+            archive_plan = _planned_via_archive(manifest, planned)
+            if archive_plan is not None:
+                self.events.put(("plan", (1, archive_plan)))
+            else:
+                self.events.put(("plan", (len(planned), total)))
             staging = root / "updates" / ("stage-" + uuid.uuid4().hex)
             staging.mkdir(parents=True, exist_ok=True)
             completed = 0
             completed_lock = threading.Lock()
+
+            def on_bytes(count: int) -> None:
+                """Every transport reports through here (archive or per file)."""
+
+                nonlocal completed
+                with completed_lock:
+                    completed += max(0, int(count))
+                    snapshot = completed
+                self.events.put(("bytes", snapshot))
 
             # One tested chain: share archive -> CDN bundle -> per-file.  Every
             # planned file is verified against the pinned manifest's SHA-256
             # before it is moved into app/ below.
             fetched_per_file = _download_planned_files(
                 manifest, planned, staging, token=token, on_bytes=on_bytes,
+                on_archive_size=lambda size: self.events.put(("plan", (1, int(size)))),
             )
             if fetched_per_file:
                 logging.info(
                     "installer: %d file(s) came from per-file requests", fetched_per_file
                 )
+            # The download phase is over: without this the bar sits at the
+            # archive's share of the per-file total while files are moved in.
+            with completed_lock:
+                done_bytes = completed
+            self.events.put(("bytes", max(done_bytes, total)))
             app_root.mkdir(parents=True, exist_ok=True)
-            # Only verified staging output reaches the live folder.
-            for item, relative in planned:
+
+            # Only verified staging output reaches the live folder.  The chain
+            # above already proved every planned file (a parallel sweep, or the
+            # archive's own SHA-256), so moving a file does not hash it again.
+            def move_one(entry: tuple[dict[str, Any], Path]) -> None:
+                item, relative = entry
                 source = staging / relative
-                if not source.is_file() or _sha256(source) != str(item["sha256"]):
-                    raise RuntimeError(f"\u6587\u4ef6\u6821\u9a8c\u5931\u8d25\uff1a{relative}")
+                if not source.is_file():
+                    raise RuntimeError(f"文件缺失：{relative}")
                 target = app_root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source.replace(target)
+
+            if planned:
+                with ThreadPoolExecutor(
+                    max_workers=max(1, min(MAX_DOWNLOAD_WORKERS, len(planned)))
+                ) as pool:
+                    futures = [pool.submit(move_one, entry) for entry in planned]
+                    for future in as_completed(futures):
+                        future.result()
             # Remove files that a previous manifest owned but the current one
             # no longer does.  User folders live outside app/ and are untouched.
             current_paths = {str(item["path"]) for item in files}
@@ -590,7 +655,10 @@ class InstallerWindow:
                     count, total = value
                     self._total_bytes = max(1, total)
                     self.progress.configure(maximum=self._total_bytes, value=0)
-                    self.status.configure(text=f"正在下载 {count} 个已更新文件…")
+                    if count <= 1:
+                        self.status.configure(text="正在下载更新安装包…")
+                    else:
+                        self.status.configure(text=f"正在下载 {count} 个已更新文件…")
                 elif kind == "bytes":
                     self.progress_value = float(value) / float(getattr(self, "_total_bytes", 1))
                     self.progress.configure(value=value)
