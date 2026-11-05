@@ -1,4 +1,4 @@
-"""Resolve a 蓝奏优享 (ilanzou) share link to a direct download URL.
+"""Resolve a lanzou share link (优享 ilanzou or classic lanzoup) to a direct URL.
 
 The flow is the one qaiu/netdisk-fast-download implements in ``IzTool.java`` +
 ``AESUtils.java`` + ``AcwScV2Generator.java``; it was reproduced and verified
@@ -30,12 +30,14 @@ No parser service is required - everything below is stdlib + ``cryptography``.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import http.client
 import json
 import logging
 import os
 import random
+import re
 import ssl
 import string
 import tempfile
@@ -45,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -61,6 +63,10 @@ USER_AGENT = (
 )
 REFERER = "https://www.ilanzou.com/"
 SHARE_HOSTS = ("ilanzou.com", "www.ilanzou.com")
+# Classic lanzou shares: https://wwblt.lanzoup.com/<fileId> (no /s/ segment).
+CLASSIC_HOSTS = (
+    "lanzoup.com", "lanzoux.com", "lanzoui.com", "lanzouw.com", "lanzou.com",
+)
 
 # acw_sc__v2 (edge anti-bot cookie) constants from AcwScV2Generator.java.
 _ACW_POSITION = (
@@ -188,20 +194,231 @@ def _api_post(path: str, *, cookie: str, timeout: float) -> tuple[int, bytes]:
 # --------------------------------------------------------------------------- share
 
 
-def parse_share_url(url: str) -> tuple[str, Optional[str]]:
-    """``https://www.ilanzou.com/s/AbCdE?code=xyz`` -> ``("AbCdE", "xyz")``."""
+def _browser_headers(host: str, referer: str, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": referer or f"https://{host}/",
+        "Host": host,
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _remember_cookies(set_cookie: str, jar: dict[str, str]) -> None:
+    for chunk in (set_cookie or "").split(","):
+        pair = chunk.strip().split(";")[0]
+        if "=" in pair:
+            name, value = pair.split("=", 1)
+            if name.strip():
+                jar[name.strip()] = value.strip()
+
+
+def _jar_header(jar: dict[str, str]) -> str:
+    return "; ".join(f"{name}={value}" for name, value in jar.items())
+
+
+def _http(
+    host: str, path: str, *, method: str = "GET", body: Optional[bytes] = None,
+    cookie: str = "", referer: str = "",
+    extra: Optional[dict[str, str]] = None, timeout: float = 30.0,
+    read_limit: int = 0,
+) -> tuple[int, bytes, dict[str, str]]:
+    """One request to a share/CDN host, gzip decoded.
+
+    Every lanzou host this module talks to gzips its HTML even when the request
+    did not ask for it; without this the 2 KB anti-bot page looked like binary
+    junk and the parser reported "no sign found".
+    """
+
+    context = ssl.create_default_context()
+    connection = http.client.HTTPSConnection(host, 443, context=context, timeout=timeout)
+    try:
+        headers = _browser_headers(host, referer, extra)
+        if body is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if cookie:
+            headers["Cookie"] = cookie
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        raw = response.read(read_limit) if read_limit else response.read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        info = {
+            "location": response.getheader("Location") or "",
+            "set_cookie": response.getheader("Set-Cookie") or "",
+            "content_range": response.getheader("Content-Range") or "",
+            "content_length": response.getheader("Content-Length") or "",
+            "content_type": response.getheader("Content-Type") or "",
+        }
+        return response.status, raw, info
+    finally:
+        connection.close()
+
+
+def _solve_challenge(raw: bytes, jar: dict[str, str], host: str) -> bool:
+    """Solve acw_sc__v2 into ``jar`` when ``raw`` is the challenge page."""
+
+    if b"var arg1=" not in raw:
+        return False
+    text = raw.decode("utf-8", "replace")
+    arg1 = text.split("var arg1='", 1)[1].split("'", 1)[0]
+    jar["acw_sc__v2"] = _acw_sc_v2(arg1)
+    LOG.info("lanzou: solved acw_sc__v2 for %s", host)
+    return True
+
+
+def _page(host: str, path: str, *, jar: dict[str, str], referer: str = "") -> tuple[int, str]:
+    """GET a page, solving the anti-bot challenge once if it appears."""
+
+    status, raw, info = _http(host, path, cookie=_jar_header(jar), referer=referer)
+    _remember_cookies(info["set_cookie"], jar)
+    if _solve_challenge(raw, jar, host):
+        status, raw, info = _http(host, path, cookie=_jar_header(jar), referer=referer)
+        _remember_cookies(info["set_cookie"], jar)
+    return status, raw.decode("utf-8", "replace")
+
+
+def _js_value(page: str, name: str) -> Optional[str]:
+    for pattern in (rf"var\s+{name}\s*=\s*'([^']*)'", rf'var\s+{name}\s*=\s*"([^"]*)"'):
+        match = re.search(pattern, page)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _range_total(content_range: str) -> int:
+    tail = (content_range or "").rsplit("/", 1)
+    if len(tail) == 2 and tail[1].strip().isdigit():
+        return int(tail[1].strip())
+    return 0
+
+
+def _follow_cdn(url: str, *, jar: dict[str, str], referer: str, hops: int = 6) -> tuple[str, int]:
+    """Walk the challenge/redirect chain to the CDN URL and its real size."""
+
+    for _hop in range(hops):
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not parts.hostname:
+            raise LanzouError(f"蓝奏直链无效: {url[:120]}")
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        status, raw, info = _http(
+            parts.hostname, path, cookie=_jar_header(jar), referer=referer,
+            extra={"Range": "bytes=0-0", "Accept": "*/*"}, read_limit=65536,
+        )
+        _remember_cookies(info["set_cookie"], jar)
+        if _solve_challenge(raw, jar, parts.hostname or ""):
+            continue
+        location = info["location"]
+        if status in (301, 302, 303, 307, 308) and location:
+            url = urljoin(url, location)
+            continue
+        total = _range_total(info["content_range"])
+        if not total and status == 200 and info["content_length"].isdigit():
+            if "html" not in info["content_type"]:
+                total = int(info["content_length"])
+        if status in (200, 206) and total:
+            return url, total
+        raise LanzouError(f"蓝奏直链返回 HTTP {status}")
+    raise LanzouError("蓝奏直链跳转次数过多")
+
+
+def _resolve_classic(host: str, share_id: str, code: Optional[str]) -> ShareFile:
+    """Classic share (lanzoup.com/<id>) -> direct CDN URL."""
+
+    jar: dict[str, str] = {}
+    status, page = _page(host, f"/{share_id}", jar=jar)
+    if status != 200:
+        raise LanzouError(f"蓝奏分享页返回 HTTP {status}")
+    if 'id="pwd"' in page or 'name="pwd"' in page:
+        raise LanzouError("该蓝奏分享带提取码，请改用无提取码的分享链接")
+
+    title = re.search(r"<title>(.*?)</title>", page)
+    name = (title.group(1).strip() if title else "") or f"{share_id}.bin"
+    file_id_match = re.search(r"/q/jb/\?f=(\d+)", page)
+    file_id = file_id_match.group(1) if file_id_match else ""
+    size_match = re.search(r"文件大小：([0-9.]+)\s*([KMG])", page)
+    size_hint = 0
+    if size_match:
+        scale = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[size_match.group(2)]
+        size_hint = int(float(size_match.group(1)) * scale)
+
+    iframe = re.search(r'<iframe[^>]+src="([^"]+)"', page)
+    if not iframe:
+        raise LanzouError("蓝奏分享页没有下载入口（可能是文件夹分享）")
+    frame_path = iframe.group(1).replace("&amp;", "&")
+
+    referer = f"https://{host}/{share_id}"
+    status, frame = _page(host, frame_path, jar=jar, referer=referer)
+    if status != 200:
+        raise LanzouError(f"蓝奏下载页返回 HTTP {status}")
+    wp_sign = _js_value(frame, "wp_sign")
+    ajaxdata = _js_value(frame, "ajaxdata") or ""
+    kdns = _js_value(frame, "kdns") or "1"
+    domain = re.search(r"var\s+domain1\s*=\s*'([^']+)'", frame)
+    api = domain.group(1) if domain else ""
+    if not api and file_id:
+        api = f"https://apifile.woozooo.com/ajaxfile.php?file={file_id}"
+    if not wp_sign or not api:
+        raise LanzouError("蓝奏下载页结构已变化，无法解析 sign")
+
+    target = urlsplit(api)
+    form = {
+        "action": "downprocess",
+        "websignkey": ajaxdata,
+        "signs": ajaxdata,
+        "sign": wp_sign,
+        "websign": "",
+        "kd": kdns,
+        "ves": "1",
+    }
+    status, raw, _info = _http(
+        target.hostname or "", (target.path or "/") + (f"?{target.query}" if target.query else ""),
+        method="POST", body=urlencode(form).encode("utf-8"),
+        cookie=_jar_header(jar), referer=referer,
+    )
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise LanzouError(f"蓝奏直链接口返回非 JSON (HTTP {status})") from exc
+    if str(payload.get("zt")) != "1":
+        raise LanzouError(f"蓝奏直链获取失败: {payload.get('inf') or payload}")
+    direct = str(payload.get("dom") or "").rstrip("/") + "/file/" + str(payload.get("url") or "")
+    if code:
+        LOG.info("lanzou: classic share declares a password; it is not used by this flow")
+
+    final_url, total = _follow_cdn(direct, jar=jar, referer=referer)
+    LOG.info(
+        "lanzou: classic share %s -> %s (%.1f MB)",
+        share_id, urlsplit(final_url).hostname, total / 1024 / 1024,
+    )
+    return ShareFile(
+        name=name, size=total or size_hint, direct_url=final_url,
+        file_id=file_id, user_id="", password=code,
+    )
+
+
+def parse_share_url(url: str) -> tuple[str, str, str, Optional[str]]:
+    """Share link -> ``(kind, host, key, code)`` with kind "youxiang" or "classic"."""
 
     parts = urlsplit(url.strip())
-    if parts.hostname is None or not any(
-        parts.hostname.endswith(host) for host in SHARE_HOSTS
-    ):
-        raise LanzouError(f"不是蓝奏优享分享链接: {url}")
+    host = parts.hostname or ""
+    if not host:
+        raise LanzouError(f"不是蓝奏分享链接: {url}")
     segments = [segment for segment in parts.path.split("/") if segment]
-    if len(segments) < 2 or segments[0] != "s":
-        raise LanzouError(f"链接中没有分享标识: {url}")
-    share_key = segments[1]
-    code = (parse_qs(parts.query).get("code") or [None])[0]
-    return share_key, (code.strip() or None) if code else None
+    if any(host == known or host.endswith("." + known) for known in SHARE_HOSTS):
+        if len(segments) < 2 or segments[0] != "s":
+            raise LanzouError(f"链接中没有分享标识: {url}")
+        code = (parse_qs(parts.query).get("code") or [None])[0]
+        return "youxiang", host, segments[1], (code.strip() or None) if code else None
+    if any(host == known or host.endswith("." + known) for known in CLASSIC_HOSTS):
+        if not segments:
+            raise LanzouError(f"链接中没有分享标识: {url}")
+        code = (parse_qs(parts.query).get("pwd") or [None])[0]
+        return "classic", host, segments[0], (code.strip() or None) if code else None
+    raise LanzouError(f"不是蓝奏分享链接: {url}")
 
 
 def resolve(
@@ -209,8 +426,10 @@ def resolve(
 ) -> ShareFile:
     """Share link -> the direct URL of the (single) file it holds."""
 
-    share_key, url_code = parse_share_url(share_url)
+    kind, host, share_key, url_code = parse_share_url(share_url)
     code = password if password is not None else url_code
+    if kind == "classic":
+        return _resolve_classic(host, share_key, code)
     uuid = _new_uuid()
     ts = encode_hex(str(int(time.time() * 1000)))
 

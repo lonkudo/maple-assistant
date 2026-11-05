@@ -83,6 +83,10 @@ MIRRORS_FILE = "installer_mirrors.json"
 # only cost the fallback - never a wrong install.  Update this URL per release,
 # or override it with installer_mirrors.json next to the installer.
 DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
+    # The operator's VIP upload (classic lanzou share).  The manifest's own
+    # VERSION gate still decides: a share holding another version is rejected
+    # before anything is extracted, and the next source is tried.
+    "https://wwblt.lanzoup.com/iiLxV4esmo5i",
     "https://www.ilanzou.com/s/1DnyKoclO?code=ru3v",
 )
 # Encoding for the generated .bat launcher; see _write_launcher().
