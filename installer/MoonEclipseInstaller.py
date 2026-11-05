@@ -69,6 +69,13 @@ MAX_DOWNLOAD_WORKERS = 8
 # never be used for a small update.  Only plan files this large, and at least
 # half the archive, take the bundle path.
 BUNDLE_MIN_BYTES = 24 * 1024 * 1024
+# A share link is fetched as ONE archive, so it is only worth the extra resolve
+# when the manifest would otherwise hand out many per-file requests.  Below this
+# the ordinary per-file path is cheaper than a 90 MB whole package.
+SHARE_MIN_FILES = 64
+# Share links the operator can drop beside the installer, so the fast path works
+# without a server-side manifest change: {"shares": ["https://www.ilanzou.com/s/..."]}
+MIRRORS_FILE = "installer_mirrors.json"
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
 # Folder created on the Desktop for a first install.
@@ -164,6 +171,53 @@ def _bundle_worth_it(bundle: dict[str, Any], planned_bytes: int) -> bool:
     if not str(bundle.get("name") or "") or size <= 0:
         return False
     return planned_bytes >= max(BUNDLE_MIN_BYTES, size // 2)
+
+
+def _share_sources(manifest: dict[str, Any]) -> list[str]:
+    """Share links the installer may fetch the whole package from.
+
+    Three places are honoured, most authoritative first:
+
+    1. ``manifest["mirrors"]``          - what the pinned origin issued;
+    2. ``manifest["bundle"]["mirrors"]`` - the same list beside the bundle entry;
+    3. ``installer_mirrors.json``        - ``{"shares": [...]}`` dropped next to
+       the installer (or the app root), so an operator can point the installer
+       at a fresh share without a server change.
+
+    Only ``http(s)`` share URLs are returned; the pinned origin's per-file
+    SHA-256 values remain the only authority on what gets installed.
+    """
+
+    found: list[str] = []
+
+    def add(values: Any) -> None:
+        if not isinstance(values, (list, tuple)):
+            return
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+                if text.startswith("http://") or text.startswith("https://"):
+                    if text not in found:
+                        found.append(text)
+
+    add(manifest.get("mirrors"))
+    bundle = manifest.get("bundle")
+    if isinstance(bundle, dict):
+        add(bundle.get("mirrors"))
+    for folder in (PIN_ROOT, Path(sys.argv[0]).resolve().parent, HERE):
+        candidate = folder / MIRRORS_FILE
+        try:
+            if not candidate.is_file():
+                continue
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            add(data.get("shares"))
+    if found:
+        logging.info("installer: %d share source(s) available: %s",
+                     len(found), ", ".join(found))
+    return found
 
 
 def _extract_bundle(archive: Path, target_root: Path) -> None:
@@ -435,27 +489,71 @@ class InstallerWindow:
                     attempts.append("server: ok")
                 if attempts:
                     logging.info("installer bundle sources: %s", "; ".join(attempts))
-                if attempts:
-                    logging.info("installer bundle sources: %s", "; ".join(attempts))
                 if (archive.stat().st_size != int(bundle.get("size", 0))
                         or _sha256(archive) != str(bundle.get("sha256", ""))):
                     raise RuntimeError("安装包整包校验失败。")
                 _extract_bundle(archive, staging)
                 archive.unlink(missing_ok=True)
 
+            def staged_matches(item: dict[str, Any], relative: Path) -> bool:
+                """True when staging already holds this exact file."""
+
+                staged = staging / relative
+                return staged.is_file() and _sha256(staged) == str(item["sha256"])
+
             bundle = manifest.get("bundle")
-            if planned and isinstance(bundle, dict) and _bundle_worth_it(bundle, total):
+            shares = _share_sources(manifest)
+            remaining = list(planned)
+
+            # 1) Whole package from a share link.  A manifest that advertises
+            #    1,000+ files is exactly the case this exists for: one 93 MB
+            #    archive over 8 ranges replaces every per-file request.  The
+            #    per-file SHA-256 the pinned origin issued still decides what may
+            #    be installed - anything the archive does not match stays in
+            #    ``remaining`` and is fetched the normal way.
+            if (remaining and shares and lanzou_download is not None
+                    and (len(remaining) >= SHARE_MIN_FILES
+                         or total >= BUNDLE_MIN_BYTES)):
+                archive = staging / "bundle.zip"
+                for mirror in shares:
+                    try:
+                        share = lanzou_resolve(mirror)
+                        lanzou_download(share, archive, parts=8, progress=on_bytes)
+                        _extract_bundle(archive, staging)
+                        archive.unlink(missing_ok=True)
+                        satisfied = sum(
+                            1 for item, relative in remaining
+                            if staged_matches(item, relative)
+                        )
+                        logging.info(
+                            "installer: whole package %s from the share "
+                            "(%d/%d files verified, no per-file download for those)",
+                            share.name, satisfied, len(remaining),
+                        )
+                        remaining = [
+                            (item, relative) for item, relative in remaining
+                            if not staged_matches(item, relative)
+                        ]
+                        break
+                    except Exception as exc:  # noqa: BLE001 - try the next source
+                        logging.warning("installer: share %s unusable: %s", mirror, exc)
+
+            # 2) The CDN bundle, when the manifest offers one and it saves bytes.
+            if remaining and isinstance(bundle, dict) and _bundle_worth_it(bundle, total):
                 # One request instead of one per file, carrying 37% of the bytes.
                 fetch_bundle()
-                # The archive is only transport, so every planned file must still
-                # match the per-file SHA-256 the pinned origin issued.
-                for item, relative in planned:
-                    staged = staging / relative
-                    if not staged.is_file() or _sha256(staged) != str(item["sha256"]):
-                        raise RuntimeError(f"文件校验失败：{relative}")
-            else:
+                missing = [
+                    relative for item, relative in remaining
+                    if not staged_matches(item, relative)
+                ]
+                if missing:
+                    raise RuntimeError(f"文件校验失败：{missing[0]}")
+                remaining = []
+
+            # 3) Whatever is still missing, one request per file.
+            if remaining:
                 with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as pool:
-                    futures = [pool.submit(fetch, item, relative) for item, relative in planned]
+                    futures = [pool.submit(fetch, item, relative) for item, relative in remaining]
                     for future in as_completed(futures):
                         future.result()
             self.events.put(("bytes", total))
@@ -463,6 +561,8 @@ class InstallerWindow:
             # Only verified staging output reaches the live folder.
             for item, relative in planned:
                 source = staging / relative
+                if not staged_matches(item, relative):
+                    raise RuntimeError(f"文件校验失败：{relative}")
                 target = app_root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source.replace(target)
