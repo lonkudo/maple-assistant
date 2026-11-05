@@ -83,14 +83,12 @@ MIRRORS_FILE = "installer_mirrors.json"
 # only cost the fallback - never a wrong install.  Update this URL per release,
 # or override it with installer_mirrors.json next to the installer.
 DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
-    # QQ 邮箱文件中转站 upload.  The manifest's own VERSION gate still decides:
-    # a share holding another version is rejected before anything is extracted,
-    # and the next source is tried.  中转站 links expire, which is exactly why
-    # the next two are kept.
+    # QQ 邮箱文件中转站 upload, the only built-in source.  The manifest's own
+    # VERSION gate still decides: an archive holding another version is rejected
+    # before anything is extracted.  With no fallback left, an expired 中转站
+    # link (they last ~30 days) fails the archive step and the installer falls
+    # back to per-file requests from the pinned origin, which still installs.
     "https://wx.mail.qq.com/s?k=oSi9hR7qY0Qlu10Gcb",
-    # The operator's VIP upload (classic lanzou share).
-    "https://wwblt.lanzoup.com/iiLxV4esmo5i",
-    "https://www.ilanzou.com/s/1DnyKoclO?code=ru3v",
 )
 # Encoding for the generated .bat launcher; see _write_launcher().
 LAUNCHER_ENCODING = "gbk"
