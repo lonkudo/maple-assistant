@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import queue
+import shutil
 import signal
 import sys
 import threading
@@ -353,6 +354,48 @@ def _clear_previous_log_files() -> None:
         except OSError:
             pass
     print(f"[startup] cleared {removed} previous log file(s)")
+
+
+def _migrate_recording_assets_out_of_config(
+    configuration_root: Path, package_root: Path,
+) -> Path:
+    """Keep generated map references out of the shareable config folder.
+
+    ``助手配置`` is intentionally exportable JSON only.  Older releases wrote
+    image references and map-name caches below it, so move those files once to
+    the private root-level runtime data tree.  Each move is per-file and
+    replace-based: a stopped migration leaves either the old or new complete
+    file, never a partially-written reference.
+    """
+
+    source = configuration_root / "recording-assets"
+    target = package_root / "data" / "recording-assets"
+    if not source.is_dir():
+        return target
+    try:
+        for path in sorted(source.rglob("*")):
+            if not path.is_file():
+                continue
+            destination = target / path.relative_to(source)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(destination))
+        for directory in sorted(
+            (entry for entry in source.rglob("*") if entry.is_dir()),
+            key=lambda entry: len(entry.parts), reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            source.rmdir()
+        except OSError:
+            pass
+        logging.info("recording assets migrated from 助手配置 to root data folder")
+    except OSError:
+        logging.warning("recording-assets migration deferred; preserving old files", exc_info=True)
+        return source
+    return target
 
 
 def main() -> int:
@@ -899,16 +942,18 @@ def main() -> int:
         else config_store,
     )
     configuration_root = profile_path.parent
+    recording_assets_root = _migrate_recording_assets_out_of_config(
+        configuration_root, application_root(__file__),
+    )
     structure_reference = (
-        configuration_root
-        / "recording-assets"
+        recording_assets_root
         / "map-structure-reference.jpg"
     )
     structure_tracker = MapStructureTracker(
         structure_reference, tracking_size=OPENCV_ANALYSIS_SIZE[0]
     )
     map_identity_store = MapIdentityStore(
-        configuration_root / "recording-assets" / "map-names"
+        recording_assets_root / "map-names"
     )
 
     def stop_patrol_for_disconnect() -> None:
@@ -985,7 +1030,8 @@ def main() -> int:
     def prepare_map_session(*, stationary_reanchor: bool = True, show_overlays: bool = True,
                             show_startup_marker: bool = False,
                             require_layer: bool = True,
-                            reconnect_restart: bool = False) -> None:
+                            reconnect_restart: bool = False,
+                            draw_bands: bool = True) -> None:
         """Verify the recorded map name and re-anchor transient world Y.
 
         ``stationary_reanchor`` is False for an AUTOMATIC patrol resume: 站桩攻击
@@ -1001,8 +1047,13 @@ def main() -> int:
         so the movement worker's out-of-route return logic can bring it back.
 
         ``show_startup_marker`` draws only the manual-start geometry and a
-        short marker crosshair.  It deliberately does not draw layer bands or
-        wait for a clean overlay-free capture, so the patrol does not freeze.
+        short marker crosshair.  It deliberately does not draw layer bands.
+
+        ``draw_bands`` draws the layer-Y bands for a manual start.  They render
+        on their own thread (``wait_until_hidden=False``) for their 2.2 s and
+        never block arming the patrol, so calibration feedback costs nothing at
+        start-up.  The automatic resumes pass False: nobody is watching them and
+        an overlay window during automatic recovery is only risk.
 
         The old ``abort_event`` hook (a lie takeover abandoning this session) is
         gone with the local lie pass.
@@ -1553,29 +1604,19 @@ def main() -> int:
                 detection.analysis_box,
                 patrol_point_overlay,
             )
-        if show_overlays:
+        if draw_bands or show_overlays:
+            # Concurrent on purpose: ``wait_until_hidden=False`` renders the
+            # bands on their own thread for their 2.2 s and returns at once, so
+            # the patrol arms immediately.  The old blocking variant waited for
+            # the overlay and for a clean recapture, which is why band drawing
+            # had been switched off for manual starts.
             screen_blinker.show_layer_bands(
                 fresh_frame.window_rect,
                 fresh_frame.image.size,
                 detection.analysis_box,
                 layer_bands,
-                # The screen-capture backend can include these translucent
-                # bands.  Do not arm movement until they are gone; otherwise
-                # the first live marker frames may be obscured and the patrol
-                # appears not to have started.
-                wait_until_hidden=True,
+                wait_until_hidden=False,
             )
-            # The overlay can be captured by desktop-based backends, so only
-            # when it was actually shown do we wait for it and publish a clean
-            # post-overlay frame. Manual patrol starts deliberately skip this
-            # optional visual step: it used to make a successful Start Patrol
-            # stand still for several seconds after its success sound.
-            try:
-                capture_worker.capture_now(timeout=2.0)
-            except TimeoutError:
-                logging.warning(
-                    "LAYER BAND OVERLAY: clean post-overlay capture timed out"
-                )
         if marker is None:
             raise OSError(
                 "巡逻启动时未检测到黄色角色标记"
@@ -1774,6 +1815,7 @@ def main() -> int:
                 prepare_map_session(
                     stationary_reanchor=False,
                     show_overlays=False,
+                    draw_bands=False,
                     require_layer=False,
                     reconnect_restart=True,
                 )
@@ -2059,6 +2101,7 @@ def main() -> int:
             prepare_map_session(
                 stationary_reanchor=False,
                 show_overlays=False,
+                draw_bands=False,
                 require_layer=False,
                 reconnect_restart=True,
             )
@@ -2194,7 +2237,7 @@ def main() -> int:
         )
 
     def _on_disconnect_event() -> None:
-        """掉线: immediately dispatch reconnect, then begin diagnostic recording."""
+        """掉线: immediately dispatch the reconnect workflow."""
 
         try:
             accepted = reconnect_worker.notify_disconnect()
@@ -2205,10 +2248,6 @@ def main() -> int:
             )
         except Exception:
             logging.warning("auto reconnect notify failed", exc_info=True)
-        try:
-            screenshot_recorder.on_disconnect()
-        except Exception:
-            logging.warning("disconnect screenshot recorder failed", exc_info=True)
 
     def save_recording_minimap_calibration(snapshot: object) -> None:
         """Publish recording's verified border for independent patrol use."""
@@ -2262,7 +2301,9 @@ def main() -> int:
         interval_hours=1.0,
         flash_callback=screen_blinker.request_blink,
         alert_callback=telegram_notifier.notify,
-        event_callback=screenshot_recorder.on_countdown,
+        # Countdown/loop reminders do not create screenshots or MP4s.  The
+        # recorder is reserved for an actual lie-window investigation.
+        event_callback=None,
     )
     lie_detector_worker = LieDetectorWorker(
         lie_detector_frames,
@@ -2858,18 +2899,9 @@ def main() -> int:
         return bool(ui_worker is not None and ui_worker.request_cancel_auto_lie_pass())
 
     def cancel_auto_reconnect() -> bool:
-        """Cancel the whole reconnect mission and discard its offline diagnostic."""
+        """Cancel the whole reconnect mission without creating diagnostics."""
 
-        cancelled = reconnect_worker.request_cancel()
-        if cancelled:
-            try:
-                screenshot_recorder.cancel_disconnect()
-            except Exception:
-                logging.debug(
-                    "auto reconnect: cancelled offline recording could not be discarded",
-                    exc_info=True,
-                )
-        return bool(cancelled)
+        return bool(reconnect_worker.request_cancel())
 
     workflow_cancel_worker = WorkflowCancelWorker(
         stop_event,

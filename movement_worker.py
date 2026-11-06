@@ -312,6 +312,9 @@ UNRESOLVED_EDGE_HOLD_SECONDS = 5.0
 UNRESOLVED_DROP_MAX_EDGE_CYCLES = 3
 UNRESOLVED_DROP_MAX_ATTEMPTS = 12
 
+# A recorded support point is extra ground evidence, not a route action.  It
+# extends the layer's accepted Y rows across the whole map.
+
 # Landing confirmation for the drop-to-route return (``_drop_landing_floor``).
 # A drop can land the character on a floor whose recorded Y band cannot contain
 # the reading, because the marker stands away from the recorded row - the
@@ -965,6 +968,16 @@ def _layer_world_anchor_at_x(layer: Any, player_x: Optional[float]) -> Optional[
 # still on the rope, and then horizontal patrol pulled it off").
 LAYER_CURRENT_Y_GRACE = 0.012
 
+# Extra lower-side grace used only by the ordinary, settled floor resolver.
+# A live marker can sit two or three rows below the endpoint row recorded on
+# the same long/uneven platform.  That must not widen ``_layer_y_band`` itself:
+# climb arrival, rope attachment and fall reconciliation deliberately require
+# that strict band so that a passing marker cannot claim a floor in mid-air.
+# The ordinary resolver applies this 0.020 normalized-Y allowance only when no
+# vertical action owns the character.  It is therefore a "standing floor"
+# recovery, not an arrival rule.
+LAYER_LANDED_Y_GRACE = 0.020
+
 # A nearest-recorded-Y answer is a small visual-quantisation fallback, not a
 # substitute for floor identity after a fall.  Five marker rows comfortably
 # covers an unsampled end of a bench/stair platform (the use case for this
@@ -1048,6 +1061,70 @@ def detect_layer_by_y(
 
     candidates = _layer_y_candidates(player_y, layers)
     return candidates[0] if candidates else None
+
+
+def detect_landed_layer_by_y(
+    player_y: float,
+    layers: dict[str, Any],
+) -> Optional[str]:
+    """Return a settled floor just below its strict marker band.
+
+    This is intentionally separate from :func:`detect_layer_by_y`.  The
+    latter remains the strict primitive used by climb/fall paths.  A landed
+    character can render a few minimap rows below the recorded supporter on a
+    sloped or long platform; accepting that narrow lower-only extension avoids
+    incorrectly declaring an otherwise stationary character unresolved.
+    """
+
+    candidates: list[tuple[float, str]] = []
+    for name, layer in layers.items():
+        if not isinstance(layer, dict):
+            continue
+        tolerance = float(layer.get("y_tolerance", 0.020000))
+        band = _layer_y_band(layer, tolerance)
+        if band is None:
+            continue
+        # Strict matches belong to detect_layer_by_y().  This helper only
+        # handles the small region immediately *below* a saved floor band.
+        if not (band[1] < player_y <= band[1] + LAYER_LANDED_Y_GRACE):
+            continue
+        distance = _layer_y_distance(layer, player_y)
+        if distance is not None:
+            candidates.append((distance, name))
+    return min(candidates)[1] if candidates else None
+
+
+def detect_layer_by_support_point(
+    player_y: float, layers: dict[str, Any],
+) -> Optional[str]:
+    """Return a layer whose support-point Y row contains the marker.
+
+    Support points are deliberately horizontal: their Y envelope is valid at
+    every X on the map.  They still do not create a patrol action or target.
+    """
+
+    candidates: list[tuple[float, str]] = []
+    for name, layer in layers.items():
+        if not isinstance(layer, dict):
+            continue
+        points = layer.get("support_points")
+        if not isinstance(points, list):
+            continue
+        tolerance = max(0.0, float(layer.get("y_tolerance", 0.020000)))
+        row = _layer_marker_row(layer) or LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
+        lower_grace = max(tolerance / 3.0, row)
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            try:
+                point_y = float(point["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            upper = point_y - tolerance * LAYER_UP_REACH_FACTOR
+            lower = point_y + lower_grace
+            if upper - 1e-9 <= float(player_y) <= lower + 1e-9:
+                candidates.append((abs(float(player_y) - point_y), name))
+    return min(candidates)[1] if candidates else None
 
 
 def detect_layer_by_world_y(
@@ -5757,18 +5834,14 @@ class MovementWorker(threading.Thread):
         self._jump_point_y_samples.append(current_y)
         if len(self._jump_point_y_samples) > JUMP_POINT_LANDING_STABLE_FRAMES:
             del self._jump_point_y_samples[:-JUMP_POINT_LANDING_STABLE_FRAMES]
-        layer = None
-        if self._jump_point_candidate is not None:
-            layer = self.important_positions.get(self._jump_point_candidate[0])
-        marker_row = _layer_marker_row(layer) if layer is not None else None
-        upward_landing_required = max(0.003, (marker_row or 0.007) * 0.5)
-        settled_on_higher_floor = bool(
-            self._jump_point_start_y is not None
-            and self._jump_point_start_y - current_y >= upward_landing_required
-        )
+        # Two stable frames end the claim.  Requiring the landing to be 0.003
+        # higher than take-off (``settled_on_higher_floor``) was meant to spot a
+        # failed jump, but it also kept Up held for the whole 3 s window when the
+        # character settled back on its own floor - the operator's "it keeps
+        # pressing up after a failed jump".  Stability is the rule now; the
+        # rise is reported for diagnosis only.
         if (len(self._jump_point_y_samples) == JUMP_POINT_LANDING_STABLE_FRAMES
-                and max(self._jump_point_y_samples) - min(self._jump_point_y_samples) <= 0.001
-                and settled_on_higher_floor):
+                and max(self._jump_point_y_samples) - min(self._jump_point_y_samples) <= 0.001):
             # End this jump-point session: release OUR claim on Up (one owner
             # reference) and stop sampling.  When the climb state machine still
             # holds its own reference the key physically stays down - which is
@@ -5800,8 +5873,14 @@ class MovementWorker(threading.Thread):
             else:
                 if self.climbing_active_event is not None:
                     self.climbing_active_event.clear()
+                rise = (
+                    self._jump_point_start_y - current_y
+                    if self._jump_point_start_y is not None else 0.0
+                )
                 LOG.info(
-                    "JUMP POINT landing Y settled; released Up and resumed patrol"
+                    "JUMP POINT: two stable Y frames at %.6f (rise from take-off "
+                    "%.4f); released Up and resumed patrol",
+                    current_y, rise,
                 )
 
     def perform_queued_stair_jump(self, direction: str) -> bool:
@@ -7206,6 +7285,12 @@ class MovementWorker(threading.Thread):
 
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = self._stationary_detection_layers(self._route_layers)
+        if observation.player is not None:
+            supported = detect_layer_by_support_point(
+                observation.player.y, layers,
+            )
+            if supported is not None:
+                return supported
         # The temporary stationary point is a session-only layer supporter.
         # Give its widened band precedence over the persisted profile so the
         # row the operator stands on cannot become "no layer" while the
@@ -7224,6 +7309,32 @@ class MovementWorker(threading.Thread):
         # repeated platform and report the previous floor after a good climb.
         if len(marker_candidates) == 1:
             return marker_candidates[0]
+
+        def settled_marker_recovery() -> Optional[str]:
+            """Use the relaxed landed-floor row only outside vertical motion.
+
+            In particular, no rope climb, jump-point Up hold, pending fall, or
+            route return may enter through this recovery.  Those paths own
+            their stricter arrival/landing confirmations.
+            """
+
+            if (observation.player is None
+                    or self._climb_state.up_held
+                    or self._jump_point_up_held
+                    or self._fall_pending
+                    or self._return_mode is not None
+                    or self._descending_to_first):
+                return None
+            landed = detect_landed_layer_by_y(
+                observation.player.y, layers,
+            )
+            if landed is not None:
+                LOG.info(
+                    "LAYER landed-row grace: marker y=%.6f is just below "
+                    "%s's strict band; reporting %s",
+                    observation.player.y, landed, landed,
+                )
+            return landed
         has_world_calibration = any(
             isinstance(layer, dict) and "layer_world_y" in layer
             for layer in layers.values()
@@ -7259,6 +7370,9 @@ class MovementWorker(threading.Thread):
                         observation.player.y, bottom, bottom,
                     )
                     return bottom
+                landed = settled_marker_recovery()
+                if landed is not None:
+                    return landed
                 # This is only a nearby marker-quantisation recovery.  An
                 # unbounded nearest choice can report the old route floor
                 # while the character is falling through one or more other
@@ -7290,6 +7404,9 @@ class MovementWorker(threading.Thread):
                 observation.player.y, bottom, bottom,
             )
             return bottom
+        landed = settled_marker_recovery()
+        if landed is not None:
+            return landed
         nearest = self._nearest_floor_by_marker_y(
             observation.player.y,
             self._landing_candidate_layers(),
@@ -11011,7 +11128,8 @@ class MovementWorker(threading.Thread):
     ) -> tuple[Optional[str], Optional[str]]:
         """``_detect_floor_all`` plus the evidence that produced the answer.
 
-        The source is ``"marker"`` (the marker's own recorded band), ``"world"``
+        The source is ``"marker"`` (the marker's own recorded band), ``"support"``
+        (a local marker support point), ``"world"``
         (the scroll-compensated world Y) or ``"bottom"`` (the at/below-bottom
         rule).  Only marker and bottom evidence describe a floor the character is
         actually standing on, so only those may re-anchor the world-Y origin
@@ -11020,6 +11138,11 @@ class MovementWorker(threading.Thread):
 
         layers = self._landing_candidate_layers()
         if observation.player is not None:
+            supported = detect_layer_by_support_point(
+                observation.player.y, layers,
+            )
+            if supported is not None:
+                return supported, "support"
             name = detect_layer_by_y(observation.player.y, layers)
             if name is not None:
                 return name, "marker"
@@ -11384,13 +11507,17 @@ class MovementWorker(threading.Thread):
         # deliberately not consulted: it can claim a floor the marker is nowhere
         # near, and such a floor cannot be walked to anyway.
         layers = self._landing_candidate_layers()
+        support_floor = (
+            detect_layer_by_support_point(y, layers) if layers else None
+        )
         band_floor = detect_layer_by_y(y, layers) if layers else None
-        if band_floor is not None or self._marker_near_recorded_floor(y, layers):
+        if (support_floor is not None or band_floor is not None
+                or self._marker_near_recorded_floor(y, layers)):
             if self._unresolved_drop_attempts:
                 LOG.info(
                     "UNRESOLVED FLOOR: the marker resolved as %s after %d "
                     "layer-change attempt(s); resuming normal routing",
-                    band_floor or "a nearby recorded floor",
+                    support_floor or band_floor or "a nearby recorded floor",
                     self._unresolved_drop_attempts,
                 )
             self._reset_unresolved_drop_recovery()
@@ -12001,7 +12128,7 @@ class MovementWorker(threading.Thread):
                     "keeping the current route state"
                 )
             return False
-        if source in ("marker", "bottom"):
+        if source in ("marker", "support", "bottom"):
             # Only marker/bottom evidence describes a floor the character is
             # actually standing on: re-anchor the world-Y origin there (and trust
             # the scroll-compensated value again).
@@ -16647,6 +16774,7 @@ __all__ = [
     "climb",
     "detect_marker",
     "detect_layer_by_y",
+    "detect_landed_layer_by_y",
     "detect_layer_by_world_y",
     "move_towards_rope",
     "move_to_left_most",
