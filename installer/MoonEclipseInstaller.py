@@ -86,7 +86,7 @@ DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
     # that never changes, use a location the operator can overwrite (GitHub
     # releases/latest/download/..., object storage, or their own server) and put
     # it here or in installer_mirrors.json - plain https URLs resolve directly.
-    "https://wx.mail.qq.com/s?k=tBb4hR7GcGMyKt0kpE",
+    "https://wx.mail.qq.com/s?k=_BLq_GPMNkE5OfMa6g",
 )
 # Folder created on the Desktop for a first install.
 DEFAULT_FOLDER_NAME = "MoonEclipse"
