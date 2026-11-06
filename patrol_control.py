@@ -22,9 +22,15 @@ def _layer_point_ys(layer: Any) -> list[float]:
 
 
 # The same upper-band factor as ``movement_worker.LAYER_UP_REACH_FACTOR`` (the operator, 2026-09-18:
-# "narrow down layer upper band a little bit, make it 0.7").  The bands must mean the same thing in both
-# modules: this one answers the panel's "is the marker on a recorded layer" question.
+# "narrow down layer upper band a little bit, make it 0.7").  Kept for reference: the band
+# edges are now built from ``LAYER_BAND_EDGE_REACH``.
 LAYER_UP_REACH_FACTOR = 0.7
+
+# Band edge reach around the recorded envelope, in normalised minimap Y.  The
+# previous rule scaled the upper side by 0.7 * y_tolerance (0.014) and the lower
+# side by max(y_tolerance / 3, one marker row) (0.008772 on a 114-px minimap);
+# this experiment uses a flat 0.003 on both sides instead.
+LAYER_BAND_EDGE_REACH = 0.003
 
 # Last-resort ``small_gap`` for a single-supporter layer whose recording carries no layout at all, so one
 # marker row cannot be derived.  Kept identical to
@@ -97,31 +103,13 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    effective_tolerance = max(0.0, float(tolerance))
-    if len(values) == 1:
-        # Keep the UI/controller interpretation exactly aligned with the
-        # movement worker: a single-supporter layer is [y, y + small_gap], with
-        # small_gap the one-third margin but never less than one marker row.
-        # Jump points never enter _layer_point_ys, so their vertical coordinate
-        # cannot widen or shift a layer band.
-        only_y = values[0]
-        gap = effective_tolerance / 3.0
-        marker_row = _layer_marker_row(layer)
-        if marker_row is not None:
-            gap = max(gap, marker_row)
-        if gap <= 0.0:
-            gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
-        return only_y, only_y + gap
-    # The margin above covers climb/drop arrival movement, scaled by the upper-band factor.  Below,
-    # retain at least one marker row: a smaller fractional tolerance can fall between two quantised
-    # diamond rows and leave the character one visible minimap row below its own floor.
-    lower_grace = effective_tolerance / 3.0
-    marker_row = _layer_marker_row(layer)
-    if marker_row is not None:
-        lower_grace = max(lower_grace, marker_row)
+    # Keep the UI/controller interpretation exactly aligned with the movement
+    # worker: ``LAYER_BAND_EDGE_REACH`` on both sides of the recorded envelope.
+    # Jump points never enter _layer_point_ys, so their vertical coordinate
+    # cannot widen or shift a layer band.
     return (
-        min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
-        max(values) + lower_grace,
+        min(values) - LAYER_BAND_EDGE_REACH,
+        max(values) + LAYER_BAND_EDGE_REACH,
     )
 
 
@@ -198,27 +186,14 @@ def _recalculate_layer_band(layer: Any) -> bool:
         layer["layer_band"] = None
         return previous is not None
 
-    tolerance = max(0.0, float(layer.get("y_tolerance", 0.020000)))
     if len(values) == 1:
         raw_upper = raw_lower = values[0]
-        gap = tolerance / 3.0
-        marker_row = _layer_marker_row(layer)
-        if marker_row is not None:
-            gap = max(gap, marker_row)
-        if gap <= 0.0:
-            gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
-        y_upper, y_lower = raw_upper, raw_lower + gap
     else:
         raw_upper, raw_lower = min(values), max(values)
-        y_upper = raw_upper - tolerance * LAYER_UP_REACH_FACTOR
-        # A live diamond is quantised to whole marker rows.  Never persist a
-        # lower grace smaller than one of those rows or a floor can miss by a
-        # single pixel and require the bottom-floor fallback to resolve.
-        lower_grace = tolerance / 3.0
-        marker_row = _layer_marker_row(layer)
-        if marker_row is not None:
-            lower_grace = max(lower_grace, marker_row)
-        y_lower = raw_lower + lower_grace
+    # Flat ``LAYER_BAND_EDGE_REACH`` on both sides of the recorded envelope
+    # (was 0.7 * y_tolerance above and max(y_tolerance / 3, marker row) below).
+    y_upper = raw_upper - LAYER_BAND_EDGE_REACH
+    y_lower = raw_lower + LAYER_BAND_EDGE_REACH
 
     world_values: list[float] = []
     for point_name in REQUIRED_LAYER_POINTS:

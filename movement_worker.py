@@ -644,6 +644,12 @@ def _layer_point_ys(layer: Any) -> list[float]:
 # through its LOWER edge.
 LAYER_UP_REACH_FACTOR = 0.7
 
+# Band edge reach around the recorded envelope, in normalised minimap Y.  The
+# previous rule scaled the upper side by 0.7 * y_tolerance (0.014) and the lower
+# side by max(y_tolerance / 3, one marker row) (0.008772 on a 114-px minimap);
+# this experiment uses a flat 0.003 on both sides instead.
+LAYER_BAND_EDGE_REACH = 0.003
+
 # Last-resort gap for a single-supporter layer (or a ``layer_y``-only layer)
 # whose recording carries no layout at all, so one marker row cannot be derived.
 # The normal gap is ``max(tolerance / 3, 1 / analysis_height)`` - about one
@@ -724,18 +730,15 @@ def _layer_marker_row(layer: Any) -> Optional[float]:
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     """Layer band from its saved recording envelope.
 
-    band = (uppermost point Y - tolerance * ``LAYER_UP_REACH_FACTOR``,
-            lowermost point Y + tolerance / 3).
-    A layer whose points span a Y range (wide platform / minimap
-    perspective) is fully detected while standing anywhere on the
-    platform; the old mean +- tolerance band excluded the platform ends,
-    so the marker at an edge flipped between floors every frame and the
-    route never advanced to the next layer.  The tolerance is applied
-    ONLY upward (above the topmost point, where the climb/drop arrives)
-    and NOT below the lowermost point, so the band does not reach into
-    the layer BELOW - adjacent floors' bands overlap less.  Falls back
-    to ``layer_y`` when the layer has no recorded points (still the mean
-    band then).
+    band = (uppermost point Y - ``LAYER_BAND_EDGE_REACH``,
+            lowermost point Y + ``LAYER_BAND_EDGE_REACH``)
+
+    The reach is a flat 0.003 on both sides (experiment, was 0.7 * y_tolerance
+    above and max(y_tolerance / 3, one marker row) below).  A layer whose points
+    span a Y range (wide platform / minimap perspective) is detected while
+    standing anywhere between its recorded ends, which is why the band spans the
+    envelope rather than a mean.  Falls back to ``layer_y`` when the layer has no
+    recorded points.
     """
     # ``PatrolController`` materialises these bounds whenever a supporter is
     # recorded, removed, or re-projected.  Runtime must use that one saved
@@ -761,41 +764,13 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    effective_tolerance = max(0.0, float(tolerance))
-    if len(values) == 1:
-        # A rope-only (or otherwise one-point) layer is a reference point,
-        # not a horizontally sampled platform.  Giving it the ordinary
-        # +/- tolerance band makes it overlap the actual floor above/below
-        # and steals layer identity during a return.  Its narrow, one-sided
-        # band follows the operator's convention: [recorded_y, y + small_gap].
-        # ``jump_points`` are intentionally not part of ``_layer_point_ys``.
-        #
-        # ``small_gap`` is the same "one third below the base" the multi-point
-        # branch uses, but never smaller than one marker row: a narrower band
-        # can only match the exact recorded row, which is what made a character
-        # walking that very floor read "matches no band" (13:16 log: layer1
-        # band (0.753571, 0.755571) while the marker read 0.796429 / 0.767857 /
-        # 0.732143 on that same floor).
-        only_y = values[0]
-        gap = effective_tolerance / 3.0
-        marker_row = _layer_marker_row(layer)
-        if marker_row is not None:
-            gap = max(gap, marker_row)
-        if gap <= 0.0:
-            gap = LAYER_SINGLE_SUPPORTER_GAP_FALLBACK
-        return only_y, only_y + gap
-    # The tolerance above the visually highest point covers climb/drop arrival
-    # movement, scaled by the operator's upper-band factor.  Only one third is
-    # allowed below the confirmed layer base: enough for OpenCV/marker
-    # quantization noise without making the band unnecessarily reach toward the
-    # layer below.  It must still cover one full quantised marker row.
-    lower_grace = effective_tolerance / 3.0
-    marker_row = _layer_marker_row(layer)
-    if marker_row is not None:
-        lower_grace = max(lower_grace, marker_row)
+    # A one-point layer is a reference point, not a sampled platform, but it now
+    # gets the same flat reach as a multi-point one: the operator asked for
+    # min - 0.003 .. max + 0.003 everywhere.  ``jump_points`` are intentionally
+    # not part of ``_layer_point_ys``, so they cannot shift a band.
     return (
-        min(values) - effective_tolerance * LAYER_UP_REACH_FACTOR,
-        max(values) + lower_grace,
+        min(values) - LAYER_BAND_EDGE_REACH,
+        max(values) + LAYER_BAND_EDGE_REACH,
     )
 
 
@@ -829,11 +804,10 @@ def _runtime_supporter_layer_band(
     ``y_tolerance`` (0.020) plus one marker row, because the diamond quantises
     to one row and a standing character's own step and jump arc are read a
     couple of rows above the point it stands on.  That is what lets the
-    temporary point decide the band's UPPER edge: the recorded envelope keeps
-    its documented reach (``LAYER_UP_REACH_FACTOR``) and the point's window
-    wins whenever it reaches higher.  Below, the point gets the ordinary one
-    third of the tolerance, and the recorded side keeps its own rule, so the
-    band still does not reach down into the floor below.
+    temporary point decide the band's UPPER edge: the recorded envelope now
+    reaches only ``LAYER_BAND_EDGE_REACH`` (0.003), so the point's wider window
+    wins in practice.  Below, the point gets one third of the tolerance, and the
+    recorded side adds the same 0.003.
 
     A layer with no recording at all keeps the documented one-sided
     single-supporter envelope, with the temporary point as that supporter.
@@ -852,8 +826,8 @@ def _runtime_supporter_layer_band(
     point_y = float(supporter_y)
     if not values:
         return point_y, point_y + max(tolerance / 3.0, row)
-    recorded_upper = min(values) - tolerance * LAYER_UP_REACH_FACTOR
-    recorded_lower = max(values) + tolerance / 3.0
+    recorded_upper = min(values) - LAYER_BAND_EDGE_REACH
+    recorded_lower = max(values) + LAYER_BAND_EDGE_REACH
     point_upper = point_y - (tolerance + row)
     point_lower = point_y + tolerance / 3.0
     return min(recorded_upper, point_upper), max(recorded_lower, point_lower)
