@@ -136,24 +136,30 @@ if (Test-Path $soundIn) {
 # 测试测谎用的演示视频留在仓库里（"don't package up test video"）。测试api 由用户自己
 # 选择视频文件，运行期不需要这个目录，发布包因此保持精简。
 
-# --- yolo-detection -----------------------------------------------------------
-$yoloOut = Join-Path $out "yolo-detection"
-New-Item -ItemType Directory -Path $yoloOut -Force | Out-Null
-Get-ChildItem (Join-Path $root "yolo-detection") -File | Where-Object {
-    ($_.Extension -in ".py", ".yaml", ".txt", ".md") -and
-    $_.Name -notin @(
-        "elevated_result.txt", "work-check.txt", "live_test_decision.py"
-    ) -and
-    $_.Name -notlike "*.log"
-} | ForEach-Object { Copy-Item $_.FullName $yoloOut }
-# 训练好的模型权重 (best.pt ~6MB; best.onnx ~12MB 可选)。
-$weightsIn = Join-Path $root "yolo-detection\weights"
-$weightsOut = Join-Path $yoloOut "weights"
-if (Test-Path $weightsIn) {
-    New-Item -ItemType Directory -Path $weightsOut -Force | Out-Null
-    Copy-Item (Join-Path $weightsIn "best.pt") $weightsOut -ErrorAction SilentlyContinue
-    Copy-Item (Join-Path $weightsIn "best.onnx") $weightsOut -ErrorAction SilentlyContinue
+# --- 助手配置（默认配置）-----------------------------------------------------
+# Shipped so a fresh install starts with the operator's default configuration
+# tree.  The installer treats 助手配置 as user data: it writes these files only
+# when they are missing and never overwrites them on update.  auth.json is the
+# operator's own account token, so it is never published.
+$configIn = Join-Path $root "助手配置"
+if (Test-Path $configIn) {
+    $configRoot = Join-Path $out "助手配置"
+    New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
+    Get-ChildItem -LiteralPath $configIn -Recurse -File | Where-Object {
+        $_.Name -ne "auth.json" -and $_.Extension -ne ".log"
+    } | ForEach-Object {
+        $relative = $_.FullName.Substring($configIn.Length + 1)
+        $target = Join-Path $configRoot $relative
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+    }
+    $configFiles = @(Get-ChildItem -LiteralPath $configRoot -Recurse -File)
+    Write-Host "  助手配置: $($configFiles.Count) 个默认配置文件" -ForegroundColor Cyan
 }
+
+# yolo-detection is intentionally not packaged: the live detection feature is
+# disabled in the UI, and its model weights (17.5 MB) were dead weight in every
+# download.  Enable the feature again before re-adding this folder.
 
 # --- recording-assets（地图识别参考图）--------------------------------------------
 $assetsIn = Join-Path $root "recording-assets"

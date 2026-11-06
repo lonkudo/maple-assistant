@@ -81,8 +81,6 @@ DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
     # keep installer_mirrors.json for an ad-hoc source swap.
     "https://wwblt.lanzoup.com/iiLxV4esmo5i",
 )
-# Encoding for the generated .bat launcher; see _write_launcher().
-LAUNCHER_ENCODING = "gbk"
 # Folder created on the Desktop for a first install.
 DEFAULT_FOLDER_NAME = "MoonEclipse"
 # The bar is the download and nothing else: it fills from real socket bytes, and
@@ -478,7 +476,13 @@ def _fetch_package(
 
     stage("正在校验文件…")
     with zipfile.ZipFile(archive) as bundle:
-        members = [info.filename for info in bundle.infolist() if not info.is_dir()]
+        members = [
+            info.filename for info in bundle.infolist()
+            if not info.is_dir()
+            # User configuration is not managed by the installer: it is never
+            # overwritten, never verified, never removed.
+            and _safe_path(info.filename).parts[0] != CONFIG_DIRECTORY
+        ]
     if not members:
         raise RuntimeError("安装包里没有文件。")
     counted = {"done": 0}
@@ -506,8 +510,16 @@ def _fetch_package(
     return entries, version, False
 
 
-def _extract_bundle(archive: Path, target_root: Path, on_entry: Any = None) -> None:
-    """Extract a version archive, refusing any path that escapes the root."""
+def _extract_bundle(
+    archive: Path, target_root: Path, on_entry: Any = None,
+    preserve: tuple[str, ...] = (CONFIG_DIRECTORY,),
+) -> None:
+    """Extract a version archive, refusing any path that escapes the root.
+
+    ``preserve`` names top-level folders that are user data: their files are
+    written only when missing, so shipping default configuration in the package
+    cannot wipe a user's own.
+    """
 
     root = target_root.resolve()
     with zipfile.ZipFile(archive) as bundle:
@@ -520,6 +532,10 @@ def _extract_bundle(archive: Path, target_root: Path, on_entry: Any = None) -> N
             destination = (root / relative).resolve()
             if root not in destination.parents:
                 raise RuntimeError(f"安装包内容无效：{info.filename}")
+            if preserve and relative.parts and relative.parts[0] in preserve and destination.exists():
+                if on_entry is not None and (index % 32 == 0 or index == len(members)):
+                    on_entry(index, len(members))
+                continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             with bundle.open(info) as source, destination.open("wb") as output:
                 shutil.copyfileobj(source, output)
@@ -533,28 +549,6 @@ def _load_local_manifest(root: Path) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {}
-
-
-def _write_launcher(root: Path) -> None:
-    """Keep user configuration beside the selected root, outside app updates."""
-
-    launcher = root / "启动 MoonEclipse.bat"
-    content = "\r\n".join((
-        "@echo off",
-        "setlocal",
-        "set \"MOONECLIPSE_CONFIG_DIR=%~dp0助手配置\"",
-        "call \"%~dp0启动助手.bat\"",
-        "",
-    ))
-    # A batch file's own literals are read in the console codepage, so this
-    # cannot be written as ascii or utf-8.  Writing it as ascii used to raise
-    # UnicodeEncodeError here (after every application file had already been
-    # replaced) and turn a completed install into a 安装失败 dialog with no
-    # launcher and no first-run setup.  GBK is the codepage cmd.exe and the
-    # Windows ANSI file APIs use on the Chinese systems this build targets, so
-    # the helper is handed the same 助手配置 folder name the installer created
-    # instead of a mojibake path that would become a second configuration tree.
-    launcher.write_text(content, encoding=LAUNCHER_ENCODING)
 
 
 def _start_first_install_setup(app_root: Path) -> bool:
@@ -779,7 +773,6 @@ class InstallerWindow:
                     logging.info("installer: removed the legacy app/ folder")
 
             _save_pointer(root)
-            _write_launcher(root)
             try:
                 update_dir.rmdir()
             except OSError:
@@ -861,9 +854,9 @@ class InstallerWindow:
                     else:
                         self.status.configure(text=f"安装完成：{root}（{version}）")
                         message = (
-                            "程序文件已就绪。首次环境安装窗口已打开；完成后可双击“启动 MoonEclipse.bat”启动。"
+                            "程序文件已就绪。首次环境安装窗口已打开；完成后可双击安装目录里的“启动助手.bat”启动。"
                             if first_setup
-                            else f"更新完成（{version}，{changed} 个文件）。可双击“启动 MoonEclipse.bat”启动。"
+                            else f"更新完成（{version}，{changed} 个文件）。可双击安装目录里的“启动助手.bat”启动。"
                         )
                         messagebox.showinfo("完成", message, parent=self.root)
                 elif kind == "error":
