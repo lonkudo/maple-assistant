@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path, PurePosixPath
 import queue
@@ -340,6 +341,47 @@ def _activate(code: str) -> tuple[str, str]:
     return token, version
 
 
+def _lens_outline(
+    centre: float, radius: float, moon_x: float, steps: int = 36,
+) -> list[float]:
+    """Outline of two equal circles' overlap, as flat xy pairs for a canvas.
+
+    Empty when the circles do not overlap (the moon has not reached the sun), the
+    full circle when they coincide.  This is the only black ever drawn, so the
+    moon cannot appear over the empty background.
+    """
+
+    distance = abs(moon_x - centre)
+    if distance >= 2.0 * radius:
+        return []
+    if distance == 0.0:
+        return [
+            coordinate
+            for index in range(steps * 2)
+            for coordinate in (
+                centre + radius * math.cos(math.pi * index / steps),
+                centre + radius * math.sin(math.pi * index / steps),
+            )
+        ]
+    spread = math.acos(distance / (2.0 * radius))
+    to_moon = math.pi if moon_x < centre else 0.0
+    points: list[float] = []
+    # Arc of the sun facing the moon, then the matching arc of the moon.
+    for index in range(steps + 1):
+        angle = to_moon - spread + (2.0 * spread) * index / steps
+        points.extend((
+            centre + radius * math.cos(angle),
+            centre + radius * math.sin(angle),
+        ))
+    for index in range(steps + 1):
+        angle = to_moon + math.pi - spread + (2.0 * spread) * index / steps
+        points.extend((
+            moon_x + radius * math.cos(angle),
+            centre + radius * math.sin(angle),
+        ))
+    return points
+
+
 def _version_from_name(name: str) -> str:
     """``MoonEclipse-release-1.2.284.zip`` -> ``1.2.284``."""
 
@@ -603,13 +645,14 @@ class InstallerWindow:
             centre - radius, centre - radius, centre + radius, centre + radius,
             fill="#f4d35e", outline="",
         )
-        # Two radii of travel plus a margin keeps the starting moon off-canvas.
-        travel = 2.0 * radius + 8.0
-        moon_x = centre - travel * (1.0 - fraction)
-        self.eclipse.create_oval(
-            moon_x - radius, centre - radius, moon_x + radius, centre + radius,
-            fill="#202b3c", outline="",
-        )
+        # The moon starts exactly touching the sun's left edge (nothing visible)
+        # and ends exactly on it; only the overlap with the sun is painted.
+        moon_x = centre - 2.0 * radius * (1.0 - fraction)
+        outline = _lens_outline(centre, radius, moon_x)
+        if outline:
+            self.eclipse.create_polygon(
+                outline, fill="#202b3c", outline="",
+            )
 
     def _start(self) -> None:
         if self.running:
