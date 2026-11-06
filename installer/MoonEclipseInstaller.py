@@ -65,7 +65,6 @@ except Exception:  # pragma: no cover - reported when a mirror is actually used
 INSTALL_MARKER = ".mooneclipse-install.json"
 POINTER_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MoonEclipseInstaller"
 POINTER_FILE = POINTER_DIR / "last-install.json"
-APP_DIRECTORY = "app"
 CONFIG_DIRECTORY = "助手配置"
 # A protected package carries this executable and its own Python runtime, so it
 # needs neither a .venv nor 安装.bat.
@@ -399,18 +398,20 @@ def _version_tuple(value: str) -> tuple[int, ...]:
 
 
 def _fetch_package(
-    staging: Path, *,
+    update_dir: Path,
+    target_root: Path,
+    *,
     on_bytes: Any,
     on_total: Any = None,
     on_stage: Any = None,
     on_files: Any = None,
     skip_version: str = "",
-) -> tuple[list[tuple[dict[str, Any], Path]], str]:
-    """Download the release archive from the share link, unpack and describe it.
+) -> tuple[list[tuple[dict[str, Any], Path]], str, bool]:
+    """Download the release archive into ``update_dir`` and unpack it into the root.
 
-    There is no activation server in this flow, so the unpacked tree is its own
-    manifest: every file's path, size and SHA-256 is computed here.  Returns the
-    entries and the archive's ``VERSION``.
+    Returns ``(entries, version, skipped)``.  The archive is unpacked straight
+    over the selected folder - duplicate files are replaced, nothing is nested -
+    and the entries describe what was written (path, size, SHA-256).
     """
 
     if lanzou_download is None or lanzou_resolve is None:
@@ -443,7 +444,7 @@ def _fetch_package(
         if on_files is not None:
             on_files(phase, done, total)
 
-    archive = staging / "package.zip"
+    archive = update_dir / "package.zip"
     problems: list[str] = []
     for index, mirror in enumerate(shares):
         try:
@@ -452,16 +453,12 @@ def _fetch_package(
             if skip_version and name_version and (
                 _version_tuple(name_version) == _version_tuple(skip_version)
             ):
-                # The share already carries the installed version and every
-                # recorded file is on disk: no download at all.
                 stage(f"已是最新版本（{skip_version}），无需下载。")
-                return [], name_version
+                return [], name_version, True
             phase_reset(int(getattr(share, "size", 0) or 0))
             stage("正在下载更新安装包…")
             lanzou_download(
                 share, archive, parts=8, progress=phase_progress,
-                # A hopeless mirror is dropped while another one is left; the
-                # last source is always allowed to finish.
                 min_rate_bps=MIRROR_MIN_RATE_BPS if index + 1 < len(shares) else 0,
             )
             break
@@ -474,26 +471,26 @@ def _fetch_package(
 
     version = _archive_version(archive)
     stage("正在解压安装包…")
-    package_root = staging / "package"
     _extract_bundle(
-        archive, package_root,
+        archive, target_root,
         on_entry=lambda done, total: files("解压", done, total),
     )
-    archive.unlink(missing_ok=True)
 
     stage("正在校验文件…")
-    members = sorted(entry for entry in package_root.rglob("*") if entry.is_file())
+    with zipfile.ZipFile(archive) as bundle:
+        members = [info.filename for info in bundle.infolist() if not info.is_dir()]
     if not members:
         raise RuntimeError("安装包里没有文件。")
     counted = {"done": 0}
     counted_lock = threading.Lock()
 
-    def describe(member: Path) -> tuple[dict[str, Any], Path]:
-        relative = member.relative_to(package_root)
+    def describe(name: str) -> tuple[dict[str, Any], Path]:
+        relative = _safe_path(name)
+        target = target_root / relative
         item = {
             "path": relative.as_posix(),
-            "size": member.stat().st_size,
-            "sha256": _sha256(member),
+            "size": target.stat().st_size,
+            "sha256": _sha256(target),
         }
         with counted_lock:
             counted["done"] += 1
@@ -505,7 +502,8 @@ def _fetch_package(
     workers = max(1, min(MAX_DOWNLOAD_WORKERS, len(members)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         entries = list(pool.map(describe, members))
-    return entries, version
+    archive.unlink(missing_ok=True)
+    return entries, version, False
 
 
 def _extract_bundle(archive: Path, target_root: Path, on_entry: Any = None) -> None:
@@ -545,7 +543,7 @@ def _write_launcher(root: Path) -> None:
         "@echo off",
         "setlocal",
         "set \"MOONECLIPSE_CONFIG_DIR=%~dp0助手配置\"",
-        "call \"%~dp0app\\启动助手.bat\"",
+        "call \"%~dp0启动助手.bat\"",
         "",
     ))
     # A batch file's own literals are read in the console codepage, so this
@@ -603,8 +601,7 @@ class InstallerWindow:
         outer = ttk.Frame(self.root, padding=18)
         outer.grid(sticky="nsew")
         ttk.Label(outer, text="MoonEclipse", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(outer, text="验证授权码后，从分享链接下载最新版本并只替换有变化的文件。").grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 14))
-        ttk.Label(outer, text="授权码").grid(row=2, column=0, sticky="w")
+        ttk.Label(outer, text="授权码").grid(row=2, column=0, sticky="w", pady=(16, 0))
         self.code = ttk.Entry(outer, width=48, show="*")
         self.code.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0))
         ttk.Label(outer, text="安装位置").grid(row=3, column=0, sticky="w", pady=(10, 0))
@@ -680,15 +677,22 @@ class InstallerWindow:
             # Authentication first: an invalid code stops before any download.
             _token, catalogue_version = _activate(code)
             if catalogue_version:
-                logging.info("installer: activation ok, catalogue version %s", catalogue_version)
+                logging.info(
+                    "installer: activation ok, catalogue version %s", catalogue_version
+                )
             root = root.resolve()
-            app_root = root / APP_DIRECTORY
+            root.mkdir(parents=True, exist_ok=True)
             local = _load_local_manifest(root)
             installed_version = str(local.get("version") or "")
+            old = {
+                str(item.get("path")): item
+                for item in local.get("files", [])
+                if isinstance(item, dict)
+            }
 
             self.events.put(("plan", (1, 1)))
-            staging = root / "updates" / ("stage-" + uuid.uuid4().hex)
-            staging.mkdir(parents=True, exist_ok=True)
+            update_dir = root / "update"
+            update_dir.mkdir(parents=True, exist_ok=True)
 
             recorded = [
                 (str(item.get("path")), str(item.get("sha256") or ""))
@@ -696,11 +700,18 @@ class InstallerWindow:
                 if isinstance(item, dict)
             ]
 
+            broken: set[str] = set()
+
             def intact(entry: tuple[str, str]) -> bool:
                 path, digest = entry
-                target = app_root / _safe_path(path)
-                return bool(digest) and target.is_file() and _sha256(target) == digest
+                target = root / _safe_path(path)
+                if not digest or not target.is_file() or _sha256(target) != digest:
+                    with broken_lock:
+                        broken.add(path)
+                    return False
+                return True
 
+            broken_lock = threading.Lock()
             complete = False
             if recorded:
                 self.events.put(("stage", "正在检查已安装文件…"))
@@ -708,10 +719,8 @@ class InstallerWindow:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     complete = all(pool.map(intact, recorded))
 
-            # One source, one archive: the share link.  Everything installed is
-            # described by that archive; nothing is fetched from a server.
-            entries, version = _fetch_package(
-                staging,
+            entries, version, skipped = _fetch_package(
+                update_dir, root,
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
@@ -719,8 +728,8 @@ class InstallerWindow:
                     self.events.put(("files", (str(phase), int(done), int(total)))),
                 skip_version=installed_version if complete else "",
             )
-            if not entries:
-                shutil.rmtree(staging, ignore_errors=True)
+            if skipped:
+                shutil.rmtree(update_dir / "update", ignore_errors=True)
                 self.events.put(("done", (root, False, 0, version or installed_version)))
                 return
 
@@ -731,62 +740,27 @@ class InstallerWindow:
                     f"请检查分享链接是否为最新版本。"
                 )
 
-            old = {
-                str(item.get("path")): item
-                for item in local.get("files", [])
-                if isinstance(item, dict)
-            }
-            planned: list[tuple[dict[str, Any], Path]] = []
-            for item, relative in entries:
-                known = old.get(str(item["path"]), {})
-                existing = app_root / relative
-                if (known.get("sha256") == item["sha256"] and existing.is_file()
-                        and _sha256(existing) == item["sha256"]):
-                    continue
-                planned.append((item, relative))
             current_paths = {str(item["path"]) for item, _ in entries}
+            changed = [
+                item for item, _ in entries
+                if (str(old.get(str(item["path"]), {}).get("sha256")) != item["sha256"]
+                    or str(item["path"]) in broken)
+            ]
             removals = [path for path in old if path not in current_paths]
+            self.events.put(("stage", f"正在完成安装（{len(changed)} 个文件）…"))
 
-            self.events.put(("stage", f"正在安装文件（{len(planned)} 个）…"))
-            moved = 0
-            move_lock = threading.Lock()
-
-            def move_one(entry: tuple[dict[str, Any], Path]) -> None:
-                nonlocal moved
-                _item, relative = entry
-                source = staging / "package" / relative
-                if not source.is_file():
-                    raise RuntimeError(f"文件缺失：{relative}")
-                target = app_root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                source.replace(target)
-                with move_lock:
-                    moved += 1
-                    current = moved
-                if current % 25 == 0 or current == len(planned):
-                    self.events.put(("files", ("安装", current, len(planned))))
-
-            if planned:
-                workers = max(1, min(MAX_DOWNLOAD_WORKERS, len(planned)))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [pool.submit(move_one, entry) for entry in planned]
-                    for future in as_completed(futures):
-                        future.result()
-
-            app_root.mkdir(parents=True, exist_ok=True)
             # A file the previous version shipped and this one does not is
-            # removed; user folders live outside app/ and are untouched.
+            # removed; user folders (助手配置, update) are untouched.
             for old_path in removals:
-                candidate = app_root / _safe_path(old_path)
+                candidate = root / _safe_path(old_path)
                 if candidate.is_file():
                     candidate.unlink()
 
-            root.mkdir(parents=True, exist_ok=True)
             (root / CONFIG_DIRECTORY).mkdir(parents=True, exist_ok=True)
             install_state = {
                 "format": "moon-eclipse-install/v2",
                 "install_id": local.get("install_id") or uuid.uuid4().hex,
-                "app_directory": APP_DIRECTORY,
+                "layout": "root",
                 "version": version,
                 "files": [item for item, _ in entries],
             }
@@ -795,11 +769,23 @@ class InstallerWindow:
                 json.dumps(install_state, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             temporary.replace(root / INSTALL_MARKER)
+
+            # Version 1.2.284 and older installs kept everything under app/;
+            # that tree is now duplicated at the root, so drop it.
+            if str(local.get("app_directory") or "") == "app":
+                legacy = root / "app"
+                if legacy.is_dir():
+                    shutil.rmtree(legacy, ignore_errors=True)
+                    logging.info("installer: removed the legacy app/ folder")
+
             _save_pointer(root)
             _write_launcher(root)
-            shutil.rmtree(staging, ignore_errors=True)
-            first_setup = _start_first_install_setup(app_root)
-            self.events.put(("done", (root, first_setup, len(planned), version)))
+            try:
+                update_dir.rmdir()
+            except OSError:
+                pass
+            first_setup = _start_first_install_setup(root)
+            self.events.put(("done", (root, first_setup, len(changed), version)))
         except Exception as exc:  # noqa: BLE001 - reported in the window
             logging.exception("installer: install failed")
             self.events.put(("error", str(exc)))
