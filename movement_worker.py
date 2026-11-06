@@ -218,11 +218,13 @@ SKILL_POINT_X_TOLERANCE = 0.016
 # hotkey and deliberately has no part in this cooldown.
 SKILL_POINT_KEY_COOLDOWN_SECONDS = 6.0
 # A left/right point that lands on a horizontal platform needs only a brief
-# post-Alt guard, then two stable 5-FPS samples before its Up claim releases.
-# A point that really grabbed a rope hands over earlier, on its first upward
-# marker advance, to the normal climb state machine.
+# post-Alt guard, then THREE stable 5-FPS samples before its Up claim releases.
+# Two samples (~0.2 s apart) were not enough: the minimap's one-row dithering can
+# fake agreement during a jump arc, which kept Up held into the landing.  A point
+# that really grabbed a rope still hands over earlier, on its first upward marker
+# advance, to the normal climb state machine.
 JUMP_POINT_LANDING_GUARD_SECONDS = 0.25
-JUMP_POINT_LANDING_STABLE_FRAMES = 2
+JUMP_POINT_LANDING_STABLE_FRAMES = 3
 # A jump-point session releases its Up only on a real landing, a rope handoff,
 # or a climb that keeps owning the key - and a jump point that fires and FAILS
 # (the character comes back down on its departure floor, same marker Y) reaches
@@ -5834,7 +5836,7 @@ class MovementWorker(threading.Thread):
         self._jump_point_y_samples.append(current_y)
         if len(self._jump_point_y_samples) > JUMP_POINT_LANDING_STABLE_FRAMES:
             del self._jump_point_y_samples[:-JUMP_POINT_LANDING_STABLE_FRAMES]
-        # Two stable frames end the claim.  Requiring the landing to be 0.003
+        # Three stable frames end the claim.  Requiring the landing to be 0.003
         # higher than take-off (``settled_on_higher_floor``) was meant to spot a
         # failed jump, but it also kept Up held for the whole 3 s window when the
         # character settled back on its own floor - the operator's "it keeps
@@ -5878,9 +5880,12 @@ class MovementWorker(threading.Thread):
                     if self._jump_point_start_y is not None else 0.0
                 )
                 LOG.info(
-                    "JUMP POINT: two stable Y frames at %.6f (rise from take-off "
-                    "%.4f); released Up and resumed patrol",
-                    current_y, rise,
+                    "JUMP POINT: %d stable Y frames around %.6f (spread %.4f, rise "
+                    "from take-off %.4f); released Up and resumed patrol",
+                    JUMP_POINT_LANDING_STABLE_FRAMES, current_y,
+                    max(self._jump_point_y_samples or [current_y])
+                    - min(self._jump_point_y_samples or [current_y]),
+                    rise,
                 )
 
     def perform_queued_stair_jump(self, direction: str) -> bool:
