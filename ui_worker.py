@@ -39,7 +39,7 @@ from licensing import (
     LicenseStatus,
     preview_activation_transfer_via_server, confirm_activation_transfer_via_server,
     revoke_license, set_device_memo_via_server, unbind_device_via_server,
-    validate_via_server, verify_license,
+    has_sealed_fingerprint, validate_via_server, verify_license,
 )
 from lie_accounting import LieAccountingWorker
 from reconnect_worker import (
@@ -216,6 +216,10 @@ LICENSE_REFRESH_RETRY_SECONDS = 1.0
 # scheduled confirmation before running automation is stopped, so a brief
 # service outage does not cut off an already-running safe session.
 LICENSE_HEARTBEAT_FAILURE_RETRY_SECONDS = 10 * 60
+# Windows can launch the helper before CIM/WMI has exposed motherboard and
+# firmware signals.  These are deliberate *CIM-only* retries; a server refusal
+# is never retried here because that could consume activation-failure quota.
+CIM_BOOT_RETRY_SECONDS = (3.0, 30.0, 60.0, 300.0)
 _GMT8 = timezone(timedelta(hours=8))
 
 
@@ -1545,24 +1549,32 @@ class UiWorker(threading.Thread):
             local_license_status = replace(
                 local_license_status, equipment_id=saved_equipment_id
             )
-        # A local signature proves the document was issued by us, but does not
-        # prove the online entitlement is still live.  Start locked and let
-        # the immediate pinned heartbeat unlock the dashboard only after the
-        # activation server accepts this device/license pair.
+        # A sealed, server-accepted fingerprint belongs only to this Windows
+        # profile and this license.  It lets a normal already-authorized user
+        # start while CIM/WMI wakes up after boot; the heartbeat below still
+        # retries live CIM and ultimately locks the UI if it never recovers.
+        sealed_boot_identity = bool(
+            local_license_status.valid
+            and local_license_status.license_id
+            and has_sealed_fingerprint(local_license_status.license_id)
+        )
         self._license_status: LicenseStatus = (
-            LicenseStatus(
-                False, "checking", "正在验证在线授权…",
-                local_license_status.license_id, local_license_status.edition,
-                local_license_status.expires_at, local_license_status.equipment_id,
+            replace(local_license_status, code="cim_pending", message="设备正在确认…")
+            if sealed_boot_identity else (
+                LicenseStatus(
+                    False, "checking", "正在验证在线授权…",
+                    local_license_status.license_id, local_license_status.edition,
+                    local_license_status.expires_at, local_license_status.equipment_id,
+                )
+                if local_license_status.valid else local_license_status
             )
-            if local_license_status.valid else local_license_status
         )
         # Keep the UI honest while the immediate pinned validation is in
         # flight.  A locally signed document is useful context (expiry), but
         # it is not an active online entitlement until the
         # server has accepted it for this session.
         self._license_online_validation_pending = bool(local_license_status.valid)
-        self._license_session_locked = True
+        self._license_session_locked = not sealed_boot_identity
         self._memory_usage_text = "内存：读取中"
         self._license_heartbeat_results: "queue.Queue[tuple[int, LicenseStatus]]" = (
             queue.Queue()
@@ -4525,6 +4537,21 @@ class UiWorker(threading.Thread):
                 aggressive = bool(self._license_refresh_aggressive)
                 self._license_refresh_aggressive = False
                 status = validate_via_server()
+                # Device-not-ready means the local CIM provider was not ready,
+                # not that the server rejected the entitlement.  Retry the
+                # live read after 3 s, 30 s, 60 s and 5 min.  ``force`` avoids
+                # the normal five-minute incomplete-fingerprint cache.
+                if status.code == "device_not_ready":
+                    for attempt, delay in enumerate(CIM_BOOT_RETRY_SECONDS, start=1):
+                        LOG.warning(
+                            "CIM unavailable; retry %d/%d in %.0fs",
+                            attempt, len(CIM_BOOT_RETRY_SECONDS), delay,
+                        )
+                        if self.stop_event.wait(delay):
+                            return
+                        status = validate_via_server(force_cim_refresh=True)
+                        if status.code != "device_not_ready":
+                            break
                 for _ in range(
                     (LICENSE_REFRESH_RETRY_ATTEMPTS - 1) if aggressive else 0
                 ):
@@ -4703,7 +4730,11 @@ class UiWorker(threading.Thread):
             "license heartbeat failed: %s (consecutive=%d)", status.code,
             self._license_heartbeat_consecutive_failures,
         )
-        if self._license_heartbeat_consecutive_failures >= 2:
+        # A CIM result reaches this point only after the complete 3s/30s/1m/
+        # 5m retry schedule above.  It is therefore a real terminal hardware
+        # readiness failure, not a transient startup race.
+        if (status.code == "device_not_ready"
+                or self._license_heartbeat_consecutive_failures >= 2):
             self._lock_licensed_functions()
         else:
             self._lock_license_ui_only()
@@ -5858,6 +5889,8 @@ class UiWorker(threading.Thread):
                     self._play_action_sound(self._record_split_point())
                 elif action == "record_flower_point":
                     self._play_action_sound(self._record_flower_point())
+                elif action == "record_support_point":
+                    self._play_action_sound(self._record_support_point())
                 elif action.startswith("record_dual_stationary_post:"):
                     slot_name = action.partition(":")[2]
                     slot = {"first": 0, "second": 1}.get(slot_name)
@@ -8680,6 +8713,35 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         return True
 
+    def _record_support_point(self) -> bool:
+        """Record a local layer supporter without adding a route action."""
+
+        if self.patrol_controller is None or self.patrol_controller.is_enabled():
+            self._control_status.configure(text="巡逻中无法录制支持点，请先停止巡逻。")
+            return False
+        snapshot = self._capture_snapshot_for_recording()
+        if snapshot is None or snapshot.player_x is None or snapshot.player_y is None:
+            self._control_status.configure(text="无法录制支持点：未检测到黄色菱形标记。")
+            return False
+        if not is_verified_border(snapshot.detection):
+            self._control_status.configure(text="无法录制支持点：未检测到可保存的小地图边框。")
+            return False
+        try:
+            undo_saved = self._undo_capture("录制支持点")
+            point = self.patrol_controller.record_support_point(
+                snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            if undo_saved:
+                self._undo_discard_latest("录制支持点")
+            self._control_status.configure(text=f"无法录制支持点: {exc}")
+            return False
+        self._control_status.configure(
+            text=f"已录制 {point.layer} 支持点：X={point.x:.6f}，Y={point.y:.6f}。"
+        )
+        self._refresh_patrol_controls()
+        return True
+
     def _delete_recorded_axis_point(
         self, layer_name: str, point_kind: str, point_x: float,
         point_index: Optional[int] = None,
@@ -8702,12 +8764,13 @@ class UiWorker(threading.Thread):
             removed = self.patrol_controller.delete_axis_point(
                 layer_name, point_kind, point_x, point_index,
             )
-            if point_kind not in ("jump_point", "skill_point", "flower_point"):
+            if point_kind not in ("jump_point", "skill_point", "flower_point", "support_point"):
                 self._unlocked_points.discard((layer_name, point_kind))
             label = {
                 "left_most_pos": "最左", "rope_pos": "绳索",
                 "right_most_pos": "最右", "jump_point": "跳点",
                 "skill_point": "技能点", "flower_point": "花点",
+                "support_point": "支持点",
             }.get(point_kind, "录制点")
         except (OSError, ValueError) as exc:
             if undo_saved:
@@ -8717,7 +8780,7 @@ class UiWorker(threading.Thread):
             return
         if removed:
             band_note = ""
-            if point_kind not in ("jump_point", "skill_point"):
+            if point_kind not in ("jump_point", "skill_point", "support_point"):
                 if self.patrol_controller.layer_has_band(layer_name):
                     band_note = " 已重新计算该层图层带。"
                 else:
@@ -8803,11 +8866,12 @@ class UiWorker(threading.Thread):
             ("添加左跳", "jump_point", lambda: self._record_jump_point("left")),
             ("添加右跳", "jump_point", lambda: self._record_jump_point("right")),
             ("添加花点", "flower_point", self._record_flower_point),
+            ("添加支持点", "support_point", self._record_support_point),
         )
         final_name = self.patrol_controller.final_layer_name()
         for label, kind, command in entries:
             already_recorded = (
-                kind not in ("jump_point", "flower_point")
+                kind not in ("jump_point", "flower_point", "support_point")
                 and self.patrol_controller.endpoint(layer_name, kind) is not None
             )
             unavailable_rope = kind == "rope_pos" and layer_name == final_name
@@ -8987,6 +9051,33 @@ class UiWorker(threading.Thread):
                         # labels instead of making the second marker look
                         # like a replacement for the first one.
                         entries.append(("flower_point", point, f"花{index + 1}", index))
+            support_points = source.get("support_points", [])
+            if isinstance(support_points, list):
+                base_ys = []
+                for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+                    base = source.get(point_name)
+                    if isinstance(base, dict) and "y" in base:
+                        try:
+                            base_ys.append(float(base["y"]))
+                        except (TypeError, ValueError):
+                            continue
+                for index, point in enumerate(support_points):
+                    if not isinstance(point, dict) or "x" not in point or "y" not in point:
+                        continue
+                    try:
+                        support_y = float(point["y"])
+                    except (TypeError, ValueError):
+                        continue
+                    # Minimap Y increases downward: a larger value is lower.
+                    # Supporters inside an existing floor envelope do not add
+                    # a new vertical extreme, so render them as 支.
+                    if base_ys and support_y > max(base_ys) + 1e-6:
+                        label = "低"
+                    elif base_ys and support_y < min(base_ys) - 1e-6:
+                        label = "高"
+                    else:
+                        label = "支"
+                    entries.append(("support_point", point, label, index))
         # Dual posts are their own marker type, just like 最左 / 最右 / 绳索.
         # They are not temporary stationary overlays: the two persisted
         # records must remain separately visible on their recorded layer.
@@ -9017,6 +9108,7 @@ class UiWorker(threading.Thread):
             "jump_point": "#1d9b45",
             "skill_point": "#8a2be2",
             "flower_point": "#d13a8b",
+            "support_point": "#4a6f9c",
             "dual_stationary_post": "#cc2222",
         }
         for kind, point, label, index in entries:
@@ -9067,6 +9159,15 @@ class UiWorker(threading.Thread):
                 canvas.create_text(
                     x, axis_y - 9, text=label, fill="white",
                     font=("TkDefaultFont", 8, "bold"), tags=(tag,),
+                )
+            elif kind == "support_point":
+                canvas.create_rectangle(
+                    x - 7, axis_y - 16, x + 7, axis_y - 2,
+                    fill=colors[kind], outline="", tags=(tag,),
+                )
+                canvas.create_text(
+                    x, axis_y - 9, text=label, fill="white",
+                    font=("TkDefaultFont", 9, "bold"), tags=(tag,),
                 )
             elif kind == "dual_stationary_post":
                 # Same red facing glyph as ordinary 站桩攻击, but as a real
@@ -11246,7 +11347,7 @@ class UiWorker(threading.Thread):
         "left": "←", "right": "→", "up": "↑", "down": "↓",
         "home": "Home", "insert": "Insert", "delete": "Delete",
         "bracketleft": "[", "bracketright": "]", "grave": "`",
-        "d": "D", "e": "E", "f": "F", "s": "S", "g": "G",
+        "a": "A", "d": "D", "e": "E", "f": "F", "s": "S", "g": "G",
         "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
         "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
     }
@@ -11259,6 +11360,7 @@ class UiWorker(threading.Thread):
         "record_jump_point:right": "插入当前图层的 右跳 点 (Ctrl+F)",
         "record_split_point": "在当前位置添加贯穿全部楼层的波浪分区线 (Ctrl+S)",
         "record_flower_point": "录制当前绳索层的花点 (Ctrl+G)",
+        "record_support_point": "录制当前图层的局部支持点 (Ctrl+A)",
         "record_dual_stationary_post:first": "录制桩1；随后按 D=朝左、F=朝右、G=双向 (Ctrl+R)",
         "record_dual_stationary_post:second": "录制桩2；随后按 D=朝左、F=朝右、G=双向 (Ctrl+T)",
         "record_skill_point": "录制技能点；随后按任意攻击键可绑定按键 (Ctrl+E)",

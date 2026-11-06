@@ -64,4 +64,7 @@ test_roi_video_tracker.py.head
 
 # Machine-bound personal entitlement and the runtime accounting outbox.
 license.json
+auth.json
+cim_identity.dat
+data/
 lie_accounting_pending.json

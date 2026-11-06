@@ -32,10 +32,22 @@ class AttackSlot:
     def consume(self, default_key: Optional[str]) -> Optional[str]:
         """Return and clear a replacement, otherwise return the normal key."""
 
+        key, _replaced = self.consume_with_source(default_key)
+        return key
+
+    def consume_with_source(self, default_key: Optional[str]) -> tuple[Optional[str], bool]:
+        """Return ``(key, replaced)`` while atomically clearing the one-shot slot.
+
+        The ordinary :meth:`consume` API intentionally remains available to
+        movement corrections.  The cadence attack worker additionally needs
+        to know whether this beat sent its configured combo key or a
+        counterattack replacement: only the former may advance a combo run.
+        """
+
         with self._lock:
             key = self._replacement
             self._replacement = None
-        return key if key is not None else default_key
+        return (key if key is not None else default_key, key is not None)
 
     def clear(self) -> bool:
         """Discard an unspent replacement when its feature is disabled."""

@@ -369,6 +369,7 @@ class AttackWorker(threading.Thread):
             charge_lease = False
             handoff_deferred = False
             selected_key: Optional[str] = None
+            combo_key_replaced = False
             if can_fire and (self.automation_active_event is not None
                     and not self.automation_active_event.is_set()):
                 can_fire = False
@@ -462,15 +463,28 @@ class AttackWorker(threading.Thread):
                 # hold the 被撞反击 key while the correction - which taps first,
                 # as part of its own motion - used the ordinary key instead.
                 slot = self.attack_slot
-                consume = getattr(slot, "consume", None)
-                selected_key = (
-                    consume(normal_key) if callable(consume) else normal_key
-                )
+                consume_with_source = getattr(slot, "consume_with_source", None)
+                if callable(consume_with_source):
+                    selected_key, combo_key_replaced = consume_with_source(normal_key)
+                else:
+                    # Backwards-compatible slot implementations cannot say
+                    # whether they replaced the normal key.  Preserve their
+                    # prior delivery behaviour; the built-in AttackSlot uses
+                    # the source-aware path above.
+                    consume = getattr(slot, "consume", None)
+                    selected_key = (
+                        consume(normal_key) if callable(consume) else normal_key
+                    )
             if can_fire:
                 sent = False
                 try:
-                    self.combo_attack.consume()
                     sent = self.attack_once(selected_key)
+                    # A combo run represents successful sends of its own
+                    # configured key.  Do not burn an occurrence when input
+                    # was refused/cancelled, or when 被撞反击 replaced this
+                    # cadence beat with its separate counterattack key.
+                    if sent and not combo_key_replaced:
+                        self.combo_attack.consume()
                 finally:
                     if self.motion_arbiter is not None and attack_lease:
                         if charge_lease:

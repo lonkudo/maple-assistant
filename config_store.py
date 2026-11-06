@@ -434,7 +434,7 @@ class ConfigSectionFile:
         return f"{self.store.path_for_section(self.section)}[{self.section}]"
 
 
-_stores: dict[tuple[Path, Path], ConfigStore] = {}
+_stores: dict[tuple[Path, Path, Path], ConfigStore] = {}
 _stores_lock = threading.Lock()
 
 
@@ -480,13 +480,17 @@ def get_config_store(
     resolved_system = Path(
         system_path or package_root / SYSTEM_CONFIG_NAME
     ).resolve()
-    key = (user_path, resolved_system)
+    # Authorization is private runtime state at the package root.  It must
+    # never sit beside the shareable ``助手配置\\user_config.json`` document.
+    resolved_auth = (package_root / AUTH_CONFIG_NAME).resolve()
+    key = (user_path, resolved_system, resolved_auth)
     with _stores_lock:
         store = _stores.get(key)
         if store is None:
             store = ConfigStore(
                 user_path,
                 system_path=resolved_system,
+                auth_path=resolved_auth,
                 legacy_root=requested.parent,
                 legacy_unified_path=legacy_unified,
             )

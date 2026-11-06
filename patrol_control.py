@@ -817,7 +817,7 @@ class PatrolController:
                     continue
                 old_parts = layer.get("part_points")
                 parts: dict[str, Any] = {}
-                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points", "flower_points"):
+                for name in (*REQUIRED_LAYER_POINTS, "jump_points", "skill_points", "flower_points", "support_points"):
                     values: list[Any] = []
                     if isinstance(old_parts, dict):
                         for old_part in old_parts.values():
@@ -845,7 +845,7 @@ class PatrolController:
                         ):
                             if anchor_key in layer:
                                 target.setdefault(anchor_key, deepcopy(layer[anchor_key]))
-                        if name in ("jump_points", "skill_points", "flower_points"):
+                        if name in ("jump_points", "skill_points", "flower_points", "support_points"):
                             target.setdefault(name, []).append(deepcopy(item))
                         else:
                             target[name] = deepcopy(item)
@@ -1462,6 +1462,53 @@ class PatrolController:
             self._persist_locked()
             return RecordedEndpoint(layer_name, "flower_point", point["x"], point["y"])
 
+    def record_support_point(
+        self, player_x: float, player_y: float,
+        layout: Optional[CoordinateLayout] = None,
+    ) -> RecordedEndpoint:
+        """Record a local, detection-only layer supporter.
+
+        A support point deliberately does not become a patrol action.  It adds
+        a recorded Y row to the layer's detection evidence across the map, so
+        a ditch or raised local section can still resolve the same layer.
+        """
+
+        with self._lock:
+            layer_name = self._selected_layer
+            layer = self._profile.get("layers", {}).get(layer_name)
+            if not isinstance(layer, dict):
+                raise ValueError("没有可录制的楼层；请先点击「添加楼层」")
+            point: dict[str, Any] = {
+                "x": round(max(0.02, min(0.98, float(player_x))), 6),
+                "y": round(max(0.02, min(0.98, float(player_y))), 6),
+                "source": "manual-ui",
+            }
+            if layout is not None:
+                stable_x, stable_y = layout.stable_point(player_x, player_y)
+                point["coordinate_v2"] = {
+                    "x_diamond": round(stable_x, 6),
+                    "y_diamond": round(stable_y, 6),
+                    "recorded_layout": layout.as_dict(),
+                }
+            target = (
+                self._part_layer_locked(
+                    layer, self._part_index_for_x_locked(point["x"]), create=True,
+                ) if self._split_points_locked() else layer
+            )
+            assert target is not None
+            points = target.setdefault("support_points", [])
+            if not isinstance(points, list):
+                points = target["support_points"] = []
+            if any(
+                abs(float(old.get("x", -9.0)) - point["x"]) < 0.006
+                and abs(float(old.get("y", -9.0)) - point["y"]) < 0.008
+                for old in points if isinstance(old, dict)
+            ):
+                raise ValueError("支持点与已有支持点距离过近")
+            points.append(point)
+            self._persist_locked()
+            return RecordedEndpoint(layer_name, "support_point", point["x"], point["y"])
+
     def delete_jump_point(self, layer_name: str, index: int) -> bool:
         """Delete one locked jump point by its stored list index.
 
@@ -1496,7 +1543,7 @@ class PatrolController:
         """
 
         allowed = set(REQUIRED_LAYER_POINTS) | {
-            "jump_point", "skill_point", "flower_point",
+            "jump_point", "skill_point", "flower_point", "support_point",
         }
         if point_kind not in allowed:
             raise ValueError(f"不支持的点类型：{point_kind}")
@@ -1512,7 +1559,7 @@ class PatrolController:
             )
             if not isinstance(target, dict):
                 return False
-            if point_kind in ("jump_point", "skill_point", "flower_point"):
+            if point_kind in ("jump_point", "skill_point", "flower_point", "support_point"):
                 field = f"{point_kind}s"
                 points = target.get(field)
                 if not isinstance(points, list) or index is None:

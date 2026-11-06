@@ -145,8 +145,11 @@ $configIn = Join-Path $root "助手配置"
 if (Test-Path $configIn) {
     $configRoot = Join-Path $out "助手配置"
     New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
+    # 助手配置 is intentionally the portable configuration/export boundary.
+    # Keep generated image caches and private authorization out of releases by
+    # shipping JSON recording/config documents only.
     Get-ChildItem -LiteralPath $configIn -Recurse -File | Where-Object {
-        $_.Name -ne "auth.json" -and $_.Extension -ne ".log"
+        $_.Extension -ieq ".json" -and $_.Name -ne "auth.json"
     } | ForEach-Object {
         $relative = $_.FullName.Substring($configIn.Length + 1)
         $target = Join-Path $configRoot $relative

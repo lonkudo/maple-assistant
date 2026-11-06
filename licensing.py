@@ -55,6 +55,9 @@ PUBLIC_KEY_FILE = "license_public_key.json"
 # named private file untouched.
 LICENSE_FILE = "auth.json"
 LEGACY_LICENSE_FILE = "license.json"
+# The last *server-accepted* fingerprint is local runtime identity, not a
+# shareable recording.  Keep it beside auth.json at the application root.
+CIM_IDENTITY_FILE = "cim_identity.dat"
 AUTH_LOCAL_STATE_KEY = "_local"
 ACTIVATION_SERVER_ENDPOINT = "https://211.149.169.194:8443"
 ACTIVATION_SERVER_PIN_FILE = "activation_server_pin.json"
@@ -82,6 +85,143 @@ _fingerprint_cache: dict[str, str] = {}
 # replace it with only MachineGuid and make later background work appear to be
 # an unready device.
 _fingerprint_last_good_cache: dict[str, str] = {}
+
+
+def _dpapi_protect(payload: bytes) -> bytes:
+    """Seal bytes to the current Windows user with DPAPI.
+
+    A copied record cannot be decrypted on another PC/user profile.  The
+    implementation uses Crypt32 directly so the protected Nuitka package does
+    not depend on pywin32's optional ``win32crypt`` module.
+    """
+
+    if sys.platform != "win32":
+        raise OSError("DPAPI is only available on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+    source_buffer = ctypes.create_string_buffer(payload)
+    source = DATA_BLOB(len(payload), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_byte)))
+    protected = DATA_BLOB()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    crypt32.CryptProtectData.argtypes = (
+        ctypes.POINTER(DATA_BLOB), wintypes.LPCWSTR, ctypes.POINTER(DATA_BLOB),
+        wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(DATA_BLOB),
+    )
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    if not crypt32.CryptProtectData(
+        ctypes.byref(source), "MoonEclipse CIM identity v1", None,
+        None, None, 0, ctypes.byref(protected),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(protected.pbData, protected.cbData)
+    finally:
+        if protected.pbData:
+            kernel32.LocalFree(ctypes.cast(protected.pbData, wintypes.HLOCAL))
+
+
+def _dpapi_unprotect(payload: bytes) -> bytes:
+    """Open one current-user DPAPI record, rejecting foreign/corrupt data."""
+
+    if sys.platform != "win32":
+        raise OSError("DPAPI is only available on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+    source_buffer = ctypes.create_string_buffer(payload)
+    source = DATA_BLOB(len(payload), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_byte)))
+    opened = DATA_BLOB()
+    description = wintypes.LPWSTR()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    crypt32.CryptUnprotectData.argtypes = (
+        ctypes.POINTER(DATA_BLOB), ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(DATA_BLOB), wintypes.LPVOID, wintypes.LPVOID,
+        wintypes.DWORD, ctypes.POINTER(DATA_BLOB),
+    )
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = (wintypes.HLOCAL,)
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    if not crypt32.CryptUnprotectData(
+        ctypes.byref(source), ctypes.byref(description), None,
+        None, None, 0, ctypes.byref(opened),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(opened.pbData, opened.cbData)
+    finally:
+        if description:
+            kernel32.LocalFree(ctypes.cast(description, wintypes.HLOCAL))
+        if opened.pbData:
+            kernel32.LocalFree(ctypes.cast(opened.pbData, wintypes.HLOCAL))
+
+
+def _save_sealed_fingerprint(fingerprint: str, license_id: str, root: Optional[Path] = None) -> None:
+    """Atomically store one server-accepted fingerprint outside exports."""
+
+    if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+            or not isinstance(license_id, str) or not license_id):
+        return
+    try:
+        record = json.dumps({
+            "format": "moon-eclipse-cim-identity/v1",
+            "fingerprint": fingerprint,
+            "license_id": license_id,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        sealed = _dpapi_protect(record)
+        target = cim_identity_path(root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("wb", dir=target.parent, delete=False) as handle:
+            handle.write(sealed)
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+        SERVER_LOG.info("CIM last-good fingerprint sealed with DPAPI")
+    except (OSError, ValueError, TypeError):
+        SERVER_LOG.warning("could not save DPAPI-sealed CIM fingerprint", exc_info=True)
+
+
+def _sealed_fingerprint_for_license(
+    license_id: str, root: Optional[Path] = None,
+) -> Optional[str]:
+    """Return the DPAPI-protected last accepted fingerprint for this license.
+
+    This is deliberately private: it is only a short boot bridge while CIM is
+    still starting.  The next successful online heartbeat always replaces it
+    with a freshly read live fingerprint.
+    """
+
+    try:
+        sealed = cim_identity_path(root).read_bytes()
+        record = json.loads(_dpapi_unprotect(sealed).decode("utf-8"))
+        valid = bool(
+            isinstance(record, dict)
+            and record.get("format") == "moon-eclipse-cim-identity/v1"
+            and record.get("license_id") == license_id
+            and isinstance(record.get("fingerprint"), str)
+            and len(record["fingerprint"]) == 64
+        )
+        if valid:
+            return str(record["fingerprint"])
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def has_sealed_fingerprint(license_id: str, root: Optional[Path] = None) -> bool:
+    """Whether this Windows profile holds a valid sealed identity for a license."""
+
+    return _sealed_fingerprint_for_license(license_id, root) is not None
 
 
 @dataclass(frozen=True)
@@ -144,8 +284,8 @@ def runtime_root() -> Path:
     return application_root(__file__)
 
 
-def user_data_root(root: Optional[Path] = None) -> Path:
-    """Return the user-owned configuration root selected by the installer."""
+def _recording_config_root(root: Optional[Path] = None) -> Path:
+    """Return the shareable recording folder, never the auth/runtime root."""
 
     if root is not None:
         return Path(root)
@@ -163,11 +303,25 @@ def user_data_root(root: Optional[Path] = None) -> Path:
 
 
 def license_path(root: Optional[Path] = None) -> Path:
-    return user_data_root(root) / LICENSE_FILE
+    """Authorization belongs to the install root, outside shareable configs."""
+
+    return Path(root) / LICENSE_FILE if root is not None else runtime_root() / LICENSE_FILE
 
 
 def _legacy_license_path(root: Optional[Path] = None) -> Path:
-    return user_data_root(root) / LEGACY_LICENSE_FILE
+    return Path(root) / LEGACY_LICENSE_FILE if root is not None else runtime_root() / LEGACY_LICENSE_FILE
+
+
+def cim_identity_path(root: Optional[Path] = None) -> Path:
+    """Path of the DPAPI-sealed, non-exported last-good fingerprint record."""
+
+    return Path(root) / CIM_IDENTITY_FILE if root is not None else runtime_root() / CIM_IDENTITY_FILE
+
+
+def _legacy_config_auth_path(root: Optional[Path] = None) -> Path:
+    """Return the pre-v1.2.287 auth location for one-time migration only."""
+
+    return _recording_config_root(root) / LICENSE_FILE
 
 
 def _signed_document_at(path: Path) -> Optional[dict[str, Any]]:
@@ -185,20 +339,31 @@ def _signed_document_at(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _migrate_displaced_auth_document(root: Optional[Path] = None) -> None:
-    """Recover one prior app-side auth.json into the selected config folder.
+    """Move old ``助手配置\\auth.json`` into the private application root.
 
-    Older overlay builds could write the signed entitlement beside the app,
-    while the installer launcher selects ``<install>\\助手配置``.  On the next
-    boot that makes the user appear unlicensed even though the valid document
-    is still present.  If the chosen config destination does not already have
-    a signed document, copy the former app-side one there atomically and keep
-    it in place as an untouched fallback.
+    Earlier builds mixed authorization with exportable recordings.  The move
+    is one-way: the old file is removed only after an atomic root replacement
+    succeeds, so an interrupted migration never loses authorization.
     """
 
     target = license_path(root)
     if _signed_document_at(target) is not None:
+        # A previous overlay update can leave a duplicate signed document in
+        # the shareable folder.  The root document is already authoritative,
+        # so remove that duplicate rather than continuing to export private
+        # entitlement material with recordings.
+        legacy_copy = _legacy_config_auth_path(root)
+        if _signed_document_at(legacy_copy) is not None:
+            try:
+                legacy_copy.unlink()
+                SERVER_LOG.info("duplicate authorization removed from 助手配置")
+            except OSError:
+                SERVER_LOG.warning(
+                    "could not remove duplicate authorization from 助手配置",
+                    exc_info=True,
+                )
         return
-    app_side = runtime_root() / LICENSE_FILE
+    app_side = _legacy_config_auth_path(root)
     try:
         if app_side.resolve() == target.resolve():
             return
@@ -208,8 +373,7 @@ def _migrate_displaced_auth_document(root: Optional[Path] = None) -> None:
     if document is None:
         return
     try:
-        # Preserve display metadata already created in the chosen config
-        # folder, such as its locally stored original activation code/memo.
+        # Preserve display metadata already written to the new private root.
         local: dict[str, Any] = {}
         try:
             existing = json.loads(target.read_text(encoding="utf-8"))
@@ -229,7 +393,8 @@ def _migrate_displaced_auth_document(root: Optional[Path] = None) -> None:
             handle.write("\n")
             temporary = Path(handle.name)
         os.replace(temporary, target)
-        SERVER_LOG.info("authorization migrated from previous app-side auth.json")
+        app_side.unlink(missing_ok=True)
+        SERVER_LOG.info("authorization migrated from 助手配置 to the application root")
     except OSError:
         SERVER_LOG.warning("authorization migration from app-side auth.json failed", exc_info=True)
 
@@ -381,7 +546,7 @@ def _cim_value_with_one_retry(class_name: str, property_name: str, signal_name: 
     return retry
 
 
-def machine_fingerprint_components() -> dict[str, str]:
+def machine_fingerprint_components(*, force_refresh: bool = False) -> dict[str, str]:
     """Return hashed hardware signals suitable for a signed device binding."""
 
     global _fingerprint_cache_at, _fingerprint_cache, _fingerprint_last_good_cache
@@ -391,7 +556,8 @@ def machine_fingerprint_components() -> dict[str, str]:
             if len(_fingerprint_cache) >= 2
             else _FINGERPRINT_INCOMPLETE_CACHE_SECONDS
         )
-        if time.monotonic() - _fingerprint_cache_at < cache_lifetime:
+        if (not force_refresh
+                and time.monotonic() - _fingerprint_cache_at < cache_lifetime):
             return dict(_fingerprint_cache)
     raw = {
         "windows": _machine_guid(),
@@ -436,10 +602,10 @@ def device_request_code() -> str:
     return DEVICE_REQUEST_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def machine_fingerprint_hash() -> str:
+def machine_fingerprint_hash(*, force_refresh: bool = False) -> str:
     """Return the opaque, stable fingerprint sent to the fixed activation server."""
 
-    components = machine_fingerprint_components()
+    components = machine_fingerprint_components(force_refresh=force_refresh)
     if len(components) < 2:
         # MachineGuid is normally ready first, while CIM/WMI firmware and
         # motherboard providers may still be starting just after a reboot.
@@ -474,7 +640,9 @@ def machine_binding_from_request(code: str) -> dict[str, Any]:
     return {"version": 1, "minimum_matches": 2, "components": cleaned}
 
 
-def _machine_binding_status(binding: Any) -> Optional[LicenseStatus]:
+def _machine_binding_status(
+    binding: Any, license_id: str = "", root: Optional[Path] = None,
+) -> Optional[LicenseStatus]:
     """Return an invalid status only when a signed device binding mismatches."""
 
     if binding is None:
@@ -486,6 +654,13 @@ def _machine_binding_status(binding: Any) -> Optional[LicenseStatus]:
         return LicenseStatus(False, "machine", "授权设备绑定格式错误。")
     minimum = int(binding.get("minimum_matches", 2))
     current = machine_fingerprint_components()
+    if len(current) < minimum:
+        if license_id and has_sealed_fingerprint(license_id, root):
+            return None
+        # A boot-time CIM outage is not proof that this is a different PC.
+        # Preserve that distinction so the heartbeat worker can run its fixed
+        # readiness retry schedule instead of falsely rejecting the license.
+        return LicenseStatus(False, "device_not_ready", "设备未就绪，稍后重试")
     matches = sum(
         1 for name, digest in expected.items()
         if current.get(str(name)) == str(digest)
@@ -537,12 +712,27 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
         return LicenseStatus(False, "fields", "授权文件内容不完整。")
     if document_format == "maple-assistant-license/v2":
         try:
-            if payload.get("fingerprint_hash") != machine_fingerprint_hash():
+            try:
+                fingerprint = machine_fingerprint_hash()
+            except DeviceNotReadyError:
+                # CIM can be unavailable during the first seconds of Windows
+                # startup.  A DPAPI record is usable only on this same user
+                # profile and only for this same signed license, so it can
+                # keep local verification alive until the scheduled live
+                # heartbeat obtains a fresh CIM reading.
+                fingerprint = _sealed_fingerprint_for_license(license_id, root)
+                if fingerprint is None:
+                    raise
+            if payload.get("fingerprint_hash") != fingerprint:
                 return LicenseStatus(False, "machine", "此授权码仅适用于另一台设备。", license_id, edition)
+        except DeviceNotReadyError as exc:
+            return LicenseStatus(False, "device_not_ready", str(exc), license_id, edition)
         except ValueError as exc:
             return LicenseStatus(False, "machine", str(exc), license_id, edition)
     else:
-        machine_status = _machine_binding_status(payload.get("machine_binding"))
+        machine_status = _machine_binding_status(
+            payload.get("machine_binding"), license_id, root,
+        )
         if machine_status is not None:
             return LicenseStatus(
                 False, machine_status.code, machine_status.message, license_id, edition
@@ -782,12 +972,13 @@ def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus
 
     try:
         SERVER_LOG.info("activation requested")
+        fingerprint = machine_fingerprint_hash()
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/activate",
             {
                 "activation_code": "".join(str(code).upper().split()),
-                "fingerprint": machine_fingerprint_hash(),
+                "fingerprint": fingerprint,
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
@@ -819,6 +1010,7 @@ def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus
         return status
     persisted = _with_server_device(_persist_document(document, status, root), answer)
     if persisted.valid:
+        _save_sealed_fingerprint(fingerprint, persisted.license_id, root)
         SERVER_LOG.info("activation accepted license_id=%s", persisted.license_id)
         if not isinstance(answer.get("auto_lie"), dict):
             # This entitlement replaces the previous code's, so it must not
@@ -873,10 +1065,11 @@ def confirm_activation_transfer_via_server(token: str, root: Optional[Path] = No
 
     try:
         SERVER_LOG.info("activation transfer confirmation requested")
+        fingerprint = machine_fingerprint_hash()
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/activation-transfer/confirm",
-            {"transfer_token": str(token), "fingerprint": machine_fingerprint_hash()},
+            {"transfer_token": str(token), "fingerprint": fingerprint},
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
         document = answer["license"]
@@ -891,10 +1084,15 @@ def confirm_activation_transfer_via_server(token: str, root: Optional[Path] = No
     parsed = _parse_document(document, root)
     if not parsed.valid:
         return parsed
-    return _with_server_device(_persist_document(document, parsed, root), answer)
+    persisted = _with_server_device(_persist_document(document, parsed, root), answer)
+    if persisted.valid:
+        _save_sealed_fingerprint(fingerprint, persisted.license_id, root)
+    return persisted
 
 
-def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
+def validate_via_server(
+    root: Optional[Path] = None, *, force_cim_refresh: bool = False,
+) -> LicenseStatus:
     """Revalidate the saved entitlement through the pinned activation server.
 
     This is deliberately separate from local signature verification.  A
@@ -910,8 +1108,8 @@ def validate_via_server(root: Optional[Path] = None) -> LicenseStatus:
     a verdict that the license is gone or the passes are used up.
     """
 
-    status = _heartbeat_via_server(root)
-    if not status.valid:
+    status = _heartbeat_via_server(root, force_cim_refresh=force_cim_refresh)
+    if not status.valid and status.code != "device_not_ready":
         # A failed heartbeat clears the credential, and so does a verdict about
         # the entitlement: revoked, expired, or no lie passes left.  A
         # *successful* heartbeat never clears it - the reply either refreshes
@@ -999,7 +1197,9 @@ def unbind_device_via_server(
         return LicenseStatus(False, "server", "解绑请求失败，请检查网络后重试。")
 
 
-def _heartbeat_via_server(root: Optional[Path] = None) -> LicenseStatus:
+def _heartbeat_via_server(
+    root: Optional[Path] = None, *, force_cim_refresh: bool = False,
+) -> LicenseStatus:
     """The heartbeat request itself; the public wrapper applies the verdict rule."""
 
     local = verify_license(root)
@@ -1009,11 +1209,12 @@ def _heartbeat_via_server(root: Optional[Path] = None) -> LicenseStatus:
         return LicenseStatus(False, "server", "授权文件缺少在线验证信息。")
     try:
         SERVER_LOG.info("license heartbeat requested")
+        fingerprint = machine_fingerprint_hash(force_refresh=force_cim_refresh)
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/validate",
             {
-                "fingerprint": machine_fingerprint_hash(),
+                "fingerprint": fingerprint,
                 "license_id": local.license_id,
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
@@ -1042,6 +1243,7 @@ def _heartbeat_via_server(root: Optional[Path] = None) -> LicenseStatus:
         return status
     persisted = _with_server_device(_persist_document(document, status, root), answer)
     if persisted.valid:
+        _save_sealed_fingerprint(fingerprint, persisted.license_id, root)
         SERVER_LOG.info("license heartbeat accepted license_id=%s", persisted.license_id)
     return persisted
 
