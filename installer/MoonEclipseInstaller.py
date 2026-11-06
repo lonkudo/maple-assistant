@@ -612,7 +612,12 @@ class InstallerWindow:
         ttk.Entry(outer, textvariable=self.install_root, width=42).grid(row=3, column=1, sticky="ew", padx=(8, 6), pady=(10, 0))
         ttk.Button(outer, text="选择…", command=self._choose_root).grid(row=3, column=2, pady=(10, 0))
 
-        self.eclipse = tk.Canvas(outer, width=52, height=52, highlightthickness=0, background="#f6f7f9")
+        # #f0f0f0 matches the window face, so the glyph has no white square
+        # behind it.  The canvas keeps focus off itself to avoid a border.
+        self.eclipse = tk.Canvas(
+            outer, width=52, height=52, highlightthickness=0,
+            background="#f0f0f0", borderwidth=0,
+        )
         self.eclipse.grid(row=4, column=0, pady=(18, 0), sticky="w")
         self.progress = ttk.Progressbar(outer, mode="determinate", length=340)
         self.progress.grid(row=4, column=1, columnspan=2, pady=(18, 0), sticky="ew")
