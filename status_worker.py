@@ -28,6 +28,11 @@ LOG = logging.getLogger(__name__)
 # in the log at all (the operator's 自动重连 report).  The first refusal of a burst is logged at INFO
 # and then at most one line every few seconds, carrying the number of refusals in between.
 INPUT_REFUSAL_LOG_SECONDS = 5.0
+# How long one caller may wait for the keyboard ledger before it is treated as
+# wedged and every thread stack is logged once.
+LEDGER_WATCHDOG_SECONDS = 2.0
+# A deferred ledger forget gives up after this long instead of hanging.
+DEFERRED_FORGET_SECONDS = 15.0
 INPUT_NOT_ENABLED_REASON = (
     "live input is not enabled - press 开始巡逻/Start Patrol to arm it "
     "(typing hotkeys re-arm it themselves)"
@@ -233,6 +238,7 @@ class WindowKeySender:
         # movement and attack workers must be able to overlap their events.
         self._selection_lock = threading.Lock()
         self._key_state_lock = threading.Lock()
+        self._ledger_watchdog_reported = False
         # Stop Patrol must never leave the dashboard in its "releasing keys"
         # state merely because another sender currently owns the ledger lock.
         # This guard permits one deferred bookkeeping pass after the immediate
@@ -375,11 +381,16 @@ class WindowKeySender:
             "start patrol", lock_timeout_seconds=0.250
         )
         if session is None:
+            # One stuck bookkeeping lock must not leave the assistant unable to
+            # start patrol: physical key-up does not need the ledger.
             LOG.warning(
                 "INPUT RESET deferred: keyboard ledger stayed busy for 250ms; "
-                "input remains disarmed"
+                "forcing a lock-free session reset and arming anyway"
             )
-            return False
+            self._emergency_release_without_lock("start patrol (ledger wedged)")
+            session = self._force_forget_session_unlocked(
+                "start patrol (ledger wedged)"
+            )
         self._input_enabled.set()
         # A fresh session reports its first refusal again instead of staying silent inside the burst
         # window of the previous one.
@@ -592,7 +603,19 @@ class WindowKeySender:
 
         def forget_when_safe() -> None:
             try:
-                with self._key_state_lock:
+                if not self._key_state_lock.acquire(
+                    timeout=DEFERRED_FORGET_SECONDS
+                ):
+                    # Never park this thread (or the deferred gate) for the rest
+                    # of the session: report it and let the next Start Patrol's
+                    # reset own the ledger.
+                    LOG.warning(
+                        "INPUT SESSION FORGET abandoned after %.0fs: keyboard "
+                        "ledger remained busy; the next Start Patrol resets it",
+                        DEFERRED_FORGET_SECONDS,
+                    )
+                    return
+                try:
                     # If a new patrol was armed before this old cleanup got
                     # the lock, its fresh reset owns the ledger. Never erase
                     # that new session from an old Stop Patrol request.
@@ -603,6 +626,8 @@ class WindowKeySender:
                         )
                         return
                     session = self._forget_input_session_locked()
+                finally:
+                    self._key_state_lock.release()
                 LOG.info(
                     "INPUT SESSION FORGOTTEN session=%d reason=%s (deferred)",
                     session,
@@ -668,7 +693,8 @@ class WindowKeySender:
         self._ctrl_chord_in_flight = max(0, self._ctrl_chord_in_flight - 1)
 
     def force_key_up(
-        self, key: str, *, reason: str = "recovery", quiet: bool = False
+        self, key: str, *, reason: str = "recovery", quiet: bool = False,
+        lock_timeout: Optional[float] = None,
     ) -> bool:
         """Unconditionally inject key-up and forget every claim for ``key``.
 
@@ -684,12 +710,83 @@ class WindowKeySender:
         key = key.casefold()
         if key not in self._SCAN:
             raise ValueError(f"unsupported key: {key}")
-        with self._key_state_lock:
+        if lock_timeout is None:
+            self._key_state_lock.acquire()
+        elif not self._key_state_lock.acquire(timeout=max(0.0, float(lock_timeout))):
+            # The caller is the global hotkey hook, which must stay responsive:
+            # waiting here parks chord detection for every later hotkey.
+            if not quiet:
+                LOG.info(
+                    "key-up forced=%s reason=%s deferred: keyboard ledger busy",
+                    key, reason,
+                )
+            return False
+        try:
             self._key_owners.pop(key, None)
             self._emit_locked(key, key_up=True)
+        finally:
+            self._key_state_lock.release()
         if not quiet:
             LOG.info("key-up forced=%s reason=%s", key, reason)
         return True
+
+    def _acquire_with_watchdog(self, timeout: Optional[float]) -> bool:
+        """Acquire the ledger lock, naming the holder when it stays busy.
+
+        A wedged ledger is otherwise invisible: callers simply wait, the hotkey
+        hook stops being served and Start Patrol refuses to arm.  One stack dump
+        per wedge is enough to identify the owning thread.
+        """
+
+        first_wait = (
+            LEDGER_WATCHDOG_SECONDS if timeout is None
+            else min(max(0.0, float(timeout)), LEDGER_WATCHDOG_SECONDS)
+        )
+        if self._key_state_lock.acquire(timeout=max(0.001, first_wait)):
+            return True
+        if not self._ledger_watchdog_reported:
+            self._ledger_watchdog_reported = True
+            try:
+                import sys
+                import traceback
+
+                LOG.error(
+                    "keyboard ledger lock has been held for more than %.0fs; "
+                    "dumping every thread to identify the holder",
+                    LEDGER_WATCHDOG_SECONDS,
+                )
+                for thread_id, frame in sys._current_frames().items():
+                    LOG.error(
+                        "thread %s stack:\n%s", thread_id,
+                        "".join(traceback.format_stack(frame)),
+                    )
+            except Exception:
+                LOG.debug("ledger watchdog dump failed", exc_info=True)
+        if timeout is None:
+            acquired = self._key_state_lock.acquire()
+        else:
+            acquired = self._key_state_lock.acquire(
+                timeout=max(0.0, float(timeout) - LEDGER_WATCHDOG_SECONDS)
+            )
+        if acquired:
+            self._ledger_watchdog_reported = False
+        return acquired
+
+    def _force_forget_session_unlocked(self, reason: str) -> int:
+        """Reset the ledger without its lock, as a wedged-lock recovery.
+
+        Dict clear and int add are atomic under the GIL and the caller has
+        already emitted the game-side key-ups, so this abort path is safe.
+        """
+
+        self._key_owners.clear()
+        self._physical_keys.clear()
+        self._input_session += 1
+        session = self._input_session
+        LOG.warning(
+            "INPUT SESSION FORCED (lock-free) session=%d reason=%s", session, reason,
+        )
+        return session
 
     def reset_input_session(
         self,
@@ -699,12 +796,11 @@ class WindowKeySender:
     ) -> Optional[int]:
         """Create a neutral input generation and scrub all bot motion keys."""
 
-        if lock_timeout_seconds is None:
-            acquired = self._key_state_lock.acquire()
-        else:
-            acquired = self._key_state_lock.acquire(
-                timeout=max(0.0, float(lock_timeout_seconds))
-            )
+        wait_seconds = (
+            None if lock_timeout_seconds is None
+            else max(0.0, float(lock_timeout_seconds))
+        )
+        acquired = self._acquire_with_watchdog(wait_seconds)
         if not acquired:
             return None
         try:

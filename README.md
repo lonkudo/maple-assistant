@@ -210,6 +210,57 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   focus thief, another window's ghost, or a vanished game window still count as a
   loss. A hang is reported once (`foreground: the game window is not responding …`).
 
+### Current release behavior (v1.2.290 – v1.2.291)
+
+- **The installer never asks for a code twice.** The launch window has no
+  activation field. An existing installation's code comes from its own profile:
+  the selected root's `助手配置` first, then the older build's
+  `<selected>\app\助手配置`, and that document is silently moved to the selected
+  root (`installer: moved the activation profile … -> …`) so the installed app
+  keeps its activation. The code is taken from `license_settings.json` when the
+  app stored the typed code, otherwise from the authenticated document's
+  `_local.activation_code` (the `MAL-…` server code); only a folder with no
+  profile opens the **首次安装需要授权码** window. Deriving a token from the
+  signed document was tried and reverted - the server answers **设备未授权** for
+  it.
+- **Each layer starts on its nearest leg.** On entry the route takes the closer
+  of the two recorded edges (a leg already reached is consumed at once), walks
+  the other edge, then the layer's way-up phase: its recorded rope, or the up
+  jump point when no rope was recorded. The order survives a split-part index
+  change; a layer with neither rope nor up point keeps repeating its own legs.
+- **The up jump point is a jump, not a rope.** It owns an `up` phase that only
+  walks to the point (`near_target=False`, no Up hold, no climb) and fires only
+  in that phase or through the dwell rule - never from the left/right or rope
+  legs. A completed jump accepts the next floor immediately and the old floor's
+  route waits `JUMP_UP_LANDING_WAIT_SECONDS` for the layer change instead of
+  running its legs on the new floor.
+- **The dwell trigger is reusable and bounded.** A point the character stays
+  inside fires after more than three captured frames, again while standing (the
+  dwell counter restarts on fire and the 0.4 s refire cooldown still applies),
+  up to `JUMP_POINT_DWELL_MAX_ATTEMPTS = 3` per leg; the entry trigger keeps its
+  once-per-leg rule.
+- **A stalled character is jumped off, not dropped.** The self-rescue presses
+  Left and Right for two captured frames each; no X movement on either side is
+  a rope stall, so it jumps toward the CLOSEST recorded target (left-most,
+  right-most, or rope of the patrolled layers) and then re-arms patrol from the
+  nearest recorded floor. A refused key cancels the probe instead of confirming
+  a stall, and a confirmed stall is never answered with Alt+Down - the
+  unresolved-floor recovery probes the walk before its first chord for the same
+  reason.
+- **The next floor is recognised.** The flicker guard accepts a floor whose
+  arrival band contains the marker, a blank detection frame no longer resets the
+  layer-resync counter, and a completed up jump arms the resync.
+- **World-Y bands are narrowed to the floor gap.** A saved band may no longer
+  contain another floor's anchor: each band is clamped around its own anchor to
+  just under half the distance to the nearest other floor, so a stair-height
+  difference stays two bands and a reading between them matches none.
+- **A horizontal leg keeps its recorded edge.** An out-of-span up jump point no
+  longer stretches the left/right leg, so the walk cannot jump away before the
+  other leg runs.
+- **The launcher shows no console.** `start_assistant.bat` and `启动助手.bat`
+  start `wscript` detached, so the cmd window closes before the UAC prompt
+  instead of hanging around the confirmation.
+
 ### Current release behavior (v1.2.278 – v1.2.280)
 
 - **An unresolved floor changes layer instead of walking it.** When the marker
@@ -392,8 +443,12 @@ the activation service could not be completed. Technical categories remain in
 `server_client.log`; neither the raw fingerprint nor a secret is logged.
 
 The most recently submitted code and its validation result are stored in the
-`license` section of `user_config.json`. The signed `license.json` document is
-the actual local entitlement. A verified rejected replacement code immediately
+`license` section of `user_config.json`. The signed `auth.json` document is
+the actual local entitlement, kept in the selected install root's `助手配置`
+(`MOONECLIPSE_CONFIG_DIR` when the launcher sets it). Installed copies the
+operator upgrades with the separate installer never retype the code: the
+installer reads it from that profile (see *Current release behavior
+(v1.2.290 – v1.2.291)*). A verified rejected replacement code immediately
 locks automation and removes that signed document, so the rejected state also
 persists after restart. A connection, TLS, or server-configuration failure is
 reported separately and does not erase a previously saved entitlement.

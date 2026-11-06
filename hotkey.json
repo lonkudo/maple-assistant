@@ -20,7 +20,12 @@
     {"keys": "ctrl+d", "action": "record_jump_point:left", "block_original": true},
     {"keys": "ctrl+f", "action": "record_jump_point:right", "block_original": true},
     {"keys": "ctrl+s", "action": "record_split_point", "block_original": true},
-    {"keys": "ctrl+e", "action": "record_skill_point", "block_original": true},
+    {
+    "keys": "ctrl+end",
+    "action": "record_jump_point:up",
+    "block_original": true
+  },
+  {"keys": "ctrl+e", "action": "record_skill_point", "block_original": true},
     {"keys": "ctrl+g", "action": "record_flower_point", "block_original": true},
     {"keys": "ctrl+a", "action": "record_support_point", "block_original": true},
     {"keys": "ctrl+r", "action": "record_dual_stationary_post:first", "block_original": true},

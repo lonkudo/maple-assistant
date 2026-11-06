@@ -30,7 +30,11 @@ from typing import Any
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from licensing import ACTIVATION_SERVER_ENDPOINT, machine_fingerprint_hash  # noqa: E402
+from licensing import (  # noqa: E402
+    ACTIVATION_SERVER_ENDPOINT,
+    activation_code,
+    machine_fingerprint_hash,
+)
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json  # noqa: E402
 
 
@@ -308,6 +312,162 @@ def _archive_version(archive: Path) -> str:
     except (OSError, zipfile.BadZipFile):
         return ""
     return ""
+
+
+def _profile_search_dirs(root: Path) -> list[Path]:
+    """The two folders a licensed profile may live in, correct one first.
+
+    The CORRECT place is the selected root's ``助手配置``: the launcher this
+    installer writes sets ``MOONECLIPSE_CONFIG_DIR=<selected>\\助手配置`` and the
+    app reads its entitlement from there.  Older builds ran straight out of the
+    ``app\\`` folder and saved the document in ``app\\助手配置`` instead, which is
+    the wrong place - it is still searched so an installation activated by the
+    old build is found and moved to the root silently.
+    """
+
+    dirs: list[Path] = [root / "助手配置"]
+    legacy = root / "app" / "助手配置"
+    if legacy != dirs[0] and legacy.is_dir():
+        dirs.append(legacy)
+    return dirs
+
+
+def _profile_target(root: Path) -> Path:
+    """Where the app expects its licensed profile document: the selected root."""
+
+    return _profile_search_dirs(root)[0] / "auth.json"
+
+
+def _relocate_profile_document(source: Path, root: Path) -> None:
+    """Silently move a profile document to the selected root's ``助手配置``.
+
+    The older build saved ``app\\助手配置\\auth.json``; the app now reads
+    ``<selected>\\助手配置\\auth.json`` (``MOONECLIPSE_CONFIG_DIR`` from the
+    launcher).  Moving it keeps the update from silently de-activating the
+    installation.  An existing target document is never overwritten, and the old
+    copy is only removed after the new one is verified present.
+    """
+
+    target = _profile_target(root)
+    try:
+        if target.resolve() == source.resolve():
+            return
+    except OSError:
+        return
+    if target.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    except OSError:
+        logging.warning(
+            "installer: could not move %s to %s", source, target, exc_info=True
+        )
+        return
+    if not target.is_file():
+        logging.warning(
+            "installer: the moved profile is missing at %s; keeping %s",
+            target, source,
+        )
+        return
+    source.unlink(missing_ok=True)
+    logging.info(
+        "installer: moved the activation profile %s -> %s", source, target
+    )
+
+
+def _previous_install_profile_code(root: Path) -> str:
+    """Activation code already stored in this installation's local profile.
+
+    An existing installation keeps its licensed ``auth.json`` (the signed
+    entitlement document) in the selected root's ``助手配置``, so the installer
+    can reproduce the activation code from it and update the folder without
+    asking the operator again.  Only a NEW folder, which has no profile, needs
+    the code typed in.
+
+    Two folders are searched (``_profile_search_dirs``): the CORRECT
+    ``<selected>\\助手配置`` and the older build's ``<selected>\\app\\助手配置``.
+
+    The code itself comes from, in order:
+
+    1. ``license_settings.json``'s ``activation_code`` - exactly what was typed;
+    2. the stored document's ``_local.activation_code`` - the code the app kept
+       from the successful activation (a ``MAL-…`` server code);
+    3. only as a last resort a token derived from the signed document.
+
+    Deriving it was the original idea and it is WRONG: the stored code is a
+    ``MAL-…`` server code while ``licensing.activation_code`` builds an
+    ``MA1-…`` token from the whole document, and the server answered
+    "设备未授权" for that ("authed but get 设备未授权", 0:24 field report).  The
+    document is still moved to the selected root so the installed app keeps its
+    activation.
+    """
+
+    dirs = _profile_search_dirs(root)
+    for directory in dirs:
+        settings = directory / "license_settings.json"
+        try:
+            data = json.loads(settings.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        stored = "".join(str(data.get("activation_code") or "").split())
+        if stored:
+            logging.info(
+                "installer: using the stored activation code from %s", settings
+            )
+            return stored
+
+    target = _profile_target(root)
+    # The correct location first, then the old build's folder, then the bare
+    # names some older runs wrote beside the executable.
+    candidates: list[Path] = [target]
+    for directory in dirs:
+        for name in ("auth.json", "license.json"):
+            candidates.append(directory / name)
+    for base in (root, root / "app"):
+        for name in ("auth.json", "license.json"):
+            candidates.append(base / name)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except OSError:
+            key = candidate
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            document = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(document, dict) or "payload" not in document:
+            continue
+        _relocate_profile_document(candidate, root)
+        local = document.get("_local")
+        if isinstance(local, dict):
+            stored = "".join(str(local.get("activation_code") or "").split())
+            if stored:
+                logging.info(
+                    "installer: using the activation code the app stored in %s",
+                    candidate,
+                )
+                return stored
+        derived = activation_code(document)
+        if derived:
+            logging.warning(
+                "installer: %s holds no activation code; falling back to a "
+                "derived token the server may refuse", candidate,
+            )
+            return derived
+    return ""
+
+
+def _is_previous_install(root: Path) -> bool:
+    """Whether ``root`` already holds an installation (install marker present)."""
+
+    return bool(_load_local_manifest(root)) or (root / INSTALL_MARKER).is_file()
 
 
 def _activate(code: str) -> tuple[str, str]:
@@ -598,13 +758,10 @@ class InstallerWindow:
         outer = ttk.Frame(self.root, padding=18)
         outer.grid(sticky="nsew")
         ttk.Label(outer, text="MoonEclipse", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(outer, text="授权码").grid(row=2, column=0, sticky="w", pady=(16, 0))
-        self.code = ttk.Entry(outer, width=48, show="*")
-        self.code.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0))
-        ttk.Label(outer, text="安装位置").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(outer, text="安装位置").grid(row=2, column=0, sticky="w", pady=(16, 0))
         self.install_root = tk.StringVar(value=str(default_root))
-        ttk.Entry(outer, textvariable=self.install_root, width=42).grid(row=3, column=1, sticky="ew", padx=(8, 6), pady=(10, 0))
-        ttk.Button(outer, text="选择…", command=self._choose_root).grid(row=3, column=2, pady=(10, 0))
+        ttk.Entry(outer, textvariable=self.install_root, width=42).grid(row=2, column=1, sticky="ew", padx=(8, 6), pady=(16, 0))
+        ttk.Button(outer, text="选择…", command=self._choose_root).grid(row=2, column=2, pady=(16, 0))
 
         # #f0f0f0 matches the window face, so the glyph has no white square
         # behind it.  The canvas keeps focus off itself to avoid a border.
@@ -612,15 +769,61 @@ class InstallerWindow:
             outer, width=52, height=52, highlightthickness=0,
             background="#f0f0f0", borderwidth=0,
         )
-        self.eclipse.grid(row=4, column=0, pady=(18, 0), sticky="w")
+        self.eclipse.grid(row=3, column=0, pady=(18, 0), sticky="w")
         self.progress = ttk.Progressbar(outer, mode="determinate", length=340)
-        self.progress.grid(row=4, column=1, columnspan=2, pady=(18, 0), sticky="ew")
+        self.progress.grid(row=3, column=1, columnspan=2, pady=(18, 0), sticky="ew")
         self.status = ttk.Label(outer, text="准备就绪")
-        self.status.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self.install = ttk.Button(outer, text="开始安装 / 更新", command=self._start)
-        self.install.grid(row=6, column=2, sticky="e", pady=(16, 0))
+        self.install.grid(row=5, column=2, sticky="e", pady=(16, 0))
         self._paint_eclipse(0.0)
         self.root.after(50, self._drain_events)
+
+    def _ask_activation_code(self) -> str:
+        """Ask for the activation code, for a NEW installation folder only.
+
+        An installation that already holds its licensed profile never reaches
+        this dialog: its code is taken from ``auth.json`` (see
+        ``_previous_install_profile_code``), so updating an existing folder never
+        asks the operator to retype it.
+        """
+
+        answer = {"code": ""}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("首次安装需要授权码")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(sticky="nsew")
+        ttk.Label(
+            frame,
+            text="这是一个新的安装位置。\n请输入授权码以完成首次安装：",
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        value = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=value, width=52)
+        entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        entry.focus_set()
+
+        def confirm(_event: object = None) -> None:
+            answer["code"] = value.get().strip()
+            dialog.destroy()
+
+        def cancel() -> None:
+            answer["code"] = ""
+            dialog.destroy()
+
+        ttk.Button(frame, text="取消", command=cancel).grid(
+            row=2, column=0, sticky="w", pady=(14, 0)
+        )
+        ttk.Button(frame, text="确定", command=confirm).grid(
+            row=2, column=1, sticky="e", pady=(14, 0)
+        )
+        entry.bind("<Return>", confirm)
+        dialog.bind("<Escape>", lambda _event: cancel())
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return answer["code"]
 
     def _choose_root(self) -> None:
         chosen = filedialog.askdirectory(parent=self.root, title="选择 MoonEclipse 安装位置", initialdir=self.install_root.get() or str(Path.home()))
@@ -656,11 +859,22 @@ class InstallerWindow:
     def _start(self) -> None:
         if self.running:
             return
-        code = self.code.get().strip()
-        if not code:
-            messagebox.showwarning("缺少授权码", "请输入授权码。", parent=self.root)
-            return
         root = Path(self.install_root.get()).expanduser()
+        # An existing installation carries its licensed profile: update it with
+        # the stored code and never ask again.  Only a NEW folder (no install
+        # marker, no auth.json) prompts for the activation code.
+        code = ""
+        if _is_previous_install(root):
+            code = _previous_install_profile_code(root)
+            if not code:
+                logging.warning(
+                    "installer: %s looks installed but holds no usable auth.json; "
+                    "asking for the activation code", root,
+                )
+        if not code:
+            code = self._ask_activation_code()
+            if not code:
+                return
         self.running = True
         self.install.state(["disabled"])
         self.status.configure(text="正在验证授权码…")

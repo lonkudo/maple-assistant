@@ -18,11 +18,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from config_store import get_config_store
 from minimap_detector import hud_scale_for
 from runtime_paths import application_root
 from auto_lie_secret import CredentialRedactionFilter, get_server_secret
 from async_log_writer import AsyncBatchLogWriter
 from crash_reporter import record_exception
+from versioning import version_label
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -315,6 +317,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _recording_log_header(
+    version: str, config_path: Path, recording: object,
+) -> str:
+    """Header placed at the top of assistant.log: recording first, then the log.
+
+    A shared log must be interpretable on its own, and the recording (layers,
+    endpoints, ropes, jump points) is what every movement line refers to.
+    """
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        body = json.dumps(recording, ensure_ascii=False, indent=2, sort_keys=True)
+    except (TypeError, ValueError):
+        body = repr(recording)
+    return (
+        "# ===== MoonEclipse log =====\n"
+        f"# started  {stamp}\n"
+        f"# version  {version}\n"
+        f"# exe      {application_root(__file__)}\n"
+        f"# config   {config_path}\n"
+        "# ===== recording (user_config.json :: recording) =====\n"
+        f"{body}\n"
+        "# ===== log =====\n"
+    )
+
+
 def _clear_previous_log_files() -> None:
     """Startup: wipe routine logs from previous runs.
 
@@ -407,6 +435,9 @@ def main() -> int:
         return 0
     args = parse_args()
     _clear_previous_log_files()
+    # The recording is needed for the log header, so the config store is
+    # created before the log writers own the file.
+    config_store = get_config_store(args.config)
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
     # INFO and ERROR tracking are persisted in work/assistant.log; the UI
@@ -420,6 +451,42 @@ def main() -> int:
         trace_log_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
+    # The recording goes on top: the writer appends below it, so the file can be
+    # attached as one self-contained document.
+    try:
+        _header = _recording_log_header(
+            version_label(),
+            config_store.user_path,
+            config_store.read_section("recording"),
+        )
+        trace_log_path.write_text(_header, encoding="utf-8")
+    except OSError:
+        pass
+    _last_recording_block = {"text": ""}
+
+    def append_recording_snapshot(reason: str) -> None:
+        """Append the recording again when it changed since the last block."""
+
+        try:
+            recording = config_store.read_section("recording")
+        except Exception:
+            return
+        try:
+            text_body = json.dumps(recording, ensure_ascii=False, indent=2, sort_keys=True)
+        except (TypeError, ValueError):
+            return
+        if text_body == _last_recording_block["text"]:
+            return
+        _last_recording_block["text"] = text_body
+        block = (
+            f"\n# ===== recording snapshot ({reason} "
+            f"{time.strftime('%H:%M:%S')}) =====\n"
+            f"{text_body}\n"
+            "# ===== end recording snapshot =====\n"
+        )
+        if not trace_log_writer.append_block(block):
+            logging.warning("recording snapshot could not be appended to the log")
+
     trace_log_writer = AsyncBatchLogWriter(
         trace_log_path,
         max_bytes=2_000_000,
@@ -573,8 +640,6 @@ def main() -> int:
     from lie_screenshot_recorder import LieScreenshotRecorder
     from screen_blinker import ScreenBlinker
     from telegram_notifier import TelegramNotifier
-    from versioning import version_label
-    from config_store import get_config_store
     from focus_worker import FocusWorker
     from minimap_detector import (
         MinimapDetector,
@@ -662,7 +727,6 @@ def main() -> int:
         # selection or the character jumps every time patrol starts.
         alt_transition=False,
     )
-    config_store = get_config_store(args.config)
     additional_settings = config_store.read_section("additional_functions")
     channel_update_events: "queue.Queue[int]" = queue.Queue(maxsize=16)
     # A stopped 有人换线 workflow asks the UI to clear its own
@@ -1446,9 +1510,9 @@ def main() -> int:
                     continue
                 try:
                     direction = str(point.get("direction", "")).casefold()
-                    marker_kind = (
-                        "jump_left" if direction == "left" else "jump_right"
-                    )
+                    marker_kind = {
+                        "left": "jump_left", "right": "jump_right", "up": "jump_up",
+                    }.get(direction, "jump_right")
                     patrol_point_overlay.append((
                         marker_kind, float(point["x"]), float(point["y"])
                     ))
@@ -1755,6 +1819,9 @@ def main() -> int:
 
         """
 
+        # Keep the attached log self-describing: if the recording changed since
+        # the header / previous start, append the current one now.
+        append_recording_snapshot("start patrol")
         # Layer-band drawing is diagnostic only. Do not make a live patrol
         # wait for it: the overlay's timed display and clean recapture caused
         # a visible freeze immediately after the start confirmation.
@@ -1974,7 +2041,13 @@ def main() -> int:
                     )
 
         try:
-            key_sender.force_key_up("ctrl", reason=f"hotkey chord: {action}")
+            # Bounded: this runs on the hotkey HOOK thread.  Waiting for the
+            # keyboard ledger here parked chord detection, so every later hotkey
+            # appeared dead (field report: no hotkey worked after a Stop Patrol
+            # whose ledger cleanup had been deferred).
+            key_sender.force_key_up(
+                "ctrl", reason=f"hotkey chord: {action}", lock_timeout=0.05,
+            )
         except Exception:
             logging.warning("hotkey Ctrl cleanup failed for %s", action, exc_info=True)
 
@@ -1996,6 +2069,10 @@ def main() -> int:
             return
         key_sender.force_key_up(
             "ctrl", reason="Ctrl still held after a hotkey chord", quiet=True,
+            # Bounded for the same reason as above: this repeats on the hook
+            # thread while Ctrl stays held, so it must never wait for a busy
+            # keyboard ledger.
+            lock_timeout=0.05,
         )
 
     hotkey_worker = None if args.no_ui else HotkeyWorker(
@@ -2506,9 +2583,6 @@ def main() -> int:
             rescue_probe_attack_block_seconds=float(
                 calibration.get("rescue_probe_attack_block_seconds", 2.0)
             ),
-            rescue_probe_hold_seconds=float(
-                calibration.get("rescue_probe_hold_seconds", 0.7)
-            ),
             rescue_probe_settle_seconds=float(
                 calibration.get("rescue_probe_settle_seconds", 0.2)
             ),
@@ -2518,7 +2592,11 @@ def main() -> int:
             drop_chord_hold_seconds=float(
                 calibration.get("drop_chord_hold_seconds", 0.10)
             ),
-            drop_retry_seconds=float(calibration.get("drop_retry_seconds", 1.5)),
+            drop_retry_seconds=float(calibration.get("drop_retry_seconds", 0.9)),
+            # The chord the jump-up point sends: Alt, the game's jump key.
+            # ctrl+up / ctrl+end are this app's recording hotkeys and are never
+            # sent to the client.
+            jump_up_chord=str(calibration.get("jump_up_chord", "alt")),
             minimap_detector=minimap_detector,
             patrol_controller=patrol_controller,
             diamond_size_tracker=movement_diamond_tracker,

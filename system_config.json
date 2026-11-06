@@ -1,7 +1,12 @@
 {
   "rope_calibration": {
     "map": "",
-    "minimap_region": [0.0, 0.075, 0.12, 0.24],
+    "minimap_region": [
+      0.0,
+      0.075,
+      0.12,
+      0.24
+    ],
     "rope_x": 0.4926,
     "calibrated_player_y": 0.65625,
     "horizontal_tolerance": 0.01,
@@ -33,7 +38,7 @@
     "climb_failed_cycles_reset": 3,
     "climb_lateral_cycles_reset": 3,
     "drop_chord_hold_seconds": 0.1,
-    "drop_retry_seconds": 1.5,
+    "jump_up_chord": "alt",
     "fall_detect_frames": 2,
     "fall_marker_y_gain": 0.015,
     "fall_settle_min_frames": 3,
@@ -43,12 +48,11 @@
     "world_drift_reanchor_threshold": 0.35,
     "rescue_cycle_limit": 3,
     "rescue_probe_attack_block_seconds": 2.0,
-    "rescue_probe_hold_seconds": 0.7,
     "rescue_probe_settle_seconds": 0.2,
     "rescue_probe_move_threshold": 0.006,
     "attack_block_max_seconds": 4.0,
     "near_rope_seconds": 0.5,
-    "near_rope_range": 0.040,
+    "near_rope_range": 0.04,
     "near_rope_inner_range": 0.032,
     "near_rope_outer_range": 0.036,
     "near_rope_diamonds": 0.66,

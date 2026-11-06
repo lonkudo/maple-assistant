@@ -164,7 +164,14 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "climb_attempt_interval_seconds": .5,
         "climb_failed_cycles_reset": 3,
         "climb_lateral_cycles_reset": 3,
-        "drop_chord_hold_seconds": .1, "drop_retry_seconds": 1.5,
+        "drop_chord_hold_seconds": .1,
+        # Only the recovery paths (reconnect / unresolved floor / dead flower)
+        # still use this stall window; the plain patrol drop retries as soon as
+        # the attempt is proven to have failed (DROP_RETRY_MIN_SECONDS).
+        "drop_retry_seconds": 0.9,
+        # Chord sent by the jump-up point: Alt is the game's jump key.  The
+        # setting exists so a different in-game binding needs no rebuild.
+        "jump_up_chord": "alt",
         "fall_detect_frames": 2, "fall_marker_y_gain": .015,
         "fall_settle_min_frames": 3, "fall_settle_epsilon": .15,
         "fall_settle_max_seconds": 1.2,
@@ -187,7 +194,6 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "rescue_check_interval_seconds": 300.0, "rescue_stuck_frames": 20,
         "rescue_cycle_limit": 3,
         "rescue_probe_attack_block_seconds": 2.0,
-        "rescue_probe_hold_seconds": .7,
         "rescue_probe_settle_seconds": .2,
         "rescue_probe_move_threshold": .006,
         "patrol_enabled": False,

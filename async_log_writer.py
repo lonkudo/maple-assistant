@@ -83,17 +83,61 @@ class _RecordBuffer:
             return not self._records
 
 
+# A batch that cannot be written this many times is dropped so one bad disk
+# state (or one pathological record) can never freeze every later log line.
+MAX_BATCH_RETRIES = 20
+
+
 class _BatchRotatingFileHandler(RotatingFileHandler):
     """One combined write/flush per batch, retaining normal rotation rules."""
 
+    def _format_one(self, record: logging.LogRecord) -> str:
+        """Format one record; a malformed one becomes a readable placeholder.
+
+        ``logging`` raises ``TypeError``/``ValueError`` when a message with a
+        ``%`` placeholder receives mismatched arguments.  Returning a
+        placeholder keeps the surviving records flowing and leaves the broken
+        message visible for whoever wrote it.
+        """
+
+        try:
+            line = f"{self.format(record)}{self.terminator}"
+            try:
+                line.encode("utf-8")
+            except UnicodeEncodeError:
+                # Lone surrogates cannot be written to a UTF-8 file.  Keep the
+                # readable part; the replacement characters make it obvious.
+                line = line.encode("utf-8", "replace").decode("utf-8")
+            return line
+        except Exception:
+            try:
+                detail = repr(record.msg)
+                arguments = repr(record.args)
+            except Exception:
+                detail, arguments = "<unreadable message>", "<unreadable args>"
+            try:
+                stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+            except Exception:
+                stamp = "??:??:??"
+            return (
+                f"{stamp} {record.name} {record.levelname} "
+                f"<unformattable log record: {detail} args={arguments}>"
+                f"{self.terminator}"
+            )
+
     def write_batch(
-        self, records: Iterable[logging.LogRecord], *, mirror: Optional[TextIO] = None
+        self, records: Iterable[logging.LogRecord], *,
+        mirror: Optional[TextIO] = None, note: str = "",
     ) -> bool:
         records = list(records)
         if not records:
             return True
         try:
-            text = "".join(f"{self.format(record)}{self.terminator}" for record in records)
+            text = note + "".join(self._format_one(record) for record in records)
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                text = text.encode("utf-8", "replace").decode("utf-8")
             self.acquire()
             try:
                 if self.stream is None:
@@ -167,6 +211,7 @@ class AsyncBatchLogWriter:
         self._batch_seconds = max(0.02, float(batch_seconds))
         self._mirror = mirror
         self._stop = threading.Event()
+        self._drop_note = ""
         self._thread = threading.Thread(
             target=self._run,
             name=f"log-writer-{Path(path).stem}",
@@ -183,18 +228,73 @@ class AsyncBatchLogWriter:
         self._thread.join(timeout=max(0.0, float(drain_timeout)))
         self._file_handler.close()
 
+    def append_block(self, text: str) -> bool:
+        """Append one raw block (a recording snapshot) between normal batches.
+
+        The file handler's lock is the same one ``write_batch`` uses, so a block
+        can never interleave with a batch or land outside its intended order.
+        """
+
+        if not text:
+            return True
+        try:
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                text = text.encode("utf-8", "replace").decode("utf-8")
+            self._file_handler.acquire()
+            try:
+                if self._file_handler.stream is None:
+                    self._file_handler.stream = self._file_handler._open()
+                self._file_handler.stream.write(text)
+                self._file_handler.flush()
+            finally:
+                self._file_handler.release()
+            return True
+        except Exception:
+            return False
+
     def _run(self) -> None:
+        failures = 0
         while not self._stop.is_set() or not self._buffer.empty():
             batch = self._buffer.take_batch(
                 timeout=self._batch_seconds,
                 maximum_records=self._batch_records,
             )
             if not batch:
+                failures = 0
                 continue
-            if not self._file_handler.write_batch(batch, mirror=self._mirror):
+            if self._file_handler.write_batch(
+                batch, mirror=self._mirror, note=self._drop_note,
+            ):
+                if self._drop_note:
+                    self._drop_note = ""
+                failures = 0
+                continue
+            failures += 1
+            if failures <= MAX_BATCH_RETRIES:
                 self._buffer.restore_front(batch)
                 # Avoid a busy retry loop while a volume/share is unavailable.
                 self._stop.wait(0.25)
+                continue
+            # Bounded: drop this batch instead of freezing every later record,
+            # and leave the reason in the log itself.
+            try:
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                self._drop_note = (
+                    f"{stamp} async-log WARNING {len(batch)} log record(s) were "
+                    f"dropped after {failures} failed writes{self._file_handler.terminator}"
+                )
+            except Exception:
+                self._drop_note = ""
+            try:
+                sys.stderr.write(
+                    "MoonEclipse async log dropped %d records after %d failed "
+                    "writes; continuing\n" % (len(batch), failures)
+                )
+            except Exception:
+                pass
+            failures = 0
 
 
 __all__ = ["AsyncBatchLogWriter"]

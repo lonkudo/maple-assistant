@@ -429,7 +429,11 @@ $launcher = @"
 @echo off
 rem Hidden elevated start, exactly like the normal package's launcher: the
 rem assistant needs the same privilege level as the game for key injection.
-wscript.exe //nologo "%~dp0launch_assistant.vbs" %*
+rem "start" detaches the wscript launcher so this console window closes before
+rem the UAC prompt appears - a cmd window hanging around the UAC confirmation
+rem is what users read as something harmful.
+start "" wscript.exe //nologo "%~dp0launch_assistant.vbs" %*
+exit /b
 "@
 [System.IO.File]::WriteAllText(
     (Join-Path $dist.FullName "launch_assistant.vbs"), $launcherVbs,

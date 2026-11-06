@@ -68,3 +68,17 @@ auth.json
 cim_identity.dat
 data/
 lie_accounting_pending.json
+
+# Operator-local recordings, exported profiles and diagnostics: machine-local
+# artefacts, never sources.  The recording folder holds the operator's own maps
+# and plaintext logs; the GPU tracking model bundle is half a gigabyte of vendor
+# weights; the crash report is a Nuitka dump.
+助手配置/
+新配置.json
+运行日志.txt
+微信图片_*.png
+nuitka-crash-report.xml
+CT_Lie3_track_custom2_GPU/
+
+# The activation service is its own repository (see its own .git).
+activation_service/

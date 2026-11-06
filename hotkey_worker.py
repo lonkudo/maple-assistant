@@ -191,6 +191,7 @@ KEY_VK = {
     "down": 0x28,
     "right": 0x27,
     "home": 0x24,
+    "end": 0x23,
     "insert": 0x2D,
     "delete": 0x2E,
     "bracketleft": 0xDB,

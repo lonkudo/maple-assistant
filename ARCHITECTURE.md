@@ -745,6 +745,85 @@ their ordinary lifecycle logging.
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.
 
+### Licensed profile resolution (v1.2.290)
+
+The signed entitlement lives in the **selected install root's** `助手配置`
+(`auth.json`), because the launcher writes `MOONECLIPSE_CONFIG_DIR=<selected>\助手配置`
+and `licensing._recording_config_root()` honours it. An installation activated by
+an older build that ran straight out of `app\` keeps it in
+`<selected>\app\助手配置` instead. The separate installer therefore:
+
+- searches both folders (`_profile_search_dirs`) and accepts either document;
+- target of the silent move is always `<selected>\助手配置\auth.json`; the
+  document is copied, verified present, and only then is the old copy removed,
+  and an existing target is never overwritten;
+- takes the code from `license_settings.json`, else from the document's
+  `_local.activation_code` (the issued `MAL-…` code, 256 characters), and only
+  as a last resort derives a token with `licensing.activation_code` - a derived
+  token is not the issued code and the server answers **设备未授权** for it;
+- opens its activation prompt only for a folder that has no profile at all.
+
+## Movement route order (v1.2.290)
+
+`_layer_phases(name)` builds one pass per layer: the two recorded edges ordered by
+the entry decision, then the way-up phase. The entry decision
+(`_choose_route_entry_phase`) is re-made every time the layer is entered - patrol
+start, layer resync, drop/route-loop restart, climb arrival, new split part - by
+comparing the marker X with the recorded edges, and it must win regardless of the
+split-part index (a part change used to fall back to left/right and walk
+right → left → right). A leg whose endpoint the marker already occupies is
+consumed on the first frame, and the other leg follows.
+
+The way-up phase is `rope` when the layer recorded `rope_pos`, otherwise `up`
+when it recorded an up jump point:
+
+- `rope` walks to the recorded rope X (`near_target=True`) and hands over to the
+  climb machinery; there is no longer a legacy profile-wide rope X fallback, so a
+  layer that never recorded a rope cannot be walked to x = 0.5.
+- `up` walks to the up jump point (`near_target=False`): no Up claim, no climb.
+  The point itself fires only in this phase (target match) or through the
+  dwell rule, after a `JUMP_UP_LANDING_WAIT_SECONDS` window the phase falls back
+  to the layer's own actions, and the horizontal legs never fire it.
+
+### Jump-point triggers (v1.2.290)
+
+- Position: `|Δx| ≤ 0.010` and `|Δy| ≤ 0.015` of a recorded point, direction
+  matched to the travel direction (右跳 only while travelling right, 左跳 only
+  while travelling left, up points independent of travel).
+- Entry: fresh entry into the box, once per leg (`already fired on this leg`),
+  with a 0.4 s refire cooldown and suppression while the marker stays inside.
+- Dwell: more than `JUMP_POINT_DWELL_FRAMES = 3` captured frames inside the box.
+  This trigger is reusable while the character keeps standing there - the dwell
+  counter restarts on every fire and the per-leg cap is
+  `JUMP_POINT_DWELL_MAX_ATTEMPTS = 3` - because a stair jump that did not carry
+  the character up leaves it in the same spot with the walk deferred.
+- The climbing path keeps its own rule: a point already used in this pass is not
+  re-fired from the rope it just grabbed.
+
+### Stall rescue (v1.2.290)
+
+`_rescue_verify_stuck_by_probe` presses Left then Right, two captured frames
+each, and compares the marker X (`RESCUE_STALL_PROBE_FRAMES`,
+`RESCUE_STALL_PROBE_FRAME_SECONDS`). Movement on any frame clears the stall; a
+refused key cancels the probe (a key that never reached the game is not evidence
+of a stall). A confirmed stall jumps toward the **closest recorded target**
+(`_nearest_route_target_x`: left-most / right-most / rope of the patrolled
+layers, with the route target and then the last walked side as fallbacks), then
+re-arms patrol from the nearest recorded floor (`_nearest_recorded_floor`) after
+waiting for the landing (`_landing_floor_after_rescue_jump`). A confirmed stall is
+never answered with Alt+Down, and the unresolved-floor recovery runs the same
+walk probe before its first chord.
+
+### Floor resolution (v1.2.290)
+
+`detect_layer_by_world_y` clamps each recorded world band around its own anchor
+to just under half the distance to the nearest other floor, so a saved band
+cannot contain another floor's anchor; a reading between two floors matches
+none. The layer-resync counter tolerates a blank detection frame
+(`LAYER DEBUG: now on none`) instead of restarting, the flicker guard accepts a
+floor whose arrival band contains the marker, and a completed up jump arms the
+resync so the new floor is accepted on its first detection.
+
 ## Concurrency rules
 
 1. **Capture is shared.** Do not add an independent high-frequency capture loop without coordinating it with `capture_worker.py`.
@@ -757,9 +836,13 @@ Atomic file replacement is used for runtime state where possible. A permission f
 
 ## Packaging and release surfaces
 
-Two packages are built from the same staged sources, and both must behave the
-same way for the operator:
+Three surfaces come out of this repository, and all must behave the same way for
+the operator:
 
+- `release/MoonEclipseInstaller.exe` - the separate bootstrap installer built by
+  `installer/build_installer.ps1` (`--windows-console-mode=disable`). It is never
+  part of an app update manifest. It keeps no activation field in its window, and
+  the licensed profile rules above decide whether it authenticates silently.
 - `release/TodoHelper-<version>.zip` — the normal package: Python sources
   plus data, installed into `.venv` by `安装.bat`. `startup_probe.py` owns its
   hidden-launch failure path: it records the traceback to

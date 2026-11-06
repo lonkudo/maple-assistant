@@ -1321,8 +1321,9 @@ class PatrolController:
         """
 
         direction = str(direction).casefold()
-        if direction not in ("left", "right"):
-            raise ValueError("跳点方向必须是 left 或 right")
+        # "up" is the vertical jump-up trigger: same storage, no rope semantics.
+        if direction not in ("left", "right", "up"):
+            raise ValueError("跳点方向必须是 left、right 或 up")
 
         with self._lock:
             layer_name = self._selected_layer

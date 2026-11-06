@@ -343,6 +343,10 @@ class ScreenBlinker(threading.Thread):
             colours = {
                 "jump_left": _colorref((50, 235, 120)),
                 "jump_right": _colorref((50, 235, 120)),
+                # Jump-up keeps the jump colour and points up: green so it stays
+                # in the jump family, the rope arrow's geometry so its meaning
+                # (vertical) is obvious.
+                "jump_up": _colorref((50, 235, 120)),
                 "rope": _colorref((245, 205, 35)),
                 "left_endpoint": _colorref((45, 140, 245)),
                 "right_endpoint": _colorref((45, 140, 245)),
@@ -418,6 +422,16 @@ class ScreenBlinker(threading.Thread):
                                 draw_line((10, 9), (3, 2))
                                 draw_line((3, 2), (7, 2))
                                 draw_line((3, 2), (3, 6))
+                            elif kind == "jump_up":
+                                # Up arrow in the jump colour.  Unlike the rope
+                                # marker it does not use the full 15-px height:
+                                # a layer band can be only a couple of pixels
+                                # tall, and a long tail reached outside it.  The
+                                # glyph is raised so the tail stops ~4 px below
+                                # the marker row.
+                                draw_line((8, 11), (8, 2))
+                                draw_line((8, 2), (3, 7))
+                                draw_line((8, 2), (13, 7))
                             elif kind == "fixed_anchor":
                                 # Same thin, compact grammar as patrol
                                 # markers; unlike the old separate aim
@@ -425,9 +439,13 @@ class ScreenBlinker(threading.Thread):
                                 draw_line((3, 7), (11, 7))
                                 draw_line((7, 3), (7, 11))
                             else:  # rope: a conventional upward arrow
-                                draw_line((8, 14), (8, 1))
-                                draw_line((8, 1), (2, 7))
-                                draw_line((8, 1), (14, 7))
+                                # Same raised, short-tailed arrow as jump_up:
+                                # the full 15-px shaft put the tail outside a
+                                # thin layer band.  The colour is what tells
+                                # the rope (yellow) from the jump-up (green).
+                                draw_line((8, 11), (8, 2))
+                                draw_line((8, 2), (3, 7))
+                                draw_line((8, 2), (13, 7))
                             gdi32.SelectObject(hdc, handle(old))
                     finally:
                         user32.ReleaseDC(overlay, hdc)

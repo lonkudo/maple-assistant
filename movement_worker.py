@@ -155,6 +155,22 @@ DEAD_FLOWER_NEXT_POINT_PROGRESS_Y = 0.003
 # one place prevents the stall detector and its recovery action from drifting
 # apart and turning a long rope approach into repeated jump-climb attempts.
 ROPE_STALL_ALIGNMENT_RANGE = 0.03
+# The self-rescue stall test: each direction is held and the marker sampled
+# once per capture, two frames each.  One sample can be a stale pre-key frame,
+# and two frames per side is the minimum the operator asked for: a character
+# whose X does not move on both sides is stalled (on a rope), and the rescue
+# jumps toward the next target - Alt+Down cannot leave a rope.
+RESCUE_STALL_PROBE_FRAMES = 2
+RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20
+# A rescue jump aims at the route's next target.  When the character already
+# sits within this distance of it the side is decided by the sign of the gap.
+RESCUE_JUMP_TARGET_DEAD_BAND = 0.005
+# After the rescue jump the character is in the air for a few captures.  The
+# patrol must be re-armed on the floor it lands on, not on the pre-jump reading.
+# The field landing took about a second (21:50:08 jump, 21:50:09 still at the
+# pre-jump height); the wait ends as soon as a real floor resolves.
+RESCUE_LANDING_SETTLE_SECONDS = 1.20
+RESCUE_LANDING_POLL_SECONDS = 0.10
 
 # A rope's X is stored as a diamond-relative coordinate and re-projected through
 # the LIVE minimap layout on every frame.  One pixel of error in the measured
@@ -246,6 +262,84 @@ JUMP_POINT_SESSION_MAX_SECONDS = 3.0
 # edge (two shared-capture frames at 5 FPS); it stays short so it can never
 # swallow a genuine crossing on the next leg.
 JUMP_POINT_REFIRE_COOLDOWN_SECONDS = 0.4
+# The operator's additional trigger: a point the character STAYS on must still
+# emit.  "Staying" means more than JUMP_POINT_DWELL_FRAMES captured frames
+# inside the point's X/Y range, counted from the frame it arrived.  Without it
+# a character that walks onto a point and stops there - or whose arrival frame
+# was spent on the refire cooldown - could sit on the point for the whole leg
+# and never jump, because only a fresh entry emitted.
+JUMP_POINT_DWELL_FRAMES = 3
+# The dwell trigger is reusable even while the character keeps standing in the
+# point's range: a stair jump that did not carry the character up leaves it in
+# the same spot ("23:18:34 PATROL pos=(0.606618) action=right [steady]"), where
+# the fired-once suppression would block every further attempt and the walk is
+# deferred while a jump point owns Up.  The 3-frame dwell plus the refire
+# cooldown rate-limits it, and this cap stops an unreachable stair from looping
+# jumps for the whole leg.
+JUMP_POINT_DWELL_MAX_ATTEMPTS = 3
+# An up jump point is a vertical spot, not a crossing: during the patrol walk it
+# fires only when it IS the leg's next target (the walk was extended to it), or
+# after the dwell rule.  This tolerance matches the extended leg target to the
+# point X (one marker step is ~0.00735).
+JUMP_POINT_UP_TARGET_TOLERANCE = 0.012
+# After a successful up jump the character lands on the next floor, but the
+# layer change is confirmed a frame or two later.  Until then the old floor's
+# route must NOT run its own legs on the new floor (the 22:53 log: "up;
+# repeating left" then a full right leg on layer2 before the resync).  The up
+# phase waits this long for the layer change, then falls back to the layer's
+# own actions.
+JUMP_UP_LANDING_WAIT_SECONDS = 2.0
+# Jump-up point (vertical hop).  It owns no Up claim and no rope semantics: it
+# fires once, waits for the marker to settle *higher*, and retries the chord up
+# to JUMP_UP_MAX_ATTEMPTS times before letting the route continue.
+# The working Alt+Down drop chord holds its keys for 0.10 s; a 30 ms hop was one
+# game frame and produced no jump at all in the field log.
+JUMP_UP_CHORD_HOLD_SECONDS = 0.12
+# THE JUMP KEY IN THE GAME IS ALT.  ctrl+up and ctrl+end are this app's own
+# recording hotkeys (rope point / up jump point) and mean nothing to the game;
+# a first build sent Ctrl+Up and the field log showed "JUMP UP executed" with no
+# jump, because the game never sees Ctrl as jump.  The hop is therefore the
+# jump key itself, pressed and released like a tap.  "alt+up" / "up" remain
+# selectable from system_config.json when a client wants the direction too.
+JUMP_UP_DEFAULT_CHORD = "alt"
+# Only the modifiers and keys the sender can inject are accepted; anything else
+# would raise ValueError inside key_down() and abort the hop silently.
+_JUMP_UP_CHORD_KEYS = frozenset({"ctrl", "alt", "shift", "up"})
+# A buff/skill emission freezes the marker Y for a few frames, so "three stable
+# Y frames and no rise" cannot prove the hop failed: the character may be
+# standing still on a rope, where a walk direction does nothing at all.  The
+# probe presses both directions for the shortest hold a capture can see, then
+# rescues with a jump toward the route when neither moves the character.
+JUMP_UP_STALL_PROBE_SECONDS = 0.20      # one minimap frame
+JUMP_UP_STALL_PROBE_EPSILON = 0.005     # one marker step: below this, no walk
+JUMP_UP_STALL_RESCUE_LEAD_SECONDS = 0.05  # direction down before the jump key
+
+
+def _parse_jump_up_chord(text: object) -> tuple[str, ...]:
+    """Turn "alt" / "alt+up" / "up" into the keys to press, in order."""
+
+    raw = str(text or JUMP_UP_DEFAULT_CHORD).strip().casefold()
+    keys = tuple(part.strip() for part in raw.split("+") if part.strip())
+    if not keys or any(key not in _JUMP_UP_CHORD_KEYS for key in keys):
+        LOG.warning(
+            "jump_up_chord=%r is not a supported chord (%s); falling back to %s",
+            text, sorted(_JUMP_UP_CHORD_KEYS), JUMP_UP_DEFAULT_CHORD,
+        )
+        keys = tuple(JUMP_UP_DEFAULT_CHORD.split("+"))
+    return keys
+# Stand still for this long before the chord: the point usually fires while the
+# character is still walking, and a jump from a moving character is not the
+# vertical hop this point records.
+JUMP_UP_STAND_DELAY_SECONDS = 0.10
+# No failure verdict before this long after the chord: the sample window can
+# otherwise be entirely pre-jump frames (observed: 3 equal samples 0.4 s after
+# the chord, so the retry and the give-up both ran before the arc started).
+JUMP_UP_SETTLE_DELAY_SECONDS = 0.9
+JUMP_UP_ATTEMPT_SECONDS = 3.0
+JUMP_UP_MAX_ATTEMPTS = 3
+JUMP_UP_STABLE_FRAMES = 3
+JUMP_UP_STABLE_SPREAD = 0.001
+JUMP_UP_CHANGED_EPSILON = 0.003
 
 # Movement-thread stall watchdog.  When patrol input is armed and this worker
 # has consumed no frame for STALL_WATCHDOG_SECONDS, its own stack is reported
@@ -688,6 +782,25 @@ CLIMB_ARRIVAL_SETTLED_GAPS_REQUIRED = 2
 STALE_JUMP_DROP_FRAMES = 2
 
 
+def _jump_up_verdict(
+    samples: list[float], takeoff_y: Optional[float],
+) -> str:
+    """``"waiting" | "done" | "failed"`` for a jump-up landing check.
+
+    "done" needs JUMP_UP_STABLE_FRAMES consecutive readings inside
+    JUMP_UP_STABLE_SPREAD *and* a settled Y at least JUMP_UP_CHANGED_EPSILON
+    above the take-off row.  "failed" is the same stability without the climb.
+    """
+
+    if takeoff_y is None or len(samples) < JUMP_UP_STABLE_FRAMES:
+        return "waiting"
+    window = list(samples)[-JUMP_UP_STABLE_FRAMES:]
+    if max(window) - min(window) > JUMP_UP_STABLE_SPREAD + 1e-12:
+        return "waiting"
+    settled = window[-1]
+    return "done" if float(takeoff_y) - settled >= JUMP_UP_CHANGED_EPSILON else "failed"
+
+
 def _layer_marker_row(layer: Any) -> Optional[float]:
     """One marker row (1 px) in normalised minimap Y, from the recorded layout.
 
@@ -974,6 +1087,14 @@ DROP_TO_FIRST_MAX_SECONDS = 10.0
 # a normal fall: two 5-FPS samples with only a tiny, steady Y increase while
 # the marker stays on the rope X.  A real drop crosses substantially more Y
 # per sample and must never be mistaken for the rope escape.
+# Alt+Down retry floor.  A missed drop is retried as soon as the evidence says it
+# failed (no descent, no landing confirmation); this minimum only stops the same
+# chord being re-sent inside one capture interval.  The previous fixed 1.5 s wait
+# is gone from the plain patrol drop.
+DROP_RETRY_MIN_SECONDS = 0.4
+# ... and at least this many fresh captures must have arrived since the chord, so
+# one late or noisy frame cannot retry a drop that is actually working.
+DROP_RETRY_FRAMES = 2
 DROP_ROPE_ESCAPE_MIN_Y_STEP = 0.001
 DROP_ROPE_ESCAPE_MAX_Y_STEP = 0.012
 DROP_ROPE_ESCAPE_MAX_X_DRIFT = 0.004
@@ -1107,21 +1228,54 @@ def detect_layer_by_world_y(
     world_y: float,
     layers: dict[str, Any],
 ) -> Optional[str]:
-    """Return nearest layer using scroll-compensated map-structure Y."""
+    """Return nearest layer using scroll-compensated map-structure Y.
 
+    A recorded ``world_y_tolerance`` (0.75 by default) is far wider than the gap
+    between two neighbouring floors on a stair map: layer1's world band
+    (4.4167-5.1667) then contains layer2's anchor 4.7022, so a single world
+    reading legitimately matches BOTH floors and the world signal cannot
+    separate them ("LAYER WORLD BAND OVERLAP", 23:23 log).  The band is
+    therefore narrowed to just over one floor gap around each anchor: a stair
+    height is still recognised as its own band, while a band can no longer
+    swallow a neighbour's anchor.
+    """
+
+    anchors: list[float] = []
+    for layer in layers.values():
+        if isinstance(layer, dict) and "layer_world_y" in layer:
+            try:
+                anchors.append(float(layer["layer_world_y"]))
+            except (TypeError, ValueError):
+                continue
     candidates = []
     for name, layer in layers.items():
         if not isinstance(layer, dict) or "layer_world_y" not in layer:
             continue
         tolerance = float(layer.get("world_y_tolerance", 0.75))
+        anchor = float(layer["layer_world_y"])
+        nearest_gap = min(
+            (abs(anchor - other) for other in anchors if abs(anchor - other) > 1e-9),
+            default=None,
+        )
+        if nearest_gap is not None:
+            # Just over half the distance to the closest other floor: the two
+            # bands meet in the middle instead of overlapping.
+            tolerance = min(tolerance, nearest_gap * 0.45)
         band = _layer_world_y_band(layer, tolerance)
         if band is None:
             continue
         band_min, band_max = band
+        # The saved layer_band overrides the tolerance inside
+        # ``_layer_world_y_band``, and it can be far wider than the floor gap
+        # (layer1 saved 4.4167-5.1667 while layer2's anchor is 4.7022).  Narrow
+        # the saved band around its own anchor so two stair-height floors stay
+        # two bands; a reading outside it belongs to another floor.
+        band_min = max(band_min, anchor - tolerance)
+        band_max = min(band_max, anchor + tolerance)
+        if band_min > band_max + 1e-9:
+            continue
         if band_min - 1e-9 <= world_y <= band_max + 1e-9:
-            reference_y = float(layer.get(
-                "layer_world_y", (band_min + band_max) / 2.0
-            ))
+            reference_y = anchor
             candidates.append((abs(world_y - reference_y), name))
     return min(candidates)[1] if candidates else None
 
@@ -1505,6 +1659,9 @@ def preserve_persistent_climb(
     # request.  It must win over the ordinary "keep Up held" decision; the
     # jump-point executor preserves Up itself through its landing check.
     if isinstance(proposed.key, str) and proposed.key.startswith("jump_point_"):
+        # Both the directional points and a jump-up point win over "keep Up
+        # held": the directional ones preserve Up themselves, the vertical one
+        # owns no Up at all.
         return proposed
     if proposed.key in ("jump_climb_left", "jump_climb_right", "jump_climb_up"):
         # The route planner recomputes from every screenshot and can suggest
@@ -1744,6 +1901,60 @@ def _drop_through_platform(
             key_up("alt")
         if down_claimed:
             key_up("down")
+
+
+def _ime_status_for_jump_up() -> str:
+    """IME state at the chord - a CJK IME swallows Ctrl combinations."""
+
+    try:
+        from hotkey_worker import ime_status
+
+        return ime_status()
+    except Exception:  # noqa: BLE001 - the log line must never fail the hop
+        return "unknown (IME state unavailable)"
+
+
+def _jump_up_chord_press(
+    sender: Any,
+    keys: tuple[str, ...],
+    chord_hold_seconds: float = JUMP_UP_CHORD_HOLD_SECONDS,
+) -> bool:
+    """Press the jump-up chord as one simultaneous combination.
+
+    A direction key is claimed before the jump key, the order the working
+    Alt+Down drop uses: the direction is already down when the jump key arrives.
+    A single-key chord (the default, just Alt) is emitted unchanged.
+    """
+
+    if not _sender_is_safe(sender):
+        LOG.warning("jump chord suppressed: target window is not safely selected")
+        return False
+    key_down = getattr(sender, "key_down", None)
+    key_up = getattr(sender, "key_up", None)
+    if not callable(key_down) or not callable(key_up):
+        LOG.warning("jump chord requires key_down()/key_up(); suppressed")
+        return False
+    modifiers = {"ctrl", "alt", "shift"}
+    ordered = tuple(keys) if len(keys) < 2 else (
+        tuple(key for key in keys if key not in modifiers)
+        + tuple(key for key in keys if key in modifiers)
+    )
+    claimed: list[str] = []
+    try:
+        for key in ordered:
+            try:
+                pressed = key_down(key)
+            except ValueError:
+                LOG.warning("jump-up chord key %r is not supported by the sender", key)
+                return False
+            if pressed is False:
+                return False
+            claimed.append(key)
+        time.sleep(max(0.025, chord_hold_seconds))
+        return True
+    finally:
+        for key in reversed(claimed):
+            key_up(key)
 
 
 def climb(
@@ -3112,35 +3323,64 @@ class MovementWorker(threading.Thread):
         key_down = getattr(self.key_sender, "key_down", None)
         key_up = getattr(self.key_sender, "key_up", None)
         moved = False
+        # A direction that could not be pressed is not evidence either way:
+        # the stall test is only valid when both keys actually reached the game.
+        refused = False
         try:
-            for direction in ("right", "left"):
+            # Two frames per side, each sampled: one capture can still be the
+            # frame from before the key went down, and a rope stall shows zero
+            # X movement on every frame of both directions.
+            for direction in ("left", "right"):
                 anchor_obs = self.last_observation
                 if anchor_obs is None or anchor_obs.player is None:
                     continue
                 anchor = anchor_obs.player.x
                 claimed = False
                 try:
-                    if key_down is None or key_down(direction) is False:
+                    if key_down is None:
+                        LOG.warning(
+                            "SELF-RESCUE probe cancelled: the sender has no "
+                            "key_down(); the stall cannot be verified"
+                        )
+                        refused = True
+                        break
+                    if key_down(direction) is False:
+                        # Input is disarmed (Stop Patrol, focus protection) or
+                        # the game window is not foreground.  A key that never
+                        # reached the game is NOT evidence that the character
+                        # cannot walk: the 21:37 field log pressed Left, the
+                        # operator stopped patrol, Right was refused, and the
+                        # probe still reported "confirmed stuck" and restarted
+                        # patrol from a stall it had not actually tested.
+                        LOG.warning(
+                            "SELF-RESCUE probe cancelled: %s was refused "
+                            "(input disabled or game window not focused); "
+                            "the stall cannot be verified", direction,
+                        )
+                        refused = True
                         break
                     claimed = True
-                    time.sleep(min(
-                        self.rescue_probe_hold_seconds,
-                        max(0.0, blocked_until - time.monotonic()),
-                    ))
+                    for frame_index in range(RESCUE_STALL_PROBE_FRAMES):
+                        time.sleep(min(
+                            RESCUE_STALL_PROBE_FRAME_SECONDS,
+                            max(0.0, blocked_until - time.monotonic()),
+                        ))
+                        current = self.last_observation
+                        if (current is not None and current.player is not None
+                                and abs(current.player.x - anchor)
+                                >= self.rescue_probe_move_threshold):
+                            LOG.warning(
+                                "SELF-RESCUE probe: marker moved %+.6f on the "
+                                "%s frame %d; character is not stuck",
+                                current.player.x - anchor, direction,
+                                frame_index + 1,
+                            )
+                            moved = True
+                            break
                 finally:
                     if claimed and key_up is not None:
                         key_up(direction)
-                time.sleep(self.rescue_probe_settle_seconds)
-                current = self.last_observation
-                if (current is not None and current.player is not None
-                        and abs(current.player.x - anchor)
-                        >= self.rescue_probe_move_threshold):
-                    LOG.warning(
-                        "SELF-RESCUE probe: marker moved %+.6f during the %s "
-                        "nudge; character is not stuck",
-                        current.player.x - anchor, direction,
-                    )
-                    moved = True
+                if moved or refused:
                     break
         finally:
             # The probe's busy claims end here.  When the rescue then runs
@@ -3150,14 +3390,203 @@ class MovementWorker(threading.Thread):
                 self.climbing_active_event.clear()
             if self.dropping_active_event is not None:
                 self.dropping_active_event.clear()
-        if moved:
+        if moved or refused:
             return False
         LOG.warning(
-            "SELF-RESCUE probe: no marker movement after right/left nudges "
-            "(%.1fs attack block); character confirmed stuck",
-            self.rescue_probe_attack_block_seconds,
+            "SELF-RESCUE probe: Left and Right each left X unchanged over %d "
+            "frames (%.1fs attack block); character confirmed stuck",
+            RESCUE_STALL_PROBE_FRAMES, self.rescue_probe_attack_block_seconds,
         )
         return True
+
+    def _nearest_route_target_x(
+        self, player: Any
+    ) -> Optional[tuple[float, str, float]]:
+        """The recorded target point closest to the character, with its label.
+
+        The operator's rule for a rescue jump: aim at the CLOSEST recorded
+        target, not at a fixed leg - the route can be heading for the far
+        left-most while the right-most platform edge is right next to the
+        stalled character.  Only the layer boundary points count: the jump
+        point the character may have just passed is not a target to jump back
+        to.
+        """
+
+        if player is None:
+            return None
+        player_x = float(player.x)
+        best: Optional[tuple[float, str, float]] = None
+        # ``_route_layers`` holds layer NAMES; the recorded points are in
+        # ``important_positions`` (the recording's own layer dicts).
+        for layer_name in self._route_layers or ():
+            points = self.important_positions.get(layer_name) or {}
+            if not isinstance(points, dict):
+                continue
+            for key, label in (
+                ("left_most_pos", "left-most"),
+                ("right_most_pos", "right-most"),
+                ("rope_pos", "rope"),
+            ):
+                point = points.get(key)
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    x = float(point.get("x"))
+                except (TypeError, ValueError):
+                    continue
+                gap = abs(x - player_x)
+                if best is None or gap < best[2]:
+                    best = (x, f"{layer_name}.{label} x={x:.4f}", gap)
+        return best
+
+    def _rescue_direction_toward_next_target(
+        self, player: Any
+    ) -> tuple[str, str]:
+        """Pick the side a rescue jump must take, and say why.
+
+        Priority, per the operator: the CLOSEST recorded target X; then the
+        route's own current target (when no boundary point is known); then the
+        last walked side; then Right.  "The next target is right-most" must
+        produce a jump right even when the last walk went left.
+        """
+
+        nearest = self._nearest_route_target_x(player)
+        if nearest is not None:
+            x, label, gap = nearest
+            if gap >= RESCUE_JUMP_TARGET_DEAD_BAND:
+                direction = "right" if x > float(player.x) else "left"
+                return direction, (
+                    f"closest target {label} is {direction} of "
+                    f"x={float(player.x):.4f} (gap {gap:.4f})"
+                )
+            return (
+                "right" if x >= float(player.x) else "left",
+                f"closest target {label} is on top of x={float(player.x):.4f}",
+            )
+        target = self._last_route_target_x
+        if player is not None and target is not None:
+            gap = float(target) - float(player.x)
+            if abs(gap) >= RESCUE_JUMP_TARGET_DEAD_BAND:
+                direction = "right" if gap > 0 else "left"
+                return direction, (
+                    f"route target x={float(target):.4f} is {direction} of "
+                    f"x={float(player.x):.4f} (gap {gap:+.4f})"
+                )
+            return (
+                "right" if gap >= 0 else "left",
+                f"the route target x={float(target):.4f} is on top of "
+                f"x={float(player.x):.4f}",
+            )
+        if self._last_walk_direction in ("left", "right"):
+            return self._last_walk_direction, "no route target; last walked side"
+        return "right", "no route target and no walk yet; defaulting right"
+
+    def _rescue_jump_toward_next_target(self, observation: Any = None) -> bool:
+        """Jump off a confirmed stall toward the route's next target.
+
+        A stalled character on a rope cannot be moved by Left/Right and cannot
+        be dropped by Alt+Down; the only exit is a jump in the route direction.
+        Returns True when the chord was sent, and says in the log whether the
+        marker moved afterwards.
+        """
+
+        obs = observation if observation is not None else self.last_observation
+        player = getattr(obs, "player", None) if obs is not None else None
+        if player is None:
+            LOG.warning("SELF-RESCUE jump skipped: no player marker to aim or verify")
+            return False
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning("SELF-RESCUE jump skipped: game window not safely selected")
+            return False
+        direction, direction_reason = self._rescue_direction_toward_next_target(player)
+        before_x = float(player.x)
+        before_y = float(player.y)
+        keys = (direction,) + tuple(self._jump_up_chord_keys)
+        sent = _jump_up_chord_press(self.key_sender, keys)
+        if not sent:
+            LOG.warning(
+                "SELF-RESCUE jump: the sender refused the %s chord; falling "
+                "back to the previous rescue logic", direction,
+            )
+            return False
+        time.sleep(self.rescue_probe_settle_seconds)
+        after = self.last_observation
+        after_player = getattr(after, "player", None) if after is not None else None
+        moved = bool(
+            after_player is not None
+            and (
+                abs(float(after_player.x) - before_x) >= self.rescue_probe_move_threshold
+                or abs(float(after_player.y) - before_y) >= self.rescue_probe_move_threshold
+            )
+        )
+        LOG.warning(
+            "SELF-RESCUE jump toward the next target: character was stalled on "
+            "both directions (on a rope); sent %s+%s (%s) and the marker %s",
+            direction, self._jump_up_chord_label, direction_reason,
+            "moved" if moved else "did not move",
+        )
+        return True
+
+    def _nearest_recorded_floor(
+        self, observation: Any = None
+    ) -> Optional[str]:
+        """The recorded floor whose band is closest to the marker, if any.
+
+        Used after a rescue jump when the marker sits between bands: the
+        bottom floor is a poor guess when the character is hanging one row
+        above the next one up (the 21:50 log re-armed layer1 while the
+        character was at layer2's height).
+        """
+
+        obs = observation if observation is not None else self.last_observation
+        player = getattr(obs, "player", None) if obs is not None else None
+        if player is None:
+            return None
+        marker_y = float(player.y)
+        best: Optional[tuple[str, float]] = None
+        for name in self._route_layers or ():
+            layer = self.important_positions.get(name)
+            if not isinstance(layer, dict):
+                continue
+            tolerance = float(layer.get("y_tolerance", 0.020000))
+            band = _layer_y_band(layer, tolerance)
+            if band is None:
+                continue
+            upper, lower = band
+            if upper <= marker_y <= lower:
+                gap = 0.0
+            else:
+                gap = min(abs(marker_y - upper), abs(marker_y - lower))
+            if best is None or gap < best[1]:
+                best = (name, gap)
+        if best is None:
+            return None
+        LOG.info(
+            "SELF-RESCUE: the landing matches no recorded band; the nearest "
+            "recorded floor is %s (%.4f away at y=%.6f)",
+            best[0], best[1], marker_y,
+        )
+        return best[0]
+
+    def _landing_floor_after_rescue_jump(self) -> Optional[str]:
+        """Floor the character landed on after the stall jump.
+
+        The marker still reads the pre-jump position for a frame or two, and a
+        patrol re-armed from that reading walked the wrong floor's route (21:50:
+        started on layer1, the character was on layer2).  Wait for the first
+        capture that resolves a real floor, then fall back to the nearest band.
+        """
+
+        deadline = time.monotonic() + RESCUE_LANDING_SETTLE_SECONDS
+        while True:
+            obs = self.last_observation
+            if obs is not None and obs.player is not None:
+                floor = self._detect_floor_all(obs)
+                if floor is not None:
+                    return floor
+            if time.monotonic() >= deadline:
+                return self._nearest_recorded_floor(self.last_observation)
+            time.sleep(RESCUE_LANDING_POLL_SECONDS)
 
     def _trigger_rescue(self) -> None:
         """Start the self-rescue in a background thread (guarded once)."""
@@ -3171,25 +3600,32 @@ class MovementWorker(threading.Thread):
         """Recover a stuck patrol without leaving the patrol range.
 
         Every rescue first VERIFIES the character is genuinely stuck: attacks
-        are blocked and the character is forced to walk right then left (see
-        ``_rescue_verify_stuck_by_probe``).  A character frozen by frequent
-        attacks moves as soon as the attacks stop - the rescue is cancelled
-        and no Alt+Down / patrol restart happens.  Only a confirmed stuck
-        character reaches the stateful recovery below:
+        are blocked and the character is forced to walk Left then Right, two
+        captured frames each (``_rescue_verify_stuck_by_probe``).  A character
+        frozen by frequent attacks, or by a buff whose animation holds it in
+        place, moves as soon as it is nudged and the rescue is cancelled - no
+        jump, no Alt+Down, no patrol restart.
 
-        - On an in-range recorded floor: restart patrol there in place.  A
-          stuck in-range character must never be dropped down to the map's
-          physical bottom - with an explicit patrol range the bottom floor
-          (e.g. layer1) may lie OUTSIDE the range, and the drop would turn a
-          recoverable stall into a full below-range return.
-        - Below the patrol range (return/climb-to-route active, or a
-          detected floor below the range): never drop deeper.  Re-run the
-          return climb from a clean state and count the cycle; when the
-          return cannot be restored after ``rescue_cycle_limit`` rescues the
-          worker stops patrol with an error instead of looping Alt+Down /
-          Alt+Up forever at a rope it cannot grab.
-        - Otherwise (marker missing / floor unknown): the guarded physical
-          descent to the bottom floor re-establishes a known state.
+        A character whose X does not move on either side is stalled - on a rope
+        that is the signature, walking does nothing there.  The rescue then
+
+        - jumps toward the route's next target (the only way off a rope), and
+        - continues with the stateful recovery below on whatever floor the
+          landing lands on:
+
+          * On an in-range recorded floor: restart patrol there in place.  A
+            stuck in-range character must never be dropped down to the map's
+            physical bottom - with an explicit patrol range the bottom floor
+            (e.g. layer1) may lie OUTSIDE the range, and the drop would turn a
+            recoverable stall into a full below-range return.
+          * Below the patrol range (return/climb-to-route active, or a
+            detected floor below the range): never drop deeper.  Re-run the
+            return climb from a clean state and count the cycle; when the
+            return cannot be restored after ``rescue_cycle_limit`` rescues the
+            worker stops patrol with an error instead of looping Alt+Down /
+            Alt+Up forever at a rope it cannot grab.
+          * Otherwise (marker missing / floor unknown): the guarded physical
+            descent to the bottom floor re-establishes a known state.
         """
         give_up = False
         try:
@@ -3216,7 +3652,30 @@ class MovementWorker(threading.Thread):
                 LOG.info("SELF-RESCUE cancelled after probe: auto reconnect owns input")
                 return
             obs = self.last_observation
-            floor = self._detect_floor_all(obs) if obs is not None else None
+            # The probe already proved the stall: Left and Right each left the
+            # marker X unchanged over two frames.  On a rope that is the
+            # signature - walking does nothing - and the legacy recovery
+            # (Alt+Down, then restart/drop) cannot leave a rope at all, so the
+            # character sat there through eight drops.  Jump toward the next
+            # target first, then run the previous rescue logic on whatever
+            # floor the landing lands on.
+            self._rescue_jump_toward_next_target(obs)
+            if (self.reconnect_active_event is not None
+                    and self.reconnect_active_event.is_set()):
+                LOG.info(
+                    "SELF-RESCUE cancelled after the stall jump: auto "
+                    "reconnect owns input"
+                )
+                return
+            obs = self.last_observation
+            # The jump just left the character in the air, so the marker can
+            # still read the pre-jump position for a frame or two.  Re-arming
+            # the patrol from the OLD reading made it start on layer1 while the
+            # character landed on layer2 - the 21:50 log shows the patrol
+            # walking the whole layer1 route left on layer2 until the resync
+            # flipped it back to the right.  Wait for the landing, then use the
+            # nearest recorded floor when the marker still matches none.
+            floor = self._landing_floor_after_rescue_jump()
             if floor is not None and floor in self._route_layers:
                 self._rescue_cycles = 0
                 self._restart_patrol_from_first_layer(floor)
@@ -3267,9 +3726,31 @@ class MovementWorker(threading.Thread):
                         if event is not None:
                             event.clear()
             else:
+                # A confirmed stall is a rope or a blocking animation: Left and
+                # Right proved the character cannot walk.  Alt+Down from there
+                # is exactly the field log's eight drops that changed nothing,
+                # so the stall is NOT answered with a drop.  The jump toward
+                # the next target already ran; re-arm the patrol from the
+                # bottom recorded floor and let the return/climb detection take
+                # over instead of dropping deeper.
                 self._rescue_cycles = 0
-                landed_floor = self._drop_to_first_layer()
-                self._restart_patrol_from_first_layer(landed_floor)
+                fallback_floor = (
+                    self._nearest_recorded_floor(self.last_observation)
+                    or self._bottom_recorded_layer()
+                )
+                if fallback_floor is None:
+                    LOG.warning(
+                        "SELF-RESCUE: a confirmed stall is never answered with "
+                        "Alt+Down; no recorded floor to re-arm on, leaving "
+                        "patrol as it is"
+                    )
+                else:
+                    LOG.warning(
+                        "SELF-RESCUE: re-arming patrol from %s in place after "
+                        "the stall jump (no drop from a confirmed stall)",
+                        fallback_floor,
+                    )
+                    self._restart_patrol_from_first_layer(fallback_floor)
         except Exception:
             LOG.exception("self-rescue failed")
         finally:
@@ -3858,6 +4339,9 @@ class MovementWorker(threading.Thread):
                         )
                         return False
                     self._walk_hold_key = decision.key
+                    # Remember the side the route is walking: a rescue jump has
+                    # to leave a stalled character toward the next target.
+                    self._last_walk_direction = decision.key
                     # Name the owner of every walk direction.  The key ledger
                     # in ``status_worker`` logs "key-down=left owners=1" without
                     # saying which worker asked for it, and the movement
@@ -4015,6 +4499,7 @@ class MovementWorker(threading.Thread):
         world_drift_reanchor_threshold: float = 0.35,
         drop_chord_hold_seconds: float = 0.10,
         drop_retry_seconds: float = 1.0,
+        jump_up_chord: str = JUMP_UP_DEFAULT_CHORD,
         minimap_detector: Any = None,
         patrol_controller: Any = None,
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
@@ -4053,10 +4538,9 @@ class MovementWorker(threading.Thread):
         # Self-rescue pre-flight: frequent attacks can freeze the character
         # past the stuck window (fixed attack keeps tapping while a monster
         # stands in range), so before ANY drop/restart the rescue blocks the
-        # attacks and forces a short walk right then left to verify the
-        # character is really stuck.  These tune that probe.
+        # attacks and forces Left then Right, two capture frames each, to
+        # verify the character is really stuck.  These tune that probe.
         rescue_probe_attack_block_seconds: float = 2.0,
-        rescue_probe_hold_seconds: float = 0.7,
         rescue_probe_settle_seconds: float = 0.2,
         rescue_probe_move_threshold: float = 0.006,
         other_player_drug_taps: int = 3,
@@ -4294,6 +4778,11 @@ class MovementWorker(threading.Thread):
         )
         self.drop_chord_hold_seconds = drop_chord_hold_seconds
         self.drop_retry_seconds = drop_retry_seconds
+        # Jump-up point: the chord itself is configurable (see
+        # JUMP_UP_DEFAULT_CHORD); the parsed keys are checked once here so a bad
+        # entry in system_config.json cannot raise inside the hop.
+        self._jump_up_chord_keys = _parse_jump_up_chord(jump_up_chord)
+        self._jump_up_chord_label = "+".join(self._jump_up_chord_keys)
         self.minimap_detector = minimap_detector
         self.patrol_controller = patrol_controller
         self.diamond_size_tracker = diamond_size_tracker
@@ -4346,6 +4835,17 @@ class MovementWorker(threading.Thread):
         # session.  A jump arc naturally leaves and re-enters the loose Y
         # tolerance; treating that as a new arrival created repeated jumps.
         self._jump_point_suppressed_tokens: set[tuple[str, int]] = set()
+        # token -> consecutive captured frames the marker has been inside that
+        # point's range.  A character that walks onto a point and STOPS there
+        # stays inside without ever being freshly "entered" again, so the
+        # operator's rule: more than JUMP_POINT_DWELL_FRAMES frames inside the
+        # range also emits the point.
+        self._jump_point_dwell_frames: dict[tuple[str, int], int] = {}
+        # token -> (leg_key, attempts) of dwell-triggered fires in this leg, so
+        # the reusable dwell stays bounded.
+        self._jump_point_dwell_attempts: dict[
+            tuple[str, int], tuple[tuple[int, int, str], int]
+        ] = {}
         # token -> (pass_id, leg_key, monotonic time) of its last dispatch.
         self._jump_point_fired: dict[
             tuple[str, int], tuple[int, tuple[int, int, str], float]
@@ -4361,6 +4861,37 @@ class MovementWorker(threading.Thread):
         self._jump_point_candidate: Optional[tuple[str, int]] = None
         self._jump_point_up_held = False
         self._jump_point_up_started_at = 0.0
+        # Jump-up point session: no Up claim, no rope handoff - the jump chord
+        # plus a stable-and-changed landing check with bounded retries.
+        self._jump_up_active = False
+        self._jump_up_token: Optional[tuple[str, int]] = None
+        self._jump_up_takeoff_y: Optional[float] = None
+        self._jump_up_samples: list[float] = []
+        self._jump_up_attempts = 0
+        self._jump_up_deadline = float("-inf")
+        self._jump_up_sent_at = 0.0
+        # Stall probe: when the landing check says "stable, no rise" the
+        # character may simply be on a rope (a buff animation freezes the marker
+        # Y the same way).  Left and right are pressed for one capture each; no
+        # X movement in either direction confirms the stall, and the rescue
+        # jumps off toward the route.
+        self._jump_up_stall_phase = ""
+        self._jump_up_stall_x: Optional[float] = None
+        self._jump_up_stall_at = 0.0
+        self._jump_up_stall_tried = False
+        # Set by a completed up jump so the layer detector may accept the new
+        # floor even while the marker sits inside the old floor's band too
+        # (the two bands overlap on this map).
+        self._layer_resync_after_jump_up = False
+        # When the last up jump landed (0.0 = none).  The old floor's route
+        # waits this window instead of repeating its legs on the new floor.
+        self._jump_up_landed_at = 0.0
+        # The last direction the patrol actually walked (fallback for a rescue
+        # jump when the route target is unknown).
+        self._last_walk_direction: Optional[str] = None
+        # The route target X of the last frame (the next target the rescue jump
+        # aims at).  None while patrol is paused or the route has no target.
+        self._last_route_target_x: Optional[float] = None
         self._jump_point_y_samples: list[float] = []
         # First post-jump marker row.  A stable reading alone is not a
         # landing: a missed jump also settles back on its departing platform.
@@ -4608,9 +5139,6 @@ class MovementWorker(threading.Thread):
         self.rescue_probe_attack_block_seconds = max(
             0.5, float(rescue_probe_attack_block_seconds)
         )
-        self.rescue_probe_hold_seconds = max(
-            0.1, float(rescue_probe_hold_seconds)
-        )
         self.rescue_probe_settle_seconds = max(
             0.0, float(rescue_probe_settle_seconds)
         )
@@ -4779,6 +5307,7 @@ class MovementWorker(threading.Thread):
         self._movement_status_log_position: Optional[tuple[float, float]] = None
         self._dispatched_position_logged: Optional[float] = None
         self._last_drop_attempt = float("-inf")
+        self._drop_attempt_frame = -10000
         # The edge-walk fallback is deliberately scoped to an automatic
         # reconnect start.  Ordinary Start Patrol and ordinary fall recovery
         # continue to use their existing drop behaviour unchanged.
@@ -4799,6 +5328,9 @@ class MovementWorker(threading.Thread):
         self._unresolved_floor_settled_frames = 0
         self._unresolved_floor_last_y: Optional[float] = None
         self._unresolved_drop_attempts = 0
+        # One Left/Right stall probe runs before the first Alt+Down of an
+        # unresolved-floor episode: a character on a rope cannot drop.
+        self._unresolved_drop_probe_armed = True
         self._unresolved_drop_stalls = 0
         self._unresolved_drop_attempt_y: Optional[float] = None
         self._unresolved_drop_attempt_at: Optional[float] = None
@@ -5082,6 +5614,8 @@ class MovementWorker(threading.Thread):
         self._clear_endpoint_turn_rearm()
         self._endpoint_turn_expected_direction = None
         self._endpoint_turn_neutral_until = 0.0
+        # Stop Patrol must not leave a jump-up retry budget alive.
+        self._clear_jump_up_session()
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
         if self.stationary_recovery_active_event is not None:
@@ -5462,6 +5996,22 @@ class MovementWorker(threading.Thread):
         index = -1 if self._route_layer_index is None else int(self._route_layer_index)
         return (int(self._jump_point_pass_id), index, str(self._route_phase))
 
+    def _clear_jump_up_session(self) -> None:
+        """Drop a half-finished jump-up session without marking it fired."""
+
+        self._cancel_jump_up_stall_probe()
+        self._jump_up_active = False
+        self._jump_up_token = None
+        self._jump_up_takeoff_y = None
+        self._jump_up_samples = []
+        self._jump_up_attempts = 0
+        self._jump_up_deadline = float("-inf")
+        self._jump_up_sent_at = 0.0
+        self._jump_up_stall_phase = ""
+        self._jump_up_stall_x = None
+        self._jump_up_stall_at = 0.0
+        self._jump_up_stall_tried = False
+
     def _begin_jump_point_pass(self, reason: str) -> None:
         """Start a new movement pass: every recorded jump point is armed again.
 
@@ -5486,6 +6036,9 @@ class MovementWorker(threading.Thread):
                 "JUMP POINT pass: released a stale Up claim left by the "
                 "previous movement pass before re-arming the points"
             )
+        # A new pass cannot inherit the previous pass's vertical session: its
+        # retry budget belongs to the finished leg.
+        self._clear_jump_up_session()
         self._jump_point_pass_id += 1
         self._jump_point_fired.clear()
         LOG.info(
@@ -5516,6 +6069,78 @@ class MovementWorker(threading.Thread):
         if time.monotonic() - fired_at < cooldown:
             return f"within the {cooldown:.1f}s refire cooldown"
         return None
+
+    def _jump_point_up_is_target(self, point_x: float, dwell_frames: int) -> bool:
+        """Whether an up jump point is allowed to fire this frame.
+
+        Two ways only:
+
+        - the character has stayed inside its range for more than
+          ``JUMP_POINT_DWELL_FRAMES`` frames (standing on it is always a
+          trigger), or
+        - the route is on the layer's own ``up`` phase, which walks to the point
+          as the way up, and its target is the point.
+
+        The horizontal legs (and the rope leg) never fire it: the point can be
+        only a few marker steps from the left-most edge (layer1: up point
+        0.540441 vs left-most 0.547794), and treating "close to the leg target"
+        as "the target" fired the jump at the left endpoint, so the right leg
+        never ran - the 22:49 field log.
+        """
+
+        if dwell_frames > JUMP_POINT_DWELL_FRAMES:
+            return True
+        if self._route_phase != "up":
+            return False
+        target = self._last_route_target_x
+        if target is None:
+            return False
+        return (
+            abs(float(target) - float(point_x))
+            <= JUMP_POINT_UP_TARGET_TOLERANCE
+        )
+
+    def _jump_point_dwell_block_reason(
+        self, token: tuple[str, int], *, climbing: bool
+    ) -> Optional[str]:
+        """Block reason for a point the character STAYS on (the dwell rule).
+
+        The dwell trigger is reusable: a point that fired once and was left may
+        fire again when the character stays on it again, so the per-leg
+        "already fired on this leg" record deliberately does NOT apply here.
+        Only the refire cooldown remains, plus the climb/pass rule - the field
+        log's "JUMP POINT suppressed: layer2[4] ... (stayed) - already fired on
+        this leg" repeated for the whole leg although the character stood on the
+        point and the point had been left in between.
+        """
+
+        record = self._jump_point_fired.get(token)
+        if record is None:
+            return None
+        pass_id, _leg_key, fired_at = record
+        if climbing and pass_id == self._jump_point_pass_id:
+            return "already used in this pass (climb)"
+        cooldown = JUMP_POINT_REFIRE_COOLDOWN_SECONDS
+        if time.monotonic() - fired_at < cooldown:
+            return f"within the {cooldown:.1f}s refire cooldown"
+        return None
+
+    def _jump_point_dwell_attempts_used(self, token: tuple[str, int]) -> int:
+        """Dwell-triggered fires of ``token`` on the CURRENT leg."""
+
+        record = self._jump_point_dwell_attempts.get(token)
+        if record is None:
+            return 0
+        leg_key, count = record
+        if leg_key != self._jump_point_leg_key():
+            return 0
+        return count
+
+    def _note_jump_point_dwell_attempt(self, token: tuple[str, int]) -> None:
+        used = self._jump_point_dwell_attempts_used(token)
+        self._jump_point_dwell_attempts[token] = (
+            self._jump_point_leg_key(), used + 1,
+        )
 
     def _jump_point_note_fired(self, token: tuple[str, int]) -> None:
         """Record a dispatched point for its leg/pass and cooldown."""
@@ -5558,6 +6183,7 @@ class MovementWorker(threading.Thread):
         player = observation.player
         if player is None:
             self._jump_point_inside_tokens.clear()
+            self._jump_point_dwell_frames.clear()
             return None
         # A falling marker can cross an unrelated point's exact X/Y window.
         # It is not standing at that point and must not dispatch a directional
@@ -5572,11 +6198,13 @@ class MovementWorker(threading.Thread):
                 else None
             )
         # A stationary/ordinary rope-approach marker must never guess at the
-        # rope centre.  ``up`` is different: active climb detection has
-        # already proved that the marker is travelling on the rope, and must
-        # be allowed to find either recorded rope-exit direction.
-        if travel_direction not in ("left", "right", "up"):
-            return None
+        # rope centre, so a directional point needs a known travel direction.
+        # ``up`` is different: active climb detection has already proved that
+        # the marker is travelling on the rope, and a jump-up point needs no
+        # travel direction at all - it is a vertical trigger on a spot.  The
+        # per-point gate below applies the right rule to each kind, so no early
+        # return here: a character standing on a jump-up point must still fire.
+
 
         matches: list[tuple[tuple[str, int], str, str]] = []
         for point_layer, point_layer_data in self.important_positions.items():
@@ -5589,20 +6217,31 @@ class MovementWorker(threading.Thread):
                 if not isinstance(point, dict):
                     continue
                 direction = str(point.get("direction", "")).casefold()
-                if direction not in ("left", "right"):
+                if direction not in ("left", "right", "up"):
                     continue
-                if (travel_direction != "up"
+                if direction == "up":
+                    # A vertical jump-up is a spot trigger: it is not a rope
+                    # exit so a climb must never fire it, its own session owns
+                    # the spot while it runs, and it fires only when it is the
+                    # leg's next target or after the dwell rule (see the filter
+                    # below) - walking past it is not a trigger.
+                    if climbing or self._jump_up_active:
+                        continue
+                elif (travel_direction != "up"
                         and direction != travel_direction):
                     continue
                 try:
+                    point_x = float(point["x"])
                     matched = (
-                        abs(player.x - float(point["x"])) <= JUMP_POINT_X_TOLERANCE
+                        abs(player.x - point_x) <= JUMP_POINT_X_TOLERANCE
                         and abs(player.y - float(point["y"])) <= JUMP_POINT_Y_TOLERANCE
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
                 if matched:
-                    matches.append(((point_layer, index), point_layer, direction))
+                    matches.append(
+                        ((point_layer, index), point_layer, direction, point_x)
+                    )
 
         if climbing and len(matches) > 1:
             # Two points can match at once on a rope (a 左跳 and a 右跳 recorded
@@ -5616,7 +6255,28 @@ class MovementWorker(threading.Thread):
             if preferred_direction in ("left", "right"):
                 matches.sort(key=lambda match: match[2] != preferred_direction)
 
-        matched_tokens = {token for token, _name, _direction in matches}
+        matched_tokens = {match[0] for match in matches}
+        # Dwell counter: consecutive captured frames the marker has been inside
+        # each matched box, counted from the frame it arrived.  The operator's
+        # rule: staying on a point for more than JUMP_POINT_DWELL_FRAMES frames
+        # also emits it.  A character that walks onto the point and stops is
+        # "inside" every frame but never freshly "entered" again, so entry alone
+        # left it standing on the point with no jump.
+        dwell = self._jump_point_dwell_frames
+        for stale in [key for key in dwell if key not in matched_tokens]:
+            del dwell[stale]
+        for token in matched_tokens:
+            dwell[token] = dwell.get(token, 0) + 1
+        # An up jump point is a spot: during the patrol walk it must not fire
+        # merely because the character passes over it.  It fires when it IS the
+        # leg's next target (the walk was extended to it), or when the character
+        # has stayed inside its range long enough to be standing on it.
+        matches = [
+            match for match in matches
+            if match[2] != "up"
+            or self._jump_point_up_is_target(match[3], dwell.get(match[0], 0))
+        ]
+        matched_tokens = {match[0] for match in matches}
         # A fired point stays suppressed until the marker leaves its zone (the
         # Up-hold/landing session may still be open).  Re-arming on zone exit is
         # kept for the per-frame entry detector only; the leg record above is
@@ -5628,7 +6288,22 @@ class MovementWorker(threading.Thread):
             if (match[0] not in self._jump_point_inside_tokens
                 and match[0] not in self._jump_point_suppressed_tokens)
         ]
-        armed_entered: list[tuple[tuple[str, int], str, str]] = []
+        # Already inside on the previous frame and still inside now: eligible
+        # through the dwell rule, and never while suppressed by its own fired
+        # session - EXCEPT that the dwell trigger is reusable: a stair jump
+        # that did not carry the character up leaves it standing right here,
+        # where the suppression would block every further attempt and the walk
+        # (deferred while a jump point owns Up) never resumes.  Bounded by the
+        # refire cooldown and JUMP_POINT_DWELL_MAX_ATTEMPTS per leg.
+        stayed = [
+            match for match in matches
+            if (match[0] in self._jump_point_inside_tokens
+                and dwell.get(match[0], 0) > JUMP_POINT_DWELL_FRAMES
+                and (match[0] not in self._jump_point_suppressed_tokens
+                     or self._jump_point_dwell_attempts_used(match[0])
+                     < JUMP_POINT_DWELL_MAX_ATTEMPTS))
+        ]
+        armed_entered: list[tuple[tuple[str, int], str, str, float]] = []
         for match in entered:
             reason = self._jump_point_block_reason(match[0], climbing=climbing)
             if reason is None:
@@ -5640,20 +6315,367 @@ class MovementWorker(threading.Thread):
                 "JUMP POINT suppressed: %s[%d] %s jump - %s",
                 match[1], match[0][1], match[2], reason,
             )
+        armed_stayed: list[tuple[tuple[str, int], str, str, float]] = []
+        for match in stayed:
+            # The dwell trigger is reusable: only the refire cooldown (and the
+            # climb/pass rule) apply, never the per-leg record.
+            reason = self._jump_point_dwell_block_reason(match[0], climbing=climbing)
+            if reason is None:
+                armed_stayed.append(match)
+                continue
+            LOG.info(
+                "JUMP POINT suppressed: %s[%d] %s jump (stayed) - %s",
+                match[1], match[0][1], match[2], reason,
+            )
         self._jump_point_inside_tokens = matched_tokens
-        if not armed_entered:
+        if armed_entered:
+            armed, from_stay = armed_entered, False
+        elif armed_stayed:
+            armed, from_stay = armed_stayed, True
+        else:
             return None
 
-        token, point_layer, direction = armed_entered[0]
+        token, point_layer, direction, _point_x = armed[0]
         self._jump_point_candidate = token
-        LOG.info(
-            "%s JUMP POINT %s[%d] entered x=%.6f y=%.6f; awaiting jump worker",
-            "LEFT" if direction == "left" else "RIGHT",
-            point_layer, token[1], player.x, player.y,
-        )
+        frames_inside = dwell.get(token, 0)
+        # Restart the dwell count from the fire: a reusable dwell needs another
+        # JUMP_POINT_DWELL_FRAMES frames inside before it may fire again.
+        dwell[token] = 0
+        if from_stay:
+            self._note_jump_point_dwell_attempt(token)
+            # Dwell trigger: the point already had its arrival frame, so say so
+            # instead of claiming a fresh entry in the log.
+            LOG.info(
+                "%s JUMP POINT %s[%d] stayed %d frames inside the range "
+                "(> %d); emitting the jump (x=%.6f y=%.6f)",
+                {"left": "LEFT", "right": "RIGHT", "up": "UP"}.get(direction, "RIGHT"),
+                point_layer, token[1], frames_inside, JUMP_POINT_DWELL_FRAMES,
+                player.x, player.y,
+            )
+        else:
+            LOG.info(
+                "%s JUMP POINT %s[%d] entered x=%.6f y=%.6f; awaiting jump worker",
+                {"left": "LEFT", "right": "RIGHT", "up": "UP"}.get(direction, "RIGHT"),
+                point_layer, token[1], player.x, player.y,
+            )
         return MovementDecision(
             f"jump_point_{direction}", "recorded jump point",
             self.minimum_final_hold_seconds,
+        )
+
+    def _drop_attempt_in_progress(self) -> bool:
+        """True while the last Alt+Down may still be the attempt that worked.
+
+        Used by the patrol drop to decide between "wait, the character is
+        falling" and "the chord did nothing, retry now".  Only positive evidence
+        counts: a descent in progress, a confirmed fall, or a landing that is
+        already being confirmed.
+        """
+
+        if self._fall_frames > 0 or self._fall_pending:
+            return True
+        if self._drop_arrival_frames > 0:
+            return True
+        player = getattr(getattr(self, "last_observation", None), "player", None)
+        last_y = getattr(self, "_drop_last_y", None)
+        if player is not None and last_y is not None:
+            # A single fresh downward frame is enough evidence that this drop is
+            # working; the retry floor then takes over on the next capture.
+            if float(player.y) - float(last_y) >= self._fall_marker_y_gain:
+                return True
+        return False
+
+    def _perform_jump_up(self) -> bool:
+        """Send the jump-up chord: the game's jump key, Alt.
+
+        It owns no Up hold and no climb claim: the chord is sent, released, and
+        the caller judges the landing from the marker.  Alt is the jump binding
+        in the game; ctrl+up / ctrl+end only record points in this app and are
+        never sent to the client.
+        """
+
+        if not self._patrol_input_allowed() or not self.patrol_enabled:
+            return False
+        sent = False
+        with self._direction_lock:
+            # A horizontal walk hold would turn the vertical hop into a
+            # diagonal one, so the point takes the character standing still.
+            self._release_walk_hold()
+            if not self._patrol_input_allowed():
+                return False
+            # Give the game one frame to see the character standing before the
+            # chord: the point fires mid-walk, and releasing the direction in the
+            # same frame as the jump swallowed the hop in the field log.
+            if not self._wait_for_patrol_motion(JUMP_UP_STAND_DELAY_SECONDS):
+                return False
+            sent = _jump_up_chord_press(
+                self.key_sender, self._jump_up_chord_keys
+            )
+        if sent:
+            # The chord and the IME state go into the log because "the jump is
+            # not emitted" has two very different causes that look identical in
+            # the screenshot: the game ignoring the chord, or a CJK IME eating
+            # the Ctrl half of it before the window ever sees the keys.
+            LOG.info(
+                "JUMP UP executed: chord=%s keys=%s ime=%s",
+                self._jump_up_chord_label,
+                "/".join(self._jump_up_chord_keys),
+                _ime_status_for_jump_up(),
+            )
+        return sent
+
+    def _begin_jump_up(self, observation: MinimapObservation) -> None:
+        """Start a jump-up session at the recorded point."""
+
+        token = self._jump_point_candidate
+        player = observation.player
+        self._jump_point_candidate = None
+        if token is None or player is None:
+            # The point already logged "entered" and is marked inside, so a
+            # silent return here loses the jump with nothing in the log to
+            # explain it.  Say why instead.
+            LOG.warning(
+                "JUMP UP cannot start: candidate=%r player=%r",
+                token, None if player is None else (player.x, player.y),
+            )
+            return
+        self._jump_up_token = token
+        self._jump_up_takeoff_y = float(player.y)
+        self._jump_up_samples = [float(player.y)]
+        self._jump_up_attempts = 1
+        self._jump_up_deadline = time.monotonic() + JUMP_UP_ATTEMPT_SECONDS
+        self._jump_up_active = True
+        # A new session gets one fresh stall probe (the previous session's flag
+        # is cleared on finish; this keeps a re-entered point consistent too).
+        self._jump_up_stall_tried = False
+        LOG.info(
+            "JUMP UP start: %s[%d] takeoff y=%.6f attempt 1/%d",
+            token[0], token[1], self._jump_up_takeoff_y, JUMP_UP_MAX_ATTEMPTS,
+        )
+        if not self._perform_jump_up():
+            self._finish_jump_up(False, self._jump_up_takeoff_y, "chord refused")
+            return
+        # Samples collected before the chord (the take-off frame) must not count
+        # towards a "settled" verdict.
+        self._jump_up_samples = []
+        self._jump_up_sent_at = time.monotonic()
+
+    def _finish_jump_up(
+        self, success: bool, settled_y: Optional[float], reason: str = "",
+    ) -> None:
+        token = self._jump_up_token
+        if token is not None:
+            # One jump per leg either way: a failed point must not spin the
+            # route, so it is marked fired and the patrol walks on.
+            self._jump_point_note_fired(token)
+        takeoff = self._jump_up_takeoff_y
+        self._jump_up_active = False
+        self._jump_up_token = None
+        self._jump_up_samples = []
+        self._jump_up_attempts = 0
+        self._jump_up_deadline = float("-inf")
+        self._jump_up_sent_at = 0.0
+        self._jump_up_takeoff_y = None
+        self._jump_up_stall_phase = ""
+        self._jump_up_stall_x = None
+        self._jump_up_stall_at = 0.0
+        self._jump_up_stall_tried = False
+        self._jump_up_landed_at = 0.0
+        if success:
+            rise = (takeoff - settled_y) if (takeoff is not None and settled_y is not None) else 0.0
+            # A completed up jump is proof that the character left the floor.
+            # The landing usually sits inside BOTH layers' bands (layer1
+            # 0.7411-0.7881 and layer2 0.6505-0.7530 overlap at 0.75), so the
+            # detector's flicker guard kept the OLD layer and the route patrolled
+            # layer1's edges on layer2 - the operator's "failed to recognize
+            # layer 2".  The next detections may accept the new floor, and the
+            # normal resync (4 stable frames) then restarts patrol there.
+            if rise > 0:
+                self._layer_resync_after_jump_up = True
+                self._jump_up_landed_at = time.monotonic()
+                self._clear_layer_resync_candidate()
+            LOG.info(
+                "JUMP UP complete: settled y=%.6f, rose %.4f; patrol continues on "
+                "the new floor", settled_y or 0.0, rise,
+            )
+        else:
+            LOG.warning(
+                "JUMP UP giving up (%s): settled y=%.6f; the route continues",
+                reason or "failed", settled_y or 0.0,
+            )
+
+    def _update_jump_up_landing(self, observation: MinimapObservation) -> None:
+        """Advance the jump-up session: settle check, retry budget, give up."""
+
+        if not self._jump_up_active or observation.player is None:
+            return
+        current = float(observation.player.y)
+        self._jump_up_samples.append(current)
+        if len(self._jump_up_samples) > JUMP_UP_STABLE_FRAMES * 4:
+            del self._jump_up_samples[:-JUMP_UP_STABLE_FRAMES * 2]
+        verdict = _jump_up_verdict(self._jump_up_samples, self._jump_up_takeoff_y)
+        if verdict == "done":
+            if self._climb_state.up_held:
+                LOG.warning("JUMP UP complete while a climb still owns Up")
+            self._finish_jump_up(True, current)
+            return
+        # A jump arc needs time: samples taken right after the chord are still
+        # the standing frames, so nothing may be judged failed before this delay.
+        if time.monotonic() - self._jump_up_sent_at < JUMP_UP_SETTLE_DELAY_SECONDS:
+            return
+        reason = ""
+        if verdict == "failed":
+            reason = "settled without climbing"
+        elif time.monotonic() >= self._jump_up_deadline:
+            reason = "no settle within the attempt window"
+        if not reason:
+            return
+        # "Three stable Y frames without a rise" is not proof that the hop
+        # failed: a buff/skill emission freezes the marker the same way, and a
+        # character stalled on a rope does not move at all.  Before spending a
+        # retry, press Left and Right for one capture each; a character that
+        # walks in either direction gets the ordinary retry, one that does not
+        # is stalled and is jumped off toward the route instead.
+        if verdict == "failed":
+            if self._jump_up_stall_phase:
+                stalled = self._advance_jump_up_stall_probe(observation)
+                if stalled is None:
+                    # The probe must not outlive the attempt window: a player
+                    # marker that stays unreadable would otherwise hold a
+                    # direction key forever.
+                    if time.monotonic() >= self._jump_up_deadline:
+                        self._cancel_jump_up_stall_probe()
+                        self._finish_jump_up(False, current, "stall probe timed out")
+                    return
+                if stalled:
+                    self._rescue_jump_up_stall(observation)
+                    return
+            elif not self._jump_up_stall_tried:
+                self._jump_up_stall_tried = True
+                if self._begin_jump_up_stall_probe(observation):
+                    return
+        if self._jump_up_attempts >= JUMP_UP_MAX_ATTEMPTS:
+            self._finish_jump_up(
+                False, current, f"{reason} after {self._jump_up_attempts} attempts",
+            )
+            return
+        self._jump_up_attempts += 1
+        LOG.info(
+            "JUMP UP retry %d/%d (%s); sending %s again",
+            self._jump_up_attempts, JUMP_UP_MAX_ATTEMPTS, reason,
+            self._jump_up_chord_label,
+        )
+        if self._jump_up_takeoff_y is None:
+            self._jump_up_takeoff_y = current
+        self._jump_up_samples = []
+        self._jump_up_deadline = time.monotonic() + JUMP_UP_ATTEMPT_SECONDS
+        if not self._perform_jump_up():
+            self._finish_jump_up(False, current, "chord refused on retry")
+            return
+        self._jump_up_sent_at = time.monotonic()
+
+    def _cancel_jump_up_stall_probe(self) -> None:
+        """Release the probe direction and forget the probe state."""
+
+        phase = self._jump_up_stall_phase
+        key_up = getattr(self.key_sender, "key_up", None)
+        if phase and callable(key_up):
+            key_up(phase)
+        self._jump_up_stall_phase = ""
+        self._jump_up_stall_x = None
+        self._jump_up_stall_at = 0.0
+
+    def _begin_jump_up_stall_probe(self, observation: MinimapObservation) -> bool:
+        """Press Left and start the stall probe; True when it started.
+
+        Nothing blocks: the direction is pressed here, and a later captured
+        frame decides from the marker X whether the character actually walked.
+        """
+
+        player = observation.player
+        if player is None or not self._patrol_input_allowed():
+            return False
+        if not _sender_is_safe(self.key_sender):
+            return False
+        key_down = getattr(self.key_sender, "key_down", None)
+        if not callable(key_down):
+            return False
+        if key_down("left") is False:
+            return False
+        # The probe moves the marker; samples taken while testing must not be
+        # judged as a landing.
+        self._jump_up_samples = []
+        self._jump_up_stall_phase = "left"
+        self._jump_up_stall_x = float(player.x)
+        self._jump_up_stall_at = time.monotonic()
+        return True
+
+    def _advance_jump_up_stall_probe(
+        self, observation: MinimapObservation
+    ) -> Optional[bool]:
+        """Step the stall probe.
+
+        ``True`` - both directions kept the character still (it is stalled);
+        ``False`` - the character walked, so this was a real failed hop;
+        ``None`` - still waiting for the minimum hold, or moving on to Right.
+        """
+
+        player = observation.player
+        if player is None or self._jump_up_stall_x is None:
+            return None
+        if time.monotonic() - self._jump_up_stall_at < JUMP_UP_STALL_PROBE_SECONDS:
+            return None
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if not callable(key_down) or not callable(key_up):
+            return False
+        phase = self._jump_up_stall_phase or "left"
+        key_up(phase)
+        moved = abs(float(player.x) - self._jump_up_stall_x) >= JUMP_UP_STALL_PROBE_EPSILON
+        if moved:
+            LOG.info(
+                "JUMP UP stall probe: %s moved the character to x=%.6f "
+                "(dx=%.4f); it is walkable, retrying the hop",
+                phase, float(player.x), float(player.x) - self._jump_up_stall_x,
+            )
+            self._jump_up_stall_phase = ""
+            self._jump_up_stall_x = None
+            return False
+        if phase == "left":
+            if key_down("right") is False:
+                self._jump_up_stall_phase = ""
+                self._jump_up_stall_x = None
+                return False
+            self._jump_up_stall_phase = "right"
+            self._jump_up_stall_x = float(player.x)
+            self._jump_up_stall_at = time.monotonic()
+            return None
+        LOG.info(
+            "JUMP UP stall probe: Left and Right both left x=%.6f unchanged "
+            "(at most %.4f); the character is stalled",
+            float(player.x), JUMP_UP_STALL_PROBE_EPSILON,
+        )
+        self._jump_up_stall_phase = ""
+        self._jump_up_stall_x = None
+        return True
+
+    def _rescue_jump_up_stall(self, observation: MinimapObservation) -> None:
+        """The character is stalled (a rope): jump off toward the next target."""
+
+        direction, direction_reason = self._rescue_direction_toward_next_target(
+            observation.player
+        )
+        keys = (direction,) + tuple(self._jump_up_chord_keys)
+        sent = _jump_up_chord_press(self.key_sender, keys)
+        LOG.warning(
+            "JUMP UP rescue: the character was stalled (left and right do not "
+            "move it - on a rope); %s (%s)",
+            f"jumped {direction} toward the route with {self._jump_up_chord_label}"
+            if sent else "the rescue jump was refused by the sender",
+            direction_reason,
+        )
+        self._finish_jump_up(
+            False, None, "stalled on a rope; jumped toward the route",
         )
 
     def _handoff_jump_point_rope_climb(
@@ -6980,7 +8002,14 @@ class MovementWorker(threading.Thread):
             except Exception:
                 LOG.warning("drop suppressed during self-rescue descent",
                             exc_info=True)
-            time.sleep(self.drop_retry_seconds)
+            # Never sleep the worker for the whole retry window: poll in short
+            # slices and stop waiting as soon as the marker starts descending.
+            deadline = time.monotonic() + DROP_RETRY_MIN_SECONDS
+            while time.monotonic() < deadline:
+                if not self._wait_for_patrol_motion(0.1):
+                    return None
+                if self._fall_frames > 0:
+                    break
         LOG.warning(
             "self-rescue drop: gave up after %d attempts without confirming %s",
             max_attempts, bottom_floor,
@@ -7426,20 +8455,24 @@ class MovementWorker(threading.Thread):
                 # the legacy left-first fallback until the route resolves it.
                 chosen = "left"
             else:
-                chosen = min(
-                    edges,
-                    key=lambda edge: (
-                        abs(float(layer[f"{edge}_most_pos"]["x"])
-                            - float(player.x)),
-                        0 if edge == "left" else 1,
-                    ),
-                )
+                def _edge_distance(edge: str) -> tuple[float, int]:
+                    # The leg actually walks to the extended edge (an outlying
+                    # up jump point), so the entry side is chosen by that X.
+                    edge_x = self._layer_walk_edge_x(layer_name, edge)
+                    if edge_x is None:
+                        edge_x = float(layer[f"{edge}_most_pos"]["x"])
+                    return (abs(edge_x - float(player.x)),
+                            0 if edge == "left" else 1)
+
+                chosen = min(edges, key=_edge_distance)
         self._route_entry_phase = chosen if chosen in ("left", "right") else None
         self._route_entry_context = (self._split_active_part, layer_name)
         self._route_phase = chosen
         self._route_patrol_cycle = 1
         if observation is not None and observation.player is not None and chosen in ("left", "right"):
-            endpoint_x = float(layer[f"{chosen}_most_pos"]["x"])
+            endpoint_x = self._layer_walk_edge_x(layer_name, chosen)
+            if endpoint_x is None:
+                endpoint_x = float(layer[f"{chosen}_most_pos"]["x"])
             LOG.info(
                 "route entry: %s %s first (marker_x=%.6f endpoint_x=%.6f, %s)",
                 layer_name, chosen, observation.player.x, endpoint_x, reason,
@@ -7931,10 +8964,34 @@ class MovementWorker(threading.Thread):
                     and 0 <= self._route_layer_index < len(self._route_layers))
                 else None
             )
+            # Arriving on the NEXT floor's own band is not flicker: the two
+            # bands overlap on this map (layer1 0.7411-0.7881, layer2
+            # 0.6505-0.7530), so a landing or rope-top position at y=0.75 sits
+            # inside both.  The guard kept layer1 there, the climb's arrival
+            # confirmation never saw layer2, and the character stayed "not
+            # recognised" at the top of the rope (22:59 log: "now on layer2 ...
+            # layer change deferred while an attached climb holds Up" forever).
+            # A marker inside the next layer's arrival band may switch.
+            next_name = (
+                self._route_layers[self._route_layer_index + 1]
+                if (self._route_layer_index is not None
+                    and self._route_layer_index + 1 < len(self._route_layers))
+                else None
+            )
+            arriving_on_next_floor = bool(
+                next_name is not None
+                and detected_name == next_name
+                and observation.player is not None
+                and self._climb_arrival_band_contains(
+                    next_name, observation.player.y
+                )
+            )
             if (current_name is not None
                     and detected_name is not None
                     and detected_name != current_name
                     and not world_authoritative
+                    and not self._layer_resync_after_jump_up
+                    and not arriving_on_next_floor
                     and observation.player is not None
                     and self._layer_band_contains(
                         current_name, observation.player.y
@@ -7950,7 +9007,14 @@ class MovementWorker(threading.Thread):
                 and self._fall_frames > 0):
             self._note_fall_floor_candidate(detected_name)
         if detected_name is None:
-            self._clear_layer_resync_candidate()
+            # A blank frame is the marker's own jump arc (the climb machinery
+            # already tolerates it with CLIMB_ARRIVAL_BLANK_FRAMES_TOLERATED).
+            # It must not throw away a pending layer transition: the 23:15 log
+            # reached layer1 -> layer2 3/4 on the rope, sampled one "now on
+            # none" frame, and restarted at 1/4 - so layer2 was never
+            # recognised while the character bounced on the rope.  Keep the
+            # candidate; a DIFFERENT detected floor still restarts it, and a
+            # confirmed same floor clears it.
             # Fall detection becomes pending after resync in the first stable
             # frame.  The previously observed lower floor may no longer be
             # visible now, so use the cached, confirmed candidate instead of
@@ -8013,6 +9077,9 @@ class MovementWorker(threading.Thread):
             return detected_name
         if detected_index == self._route_layer_index:
             self._clear_layer_resync_candidate()
+            # The floor is confirmed where it was: a pending post-jump-up
+            # resync has nothing left to do.
+            self._layer_resync_after_jump_up = False
             if self._climb_state.up_held or self._climb_state.phase == "climbing-up":
                 self._climb_state.target_layer_frames = 0
                 self._climb_state.target_layer_since = None
@@ -8061,7 +9128,22 @@ class MovementWorker(threading.Thread):
                 self._layer_resync_candidate_frames = 1
             else:
                 self._layer_resync_candidate_frames += 1
-            if self._layer_resync_candidate_frames < self._normal_layer_resync_frames:
+            # A COMPLETED up jump is a verified floor change (the session only
+            # finishes "done" after a stable landing higher than take-off), so
+            # the new floor is accepted on its first detection instead of
+            # waiting four frames.  Waiting let the old floor's phases run on the
+            # new one - the 22:53 field log walked layer1's right leg on layer2,
+            # then layer2's left-most, then its right-most (right/left/right).
+            if (self._layer_resync_after_jump_up
+                    and self._layer_resync_candidate_frames <= 1):
+                LOG.info(
+                    "LAYER accepted after the up jump: %s -> %s (marker_y=%.6f)",
+                    current_name, detected_name,
+                    (observation.player.y if observation.player is not None
+                     else float("nan")),
+                )
+                self._clear_layer_resync_candidate()
+            elif self._layer_resync_candidate_frames < self._normal_layer_resync_frames:
                 LOG.info(
                     "LAYER transition candidate: %s -> %s %d/%d; keeping "
                     "current patrol (marker_y=%.6f matches %s, world_y=%s "
@@ -8078,7 +9160,8 @@ class MovementWorker(threading.Thread):
                     observation.structure_confidence,
                 )
                 return current_name
-            self._clear_layer_resync_candidate()
+            else:
+                self._clear_layer_resync_candidate()
 
         previous_name = (
             self._route_layers[self._route_layer_index]
@@ -8107,6 +9190,7 @@ class MovementWorker(threading.Thread):
         # failed jump) use the small creep steps.
         self._rope_attempted = False
         self._last_drop_attempt = float("-inf")
+        self._drop_attempt_frame = -10000
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
         # Arrival is definitive: bypass the inter-attempt busy hysteresis so
@@ -8135,6 +9219,7 @@ class MovementWorker(threading.Thread):
             LOG.info("CLIMB complete: detected %s at y=%.6f",
                      detected_name, observation.player.y)
         else:
+            self._layer_resync_after_jump_up = False
             LOG.warning(
                 "LAYER CHANGED: %s -> %s at y=%.6f; restarting %s patrol "
                 "(marker_y matches %s, world_y=%s confidence=%.3f)",
@@ -9680,6 +10765,7 @@ class MovementWorker(threading.Thread):
         self._begin_jump_point_pass("timed stationary patrol")
         self._jump_point_inside_tokens.clear()
         self._jump_point_suppressed_tokens.clear()
+        self._jump_point_dwell_frames.clear()
         self._jump_point_candidate = None
         anchor_index = self._route_layers.index(anchor_layer)
         first_index = 0
@@ -9951,6 +11037,7 @@ class MovementWorker(threading.Thread):
         self._begin_jump_point_pass("stationary attack manual start")
         self._jump_point_inside_tokens.clear()
         self._jump_point_suppressed_tokens.clear()
+        self._jump_point_dwell_frames.clear()
         self._jump_point_candidate = None
         self._jump_point_up_held = False
         self._jump_point_up_started_at = 0.0
@@ -10935,6 +12022,7 @@ class MovementWorker(threading.Thread):
         self._climb_direction_log = None
         self._route_patrol_cycle = 1
         self._last_drop_attempt = float("-inf")
+        self._drop_attempt_frame = -10000
         self._patrol_busy_until = 0.0
         # A Start Patrol is a new movement pass: every recorded jump point is
         # armed again (the operator's rule), whatever the previous run did.
@@ -11442,6 +12530,9 @@ class MovementWorker(threading.Thread):
         self._unresolved_floor_settled_frames = 0
         self._unresolved_floor_last_y = None
         self._unresolved_drop_attempts = 0
+        # A new unresolved-floor episode gets one fresh stall probe before its
+        # first Alt+Down chord.
+        self._unresolved_drop_probe_armed = True
         self._unresolved_drop_stalls = 0
         self._unresolved_drop_attempt_y = None
         self._unresolved_drop_attempt_at = None
@@ -11676,6 +12767,25 @@ class MovementWorker(threading.Thread):
             return self._abandon_unresolved_drop(
                 f"{self._unresolved_drop_attempts} Alt+Down chords without a "
                 "recorded floor"
+            )
+        if self._rescue_active:
+            return MovementDecision(
+                None, "unresolved floor; the stall rescue owns the layer change",
+            )
+        if self._unresolved_drop_attempts == 0 and self._unresolved_drop_probe_armed:
+            # Field log 21:43: two Alt+Down chords were spent and only then did
+            # the stall probe find that Left and Right could not move the
+            # character at all - it was on a rope, where Alt+Down does nothing.
+            # Walk first, drop second: the probe runs before any chord, and a
+            # stalled character gets the jump toward the closest target instead.
+            self._unresolved_drop_probe_armed = False
+            LOG.info(
+                "UNRESOLVED FLOOR: verifying the character can walk before the "
+                "first Alt+Down (Left/Right stall probe)"
+            )
+            self._trigger_rescue()
+            return MovementDecision(
+                None, "unresolved floor; stall probe before the Alt+Down",
             )
         player = observation.player
         if player is None:
@@ -13151,6 +14261,11 @@ class MovementWorker(threading.Thread):
         """
 
         target, near_target, label = self._route_target_impl(observation)
+        # The route target is the "next target" a rescue jump must aim at; the
+        # last walked direction is only a fallback (a stall can leave the
+        # character walking away from the target it had reached - the field log
+        # showed the right-most target but the jump went left).
+        self._last_route_target_x = target
         if label != self._route_target_label:
             self._route_target_label = label
             LOG.info(
@@ -13277,11 +14392,32 @@ class MovementWorker(threading.Thread):
             self._route_phase = phases[0]
         self._trigger_skill_points(observation, name, layer)
         if self._route_phase == "left":
-            return float(layer["left_most_pos"]["x"]), False, f"{name}.left-most"
+            left_x = self._layer_walk_edge_x(name, "left")
+            return (
+                left_x if left_x is not None else float(layer["left_most_pos"]["x"])
+            ), False, f"{name}.left-most"
         if self._route_phase == "right":
-            return float(layer["right_most_pos"]["x"]), False, f"{name}.right-most"
+            right_x = self._layer_walk_edge_x(name, "right")
+            return (
+                right_x if right_x is not None else float(layer["right_most_pos"]["x"])
+            ), False, f"{name}.right-most"
         if self._route_phase == "drop":
             return None, False, f"{name}.drop-to-first"
+        if self._route_phase == "up":
+            # Way up through the recorded up jump point: walk to it and let the
+            # point fire its own chord.  near_target stays False on purpose -
+            # this is NOT a climb and must not start the rope machinery.
+            # After a completed jump the old floor's route waits for the layer
+            # change; running its left/right legs on the new floor was the
+            # 22:53 "right, then left-most, then right-most".
+            if (self._jump_up_landed_at > 0.0
+                    and time.monotonic() - self._jump_up_landed_at
+                    < JUMP_UP_LANDING_WAIT_SECONDS):
+                return None, False, f"{name}.awaiting-layer"
+            up_x = self._layer_up_point_x(name)
+            if up_x is None:
+                return None, False, f"{name}.no-way-up"
+            return up_x, False, f"{name}.up"
         is_final = self._route_layer_index == len(self._route_layers) - 1
         if is_final:
             # The final layer has no rope to climb: loop its own actions, or
@@ -13297,9 +14433,13 @@ class MovementWorker(threading.Thread):
             return self._route_target(observation)
         if not self.climbing_enabled:
             return None, False, "route-complete"
-        rope = layer.get("rope_pos", {})
-        rope_x = float(rope["x"]) if isinstance(rope, dict) and "x" in rope else self.fixed_target_x
-        return rope_x, True, f"{name}.rope"
+        # A recorded rope_pos only: the legacy profile-wide rope X walked off
+        # floors that never recorded a rope, and an up jump point is a jump
+        # spot handled by its own "up" phase, never by the climb machinery.
+        approach = layer.get("rope_pos")
+        if not isinstance(approach, dict) or "x" not in approach:
+            return None, False, f"{name}.no-rope"
+        return float(approach["x"]), True, f"{name}.rope"
 
     def _trigger_skill_points(
         self, observation: MinimapObservation, layer_name: str, layer: Any,
@@ -13537,6 +14677,35 @@ class MovementWorker(threading.Thread):
                  previous + 1, self._split_part_count,
                  self._split_active_part + 1, self._split_part_count)
 
+    def _layer_walk_edge_x(self, layer_name: str, edge: str) -> Optional[float]:
+        """X of a left/right leg's far end: the recorded edge, nothing more.
+
+        An out-of-span up jump point must NOT extend the leg.  It used to (the
+        operator's earlier "if up jump point is out of left-most right-most the
+        character don't go to it"), but now that a layer without a rope has its
+        own ``up`` phase, extending the horizontal leg made the character walk
+        straight onto the up point during the LEFT leg and jump away before the
+        right leg ran:
+
+            22:49:03 route entry: layer1 left first (endpoint_x=0.540441)
+            22:49:04 route endpoint reached/crossed: left; next right
+            22:49:08 LAYER CHANGED: layer1 -> layer2   (right leg never walked)
+
+        The ``up`` phase visits the point after the layer's own patrol, so the
+        horizontal legs keep their recorded edges.
+        """
+
+        layer = self.important_positions.get(layer_name)
+        if not isinstance(layer, dict) or edge not in ("left", "right"):
+            return None
+        endpoint = layer.get(f"{edge}_most_pos")
+        if not isinstance(endpoint, dict):
+            return None
+        try:
+            return float(endpoint["x"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def _layer_phases(self, name: str) -> list[str]:
         """Ordered action phases for a layer from its recorded points.
 
@@ -13554,21 +14723,105 @@ class MovementWorker(threading.Thread):
             edge for edge in ("left", "right")
             if isinstance(layer.get(f"{edge}_most_pos"), dict)
         ]
-        # The layer-entry decision is stable for the entire layer pass.  It
-        # changes only when a different layer/part is confirmed, never as X
-        # moves between the two endpoints.
-        if self._route_entry_context == (self._split_active_part, name):
-            entry = self._route_entry_phase
-            if entry in edges:
-                edges = [entry, *(edge for edge in edges if edge != entry)]
+        # The entry decision is re-made every time a layer is entered (layer
+        # start, resync, drop restart, climb arrival, new split part) and it
+        # must win here: on entry the character starts with the NEAREST edge,
+        # then the other edge, then the way-up phase.  Matching the split part
+        # as well as the name silently fell back to left/right order whenever
+        # the part index changed, and the route then walked right -> left ->
+        # right again ("this phase is not fixed").  The layer name is what the
+        # decision belongs to; every entry path rewrites it anyway.
+        entry = self._route_entry_phase
+        entry_context = self._route_entry_context
+        if (entry in edges
+                and entry_context is not None
+                and entry_context[1] == name):
+            edges = [entry, *(edge for edge in edges if edge != entry)]
         phases.extend(edges)
         is_final = (
             self._route_layer_index is not None
             and self._route_layer_index == len(self._route_layers) - 1
         )
-        if isinstance(layer.get("rope_pos"), dict) and self.climbing_enabled and not is_final:
-            phases.append("rope")
+        # A layer with a recorded rope climbs it; a layer that recorded none but
+        # has an approach point (its recorded jump points are the operator's own
+        # way up, see ``_rope_target_for_floor``) must still leave the layer.
+        # Without that phase the layer's own actions repeated forever: the 22:23
+        # field log patrolled layer1 right -> left -> right -> left with no rope
+        # phase to advance to, because layer1 has an up jump point at x=0.540441
+        # and no rope_pos.
+        if self.climbing_enabled and not is_final:
+            rope = layer.get("rope_pos")
+            if isinstance(rope, dict) and "x" in rope:
+                phases.append("rope")
+            elif self._layer_up_point_x(name) is not None:
+                phases.append("up")
         return phases
+
+    def _layer_up_point_x(self, name: str) -> Optional[float]:
+        """X of the layer's up jump point: its way up when no rope is recorded.
+
+        An up jump point is a JUMP spot, not a rope.  The route only walks to
+        it; the point fires its own chord, nothing holds Up and nothing climbs.
+        The 22:30 field log is why this must stay separate from the ``rope``
+        phase: routed as a rope, the worker held Up at x=0.540441, attempted
+        grab after grab ("CLIMB grab retry", "holding-up-awaiting-progress"),
+        and the marker flipped between the two floors instead of leaving.
+
+        The 22:23 log is why the phase exists at all: layer1 has an up jump
+        point and no rope_pos, so without this phase it repeated its right/left
+        patrol forever.
+        """
+
+        layer = self.important_positions.get(name)
+        if not isinstance(layer, dict):
+            return None
+        xs: list[float] = []
+        for point in layer.get("jump_points") or ():
+            if not isinstance(point, dict):
+                continue
+            if str(point.get("direction", "")).casefold() != "up":
+                continue
+            try:
+                xs.append(float(point["x"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not xs:
+            return None
+        return min(xs, key=lambda value: abs(value - self.fixed_target_x))
+
+    def _jump_point_up_phase_complete(self, name: str) -> bool:
+        """Whether the layer's ``up`` phase has done its jump for this leg.
+
+        The up jump point fires once per leg and marks itself fired when its
+        session ends (landing or give-up); that record is what lets the phase
+        advance.  While the session runs the phase stays put, and a landing on
+        the next floor restarts the route through the layer change instead.
+        """
+
+        layer = self.important_positions.get(name)
+        if not isinstance(layer, dict):
+            return True
+        points = layer.get("jump_points") or []
+        target_x = self._layer_up_point_x(name)
+        if target_x is None:
+            return True
+        for index, point in enumerate(points):
+            if not isinstance(point, dict):
+                continue
+            if str(point.get("direction", "")).casefold() != "up":
+                continue
+            try:
+                matches = abs(float(point["x"]) - target_x) <= 1e-9
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not matches:
+                continue
+            record = self._jump_point_fired.get((name, index))
+            if record is None:
+                return False
+            _pass_id, leg_key, _fired_at = record
+            return leg_key == self._jump_point_leg_key()
+        return True
 
     def _begin_endpoint_turn(self, previous: str, next_direction: str) -> None:
         """Release an endpoint walk now and reserve one clean reverse.
@@ -13793,6 +15046,22 @@ class MovementWorker(threading.Thread):
                     return True
                 return False
             self._clear_endpoint_band_timeout()
+        elif self._route_phase == "up":
+            # The up jump point owns the exit: no walk band, no climb.  Stay in
+            # the phase until its jump for this leg has been dispatched and the
+            # session ended; a landing on the next floor restarts the route
+            # through the layer change before this is reached.
+            self._clear_endpoint_band_timeout()
+            if (self._jump_up_landed_at > 0.0
+                    and time.monotonic() - self._jump_up_landed_at
+                    < JUMP_UP_LANDING_WAIT_SECONDS):
+                # The jump landed: wait for the layer change instead of
+                # repeating this floor's legs on the new one.  Each floor then
+                # restarts from its NEAREST edge, then the other edge, then its
+                # own up phase.
+                return False
+            if not self._jump_point_up_phase_complete(name):
+                return False
         else:
             # Rope phase advances through the climb machinery, not here.
             self._clear_endpoint_band_timeout()
@@ -14045,6 +15314,7 @@ class MovementWorker(threading.Thread):
         self._forced_phase_entry = None
         self._climb_state = ClimbState()
         self._last_drop_attempt = float("-inf")
+        self._drop_attempt_frame = -10000
         self._descending_to_first = False
         self._descending_since = None
         self._drop_descent_saw = None
@@ -15909,7 +17179,20 @@ class MovementWorker(threading.Thread):
                     else:
                         target_y = observation.player.y if observation.player is not None else 0.0
                         position_target = Point(route_target_x, target_y)
-                        if self._route_phase == "left":
+                        # A boundary phase walks toward its own edge; the "up"
+                        # phase walks toward a POINT, which may lie on either
+                        # side.  Planning it with the right-most test made the
+                        # character standing at x=0.790441 "reached" its target
+                        # x=0.540441 and wait there forever ("22:39:13
+                        # action=wait (right-most reached or crossed)" while the
+                        # route wanted the up phase).  Pick the boundary by the
+                        # direction the target lies in.
+                        walk_left = self._route_phase == "left" or (
+                            self._route_phase == "up"
+                            and observation.player is not None
+                            and route_target_x < observation.player.x
+                        )
+                        if walk_left:
                             position_plan = move_to_left_most(
                                 observation,
                                 position_target,
@@ -16049,6 +17332,7 @@ class MovementWorker(threading.Thread):
                         # ``MOVE TO ROPE ... action=wait`` forever.
                         and decision.key not in (
                             "jump_point_left", "jump_point_right",
+                            "jump_point_up",
                         )):
                     climb_was_preserved = self._yield_climb_to_jump_point()
                     decision = MovementDecision(
@@ -16067,6 +17351,7 @@ class MovementWorker(threading.Thread):
                 # 回到第一层重启巡逻。
                 self._rescue_stuck_check(observation, time.monotonic())
                 self._update_jump_point_landing(observation)
+                self._update_jump_up_landing(observation)
                 decision = preserve_persistent_climb(self._climb_state, decision)
                 if route_label in ("route-complete", "patrol-paused"):
                     active_target_x = None
@@ -16456,16 +17741,25 @@ class MovementWorker(threading.Thread):
                     and decision.key.startswith("stair_jump_")
                 )
                 is_jump_point = bool(
-                    isinstance(decision.key, str)
-                    and decision.key.startswith("jump_point_")
+                    decision.key in ("jump_point_left", "jump_point_right")
                 )
+                # A jump-up point is vertical: it must not keep a horizontal
+                # walk hold, must not hold Up, and must never enter the
+                # rope/stair-jump recovery.
+                is_jump_up = bool(decision.key == "jump_point_up")
                 if decision.key not in ("left", "right") and not is_stair_jump and not is_jump_point:
                     self._release_walk_hold()
                 # A recorded jump point is a narrow, one-frame positional
                 # event.  It must not be lost merely because an ordinary walk
-                # send occurred in the preceding 250 ms.
+                # send occurred in the preceding 250 ms.  The up jump point is
+                # the same kind of event and is exempted for the same reason:
+                # without it the point fired right after a walk send, the gate
+                # swallowed the one-shot decision, and the log showed
+                # "entered; awaiting jump worker" followed by more walking and
+                # no hop at all.
                 if decision.key and (
                     is_jump_point
+                    or is_jump_up
                     or now - self._last_send >= self.movement_cooldown
                 ):
                     if decision.key in (
@@ -16487,8 +17781,23 @@ class MovementWorker(threading.Thread):
                             continue
                         self._pickup_z_force_after = 0.0
                     if decision.key == "drop":
-                        if now - self._last_drop_attempt < self.drop_retry_seconds:
+                        # Failure-driven retry: the old fixed
+                        # ``drop_retry_seconds`` wait made every missed chord
+                        # cost 1.5 s.  Wait only while the previous attempt
+                        # still has a chance (descent/landing evidence), or
+                        # while the chord was sent within this capture interval.
+                        if now - self._last_drop_attempt < DROP_RETRY_MIN_SECONDS:
                             continue
+                        if frame.sequence - self._drop_attempt_frame < DROP_RETRY_FRAMES:
+                            continue
+                        if self._drop_attempt_in_progress():
+                            continue
+                        if self._last_drop_attempt != float("-inf"):
+                            LOG.info(
+                                "DROP RETRY: previous Alt+Down produced no descent "
+                                "after %.2fs; sending it again",
+                                now - self._last_drop_attempt,
+                            )
                         if self.climbing_active_event is not None:
                             self.climbing_active_event.set()
                         if self.dropping_active_event is not None:
@@ -16505,6 +17814,7 @@ class MovementWorker(threading.Thread):
                                 self.dropping_active_event.clear()
                             continue
                         self._last_drop_attempt = now
+                        self._drop_attempt_frame = int(frame.sequence)
                         self._note_reconnect_drop_attempt(observation, now)
                     elif decision.key in (
                         "climb", "jump_climb_left", "jump_climb_right",
@@ -16543,6 +17853,8 @@ class MovementWorker(threading.Thread):
                         self._run_climb_step(
                             observation, route_target_x, preferred_direction
                         )
+                    elif is_jump_up:
+                        self._begin_jump_up(observation)
                     elif is_stair_jump or is_jump_point:
                         # The worker waits independently for the *current*
                         # fixed attack to end.  Keep walking in the patrol

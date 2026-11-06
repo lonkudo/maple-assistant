@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     打包 MoonEclipse 的最小发布文件夹。
 
@@ -79,7 +79,12 @@ if not exist "$environmentDir\Scripts\pythonw.exe" (
     pause
     exit /b 1
 )
-wscript.exe //nologo "%~dp0launch_assistant.vbs" %*
+rem Start the hidden, elevated launcher and close this console immediately.
+rem Waiting for wscript.exe kept a cmd window on screen around the UAC prompt,
+rem so users read it as something harmful.  "start" detaches the launcher: this
+rem window is gone before the UAC confirmation appears.
+start "" wscript.exe //nologo "%~dp0launch_assistant.vbs" %*
+exit /b
 "@
 $packageVbs = @"
 Option Explicit

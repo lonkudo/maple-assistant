@@ -8094,55 +8094,17 @@ class UiWorker(threading.Thread):
             LOG.info("%s已导出并复制文件：%s", log_type, target)
 
     def _copy_running_log(self) -> None:
-        """Write and copy the live log plus the recording needed to read it.
+        """Attach the live log itself - the recording is already at its top.
 
-        The export deliberately has only two sources: the currently written
-        ``work\\assistant.log`` and ``recording`` from user_config.json.  The
-        latter supplies layers, endpoints, ropes and jump points needed to
-        interpret movement decisions, while avoiding unrelated user settings
-        such as bot credentials.  ``运行日志.txt`` is a stable, shareable file
-        rebuilt only when its toolbar button is clicked.
+        ``work\\assistant.log`` now starts with the recording block and receives
+        a fresh snapshot whenever the recording changes, so there is nothing to
+        flush or rewrite: the toolbar copies that one file for the operator to
+        attach.
         """
 
-        target = application_root(__file__) / "运行日志.txt"
-        assistant_log = application_root(__file__) / "work" / "assistant.log"
-        try:
-            log_text = assistant_log.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            log_text = f"(无法读取 work\\assistant.log: {exc})"
-
-        recording: object = "(未找到录制配置)"
-        if self.user_config_path:
-            try:
-                document = json.loads(
-                    Path(self.user_config_path).read_text(encoding="utf-8")
-                )
-                if isinstance(document, dict):
-                    value = document.get("recording")
-                    if isinstance(value, dict):
-                        recording = value
-                    else:
-                        recording = "(user_config.json 中没有录制配置)"
-            except (OSError, ValueError, TypeError) as exc:
-                recording = f"(无法读取录制配置: {exc})"
-        else:
-            recording = "(当前运行未提供 user_config.json 路径)"
-
-        snapshot = (
-            "===== work\\assistant.log =====\n"
-            + log_text.rstrip()
-            + "\n\n===== user_config.json :: recording =====\n"
-            + json.dumps(recording, ensure_ascii=False, indent=2)
+        self._copy_log_file(
+            application_root(__file__) / "work" / "assistant.log", "运行日志",
         )
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(".tmp")
-            temporary.write_text(snapshot + "\n", encoding="utf-8")
-            temporary.replace(target)
-        except OSError:
-            LOG.error("运行日志快照写入失败：%s", target, exc_info=True)
-            return
-        self._copy_log_file(target, "运行日志")
 
     def _copy_server_client_log(self) -> None:
         """Export the safe server-client interaction log and copy its file."""
@@ -8286,8 +8248,25 @@ class UiWorker(threading.Thread):
         if reload_minimap is not None:
             reload_minimap()
         controller = self.patrol_controller
+        previous_layer = ""
         if controller is not None:
+            try:
+                previous_layer = str(controller.selected_layer())
+            except Exception:
+                previous_layer = ""
             controller.reload_recording()
+            # ``reload_recording`` selects the TOP layer.  An undo/import must
+            # leave the operator on the layer they were calibrating, and the
+            # combo below is painted from the controller, so restore it first.
+            if previous_layer:
+                try:
+                    controller.select_layer(previous_layer)
+                except (ValueError, KeyError):
+                    LOG.info(
+                        "reload: layer %s is gone after the reload; "
+                        "keeping the controller's own selection",
+                        previous_layer,
+                    )
             self.configured_map_name = controller.map_name()
         # Each loader also applies its values to its corresponding live worker.
         self._yolo_load_settings()
@@ -8603,12 +8582,12 @@ class UiWorker(threading.Thread):
         return True
 
     def _record_jump_point(self, direction: str) -> bool:
-        """Record a locked left- or right-moving jump trigger on this layer."""
+        """Record a locked directional or upward jump trigger on this layer."""
         direction = str(direction).casefold()
-        if direction not in ("left", "right"):
+        if direction not in ("left", "right", "up"):
             LOG.warning("ignored jump-point record request with direction=%r", direction)
             return False
-        label = "左跳" if direction == "left" else "右跳"
+        label = {"left": "左跳点", "right": "右跳点", "up": "上跳点"}[direction]
         if self.patrol_controller is None or self.patrol_controller.is_enabled():
             self._control_status.configure(text=f"巡逻中无法录制{label}，请先停止巡逻。")
             return False
@@ -8865,6 +8844,7 @@ class UiWorker(threading.Thread):
             ("添加最右", "right_most_pos", lambda: self._record_endpoint("right_most_pos")),
             ("添加左跳", "jump_point", lambda: self._record_jump_point("left")),
             ("添加右跳", "jump_point", lambda: self._record_jump_point("right")),
+            ("添加上跳", "jump_point", lambda: self._record_jump_point("up")),
             ("添加花点", "flower_point", self._record_flower_point),
             ("添加支持点", "support_point", self._record_support_point),
         )
@@ -9034,7 +9014,11 @@ class UiWorker(threading.Thread):
                 for index, point in enumerate(jump_points):
                     if isinstance(point, dict) and "x" in point and "y" in point:
                         direction = str(point.get("direction", "")).casefold()
-                        label = "左跳" if direction == "left" else "右跳" if direction == "right" else "旧跳点"
+                        label = {
+                            "left": "左跳", "right": "右跳", "up": "上跳点",
+                            # A point with no direction predates the
+                            # directional recorder; it is still a jump.
+                        }.get(direction, "旧跳点")
                         entries.append(("jump_point", point, label, index))
             skill_points = source.get("skill_points", [])
             if isinstance(skill_points, list):
@@ -9184,7 +9168,17 @@ class UiWorker(threading.Thread):
                 )
             else:
                 direction = str(point.get("direction", "")).casefold()
-                if direction == "left":
+                if direction == "up":
+                    # Vertical jump-up: the rope marker's up arrow, in the
+                    # jump-point colour.  Falling through to the right arrow
+                    # drew a 45-degree marker that pointed nowhere near the
+                    # recorded action.
+                    canvas.create_line(x, axis_y - 2, x, axis_y - 15,
+                                       x - 6, axis_y - 9, tags=(tag,),
+                                       fill=colors[kind], width=1)
+                    canvas.create_line(x, axis_y - 15, x + 6, axis_y - 9,
+                                       tags=(tag,), fill=colors[kind], width=1)
+                elif direction == "left":
                     canvas.create_line(x + 5, axis_y - 6, x - 4, axis_y - 15,
                                        tags=(tag,), fill=colors[kind], width=1)
                     canvas.create_line(x - 4, axis_y - 15, x, axis_y - 15,
@@ -11345,7 +11339,7 @@ class UiWorker(threading.Thread):
     # KEY_VK spellings used by HotkeyWorker).
     _HELP_KEY_LABELS = {
         "left": "←", "right": "→", "up": "↑", "down": "↓",
-        "home": "Home", "insert": "Insert", "delete": "Delete",
+        "home": "Home", "end": "End", "insert": "Insert", "delete": "Delete",
         "bracketleft": "[", "bracketright": "]", "grave": "`",
         "a": "A", "d": "D", "e": "E", "f": "F", "s": "S", "g": "G",
         "0": "0", "1": "1", "2": "2", "3": "3", "4": "4",
@@ -11358,6 +11352,7 @@ class UiWorker(threading.Thread):
         "record:right_most_pos": "录制当前图层的 最右 巡逻点",
         "record_jump_point:left": "插入当前图层的 左跳 点 (Ctrl+D)",
         "record_jump_point:right": "插入当前图层的 右跳 点 (Ctrl+F)",
+        "record_jump_point:up": "添入当前图层的上跳点 (Ctrl+End)",
         "record_split_point": "在当前位置添加贯穿全部楼层的波浪分区线 (Ctrl+S)",
         "record_flower_point": "录制当前绳索层的花点 (Ctrl+G)",
         "record_support_point": "录制当前图层的局部支持点 (Ctrl+A)",
