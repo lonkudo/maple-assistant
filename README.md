@@ -10,12 +10,12 @@ Two packages are published for each version:
 
 | Package | Audience | Start |
 | --- | --- | --- |
-| `TodoHelper-<version>.zip` | normal package, needs a Python environment | extract, run `安装.bat` once, then `启动助手.bat` |
-| `TodoHelper-release-<version>.zip` | standalone package, no Python installation | extract, run `启动助手.bat` |
+| `MoonEclipse-<version>.zip` | normal package, needs a Python environment | extract, run `安装.bat` once, then `启动助手.bat` |
+| `MoonEclipse-release-<version>.zip` | standalone package, no Python installation | extract, run `启动助手.bat` |
 
 Normal package:
 
-1. Extract the newest `TodoHelper-<version>.zip` to a normal writable folder.
+1. Extract the newest `MoonEclipse-<version>.zip` to a normal writable folder.
 2. Run `安装.bat` once. Approve the single Windows permission prompt when requested.
 3. Run `启动助手.bat`.
 
@@ -26,7 +26,7 @@ only for compatibility.
 
 Standalone package:
 
-1. Extract the whole `TodoHelper-release-<version>.zip` folder — the executable needs the files beside it, so running `TodoHelper.exe` alone is not supported.
+1. Extract the whole `MoonEclipse-release-<version>.zip` folder — the executable needs the files beside it, so running `MoonEclipse.exe` alone is not supported.
 2. Run `启动助手.bat` and approve the Windows permission prompt. The launcher is hidden and requests administrator rights, because the assistant must run at the same privilege level as the game or Windows silently drops injected keys.
 3. If the assistant does not appear, run `诊断启动.bat` (`diagnose_start.bat`); it keeps its console window open and prints the startup error.
 
@@ -1151,7 +1151,7 @@ requested. When requested, the normal release command is:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
-The release script advances `VERSION`, creates `release/TodoHelper-<version>.zip`, and removes the previous release ZIP. Field testing is the normal validation path; do not run broad unit-test suites unless specifically requested.
+The release script advances `VERSION`, creates `release/MoonEclipse-<version>.zip`, and removes the previous release ZIP. Field testing is the normal validation path; do not run broad unit-test suites unless specifically requested.
 
 Pass `-Version X.Y.Z` to publish an exact version without advancing it, and `-Minor` / `-Major` to move the second or first part.
 
@@ -1161,7 +1161,7 @@ The standalone package is built from that staged normal package afterwards, with
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_protected_release.ps1 -Version X.Y.Z
 ```
 
-Run the two commands in that order: `release_now.ps1` prunes `TodoHelper-*.zip`, which also matches the standalone package name. The standalone build mirrors the staged package's data layout, installs any missing build requirement automatically, compiles from inside the staged package, refuses to publish an executable that cannot import a bundled module, and writes `release/TodoHelper-release-<version>.zip`.
+Run the two commands in that order: `release_now.ps1` prunes `MoonEclipse-*.zip`, which also matches the standalone package name. The standalone build mirrors the staged package's data layout, installs any missing build requirement automatically, compiles from inside the staged package, refuses to publish an executable that cannot import a bundled module, and writes `release/MoonEclipse-release-<version>.zip`.
 
 EXE releases are a packaging operation, not a debugging pass. Run the reusable build quietly and report only completion and the ZIP path. Do not inspect or relay build/debug output unless the operator reports a failed launch or another field problem and asks for investigation.
 
@@ -1179,7 +1179,7 @@ A version stays untagged while its source and its built package differ. The firs
 untagged; both packages were then rebuilt from the commit this table tags —
 `release/TodoHelper-1.2.112.zip` by `release_now.ps1` and
 `release/TodoHelper-release-1.2.112.zip` by `build_protected_release.ps1`, in that
-order, because the normal release prunes `TodoHelper-*.zip` and would otherwise
+order, because the normal release prunes `MoonEclipse-*.zip` and would otherwise
 remove a standalone package built first. The `1.2.105` – `1.2.111` packages were
 superseded and pruned, so their exact sources are not recoverable from a version
 number alone.

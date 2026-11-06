@@ -843,7 +843,7 @@ the operator:
   `installer/build_installer.ps1` (`--windows-console-mode=disable`). It is never
   part of an app update manifest. It keeps no activation field in its window, and
   the licensed profile rules above decide whether it authenticates silently.
-- `release/TodoHelper-<version>.zip` — the normal package: Python sources
+- `release/MoonEclipse-<version>.zip` — the normal package: Python sources
   plus data, installed into `.venv` by `安装.bat`. `startup_probe.py` owns its
   hidden-launch failure path: it records the traceback to
   `assistant-launch-error.log`/`error.log`, and when the failure is a
@@ -851,9 +851,9 @@ the operator:
   restarts the assistant in a fresh process (guarded by an environment flag, so
   it cannot loop). A missing local module is a damaged package, not an
   installable requirement, and is only reported.
-- `release/TodoHelper-release-<version>.zip` — the standalone package built
+- `release/MoonEclipse-release-<version>.zip` — the standalone package built
   by `build_protected_release.ps1`: the same staged layout with the Python
-  sources compiled by Nuitka into `TodoHelper.exe`. It contains no source,
+  sources compiled by Nuitka into `MoonEclipse.exe`. It contains no source,
   so `安装.bat` is absent and its launcher is generated from code points rather
   than Chinese literals.
 
@@ -898,7 +898,7 @@ file or a developer stays English so a traceback keeps its searchable wording.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
-The script creates the `release/TodoHelper-<version>.zip` package and removes
+The script creates the `release/MoonEclipse-<version>.zip` package and removes
 the prior ZIP. The standalone package is built from that staged package
 afterwards with the same version:
 
@@ -906,7 +906,7 @@ afterwards with the same version:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build_protected_release.ps1 -Version X.Y.Z
 ```
 
-The order matters: `release_now.ps1` prunes `TodoHelper-*.zip`, which also
+The order matters: `release_now.ps1` prunes `MoonEclipse-*.zip`, which also
 matches the standalone package name. Field runs are the normal verification
 path. Do not run broad unit-test suites unless the operator specifically requests
 them.
