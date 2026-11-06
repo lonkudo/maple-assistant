@@ -77,9 +77,12 @@ MIRRORS_FILE = "installer_mirrors.json"
 # this URL per release, or override it with installer_mirrors.json
 # ({"shares": ["https://..."]}) next to the installer.
 DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
-    # VIP 蓝奏云 classic share.  蓝奏 links do not expire like a 邮件中转站 does;
-    # keep installer_mirrors.json for an ad-hoc source swap.
-    "https://wwblt.lanzoup.com/iiLxV4esmo5i",
+    # QQ 邮箱文件中转站 upload of the current release.  Both this and a 蓝奏
+    # share are per-upload links: a new ZIP means a new link here.  For a URL
+    # that never changes, use a location the operator can overwrite (GitHub
+    # releases/latest/download/..., object storage, or their own server) and put
+    # it here or in installer_mirrors.json - plain https URLs resolve directly.
+    "https://wx.mail.qq.com/s?k=tBb4hR7GcGMyKt0kpE",
 )
 # Folder created on the Desktop for a first install.
 DEFAULT_FOLDER_NAME = "MoonEclipse"

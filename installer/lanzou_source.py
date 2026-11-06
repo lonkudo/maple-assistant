@@ -274,6 +274,7 @@ def _http(
             "content_range": response.getheader("Content-Range") or "",
             "content_length": response.getheader("Content-Length") or "",
             "content_type": response.getheader("Content-Type") or "",
+            "content_disposition": response.getheader("Content-Disposition") or "",
         }
         return response.status, raw, info
     finally:
@@ -524,6 +525,48 @@ def _resolve_pan(share_key: str, code: Optional[str]) -> ShareFile:
     )
 
 
+def _resolve_direct(url: str) -> ShareFile:
+    """A plain HTTPS URL that serves one archive (no share API involved)."""
+
+    name = ""
+    total = 0
+    final = url
+    for _hop in range(6):
+        parts = urlsplit(final)
+        if parts.scheme != "https" or not parts.hostname:
+            raise LanzouError(f"直链无效: {url[:120]}")
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        status, _raw, info = _http(
+            parts.hostname, path, referer=f"https://{parts.hostname}/",
+            extra={"Accept": "*/*", "Range": "bytes=0-0"}, read_limit=65536,
+        )
+        disposition = info.get("content_disposition") or ""
+        if "filename=" in disposition:
+            name = disposition.rsplit("filename=", 1)[1].strip().strip('"').strip("'")
+        location = info["location"]
+        if status in (301, 302, 303, 307, 308) and location:
+            final = urljoin(final, location)
+            continue
+        total = _range_total(info["content_range"])
+        if not total and status in (200, 206) and info["content_length"].isdigit():
+            total = int(info["content_length"])
+        if total:
+            break
+        raise LanzouError(f"直链返回 HTTP {status}")
+    else:
+        raise LanzouError("直链跳转次数过多")
+
+    if not name:
+        name = Path(urlsplit(final).path).name or "package.zip"
+    LOG.info("direct: %s -> %s (%.1f MB)", urlsplit(url).hostname,
+             urlsplit(final).hostname, total / 1024 / 1024)
+    return ShareFile(
+        name=name, size=total, direct_url=final, file_id="", user_id="",
+        # Neutral headers: this host wants no lanzou Origin/Referer.
+        headers={"Referer": f"https://{urlsplit(final).hostname}/", "Accept": "*/*"},
+    )
+
+
 def _resolve_qq(key: str, share_url: str, code: Optional[str]) -> ShareFile:
     """QQ 邮箱文件中转 share -> CDN URL plus the cookie its ranges need."""
 
@@ -705,7 +748,12 @@ def parse_share_url(url: str) -> tuple[str, str, str, Optional[str]]:
         query = parse_qs(parts.query)
         code = (query.get("pwd") or query.get("code") or [None])[0]
         return "pan", host, key, (code.strip() or None) if code else None
-    raise LanzouError(f"不是蓝奏分享链接: {url}")
+    # Any other well-formed HTTPS URL is a direct archive URL (GitHub release
+    # asset, object storage, the operator's own server).  This is the stable
+    # option: the same URL keeps working across releases when it is overwritten.
+    if parts.scheme == "https":
+        return "direct", host, url.strip(), None
+    raise LanzouError(f"不支持的链接: {url}")
 
 
 def resolve(
@@ -721,6 +769,8 @@ def resolve(
         return _resolve_pan(share_key, code)
     if kind == "qq":
         return _resolve_qq(share_key, share_url, code)
+    if kind == "direct":
+        return _resolve_direct(share_key)
     uuid = _new_uuid()
     ts = encode_hex(str(int(time.time() * 1000)))
 
