@@ -376,6 +376,104 @@ def _relocate_profile_document(source: Path, root: Path) -> None:
     )
 
 
+def _legacy_app_dir(root: Path) -> Path | None:
+    """The older layout's app folder (``<selected>\\app``) when it holds an install.
+
+    Packages up to v1.2.284 kept every file under ``<selected>\\app`` and their
+    manifest even declares ``app_directory: "app"``.  Selecting such a folder
+    must be recognised as an EXISTING installation, not a new location.
+    """
+
+    app_dir = root / "app"
+    if not app_dir.is_dir():
+        return None
+    if (
+        (app_dir / INSTALL_MARKER).is_file()
+        or (app_dir / CONFIG_DIRECTORY).is_dir()
+        or (app_dir / PROTECTED_EXECUTABLE).is_file()
+    ):
+        return app_dir
+    return None
+
+
+def _migrate_legacy_install(root: Path) -> None:
+    """Adopt an old-layout installation from ``<selected>\\app`` into the root.
+
+    The selected root is the folder the operator picks now, and the current app
+    reads its configuration and entitlement from ``<selected>\\助手配置``
+    (``MOONECLIPSE_CONFIG_DIR``).  An old installation keeps both under
+    ``<selected>\\app``, so:
+
+    * the install marker is copied to the root when the root has none, which is
+      what makes the folder an existing installation instead of a new location;
+    * every file of the old ``助手配置`` (``auth.json``, ``user_config.json``,
+      saved maps) is copied into the root's ``助手配置``; an existing file is
+      never overwritten.
+
+    Nothing is deleted here.  The install step removes the old ``app`` tree only
+    after this migration, and only when every legacy config file is present at
+    the root (see ``_install_worker``).
+    """
+
+    app_dir = _legacy_app_dir(root)
+    if app_dir is None:
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    marker = app_dir / INSTALL_MARKER
+    if not (root / INSTALL_MARKER).is_file() and marker.is_file():
+        try:
+            shutil.copy2(marker, root / INSTALL_MARKER)
+        except OSError:
+            logging.warning(
+                "installer: could not adopt %s's install marker", app_dir,
+                exc_info=True,
+            )
+        else:
+            logging.info("installer: adopted the install marker from %s", app_dir)
+    source = app_dir / CONFIG_DIRECTORY
+    target = root / CONFIG_DIRECTORY
+    if not source.is_dir():
+        return
+    copied = 0
+    for item in source.rglob("*"):
+        if not item.is_file():
+            continue
+        destination = target / item.relative_to(source)
+        if destination.exists():
+            continue
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, destination)
+            copied += 1
+        except OSError:
+            logging.warning(
+                "installer: could not migrate %s to %s", item, destination,
+                exc_info=True,
+            )
+    if copied:
+        logging.info(
+            "installer: migrated %d configuration file(s) %s -> %s",
+            copied, source, target,
+        )
+
+
+def _legacy_config_missing(root: Path) -> list[str]:
+    """Legacy config files that are still absent from the selected root."""
+
+    app_dir = _legacy_app_dir(root)
+    if app_dir is None:
+        return []
+    source = app_dir / CONFIG_DIRECTORY
+    if not source.is_dir():
+        return []
+    target = root / CONFIG_DIRECTORY
+    return [
+        str(item.relative_to(source))
+        for item in source.rglob("*")
+        if item.is_file() and not (target / item.relative_to(source)).exists()
+    ]
+
+
 def _previous_install_profile_code(root: Path) -> str:
     """Activation code already stored in this installation's local profile.
 
@@ -465,9 +563,19 @@ def _previous_install_profile_code(root: Path) -> str:
 
 
 def _is_previous_install(root: Path) -> bool:
-    """Whether ``root`` already holds an installation (install marker present)."""
+    """Whether ``root`` already holds an installation (marker present).
 
-    return bool(_load_local_manifest(root)) or (root / INSTALL_MARKER).is_file()
+    Both layouts count: the marker at the selected root, and the older layout's
+    marker inside ``<selected>\\app``.  Without the second check an
+    old-version folder was treated as a NEW location and the operator was asked
+    for the activation code again.
+    """
+
+    return (
+        bool(_load_local_manifest(root))
+        or (root / INSTALL_MARKER).is_file()
+        or _legacy_app_dir(root) is not None
+    )
 
 
 def _activate(code: str) -> tuple[str, str]:
@@ -860,15 +968,23 @@ class InstallerWindow:
         if self.running:
             return
         root = Path(self.install_root.get()).expanduser()
+        # An old-layout installation (everything under app\) is adopted into the
+        # selected root first: its marker makes the folder an existing install
+        # and its 助手配置 (user_config.json, auth.json, saved maps) is copied to
+        # the root before anything else touches the folder.
+        try:
+            _migrate_legacy_install(root)
+        except Exception:  # noqa: BLE001 - a migration failure must not block
+            logging.exception("installer: legacy install migration failed")
         # An existing installation carries its licensed profile: update it with
         # the stored code and never ask again.  Only a NEW folder (no install
-        # marker, no auth.json) prompts for the activation code.
+        # marker, no profile) prompts for the activation code.
         code = ""
         if _is_previous_install(root):
             code = _previous_install_profile_code(root)
             if not code:
                 logging.warning(
-                    "installer: %s looks installed but holds no usable auth.json; "
+                    "installer: %s looks installed but holds no usable profile; "
                     "asking for the activation code", root,
                 )
         if not code:
@@ -893,6 +1009,11 @@ class InstallerWindow:
                 )
             root = root.resolve()
             root.mkdir(parents=True, exist_ok=True)
+            # An older layout keeps everything (marker, 助手配置) under app\.
+            # Adopt it into the selected root BEFORE reading the manifest, so
+            # the folder is an existing installation and the user's config and
+            # entitlement are already where the installed app reads them.
+            _migrate_legacy_install(root)
             local = _load_local_manifest(root)
             installed_version = str(local.get("version") or "")
             old = {
@@ -957,11 +1078,20 @@ class InstallerWindow:
                 if (str(old.get(str(item["path"]), {}).get("sha256")) != item["sha256"]
                     or str(item["path"]) in broken)
             ]
-            removals = [path for path in old if path not in current_paths]
+            # A file the previous version shipped and this one does not is
+            # removed; user folders (助手配置, update) are untouched.  The old
+            # manifest can list paths under 助手配置 - deleting them is exactly
+            # how a working user_config.json was "cleared".
+            def _is_user_data(relative: str) -> bool:
+                parts = PurePosixPath(relative.replace("\\", "/")).parts
+                return bool(parts) and parts[0] == CONFIG_DIRECTORY
+
+            removals = [
+                path for path in old
+                if path not in current_paths and not _is_user_data(path)
+            ]
             self.events.put(("stage", f"正在完成安装（{len(changed)} 个文件）…"))
 
-            # A file the previous version shipped and this one does not is
-            # removed; user folders (助手配置, update) are untouched.
             for old_path in removals:
                 candidate = root / _safe_path(old_path)
                 if candidate.is_file():
@@ -982,10 +1112,20 @@ class InstallerWindow:
             temporary.replace(root / INSTALL_MARKER)
 
             # Version 1.2.284 and older installs kept everything under app/;
-            # that tree is now duplicated at the root, so drop it.
+            # that tree is duplicated at the root now, so drop it - but only
+            # after the migration above put every legacy config file at the
+            # root.  A file that could not be migrated keeps the old tree
+            # alive instead of being destroyed with it.
             if str(local.get("app_directory") or "") == "app":
                 legacy = root / "app"
-                if legacy.is_dir():
+                missing = _legacy_config_missing(root)
+                if missing:
+                    logging.warning(
+                        "installer: keeping the legacy app/ folder; %d "
+                        "configuration file(s) are not migrated yet: %s",
+                        len(missing), ", ".join(missing[:6]),
+                    )
+                elif legacy.is_dir():
                     shutil.rmtree(legacy, ignore_errors=True)
                     logging.info("installer: removed the legacy app/ folder")
 
