@@ -1,9 +1,10 @@
 """Standalone MoonEclipse installer and updater.
 
 The release archive is published to a netdisk share; this window downloads that
-one archive, unpacks it, and installs only the files that differ from the
-installed copy.  There is no activation server in the flow: the share link is the
-only source, and the unpacked tree is its own manifest.
+one archive and unpacks the whole of it into the selected folder, keeping the
+user's ``助手配置``.  There is no activation server and no install manifest in the
+flow: the share link is the only source, and it carries every file the install
+needs.
 
 It is intentionally not imported by the running game helper.  The install root is
 remembered in a small LocalAppData pointer, never in the Windows Registry.
@@ -66,7 +67,6 @@ except Exception:  # pragma: no cover - reported when a mirror is actually used
     lanzou_resolve = None  # type: ignore[assignment]
 
 
-INSTALL_MARKER = ".mooneclipse-install.json"
 POINTER_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MoonEclipseInstaller"
 POINTER_FILE = POINTER_DIR / "last-install.json"
 CONFIG_DIRECTORY = "助手配置"
@@ -222,7 +222,7 @@ def _pointer_root() -> Path | None:
     try:
         payload = json.loads(POINTER_FILE.read_text(encoding="utf-8"))
         root = Path(str(payload.get("install_root", ""))).resolve()
-        if (root / INSTALL_MARKER).is_file():
+        if (root / PROTECTED_EXECUTABLE).is_file() or (root / "VERSION").is_file():
             return root
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
@@ -315,20 +315,31 @@ def _archive_version(archive: Path) -> str:
 
 
 def _profile_search_dirs(root: Path) -> list[Path]:
-    """The two folders a licensed profile may live in, correct one first.
+    """Every folder a licensed profile may live in, the correct one first.
 
-    The CORRECT place is the selected root's ``助手配置``: the launcher this
-    installer writes sets ``MOONECLIPSE_CONFIG_DIR=<selected>\\助手配置`` and the
-    app reads its entitlement from there.  Older builds ran straight out of the
-    ``app\\`` folder and saved the document in ``app\\助手配置`` instead, which is
-    the wrong place - it is still searched so an installation activated by the
-    old build is found and moved to the root silently.
+    The CORRECT place is the selected root's ``助手配置``: the launcher sets
+    ``MOONECLIPSE_CONFIG_DIR=<selected>\\助手配置`` and the app reads its
+    entitlement from there.  Older installations are searched too, because the
+    operator's activated copies were created by both of them:
+
+    * ``<selected>\\app\\助手配置`` - packages up to v1.2.284 kept everything in
+      ``app\\``;
+    * ``<parent of selected>\\助手配置`` - a ZIP-extracted package (e.g.
+      ``Desktop\\MoonEclipse-release-1.2.274(2)``) has no ``助手配置`` of its own,
+      so the app's ``package_root.parent / 助手配置`` fallback made it read and
+      activate into ``Desktop\\助手配置``.
+
+    A profile found in either legacy place is copied into the selected root so
+    the installed app - and the installer's own window - see one location.
     """
 
     dirs: list[Path] = [root / "助手配置"]
-    legacy = root / "app" / "助手配置"
-    if legacy != dirs[0] and legacy.is_dir():
-        dirs.append(legacy)
+    candidates = [root / "app" / "助手配置", root.parent / "助手配置"]
+    for directory in candidates:
+        if directory in dirs:
+            continue
+        if directory.is_dir():
+            dirs.append(directory)
     return dirs
 
 
@@ -339,13 +350,16 @@ def _profile_target(root: Path) -> Path:
 
 
 def _relocate_profile_document(source: Path, root: Path) -> None:
-    """Silently move a profile document to the selected root's ``助手配置``.
+    """Copy a profile document into the selected root's ``助手配置``.
 
-    The older build saved ``app\\助手配置\\auth.json``; the app now reads
-    ``<selected>\\助手配置\\auth.json`` (``MOONECLIPSE_CONFIG_DIR`` from the
-    launcher).  Moving it keeps the update from silently de-activating the
-    installation.  An existing target document is never overwritten, and the old
-    copy is only removed after the new one is verified present.
+    The profile keeps working whichever legacy folder it was found in, but the
+    installed app must find it in the selected root.  An existing target
+    document is never overwritten.
+
+    The old copy is removed only when it sits inside the selected folder's own
+    ``app\\`` tree (that tree is deleted by the install anyway).  A copy found
+    one level up (``<parent>\\助手配置``) is shared with the operator's other
+    installations on the Desktop and is therefore left alone.
     """
 
     target = _profile_target(root)
@@ -361,100 +375,91 @@ def _relocate_profile_document(source: Path, root: Path) -> None:
         shutil.copy2(source, target)
     except OSError:
         logging.warning(
-            "installer: could not move %s to %s", source, target, exc_info=True
+            "installer: could not copy %s to %s", source, target, exc_info=True
         )
         return
     if not target.is_file():
         logging.warning(
-            "installer: the moved profile is missing at %s; keeping %s",
+            "installer: the copied profile is missing at %s; keeping %s",
             target, source,
         )
         return
-    source.unlink(missing_ok=True)
+    try:
+        inside_legacy_tree = (root / "app") in source.resolve().parents
+    except OSError:
+        inside_legacy_tree = False
+    if inside_legacy_tree:
+        source.unlink(missing_ok=True)
     logging.info(
-        "installer: moved the activation profile %s -> %s", source, target
+        "installer: copied the activation profile %s -> %s", source, target
     )
 
 
 def _legacy_app_dir(root: Path) -> Path | None:
     """The older layout's app folder (``<selected>\\app``) when it holds an install.
 
-    Packages up to v1.2.284 kept every file under ``<selected>\\app`` and their
-    manifest even declares ``app_directory: "app"``.  Selecting such a folder
-    must be recognised as an EXISTING installation, not a new location.
+    Packages up to v1.2.284 kept every file under ``<selected>\\app``.  Selecting
+    such a folder must be recognised as an EXISTING installation, not a new
+    location.
     """
 
     app_dir = root / "app"
     if not app_dir.is_dir():
         return None
     if (
-        (app_dir / INSTALL_MARKER).is_file()
-        or (app_dir / CONFIG_DIRECTORY).is_dir()
+        (app_dir / CONFIG_DIRECTORY).is_dir()
         or (app_dir / PROTECTED_EXECUTABLE).is_file()
+        or (app_dir / "VERSION").is_file()
     ):
         return app_dir
     return None
 
 
 def _migrate_legacy_install(root: Path) -> None:
-    """Adopt an old-layout installation from ``<selected>\\app`` into the root.
+    """Adopt an old installation's profile into the selected root.
 
-    The selected root is the folder the operator picks now, and the current app
-    reads its configuration and entitlement from ``<selected>\\助手配置``
-    (``MOONECLIPSE_CONFIG_DIR``).  An old installation keeps both under
-    ``<selected>\\app``, so:
+    The selected root is the folder the operator picks now, and the app reads its
+    configuration and entitlement from ``<selected>\\助手配置``
+    (``MOONECLIPSE_CONFIG_DIR``).  Older installations kept it elsewhere, so
+    every file of a legacy ``助手配置`` (``auth.json``, ``user_config.json``,
+    saved maps) is copied into the root's ``助手配置``; an existing file is never
+    overwritten.  The legacy folder may be ``<selected>\\app\\助手配置`` or, for
+    a ZIP-extracted package like ``Desktop\\MoonEclipse-release-1.2.274(2)``, the
+    shared ``<parent>\\助手配置`` the old app fell back to.
 
-    * the install marker is copied to the root when the root has none, which is
-      what makes the folder an existing installation instead of a new location;
-    * every file of the old ``助手配置`` (``auth.json``, ``user_config.json``,
-      saved maps) is copied into the root's ``助手配置``; an existing file is
-      never overwritten.
-
-    Nothing is deleted here.  The install step removes the old ``app`` tree only
-    after this migration, and only when every legacy config file is present at
-    the root (see ``_install_worker``).
+    Nothing is shared away: a copy found one level up is never deleted (the
+    operator's other installations use it), only an in-folder ``app\\`` copy is
+    left for the install step's cleanup.
     """
 
-    app_dir = _legacy_app_dir(root)
-    if app_dir is None:
-        return
     root.mkdir(parents=True, exist_ok=True)
-    marker = app_dir / INSTALL_MARKER
-    if not (root / INSTALL_MARKER).is_file() and marker.is_file():
-        try:
-            shutil.copy2(marker, root / INSTALL_MARKER)
-        except OSError:
-            logging.warning(
-                "installer: could not adopt %s's install marker", app_dir,
-                exc_info=True,
-            )
-        else:
-            logging.info("installer: adopted the install marker from %s", app_dir)
-    source = app_dir / CONFIG_DIRECTORY
     target = root / CONFIG_DIRECTORY
-    if not source.is_dir():
-        return
-    copied = 0
-    for item in source.rglob("*"):
-        if not item.is_file():
+    for source in [root / "app" / CONFIG_DIRECTORY, root.parent / CONFIG_DIRECTORY]:
+        if not source.is_dir():
             continue
-        destination = target / item.relative_to(source)
-        if destination.exists():
+        if source.resolve() == target.resolve():
             continue
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, destination)
-            copied += 1
-        except OSError:
-            logging.warning(
-                "installer: could not migrate %s to %s", item, destination,
-                exc_info=True,
+        copied = 0
+        for item in source.rglob("*"):
+            if not item.is_file():
+                continue
+            destination = target / item.relative_to(source)
+            if destination.exists():
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, destination)
+                copied += 1
+            except OSError:
+                logging.warning(
+                    "installer: could not migrate %s to %s", item, destination,
+                    exc_info=True,
+                )
+        if copied:
+            logging.info(
+                "installer: migrated %d configuration file(s) %s -> %s",
+                copied, source, target,
             )
-    if copied:
-        logging.info(
-            "installer: migrated %d configuration file(s) %s -> %s",
-            copied, source, target,
-        )
 
 
 def _legacy_config_missing(root: Path) -> list[str]:
@@ -563,19 +568,30 @@ def _previous_install_profile_code(root: Path) -> str:
 
 
 def _is_previous_install(root: Path) -> bool:
-    """Whether ``root`` already holds an installation (marker present).
+    """Whether ``root`` already holds an installation.
 
-    Both layouts count: the marker at the selected root, and the older layout's
-    marker inside ``<selected>\\app``.  Without the second check an
-    old-version folder was treated as a NEW location and the operator was asked
-    for the activation code again.
+    There is no install marker file to look for: every update ships the complete
+    package from the netdisk, so a folder is judged only by what it contains.  An
+    installation created by unzipping a release ZIP - a folder like
+    ``Desktop\\MoonEclipse-release-1.2.274(2)`` - is a perfectly normal activated
+    installation.  Recognition therefore uses what an installation actually has:
+
+    * the app executable or a ``VERSION`` file at the selected root;
+    * the older layout under ``<selected>\\app`` (exe / config);
+    * a real profile - ``auth.json`` or ``user_config.json`` - in any searched
+      ``助手配置`` (selected root, ``app\\``, or the parent folder the old
+      ZIP-extracted app fell back to).
     """
 
-    return (
-        bool(_load_local_manifest(root))
-        or (root / INSTALL_MARKER).is_file()
-        or _legacy_app_dir(root) is not None
-    )
+    if (root / PROTECTED_EXECUTABLE).is_file() or (root / "VERSION").is_file():
+        return True
+    if _legacy_app_dir(root) is not None:
+        return True
+    for directory in _profile_search_dirs(root):
+        for name in ("auth.json", "license.json", "user_config.json"):
+            if (directory / name).is_file():
+                return True
+    return False
 
 
 def _activate(code: str) -> tuple[str, str]:
@@ -674,7 +690,6 @@ def _fetch_package(
     on_total: Any = None,
     on_stage: Any = None,
     on_files: Any = None,
-    skip_version: str = "",
 ) -> tuple[list[tuple[dict[str, Any], Path]], str, bool]:
     """Download the release archive into ``update_dir`` and unpack it into the root.
 
@@ -718,12 +733,6 @@ def _fetch_package(
     for index, mirror in enumerate(shares):
         try:
             share = lanzou_resolve(mirror)
-            name_version = _version_from_name(share.name)
-            if skip_version and name_version and (
-                _version_tuple(name_version) == _version_tuple(skip_version)
-            ):
-                stage(f"已是最新版本（{skip_version}），无需下载。")
-                return [], name_version, True
             phase_reset(int(getattr(share, "size", 0) or 0))
             stage("正在下载更新安装包…")
             lanzou_download(
@@ -814,12 +823,18 @@ def _extract_bundle(
                 on_entry(index, len(members))
 
 
-def _load_local_manifest(root: Path) -> dict[str, Any]:
+def _installed_version(root: Path) -> str:
+    """The version of the copy in ``root``, from the app's own VERSION file.
+
+    The installer keeps no manifest any more: the netdisk package carries every
+    file, so the only thing worth reading from an existing folder is its version
+    (the downgrade guard).
+    """
+
     try:
-        value = json.loads((root / INSTALL_MARKER).read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return {}
+        return (root / "VERSION").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def _start_first_install_setup(app_root: Path) -> bool:
@@ -1009,125 +1024,56 @@ class InstallerWindow:
                 )
             root = root.resolve()
             root.mkdir(parents=True, exist_ok=True)
-            # An older layout keeps everything (marker, 助手配置) under app\.
-            # Adopt it into the selected root BEFORE reading the manifest, so
-            # the folder is an existing installation and the user's config and
-            # entitlement are already where the installed app reads them.
+            # An older layout keeps 助手配置 elsewhere (inside app\, or the
+            # shared parent folder a ZIP-extracted app fell back to).  Adopt it
+            # into the selected root before anything else.
             _migrate_legacy_install(root)
-            local = _load_local_manifest(root)
-            installed_version = str(local.get("version") or "")
-            old = {
-                str(item.get("path")): item
-                for item in local.get("files", [])
-                if isinstance(item, dict)
-            }
+            installed_version = _installed_version(root)
 
             self.events.put(("plan", (1, 1)))
             update_dir = root / "update"
             update_dir.mkdir(parents=True, exist_ok=True)
 
-            recorded = [
-                (str(item.get("path")), str(item.get("sha256") or ""))
-                for item in local.get("files", [])
-                if isinstance(item, dict)
-            ]
-
-            broken: set[str] = set()
-
-            def intact(entry: tuple[str, str]) -> bool:
-                path, digest = entry
-                target = root / _safe_path(path)
-                if not digest or not target.is_file() or _sha256(target) != digest:
-                    with broken_lock:
-                        broken.add(path)
-                    return False
-                return True
-
-            broken_lock = threading.Lock()
-            complete = False
-            if recorded:
-                self.events.put(("stage", "正在检查已安装文件…"))
-                workers = max(1, min(MAX_DOWNLOAD_WORKERS, len(recorded)))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    complete = all(pool.map(intact, recorded))
-
-            entries, version, skipped = _fetch_package(
+            # The netdisk package is complete: download it and extract it over
+            # the folder.  No local manifest, no per-file diff - user data
+            # (助手配置) is preserved by _extract_bundle.
+            entries, version, _skipped = _fetch_package(
                 update_dir, root,
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
                 on_files=lambda phase, done, total:
                     self.events.put(("files", (str(phase), int(done), int(total)))),
-                skip_version=installed_version if complete else "",
             )
-            if skipped:
-                shutil.rmtree(update_dir / "update", ignore_errors=True)
-                self.events.put(("done", (root, False, 0, version or installed_version)))
-                return
 
             if (installed_version and version
                     and _version_tuple(version) < _version_tuple(installed_version)):
                 raise RuntimeError(
-                    f"安装包版本 {version} 低于已安装的 {installed_version}，已停止。"
-                    f"请检查分享链接是否为最新版本。"
+                    f"安装包版本 {version} 低于已安装的 {installed_version}，已停止："
+                    f"请确认下载地址是否为最新版本。"
                 )
 
-            current_paths = {str(item["path"]) for item, _ in entries}
-            changed = [
-                item for item, _ in entries
-                if (str(old.get(str(item["path"]), {}).get("sha256")) != item["sha256"]
-                    or str(item["path"]) in broken)
-            ]
-            # A file the previous version shipped and this one does not is
-            # removed; user folders (助手配置, update) are untouched.  The old
-            # manifest can list paths under 助手配置 - deleting them is exactly
-            # how a working user_config.json was "cleared".
-            def _is_user_data(relative: str) -> bool:
-                parts = PurePosixPath(relative.replace("\\", "/")).parts
-                return bool(parts) and parts[0] == CONFIG_DIRECTORY
-
-            removals = [
-                path for path in old
-                if path not in current_paths and not _is_user_data(path)
-            ]
-            self.events.put(("stage", f"正在完成安装（{len(changed)} 个文件）…"))
-
-            for old_path in removals:
-                candidate = root / _safe_path(old_path)
-                if candidate.is_file():
-                    candidate.unlink()
+            installed = len(entries)
+            self.events.put(("stage", f"正在完成安装（{installed} 个文件）…"))
 
             (root / CONFIG_DIRECTORY).mkdir(parents=True, exist_ok=True)
-            install_state = {
-                "format": "moon-eclipse-install/v2",
-                "install_id": local.get("install_id") or uuid.uuid4().hex,
-                "layout": "root",
-                "version": version,
-                "files": [item for item, _ in entries],
-            }
-            temporary = root / (INSTALL_MARKER + ".tmp")
-            temporary.write_text(
-                json.dumps(install_state, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            temporary.replace(root / INSTALL_MARKER)
 
             # Version 1.2.284 and older installs kept everything under app/;
             # that tree is duplicated at the root now, so drop it - but only
             # after the migration above put every legacy config file at the
             # root.  A file that could not be migrated keeps the old tree
             # alive instead of being destroyed with it.
-            if str(local.get("app_directory") or "") == "app":
-                legacy = root / "app"
-                missing = _legacy_config_missing(root)
-                if missing:
-                    logging.warning(
-                        "installer: keeping the legacy app/ folder; %d "
-                        "configuration file(s) are not migrated yet: %s",
-                        len(missing), ", ".join(missing[:6]),
-                    )
-                elif legacy.is_dir():
-                    shutil.rmtree(legacy, ignore_errors=True)
-                    logging.info("installer: removed the legacy app/ folder")
+            missing = _legacy_config_missing(root)
+            legacy = root / "app"
+            if missing:
+                logging.warning(
+                    "installer: keeping the legacy app/ folder; %d "
+                    "configuration file(s) are not migrated yet: %s",
+                    len(missing), ", ".join(missing[:6]),
+                )
+            elif legacy.is_dir():
+                shutil.rmtree(legacy, ignore_errors=True)
+                logging.info("installer: removed the legacy app/ folder")
 
             _save_pointer(root)
             try:
@@ -1135,7 +1081,7 @@ class InstallerWindow:
             except OSError:
                 pass
             first_setup = _start_first_install_setup(root)
-            self.events.put(("done", (root, first_setup, len(changed), version)))
+            self.events.put(("done", (root, first_setup, installed, version)))
         except Exception as exc:  # noqa: BLE001 - reported in the window
             logging.exception("installer: install failed")
             self.events.put(("error", str(exc)))

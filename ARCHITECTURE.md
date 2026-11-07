@@ -750,18 +750,36 @@ Atomic file replacement is used for runtime state where possible. A permission f
 The signed entitlement lives in the **selected install root's** `助手配置`
 (`auth.json`), because the launcher writes `MOONECLIPSE_CONFIG_DIR=<selected>\助手配置`
 and `licensing._recording_config_root()` honours it. An installation activated by
-an older build that ran straight out of `app\` keeps it in
-`<selected>\app\助手配置` instead. The separate installer therefore:
+an older build keeps it elsewhere: a build that ran straight out of `app\` uses
+`<selected>\app\助手配置`, and a package unzipped into its own folder (no
+`助手配置` of its own, e.g. `MoonEclipse-release-1.2.274(2)`) made the app fall
+back to `<parent>\助手配置`. The separate installer therefore:
 
-- searches both folders (`_profile_search_dirs`) and accepts either document;
+- searches all three folders (`_profile_search_dirs`) and accepts any document;
 - target of the silent move is always `<selected>\助手配置\auth.json`; the
-  document is copied, verified present, and only then is the old copy removed,
-  and an existing target is never overwritten;
+  document is copied, verified present, and only then is the old copy removed
+  (only for a copy inside the selected folder's own `app\` tree - a shared
+  `<parent>\助手配置` is never touched), and an existing target is never
+  overwritten;
 - takes the code from `license_settings.json`, else from the document's
   `_local.activation_code` (the issued `MAL-…` code, 256 characters), and only
   as a last resort derives a token with `licensing.activation_code` - a derived
   token is not the issued code and the server answers **设备未授权** for it;
-- opens its activation prompt only for a folder that has no profile at all.
+- opens its activation prompt only for a folder that has no profile at all;
+- recognises an existing installation from the executable or `VERSION` at the
+  root, the legacy `app\` layout, or any profile file in the searched folders -
+  there is no install marker file, because every update ships the complete
+  netdisk package and a folder is judged only by what it contains.
+
+### Install and update (v1.2.291)
+
+The installer downloads the whole published archive from the netdisk share and
+extracts it over the selected folder, so no local manifest, per-file diff or
+removal step exists any more. `_extract_bundle` preserves `助手配置` (an existing
+file is never overwritten by the package's default), the legacy `app\` tree is
+deleted only after every legacy config file is confirmed present at the root
+(`_legacy_config_missing`), and the downgrade guard compares the archive version
+with the folder's `VERSION` (`_installed_version`).
 
 ## Movement route order (v1.2.290)
 

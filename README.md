@@ -215,14 +215,25 @@ operator: the 被撞反击 reaction and the automatic lie pass.
 - **The installer never asks for a code twice.** The launch window has no
   activation field. An existing installation's code comes from its own profile:
   the selected root's `助手配置` first, then the older build's
-  `<selected>\app\助手配置`, and that document is silently moved to the selected
-  root (`installer: moved the activation profile … -> …`) so the installed app
-  keeps its activation. The code is taken from `license_settings.json` when the
+  `<selected>\app\助手配置`, then the shared `<parent>\助手配置` a ZIP-extracted
+  package fell back to (e.g. `Desktop\助手配置` for
+  `Desktop\MoonEclipse-release-1.2.274(2)`); that document is silently copied to
+  the selected root (`installer: copied the activation profile … -> …`) so the
+  installed app keeps its activation, and the shared parent copy is left alone.
+  The code is taken from `license_settings.json` when the
   app stored the typed code, otherwise from the authenticated document's
   `_local.activation_code` (the `MAL-…` server code); only a folder with no
   profile opens the **首次安装需要授权码** window. Deriving a token from the
   signed document was tried and reverted - the server answers **设备未授权** for
   it.
+- **An update is the whole package, not a patch.** The installer downloads the
+  complete netdisk archive and unpacks it over the selected folder: there is no
+  install marker file and no per-file diff, and `助手配置` is never overwritten by
+  the package's defaults. A folder counts as an existing installation when it has
+  the executable or a `VERSION` file, the legacy `app\` layout, or any profile
+  file - so a folder unzipped from a release ZIP is updated in place instead of
+  being called a new location. The legacy `app\` tree is removed only after every
+  one of its config files is confirmed at the root.
 - **Each layer starts on its nearest leg.** On entry the route takes the closer
   of the two recorded edges (a leg already reached is consumed at once), walks
   the other edge, then the layer's way-up phase: its recorded rope, or the up
