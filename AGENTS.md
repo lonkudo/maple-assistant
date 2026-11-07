@@ -27,9 +27,57 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\release_now.ps1 -SkipTests
 ```
 
 `release_now.ps1` advances the semantic `VERSION` (`X.Y.Z`, patch by default), builds
-the single `release/MapleAssistant` package, writes
-`release/MapleAssistant-<version>.zip`, and removes the previous ZIP. `-SkipTests` is
-the normal mode: the tests are not the gate, the field run is.
+the normal package, writes `release/MoonEclipse-<version>.zip`, and removes the
+previous ZIPs. The standalone package is then built from that staged package with
+the same version:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_protected_release.ps1 -Version X.Y.Z
+powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\build_installer.ps1
+```
+
+`-SkipTests` is the normal mode: the tests are not the gate, the field run is.
+Build a release only when the operator asks for it.
+
+## Push flow: two repositories, two remotes each
+
+This workspace holds **two Git repositories**, and each one has **two GitHub
+remotes**. A change is delivered only when **all four** remote branches carry it.
+Pushing just one of them has already left the canonical copy a release behind.
+
+| Repository | Working copy | Remotes | Key |
+| --- | --- | --- | --- |
+| Client | this workspace root | `forbestop22/maple-assistant`, `lonkudo/maple-assistant` | see below |
+| Server | `activation_service/` (its own `.git`) | `forbestop22/maple-assistant-server`, `lonkudo/maple-assistant-server` | see below |
+
+* `~/.ssh/forbestop22_key` pushes the `forbestop22` mirror of **both** repositories.
+* `~/.ssh/lonkudo_key` pushes the `lonkudo` (canonical) copy of **both** repositories.
+* Select the key explicitly every time — a default identity is never assumed:
+
+```powershell
+$keyDir = ($env:USERPROFILE -replace '\\','/') + "/.ssh"      # forward slashes only
+$env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/lonkudo_key`" -o IdentitiesOnly=yes"
+```
+
+* Do **not** use `git push origin`: the client's `origin` has two push URLs that need
+  different keys in one command, and the server's `origin` is HTTPS (no key). Push the
+  explicit SSH URL per key:
+
+```powershell
+git -C <repo> push git@github.com:lonkudo/maple-assistant.git main
+git -C <repo> push git@github.com:forbestop22/maple-assistant.git main
+git -C <repo> push git@github.com:lonkudo/maple-assistant-server.git main
+git -C <repo> push git@github.com:forbestop22/maple-assistant-server.git main
+```
+
+* Server first when the released client depends on a new endpoint; release tags
+  (`release/vX.Y.Z`) go to both client remotes (`git push <remote> --tags`).
+* Verify, do not assume: `git ls-remote <url> refs/heads/main` must equal
+  `git rev-parse HEAD` for all four. The runnable snippet is in `README.md`
+  ("Push flow: two repositories × two remotes").
+* The server repository ignores `operator_console/node_modules/` and
+  `static/operator_console/`; the console bundle is built **on the server**
+  (`npm ci && npm run build`), never shipped through Git.
 
 ## Documentation
 

@@ -1249,33 +1249,81 @@ Releases before `1.1.53` were distributed as replace-in-place ZIPs without
 matching Git checkpoints, so their exact historical source cannot be recovered
 reliably from a version number alone.
 
-### Which SSH key pushes which remote
+### Push flow: two repositories × two remotes
 
-Two account keys live in `~/.ssh`, and a push must select the **matching** key
-instead of relying on a default identity:
+This workspace contains **two Git repositories**, and each one is pushed to **two
+GitHub remotes**. A change is delivered only when all four branches carry it —
+pushing the client alone has already left the canonical copy one release behind.
 
-| Key | Account | State |
+| Repository | Working copy | Remotes on GitHub |
 | --- | --- | --- |
-| `~/.ssh/forbestop22_key` | `forbestop22` | Accepted by GitHub; this is the working push key. |
-| `~/.ssh/lonkudo_github_ed25519` | `lonkudo` | Not registered with GitHub — it is refused with `Permission denied (publickey)`. Re-add the matching `.pub` file to that account before relying on it. |
+| Client (desktop app) | this workspace root | `git@github.com:forbestop22/maple-assistant.git`, `git@github.com:lonkudo/maple-assistant.git` |
+| Server (activation service + operator console) | `activation_service\` (nested `.git`) | `git@github.com:forbestop22/maple-assistant-server.git`, `git@github.com:lonkudo/maple-assistant-server.git` |
+
+Both account keys live in `~/.ssh` and must be selected explicitly — a default
+identity is never assumed:
+
+| Key | Account | Pushes |
+| --- | --- | --- |
+| `~/.ssh/forbestop22_key` | `forbestop22` | the `forbestop22` mirror of **both** repositories |
+| `~/.ssh/lonkudo_key` | `lonkudo` | the `lonkudo` (canonical) copy of **both** repositories |
 
 Each private key sits beside its own `.pub` file, so the public half can be
-re-registered without regenerating the pair.
+re-registered without regenerating the pair. The key path must use forward
+slashes: a Windows-style path is passed through `GIT_SSH_COMMAND` with its
+backslashes stripped (`C:UsersSOTTES.ssh...`) and the push then fails with
+`Permission denied (publickey)` even though the key is present.
+
+The complete flow — commit in both repositories first, then push each one twice:
 
 ```powershell
-$key = ($env:USERPROFILE -replace '\\','/') + "/.ssh/forbestop22_key"
-$env:GIT_SSH_COMMAND = "ssh -i `"$key`" -o IdentitiesOnly=yes"
-git push git@github.com:forbestop22/maple-assistant.git main
+$root   = "C:\Users\SOTTES\Documents\Codex\2026-08-12\skill-creator-c-users-sottes-codex-2"
+$server = "$root\activation_service"
+$keyDir = ($env:USERPROFILE -replace '\\','/') + "/.ssh"
+
+# 1) client: canonical first, then the mirror
+$env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/lonkudo_key`" -o IdentitiesOnly=yes"
+git -C $root push git@github.com:lonkudo/maple-assistant.git main
+git -C $root push git@github.com:lonkudo/maple-assistant.git --tags
+$env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/forbestop22_key`" -o IdentitiesOnly=yes"
+git -C $root push git@github.com:forbestop22/maple-assistant.git main
+git -C $root push git@github.com:forbestop22/maple-assistant.git --tags
+
+# 2) server: same two accounts, its own repository
+$env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/lonkudo_key`" -o IdentitiesOnly=yes"
+git -C $server push git@github.com:lonkudo/maple-assistant-server.git main
+$env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/forbestop22_key`" -o IdentitiesOnly=yes"
+git -C $server push git@github.com:forbestop22/maple-assistant-server.git main
 ```
 
-The key path must use forward slashes. A Windows-style path is passed through
-`GIT_SSH_COMMAND` with its backslashes stripped (`C:UsersSOTTES.ssh...`), and
-the push then fails with `Permission denied (publickey)` even though the key is
-present.
+Verify — every remote must report the same commit as `git rev-parse HEAD`:
 
-`forbestop22` has write access to the `forbestop22` mirrors but not to
-`lonkudo/maple-assistant`, which answers
-`ERROR: Permission to lonkudo/maple-assistant.git denied to forbestop22`. Push
-to the mirror, or grant that account access to the canonical repository first.
+```powershell
+$local = (git -C $root rev-parse HEAD).Trim()
+foreach ($pair in @(
+        @{ key = "lonkudo_key";    url = "git@github.com:lonkudo/maple-assistant" },
+        @{ key = "forbestop22_key"; url = "git@github.com:forbestop22/maple-assistant" })) {
+    $env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/$($pair.key)`" -o IdentitiesOnly=yes"
+    $remote = ((git -C $root ls-remote "$($pair.url).git" refs/heads/main) -split "`t")[0]
+    "{0,-22} {1}" -f $pair.key, $(if ($remote -eq $local) { "in sync $remote" } else { "STALE ($remote)" })
+}
+```
+
+`git push origin` is **not** used here: on the client, `origin` has two push URLs
+(lonkudo + forbestop22) that require *different* keys inside one command, and on
+the server `origin` is an HTTPS URL that would ask for a token instead of using
+`lonkudo_key`. Push the explicit SSH URL per key instead.
+
+A release that depends on server behaviour must push the **server first**, then
+the client package. The server repository ignores `operator_console/node_modules/`
+and `static/operator_console/`, so the console bundle is built on the server
+(`cd operator_console && npm ci && npm run build`) and never travels through Git.
+
+`ssh -T` is the cheapest identity check before pushing:
+
+```powershell
+ssh -i "$keyDir/lonkudo_key" -o IdentitiesOnly=yes -T git@github.com   # Hi lonkudo!
+ssh -i "$keyDir/forbestop22_key" -o IdentitiesOnly=yes -T git@github.com   # Hi forbestop22!
+```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for component ownership, data flow, and concurrency rules.

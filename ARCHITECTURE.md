@@ -989,4 +989,33 @@ matches the standalone package name. Field runs are the normal verification
 path. Do not run broad unit-test suites unless the operator specifically requests
 them.
 
+### Delivery: two repositories, two remotes (one push is not a push)
+
+This workspace holds **two Git repositories**, and each has **two remotes**, so a
+change is delivered only when all four remote branches carry it:
+
+| Repository | Working copy | GitHub repositories |
+| --- | --- | --- |
+| Client (desktop app) | this workspace root | `forbestop22/maple-assistant`, `lonkudo/maple-assistant` |
+| Server (activation service + operator console) | `activation_service/` (its own `.git`) | `forbestop22/maple-assistant-server`, `lonkudo/maple-assistant-server` |
+
+Each remote needs its own account key under `~/.ssh`, selected explicitly through
+`GIT_SSH_COMMAND`; a default identity is never assumed:
+
+| Key | Pushes |
+| --- | --- |
+| `~/.ssh/forbestop22_key` | the `forbestop22` mirror of **both** repositories |
+| `~/.ssh/lonkudo_key` | the `lonkudo` (canonical) copy of **both** repositories |
+
+`git push origin` is deliberately not used: the client's `origin` carries two push
+URLs (lonkudo + forbestop22) that need *different* keys, and the server's `origin`
+is an HTTPS URL that would prompt for a token instead of using the key. Push the
+explicit SSH URL per key, and verify every remote afterwards with `ls-remote`.
+
+Client-only changes still push the server repository when the released client
+depends on a new endpoint — server first, then the client package. The server
+repository ignores `operator_console/node_modules/` and
+`static/operator_console/`, so the built console bundle is produced **on the
+server** (`npm ci && npm run build`), never shipped through Git.
+
 For a component-level guide, start with the source modules named above, then follow their constructor wiring in `assistant.py`. This preserves the intended direction of dependency: UI and workers depend on coordinator-provided interfaces; they do not depend directly on one another.
