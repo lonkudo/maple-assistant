@@ -270,16 +270,15 @@ JUMP_POINT_REFIRE_COOLDOWN_SECONDS = 0.4
 # and never jump, because only a fresh entry emitted.
 JUMP_POINT_DWELL_FRAMES = 3
 # A dwell is a STANDING trigger, never "inside the box for a while".  The
-# minimap quantises the marker to whole columns (0.007143 on the operator's
-# 114x140 minimap) and the patrol walks one column per captured frame, so
-# crossing a +/-0.010 X box takes four matched frames - exactly the dwell
-# threshold.  The counter therefore only grows while the marker holds its
-# position; one column of movement restarts it.  Without this the left leg of
-# layer1 walked through its recorded up point (x=0.525) and fired the vertical
-# jump before the right leg had run: the character climbed the stairs, the layer
-# flipped to layer2, the route restarted there and layer1's right-most was never
-# reached (the 21:53 field log).
-JUMP_POINT_DWELL_STILL_X = 0.0088
+# minimap quantises the marker to whole columns - one X column is
+# 1/analysis_width (0.007143 on the operator's 140-wide minimap) - and the patrol
+# walks one column per captured frame, so the marker holds the same X for two
+# consecutive frames while it is still moving.  The threshold must therefore sit
+# BELOW one column, and the counter compares against the X the dwell run started
+# at rather than the previous frame, so duplicated readings cannot accumulate a
+# dwell.  Without this the left leg of layer1 walked over its recorded up point
+# (x=0.525) and fired the vertical jump before the right leg had run.
+JUMP_POINT_DWELL_STILL_X = 0.0035
 # The dwell trigger is reusable even while the character keeps standing in the
 # point's range: a stair jump that did not carry the character up leaves it in
 # the same spot ("23:18:34 PATROL pos=(0.606618) action=right [steady]"), where
@@ -6088,25 +6087,26 @@ class MovementWorker(threading.Thread):
     def _jump_point_up_is_target(self, point_x: float, dwell_frames: int) -> bool:
         """Whether an up jump point is allowed to fire this frame.
 
-        Two ways only:
+        The operator's rule for a *full* layer patrol is: the chosen first leg,
+        then the other horizontal leg, and only then the way up.  The up point is
+        therefore armed **only while the route is on that layer's ``up`` phase**,
+        and that gate comes before every trigger - the dwell rule included.
 
-        - the character has stayed inside its range for more than
-          ``JUMP_POINT_DWELL_FRAMES`` frames (standing on it is always a
-          trigger), or
-        - the route is on the layer's own ``up`` phase, which walks to the point
-          as the way up, and its target is the point.
-
-        The horizontal legs (and the rope leg) never fire it: the point can be
-        only a few marker steps from the left-most edge (layer1: up point
-        0.540441 vs left-most 0.547794), and treating "close to the leg target"
-        as "the target" fired the jump at the left endpoint, so the right leg
-        never ran - the 22:49 field log.
+        The dwell rule used to return True first, so a character that merely
+        crossed the point was enough: the left leg of layer1 passes straight over
+        its up point (x=0.525 between left-most 0.496429 and the leg start), the
+        crossing satisfied the frame counter, and the vertical jump fired before
+        the right leg ran - the character climbed the stairs, the layer flipped to
+        layer2 and the route restarted there, so layer1's right-most was never
+        reached (the 21:53 field log).  Inside the ``up`` phase both triggers stay:
+        the walk target being the point, and standing on it (the reusable stall
+        trigger for a hop that did not carry the character up).
         """
 
-        if dwell_frames > JUMP_POINT_DWELL_FRAMES:
-            return True
         if self._route_phase != "up":
             return False
+        if dwell_frames > JUMP_POINT_DWELL_FRAMES:
+            return True
         target = self._last_route_target_x
         if target is None:
             return False
@@ -6281,22 +6281,21 @@ class MovementWorker(threading.Thread):
         # jump.
         #
         # "Standing" is literal: the marker advances one whole column per frame
-        # while walking, so a crossing of the +/-0.010 box already matches four
-        # frames and used to satisfy the rule.  The counter restarts whenever the
-        # marker moved more than JUMP_POINT_DWELL_STILL_X since the previous
-        # inside frame.
+        # while walking (and repeats the same column for two frames because the
+        # read is quantised), so the counter compares the current X with the X
+        # the run started at and restarts once it moved more than half a column.
         dwell = self._jump_point_dwell_frames
         dwell_x = self._jump_point_dwell_last_x
         for stale in [key for key in dwell if key not in matched_tokens]:
             del dwell[stale]
             dwell_x.pop(stale, None)
         for token in matched_tokens:
-            previous = dwell_x.get(token)
-            if previous is not None and abs(player.x - previous) > JUMP_POINT_DWELL_STILL_X:
+            anchor = dwell_x.get(token)
+            if anchor is None or abs(player.x - anchor) > JUMP_POINT_DWELL_STILL_X:
                 dwell[token] = 1
+                dwell_x[token] = float(player.x)
             else:
                 dwell[token] = dwell.get(token, 0) + 1
-            dwell_x[token] = float(player.x)
         # An up jump point is a spot: during the patrol walk it must not fire
         # merely because the character passes over it.  It fires when it IS the
         # leg's next target (the walk was extended to it), or when the character

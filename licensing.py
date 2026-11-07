@@ -351,13 +351,23 @@ def _migrate_displaced_auth_document(root: Optional[Path] = None) -> None:
     """
 
     target = license_path(root)
+    legacy_copy = _legacy_config_auth_path(root)
+    # ``_legacy_config_auth_path`` falls back to the package root when the install
+    # has no ``助手配置`` folder, so it can name the SAME file as ``target``.  The
+    # duplicate-removal branch below then unlinked the authoritative document
+    # itself: every verification (startup, heartbeat, and therefore the update
+    # icon's record fetch) left the installation unlicensed.  Never delete when
+    # the two paths are the same file, and treat "cannot compare" as "same".
+    try:
+        same_file = legacy_copy.resolve() == target.resolve()
+    except OSError:
+        same_file = True
     if _signed_document_at(target) is not None:
         # A previous overlay update can leave a duplicate signed document in
         # the shareable folder.  The root document is already authoritative,
         # so remove that duplicate rather than continuing to export private
         # entitlement material with recordings.
-        legacy_copy = _legacy_config_auth_path(root)
-        if _signed_document_at(legacy_copy) is not None:
+        if not same_file and _signed_document_at(legacy_copy) is not None:
             try:
                 legacy_copy.unlink()
                 SERVER_LOG.info("duplicate authorization removed from 助手配置")
