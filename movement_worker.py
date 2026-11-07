@@ -269,6 +269,17 @@ JUMP_POINT_REFIRE_COOLDOWN_SECONDS = 0.4
 # was spent on the refire cooldown - could sit on the point for the whole leg
 # and never jump, because only a fresh entry emitted.
 JUMP_POINT_DWELL_FRAMES = 3
+# A dwell is a STANDING trigger, never "inside the box for a while".  The
+# minimap quantises the marker to whole columns (0.007143 on the operator's
+# 114x140 minimap) and the patrol walks one column per captured frame, so
+# crossing a +/-0.010 X box takes four matched frames - exactly the dwell
+# threshold.  The counter therefore only grows while the marker holds its
+# position; one column of movement restarts it.  Without this the left leg of
+# layer1 walked through its recorded up point (x=0.525) and fired the vertical
+# jump before the right leg had run: the character climbed the stairs, the layer
+# flipped to layer2, the route restarted there and layer1's right-most was never
+# reached (the 21:53 field log).
+JUMP_POINT_DWELL_STILL_X = 0.0088
 # The dwell trigger is reusable even while the character keeps standing in the
 # point's range: a stair jump that did not carry the character up leaves it in
 # the same spot ("23:18:34 PATROL pos=(0.606618) action=right [steady]"), where
@@ -4835,12 +4846,16 @@ class MovementWorker(threading.Thread):
         # session.  A jump arc naturally leaves and re-enters the loose Y
         # tolerance; treating that as a new arrival created repeated jumps.
         self._jump_point_suppressed_tokens: set[tuple[str, int]] = set()
-        # token -> consecutive captured frames the marker has been inside that
-        # point's range.  A character that walks onto a point and STOPS there
-        # stays inside without ever being freshly "entered" again, so the
-        # operator's rule: more than JUMP_POINT_DWELL_FRAMES frames inside the
-        # range also emits the point.
+        # token -> consecutive captured frames the marker has been STANDING
+        # inside that point's range.  A character that walks onto a point and
+        # STOPS there stays inside without ever being freshly "entered" again,
+        # so the operator's rule: more than JUMP_POINT_DWELL_FRAMES frames
+        # standing there also emits the point.  Walking through is not standing
+        # (see JUMP_POINT_DWELL_STILL_X).
         self._jump_point_dwell_frames: dict[tuple[str, int], int] = {}
+        # token -> the marker X of the previous inside frame, so the dwell
+        # counter can tell "standing on the point" from "walking past it".
+        self._jump_point_dwell_last_x: dict[tuple[str, int], float] = {}
         # token -> (leg_key, attempts) of dwell-triggered fires in this leg, so
         # the reusable dwell stays bounded.
         self._jump_point_dwell_attempts: dict[
@@ -6184,6 +6199,7 @@ class MovementWorker(threading.Thread):
         if player is None:
             self._jump_point_inside_tokens.clear()
             self._jump_point_dwell_frames.clear()
+            self._jump_point_dwell_last_x.clear()
             return None
         # A falling marker can cross an unrelated point's exact X/Y window.
         # It is not standing at that point and must not dispatch a directional
@@ -6256,33 +6272,53 @@ class MovementWorker(threading.Thread):
                 matches.sort(key=lambda match: match[2] != preferred_direction)
 
         matched_tokens = {match[0] for match in matches}
-        # Dwell counter: consecutive captured frames the marker has been inside
-        # each matched box, counted from the frame it arrived.  The operator's
-        # rule: staying on a point for more than JUMP_POINT_DWELL_FRAMES frames
-        # also emits it.  A character that walks onto the point and stops is
-        # "inside" every frame but never freshly "entered" again, so entry alone
-        # left it standing on the point with no jump.
+        # Dwell counter: consecutive captured frames the marker has been STANDING
+        # inside each matched box, counted from the frame it arrived.  The
+        # operator's rule: staying on a point for more than
+        # JUMP_POINT_DWELL_FRAMES frames also emits it.  A character that walks
+        # onto the point and stops is "inside" every frame but never freshly
+        # "entered" again, so entry alone left it standing on the point with no
+        # jump.
+        #
+        # "Standing" is literal: the marker advances one whole column per frame
+        # while walking, so a crossing of the +/-0.010 box already matches four
+        # frames and used to satisfy the rule.  The counter restarts whenever the
+        # marker moved more than JUMP_POINT_DWELL_STILL_X since the previous
+        # inside frame.
         dwell = self._jump_point_dwell_frames
+        dwell_x = self._jump_point_dwell_last_x
         for stale in [key for key in dwell if key not in matched_tokens]:
             del dwell[stale]
+            dwell_x.pop(stale, None)
         for token in matched_tokens:
-            dwell[token] = dwell.get(token, 0) + 1
+            previous = dwell_x.get(token)
+            if previous is not None and abs(player.x - previous) > JUMP_POINT_DWELL_STILL_X:
+                dwell[token] = 1
+            else:
+                dwell[token] = dwell.get(token, 0) + 1
+            dwell_x[token] = float(player.x)
         # An up jump point is a spot: during the patrol walk it must not fire
         # merely because the character passes over it.  It fires when it IS the
         # leg's next target (the walk was extended to it), or when the character
-        # has stayed inside its range long enough to be standing on it.
+        # has stood inside its range long enough.
         matches = [
             match for match in matches
             if match[2] != "up"
             or self._jump_point_up_is_target(match[3], dwell.get(match[0], 0))
         ]
+        # "Inside" is the physical fact, decided BEFORE the up-point gate: a
+        # blocked up point is still inside its box, so a later allowed fire is the
+        # dwell (stayed) path with its attempt cap - not a fresh entry.  Recording
+        # the filtered set instead made the same crossing log as "entered" and
+        # bypassed the dwell bookkeeping.
+        inside_tokens = matched_tokens
         matched_tokens = {match[0] for match in matches}
         # A fired point stays suppressed until the marker leaves its zone (the
         # Up-hold/landing session may still be open).  Re-arming on zone exit is
         # kept for the per-frame entry detector only; the leg record above is
         # what limits a point to one jump per leg.
         if not self._jump_point_up_held:
-            self._jump_point_suppressed_tokens.intersection_update(matched_tokens)
+            self._jump_point_suppressed_tokens.intersection_update(inside_tokens)
         entered = [
             match for match in matches
             if (match[0] not in self._jump_point_inside_tokens
@@ -6327,7 +6363,9 @@ class MovementWorker(threading.Thread):
                 "JUMP POINT suppressed: %s[%d] %s jump (stayed) - %s",
                 match[1], match[0][1], match[2], reason,
             )
-        self._jump_point_inside_tokens = matched_tokens
+        # Physical presence, not "passed the gate": a blocked up point is still
+        # inside its box, so the next frame is a dwell (stayed) check.
+        self._jump_point_inside_tokens = inside_tokens
         if armed_entered:
             armed, from_stay = armed_entered, False
         elif armed_stayed:
@@ -10810,6 +10848,7 @@ class MovementWorker(threading.Thread):
         self._jump_point_inside_tokens.clear()
         self._jump_point_suppressed_tokens.clear()
         self._jump_point_dwell_frames.clear()
+        self._jump_point_dwell_last_x.clear()
         self._jump_point_candidate = None
         anchor_index = self._route_layers.index(anchor_layer)
         first_index = 0
@@ -11082,6 +11121,7 @@ class MovementWorker(threading.Thread):
         self._jump_point_inside_tokens.clear()
         self._jump_point_suppressed_tokens.clear()
         self._jump_point_dwell_frames.clear()
+        self._jump_point_dwell_last_x.clear()
         self._jump_point_candidate = None
         self._jump_point_up_held = False
         self._jump_point_up_started_at = 0.0

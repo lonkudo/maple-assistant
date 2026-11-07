@@ -53,9 +53,9 @@ from reconnect_worker import (
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
 from update_core import (
-    ReleaseInfo, UpdateCoreError, apply_staged_update, clear_staged_updates,
-    fetch_release_info, is_newer, parse_release, read_notice, stage_update,
-    write_notice,
+    ReleaseInfo, UpdateCoreError, announced_version, apply_staged_update,
+    clear_staged_updates, fetch_release_info, is_newer, read_notice,
+    stage_update, write_notice,
 )
 from update_manager import (
     UpdateError, desktop_roots, export_user_config, import_user_config,
@@ -4040,45 +4040,58 @@ class UiWorker(threading.Thread):
         """Compare the announced version and fetch its notes when they are new.
 
         Called from the heartbeat thread, so it must not touch widgets.  The
-        notes are requested once per version: the heartbeat announces the same
-        version every three hours and the stored notice already answers it.
+        heartbeat carries the **version only** - ``announced_version`` accepts
+        exactly that, while ``parse_release`` (which needs a download link) is
+        reserved for the full record fetched below.  Using the full-record parser
+        here silently rejected every heartbeat announcement and the icon never
+        turned green.
+
+        The notes are requested once per version: the heartbeat announces the
+        same version every three hours and the stored notice already answers it.
         """
 
-        release = parse_release(payload)
-        if release is None:
+        version = announced_version(payload)
+        if not version:
             return
-        if not is_newer(release.version, self._local_version()):
+        if not is_newer(version, self._local_version()):
             # The server is at or behind this build: any stored notice is stale.
             if self._release_notice is not None:
-                self._put_release_state("clear", release.version)
+                self._put_release_state("clear", version)
             return
         known = self._release_notice or {}
-        if known.get("version") == release.version and known.get("info"):
+        if known.get("version") == version and (known.get("info") or known.get("link")):
             return
-        if self._release_check_in_flight and self._release_check_version == release.version:
+        if self._release_check_in_flight and self._release_check_version == version:
             return
         self._release_check_in_flight = True
-        self._release_check_version = release.version
+        self._release_check_version = version
         threading.Thread(
-            target=self._release_check_job, args=(release,),
+            target=self._release_check_job, args=(version,),
             name="release-check", daemon=True,
         ).start()
 
-    def _release_check_job(self, release: ReleaseInfo) -> None:
+    def _release_check_job(self, version: str) -> None:
         """Worker: fetch the full record for an announced version."""
 
         try:
             info = fetch_release_info()
-            full = info if (info is not None and info.version == release.version) else None
-            payload = full or ReleaseInfo(
-                version=release.version, info=release.info, link=release.link,
-            )
+            full = info if (info is not None and info.version == version) else None
             if full is not None:
                 write_notice(self._install_root(), full)
-            notice = {
-                "version": payload.version, "info": payload.info,
-                "link": payload.link, "extra_links": list(payload.extra_links),
-            }
+                notice = {
+                    "version": full.version, "info": full.info,
+                    "link": full.link, "extra_links": list(full.extra_links),
+                }
+            else:
+                # The announcement is real even when the detail request failed;
+                # keep the version so the icon is honest, and let the click
+                # fetch the link again.  Nothing to store on disk: a notice
+                # without a link cannot be acted on after a restart.
+                LOG.warning(
+                    "更新提示：服务器公布 v%s，但更新说明获取失败；点击时将重新获取",
+                    version,
+                )
+                notice = {"version": version, "info": "", "link": "", "extra_links": []}
             self._put_release_state("notice", notice)
         except Exception:  # noqa: BLE001 - never kill the heartbeat over this
             LOG.warning("更新提示：获取更新说明失败", exc_info=True)
@@ -4180,6 +4193,21 @@ class UiWorker(threading.Thread):
 
         root = self._install_root()
         meter = {"position": 0}
+
+        if not release.links():
+            # The heartbeat only announced a version and the detail request has
+            # not produced a link (yet): fetch it now rather than downloading
+            # from nowhere.
+            self._put_release_state("progress", "正在获取下载链接…")
+            fetched = fetch_release_info()
+            if fetched is None or fetched.version != release.version:
+                self._put_release_state(
+                    "failed",
+                    f"无法获取 v{release.version} 的下载链接，请稍后重试；"
+                    "也可以稍后再点一次更新图标。",
+                )
+                return
+            release = fetched
 
         def on_total(total: int) -> None:
             meter["position"] = 0

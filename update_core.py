@@ -80,11 +80,33 @@ class ReleaseInfo:
         return ""
 
 
+def announced_version(value: Any) -> Optional[str]:
+    """The version a heartbeat announced, or ``None``.
+
+    The heartbeat deliberately carries **only** the version - never the notes or
+    the link - so this must not apply ``parse_release``'s full-record rules.  A
+    version-only payload was being rejected by them, which silently disabled the
+    update icon for every client: the check ran, decided "no record", and the
+    icon never turned green.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    version = str(value.get("version") or "").strip()
+    try:
+        parse_version(version)
+    except ValueError:
+        return None
+    return version
+
+
 def parse_release(value: Any) -> Optional[ReleaseInfo]:
-    """Build a ``ReleaseInfo`` from the server's JSON, or ``None``.
+    """Build a ``ReleaseInfo`` from the server's full JSON, or ``None``.
 
     An older server, a device the operator has published nothing for, and a
     malformed payload all mean the same thing to the caller: no update exists.
+    A record without any download location is useless for installing, so it is
+    rejected here - the *version* announcement uses ``announced_version``.
     """
 
     if not isinstance(value, dict):
@@ -429,8 +451,9 @@ def _host(link: str) -> str:
 
 __all__ = [
     "ARCHIVE_PREFIX", "NOTICE_FILE", "ReleaseInfo", "UPDATE_DIRECTORY",
-    "UpdateCoreError", "apply_staged_update", "archive_version",
-    "clear_notice", "clear_staged_updates", "download_package",
-    "fetch_release_info", "is_newer", "notice_path", "parse_release",
-    "read_notice", "stage_update", "verify_archive", "write_notice",
+    "UpdateCoreError", "announced_version", "apply_staged_update",
+    "archive_version", "clear_notice", "clear_staged_updates",
+    "download_package", "fetch_release_info", "is_newer", "notice_path",
+    "parse_release", "read_notice", "stage_update", "verify_archive",
+    "write_notice",
 ]
