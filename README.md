@@ -1284,16 +1284,20 @@ $keyDir = ($env:USERPROFILE -replace '\\','/') + "/.ssh"
 # 1) client: canonical first, then the mirror
 $env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/lonkudo_key`" -o IdentitiesOnly=yes"
 git -C $root push git@github.com:lonkudo/maple-assistant.git main
-git -C $root push git@github.com:lonkudo/maple-assistant.git --tags
 $env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/forbestop22_key`" -o IdentitiesOnly=yes"
 git -C $root push git@github.com:forbestop22/maple-assistant.git main
-git -C $root push git@github.com:forbestop22/maple-assistant.git --tags
 
 # 2) server: same two accounts, its own repository
 $env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/lonkudo_key`" -o IdentitiesOnly=yes"
 git -C $server push git@github.com:lonkudo/maple-assistant-server.git main
 $env:GIT_SSH_COMMAND = "ssh -i `"$keyDir/forbestop22_key`" -o IdentitiesOnly=yes"
 git -C $server push git@github.com:forbestop22/maple-assistant-server.git main
+
+# 3) the release tag, on both client remotes - name the ONE tag, never --tags:
+#    a plain "git push <remote> --tags" walks every historical tag (and their LFS
+#    objects) and can sit there for minutes.
+git -C $root push git@github.com:lonkudo/maple-assistant.git refs/tags/release/vX.Y.Z
+git -C $root push git@github.com:forbestop22/maple-assistant.git refs/tags/release/vX.Y.Z
 ```
 
 Verify — every remote must report the same commit as `git rev-parse HEAD`:

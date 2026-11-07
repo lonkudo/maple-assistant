@@ -71,7 +71,9 @@ git -C <repo> push git@github.com:forbestop22/maple-assistant-server.git main
 ```
 
 * Server first when the released client depends on a new endpoint; release tags
-  (`release/vX.Y.Z`) go to both client remotes (`git push <remote> --tags`).
+  (`release/vX.Y.Z`) go to both client remotes, naming the single tag:
+  `git push <remote> refs/tags/release/vX.Y.Z`. Never `git push <remote> --tags` —
+  it walks every historical tag and their LFS objects and can hang for minutes.
 * Verify, do not assume: `git ls-remote <url> refs/heads/main` must equal
   `git rev-parse HEAD` for all four. The runnable snippet is in `README.md`
   ("Push flow: two repositories × two remotes").
