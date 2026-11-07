@@ -741,6 +741,8 @@ their ordinary lifecycle logging.
 | `assistant-launch-error.log` | `startup_probe.py` | Hidden-launch failures, including the missing dependency that triggered the automatic install. |
 | `assistant-launch-status.log` | `startup_probe.py` | Launcher milestones: probe reached, repair started/finished, normal exit. |
 | `teach-assets/` | UI teaching viewer | Shipped JPG pages, loaded one at a time in natural filename order; copied unchanged into both packages. |
+| `update_info.json` | `update_core` | Cached 更新说明 for a released version this installation has not installed yet: version, notes, link, `fetched_at`. Written once per announced version, deleted by the build that matches it. |
+| `update/` | `update_core` | Staging folder for the update archive (`MoonEclipse-<version>.zip`); the shipped helper consumes and deletes the ZIP after installing it. |
 | `autolie_api/` | Vendor | Reference protocol implementation; read-only. |
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.
@@ -780,6 +782,61 @@ file is never overwritten by the package's default), the legacy `app\` tree is
 deleted only after every legacy config file is confirmed present at the root
 (`_legacy_config_missing`), and the downgrade guard compares the archive version
 with the folder's `VERSION` (`_installed_version`).
+
+### Server-managed release link (v1.2.292)
+
+The download address is no longer compiled into the installer. The activation
+service owns a version table (`licensing.ReleaseUpdate`): **版本号 / 更新说明 /
+下载链接** (+ optional 备用链接 and an explicit `is_current` switch), edited in the
+console's **更新链接** panel and audited as `release_update`. Three consumers read
+one record:
+
+- `POST /api/v1/validate` (heartbeat) answers `release: {"version": …}` only - the
+  notes and link never ride the three-hourly reply;
+- `POST /api/v1/update/info` returns the full record to a device that decided the
+  version differs (same fingerprint/license ownership check as the heartbeat, but
+  it writes nothing: no counters, no attempt rows, no `last_seen_time`);
+- `POST /api/v1/installer/session` returns the same record so an installer learns
+  the link at run time. A netdisk-only deployment therefore answers `ok` with
+  `session_token: null`; `NO_RELEASE` remains only for "neither a manifest nor a
+  release record exists".
+
+The record is served from process memory (`licensing/release_cache.py`). One
+database read fills a plain dict per worker; afterwards a heartbeat costs one
+`stat`-sized read of a shared epoch file (`RELEASE_STORAGE_ROOT/.release-update-epoch`).
+A console write bumps that stamp, so every gunicorn worker refills on its next
+read without a restart and without a query per heartbeat. A cached `None` ("nothing
+published") is cached too, with a time-based fallback used only when the stamp file
+cannot be written at all.
+
+### Shared update path (v1.2.292)
+
+`update_core.py` is the single implementation both programs use: fetch the record
+(`fetch_release_info`, pinned TLS), resolve a share link, download with progress,
+verify the archive's own `VERSION`, and stage it. `lanzou_source.py` moved to the
+package root for the same reason - the desktop app now resolves 蓝奏 / QQ 中转
+links itself instead of delegating every update to the installer.
+
+The desktop half of the feature:
+
+- the heartbeat's `release.version` is compared with the local `VERSION` on the
+  heartbeat thread (`version_key`, so `1.2.10` sorts above `1.2.9`);
+- only a strictly newer version starts a fetch; the result is cached in
+  `update_info.json` next to `VERSION`, so a user who skips the update still sees
+  the notice on the next start, and the build that matches the version deletes it;
+- the caption's release icon is grey when current, green when an update exists,
+  blue while downloading; hovering shows 版本 + 说明, clicking downloads into
+  `update\`, confirms, stops patrol and hands the archive to the shipped
+  `todohelper_update.ps1`, which installs it after the process exits and restarts
+  the application. A running executable is never overwritten in place.
+
+### Installer link precedence (v1.2.292)
+
+`_share_sources` accepts, in order: the served release record's `link` and
+`extra_links`, a legacy manifest's `mirrors`, and `installer_mirrors.json` beside
+the installer (manual escape hatch). There is deliberately **no built-in link** -
+a compiled address is stale the moment it ships - and a folder with no source at
+all fails with a clear 无法从服务器获取最新下载地址 rather than a silent one.
 
 ## Movement route order (v1.2.290)
 
@@ -860,7 +917,10 @@ the operator:
 - `release/MoonEclipseInstaller.exe` - the separate bootstrap installer built by
   `installer/build_installer.ps1` (`--windows-console-mode=disable`). It is never
   part of an app update manifest. It keeps no activation field in its window, and
-  the licensed profile rules above decide whether it authenticates silently.
+  the licensed profile rules above decide whether it authenticates silently. From
+  `v1.2.292` it carries no download address: `build_installer.ps1` ships the same
+  `update_core.py` + `lanzou_source.py` the app uses and the link comes from the
+  activation server.
 - `release/MoonEclipse-<version>.zip` — the normal package: Python sources
   plus data, installed into `.venv` by `安装.bat`. `startup_probe.py` owns its
   hidden-launch failure path: it records the traceback to

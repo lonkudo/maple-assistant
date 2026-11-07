@@ -254,6 +254,10 @@ class LicenseStatus:
     # ``{"total": int, "success": int, "failed": int}``.
     lie_detect_today: dict[str, int] = field(default_factory=dict)
     lie_detect_yesterday: dict[str, int] = field(default_factory=dict)
+    # The newest release the server knows about, as ``{"version": "1.2.292"}``.
+    # ``None`` means the server said nothing (older server, or nothing published),
+    # which is deliberately different from an empty version string.
+    server_release: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -1242,6 +1246,13 @@ def _heartbeat_via_server(
         SERVER_LOG.warning("license heartbeat response rejected category=%s", status.code)
         return status
     persisted = _with_server_device(_persist_document(document, status, root), answer)
+    # The heartbeat only announces the version; the notes and the link are
+    # fetched by ``update_core.fetch_release_info`` when a client cares.  Keep
+    # the raw dict so a newer server can add fields without another client
+    # change, but never let it influence the entitlement verdict.
+    release = answer.get("release") if isinstance(answer, dict) else None
+    if isinstance(release, dict) and release.get("version"):
+        persisted = replace(persisted, server_release=release)
     if persisted.valid:
         _save_sealed_fingerprint(fingerprint, persisted.license_id, root)
         SERVER_LOG.info("license heartbeat accepted license_id=%s", persisted.license_id)

@@ -34,7 +34,7 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
-The update icon in the title bar searches the Desktop, the running folder, and its parent folder for a newer compatible release ZIP. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
 ### Current release behavior (v1.2.2)
 
@@ -210,8 +210,22 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   focus thief, another window's ghost, or a vanished game window still count as a
   loss. A hang is reported once (`foreground: the game window is not responding …`).
 
-### Current release behavior (v1.2.290 – v1.2.291)
+### Current release behavior (v1.2.290 – v1.2.292)
 
+- **The download link lives on the server, not in the installer.** The activation
+  console has a new **更新链接** panel holding one row per version (版本号 /
+  更新说明 / 下载链接 + optional 备用链接, one row marked 当前). The installer asks
+  the server at run time and no longer carries any address; `installer_mirrors.json`
+  beside the EXE stays as a manual fallback. Publishing a release is therefore:
+  upload the ZIP to the netdisk, then fill one row - no new installer build.
+- **The update icon appears in the title bar.** The heartbeat answers with the
+  newest version only (`release: {"version": …}`, or nothing when the operator has
+  published nothing). A strictly newer version turns the caption's release icon
+  **green**; the notes and link are fetched once per version and cached in
+  `update_info.json` next to `VERSION`, so a skipped update still shows the icon
+  after a restart and the installed build deletes the file. Hovering shows the
+  version and 更新说明; clicking downloads into `update\`, verifies the archive's
+  own `VERSION`, and installs after the assistant exits (then it restarts).
 - **The installer never asks for a code twice.** The launch window has no
   activation field. An existing installation's code comes from its own profile:
   the selected root's `助手配置` first, then the older build's
@@ -562,6 +576,15 @@ The v1.2.252 self-unbind endpoint requires migration
 used. It adds only the per-fingerprint `self_unbind_day` and
 `self_unbind_count` rate-limit fields; it does not alter activation codes,
 existing bindings, entitlement periods, or auto-lie balances.
+
+The v1.2.292 更新链接 feature requires migration
+`licensing.0018_release_update` (one new table: version, release notes, download
+link, current flag) and the rebuilt operator console assets. It adds the
+`/api/v1/update/info` endpoint, an optional `release` object on `/api/v1/validate`
+and `/api/v1/installer/session`, and makes a missing server-side release manifest
+non-fatal for the installer. Nothing existing is altered, and a server that has no
+release row simply answers `release: null`, which every client treats as "no
+update". The runbook is `activation_service/DEPLOY_UPDATE_LINK.md`.
 
 **Existing clients remain compatible only when the server preserves all of
 these contracts:** the same HTTPS address and TLS key/pin, the same

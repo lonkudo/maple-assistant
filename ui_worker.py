@@ -52,6 +52,11 @@ from reconnect_worker import (
 )
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
+from update_core import (
+    ReleaseInfo, UpdateCoreError, apply_staged_update, clear_staged_updates,
+    fetch_release_info, is_newer, parse_release, read_notice, stage_update,
+    write_notice,
+)
 from update_manager import (
     UpdateError, desktop_roots, export_user_config, import_user_config,
     find_newer_desktop_update,
@@ -221,6 +226,19 @@ LICENSE_HEARTBEAT_FAILURE_RETRY_SECONDS = 10 * 60
 # is never retried here because that could consume activation-failure quota.
 CIM_BOOT_RETRY_SECONDS = (3.0, 30.0, 60.0, 300.0)
 _GMT8 = timezone(timedelta(hours=8))
+
+# --- 更新图标 -----------------------------------------------------------------
+# The caption's second action turns green when the heartbeat announces a release
+# newer than this build.  The heartbeat only carries the version, so the notes and
+# link are fetched once per version and cached on disk (``update_info.json`` next
+# to VERSION) - a user who skips the update still sees the notice next start.
+UPDATE_ICON_GREY = "#8a8a8a"
+UPDATE_ICON_GREEN = "#2e9e4f"
+UPDATE_ICON_INK_GREY = "#7d8794"
+UPDATE_ICON_INK_GREEN = "#ffffff"
+UPDATE_ICON_BUSY = "#2f6fd0"
+# Tooltip line budget: enough for the version, a few note lines and the hint.
+UPDATE_NOTICE_TOOLTIP_LINES = 8
 
 
 def seconds_until_next_gmt8_midnight_refresh() -> float:
@@ -1595,6 +1613,16 @@ class UiWorker(threading.Thread):
         self._license_heartbeat_request = threading.Event()
         self._license_refresh_aggressive = False
         self._license_refresh_cooldown_job: Any = None
+        # --- 更新图标 state ---------------------------------------------------
+        # ``_release_notice`` is the release the green icon stands for (version,
+        # notes, link); ``_release_states`` delivers worker results to Tk, so the
+        # heartbeat thread and the download thread never touch widgets directly.
+        self._release_notice: Optional[dict[str, Any]] = None
+        self._release_states: "queue.Queue[tuple[str, Any]]" = queue.Queue(maxsize=8)
+        self._release_check_in_flight = False
+        self._release_check_version = ""
+        self._release_download_in_flight = False
+        self._release_progress_text = ""
         # Completed auto-lie passes are accounted for later, never on the
         # time-sensitive WebSocket/cursor path.  The worker persists its own
         # queue so an app restart cannot silently discard a completed event.
@@ -1786,6 +1814,9 @@ class UiWorker(threading.Thread):
 
             if caption_installed:
                 self._build_caption_bar(root, tk, app_version)
+                # Restore a pending update notice from disk: a user who skipped
+                # the update must still see the green icon on the next start.
+                self._load_release_notice()
             else:
                 # Fallback when the custom caption cannot be installed: keep
                 # the native caption and float a small ? at the top-right of
@@ -3617,6 +3648,9 @@ class UiWorker(threading.Thread):
         )
         title.pack(side="left", padx=(10, 0))
         self._caption_title = title
+        # Restored verbatim after a download progress line (see
+        # ``_set_release_progress``), so the caption never keeps a stale status.
+        self._caption_title_base = f"MoonEclipse {app_version}"
 
         def _button(
             text: str, command: Any, image: Any = None, width: int = 3
@@ -3684,13 +3718,30 @@ class UiWorker(threading.Thread):
             self._update_button, "刷新测谎次数"
         )
         self._update_button_tooltip.set_enabled(True)
+        # The release icon sits beside ↻ and is the only control that changes
+        # colour: green means "a newer version was announced by the server".
+        # Hover shows the release notes, a click downloads and installs.
+        self._release_button = tk.Canvas(
+            bar, width=30, height=_CAPTION_HEIGHT,
+            bg="#f0f0f0", highlightthickness=0, cursor="hand2",
+        )
+        self._release_button.bind(
+            "<Button-1>", lambda _event: self._start_release_update()
+        )
+        _bind_caption_hover(self._release_button)
+        self._release_button_tooltip = HoverTooltip(
+            self._release_button, "已是最新版本"
+        )
+        self._release_button_tooltip.set_enabled(True)
         # ``side=right`` adds each later child to the left.  Re-pack these two
         # controls as refresh then teaching so their visible order is book,
         # refresh, help, minimize, maximize, close.
         self._teaching_button.pack_forget()
         self._update_button.pack_forget()
         self._update_button.pack(side="right", fill="y")
+        self._release_button.pack(side="right", fill="y")
         self._teaching_button.pack(side="right", fill="y")
+        self._paint_release_icon()
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
         # Keep the caption hover shade registered by ``_button`` while also
@@ -3884,6 +3935,303 @@ class UiWorker(threading.Thread):
             package.version,
         )
         self._close_for_restart()
+
+    # ------------------------------------------------------------- 更新图标 ---
+    def _install_root(self) -> Path:
+        """The folder VERSION and ``update_info.json`` belong to."""
+
+        return application_root(__file__)
+
+    def _local_version(self) -> str:
+        return read_version(self._install_root() / "VERSION")
+
+    def _load_release_notice(self) -> None:
+        """Restore the green icon from disk at startup.
+
+        ``read_notice`` deletes a record that is no longer newer than this build,
+        so an installed update clears its own notice on the next start.
+        """
+
+        try:
+            notice = read_notice(self._install_root(), self._local_version())
+        except Exception:  # noqa: BLE001 - a display detail must not break startup
+            LOG.warning("更新提示：读取本地缓存失败", exc_info=True)
+            notice = None
+        self._release_notice = notice
+        self._refresh_release_tooltip()
+        self._paint_release_icon()
+
+    def _release_tooltip_text(self) -> str:
+        """What hovering the icon says: the notice, or "up to date"."""
+
+        notice = self._release_notice
+        if not isinstance(notice, dict) or not notice.get("version"):
+            return f"已是最新版本 v{self._local_version()}"
+        lines = [f"发现新版本 v{notice['version']}"]
+        info_lines = [
+            line.strip() for line in str(notice.get("info") or "").splitlines()
+            if line.strip()
+        ]
+        if info_lines:
+            lines.extend(info_lines[:UPDATE_NOTICE_TOOLTIP_LINES])
+            if len(info_lines) > UPDATE_NOTICE_TOOLTIP_LINES:
+                lines.append("…")
+        lines.append("点击立即更新")
+        return "\n".join(lines)
+
+    def _refresh_release_tooltip(self) -> None:
+        tooltip = getattr(self, "_release_button_tooltip", None)
+        if tooltip is not None:
+            tooltip.text = self._release_tooltip_text()
+
+    def _paint_release_icon(self) -> None:
+        """Draw the glyph: grey idle, green update available, blue downloading."""
+
+        canvas = getattr(self, "_release_button", None)
+        if canvas is None:
+            return
+        notice = self._release_notice
+        if self._release_download_in_flight:
+            ink = UPDATE_ICON_BUSY
+        elif isinstance(notice, dict) and notice.get("version"):
+            ink = UPDATE_ICON_GREEN
+        else:
+            ink = UPDATE_ICON_INK_GREY
+        canvas.delete("all")
+        # A downward arrow into a tray: "there is something to take in".
+        canvas.create_line(15, 7, 15, 17, fill=ink, width=2)
+        canvas.create_line(15, 18, 10, 12, fill=ink, width=2)
+        canvas.create_line(15, 18, 20, 12, fill=ink, width=2)
+        canvas.create_line(8, 24, 22, 24, fill=ink, width=2)
+        canvas.create_line(8, 24, 8, 21, fill=ink, width=2)
+        canvas.create_line(22, 24, 22, 21, fill=ink, width=2)
+        if isinstance(notice, dict) and notice.get("version") and not self._release_download_in_flight:
+            # The badge makes the state readable even at a glance, not only by
+            # comparing two shades of green.
+            canvas.create_oval(19, 4, 27, 12, fill=UPDATE_ICON_GREEN, outline="#ffffff")
+
+    def _set_release_progress(self, text: str) -> None:
+        """Show download progress in the caption title, restoring it after."""
+
+        self._release_progress_text = text
+        title = getattr(self, "_caption_title", None)
+        if title is None:
+            return
+        try:
+            base = getattr(self, "_caption_title_base", "MoonEclipse")
+            title.configure(text=f"{base} · {text}" if text else base)
+        except Exception:  # noqa: BLE001 - a title is cosmetic
+            LOG.debug("更新提示：标题更新失败", exc_info=True)
+
+    def _apply_release_notice(self, notice: Optional[dict[str, Any]]) -> None:
+        """Adopt one release record (or clear it) and repaint the icon."""
+
+        previous = (self._release_notice or {}).get("version")
+        self._release_notice = notice if isinstance(notice, dict) else None
+        self._refresh_release_tooltip()
+        self._paint_release_icon()
+        current = (self._release_notice or {}).get("version")
+        if current and current != previous:
+            LOG.info("更新提示：发现新版本 v%s（点击标题栏的更新图标安装）", current)
+        elif previous and not current:
+            LOG.info("更新提示：已是最新版本 v%s", self._local_version())
+
+    def _schedule_release_check(self, payload: Any) -> None:
+        """Compare the announced version and fetch its notes when they are new.
+
+        Called from the heartbeat thread, so it must not touch widgets.  The
+        notes are requested once per version: the heartbeat announces the same
+        version every three hours and the stored notice already answers it.
+        """
+
+        release = parse_release(payload)
+        if release is None:
+            return
+        if not is_newer(release.version, self._local_version()):
+            # The server is at or behind this build: any stored notice is stale.
+            if self._release_notice is not None:
+                self._put_release_state("clear", release.version)
+            return
+        known = self._release_notice or {}
+        if known.get("version") == release.version and known.get("info"):
+            return
+        if self._release_check_in_flight and self._release_check_version == release.version:
+            return
+        self._release_check_in_flight = True
+        self._release_check_version = release.version
+        threading.Thread(
+            target=self._release_check_job, args=(release,),
+            name="release-check", daemon=True,
+        ).start()
+
+    def _release_check_job(self, release: ReleaseInfo) -> None:
+        """Worker: fetch the full record for an announced version."""
+
+        try:
+            info = fetch_release_info()
+            full = info if (info is not None and info.version == release.version) else None
+            payload = full or ReleaseInfo(
+                version=release.version, info=release.info, link=release.link,
+            )
+            if full is not None:
+                write_notice(self._install_root(), full)
+            notice = {
+                "version": payload.version, "info": payload.info,
+                "link": payload.link, "extra_links": list(payload.extra_links),
+            }
+            self._put_release_state("notice", notice)
+        except Exception:  # noqa: BLE001 - never kill the heartbeat over this
+            LOG.warning("更新提示：获取更新说明失败", exc_info=True)
+        finally:
+            self._release_check_in_flight = False
+
+    def _put_release_state(self, action: str, payload: Any) -> None:
+        """Queue one update-icon event for Tk; dropping a cosmetic one is fine.
+
+        Progress callbacks fire per network chunk, so an unbounded queue would
+        grow without limit if the UI thread were busy.  A dropped progress line
+        only costs one repaint; the terminal events (``notice``, ``staged``,
+        ``failed``) are queued on a fresh queue when the small one is full.
+        """
+
+        try:
+            self._release_states.put_nowait((action, payload))
+        except queue.Full:
+            if action in {"progress"}:
+                return
+            try:
+                self._release_states.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._release_states.put_nowait((action, payload))
+            except queue.Full:
+                LOG.debug("更新提示：状态队列已满，丢弃 %s", action)
+
+    def _drain_release_states(self) -> None:
+        """Apply worker results for the update icon on Tk's thread."""
+
+        while True:
+            try:
+                action, payload = self._release_states.get_nowait()
+            except queue.Empty:
+                return
+            if action == "notice":
+                self._apply_release_notice(dict(payload))
+            elif action == "clear":
+                try:
+                    clear_notice(self._install_root())
+                except Exception:  # noqa: BLE001 - the icon state matters more
+                    LOG.warning("更新提示：删除本地缓存失败", exc_info=True)
+                self._apply_release_notice(None)
+            elif action == "progress":
+                self._set_release_progress(str(payload))
+            elif action == "failed":
+                self._release_download_in_flight = False
+                self._paint_release_icon()
+                self._set_release_progress("")
+                LOG.warning("更新失败：%s", payload)
+                self._show_release_message("更新失败", str(payload), error=True)
+            elif action == "staged":
+                self._release_download_in_flight = False
+                self._set_release_progress("")
+                LOG.info("更新已安排：v%s 将在助手退出后安装并重启。", (self._release_notice or {}).get("version"))
+                self._close_for_restart()
+
+    def _start_release_update(self) -> None:
+        """The update icon's click: download the announced release and install it."""
+
+        notice = self._release_notice
+        local = self._local_version()
+        if not isinstance(notice, dict) or not notice.get("version"):
+            self._show_release_message(
+                "已是最新版本", f"当前运行的是 v{local}，服务器没有更新版本。",
+            )
+            return
+        if self._release_download_in_flight:
+            LOG.info("更新：下载已在进行中，忽略本次点击。")
+            return
+        version = str(notice["version"])
+        from tkinter import messagebox
+
+        if not messagebox.askyesno(
+            "安装更新",
+            f"下载并安装 v{version}？\n\n安装期间助手会关闭，完成后自动重启；"
+            "user_config.json 与助手配置都会保留。",
+            parent=getattr(self, "_root", None),
+        ):
+            return
+        release = ReleaseInfo(
+            version=version,
+            info=str(notice.get("info") or ""),
+            link=str(notice.get("link") or ""),
+            extra_links=tuple(str(item) for item in (notice.get("extra_links") or [])),
+        )
+        self._release_download_in_flight = True
+        self._paint_release_icon()
+        self._set_release_progress("正在准备更新…")
+        threading.Thread(
+            target=self._release_download_job, args=(release,),
+            name="release-download", daemon=True,
+        ).start()
+
+    def _release_download_job(self, release: ReleaseInfo) -> None:
+        """Worker: download, verify, then hand the archive to the restart helper."""
+
+        root = self._install_root()
+        meter = {"position": 0}
+
+        def on_total(total: int) -> None:
+            meter["position"] = 0
+            if total > 0:
+                self._put_release_state(
+                    "progress", f"下载更新 0.0/{total / 1048576:.1f} MB"
+                )
+
+        def on_bytes(position: int) -> None:
+            meter["position"] = position
+            self._put_release_state(
+                "progress", f"下载更新 {position / 1048576:.1f} MB"
+            )
+
+        def on_stage(text_value: str) -> None:
+            self._put_release_state("progress", str(text_value))
+
+        try:
+            archive = stage_update(
+                root, release, on_bytes=on_bytes, on_total=on_total, on_stage=on_stage,
+            )
+        except UpdateCoreError as exc:
+            self._put_release_state("failed", str(exc))
+            return
+        except Exception:  # noqa: BLE001 - report, never crash the UI
+            LOG.exception("更新失败：下载安装包时发生未预期错误")
+            self._put_release_state("failed", "下载更新时发生未预期错误，请稍后重试。")
+            return
+        self._put_release_state("progress", "正在校验安装包…")
+        try:
+            apply_staged_update(root, archive)
+        except UpdateError as exc:
+            self._put_release_state("failed", str(exc))
+            return
+        except Exception:  # noqa: BLE001
+            LOG.exception("更新失败：安排安装时发生未预期错误")
+            self._put_release_state("failed", "无法安排安装，请稍后重试。")
+            return
+        self._put_release_state("staged", str(archive))
+
+    def _show_release_message(self, title: str, text: str, *, error: bool = False) -> None:
+        """One message box for the update icon, never blocking a worker thread."""
+
+        try:
+            from tkinter import messagebox
+
+            if error:
+                messagebox.showerror(title, text, parent=getattr(self, "_root", None))
+            else:
+                messagebox.showinfo(title, text, parent=getattr(self, "_root", None))
+        except Exception:  # noqa: BLE001 - no window to attach to
+            LOG.info("%s：%s", title, text)
 
     def _caption_drag_begin(self, event: Any) -> None:
         """Start an outline-only caption drag (no live window moves)."""
@@ -4397,6 +4745,7 @@ class UiWorker(threading.Thread):
             # dispatch: an armed live pass never waits for cosmetic/status
             # work or configuration I/O.
             self._drain_license_heartbeat_results,
+            self._drain_release_states,
             self._drain_device_memo_results,
             self._drain_device_unbind_results,
             self._drain_lie_accounting_results,
@@ -4569,6 +4918,14 @@ class UiWorker(threading.Thread):
                     self._license_heartbeat_results.put_nowait((generation, status))
                 except Exception:
                     LOG.warning("license heartbeat result could not be queued", exc_info=True)
+                # The heartbeat's release field is the server's newest version.
+                # Comparing it here (a worker thread, no widgets) starts the one
+                # screen the UI still needs: the green caption icon.
+                if status.server_release:
+                    try:
+                        self._schedule_release_check(status.server_release)
+                    except Exception:
+                        LOG.warning("更新提示：版本检查调度失败", exc_info=True)
                 # The first iteration happens immediately. A failed result
                 # keeps the dashboard grey and receives one confirmation ten
                 # minutes later; an accepted result resumes the normal

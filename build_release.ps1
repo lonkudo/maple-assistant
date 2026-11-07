@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     打包 MoonEclipse 的最小发布文件夹。
 

@@ -57,14 +57,20 @@ PIN_ROOT = next(
 # first, then the source tree.
 CONFIG_ROOTS = (_exe_root, HERE)
 
-# Share parsing (share link -> CDN direct URL -> parallel Range download).  This
-# is the only payload path: without it there is nothing to install.
+# Share parsing and the shared update transport.  The download path lives in
+# the application's ``update_core`` module so the installer and the desktop's
+# update icon cannot drift apart; this file only owns the window and the install.
 try:  # noqa: WPS229 - the installer must start even without the helper
-    from lanzou_source import download as lanzou_download
-    from lanzou_source import resolve as lanzou_resolve
-except Exception:  # pragma: no cover - reported when a mirror is actually used
-    lanzou_download = None  # type: ignore[assignment]
-    lanzou_resolve = None  # type: ignore[assignment]
+    from update_core import (
+        ReleaseInfo, UpdateCoreError, archive_version, download_package,
+        parse_release,
+    )
+except Exception:  # pragma: no cover - reported when a download is attempted
+    ReleaseInfo = None  # type: ignore[assignment]
+    UpdateCoreError = RuntimeError  # type: ignore[assignment,misc]
+    archive_version = None  # type: ignore[assignment]
+    download_package = None  # type: ignore[assignment]
+    parse_release = None  # type: ignore[assignment]
 
 
 POINTER_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "MoonEclipseInstaller"
@@ -74,20 +80,11 @@ CONFIG_DIRECTORY = "助手配置"
 # needs neither a .venv nor 安装.bat.
 PROTECTED_EXECUTABLE = "MoonEclipse.exe"
 MAX_DOWNLOAD_WORKERS = 8
-# Share links the operator can drop beside the installer, so the fast path works
-# without a server-side manifest change: {"shares": ["https://www.ilanzou.com/s/..."]}
+# Share links the operator can drop beside the installer, so a manual install
+# works even when the activation server cannot be reached:
+# {"shares": ["<分享链接>"]}.  There is no built-in link: the newest one is served
+# by the activation server (see ``_activate``).
 MIRRORS_FILE = "installer_mirrors.json"
-# Built-in share, so a fresh download works with no configuration file.  Update
-# this URL per release, or override it with installer_mirrors.json
-# ({"shares": ["https://..."]}) next to the installer.
-DEFAULT_SHARE_MIRRORS: tuple[str, ...] = (
-    # QQ 邮箱文件中转站 upload of the current release.  Both this and a 蓝奏
-    # share are per-upload links: a new ZIP means a new link here.  For a URL
-    # that never changes, use a location the operator can overwrite (GitHub
-    # releases/latest/download/..., object storage, or their own server) and put
-    # it here or in installer_mirrors.json - plain https URLs resolve directly.
-    "https://wx.mail.qq.com/s?k=_BLq_GPMNkE5OfMa6g",
-)
 # Folder created on the Desktop for a first install.
 DEFAULT_FOLDER_NAME = "MoonEclipse"
 # The bar is the download and nothing else: it fills from real socket bytes, and
@@ -97,9 +94,6 @@ DEFAULT_FOLDER_NAME = "MoonEclipse"
 PROGRESS_UNITS = 1000
 PROGRESS_DOWNLOAD_SHARE = 1.0
 PROGRESS_LABELS = {"解压": "正在解压安装包", "校验": "正在校验文件", "安装": "正在安装文件"}
-# A mirror slower than this is abandoned when another source is still available
-# (0.1 MB/s is 16 minutes for the 93.6 MB archive); the last source is never cut.
-MIRROR_MIN_RATE_BPS = 1536 * 1024
 
 
 def _desktop_candidates() -> list[Path]:
@@ -251,24 +245,28 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _share_sources(manifest: dict[str, Any]) -> list[str]:
+def _share_sources(manifest: dict[str, Any], release: Any = None) -> list[str]:
     """Share links the installer may fetch the whole package from.
 
-    Three places are honoured, most authoritative first:
+    The newest 更新链接 record comes from the activation server, so a release no
+    longer needs a new installer build.  Honoured, most authoritative first:
 
-    1. ``manifest["mirrors"]``          - what the pinned origin issued;
-    2. ``manifest["bundle"]["mirrors"]`` - the same list beside the bundle entry;
-    3. ``installer_mirrors.json``        - ``{"shares": [...]}`` dropped next to
-       the installer (or the app root), so an operator can point the installer
-       at a fresh share without a server change.
+    1. the served ``release`` record (``link``, then ``extra_links``);
+    2. ``manifest["mirrors"]`` / ``manifest["bundle"]["mirrors"]`` - a legacy
+       server-side publish, still accepted when the operator uses one;
+    3. ``installer_mirrors.json`` - ``{"shares": [...]}`` dropped next to the
+       installer (or the app root), a manual escape hatch when the server is
+       unreachable.
 
-    Only ``http(s)`` share URLs are returned; the pinned origin's per-file
-    SHA-256 values remain the only authority on what gets installed.
+    There is deliberately no built-in link: a hardcoded address is one release
+    stale the moment it ships.  Only ``http(s)`` URLs are accepted.
     """
 
     found: list[str] = []
 
     def add(values: Any) -> None:
+        if isinstance(values, str):
+            values = [values]
         if not isinstance(values, (list, tuple)):
             return
         for value in values:
@@ -278,13 +276,15 @@ def _share_sources(manifest: dict[str, Any]) -> list[str]:
                     if text not in found:
                         found.append(text)
 
+    released = getattr(release, "links", None)
+    if callable(released):
+        add(list(released()))
+    else:
+        add(release)
     add(manifest.get("mirrors"))
     bundle = manifest.get("bundle")
     if isinstance(bundle, dict):
         add(bundle.get("mirrors"))
-    # The build's own share comes after anything the server issued, so a server
-    # update can retarget the installer without a new build.
-    add(DEFAULT_SHARE_MIRRORS)
     for folder in CONFIG_ROOTS:
         candidate = folder / MIRRORS_FILE
         try:
@@ -296,22 +296,27 @@ def _share_sources(manifest: dict[str, Any]) -> list[str]:
         if isinstance(data, dict):
             add(data.get("shares"))
     if found:
-        logging.info("installer: %d share source(s) available: %s",
-                     len(found), ", ".join(found))
+        # Host names only: a share URL is a capability, not a log line.
+        logging.info(
+            "installer: %d share source(s) available: %s",
+            len(found), ", ".join(_link_host(item) for item in found),
+        )
     return found
+
+
+def _link_host(link: str) -> str:
+    try:
+        from urllib.parse import urlsplit
+
+        return urlsplit(str(link)).hostname or ""
+    except ValueError:
+        return ""
 
 
 def _archive_version(archive: Path) -> str:
     """The ``VERSION`` member of a release archive, or "" when absent."""
 
-    try:
-        with zipfile.ZipFile(archive) as bundle:
-            for name in ("VERSION", "app/VERSION"):
-                if name in bundle.namelist():
-                    return bundle.read(name).decode("ascii", "replace").strip()
-    except (OSError, zipfile.BadZipFile):
-        return ""
-    return ""
+    return archive_version(archive)
 
 
 def _profile_search_dirs(root: Path) -> list[Path]:
@@ -594,12 +599,14 @@ def _is_previous_install(root: Path) -> bool:
     return False
 
 
-def _activate(code: str) -> tuple[str, str]:
-    """Validate this copy against the activation server.
+def _activate(code: str) -> tuple[str, Any]:
+    """Validate this copy against the activation server; return its release.
 
-    Returns ``(session_token, catalogue_version)``.  Authentication only: the
-    installer never downloads payload from that server, so the catalogue version
-    is informational (it is logged, not enforced).
+    Returns ``(session_token, release)``.  The token is only meaningful when the
+    operator still publishes a server-side manifest, so it may be empty: the
+    payload is fetched from the 更新链接 record's netdisk share, which is what the
+    reply now carries.  ``release`` is a ``ReleaseInfo`` (or ``None`` when the
+    server has published nothing).
     """
 
     payload = {
@@ -616,13 +623,21 @@ def _activate(code: str) -> tuple[str, str]:
     except PinnedTlsError as exc:
         raise RuntimeError(f"授权失败：无法连接到授权服务器（{exc}）") from exc
     token = str((answer or {}).get("session_token") or "")
-    if not token:
-        raise RuntimeError("授权失败：服务器未返回会话。")
-    manifest = answer.get("manifest")
-    version = ""
-    if isinstance(manifest, dict):
-        version = str(manifest.get("version") or "")
-    return token, version
+    release = parse_release((answer or {}).get("release")) if parse_release else None
+    if release is None:
+        manifest = (answer or {}).get("manifest")
+        if isinstance(manifest, dict) and manifest.get("version"):
+            # A legacy publish still names the version; the link then comes from
+            # the manifest's mirrors through ``_share_sources``.
+            release = ReleaseInfo(version=str(manifest["version"]))
+    if token or release is not None:
+        logging.info(
+            "installer: activation ok, session=%s release=%s",
+            "yes" if token else "no",
+            getattr(release, "version", "") or "none",
+        )
+        return token, release
+    raise RuntimeError("授权失败：服务器未返回下载信息。")
 
 
 def _lens_outline(
@@ -685,6 +700,7 @@ def _version_tuple(value: str) -> tuple[int, ...]:
 def _fetch_package(
     update_dir: Path,
     target_root: Path,
+    release: Any = None,
     *,
     on_bytes: Any,
     on_total: Any = None,
@@ -695,30 +711,29 @@ def _fetch_package(
 
     Returns ``(entries, version, skipped)``.  The archive is unpacked straight
     over the selected folder - duplicate files are replaced, nothing is nested -
-    and the entries describe what was written (path, size, SHA-256).
+    and the entries describe what was written (path, size, SHA-256).  ``release``
+    is the record the activation server served; its link is the only automatic
+    source of the package.
     """
 
-    if lanzou_download is None or lanzou_resolve is None:
-        raise RuntimeError("安装包解析模块不可用，无法下载。")
-    shares = _share_sources({})
+    if download_package is None:
+        raise RuntimeError("安装包下载模块不可用，无法下载。")
+    if release is None:
+        release = ReleaseInfo(version="")
+    shares = _share_sources({}, release)
     if not shares:
-        raise RuntimeError("没有可用的分享链接；请在 installer_mirrors.json 中配置。")
-
-    meter = {"bytes": 0}
-    meter_lock = threading.Lock()
-
-    def phase_reset(total: int) -> None:
-        with meter_lock:
-            meter["bytes"] = 0
-        if on_total is not None:
-            on_total(max(0, int(total)))
-        on_bytes(0)
-
-    def phase_progress(count: int) -> None:
-        with meter_lock:
-            meter["bytes"] += max(0, int(count))
-            position = meter["bytes"]
-        on_bytes(position)
+        raise RuntimeError(
+            "无法从服务器获取最新下载地址；"
+            "请确认网络与授权状态，或在 installer_mirrors.json 中手动配置。"
+        )
+    # The shared transport owns the mirrors loop, the progress callbacks and the
+    # version check; this window only reports them.
+    location = ReleaseInfo(
+        version=getattr(release, "version", "") or "",
+        info=getattr(release, "info", "") or "",
+        link=shares[0],
+        extra_links=tuple(shares[1:]),
+    )
 
     def stage(text_value: str) -> None:
         if on_stage is not None:
@@ -728,26 +743,22 @@ def _fetch_package(
         if on_files is not None:
             on_files(phase, done, total)
 
-    archive = update_dir / "package.zip"
-    problems: list[str] = []
-    for index, mirror in enumerate(shares):
-        try:
-            share = lanzou_resolve(mirror)
-            phase_reset(int(getattr(share, "size", 0) or 0))
-            stage("正在下载更新安装包…")
-            lanzou_download(
-                share, archive, parts=8, progress=phase_progress,
-                min_rate_bps=MIRROR_MIN_RATE_BPS if index + 1 < len(shares) else 0,
-            )
-            break
-        except Exception as exc:  # noqa: BLE001 - try the next mirror
-            logging.warning("installer: share %s unusable: %s", mirror, exc)
-            problems.append(str(exc))
-            stage(f"安装包获取失败（{str(exc)[:60]}）")
-    else:
-        raise RuntimeError("无法从分享链接获取安装包：" + ("；".join(problems) or "没有可用来源"))
+    try:
+        archive = download_package(
+            location, update_dir,
+            on_bytes=on_bytes, on_total=on_total, on_stage=on_stage,
+            filename="package.zip",
+        )
+    except UpdateCoreError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     version = _archive_version(archive)
+    if not version:
+        raise RuntimeError("安装包里没有 VERSION 文件，无法确认版本。")
+    if location.version and _version_tuple(location.version) > _version_tuple(version):
+        raise RuntimeError(
+            f"下载到的安装包是 {version}，低于服务器公布的 {location.version}。"
+        )
     stage("正在解压安装包…")
     _extract_bundle(
         archive, target_root,
@@ -1017,11 +1028,9 @@ class InstallerWindow:
     def _install_worker(self, code: str, root: Path) -> None:
         try:
             # Authentication first: an invalid code stops before any download.
-            _token, catalogue_version = _activate(code)
-            if catalogue_version:
-                logging.info(
-                    "installer: activation ok, catalogue version %s", catalogue_version
-                )
+            # The reply also carries the newest 更新链接 record, which is where
+            # this installer learns the download address at all.
+            _token, release = _activate(code)
             root = root.resolve()
             root.mkdir(parents=True, exist_ok=True)
             # An older layout keeps 助手配置 elsewhere (inside app\, or the
@@ -1038,7 +1047,7 @@ class InstallerWindow:
             # the folder.  No local manifest, no per-file diff - user data
             # (助手配置) is preserved by _extract_bundle.
             entries, version, _skipped = _fetch_package(
-                update_dir, root,
+                update_dir, root, release,
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
