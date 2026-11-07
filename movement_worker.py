@@ -296,9 +296,17 @@ JUMP_POINT_UP_TARGET_TOLERANCE = 0.012
 # layer change is confirmed a frame or two later.  Until then the old floor's
 # route must NOT run its own legs on the new floor (the 22:53 log: "up;
 # repeating left" then a full right leg on layer2 before the resync).  The up
-# phase waits this long for the layer change, then falls back to the layer's
-# own actions.
-JUMP_UP_LANDING_WAIT_SECONDS = 2.0
+# phase holds still this long for the layer change, then retries the hop from
+# where the character stands (see _rearm_jump_up_for_retry).
+#
+# 800 ms, not 2 s: the landing verdict itself already needed
+# JUMP_UP_STABLE_FRAMES (3) settled samples, and the post-jump layer resync
+# accepts the new floor on its FIRST detection - at the 5 fps capture one frame
+# is 0.2 s, so 0.8 s is four frames of margin.  The 2 s window was the operator's
+# complaint: the character stood on the landing long enough for the old floor's
+# route to walk back over the stair ledge (22:40 "up; repeating left"), the
+# marker fell to layer1 and the layer flipped twice.
+JUMP_UP_LANDING_WAIT_SECONDS = 0.8
 # Jump-up point (vertical hop).  It owns no Up claim and no rope semantics: it
 # fires once, waits for the marker to settle *higher*, and retries the chord up
 # to JUMP_UP_MAX_ATTEMPTS times before letting the route continue.
@@ -4764,6 +4772,13 @@ class MovementWorker(threading.Thread):
         # left, rather than recalculating direction at every turn.
         self._route_entry_phase: Optional[str] = None
         self._route_entry_context: Optional[tuple[int, str]] = None
+        # Phases already completed on each route layer in the CURRENT circuit.
+        # The operator's rule: "if layer1 is finished the next one should be
+        # layer2, don't try layer1 again" and "if hit down or fall, return to the
+        # next layer rather than rerun".  A layer whose horizontal legs are done
+        # keeps only its way-up phase, so a knock-down back onto it walks straight
+        # to the rope/up point and leaves again instead of re-walking its ledges.
+        self._route_phases_done: dict[str, set[str]] = {}
         # Start Patrol performs its own focused capture and floor detection.
         # Transfer that result into this worker on its next frame so a stale
         # Stop/Start climb, return, or route index cannot survive the restart.
@@ -9205,9 +9220,17 @@ class MovementWorker(threading.Thread):
             if 0 <= self._route_layer_index < len(self._route_layers)
             else "route-complete"
         )
+        # Record the phase the character left behind before the entry decision
+        # rewrites it: a rope arrival means the rope phase finished, and any
+        # other transition means the horizontal/up phase it was walking reached
+        # its end.  This is what lets the shared route skip a finished layer.
+        leaving_phase = self._route_phase
         was_climbing = climb_input_active
         if was_climbing:
             self._climb_arrival_at = time.monotonic()
+            self._mark_route_phase_done(previous_name, "rope")
+        elif leaving_phase in ("left", "right", "up"):
+            self._mark_route_phase_done(previous_name, leaving_phase)
         self._release_climb_up()
         self._route_layer_index = detected_index
         # The marker is confirmed on an in-range route layer: any below-range
@@ -10843,6 +10866,9 @@ class MovementWorker(threading.Thread):
         self._stationary_pickup_phase = "route"
         self._stationary_pickup_next_at = float("inf")
         self._route_patrol_cycle = 1
+        # The 定时巡逻 circuit is a fresh pass over the route: the completion
+        # ledger starts empty, exactly like a normal patrol loop.
+        self._reset_route_completion()
         self._begin_jump_point_pass("timed stationary patrol")
         self._jump_point_inside_tokens.clear()
         self._jump_point_suppressed_tokens.clear()
@@ -12174,6 +12200,8 @@ class MovementWorker(threading.Thread):
         """Restart patrol from ``floor`` (must be inside the patrol range)."""
         self._clear_endpoint_turn_rearm()
         self._clear_layer_resync_candidate()
+        # A fresh patrol is a fresh circuit: every layer's legs owe a pass again.
+        self._reset_route_completion()
         self._route_layer_index = self._route_layers.index(floor)
         # Back inside the patrol range: any below-range rescue streak is over.
         self._rescue_cycles = 0
@@ -14497,6 +14525,21 @@ class MovementWorker(threading.Thread):
                     and time.monotonic() - self._jump_up_landed_at
                     < JUMP_UP_LANDING_WAIT_SECONDS):
                 return None, False, f"{name}.awaiting-layer"
+            if self._jump_up_landed_at > 0.0:
+                # The wait expired without a layer change while the character
+                # stood on the landing.  Repeating the layer's own legs is what
+                # destroyed the hop: the 22:40 field log walked BACK over the
+                # stair ledge ("up; repeating left"), the marker fell to the old
+                # floor and the layer flipped layer1 -> layer2 -> layer1.  Stay
+                # on the way-up phase and re-arm this leg's point so the hop is
+                # retried from where the character stands.
+                LOG.warning(
+                    "JUMP UP landing not confirmed as a layer change after "
+                    "%.1fs; re-arming %s's up point and retrying the hop",
+                    JUMP_UP_LANDING_WAIT_SECONDS, name,
+                )
+                self._rearm_jump_up_for_retry(name)
+                self._jump_up_landed_at = 0.0
             up_x = self._layer_up_point_x(name)
             if up_x is None:
                 return None, False, f"{name}.no-way-up"
@@ -14789,6 +14832,52 @@ class MovementWorker(threading.Thread):
         except (KeyError, TypeError, ValueError):
             return None
 
+    def _route_phase_is_done(self, name: str, phase: str) -> bool:
+        return phase in self._route_phases_done.get(name, set())
+
+    def _mark_route_phase_done(self, name: str, phase: str) -> None:
+        """Record one completed phase of ``name`` for this circuit."""
+
+        if not name or not phase:
+            return
+        done = self._route_phases_done.setdefault(name, set())
+        if phase not in done:
+            done.add(phase)
+            LOG.info("ROUTE COMPLETION: %s.%s done (%s)", name, phase,
+                     "+".join(sorted(done)))
+
+    def _horizontal_phases(self, name: str) -> list[str]:
+        """The layer's recorded horizontal legs (its checkpoint-able phases)."""
+
+        layer = self.important_positions.get(name, {})
+        if not isinstance(layer, dict):
+            return []
+        return [
+            edge for edge in ("left", "right")
+            if isinstance(layer.get(f"{edge}_most_pos"), dict)
+        ]
+
+    def _layer_horizontal_done(self, name: str) -> bool:
+        """Whether every horizontal leg of the layer is finished this circuit."""
+
+        phases = self._horizontal_phases(name)
+        if not phases:
+            return False
+        return all(self._route_phase_is_done(name, phase) for phase in phases)
+
+    def _reset_route_completion(self) -> None:
+        """Forget the circuit's per-layer completion (a new loop starts)."""
+
+        if self._route_phases_done:
+            LOG.info(
+                "ROUTE COMPLETION reset: %s",
+                ", ".join(
+                    f"{name}={'+'.join(sorted(done)) or '-'}"
+                    for name, done in sorted(self._route_phases_done.items())
+                ),
+            )
+        self._route_phases_done.clear()
+
     def _layer_phases(self, name: str) -> list[str]:
         """Ordered action phases for a layer from its recorded points.
 
@@ -14802,10 +14891,33 @@ class MovementWorker(threading.Thread):
         phases: list[str] = []
         if not isinstance(layer, dict):
             return phases
+        is_final = (
+            self._route_layer_index is not None
+            and self._route_layer_index == len(self._route_layers) - 1
+        )
         edges = [
             edge for edge in ("left", "right")
             if isinstance(layer.get(f"{edge}_most_pos"), dict)
         ]
+        # A layer's way up: its recorded rope, else its recorded up jump point.
+        # A layer that recorded neither (the final floor) has no way up of its
+        # own and ends through the drop/complete paths.
+        #
+        # The operator's completion rule lives HERE, in the shared route engine,
+        # so patrol, 跑花 and the 定时巡逻/站桩 circuit all obey it: once a layer's
+        # horizontal legs are finished in this circuit, they are never walked
+        # again - only its way up remains.  Being knocked down or falling back
+        # onto that floor then walks straight to the rope/up point and leaves,
+        # instead of re-running ledges the circuit already finished.
+        way_up: Optional[str] = None
+        if self.climbing_enabled and not is_final:
+            rope = layer.get("rope_pos")
+            if isinstance(rope, dict) and "x" in rope:
+                way_up = "rope"
+            elif self._layer_up_point_x(name) is not None:
+                way_up = "up"
+        if way_up is not None and self._layer_horizontal_done(name):
+            edges = []
         # The entry decision is re-made every time a layer is entered (layer
         # start, resync, drop restart, climb arrival, new split part) and it
         # must win here: on entry the character starts with the NEAREST edge,
@@ -14821,10 +14933,6 @@ class MovementWorker(threading.Thread):
                 and entry_context[1] == name):
             edges = [entry, *(edge for edge in edges if edge != entry)]
         phases.extend(edges)
-        is_final = (
-            self._route_layer_index is not None
-            and self._route_layer_index == len(self._route_layers) - 1
-        )
         # A layer with a recorded rope climbs it; a layer that recorded none but
         # has an approach point (its recorded jump points are the operator's own
         # way up, see ``_rope_target_for_floor``) must still leave the layer.
@@ -14832,12 +14940,8 @@ class MovementWorker(threading.Thread):
         # field log patrolled layer1 right -> left -> right -> left with no rope
         # phase to advance to, because layer1 has an up jump point at x=0.540441
         # and no rope_pos.
-        if self.climbing_enabled and not is_final:
-            rope = layer.get("rope_pos")
-            if isinstance(rope, dict) and "x" in rope:
-                phases.append("rope")
-            elif self._layer_up_point_x(name) is not None:
-                phases.append("up")
+        if way_up is not None:
+            phases.append(way_up)
         return phases
 
     def _layer_up_point_x(self, name: str) -> Optional[float]:
@@ -14871,6 +14975,41 @@ class MovementWorker(threading.Thread):
         if not xs:
             return None
         return min(xs, key=lambda value: abs(value - self.fixed_target_x))
+
+    def _rearm_jump_up_for_retry(self, name: str) -> None:
+        """Make the layer's up point fireable again on this leg.
+
+        Called when a completed up jump did not turn into a confirmed layer
+        change: the character is standing on the landing, so the honest next step
+        is another hop from the same spot.  Only the up point(s) matching the
+        layer's way-up X are re-armed; a directional point that already fired on
+        this leg keeps its record.
+        """
+
+        layer = self.important_positions.get(name)
+        if not isinstance(layer, dict):
+            return
+        points = layer.get("jump_points") or []
+        target_x = self._layer_up_point_x(name)
+        if target_x is None:
+            return
+        for index, point in enumerate(points):
+            if not isinstance(point, dict):
+                continue
+            if str(point.get("direction", "")).casefold() != "up":
+                continue
+            try:
+                if abs(float(point["x"]) - target_x) > 1e-9:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            token = (name, index)
+            self._jump_point_fired.pop(token, None)
+            self._jump_point_suppressed_tokens.discard(token)
+            self._jump_point_inside_tokens.discard(token)
+            self._jump_point_dwell_frames.pop(token, None)
+            self._jump_point_dwell_last_x.pop(token, None)
+            self._jump_point_dwell_attempts.pop(token, None)
 
     def _jump_point_up_phase_complete(self, name: str) -> bool:
         """Whether the layer's ``up`` phase has done its jump for this leg.
@@ -15157,6 +15296,10 @@ class MovementWorker(threading.Thread):
             index = phases.index(current)
             if index + 1 < len(phases):
                 next_phase = phases[index + 1]
+                # The phase reached its endpoint: record it for the circuit so
+                # this layer's legs are not walked again (shared by patrol, 跑花
+                # and the timed circuit).
+                self._mark_route_phase_done(name, current)
                 self._begin_endpoint_turn(current, next_phase)
                 self._route_phase = next_phase
                 LOG.info("route endpoint reached/crossed: %s; next %s",
@@ -15190,7 +15333,23 @@ class MovementWorker(threading.Thread):
             return True
         if phases:
             # Repeat the layer's own actions: stand at a lone point, patrol a
-            # floor back-and-forth, or hold position before climbing.
+            # floor back-and-forth, or hold position before climbing.  A layer
+            # whose legs are all finished is never repeated: it only has its way
+            # up left, so the route goes there (the operator's rule "if layer1 is
+            # finished the next one should be layer2, don't try layer1 again").
+            way_up = next(
+                (phase for phase in phases if phase in ("up", "rope")), None
+            )
+            if (way_up is not None
+                    and self._layer_horizontal_done(name)
+                    and current not in ("up", "rope")):
+                self._begin_endpoint_turn(current, way_up)
+                self._route_phase = way_up
+                LOG.info(
+                    "route endpoint reached/crossed: %s; %s finished, leaving via %s",
+                    current, name, way_up,
+                )
+                return True
             next_phase = phases[0]
             self._begin_endpoint_turn(current, next_phase)
             self._route_phase = next_phase
@@ -15435,6 +15594,9 @@ class MovementWorker(threading.Thread):
         self._choose_route_entry_phase(
             self.first_layer, observation, reason="route loop reset"
         )
+        # A full circuit is over (back on the first floor): every layer's legs
+        # owe a pass again in the new loop.
+        self._reset_route_completion()
         LOG.info("returned to %s; starting new patrol loop", self.first_layer)
 
     def _endpoint_band_timeout(
