@@ -10716,6 +10716,47 @@ class MovementWorker(threading.Thread):
             0.0, self.stationary_pickup_jitter_seconds
         )
 
+    def _stationary_timed_patrol_route_walking(self) -> bool:
+        """Whether the timed patrol is walking its route right now.
+
+        True only for the ordinary walk between recorded points: the stage is
+        active, the route phase owns movement, the return leg has not started,
+        and no vertical input is in flight.  In that state the 站桩 anchor rules
+        do not apply - the character is deliberately away from the stake - so the
+        fixed attack cadence runs exactly like normal patrol.
+        """
+
+        return bool(
+            self._stationary_timed_patrol_active
+            and self._stationary_pickup_phase == "route"
+            and not self._stationary_timed_patrol_returning
+            and not self._stationary_timed_patrol_input_busy()
+        )
+
+    def _stationary_timed_patrol_input_busy(self) -> bool:
+        """Whether the timed patrol route is currently driving vertical input.
+
+        The timed 定时巡逻 stage walks the ordinary recorded route, so it behaves
+        like normal patrol: the fixed attack cadence keeps beating while the
+        character walks, and only input that owns the keyboard exclusively
+        suppresses a beat - a recorded jump/up point press, a rope/climb
+        operation, or the drop chord.  Anything else used to block the cadence
+        for the entire stage, because a single-layer pickup leg was exclusive
+        from start to finish.
+        """
+
+        if not self._stationary_timed_patrol_active:
+            return False
+        return bool(
+            self._jump_up_active
+            or self._jump_point_up_held
+            or self._climb_state.phase != "idle"
+            or self._climb_state.up_held
+            or self._return_mode is not None
+            or (self.dropping_active_event is not None
+                and self.dropping_active_event.is_set())
+        )
+
     def _stationary_pickup_decision(
         self, anchor: Point, player: Point,
     ) -> Optional[MovementDecision]:
@@ -10723,7 +10764,10 @@ class MovementWorker(threading.Thread):
 
         The historical same-layer pickup circuit is intentionally retired.
         This function only owns the timer; the ordinary route engine owns the
-        actual all-layer traversal, with no Z input and no attack cadence.
+        actual all-layer traversal, with no Z input.  The fixed attack cadence
+        runs during that traversal exactly as it does on normal patrol - the
+        route walks and attacks, and only its vertical input (rope/climb/drop and
+        a recorded jump point) suppresses a beat.
         """
 
         if (not self.stationary_pickup_enabled
@@ -17384,6 +17428,16 @@ class MovementWorker(threading.Thread):
                 stationary_recovery_exclusive = bool(
                     self.stationary_attack_enabled
                     and anchor is not None
+                    # The timed patrol stage walks away from the stake on
+                    # purpose: the anchor zone, the readiness check and the
+                    # pickup-phase flag all describe "站桩 recovery", which would
+                    # otherwise hold the whole route attack-free (the old
+                    # single-layer pickup was exclusive end to end).  While the
+                    # route is simply walking, the cadence must behave like
+                    # normal patrol - only its vertical input stays exclusive,
+                    # which the remaining terms and ``climbing_now`` below
+                    # already cover.
+                    and not self._stationary_timed_patrol_route_walking()
                     and (
                         # A route climb/drop is always exclusive, including
                         # its idle observations between physical key presses.
@@ -17403,10 +17457,10 @@ class MovementWorker(threading.Thread):
                         or not self._stationary_attack_ready_for_player(
                             anchor, player,
                         )
-                        # A pickup leg remains exclusive even when the live
-                        # decision has been replaced by its recorded jump
-                        # point.  Do not let fixed attack interrupt that jump.
-                        or self._stationary_pickup_phase is not None
+                        # A recorded jump point or a climb owns the keyboard for
+                        # the frame it fires, so a cadence beat must not land on
+                        # top of it.
+                        or self._stationary_timed_patrol_input_busy()
                     )
                 )
                 # This independent event gates fixed attacks only while the

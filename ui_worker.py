@@ -11917,6 +11917,29 @@ class UiWorker(threading.Thread):
                 anchor="w",
             ).grid(row=1, column=1, sticky="w")
 
+        # Two setup requirements follow the binding table: both are conditions
+        # the assistant cannot detect, and both were asked for by the operator
+        # after field reports where the game simply ignored the jump chord or the
+        # minimap geometry did not match the recording.  They stay below the
+        # table so the bindings - what the operator opens "?" for - come first.
+        if key_lines:
+            # A thin rule separates the binding list from the requirements.
+            tk.Frame(content, bg="#d8d0a8", height=1).pack(fill="x", pady=(5, 4))
+        tk.Label(
+            content, text="注意事项", background="#fffbd6",
+            foreground="#202020", font=("", 9, "bold"), anchor="w",
+        ).pack(fill="x")
+        for line in (
+            "1. 跳跃键必须绑定 alt。",
+            "2. 游戏内分辨率必须设置为 1366x768；"
+            "如果窗口太小，请到 Windows「显示设置」把缩放改为 150% 或 125%。",
+        ):
+            tk.Label(
+                content, text=line, justify="left", anchor="w",
+                background="#fffbd6", foreground="#202020",
+                wraplength=380,
+            ).pack(fill="x", pady=(0, 1))
+
         # Stay open while the pointer is over the popup; hover-out closes it.
         self._help_bind_popup_hover(popup)
 
