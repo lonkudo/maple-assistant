@@ -117,6 +117,7 @@ class AutoRestartWorker(threading.Thread):
         self._sending_offline_esc = threading.Event()
         self._running = False
         self._test_requested = False
+        self._logoff_requested = False
 
     def configure(self, *, enabled: bool, offline_message: object = "") -> None:
         with self._lock:
@@ -155,6 +156,24 @@ class AutoRestartWorker(threading.Thread):
             self._test_requested = True
         self._wake.set()
         LOG.info("auto restart: manual test requested")
+        return True
+
+    def trigger_logoff(self) -> bool:
+        """Log the client off and STOP there - no relaunch, no reconnect.
+
+        定时下机 wants exactly the offline half of this lifecycle: the character
+        must leave the game and stay off.  ``trigger_test`` runs the full
+        restart, which hand the login to 自动重连 afterwards - the field report
+        "定时下机 auto reconnected" is that handoff, not a stray click.
+        """
+
+        with self._lock:
+            if self._running or self._test_requested or self._logoff_requested:
+                LOG.info("auto restart: logoff ignored; an action is already active")
+                return False
+            self._logoff_requested = True
+        self._wake.set()
+        LOG.info("auto restart: logoff requested (no reconnect afterwards)")
         return True
 
     def _report(self, state: str, detail: str) -> None:
@@ -502,6 +521,25 @@ class AutoRestartWorker(threading.Thread):
         finally:
             self.restart_active_event.clear()
 
+    def _run_logoff(self, offline_message: str) -> None:
+        """The offline half of ``_run_restart``: log out and keep the game off.
+
+        Deliberately stops before ``_wait_for_login_page_ready`` and
+        ``_handoff_to_reconnect``: no launcher, no login, no patrol restart.
+        """
+
+        self.restart_active_event.set()
+        try:
+            if callable(self.stop_patrol):
+                self.stop_patrol()
+            delivered = self._send_offline_sequence(offline_message)
+            if delivered:
+                self._report("logoff", "已下线，不会再自动重连")
+            else:
+                self._report("warning", "下线按键未完整送达")
+        finally:
+            self.restart_active_event.clear()
+
     def run(self) -> None:
         LOG.info("auto restart worker started (checks system memory every %.0f minutes)", self.CHECK_SECONDS / 60.0)
         # Give the header one prompt reading, then use the shared 30-second
@@ -515,6 +553,20 @@ class AutoRestartWorker(threading.Thread):
             with self._lock:
                 manual_test = self._test_requested
                 self._test_requested = False
+                logoff_requested = self._logoff_requested
+                self._logoff_requested = False
+            if logoff_requested:
+                with self._lock:
+                    self._running = True
+                    self._cancel_requested.clear()
+                try:
+                    self._report("logoff", "定时下机")
+                    self._run_logoff(offline_message)
+                finally:
+                    with self._lock:
+                        self._running = False
+                next_check = time.monotonic() + self.CHECK_SECONDS
+                continue
             if manual_test:
                 with self._lock:
                     self._running = True

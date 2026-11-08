@@ -65,6 +65,10 @@ from update_manager import (
     schedule_package_update,
 )
 from runtime_paths import application_root, package_format
+from dingtalk_notifier import (
+    format_dingtalk_message, normalize_webhook as normalize_dingtalk_webhook,
+    send_in_background as send_dingtalk_in_background,
+)
 from crash_reporter import record_current_exception, record_exception
 from ui_hang_watchdog import UiHangWatchdog
 from auto_lie_secret import clear_server_secret, get_server_secret, has_server_secret
@@ -1387,6 +1391,7 @@ class UiWorker(threading.Thread):
         lie_detector_worker: Any = None,
         screen_blinker: Any = None,
         telegram_notifier: Any = None,
+        dingtalk_notifier: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_restart: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
@@ -1528,6 +1533,10 @@ class UiWorker(threading.Thread):
         # Optional Telegram delivery runs in its own worker; UI calls only
         # non-blocking configuration/queue methods.
         self.telegram_notifier = telegram_notifier
+        # 钉钉提醒: same contract as the Telegram notifier - the UI only writes
+        # the webhook / switch and reads a status line, the worker owns the
+        # network.  Armed by the same 消息 selection as the other channels.
+        self.dingtalk_notifier = dingtalk_notifier
         self._telegram_bot_token = ""
         self._telegram_chat_id = ""
         self._quick_messages: list[str] = []
@@ -3139,16 +3148,43 @@ class UiWorker(threading.Thread):
                 variable=self._telegram_enabled_var,
                 command=self._shutdown_on_change,
             )
-            # Temporarily retained as an internal persisted setting, but not
-            # exposed in the compact dashboard UI.
+            telegram_check.pack(side="left")
+            # 钉钉消息: the group-robot webhook, in the same 提醒 row and the
+            # same plain button style as the other controls.  The button carries
+            # its own state (钉钉消息 / 钉钉已设置); the live status shares the
+            # 图层校准与巡逻 hint line instead of owning a row of its own.
+            self._dingtalk_webhook = self._load_dingtalk_webhook()
+            self._dingtalk_results: queue.Queue[tuple[Any, Any]] = queue.Queue()
+            self._dingtalk_note = ""
+            self._dingtalk_button = ttk.Button(
+                reminder_row,
+                text="钉钉消息",
+                command=self._dingtalk_change_webhook,
+            )
+            self._dingtalk_button.pack(side="left", padx=(8, 0))
+            # 设备名: the marker every push carries ("MoonEclipse 设备名 掉线 时间…"),
+            # so the group can tell two running machines apart.  Same plain
+            # button style, and it reports its own state (设备名 / 名称已设置).
+            self._dingtalk_name_button = ttk.Button(
+                reminder_row,
+                text="设备名",
+                command=self._edit_dingtalk_name,
+            )
+            self._dingtalk_name_button.pack(side="left", padx=(8, 0))
             for widget, hint_text in (
                 (sound_check, "发出dingdong的声音"),
                 (blink_check, "屏幕闪烁红色，适用于没声音的电脑"),
-                (telegram_check, "telegram消息推送提醒"),
+                (telegram_check, "勾选后：掉线、测谎、循环 推送到钉钉群"),
+                (self._dingtalk_button, "设置钉钉群机器人的 webhook 链接（点击输入，留空清除）"),
+                (self._dingtalk_name_button, "设置推送消息里的设备名称（点击输入，留空清除）"),
             ):
                 tooltip = HoverTooltip(widget, hint_text)
                 tooltip.set_enabled(True)
                 self._bind_key_tooltips.append(tooltip)
+            self._refresh_dingtalk_button()
+            self._refresh_dingtalk_name_button()
+            self._apply_dingtalk_settings()
+            self._apply_dingtalk_settings()
             telegram_row = ttk.Frame(extra_panel)
             # 消息推送配置 is intentionally hidden for now.  Keep its widgets
             # instantiated so existing saved settings and notifier callbacks
@@ -3326,6 +3362,62 @@ class UiWorker(threading.Thread):
             )
             self._auto_restart_check.pack(side="left")
             self._restart_offline_message_button.pack(side="left", padx=(6, 0))
+            # 定时下机: the same 清理内存 log-off, on a clock instead of on memory.
+            # It reuses the 循环 numeric control (NumericValueRangeControl) as
+            # three HH : mm : ss fields capped at 12:00:00, and when the time is
+            # reached it asks the auto-restart worker for its normal lifecycle
+            # (下线消息 -> Esc -> 下线 -> 重连), exactly like the memory trigger.
+            self._timed_logout_var = tk.BooleanVar(value=False)
+            timed_logout_check = ttk.Checkbutton(
+                restart_row,
+                text="定时下机",
+                variable=self._timed_logout_var,
+                command=self._timed_logout_on_change,
+            )
+            timed_logout_check.pack(side="left", padx=(12, 0))
+            timed_clock_width = 2
+            timed_clock_extra = (8, 10, 10)
+            self._timed_logout_hour_control = NumericValueRangeControl(
+                restart_row, tk_module=tk, ttk_module=ttk,
+                minimum=0, range_mode=False, value_type=int, step=1,
+                lower_bound=0, upper_bound=self.TIMED_LOGOUT_MAX_HOURS, unit="",
+                value_width=timed_clock_width,
+                extra_width_px=timed_clock_extra[0],
+                before_change=lambda: self._undo_capture_callback("定时下机"),
+                on_change=self._timed_logout_on_change,
+            )
+            self._timed_logout_minute_control = NumericValueRangeControl(
+                restart_row, tk_module=tk, ttk_module=ttk,
+                minimum=0, range_mode=False, value_type=int, step=1,
+                lower_bound=0, upper_bound=59, unit="",
+                value_width=timed_clock_width,
+                extra_width_px=timed_clock_extra[1],
+                before_change=lambda: self._undo_capture_callback("定时下机"),
+                on_change=self._timed_logout_on_change,
+            )
+            self._timed_logout_second_control = NumericValueRangeControl(
+                restart_row, tk_module=tk, ttk_module=ttk,
+                minimum=0, range_mode=False, value_type=int, step=1,
+                lower_bound=0, upper_bound=59, unit="",
+                value_width=timed_clock_width,
+                extra_width_px=timed_clock_extra[2],
+                before_change=lambda: self._undo_capture_callback("定时下机"),
+                on_change=self._timed_logout_on_change,
+            )
+            self._timed_logout_hour_control.pack(side="left", padx=(6, 0))
+            ttk.Label(restart_row, text=":").pack(side="left")
+            self._timed_logout_minute_control.pack(side="left")
+            ttk.Label(restart_row, text=":").pack(side="left")
+            self._timed_logout_second_control.pack(side="left")
+            timed_logout_hint = HoverTooltip(
+                timed_logout_check,
+                "到时间后下线",
+            )
+            timed_logout_hint.set_enabled(True)
+            self._bind_key_tooltips.append(timed_logout_hint)
+            self._timed_logout_deadline: Optional[float] = None
+            self._timed_logout_deadline: Optional[float] = None
+            self._timed_logout_note = ""
             # Retain invisible status sinks for workflow callbacks.  The
             # Additional Functions panel intentionally shows controls only;
             # progress and failures are reported in the running log instead.
@@ -4790,6 +4882,9 @@ class UiWorker(threading.Thread):
             self._refresh_shutdown_status,
             self._refresh_countdown_status,
             self._refresh_telegram_status,
+            self._drain_dingtalk_results,
+            self._refresh_panel_hints,
+            self._tick_timed_logout,
             self._poll_yolo_exit,
             self._drain_api_test_results,
             self._service_auto_lie_marker_verification,
@@ -11097,6 +11192,23 @@ class UiWorker(threading.Thread):
             data["telegram_machine_name"] = self._telegram_machine_var.get().strip()
         if hasattr(self, "_quick_messages"):
             data["quick_messages"] = list(self._quick_messages)
+        # 定时下机: the one-shot 清理内存 log-off, with the wait in seconds.
+        data["timed_logout_enabled"] = bool(
+            self._timed_logout_var.get()
+            if hasattr(self, "_timed_logout_var") else False
+        )
+        data["timed_logout_seconds"] = (
+            self._timed_logout_seconds()
+            if hasattr(self, "_timed_logout_hour_control") else 0
+        )
+        # 钉钉提醒: webhook + the 消息 switch are part of 附加功能 configuration.
+        data["dingtalk_webhook"] = str(
+            getattr(self, "_dingtalk_webhook", "") or ""
+        )
+        data["dingtalk_enabled"] = bool(
+            self._telegram_enabled_var.get()
+            if hasattr(self, "_telegram_enabled_var") else False
+        )
         if hasattr(self, "_countdown_enabled_var"):
             data["countdown_enabled"] = bool(
                 self._countdown_enabled_var.get()
@@ -11174,6 +11286,501 @@ class UiWorker(threading.Thread):
         self._shutdown_save_settings(data)
         self._shutdown_apply_to_worker(data)
         self._shutdown_refresh_grey()
+
+    def _load_dingtalk_webhook(self) -> str:
+        """The saved 钉钉 webhook, normalised ("" when unset or unusable)."""
+
+        try:
+            data = json.loads(
+                self._shutdown_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        return normalize_dingtalk_webhook(data.get("dingtalk_webhook", ""))
+
+    def _apply_dingtalk_settings(self) -> None:
+        """Hand the webhook / switch / 设备名称 to the 钉钉 worker and repaint.
+
+        The status line is the 图层校准与巡逻 panel's hint, so this is also what
+        keeps that hint truthful after every change (saved, cleared, armed).
+        """
+
+        notifier = getattr(self, "dingtalk_notifier", None)
+        webhook = str(getattr(self, "_dingtalk_webhook", "") or "")
+        enabled = False
+        variable = getattr(self, "_telegram_enabled_var", None)
+        if variable is not None:
+            try:
+                enabled = bool(variable.get())
+            except Exception:  # noqa: BLE001 - Tk variable, display only
+                enabled = False
+        if notifier is not None:
+            configure = getattr(notifier, "configure", None)
+            if callable(configure):
+                try:
+                    configure(webhook, self._dingtalk_machine_name(), enabled)
+                except Exception:  # noqa: BLE001 - never break the panel
+                    LOG.warning("钉钉提醒: settings could not be applied",
+                                exc_info=True)
+        self._refresh_dingtalk_button()
+        self._refresh_dingtalk_name_button()
+        self._refresh_dingtalk_status()
+
+    # The 钉钉 status shares the panel hint line ("在线授权验证成功…") instead of
+    # owning a row of its own: the note is appended to whatever that line
+    # currently says and re-appended on every poll tick.
+    DINGTALK_NOTE_SEP = " · "
+
+    def _dingtalk_note_text(self) -> str:
+        """The ONE short 钉钉 state appended to the panel hint.
+
+        How to configure it lives in the panel tooltips, not here: repeating
+        "掉线、测谎、循环…" in this line as well made the same sentence appear
+        twice on screen.
+        """
+
+        transient = str(getattr(self, "_dingtalk_note", "") or "")
+        if transient:
+            # A test result is shown exactly once; the next tick reports the
+            # notifier's own state again.
+            self._dingtalk_note = ""
+            return transient
+        notifier = getattr(self, "dingtalk_notifier", None)
+        status_text = getattr(notifier, "status_text", None)
+        if callable(status_text):
+            try:
+                state = str(status_text())
+            except Exception:  # noqa: BLE001 - hint only
+                state = ""
+            if state:
+                return f"钉钉消息: {state}"
+        if not getattr(self, "_dingtalk_webhook", ""):
+            return "钉钉消息: 未设置"
+        enabled = False
+        variable = getattr(self, "_telegram_enabled_var", None)
+        try:
+            enabled = bool(variable.get()) if variable is not None else False
+        except Exception:  # noqa: BLE001
+            enabled = False
+        return "钉钉消息: 已开启" if enabled else "钉钉消息: 已设置，未开启"
+
+    def _refresh_panel_hints(self) -> None:
+        """Write every 附加功能 status onto the ONE shared hint line.
+
+        Order is fixed (钉钉 first, then 定时下机) so the line never reorders
+        itself, and any previous notes are stripped before the new ones are
+        appended - no stacked, half-stale sentences.
+        """
+
+        label = getattr(self, "_control_status", None)
+        if label is None:
+            return
+        try:
+            current = str(label.cget("text") or "")
+        except Exception:  # noqa: BLE001 - hint only
+            return
+        base = current.split(self.DINGTALK_NOTE_SEP)[0].rstrip(" ·;；")
+        notes = []
+        dingtalk_note = self._dingtalk_note_text()
+        if dingtalk_note:
+            notes.append(dingtalk_note)
+        timed_note = self._timed_logout_remaining_text()
+        if timed_note:
+            notes.append(timed_note)
+        self.last_dingtalk_status = dingtalk_note
+        self.last_timed_logout_status = timed_note
+        text = self.DINGTALK_NOTE_SEP.join([base, *notes]) if base else \
+            self.DINGTALK_NOTE_SEP.join(notes)
+        try:
+            label.configure(text=text)
+        except Exception:  # noqa: BLE001 - a hint is cosmetic
+            LOG.debug("面板提示: could not be painted", exc_info=True)
+
+    def _refresh_dingtalk_status(self) -> None:
+        """Compatibility alias: the 钉钉 state is part of the shared hint now."""
+
+        self._refresh_panel_hints()
+
+    def _refresh_dingtalk_button(self) -> None:
+        """The button doubles as the state readout: 钉钉消息 / 钉钉已设置."""
+
+        button = getattr(self, "_dingtalk_button", None)
+        if button is None:
+            return
+        try:
+            button.configure(
+                text="钉钉已设置" if getattr(self, "_dingtalk_webhook", "")
+                else "钉钉消息"
+            )
+        except Exception:  # noqa: BLE001 - a label is cosmetic
+            LOG.debug("钉钉消息: button could not be repainted", exc_info=True)
+
+    def _set_dingtalk_status(self, text: str, *, error: bool = False) -> None:
+        """Show one transient note in the shared hint line.
+
+        The note survives until the next poll, which replaces it with the
+        notifier's own state, so a test result is visible without becoming a
+        permanent fixture.
+        """
+
+        del error  # the shared hint line has one colour; the wording carries it
+        self._dingtalk_note = f"钉钉消息: {text}"
+        self._refresh_dingtalk_status()
+
+    def _dingtalk_change_webhook(self) -> None:
+        """Ask for the group-robot webhook and send one test message.
+
+        An empty answer clears the setting (the button returns to 钉钉提醒).
+        A stored webhook is verified immediately, because "saved" without a
+        delivered message tells the operator nothing.
+        """
+
+        from tkinter import simpledialog
+
+        try:
+            value = simpledialog.askstring(
+                "钉钉提醒",
+                "请输入 webhook 链接：",
+                initialvalue=getattr(self, "_dingtalk_webhook", ""),
+                parent=getattr(self, "_root", None),
+            )
+        except Exception:  # noqa: BLE001 - no window to attach to
+            LOG.exception("钉钉提醒: the webhook dialog could not open")
+            return
+        if value is None:
+            # Cancelled: keep whatever is stored.
+            return
+        webhook = normalize_dingtalk_webhook(value)
+        if str(value).strip() and not webhook:
+            self._set_dingtalk_status(
+                "链接无效：需要机器人 send?access_token=… 或 "
+                "connector.dingtalk.com/webhook/… 形式的完整地址",
+                error=True,
+            )
+            return
+        self._dingtalk_webhook = webhook
+        # Persist immediately: the webhook belongs to 附加功能 settings, so it
+        # travels with user_config.json and survives an update.
+        self._shutdown_on_change()
+        self._apply_dingtalk_settings()
+        if not webhook:
+            self._set_dingtalk_status("已清除钉钉提醒")
+            LOG.info("钉钉提醒: webhook cleared")
+            return
+        self._set_dingtalk_status("正在发送测试消息…")
+        LOG.info("钉钉提醒: webhook saved, sending one test message")
+        send_dingtalk_in_background(
+            webhook,
+            format_dingtalk_message(self._dingtalk_machine_name(), "测试提醒"),
+            self._dingtalk_test_finished,
+        )
+
+    # 定时下机 fires the 清理内存 lifecycle once, after a HH:mm:ss wait.
+    # 12:00:00 is the operator's maximum; anything longer is clamped.
+    TIMED_LOGOUT_MAX_HOURS = 12
+    TIMED_LOGOUT_MAX_SECONDS = TIMED_LOGOUT_MAX_HOURS * 3600
+
+    def _timed_logout_components(self) -> tuple[int, int, int]:
+        """The three clock fields as (hours, minutes, seconds)."""
+
+        values = []
+        for name in ("_timed_logout_hour_control",
+                     "_timed_logout_minute_control",
+                     "_timed_logout_second_control"):
+            control = getattr(self, name, None)
+            try:
+                values.append(int(control.minimum_var.get()) if control else 0)
+            except Exception:  # noqa: BLE001 - Tk variable, display only
+                values.append(0)
+        return values[0], values[1], values[2]
+
+    def _timed_logout_seconds(self) -> int:
+        """Configured wait in seconds, clamped to 12:00:00."""
+
+        hours, minutes, seconds = self._timed_logout_components()
+        total = max(0, hours) * 3600 + max(0, min(59, minutes)) * 60 + max(0, min(59, seconds))
+        return int(min(total, self.TIMED_LOGOUT_MAX_SECONDS))
+
+    def _set_timed_logout_components(self, seconds: int) -> None:
+        """Render ``seconds`` into the HH:mm:ss fields (clamped to the maximum)."""
+
+        total = max(0, min(int(seconds), self.TIMED_LOGOUT_MAX_SECONDS))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds_part = divmod(remainder, 60)
+        for name, value in (
+            ("_timed_logout_hour_control", hours),
+            ("_timed_logout_minute_control", minutes),
+            ("_timed_logout_second_control", seconds_part),
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                try:
+                    control.set_bounds(value)
+                except Exception:  # noqa: BLE001 - widget state only
+                    LOG.debug("定时下机: clock field could not be set", exc_info=True)
+
+    def _timed_logout_remaining_text(self) -> str:
+        """The 定时下机 note for the shared hint line.
+
+        The countdown itself has NO sentence: the three clock fields are the
+        countdown (they tick down like 循环's 剩余 HH:mm:ss), so the hint only
+        carries an event ("时间到，正在下线…") or the reason nothing runs.
+        """
+
+        transient = str(getattr(self, "_timed_logout_note", "") or "")
+        if transient:
+            # One-shot messages (fired, failed, unsupported) are shown once.
+            self._timed_logout_note = ""
+            return f"定时下机: {transient}"
+        if getattr(self, "_timed_logout_deadline", None) is not None:
+            return ""
+        checked = False
+        variable = getattr(self, "_timed_logout_var", None)
+        try:
+            checked = bool(variable.get()) if variable is not None else False
+        except Exception:  # noqa: BLE001 - Tk variable, display only
+            checked = False
+        if checked and self._timed_logout_seconds() <= 0:
+            return "定时下机: 未启动，请先设置时间"
+        # Unchecked (or fired): say nothing - the hint line stays clean.
+        return ""
+
+    def _timed_logout_on_change(self, _value: Any = "") -> None:
+        """Arm/disarm the one-shot 定时下机 timer and persist it.
+
+        Arming restarts the wait from the configured HH:mm:ss; unchecking (or
+        setting 00:00:00) cancels it.  No worker thread is involved: the shared
+        UI poll compares one deadline, so this costs nothing while it waits.
+        The countdown itself is the feedback, so no extra sentence is written.
+        """
+
+        enabled = False
+        variable = getattr(self, "_timed_logout_var", None)
+        try:
+            enabled = bool(variable.get()) if variable is not None else False
+        except Exception:  # noqa: BLE001 - Tk variable, display only
+            enabled = False
+        seconds = self._timed_logout_seconds()
+        if enabled and seconds <= 0:
+            self._timed_logout_deadline = None
+            LOG.info("定时下机: 已勾选但时间是 00:00:00，未启动")
+        elif enabled:
+            self._timed_logout_deadline = time.monotonic() + seconds
+            hours, minutes, rest = self._timed_logout_components()
+            LOG.info(
+                "定时下机: 已启动，%02d:%02d:%02d 后下线",
+                hours, minutes, rest,
+            )
+        else:
+            self._timed_logout_deadline = None
+            LOG.info("定时下机: 已取消")
+        self._refresh_panel_hints()
+        data = self._shutdown_collect_data()
+        self._shutdown_save_settings(data)
+
+    def _set_timed_logout_note(self, text: str) -> None:
+        """Queue one short one-shot sentence for the shared hint line."""
+
+        self._timed_logout_note = str(text)
+        self._refresh_panel_hints()
+
+    def _tick_timed_logout(self) -> None:
+        """Run the readout, then fire 定时下机 once its deadline passes.
+
+        The readout IS the countdown: while armed the three clock fields are
+        rewritten with the remaining HH:mm:ss, exactly the way 循环's 剩余
+        fields behave, so no separate sentence is needed on screen.
+        """
+
+        deadline = getattr(self, "_timed_logout_deadline", None)
+        if deadline is not None:
+            remaining = max(0, int(round(deadline - time.monotonic())))
+            self._set_timed_logout_components(remaining)
+        self._refresh_panel_hints()
+        if deadline is None or time.monotonic() < deadline:
+            return
+        self._timed_logout_deadline = None
+        variable = getattr(self, "_timed_logout_var", None)
+        if variable is not None:
+            try:
+                variable.set(False)
+            except Exception:  # noqa: BLE001 - Tk variable, display only
+                LOG.debug("定时下机: could not uncheck the selection", exc_info=True)
+        worker = getattr(self, "auto_restart_worker", None)
+        LOG.warning("定时下机: 时间到，执行下线")
+        # 定时下机 owns this log-off: 自动重连 watches the same 掉线 signal and
+        # would reconnect in the middle of it, so its selection is ticked off
+        # first (and stays off in the saved configuration).
+        self._suppress_auto_reconnect_for_timed_logout()
+        data = self._shutdown_collect_data()
+        self._shutdown_save_settings(data)
+        trigger = getattr(worker, "trigger_logoff", None)
+        if not callable(trigger):
+            LOG.warning("定时下机: 清理内存工作线程不支持只下线")
+            self._set_timed_logout_note("清理内存未接入")
+            return
+        try:
+            accepted = bool(trigger())
+        except Exception:  # noqa: BLE001 - never kill the poll tick
+            LOG.exception("定时下机: 触发下线失败")
+            self._set_timed_logout_note("触发下线失败")
+            return
+        if not accepted:
+            LOG.info("定时下机: 下线流程已经在运行")
+            self._set_timed_logout_note("下线流程已在运行")
+            return
+        self._set_timed_logout_note("时间到，正在下线…")
+
+    def _suppress_auto_reconnect_for_timed_logout(self) -> bool:
+        """Tick 自动重连 off before the 定时下机 log-off runs.
+
+        Returns True when it had been selected.  The change goes through the
+        normal handler, so the reconnect worker is disarmed and the setting is
+        saved - repainting the checkbox alone would leave a live watcher that
+        races the log-off.  No sentence is written: the fired note already says
+        what is happening.
+        """
+
+        variable = getattr(self, "_reconnect_var", None)
+        if variable is None:
+            return False
+        try:
+            if not bool(variable.get()):
+                return False
+            variable.set(False)
+        except Exception:  # noqa: BLE001 - never block the log-off
+            LOG.exception("定时下机: 无法取消 自动重连 选择")
+            return False
+        LOG.warning("定时下机: 已取消 自动重连，避免与下线流程冲突")
+        try:
+            self._reconnect_on_change()
+        except Exception:  # noqa: BLE001 - the log-off must still run
+            LOG.exception("定时下机: 应用 自动重连 关闭状态失败")
+        return True
+
+    def _apply_timed_logout(self, data: dict) -> None:
+        """Restore the saved 定时下机 selection and clock fields."""
+
+        controls = [getattr(self, name, None) for name in (
+            "_timed_logout_hour_control", "_timed_logout_minute_control",
+            "_timed_logout_second_control",
+        )]
+        if any(control is None for control in controls):
+            return
+        try:
+            seconds = int(data.get("timed_logout_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            seconds = 0
+        self._set_timed_logout_components(seconds)
+        enabled = bool(data.get("timed_logout_enabled", False))
+        variable = getattr(self, "_timed_logout_var", None)
+        if variable is not None:
+            try:
+                variable.set(enabled)
+            except Exception:  # noqa: BLE001 - Tk variable, display only
+                LOG.debug("定时下机: could not restore the selection", exc_info=True)
+        if enabled and self._timed_logout_seconds() > 0:
+            # A running countdown keeps ITS deadline: every other panel change
+            # re-applies this configuration, and re-arming here would push the
+            # deadline forward forever (the operator's "倒计时没有开始").
+            if getattr(self, "_timed_logout_deadline", None) is None:
+                self._timed_logout_deadline = (
+                    time.monotonic() + self._timed_logout_seconds()
+                )
+                hours, minutes, rest = self._timed_logout_components()
+                LOG.info("定时下机: 已恢复 %02d:%02d:%02d 的倒计时",
+                         hours, minutes, rest)
+        else:
+            self._timed_logout_deadline = None
+        self._refresh_panel_hints()
+
+    def _dingtalk_machine_name(self) -> str:
+        """The device name every push carries ("" when the operator cleared it)."""
+
+        variable = getattr(self, "_telegram_machine_var", None)
+        try:
+            return str(variable.get()) if variable is not None else ""
+        except Exception:  # noqa: BLE001 - display-only value
+            return ""
+
+    def _refresh_dingtalk_name_button(self) -> None:
+        """设备名 while unset, 名称已设置 once a name is stored."""
+
+        button = getattr(self, "_dingtalk_name_button", None)
+        if button is None:
+            return
+        try:
+            button.configure(
+                text="名称已设置" if self._dingtalk_machine_name().strip()
+                else "设备名"
+            )
+        except Exception:  # noqa: BLE001 - a label is cosmetic
+            LOG.debug("钉钉消息: name button could not be repainted", exc_info=True)
+
+    def _edit_dingtalk_name(self) -> None:
+        """Ask for the device name shown in every 钉钉 message.
+
+        It reuses the same stored 设备名称 the Telegram alert reads, so one name
+        describes this machine on every channel; an empty answer clears it.
+        """
+
+        from tkinter import simpledialog
+
+        try:
+            name = simpledialog.askstring(
+                "设备名",
+                "请输入设备名称（会显示在每条提醒里；留空则清除）：",
+                initialvalue=self._dingtalk_machine_name(),
+                parent=getattr(self, "_root", None),
+            )
+        except Exception:  # noqa: BLE001 - no window to attach to
+            LOG.exception("钉钉消息: the device-name dialog could not open")
+            return
+        if name is None:
+            # Cancelled: keep the stored name.
+            return
+        variable = getattr(self, "_telegram_machine_var", None)
+        if variable is not None:
+            try:
+                variable.set(str(name).strip()[:100])
+            except Exception:  # noqa: BLE001 - Tk variable, display only
+                LOG.debug("钉钉消息: device name could not be stored", exc_info=True)
+        self._refresh_dingtalk_name_button()
+        # Persist with the rest of the 附加功能 settings and push the new name
+        # into the notifier so the very next message carries it.
+        self._shutdown_on_change()
+        self._apply_dingtalk_settings()
+        LOG.info("钉钉消息: device name set to %r", self._dingtalk_machine_name())
+
+    def _dingtalk_test_finished(self, status: Any, error: Any) -> None:
+        """Worker thread → Tk: queue the outcome, never touch widgets here."""
+
+        results = getattr(self, "_dingtalk_results", None)
+        if results is None:
+            return
+        try:
+            results.put_nowait((status, error))
+        except queue.Full:
+            pass
+
+    def _drain_dingtalk_results(self) -> None:
+        """Paint the outcome of a test send on Tk's thread."""
+        results = getattr(self, "_dingtalk_results", None)
+        if results is None:
+            return
+        while True:
+            try:
+                status, error = results.get_nowait()
+            except queue.Empty:
+                return
+            if error:
+                self._set_dingtalk_status(f"测试失败：{error}", error=True)
+                LOG.warning("钉钉提醒: test message failed - %s", error)
+                continue
+            self._set_dingtalk_status("测试消息已发送，请在钉钉群查看")
+            LOG.info("钉钉提醒: test message delivered (%s)", status or "ok")
 
     def _shutdown_save_settings(self, data: dict) -> None:
         """Persist the Additional Functions values to the local JSON file."""
@@ -11321,6 +11928,30 @@ class UiWorker(threading.Thread):
                 str(data.get("telegram_machine_name", "")),
             )
             notifier.set_enabled(bool(data.get("telegram_enabled", False)))
+        # 钉钉提醒: the webhook and the 消息 switch travel with the same section,
+        # so a restored configuration arms the push without touching the panel.
+        dingtalk = getattr(self, "dingtalk_notifier", None)
+        if dingtalk is not None:
+            webhook = normalize_dingtalk_webhook(data.get("dingtalk_webhook", ""))
+            if webhook:
+                self._dingtalk_webhook = webhook
+            configure = getattr(dingtalk, "configure", None)
+            if callable(configure):
+                try:
+                    configure(
+                        webhook or getattr(self, "_dingtalk_webhook", ""),
+                        str(data.get("telegram_machine_name", "")),
+                        bool(data.get("telegram_enabled", False)),
+                    )
+                except Exception:  # noqa: BLE001 - optional channel
+                    LOG.warning("钉钉提醒: restored settings could not be applied",
+                                exc_info=True)
+        if hasattr(self, "_dingtalk_button"):
+            self._refresh_dingtalk_button()
+            self._refresh_dingtalk_status()
+        # 定时下机: restore the saved clock so a restart keeps the operator's
+        # selection instead of silently disarming it.
+        self._apply_timed_logout(data)
         if worker is not None and worker.enabled:
             self._shutdown_status.configure(
                 text=f"定时关闭已启动: 游戏将在 "

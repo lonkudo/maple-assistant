@@ -731,12 +731,31 @@ RUNTIME_SUPPORTER_KEY = "_runtime_supporter"
 
 
 def _layer_point_ys(layer: Any) -> list[float]:
+    """Every recorded Y that makes this layer's detection envelope.
+
+    Route endpoints (left / rope / right), every support point, and the
+    session's temporary 站桩 row.  Support points are the operator's way of
+    saying "this row is still this floor" for a ditch, a bench or the stair row
+    a jump lands on (the UI labels them 低 / 高 when they extend the envelope and
+    支 when they sit inside it), so they must widen the band too - otherwise
+    every band-based decision kept answering "no floor" on a row that had been
+    recorded on purpose.
+    """
+
     values = []
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
         point = layer.get(point_name)
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
     if isinstance(layer, dict):
+        supports = layer.get("support_points")
+        if isinstance(supports, list):
+            for point in supports:
+                if isinstance(point, dict) and "y" in point:
+                    try:
+                        values.append(float(point["y"]))
+                    except (TypeError, ValueError):
+                        continue
         runtime = layer.get(RUNTIME_SUPPORTER_KEY)
         if isinstance(runtime, dict) and "y" in runtime:
             values.append(float(runtime["y"]))

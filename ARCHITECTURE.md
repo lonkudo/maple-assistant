@@ -544,6 +544,18 @@ selected 0.25 s cadence into 0.3 s.
 The additional-functions countdown uses a single integer `1–300` minute component and three
 single-value `HH:mm:ss` components. `_refresh_countdown_status()` updates only clock components whose
 numeric value changed; this prevents Tk redraw traffic from cancelling the hovered clock field.
+
+**HP/MP recovery when the HUD cannot be read (v1.2.302).** `StatusWorker` keeps
+`_last_ratio` (the last *readable* bar ratio) and `_low_latched` per resource. A
+frame whose confidence is below `minimum_action_confidence` used to zero every
+counter and return, so an unreadable HUD - a covered window, a bar the detector
+cannot measure - silently stopped eating even when the last good read was below
+threshold (23:13 field log: 32 s with no potion at MP 4-27%). `_check_latched_resource`
+now keeps the cooldown-limited attempt alive while the read fails: it taps at
+most once per `potion_cooldown` (refused taps included), never arms the effect
+verification (there is no bar to verify), and is cleared by the next readable
+reading at or above the threshold. The accompanying suppression warning is
+rate-limited to one line per 3 s instead of five per second.
 Manual clock edits call `CountdownWorker.set_remaining_seconds()` directly and do not pause the worker.
 
 Dead-flower mode is a separately gated movement program. It never activates ordinary attack,
@@ -582,6 +594,41 @@ World selection is intentionally its own verified gesture. `reconnect_worker.py`
 The reconnect-only drop-recovery policy belongs to `movement_worker.py`, but is armed by the reconnect restart path in `assistant.py`. It remains inert for a manual patrol start and for a reconnect that begins within the route. After three genuine down-jump attempts without enough positive Y progress, it probes left for five seconds, then right for five seconds only if left did not reveal a drop. A successful descent returns control to normal drop-to-route movement.
 
 `auto_restart_worker.py` is a distinct memory-leak recovery lifecycle. It samples Windows system memory every 30 seconds and publishes that reading to the authorization header whether or not restart is enabled. At or above 98% with 自动重开 selected, it stops patrol, sends the optional 重开消息, signs out, terminates the game process tree, and waits without a fixed abandonment timeout until the old game window and process tree are gone. It then focuses the persistent `launcher3.0` dialog and clicks its measured launch point. A newly visible game window is not enough to start reconnect: the worker re-focuses it once per second while waiting for `ReconnectWorker`'s existing login-page colour evidence. Only a confirmed login page receives the dedicated reconnect handoff. If the fresh game remains visible but login/reconnect cannot complete, it is retained rather than killed into a restart loop. Auto-restart reports its lifecycle through the 图层校准与逻辑 status line; the Additional Functions panel contains controls only.
+
+### Message channels, 定时下机, and the log-off owner (v1.2.302)
+
+Every optional message channel is fed by ONE helper in `assistant.py`:
+
+```python
+def _message_alert(event_type):
+    telegram_notifier.notify(event_type)   # optional, proxy-aware
+    dingtalk_notifier.notify(event_type)   # 钉钉, keyword-safe
+```
+
+so no worker knows how many channels exist; the three alert producers (countdown
+循环, lie detector 测谎, character detector 掉线) still pass a plain event string.
+`dingtalk_notifier.DingTalkNotifier` owns a bounded queue and one thread: it drops
+an event while the 消息 switch is off or no webhook is stored, coalesces the same
+event for 10 s (`EVENT_COALESCE_SECONDS`) to protect the robot's 20-per-minute
+quota, and reports one short state (`未设置` / `已设置，未开启` / `已开启` /
+`已发送(掉线)` / `失败 - …`) that the UI reads through `status_text()`.
+`send_dingtalk_text` posts direct first and once through the system proxy, always
+prepends `DINGTALK_KEYWORD = "MoonEclipse"`, and maps the answers that matter
+(`310000` keyword/sign, `130101` rate limit, `300001`/`300005` token, `555
+webhook not found` for an unpublished 连接器 flow).
+
+定时下机 is a **one-shot** timer owned by the UI poll, not a worker: the Tk tick
+compares `time.monotonic()` against one deadline, rewrites the three
+`NumericValueRangeControl` clock fields with the remaining `HH:mm:ss` (the
+control is the countdown - no sentence is drawn), and fires once. The fired
+action is deliberately NOT `AutoRestartWorker.trigger_test()`: that entry point
+runs the whole 清理内存 lifecycle, whose `_handoff_to_reconnect()` logs the
+character back in. 定时下机 calls the new `trigger_logoff()`, which runs only
+`stop_patrol` + `_send_offline_sequence` (`_run_logoff`) and stops before the
+login-page wait, so a log-off can never turn into a reconnect. `自动重连` is
+ticked off through its normal handler (`_reconnect_on_change`, which disarms the
+worker and persists the choice) before the log-off begins, and the whole action
+is skipped when a restart or log-off is already running.
 
 ### Other-player detection and the channel switch
 
@@ -747,6 +794,25 @@ their ordinary lifecycle logging.
 
 Atomic file replacement is used for runtime state where possible. A permission failure while writing a runtime file must be reported and must not leave held input active.
 
+**The runtime log covers exactly one patrol run (v1.2.302).** `async_log_writer`
+gained a `_SectionBoundary` marker and `AsyncBatchLogWriter.start_new_run(header)`;
+the marker travels through the same queue as the log records, so the writer
+truncates the file and writes the new header *between* the batches that were
+already logged - the cut is order-exact and never splits a line. `assistant.py`
+calls it from `start_patrol_log_document()` at every Start Patrol, with the
+version and the current recording snapshot as the new document header, so
+`work\assistant.log` describes the run on screen instead of accumulating history;
+`max_bytes=0` means it never rotates mid-run (the old 2 MB × 3-chunk rotation
+silently cut a long run). Side logs (`server_client.log`, `auto_lie.log`,
+`ui_poll.log`) keep their caps, and startup also deletes rotated `*.log.N`
+chunks left by older builds.
+
+The 附加功能 section of `user_config.json` also carries the message and timer
+settings added in v1.2.302: `dingtalk_webhook` / `dingtalk_enabled` (the 消息
+switch) and `timed_logout_enabled` / `timed_logout_seconds`, so the webhook, the
+device name and an armed 定时下机 survive an update - the helper skips those files
+by name.
+
 ### Licensed profile resolution (v1.2.290)
 
 The signed entitlement lives in the **selected install root's** `助手配置`
@@ -782,6 +848,31 @@ file is never overwritten by the package's default), the legacy `app\` tree is
 deleted only after every legacy config file is confirmed present at the root
 (`_legacy_config_missing`), and the downgrade guard compares the archive version
 with the folder's `VERSION` (`_installed_version`).
+
+### In-application update and restart (v1.2.302)
+
+The helper that installs an update lives in the INSTALL ROOT, so it belongs to the
+version that is running - a helper fix would otherwise take effect one update
+later, and the update that needs it most is the one being started. Three rules
+close that gap:
+
+1. `update_core.verify_archive_layout` refuses an archive whose package root (the
+   folder holding `VERSION`) carries no entry point for THIS installation -
+   `ARCHIVE_ENTRY_POINTS[frozen] = MoonEclipse.exe`, `…[source] = assistant.py` -
+   and it runs in `apply_staged_update` *before* the app closes, so the refusal is
+   a message instead of a dead installation.
+2. `update_core.extract_package_helper` extracts `todohelper_update.ps1` from the
+   verified archive into `update\` and `update_manager.schedule_package_update`
+   runs that copy (`_persistent_helper(install_root, helper)`), so the package's
+   own helper performs this update.
+3. `todohelper_update.ps1` never leaves the operator without an app: a failed
+   install is caught (`INSTALL FAILED (current installation kept, restarting
+   anyway)`), the restart is always attempted - `MoonEclipse.exe` first (no UAC
+   prompt, the helper already runs at the assistant's integrity level), then
+   `launch_assistant.vbs`, then `start_assistant.bat` - the exit wait is two
+   minutes, the launcher choice and the new PID are logged, and the copy skips
+   `user_config.json` / `auth.json` / `cim_identity.dat` **by name** so a package
+   template can never replace the live recording or the entitlement.
 
 ### Server-managed release link (v1.2.292)
 
@@ -898,6 +989,27 @@ none. The layer-resync counter tolerates a blank detection frame
 (`LAYER DEBUG: now on none`) instead of restarting, the flicker guard accepts a
 floor whose arrival band contains the marker, and a completed up jump arms the
 resync so the new floor is accepted on its first detection.
+
+**A landing row belongs to its floor, not to the floor below (v1.2.302).** The
+strict band stays strict - climb arrival, rope attachment and fall
+reconciliation must not be fooled by a marker in mid-air - but the *settled*
+resolver allows `LAYER_LANDED_Y_GRACE = 0.030` (3.4 marker rows) below a band,
+and `_landing_floor_cap` honours the same grace. Before that, a character whose
+up jump landed on the stair row `y=0.750` while layer2's band ended at
+`0.726684` was refused by every path: the nearest-floor fallback answered layer2,
+the cap demoted the (correct) world-Y answer to layer1, the two alternated frame
+by frame and the 4-frame floor confirmation could never complete - 11 s of
+standing still plus two self-rescue probes in the 00:12 log. The nearest real
+floor is 0.0584 away, so the grace cannot reach it.
+
+**Support points are part of the envelope (v1.2.302).** `_layer_point_ys` - in
+both `patrol_control.py` and `movement_worker.py` - now includes every
+`support_points[*].y` beside `left_most_pos` / `rope_pos` / `right_most_pos`, so
+`_recalculate_layer_band` spans them and `record_support_point` saves a widened
+band in the same action (deletion recalcs it back). The axis editor labels such a
+point 低 (extends the lower edge), 高 (extends the upper edge) or 支 (inside the
+envelope, counted but no new edge). Jump points, skill points and flower points
+stay actions and never move a band.
 
 ## Concurrency rules
 

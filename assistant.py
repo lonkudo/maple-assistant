@@ -659,6 +659,7 @@ def main() -> int:
     from lie_screenshot_recorder import LieScreenshotRecorder
     from screen_blinker import ScreenBlinker
     from telegram_notifier import TelegramNotifier
+    from dingtalk_notifier import DingTalkNotifier
     from focus_worker import FocusWorker
     from minimap_detector import (
         MinimapDetector,
@@ -2386,6 +2387,17 @@ def main() -> int:
         )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
     telegram_notifier = TelegramNotifier(stop_event)
+    # 钉钉提醒: the operator's group-robot webhook, armed by the 消息 selection.
+    # One alert helper fans the key events (掉线 / 测谎 / 循环) out to every
+    # enabled channel, so no worker has to know how many channels exist.
+    dingtalk_notifier = DingTalkNotifier(stop_event)
+
+    def _message_alert(event_type: str) -> None:
+        """Publish one key event to the optional message channels."""
+
+        telegram_notifier.notify(event_type)
+        dingtalk_notifier.notify(event_type)
+
     # Passive diagnostic recorder: it writes only the existing shared frames;
     # it must never create a second GDI/window-capture loop beside auto-lie.
     screenshot_recorder = LieScreenshotRecorder(
@@ -2397,7 +2409,7 @@ def main() -> int:
         enabled=False,
         interval_hours=1.0,
         flash_callback=screen_blinker.request_blink,
-        alert_callback=telegram_notifier.notify,
+        alert_callback=_message_alert,
         # Countdown/loop reminders do not create screenshots or MP4s.  The
         # recorder is reserved for an actual lie-window investigation.
         event_callback=None,
@@ -2409,7 +2421,7 @@ def main() -> int:
         scan_interval=0.20,
         sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
         flash_callback=screen_blinker.request_blink,
-        alert_callback=telegram_notifier.notify,
+        alert_callback=_message_alert,
     )
     lie_detector_worker.add_lie_seen_callback(
         screenshot_recorder.on_lie_seen
@@ -2819,7 +2831,7 @@ def main() -> int:
             Path(__file__).resolve().parent / "sound" / "dingdong.mp3"
         ),
         flash_callback=screen_blinker.request_blink,
-        alert_callback=telegram_notifier.notify,
+        alert_callback=_message_alert,
         on_disconnect=stop_patrol_for_disconnect,
         disconnect_event_callback=_on_disconnect_event,
         # A missing marker alone is not an offline event: space zones can
@@ -2859,6 +2871,7 @@ def main() -> int:
         lie_detector_worker,
         parked_watch,
         telegram_notifier,
+        dingtalk_notifier,
         focus_worker,
     ]
     ui_worker = None if args.no_ui else (
@@ -2894,6 +2907,7 @@ def main() -> int:
             lie_detector_worker=lie_detector_worker,
             screen_blinker=screen_blinker,
             telegram_notifier=telegram_notifier,
+            dingtalk_notifier=dingtalk_notifier,
             on_patrol_start=start_patrol_input,
             # 自动重连 brought the character back into the game: prepare the map session again (layer
             # detection) and resume the patrol without the operator pressing 开始巡逻.

@@ -402,6 +402,60 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   caught by the three-capture progress watch instead, so the character starts
   walking back immediately.
 
+### Current release behavior (v1.2.293 - v1.2.302)
+
+- **The runtime log is one patrol run.** `work\assistant.log` is rewritten at
+  every Start Patrol (`start_patrol_log_document`): version, the current
+  recording, then that run's lines. The reset travels through the log writer's
+  queue as a section marker, so the cut is order-exact, and the 2 MB rotation is
+  gone - a long run is never chopped and no history accumulates across runs. The
+  运行日志 button copies that one file.
+- **Potions survive an unreadable HUD.** A failed status read no longer stops
+  eating: the last readable ratio is latched and the cooldown-limited potion
+  attempt keeps running while the bars cannot be measured (the 23:13 field log
+  had 32 s with no potion at MP 4-27%).
+- **The 站桩 return walk can climb.** The automatic blocked-walk Alt hop now also
+  runs in the return walk (it only ran in the `.left-most`/`.right-most`
+  phases), and the no-progress re-arm never releases the walk direction while a
+  jump point holds Up or the stair-jump worker is active - the 23:32 loop of
+  "jump point -> land on the same row -> no X progress -> jump point".
+- **A landing row belongs to its floor.** `LAYER_LANDED_Y_GRACE` is 0.030 (3.4
+  marker rows) and the landing cap honours it, so a character standing a stair
+  or two below a recorded band still identifies that floor instead of the world
+  signal being demoted to the floor below (the 00:12 log stood still 11 s at the
+  y=0.750 landing row).
+- **低 / 高 / 支 support points are part of the layer band.** `support_points` now
+  feed the envelope in both `patrol_control` and `movement_worker`, and
+  `record_support_point` recalculates and saves the band immediately; deleting a
+  supporter shrinks it again. Jump points and skill points still never move a
+  band.
+- **An update cannot close the app for a package it cannot install.** The
+  archive's package root must carry the entry point of THIS installation
+  (`MoonEclipse.exe` for the standalone, `assistant.py` for the source layout);
+  the mismatch is refused while the window is open, naming the ZIP that is
+  required. `extract_package_helper` then runs the helper from the downloaded
+  package, so a helper fix applies to the update that introduces it.
+- **A failed install still brings the app back.** `todohelper_update.ps1` logs
+  `INSTALL FAILED`, restarts anyway (executable first - no UAC - then the
+  launcher, then a batch file), waits up to two minutes for the exit, confirms
+  the new PID, and never copies `user_config.json`, `auth.json` or
+  `cim_identity.dat` over the live files (the package ships its own
+  `助手配置\user_config.json` template).
+- **钉钉消息 (DingTalk) alerts.** 附加功能 gains a **消息** selection in the 提醒
+  row followed by the **钉钉消息** button (→ 钉钉已设置 once a webhook is stored)
+  and a **设备名** button (→ 名称已设置). The webhook may be a group robot
+  (`oapi.dingtalk.com/robot/send?access_token=…`) or a 连接器 flow
+  (`connector.dingtalk.com/webhook/…`); every message contains the keyword
+  `MoonEclipse`, is sent off the UI thread, coalesces the same event for 10 s,
+  and pushes 掉线 / 测谎 / 循环 when 消息 is selected. Docs live in the tooltips;
+  the panel hint line carries only one short state such as `钉钉消息: 已开启`.
+- **定时下机 (timed log-off).** A selection next to 清理内存 with three
+  `NumericValueRangeControl` clock fields (maximum 12:00:00) that count down by
+  themselves, like 循环's 剩余. When the time is reached it runs the log-off half
+  of 清理内存 (`trigger_logoff`: 下线消息 then Esc/Up/Enter/Enter) and stops - no
+  launcher, no login, no reconnect - and 自动重连 is ticked off first so it cannot
+  race the log-off.
+
 ## Configuration
 
 Two configuration files keep personal settings separate from shipped defaults:
@@ -742,6 +796,18 @@ The same rule lives in both `movement_worker.py` and `patrol_control.py`, and th
 
 A one-row band is a reference row, not the whole floor: on a floor whose canvas Y changes along its length (a bench or stepped platform), readings away from the recorded row still match no band, and the floor is identified through the scroll-compensated world-Y band instead. A layer with one supporter has one route phase, so it can only repeat that single point; a floor that must be patrolled end to end needs its endpoints recorded.
 
+**Low / high support points widen the band (v1.2.302).** A recorded support point
+is the operator's statement "this row is still this floor" - a ditch, a bench, or
+the stair row a jump lands on. It now belongs to the layer's envelope: the saved
+`layer_band` spans `min - LAYER_BAND_EDGE_REACH .. max + LAYER_BAND_EDGE_REACH`
+over the three route endpoints **and** every `support_points` entry, and
+`record_support_point` recalculates and saves the band in the same action. On the
+axis editor the point is labelled 低 (below the envelope), 高 (above it) or 支
+(inside it); 低/高 extend the band, 支 leaves the edges alone but still counts as
+a supporter. Jump points and skill points remain actions and never move a band.
+Deleting a supporter recalculates the band again, so the envelope always matches
+what is recorded.
+
 ## Patrol, movement, and combat
 
 ### Patrol safety
@@ -921,6 +987,54 @@ Two related rules protect that motion:
 ## Alerts and recovery
 
 The additional-functions panel can enable sound, screen flash, Telegram messages, disconnect alerts, lie-detection alerts, timer alarms, and other-player channel switching.
+
+### 钉钉消息 (DingTalk notifications)
+
+The 提醒 row of 附加功能 is `声音 / 闪烁 / 消息 / 钉钉消息 / 设备名`. **消息** is the
+single selection that arms message pushes; **钉钉消息** stores the webhook
+(click → `请输入 webhook 链接：`) and shows **钉钉已设置** once one is saved - an
+empty answer clears it. Two webhook kinds are accepted:
+
+| Kind | URL |
+| --- | --- |
+| group robot (自定义机器人) | `https://oapi.dingtalk.com/robot/send?access_token=…` |
+| 连接器 flow (webhook 触发) | `https://connector.dingtalk.com/webhook/flow/…` |
+
+Saving a webhook sends one test message immediately, so "saved" and "delivered"
+are never confused. **设备名** stores the device name that appears in every
+message (button → **名称已设置**; empty clears it).
+
+While **消息** is selected the three key events are pushed - **掉线**, **测谎**,
+**循环** - each as one compact line in the Telegram style, with the keyword
+DingTalk's 关键字 security requires:
+
+```
+MoonEclipse Dev-PC 掉线 时间 2026-11-08 13:24:47
+```
+
+The send runs on its own thread (a slow or unreachable DingTalk server can never
+stall the assistant), the same event is coalesced for 10 s so a flapping session
+cannot burn the robot's 20-per-minute budget, and a rejected message explains
+itself (`310000` keyword/sign mismatch, `130101` rate limit, `300001`/`300005`
+bad token, `555 webhook not found` unpublished flow). The panel hint line under
+**图层校准与巡逻** carries one short state only, e.g. `钉钉消息: 已开启`; how to
+configure the robot is in the row tooltips, not in the status line.
+
+### 定时下机 (timed log-off)
+
+The row also holds **定时下机** next to **清理内存**, followed by three numeric
+clock fields (`hours : minutes : seconds`, maximum `12:00:00`). The fields are
+the countdown: while the selection is on they tick down like 循环's 剩余, so no
+extra sentence is needed.
+
+When the time is reached it performs the log-off half of 清理内存 - the optional
+**下线消息**, then `Esc / Up / Enter / Enter` - and **stops there**: no launcher,
+no login, no reconnect, and the patrol is stopped first. **自动重连** is ticked
+off just before the log-off starts, so the disconnect the log-off causes cannot
+start a reconnect of its own. Failures are stated once on the shared hint line
+(`定时下机: 清理内存未接入`, `触发下线失败`, `下线流程已在运行`), and the setting
+(`timed_logout_enabled` / `timed_logout_seconds`) is part of the configuration
+and restored at the next start.
 
 ### Patrol self-rescue probe
 
@@ -1108,6 +1222,13 @@ The in-app running log is the first place to check. Critical unexpected errors
 are also written to `error.log`. For an activation problem, use the linked-node
 icon in **运行日志** to copy `server_client.log`; it contains the safe
 client–server diagnostic trail.
+
+`work\assistant.log` covers exactly the run you are looking at (v1.2.302): it is
+rewritten at every Start Patrol with the version, the recording snapshot and then
+that run's lines, and it no longer rotates, so the earlier part of a long run is
+never dropped and nothing accumulates across runs. Attach that one file - it is
+self-contained. `crash_report.log` and `ui_hang_trace.log` survive a restart;
+everything else is cleared at launch.
 
 For a failed patrol start, check in this order:
 

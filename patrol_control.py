@@ -13,11 +13,32 @@ from typing import Any, Literal, Optional
 
 
 def _layer_point_ys(layer: Any) -> list[float]:
+    """Every recorded Y that makes this layer's detection envelope.
+
+    The three route endpoints (left / rope / right) plus every support point.
+    A support point exists precisely because the operator stood on a row that
+    the endpoints alone would not cover - a ditch, a bench, the stair row the
+    character lands on after its up jump - so leaving it out of the envelope
+    kept asking the band a question it had already been answered.  The UI labels
+    such a point 低 / 高 when it extends the envelope and 支 when it sits inside
+    it; both kinds therefore contribute here.  Jump points and skill points are
+    actions, not floor evidence, and still never move the band.
+    """
+
     values = []
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
         point = layer.get(point_name)
         if isinstance(point, dict) and "y" in point:
             values.append(float(point["y"]))
+    if isinstance(layer, dict):
+        supports = layer.get("support_points")
+        if isinstance(supports, list):
+            for point in supports:
+                if isinstance(point, dict) and "y" in point:
+                    try:
+                        values.append(float(point["y"]))
+                    except (TypeError, ValueError):
+                        continue
     return values
 
 
@@ -171,10 +192,12 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
 def _recalculate_layer_band(layer: Any) -> bool:
     """Materialise one layer's complete Y/world-Y detection envelope.
 
-    Only left-most, rope, and right-most recordings are supporters.  Jump
-    points deliberately never change a layer's identity.  A single supporter
-    produces the documented one-sided ``[y, y + small_gap]`` envelope; two or
-    more supporters span their observed top/bottom positions with the normal
+    Left-most, rope, right-most and every support point are supporters; the
+    support points are what let a 低/高 row (a ditch, a bench, the stair row a
+    jump lands on) belong to this floor instead of "no floor".  Jump points
+    deliberately never change a layer's identity.  A single supporter produces
+    the documented one-sided ``[y, y + small_gap]`` envelope; two or more
+    supporters span their observed top/bottom positions with the normal
     asymmetric tolerance.  The same calculation produces the world-Y band.
     """
 
@@ -1482,6 +1505,11 @@ class PatrolController:
             ):
                 raise ValueError("支持点与已有支持点距离过近")
             points.append(point)
+            # A support point is layer evidence, so the saved detection band
+            # must cover its row immediately: a 低/高 supporter that only lived
+            # in support_points left the band (and every band-based decision)
+            # answering "no floor" for the row the operator had just recorded.
+            _recalculate_layer_band(target)
             self._persist_locked()
             return RecordedEndpoint(layer_name, "support_point", point["x"], point["y"])
 
