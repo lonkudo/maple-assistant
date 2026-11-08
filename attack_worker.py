@@ -18,6 +18,13 @@ from combo_attack import ComboAttackPlan
 
 LOG = logging.getLogger(__name__)
 
+# 定时巡逻 stage of 站桩攻击: the attack gap is multiplied by this factor while the
+# circuit walks/returns along the recorded route (operator request: "double the
+# attack time gap on the 定时巡逻 stage").  Applies to the whole configured range,
+# so a 2.00-2.10s range beats at 4.00-4.20s during that stage and returns to the
+# normal range as soon as the character is back at the 桩.
+STATIONARY_PATROL_ATTACK_GAP_FACTOR = 2.0
+
 
 class AttackWorker(threading.Thread):
     """Tap the attack key on a monotonic timer, except during climb input.
@@ -130,6 +137,15 @@ class AttackWorker(threading.Thread):
         # a 小碎步 attack and the character then walking an abnormally long
         # stretch before its own attack.
         self.stationary_mode = False
+        # 定时巡逻 (the timed patrol circuit of 站桩攻击) doubles the attack gap
+        # while it runs.  The stage itself lives in MovementWorker, so this is a
+        # probe rather than a copy of the flag: the operator's rule is "on the
+        # 定时巡逻 stage double the attack gap", and a duplicated boolean would
+        # drift apart from the stage that actually owns the route.
+        self.stationary_patrol_stage_probe: Optional[Callable[[], bool]] = None
+        # The scale the next delay was actually built with, so a stage change is
+        # reported once instead of on every beat.
+        self._attack_gap_scale_applied: float = 1.0
         # The optional sequence planner is deliberately separate from this
         # worker: it only selects a key for an already-approved cadence beat.
         self.combo_attack = ComboAttackPlan()
@@ -286,11 +302,48 @@ class AttackWorker(threading.Thread):
         )
 
     def next_delay(self) -> float:
-        """Return the next delay sampled from the configured inclusive range."""
+        """Return the next delay sampled from the configured inclusive range.
 
+        While the 定时巡逻 stage of 站桩攻击 owns movement the whole range is
+        multiplied by ``STATIONARY_PATROL_ATTACK_GAP_FACTOR`` (2x).  The stage
+        walks the recorded patrol route away from the 桩, where the operator
+        wants the cadence spread out instead of running at the same gap the
+        stationary attack uses.
+        """
+
+        scale = self._attack_gap_scale()
         minimum = max(0.05, float(self.attack_min_interval))
         maximum = max(minimum, float(self.attack_max_interval))
+        if scale != 1.0:
+            minimum *= scale
+            maximum = max(minimum, maximum * scale)
+        if scale != self._attack_gap_scale_applied:
+            self._attack_gap_scale_applied = scale
+            LOG.info(
+                "attack gap %s for the 定时巡逻 stage: %.2f-%.2fs -> %.2f-%.2fs "
+                "(x%.1f)",
+                "doubled" if scale > 1.0 else "restored",
+                self.attack_min_interval, self.attack_max_interval,
+                minimum, maximum, scale,
+            )
         return random.uniform(minimum, maximum)
+
+    def _attack_gap_scale(self) -> float:
+        """Interval multiplier for the current mode/stage, 1.0 when normal.
+
+        Fail-soft: a probe that raises (a worker shutting down mid-beat) must
+        never stop the cadence, so the ordinary gap is used instead.
+        """
+
+        probe = self.stationary_patrol_stage_probe
+        if probe is None or not self.stationary_mode:
+            return 1.0
+        try:
+            active = bool(probe())
+        except Exception:  # noqa: BLE001 - never break the cadence
+            LOG.debug("stationary patrol stage probe failed", exc_info=True)
+            return 1.0
+        return STATIONARY_PATROL_ATTACK_GAP_FACTOR if active else 1.0
 
     def spacing_wait_seconds(self) -> Optional[float]:
         """How long this beat must still wait to keep the attack spacing.
@@ -509,4 +562,4 @@ class AttackWorker(threading.Thread):
         LOG.info("attack worker stopped")
 
 
-__all__ = ["AttackWorker"]
+__all__ = ["AttackWorker", "STATIONARY_PATROL_ATTACK_GAP_FACTOR"]

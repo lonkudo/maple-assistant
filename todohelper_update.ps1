@@ -132,7 +132,12 @@ function Install-ImportedConfig([string]$sourcePath, [string]$destinationRoot) {
 }
 
 try {
-    Write-UpdateLog "helper started mode=$Mode pid=$TargetPid"
+    # Log every argument, not just the mode: when an install fails the operator
+    # only ever sends this file, and "path does not exist" is worthless without
+    # the paths the helper was actually given.
+    Write-UpdateLog ("helper started mode=" + $Mode + " pid=" + $TargetPid +
+        " root=" + $root + " format=" + $PackageFormat +
+        " package=" + $(if ($PackagePath) { $PackagePath } else { "(none)" }))
     Wait-ForTarget $TargetPid
 } catch {
     Write-UpdateLog "FAILED: $($_.Exception.Message)"
@@ -141,26 +146,82 @@ try {
     exit 1
 }
 
+function Resolve-PackagePath([string]$given, [string]$installRoot) {
+    # The application hands over the archive it downloaded into ``update``.  If
+    # that exact file is gone - a hand-copied package, a second click, a cleaner
+    # - the operator still meant to install SOME release, so fall back to the
+    # newest ZIP the install can see and log the substitution instead of failing
+    # with the bare "path does not exist" this helper used to show.
+    if ($given -and (Test-Path -LiteralPath $given -PathType Leaf)) { return $given }
+    $searched = @()
+    $candidates = @()
+    foreach ($folder in @((Join-Path $installRoot "update"), $installRoot, (Split-Path $installRoot))) {
+        if (-not $folder -or -not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+        $searched += $folder
+        $candidates += @(Get-ChildItem -LiteralPath $folder -File -Filter "*.zip" -ErrorAction SilentlyContinue)
+    }
+    if (-not $candidates) {
+        throw ("Update ZIP is missing: '" + $given + "'. Searched: " + ($searched -join "; "))
+    }
+    $newest = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    Write-UpdateLog ("package path '" + $given + "' was not found; using '" + $newest.FullName +
+        "' (newest ZIP in " + ($searched -join "; ") + ")")
+    return $newest.FullName
+}
+
+function Read-InstalledVersion([string]$installRoot) {
+    $file = Join-Path $installRoot "VERSION"
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return "" }
+    try { return (Get-Content -LiteralPath $file -Raw -ErrorAction Stop).Trim() } catch { return "" }
+}
+
 $installFailure = ""
 if ($Mode -eq "Update") {
     # The application has already exited, so a failing install must not abort
     # this helper: the operator would be left with no running program at all
     # ("the update finished but the client never came back").  Keep the error,
     # finish whatever is possible, and always try to restart.
+    #
+    # Every step is named in its own error: the operator only ever reports the
+    # message box, and "C ... because that path does not exist" without knowing
+    # whether it came from extracting, locating or copying tells nobody anything.
+    $step = "start"
+    $versionBefore = Read-InstalledVersion $root
+    Write-UpdateLog ("install: installed version before = '" + $versionBefore + "'")
     try {
-        if (-not (Test-Path -LiteralPath $PackagePath)) { throw "Update ZIP is missing: $PackagePath" }
+        $step = "resolve package"
+        $PackagePath = Resolve-PackagePath $PackagePath $root
+        $step = "extract " + $PackagePath
         $stage = Join-Path ([IO.Path]::GetTempPath()) ("todohelper-update-" + [guid]::NewGuid().ToString("N"))
         try {
             Expand-Archive -LiteralPath $PackagePath -DestinationPath $stage -Force
+            $step = "locate the package root in " + $stage
             $source = Find-PackageRoot $stage $PackageFormat
+            $packageVersion = Read-InstalledVersion $source
+            Write-UpdateLog ("install: package root=" + $source + " package version='" + $packageVersion + "'")
+            $step = "copy " + $source + " -> " + $root
             Copy-Package $source $root
-            Remove-Item -LiteralPath $PackagePath -Force -ErrorAction Stop
-            Write-UpdateLog "update applied and consumed ZIP=$PackagePath"
+            $versionAfter = Read-InstalledVersion $root
+            Write-UpdateLog ("install: installed version after = '" + $versionAfter + "'")
+            if ($packageVersion -and $versionAfter -and ($packageVersion -ne $versionAfter)) {
+                throw ("VERSION is still '" + $versionAfter + "' after copying the package '" +
+                    $packageVersion + "' (a file in " + $root + " was not replaced)")
+            }
+            $step = "consume " + $PackagePath
+            # Cosmetics only: removing the downloaded archive must never be
+            # reported as "the update was not installed".
+            try {
+                Remove-Item -LiteralPath $PackagePath -Force -ErrorAction Stop
+                Write-UpdateLog "update applied and consumed ZIP=$PackagePath"
+            } catch {
+                Write-UpdateLog ("WARNING: the update was installed but the package could not be removed (" +
+                    $_.Exception.Message + ")")
+            }
         } finally {
             Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         }
     } catch {
-        $installFailure = $_.Exception.Message
+        $installFailure = ("[" + $step + "] " + $_.Exception.Message)
         Write-UpdateLog "INSTALL FAILED (current installation kept, restarting anyway): $installFailure"
     }
 }
@@ -177,12 +238,19 @@ if ($ConfigSource) {
 # restart into a UAC prompt that can silently be denied - and this helper
 # already runs at the same integrity level as the assistant it replaces, so a
 # direct start reproduces the previous session without asking the operator.
+#
+# ``-WindowStyle Hidden`` is not cosmetic.  The frozen build is a console
+# subsystem program, so a plain Start-Process gives the restarted assistant its
+# own console window; the operator sees a cmd window that belongs to the new
+# instance, and closing it terminates the assistant ("I closed the cmd window
+# and the application closed").  The shipped launcher chain hides it, so the
+# helper's own start must hide it too.
 $started = ""
 foreach ($name in @("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe")) {
     $candidate = Join-Path $root $name
     if (-not (Test-Path -LiteralPath $candidate)) { continue }
     try {
-        Start-Process -FilePath $candidate -WorkingDirectory $root -ErrorAction Stop
+        Start-Process -FilePath $candidate -WorkingDirectory $root -WindowStyle Hidden -ErrorAction Stop
         $started = $name
         break
     } catch {

@@ -44,14 +44,38 @@ def _layer_point_ys(layer: Any) -> list[float]:
 
 # The same upper-band factor as ``movement_worker.LAYER_UP_REACH_FACTOR`` (the operator, 2026-09-18:
 # "narrow down layer upper band a little bit, make it 0.7").  Kept for reference: the band
-# edges are now built from ``LAYER_BAND_EDGE_REACH``.
+# edges are now built from ``LAYER_BAND_UPPER_EDGE_REACH`` / ``LAYER_BAND_LOWER_EDGE_REACH``.
 LAYER_UP_REACH_FACTOR = 0.7
 
-# Band edge reach around the recorded envelope, in normalised minimap Y.  The
-# previous rule scaled the upper side by 0.7 * y_tolerance (0.014) and the lower
-# side by max(y_tolerance / 3, one marker row) (0.008772 on a 114-px minimap);
-# this experiment uses a flat 0.003 on both sides instead.
-LAYER_BAND_EDGE_REACH = 0.003
+# Band edge reach around the recorded envelope, in normalised minimap Y.
+#
+# The two sides are deliberately asymmetric.  The reach ABOVE a floor's topmost
+# recorded row is what lets a floor claim a row that belongs to the floor above
+# it, and on the operator's map two neighbouring floors were recorded only
+# 0.001908 apart (layer1 top 0.751908, layer2 bottom 0.750000): the 0.003 reach
+# above layer1 reached up to 0.748908 and layer2's 0.003 reach below its bottom
+# reached down to 0.753000, so the row an up jump lands on (0.750000) sat inside
+# BOTH bands and the jump never resolved its new floor.
+#
+# The operator's rule (this session): "we shall only narrow down the tolerance a
+# little bit, on the upper side (not the bottom side)".  So the upper side is
+# halved to 0.0015 while the down side keeps 0.003:
+#   * 0.0015 is the largest "little bit" that still lands the upper edge of
+#     layer1 (0.751908 - 0.0015 = 0.750408) ABOVE layer2's recorded bottom row
+#     0.750000, so the landing row is unambiguously layer2's;
+#   * one marker row on the 140-px minimap is 0.007143, so both values are still
+#     sub-row: they keep a standing reading on the recorded row inside its own
+#     floor and only stop the reach from wandering into the floor above.
+# The down side is untouched because a platform's lower edge is what a marker
+# reads while walking a slope, and a jump arc never resolves a floor downward.
+LAYER_BAND_UPPER_EDGE_REACH = 0.0015
+LAYER_BAND_LOWER_EDGE_REACH = 0.003
+
+# Schema stamp written into ``layer_band``.  Version 2 is the asymmetric edge
+# reach above; a stored band with an older version is rebuilt at load so an
+# already-recorded profile adopts the new upper edge instead of keeping the
+# overlap the old flat 0.003 produced.
+LAYER_BAND_VERSION = 2
 
 # Last-resort ``small_gap`` for a single-supporter layer whose recording carries no layout at all, so one
 # marker row cannot be derived.  Kept identical to
@@ -125,12 +149,13 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     if not values:
         return None
     # Keep the UI/controller interpretation exactly aligned with the movement
-    # worker: ``LAYER_BAND_EDGE_REACH`` on both sides of the recorded envelope.
+    # worker: an asymmetric edge around the recorded envelope, 0.0015 above the
+    # topmost row and 0.003 below the lowermost one (see the constants).
     # Jump points never enter _layer_point_ys, so their vertical coordinate
     # cannot widen or shift a layer band.
     return (
-        min(values) - LAYER_BAND_EDGE_REACH,
-        max(values) + LAYER_BAND_EDGE_REACH,
+        min(values) - LAYER_BAND_UPPER_EDGE_REACH,
+        max(values) + LAYER_BAND_LOWER_EDGE_REACH,
     )
 
 
@@ -197,8 +222,10 @@ def _recalculate_layer_band(layer: Any) -> bool:
     jump lands on) belong to this floor instead of "no floor".  Jump points
     deliberately never change a layer's identity.  A single supporter produces
     the documented one-sided ``[y, y + small_gap]`` envelope; two or more
-    supporters span their observed top/bottom positions with the normal
-    asymmetric tolerance.  The same calculation produces the world-Y band.
+    supporters span their observed top/bottom positions with the asymmetric
+    edge reach: ``LAYER_BAND_UPPER_EDGE_REACH`` (0.0015) above the topmost row
+    and ``LAYER_BAND_LOWER_EDGE_REACH`` (0.003) below the lowermost one.  The
+    same calculation produces the world-Y band.
     """
 
     if not isinstance(layer, dict):
@@ -213,10 +240,11 @@ def _recalculate_layer_band(layer: Any) -> bool:
         raw_upper = raw_lower = values[0]
     else:
         raw_upper, raw_lower = min(values), max(values)
-    # Flat ``LAYER_BAND_EDGE_REACH`` on both sides of the recorded envelope
-    # (was 0.7 * y_tolerance above and max(y_tolerance / 3, marker row) below).
-    y_upper = raw_upper - LAYER_BAND_EDGE_REACH
-    y_lower = raw_lower + LAYER_BAND_EDGE_REACH
+    # Asymmetric edge reach: 0.0015 above the topmost recorded row (so a band
+    # cannot claim the row of the floor above it) and 0.003 below the
+    # lowermost one (unchanged).
+    y_upper = raw_upper - LAYER_BAND_UPPER_EDGE_REACH
+    y_lower = raw_lower + LAYER_BAND_LOWER_EDGE_REACH
 
     world_values: list[float] = []
     for point_name in REQUIRED_LAYER_POINTS:
@@ -233,7 +261,10 @@ def _recalculate_layer_band(layer: Any) -> bool:
             pass
 
     band: dict[str, Any] = {
-        "version": 1,
+        # 2 = asymmetric edge reach (upper 0.0015 / lower 0.003).  Version 1
+        # bands were built with a flat 0.003 and are rebuilt on load, because a
+        # saved band that keeps the old upper edge keeps the old overlap.
+        "version": LAYER_BAND_VERSION,
         "supporter_count": len(values),
         "y_top": round(raw_upper, 6),
         "y_bottom": round(raw_lower, 6),
@@ -416,11 +447,10 @@ class PatrolController:
         # carry it; materialise one pass at load time so the UI, persisted
         # profile and movement worker cannot disagree about its default.
         migrated = self._ensure_layer_patrol_times_locked()
-        for layer in self._profile.get("layers", {}).values():
-            # Do not use ``any(generator)`` here: it short-circuits after the
-            # first changed floor and would leave the rest of the profile on
-            # the legacy per-frame calculation.
-            migrated = _recalculate_layer_band(layer) or migrated
+        # Do not use ``any(generator)`` here: it short-circuits after the
+        # first changed floor and would leave the rest of the profile on the
+        # legacy per-frame calculation.
+        migrated = self._materialise_layer_bands_locked() or migrated
         # Older recordings may have two boundaries but only retain buckets
         # which happened to receive a point.  Normalize them once at load so
         # parts are always 0..N and a three-part map cannot collapse to two.
@@ -712,6 +742,33 @@ class PatrolController:
             if anchor_key in layer:
                 part[anchor_key] = deepcopy(layer[anchor_key])
         return part
+
+    def _materialise_layer_bands_locked(self) -> bool:
+        """Rebuild every stored detection envelope from the current rule.
+
+        Covers the logical layer *and* each split part, because the movement
+        worker resolves floors from the part buckets.  The band itself is
+        persisted (``layer_band``) so runtime never re-derives one per frame,
+        which means a rule change - such as the narrower upper edge in
+        ``LAYER_BAND_UPPER_EDGE_REACH`` - only reaches an existing recording
+        through this pass at load: an old flat-0.003 band would otherwise keep
+        reaching into the floor above and the overlap would survive the update.
+        """
+
+        changed = False
+        layers = self._profile.get("layers", {})
+        if not isinstance(layers, dict):
+            return False
+        for layer in layers.values():
+            if not isinstance(layer, dict):
+                continue
+            changed = _recalculate_layer_band(layer) or changed
+            parts = layer.get("part_points")
+            if isinstance(parts, dict):
+                for part in parts.values():
+                    if isinstance(part, dict):
+                        changed = _recalculate_layer_band(part) or changed
+        return changed
 
     def _ensure_split_part_buckets_locked(self) -> bool:
         """Ensure every layer has a stable bucket for every split section."""

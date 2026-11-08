@@ -352,6 +352,16 @@ def _clear_previous_log_files() -> None:
     keeps any pasted diagnostic output attributable to the current run.  The
     exception-only crash report is deliberately preserved: it is the evidence
     available after the dashboard has already disappeared.
+
+    The update/launch reports are preserved for the same reason, and one of them
+    is decisive: ``update-helper.log`` belongs to ``todohelper_update.ps1``,
+    which runs BETWEEN two instances and always ends by starting the new one.
+    Deleting it here destroyed the only record of an install that had just
+    failed - the field report "the update was NOT installed ... path does not
+    exist" arrived with no log to read, because the restarted assistant had
+    already wiped it.  ``assistant-launch-*.log`` / ``error.log`` are written by
+    ``startup_probe.py`` when the app fails to come up at all and have the same
+    "read after the fact" role.
     """
 
     root = Path(__file__).resolve().parent
@@ -377,6 +387,11 @@ def _clear_previous_log_files() -> None:
                 for path in base.rglob(pattern):
                     if path.name.casefold() in {
                         "crash_report.log", "ui_hang_trace.log",
+                        # Update/launch evidence that is only ever read AFTER
+                        # this process started (see the docstring).
+                        "update-helper.log",
+                        "assistant-launch-status.log",
+                        "assistant-launch-error.log",
                     }:
                         continue
                     try:
@@ -2723,6 +2738,12 @@ def main() -> int:
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
     movement_worker.set_attack_slot(attack_slot)
+    # 定时巡逻 stage of 站桩攻击: the attack gap is doubled while that stage runs.
+    # MovementWorker owns the stage, so the cadence asks it instead of keeping a
+    # second copy of the flag that could drift.
+    attack_worker.stationary_patrol_stage_probe = (
+        movement_worker.stationary_patrol_stage_active
+    )
     # 跑花模式 uses the normal patrol route.  Only its combat cadence is
     # gated, through the movement-owned confirmed-layer snapshot.
     attack_worker.set_layer_attack_gate(

@@ -775,11 +775,17 @@ def _layer_point_ys(layer: Any) -> list[float]:
 # through its LOWER edge.
 LAYER_UP_REACH_FACTOR = 0.7
 
-# Band edge reach around the recorded envelope, in normalised minimap Y.  The
-# previous rule scaled the upper side by 0.7 * y_tolerance (0.014) and the lower
-# side by max(y_tolerance / 3, one marker row) (0.008772 on a 114-px minimap);
-# this experiment uses a flat 0.003 on both sides instead.
-LAYER_BAND_EDGE_REACH = 0.003
+# Band edge reach around the recorded envelope, in normalised minimap Y.
+#
+# Asymmetric on purpose (operator, this session: "we shall only narrow down the
+# tolerance a little bit, on the upper side (not the bottom side)").  The reach
+# ABOVE a floor's topmost recorded row is what let one floor claim a row that
+# belongs to the floor above: layer1's top row 0.751908 and layer2's bottom row
+# 0.750000 are only 0.001908 apart, so the old flat 0.003 put the up-jump
+# landing row 0.750000 inside BOTH bands.  Kept identical to
+# ``patrol_control.LAYER_BAND_UPPER_EDGE_REACH`` / ``..._LOWER_EDGE_REACH``.
+LAYER_BAND_UPPER_EDGE_REACH = 0.0015
+LAYER_BAND_LOWER_EDGE_REACH = 0.003
 
 # Last-resort gap for a single-supporter layer (or a ``layer_y``-only layer)
 # whose recording carries no layout at all, so one marker row cannot be derived.
@@ -880,14 +886,15 @@ def _layer_marker_row(layer: Any) -> Optional[float]:
 def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]:
     """Layer band from its saved recording envelope.
 
-    band = (uppermost point Y - ``LAYER_BAND_EDGE_REACH``,
-            lowermost point Y + ``LAYER_BAND_EDGE_REACH``)
+    band = (uppermost point Y - ``LAYER_BAND_UPPER_EDGE_REACH``,
+            lowermost point Y + ``LAYER_BAND_LOWER_EDGE_REACH``)
 
-    The reach is a flat 0.003 on both sides (experiment, was 0.7 * y_tolerance
-    above and max(y_tolerance / 3, one marker row) below).  A layer whose points
-    span a Y range (wide platform / minimap perspective) is detected while
-    standing anywhere between its recorded ends, which is why the band spans the
-    envelope rather than a mean.  Falls back to ``layer_y`` when the layer has no
+    The reach is 0.0015 above the topmost row and 0.003 below the lowermost one
+    (was a flat 0.003 on both sides, and before that 0.7 * y_tolerance above and
+    max(y_tolerance / 3, one marker row) below).  A layer whose points span a Y
+    range (wide platform / minimap perspective) is detected while standing
+    anywhere between its recorded ends, which is why the band spans the envelope
+    rather than a mean.  Falls back to ``layer_y`` when the layer has no
     recorded points.
     """
     # ``PatrolController`` materialises these bounds whenever a supporter is
@@ -914,13 +921,13 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
         values = [float(layer["layer_y"])]
     if not values:
         return None
-    # A one-point layer is a reference point, not a sampled platform, but it now
-    # gets the same flat reach as a multi-point one: the operator asked for
-    # min - 0.003 .. max + 0.003 everywhere.  ``jump_points`` are intentionally
-    # not part of ``_layer_point_ys``, so they cannot shift a band.
+    # A one-point layer is a reference point, not a sampled platform, but it
+    # gets the same edges as a multi-point one: 0.0015 above the topmost row and
+    # 0.003 below the lowermost one.  ``jump_points`` are intentionally not part
+    # of ``_layer_point_ys``, so they cannot shift a band.
     return (
-        min(values) - LAYER_BAND_EDGE_REACH,
-        max(values) + LAYER_BAND_EDGE_REACH,
+        min(values) - LAYER_BAND_UPPER_EDGE_REACH,
+        max(values) + LAYER_BAND_LOWER_EDGE_REACH,
     )
 
 
@@ -955,9 +962,9 @@ def _runtime_supporter_layer_band(
     to one row and a standing character's own step and jump arc are read a
     couple of rows above the point it stands on.  That is what lets the
     temporary point decide the band's UPPER edge: the recorded envelope now
-    reaches only ``LAYER_BAND_EDGE_REACH`` (0.003), so the point's wider window
-    wins in practice.  Below, the point gets one third of the tolerance, and the
-    recorded side adds the same 0.003.
+    reaches only ``LAYER_BAND_UPPER_EDGE_REACH`` (0.0015), so the point's wider
+    window wins in practice.  Below, the point gets one third of the tolerance,
+    and the recorded side adds ``LAYER_BAND_LOWER_EDGE_REACH`` (0.003).
 
     A layer with no recording at all keeps the documented one-sided
     single-supporter envelope, with the temporary point as that supporter.
@@ -976,8 +983,8 @@ def _runtime_supporter_layer_band(
     point_y = float(supporter_y)
     if not values:
         return point_y, point_y + max(tolerance / 3.0, row)
-    recorded_upper = min(values) - LAYER_BAND_EDGE_REACH
-    recorded_lower = max(values) + LAYER_BAND_EDGE_REACH
+    recorded_upper = min(values) - LAYER_BAND_UPPER_EDGE_REACH
+    recorded_lower = max(values) + LAYER_BAND_LOWER_EDGE_REACH
     point_upper = point_y - (tolerance + row)
     point_lower = point_y + tolerance / 3.0
     return min(recorded_upper, point_upper), max(recorded_lower, point_lower)
@@ -1120,6 +1127,20 @@ LAYER_LANDED_Y_GRACE = 0.030
 # fallback), while rejecting the 0.1429-wide guess that turned a fall through
 # layer2/layer1 back into layer3 patrol.
 LAYER_NEAREST_FLOOR_MAX_DISTANCE = 0.050
+# The floor may only be decided from a marker that has PROVEN it is standing
+# still: two consecutive stable Y readings.  A single capture is never enough,
+# whatever it shows.  Two reasons, both in the field logs:
+#
+# * a fall passes through the bands of the floors below it - the 17:26 站桩 run
+#   read y=0.644737 and then y=0.714912 (inside layer2's band) while falling
+#   from layer3 to layer1, and each sample was accepted as "the floor";
+# * a single stale/garbage minimap crop can put the marker on any row for one
+#   frame (the same log alternates 141x186 and 364x206 crops), which must not
+#   re-label the floor either.
+#
+# So `_layer_settle_frames` counts consecutive stable comparisons (one row of Y
+# difference is not stable), and nothing is decided below this many.
+LAYER_SETTLE_FRAMES = 2
 
 # How long the planned descent to the route's first floor may keep the layer state before the normal
 # recovery takes over again.  The descent owns every vertical move (see ``_resync_route_layer``), so it
@@ -4854,6 +4875,9 @@ class MovementWorker(threading.Thread):
         # fired the same 右跳 again on another run - throwing the character off
         # the rope it had just grabbed.
         self._jump_point_inside_tokens: set[tuple[str, int]] = set()
+        # Log-once latch for "the return climb owns movement, so recorded jump
+        # points are not consulted" (see ``_jump_point_decision``).
+        self._jump_point_return_suppression_logged = False
         # A fired point stays suppressed for its entire Up-hold/landing
         # session.  A jump arc naturally leaves and re-enters the loose Y
         # tolerance; treating that as a new arrival created repeated jumps.
@@ -5442,12 +5466,19 @@ class MovementWorker(threading.Thread):
         self._fall_marker_y_gain = max(0.005, float(fall_marker_y_gain))
         self._fall_last_y: Optional[float] = None
         self._fall_frames = 0
-        self._fall_pending = False
-        # While the marker is descending, the world tracker can name a real
+        self._fall_pending = False        # While the marker is descending, the world tracker can name a real
         # lower floor for one frame and then lose it when the minimap scrolls.
         # Keep that evidence until the fall settles; otherwise the next blank
         # frame leaves the old route state (for example layer3) active.
         self._fall_floor_candidate: Optional[str] = None
+        # Airborne evidence for the SETTLED floor fallbacks (see
+        # ``_marker_airborne``): a marker that is still dropping must never be
+        # answered with the nearest recorded floor.
+        self._layer_settle_last_y: Optional[float] = None
+        self._layer_settle_descend_frames = 0
+        self._layer_settle_frames = 0
+        self._marker_settle_ok = False
+        self._layer_hold_logged = False
         # Set once per confirmed fall: every movement key was released (see
         # ``_release_stuck_keys``) so a key whose key-up the game missed
         # during the knock-down cannot pin the character against a wall after
@@ -6307,6 +6338,46 @@ class MovementWorker(threading.Thread):
         # first; the next patrol leg will re-arm legitimate points.
         if self._fall_frames > 0 or self._fall_pending:
             return None
+        # A climb that owns Up must not be disturbed by a recorded point.  The
+        # 18:02 field log: the layer1 -> layer2 return climb arrived on layer2
+        # (marker 0.741228, "RETURN CLIMB arrival confirmation: layer2 1/2") and
+        # layer2's recorded right jump point at (0.555147, 0.750000) fired from
+        # that same row - the climb's own arrival row.  Firing it discarded the
+        # climb state ("cancelled ordinary rope recovery"), the lateral Alt moved
+        # the marker 0.0074 off the rope X, the retry jumped Alt+left off the
+        # rope and the character fell back to layer1 (0.785088, "CLIMB grab
+        # failed: marker fell back"), so the layer never resolved.  Standing on
+        # that point afterwards the reusable dwell trigger fired it three more
+        # times, and every fire handed Up to a climb that defers the horizontal
+        # walk, so the rope was never reached.
+        #
+        # The gate is deliberately limited to the frames a climb owns Up: while
+        # a return only WALKS toward its rope target, a recorded point is exactly
+        # what the floor needs.  The 18:08 log shows why - the return settled on
+        # layer2, re-locked the rope to x=0.650735 and walked right, but the
+        # marker froze at x=0.562500 y=0.750000 ("ROPE approach walk frozen far
+        # from rope; re-arming right" twice, never moving) because getting from
+        # layer2's left end onto its plateau needs the recorded Alt+right hop.
+        # Suppressing points for the whole return turned that hop off and the
+        # character sat on the point until patrol was stopped.
+        if (self._return_mode == "climb-to-route"
+                and (self._climb_state.up_held
+                     or self._climb_state.phase != "idle")):
+            if not self._jump_point_return_suppression_logged:
+                self._jump_point_return_suppression_logged = True
+                LOG.info(
+                    "JUMP POINT: recorded points are not consulted while a "
+                    "climb owns Up; the climb keeps its own rope target"
+                )
+            # Drop the entry/dwell bookkeeping for the same reason the
+            # missing-marker branch does: the frames spent inside a box during
+            # the climb must not count as "standing on the point", otherwise the
+            # first frame after the climb ends fires it on a stale dwell.
+            self._jump_point_inside_tokens.clear()
+            self._jump_point_dwell_frames.clear()
+            self._jump_point_dwell_last_x.clear()
+            return None
+        self._jump_point_return_suppression_logged = False
         if travel_direction not in ("left", "right", "up"):
             travel_direction = (
                 plan.decision.key
@@ -8428,8 +8499,80 @@ class MovementWorker(threading.Thread):
             return None
         return bottom_floor
 
+    def _update_marker_settle(self, observation: "MinimapObservation") -> bool:
+        """Refresh the settled-marker evidence once per captured frame.
+
+        The floor is never decided from one capture: a falling character passes
+        through the bands of the floors below it, and a single stale minimap
+        crop can move the marker by several rows.  ``_layer_settle_frames``
+        counts consecutive comparisons whose Y difference is smaller than one
+        marker row; :data:`LAYER_SETTLE_FRAMES` of them are required, and any
+        descent or rise resets the count.
+
+        The result is cached in ``_marker_settle_ok`` so every resolver in the
+        same frame reads the same verdict instead of advancing the counter again
+        (``_detected_layer``, the fall tracker and the 站桩 return all ask).
+        """
+
+        player = getattr(observation, "player", None)
+        self._marker_settle_ok = False
+        if player is None:
+            self._layer_settle_frames = 0
+            return False
+        try:
+            y = float(player.y)
+        except (TypeError, ValueError):
+            self._layer_settle_frames = 0
+            return False
+        gain = max(1e-6, float(getattr(self, "_fall_marker_y_gain", 0.008)))
+        last = self._layer_settle_last_y
+        self._layer_settle_last_y = y
+        if last is None:
+            # The first reading of a session cannot be compared with anything.
+            self._layer_settle_frames = 0
+            return False
+        delta = y - last
+        if delta >= gain:
+            # Dropping: airborne, never a floor decision.
+            self._layer_settle_descend_frames += 1
+            self._layer_settle_frames = 0
+            return False
+        if abs(delta) < gain:
+            self._layer_settle_frames += 1
+        else:
+            # Rising: a jump/rope arc, not a standing reading.
+            self._layer_settle_frames = 0
+        self._marker_settle_ok = (
+            self._layer_settle_frames >= LAYER_SETTLE_FRAMES
+        )
+        return self._marker_settle_ok
+
+    def _marker_settled_now(self) -> bool:
+        """Whether the current frame's marker counts as a settled reading."""
+
+        return bool(getattr(self, "_marker_settle_ok", False))
+
     def _detected_layer(self, observation: MinimapObservation) -> Optional[str]:
         layers = self._stationary_detection_layers(self._route_layers)
+        # No floor decision from a moving or unproven marker: two consecutive
+        # stable Y readings are required (see ``_update_marker_settle``).  This
+        # gate sits FIRST - before the band match, the support points and the
+        # world branch - because a fall passes through the bands of the floors
+        # below it and one stale crop can move the marker by several rows.
+        if not self._marker_settled_now():
+            current = self._current_route_layer_with_grace(observation)
+            if not self._layer_hold_logged:
+                self._layer_hold_logged = True
+                LOG.info(
+                    "LAYER hold: marker y=%.6f is not a settled reading yet "
+                    "(needs %d stable captures); keeping %s",
+                    observation.player.y if observation.player is not None
+                    else float("nan"),
+                    LAYER_SETTLE_FRAMES,
+                    current or "unresolved",
+                )
+            return current
+        self._layer_hold_logged = False
         if observation.player is not None:
             supported = detect_layer_by_support_point(
                 observation.player.y, layers,
@@ -8560,6 +8703,39 @@ class MovementWorker(threading.Thread):
         if nearest is not None:
             return nearest
         return self._current_route_layer_with_grace(observation)
+
+    def _prefer_next_layer_after_up_jump(
+        self,
+        current_name: Optional[str],
+        next_name: Optional[str],
+        detected_name: Optional[str],
+        marker_candidates: list[str],
+        observation: "MinimapObservation",
+        *,
+        settled: bool,
+    ) -> bool:
+        """Break a band overlap in favour of the next floor after an up jump.
+
+        The two floors can share a row: on the operator's map layer1 ends at
+        0.748908 and layer2 reaches 0.753000, so the row an up jump lands on
+        (0.750000) is inside both.  A verified up jump is proof the character
+        moved UP one floor, so inside that overlap the NEXT floor wins - without
+        this the reading stayed on the old floor, ``JUMP_UP_LANDING_WAIT_SECONDS``
+        expired and the up point was re-armed for a jump that had already worked.
+        """
+
+        if not (settled and self._layer_resync_after_jump_up):
+            return False
+        if current_name is None or next_name is None:
+            return False
+        if detected_name != current_name:
+            return False
+        if next_name not in marker_candidates:
+            return False
+        player = getattr(observation, "player", None)
+        if player is None:
+            return False
+        return bool(self._climb_arrival_band_contains(next_name, player.y))
 
     def _choose_route_entry_phase(
         self,
@@ -8991,6 +9167,18 @@ class MovementWorker(threading.Thread):
                 else None
             )
         else:
+            if not self._marker_settled_now():
+                # The resync re-derives the floor from the raw marker bands and
+                # the world signal below, which would bypass the settled-marker
+                # rule that ``_detected_layer`` enforces.  That is exactly how
+                # the 17:46 站桩 log switched to layer2: one mid-air sample
+                # (y=0.671053) sat inside layer2's band, the unique candidate
+                # answered layer2, and the return started climbing from a floor
+                # the character never stood on.  No floor change from a moving
+                # marker: the fall/landing machinery resolves it once settled.
+                current = self._current_route_layer_with_grace(observation)
+                self._clear_layer_resync_candidate()
+                return current
             detected_name = self._detected_layer(observation)
             marker_candidates_all = _layer_y_candidates(
                 observation.player.y,
@@ -9123,6 +9311,22 @@ class MovementWorker(threading.Thread):
                     next_name, observation.player.y
                 )
             )
+            # Overlapping bands after an UP JUMP: the jump proved the character
+            # moved up one floor, so a marker standing inside the overlap of the
+            # current and next bands belongs to the NEXT floor.  On the
+            # operator's map layer1 is [0.748908, 0.788088] and layer2 is
+            # [0.650509, 0.753000], so the landing row 0.750000 sits inside BOTH:
+            # the reading stayed "layer1" and the jump-up session timed out and
+            # re-armed the up point instead of resolving layer2.
+            # settled=True: this branch is only reachable past the settle gate
+            # at the top of the else clause, so the marker has already been
+            # proven still for LAYER_SETTLE_FRAMES captures.
+            if (self._prefer_next_layer_after_up_jump(
+                    current_name, next_name, detected_name,
+                    marker_candidates_route, observation,
+                    settled=True)):
+                detected_name = next_name
+                arriving_on_next_floor = True
             if (current_name is not None
                     and detected_name is not None
                     and detected_name != current_name
@@ -10861,6 +11065,18 @@ class MovementWorker(threading.Thread):
             0.0, self.stationary_pickup_jitter_seconds
         )
 
+    def stationary_patrol_stage_active(self) -> bool:
+        """True while the 定时巡逻 stage of the 站桩 circuit owns movement.
+
+        Read by ``AttackWorker`` through ``stationary_patrol_stage_probe``: that
+        stage doubles the attack gap.  The stage covers the whole circuit - the
+        route pass and the return leg - and is cleared the moment the character
+        is back on the anchor floor, so the stationary cadence resumes at its
+        configured range immediately (see ``_stationary_timed_patrol_active``).
+        """
+
+        return bool(self._stationary_timed_patrol_active)
+
     def _stationary_timed_patrol_route_walking(self) -> bool:
         """Whether the timed patrol is walking its route right now.
 
@@ -12484,6 +12700,13 @@ class MovementWorker(threading.Thread):
         anchor_layer = self._stationary_route_anchor_layer
         if not anchor_layer or observation.player is None:
             return self._detect_floor_all(observation)
+        if not self._marker_settled_now():
+            # "Which floor is the character on?" cannot be answered from a
+            # moving marker, whether or not a fall was confirmed: the fall that
+            # starts a return is exactly the case where the sample is mid-air.
+            # The caller retries on the next frames, once two consecutive stable
+            # readings exist.
+            return None
 
         anchor = self._stationary_attack_anchor
         # A temporary anchor can deliberately belong to an empty layer.  It
@@ -14228,6 +14451,13 @@ class MovementWorker(threading.Thread):
         if (confirmed_fall
                 and self.stationary_attack_enabled
                 and self._stationary_return_route_ready):
+            if not self._marker_settled_now():
+                # The descent stopped, but the marker has not proven it is
+                # standing yet.  Keep the fall evidence and wait: the 17:42
+                # 站桩 log started the return from this very sample, which still
+                # read mid-air, and "climbed back" from layer2 while the
+                # character was landing on layer1.
+                return
             # The falling detector is shared with patrol mode.  Once the
             # marker settles away from the temporary anchor's recorded layer,
             # discard any pickup plan immediately, then hand vertical work to
@@ -16194,6 +16424,14 @@ class MovementWorker(threading.Thread):
                 or self._jump_point_up_held
                 or observation.player is None):
             return
+        if not self._marker_settled_now():
+            # A return is started from "the floor the character is standing
+            # on", so it may only begin on a settled reading.  The 17:50 站桩
+            # log started it from mid-air samples (y=0.653509 then 0.732456)
+            # and locked the layer2 rope target while the character was still
+            # falling to layer1 - the return then climbed from a floor it had
+            # never stood on.
+            return
         anchor_layer = self._stationary_route_anchor_layer
         if not anchor_layer:
             return
@@ -17106,6 +17344,11 @@ class MovementWorker(threading.Thread):
                 # above. It can recover from a monster knock-down even when a
                 # stale climb/drop phase would reject normal reconciliation.
                 self._verify_out_of_range_floor(observation)
+                # Settled-marker evidence for THIS frame: a floor is only ever
+                # named from two consecutive stable Y readings, so every
+                # resolver below (route resync, fall landing, 站桩 return) reads
+                # the same verdict instead of advancing the counter again.
+                self._update_marker_settle(observation)
                 # Reconcile route state with the actual marker Y before making
                 # any movement decision. This handles falls from higher layers,
                 # successful climbs, and external/manual layer changes alike.
