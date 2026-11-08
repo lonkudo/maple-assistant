@@ -501,27 +501,36 @@ def validate_user_config_import(source: Path, destination: Optional[Path] = None
     return source
 
 
-def _persistent_helper(install_root: Path) -> Path:
-    helper = Path(install_root).resolve() / "todohelper_update.ps1"
-    if not helper.is_file():
+def _persistent_helper(install_root: Path, helper: Optional[Path] = None) -> Path:
+    candidate = (Path(helper) if helper is not None
+                 else Path(install_root).resolve() / "todohelper_update.ps1")
+    if not candidate.is_file():
         raise UpdateError("更新辅助程序缺失，无法安全重启。")
-    return helper
+    return candidate
 
 
-def _run_persistent_helper(arguments: list[str], install_root: Path) -> Path:
-    """Start the one shipped update helper; never create a per-run script."""
+def _run_persistent_helper(
+    arguments: list[str], install_root: Path, helper: Optional[Path] = None,
+) -> Path:
+    """Start the update helper; never create a per-run script.
 
-    helper = _persistent_helper(install_root)
+    ``helper`` lets a caller use the helper shipped INSIDE the package being
+    installed.  The install root's copy belongs to the version that is running
+    right now, so a restart fix would otherwise only take effect one update
+    later - and the update that needs it most is exactly the one being started.
+    """
+
+    resolved = _persistent_helper(install_root, helper)
     try:
         subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", str(helper), *arguments],
+             "-File", str(resolved), *arguments],
             cwd=str(Path(install_root).resolve()),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except OSError as exc:
         raise UpdateError(f"无法启动更新辅助程序: {exc}") from exc
-    return helper
+    return resolved
 
 
 def schedule_hidden_restart(install_root: Path, delay_ms: int = 1200) -> Path:
@@ -550,7 +559,10 @@ def schedule_config_import_restart(source: Path, install_root: Path) -> Path:
     )
 
 
-def schedule_package_update(package: DesktopUpdate, install_root: Path) -> Path:
+def schedule_package_update(
+    package: DesktopUpdate, install_root: Path, *,
+    helper: Optional[Path] = None,
+) -> Path:
     """Apply a same-format ZIP only after the running app has exited."""
 
     if package.kind != "zip":
@@ -559,7 +571,7 @@ def schedule_package_update(package: DesktopUpdate, install_root: Path) -> Path:
     return _run_persistent_helper(
         ["-Mode", "Update", "-TargetPid", str(os.getpid()),
          "-InstallRoot", str(root), "-PackagePath", str(package.path),
-         "-PackageFormat", package.package_format], root,
+         "-PackageFormat", package.package_format], root, helper,
     )
 
 

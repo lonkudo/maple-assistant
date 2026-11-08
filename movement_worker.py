@@ -1080,10 +1080,20 @@ LAYER_CURRENT_Y_GRACE = 0.012
 # the same long/uneven platform.  That must not widen ``_layer_y_band`` itself:
 # climb arrival, rope attachment and fall reconciliation deliberately require
 # that strict band so that a passing marker cannot claim a floor in mid-air.
-# The ordinary resolver applies this 0.020 normalized-Y allowance only when no
+# The ordinary resolver applies this normalized-Y allowance only when no
 # vertical action owns the character.  It is therefore a "standing floor"
 # recovery, not an arrival rule.
-LAYER_LANDED_Y_GRACE = 0.020
+#
+# 0.030 (3.4 marker rows), raised from 0.020 by the 00:12 field log: the
+# character's up jump from layer1 lands on the stair row y=0.750 while layer2's
+# recorded band bottom is 0.726684 (its left-most was recorded one step higher),
+# i.e. 0.0233 below the band - just outside the old 0.020 grace.  Every "which
+# floor" path then refused layer2, the landing cap demoted the (correct) world
+# signal to layer1, the nearest-floor fallback answered layer2, and the two
+# alternated so the 4-frame floor confirmation never completed: 11 s of standing
+# still plus repeated self-rescue probes.  The nearest real floor is 0.0584
+# away, so this grace still cannot reach the floor below.
+LAYER_LANDED_Y_GRACE = 0.030
 
 # A nearest-recorded-Y answer is a small visual-quantisation fallback, not a
 # substitute for floor identity after a fall.  Five marker rows comfortably
@@ -4178,41 +4188,10 @@ class MovementWorker(threading.Thread):
             and decision.reason == "stationary return walking to final approach zone"
         )
         if stationary_far_return:
-            anchor = self._stationary_attack_anchor
-            player = getattr(getattr(self, "last_observation", None), "player", None)
-            if anchor is not None and player is not None:
-                distance = abs(float(anchor.x) - float(player.x))
-                if (self._stationary_return_watch_direction != decision.key
-                        or self._stationary_return_watch_best_distance is None):
-                    self._stationary_return_watch_direction = decision.key
-                    self._stationary_return_watch_best_distance = distance
-                    self._stationary_return_watch_frames = 0
-                elif distance < self._stationary_return_watch_best_distance - 0.001:
-                    self._stationary_return_watch_best_distance = distance
-                    self._stationary_return_watch_frames = 0
-                else:
-                    self._stationary_return_watch_frames += 1
-                    if (self._stationary_return_watch_frames
-                            >= STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES):
-                        LOG.warning(
-                            "STATIONARY RETURN walk made no X progress toward "
-                            "anchor for %d frames (distance=%.6f); releasing and "
-                            "re-arming %s",
-                            self._stationary_return_watch_frames,
-                            distance,
-                            decision.key,
-                        )
-                        self._release_walk_hold()
-                        self._stationary_return_watch_best_distance = distance
-                        self._stationary_return_watch_frames = 0
-            else:
-                self._stationary_return_watch_direction = None
-                self._stationary_return_watch_best_distance = None
-                self._stationary_return_watch_frames = 0
+            if self._stationary_return_should_release(decision):
+                self._release_walk_hold()
         else:
-            self._stationary_return_watch_direction = None
-            self._stationary_return_watch_best_distance = None
-            self._stationary_return_watch_frames = 0
+            self._forget_stationary_return_watch()
         # 站桩 recovery deliberately does NOT wait for an in-flight attack here.
         # This used to poll ``attack_motion_active()`` for up to 1.0 s before the
         # first return key after a knockback, because Maple can swallow a
@@ -5752,7 +5731,8 @@ class MovementWorker(threading.Thread):
     ) -> Optional[MovementDecision]:
         """Return a stair-jump decision when walking is blocked by a stair.
 
-        Runs only in the move-to-left-most / move-to-right-most phases.  A
+        Runs in the move-to-left-most / move-to-right-most phases and in the
+        站桩 return walk (which climbs the same stairs to reach the anchor).  A
         seven-position sliding window has six transitions; when all six are
         frozen in *both* X and Y, a stair blocks the walk and the worker emits
         one ``stair_jump_<direction>`` action.  No jump points need to be
@@ -5785,6 +5765,18 @@ class MovementWorker(threading.Thread):
             direction = "left"
         elif route_label.endswith(".right-most"):
             direction = "right"
+        elif (self.stationary_attack_enabled
+              and route_label.startswith("stationary-attack")
+              and position_plan.decision.reason
+              == "stationary return walking to final approach zone"):
+            # The 站桩 return walk climbs the SAME stairs as the route: the
+            # anchor can sit up a stair chain (the recorded anchor here is one
+            # step above the lower floor).  Without the hop, the character
+            # stands one marker column short of the anchor, cannot reach the
+            # recorded jump point recorded at the next step, and the 23:32
+            # field log loop never ends: jump point -> land on the same row ->
+            # "walk made no X progress" -> re-arm -> jump point again.
+            direction = position_plan.decision.key
         else:
             return None
         # A registered stair event owns the next five detection frames. The
@@ -6012,6 +6004,80 @@ class MovementWorker(threading.Thread):
                         self.climbing_active_event.clear()
                 if added_direction_claim:
                     key_up(direction)
+
+    def _jump_point_input_busy(self) -> bool:
+        """Whether a jump point / stair jump currently owns the input.
+
+        While Up is held for a recorded point, or the dedicated stair-jump
+        worker is mid-action, the walk direction must be left alone: releasing
+        and re-pressing it during the hop cancels the horizontal part of the
+        jump so the character lands back on the row it took off from - the
+        23:32 field log's endless "no X progress -> release -> re-arm -> same
+        jump point" cycle.
+        """
+
+        if getattr(self, "_jump_point_up_held", False):
+            return True
+        worker = getattr(self, "stair_jump_worker", None)
+        probe = getattr(worker, "is_active", None)
+        if callable(probe):
+            try:
+                if probe():
+                    return True
+            except Exception:
+                LOG.exception("stair jump state probe failed")
+        return False
+
+    def _forget_stationary_return_watch(self) -> None:
+        self._stationary_return_watch_direction = None
+        self._stationary_return_watch_best_distance = None
+        self._stationary_return_watch_frames = 0
+
+    def _stationary_return_should_release(self, decision: MovementDecision) -> bool:
+        """Whether the 站桩 return walk must release and re-arm its hold.
+
+        A direction key Maple swallowed (attack animation, key already held)
+        leaves the character standing, so the walk is re-armed after
+        ``STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES`` captures without X
+        progress.  While a jump point / stair hop owns the input there is no
+        progress to expect yet: releasing there cancelled the horizontal part
+        of the hop, so the character landed on the row it took off from and the
+        recorded point fired again - the 23:32 field trap.
+        """
+
+        anchor = self._stationary_attack_anchor
+        player = getattr(getattr(self, "last_observation", None), "player", None)
+        if anchor is None or player is None:
+            self._forget_stationary_return_watch()
+            return False
+        distance = abs(float(anchor.x) - float(player.x))
+        if self._jump_point_input_busy():
+            self._stationary_return_watch_direction = decision.key
+            self._stationary_return_watch_best_distance = distance
+            self._stationary_return_watch_frames = 0
+            return False
+        if (self._stationary_return_watch_direction != decision.key
+                or self._stationary_return_watch_best_distance is None):
+            self._stationary_return_watch_direction = decision.key
+            self._stationary_return_watch_best_distance = distance
+            self._stationary_return_watch_frames = 0
+            return False
+        if distance < self._stationary_return_watch_best_distance - 0.001:
+            self._stationary_return_watch_best_distance = distance
+            self._stationary_return_watch_frames = 0
+            return False
+        self._stationary_return_watch_frames += 1
+        if (self._stationary_return_watch_frames
+                < STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES):
+            return False
+        LOG.warning(
+            "STATIONARY RETURN walk made no X progress toward anchor for %d "
+            "frames (distance=%.6f); releasing and re-arming %s",
+            self._stationary_return_watch_frames, distance, decision.key,
+        )
+        self._stationary_return_watch_best_distance = distance
+        self._stationary_return_watch_frames = 0
+        return True
 
     def _jump_point_leg_key(self) -> tuple[int, int, str]:
         """Identity of the current movement leg: (pass, route floor, phase).
@@ -12248,7 +12314,15 @@ class MovementWorker(threading.Thread):
         for name in floors:
             layer = self.important_positions[name]
             band = _layer_y_band(layer, float(layer.get("y_tolerance", 0.020000)))
-            if band is None or band[1] < marker_y - 1e-9:
+            # ``LAYER_LANDED_Y_GRACE`` is allowed here for the same reason the
+            # settled resolver uses it: the character can stand a stair step or
+            # two below the row its floor was recorded at.  Without it the cap
+            # demoted a CORRECT world-Y answer (the 00:12 log: marker y=0.750,
+            # layer2's band bottom 0.726684, world signal = layer2) down to
+            # layer1, which then fought the nearest-floor fallback frame by
+            # frame and stalled the floor change for 11 s.
+            if (band is None
+                    or band[1] + LAYER_LANDED_Y_GRACE < marker_y - 1e-9):
                 # The whole band sits above the marker position: the character cannot be standing here.
                 continue
             if highest is None or _layer_number(name) > _layer_number(highest):

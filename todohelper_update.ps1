@@ -27,7 +27,10 @@ function Write-UpdateLog([string]$message) {
 }
 
 function Wait-ForTarget([int]$targetProcessId) {
-    for ($i = 0; $i -lt 600; $i++) {
+    # Two minutes: a patrol stop, a shutdown save and an antivirus scan of the
+    # exiting image can all take a while, and giving up early meant the whole
+    # update was abandoned with nothing installed.
+    for ($i = 0; $i -lt 1200; $i++) {
         # $PID is a PowerShell automatic, read-only variable.  Do not name a
         # function parameter $pid: parameter binding would fail before this
         # helper has a chance to wait for the assistant and restart it.
@@ -35,6 +38,17 @@ function Wait-ForTarget([int]$targetProcessId) {
         Start-Sleep -Milliseconds 100
     }
     throw "Timed out waiting for MoonEclipse to exit."
+}
+
+function Show-OperatorMessage([string]$message) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        [System.Windows.Forms.MessageBox]::Show(
+            $message, "MoonEclipse update", 0, 16) | Out-Null
+    } catch {
+        # No interactive desktop: the log is the only channel left.
+        Write-UpdateLog "MESSAGE (no window): $message"
+    }
 }
 
 function Find-PackageRoot([string]$stage, [string]$format) {
@@ -57,7 +71,15 @@ function Copy-Package([string]$source, [string]$destination) {
     Get-ChildItem -LiteralPath $source -Recurse -Force | ForEach-Object {
         $relative = $_.FullName.Substring($source.Length).TrimStart('\')
         if (-not $relative -or $relative -match '^(\.git|\.venv|work|node_modules)(\\|$)') { return }
-        if ($relative -ieq "user_config.json") { return }
+        # The live recording (layers, endpoints, jump points) is the "recording"
+        # section of the config folder's user_config.json, and authorization is
+        # auth.json / cim_identity.dat.  A package ships its own copy of that
+        # user_config.json template, so compare the file NAME: matching only the
+        # package-root path replaced the operator's recording with the template.
+        if (-not $_.PSIsContainer -and (
+                $_.Name -ieq "user_config.json" -or
+                $_.Name -ieq "auth.json" -or
+                $_.Name -ieq "cim_identity.dat")) { return }
         $target = Join-Path $destination $relative
         if ($_.PSIsContainer) {
             New-Item -ItemType Directory -Path $target -Force | Out-Null
@@ -112,7 +134,20 @@ function Install-ImportedConfig([string]$sourcePath, [string]$destinationRoot) {
 try {
     Write-UpdateLog "helper started mode=$Mode pid=$TargetPid"
     Wait-ForTarget $TargetPid
-    if ($Mode -eq "Update") {
+} catch {
+    Write-UpdateLog "FAILED: $($_.Exception.Message)"
+    Show-OperatorMessage ("MoonEclipse did not exit, so the update was not installed." + [Environment]::NewLine +
+        "Close the assistant and click the update icon again, or unpack the package by hand.")
+    exit 1
+}
+
+$installFailure = ""
+if ($Mode -eq "Update") {
+    # The application has already exited, so a failing install must not abort
+    # this helper: the operator would be left with no running program at all
+    # ("the update finished but the client never came back").  Keep the error,
+    # finish whatever is possible, and always try to restart.
+    try {
         if (-not (Test-Path -LiteralPath $PackagePath)) { throw "Update ZIP is missing: $PackagePath" }
         $stage = Join-Path ([IO.Path]::GetTempPath()) ("todohelper-update-" + [guid]::NewGuid().ToString("N"))
         try {
@@ -124,14 +159,77 @@ try {
         } finally {
             Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         }
+    } catch {
+        $installFailure = $_.Exception.Message
+        Write-UpdateLog "INSTALL FAILED (current installation kept, restarting anyway): $installFailure"
     }
-    if ($ConfigSource) {
+}
+if ($ConfigSource) {
+    try {
         Install-ImportedConfig $ConfigSource $root
+    } catch {
+        Write-UpdateLog "CONFIG IMPORT FAILED: $($_.Exception.Message)"
     }
-    $launcher = Join-Path $root "launch_assistant.vbs"
-    if (-not (Test-Path -LiteralPath $launcher)) { throw "Launcher missing after update." }
-    Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", $launcher) -WorkingDirectory $root -WindowStyle Hidden
-    Write-UpdateLog "restart launched"
-} catch {
-    Write-UpdateLog "FAILED: $($_.Exception.Message)"
+}
+
+# Restart, whatever happened above.  The packaged executable is tried FIRST:
+# the launcher asks Windows for elevation ("runas"), which turns an automatic
+# restart into a UAC prompt that can silently be denied - and this helper
+# already runs at the same integrity level as the assistant it replaces, so a
+# direct start reproduces the previous session without asking the operator.
+$started = ""
+foreach ($name in @("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe")) {
+    $candidate = Join-Path $root $name
+    if (-not (Test-Path -LiteralPath $candidate)) { continue }
+    try {
+        Start-Process -FilePath $candidate -WorkingDirectory $root -ErrorAction Stop
+        $started = $name
+        break
+    } catch {
+        Write-UpdateLog "$name start failed: $($_.Exception.Message)"
+    }
+}
+$launcher = Join-Path $root "launch_assistant.vbs"
+if (-not $started -and (Test-Path -LiteralPath $launcher)) {
+    try {
+        Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", $launcher) -WorkingDirectory $root -WindowStyle Hidden -ErrorAction Stop
+        $started = "launch_assistant.vbs"
+    } catch {
+        Write-UpdateLog "launcher start failed: $($_.Exception.Message)"
+    }
+}
+if (-not $started) {
+    foreach ($name in @("start_assistant.bat")) {
+        $candidate = Join-Path $root $name
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
+            Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$candidate`"") -WorkingDirectory $root -WindowStyle Hidden -ErrorAction Stop
+            $started = $name
+            break
+        } catch {
+            Write-UpdateLog "$name start failed: $($_.Exception.Message)"
+        }
+    }
+}
+if ($started) {
+    Write-UpdateLog "restart launched via $started"
+    # An elevated launcher shows a UAC prompt first, so allow it time to appear
+    # before judging the start as failed.
+    Start-Sleep -Seconds 8
+    $alive = @(Get-Process -Name "MoonEclipse", "pythonw", "python" -ErrorAction SilentlyContinue)
+    if ($alive.Count -eq 0) {
+        Write-UpdateLog "WARNING: no MoonEclipse process 8s after the restart (UAC declined, or the new install cannot start)"
+    } else {
+        $aliveIds = ($alive | ForEach-Object { $_.Id }) -join ","
+        Write-UpdateLog "restart confirmed: pid=$aliveIds"
+    }
+} else {
+    Write-UpdateLog "FAILED: no launcher could be started"
+    Show-OperatorMessage ("MoonEclipse was not restarted: no usable launcher was found in " + $root + "." + [Environment]::NewLine +
+        "Start MoonEclipse.exe from that folder and send update-helper.log to the developer.")
+}
+if ($installFailure) {
+    Show-OperatorMessage ("The update was NOT installed; the previous version is running again." + [Environment]::NewLine +
+        $installFailure + [Environment]::NewLine +
+        "Details: update-helper.log in the install folder.")
 }

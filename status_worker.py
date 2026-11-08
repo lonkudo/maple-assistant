@@ -2266,6 +2266,18 @@ class StatusWorker(threading.Thread):
         }
         self._last_hp: Optional[int] = None
         self._last_mp: Optional[int] = None
+        # Last READABLE ratio per resource and whether it was below its
+        # threshold.  The HUD can become unreadable for many seconds (a
+        # covered window, an overlay, a bar the detector cannot measure) and
+        # dropping every potion action during that window is the one failure
+        # mode that must not happen: a bar that was last read low keeps its
+        # cooldown-limited potion attempt until a fresh read proves it healed.
+        self._last_ratio: dict[str, Optional[float]] = {"hp": None, "mp": None}
+        self._low_latched = {"hp": False, "mp": False}
+        # Rate limit for the unreadable-HUD path (one attempt per cooldown,
+        # even when the tap itself is refused).
+        self._latched_attempt_at = {"hp": float("-inf"), "mp": float("-inf")}
+        self._last_suppressed_warning = float("-inf")
 
     def _tap_potion(self, key: str) -> bool:
         """Tap the potion key, retrying briefly if the first attempt is blocked.
@@ -2309,8 +2321,13 @@ class StatusWorker(threading.Thread):
     def _check_resource(self, name: str, ratio: Optional[float],
                         threshold_ratio: float, key: str, now: float) -> None:
         if ratio is None:
+            # An unreadable bar is not proof that the character healed: keep
+            # the latched low state alive instead of silently stopping.
             self._low_count[name] = 0
+            self._check_latched_resource(name, threshold_ratio, key, now)
             return
+        self._last_ratio[name] = ratio
+        self._low_latched[name] = ratio < threshold_ratio
         self._low_count[name] = (
             self._low_count[name] + 1 if ratio < threshold_ratio else 0
         )
@@ -2326,6 +2343,43 @@ class StatusWorker(threading.Thread):
                 }
                 LOG.warning("%s=%.0f%% below %.0f%%: used %s", name.upper(),
                             ratio * 100, threshold_ratio * 100, key)
+
+    def _check_latched_resource(self, name: str, threshold_ratio: float,
+                                key: str, now: float) -> bool:
+        """Keep eating while the HUD is unreadable but was last read low.
+
+        Returns true when this resource is in the latched state, so the
+        caller can distinguish "the read failed but we already acted" from
+        "nothing could be done".  The attempt itself is limited to one per
+        potion cooldown, and it is never verified (there is no bar to read).
+        """
+
+        if not self._low_latched[name]:
+            return False
+        reference = max(self._last_potion[name],
+                        self._latched_attempt_at[name])
+        if now - reference < self.potion_cooldown:
+            return True
+        self._latched_attempt_at[name] = now
+        last = self._last_ratio[name]
+        if not self._tap_potion(key):
+            LOG.warning(
+                "%s last read %s below %.0f%% but the HUD read failed; "
+                "potion %s was refused",
+                name.upper(),
+                "----" if last is None else f"{last * 100:.0f}%",
+                threshold_ratio * 100, key,
+            )
+            return True
+        self._last_potion[name] = now
+        LOG.warning(
+            "%s last read %s below %.0f%% but the HUD read failed: "
+            "kept the potion %s",
+            name.upper(),
+            "----" if last is None else f"{last * 100:.0f}%",
+            threshold_ratio * 100, key,
+        )
+        return True
 
     def _verify_potion_effect(
         self,
@@ -2601,10 +2655,31 @@ class StatusWorker(threading.Thread):
             mp_critical = (reading.mp_ratio is not None
                            and reading.mp_ratio < config.mp_ratio_threshold)
             if not hp_critical and not mp_critical:
-                LOG.warning(
-                    "status confidence %.2f below %.2f; potion actions suppressed",
-                    reading.confidence, config.minimum_action_confidence,
-                )
+                # Neither bar is readable-critical, but a bar was last READ low
+                # and the HUD has since become unreadable (a covered window, an
+                # overlay).  Keep the cooldown-limited potion attempt alive:
+                # a character that was low before the read failed may still be.
+                now = time.monotonic()
+                latched = False
+                if config.hp_enabled:
+                    latched |= self._check_latched_resource(
+                        "hp", config.hp_ratio_threshold, config.hp_key, now,
+                    )
+                if config.mp_enabled:
+                    latched |= self._check_latched_resource(
+                        "mp", config.mp_ratio_threshold, config.mp_key, now,
+                    )
+                if not latched:
+                    # 5 fps of the same warning buries the movement log; one
+                    # line every few seconds is enough to diagnose the HUD.
+                    if now - self._last_suppressed_warning >= 3.0:
+                        self._last_suppressed_warning = now
+                        LOG.warning(
+                            "status confidence %.2f below %.2f; "
+                            "potion actions suppressed",
+                            reading.confidence,
+                            config.minimum_action_confidence,
+                        )
                 self._low_count = {"hp": 0, "mp": 0}
                 return
             LOG.warning(
@@ -2627,6 +2702,7 @@ class StatusWorker(threading.Thread):
                 )
         else:
             self._low_count["hp"] = 0
+            self._low_latched["hp"] = False
             self._potion_verification["hp"] = None
         if config.mp_enabled:
             if not self._verify_potion_effect(
@@ -2639,6 +2715,7 @@ class StatusWorker(threading.Thread):
                 )
         else:
             self._low_count["mp"] = 0
+            self._low_latched["mp"] = False
             self._potion_verification["mp"] = None
         # Did each buff tap actually reach the game?  Reported from the HUD,
         # because the sender can only prove the key was emitted.

@@ -369,16 +369,21 @@ def _clear_previous_log_files() -> None:
     removed = 0
     for base in bases:
         try:
-            for path in base.rglob("*.log"):
-                if path.name.casefold() in {
-                    "crash_report.log", "ui_hang_trace.log",
-                }:
-                    continue
-                try:
-                    path.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+            # "*.log" covers the live files; "*.log.*" covers the rotated
+            # chunks a previous build left behind (assistant.log.1 ...).  The
+            # runtime log no longer rotates, so a leftover chunk would only be
+            # mistaken for part of the current run.
+            for pattern in ("*.log", "*.log.[0-9]*"):
+                for path in base.rglob(pattern):
+                    if path.name.casefold() in {
+                        "crash_report.log", "ui_hang_trace.log",
+                    }:
+                        continue
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
         except OSError:
             pass
     print(f"[startup] cleared {removed} previous log file(s)")
@@ -462,35 +467,49 @@ def main() -> int:
         trace_log_path.write_text(_header, encoding="utf-8")
     except OSError:
         pass
-    _last_recording_block = {"text": ""}
+    def start_patrol_log_document(reason: str) -> None:
+        """Restart the log at a patrol start: the file holds this run only.
 
-    def append_recording_snapshot(reason: str) -> None:
-        """Append the recording again when it changed since the last block."""
+        The operator attaches ``work\\assistant.log`` as the evidence for the
+        run he is looking at, so the file must describe *that* run - not an
+        ever-growing archive and not a size-capped cut of it.  The version and
+        the current recording lead the new document, and everything logged
+        from here on follows them.
+        """
 
         try:
             recording = config_store.read_section("recording")
         except Exception:
-            return
+            recording = {}
         try:
-            text_body = json.dumps(recording, ensure_ascii=False, indent=2, sort_keys=True)
+            text_body = json.dumps(
+                recording, ensure_ascii=False, indent=2, sort_keys=True
+            )
         except (TypeError, ValueError):
-            return
-        if text_body == _last_recording_block["text"]:
-            return
-        _last_recording_block["text"] = text_body
-        block = (
-            f"\n# ===== recording snapshot ({reason} "
+            text_body = ""
+        header = (
+            "# ===== MoonEclipse log =====\n"
+            f"# started  {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# version  {version_label()}\n"
+            f"# exe      {application_root(__file__)}\n"
+            f"# config   {config_store.user_path}\n"
+            f"# ===== recording snapshot ({reason} "
             f"{time.strftime('%H:%M:%S')}) =====\n"
             f"{text_body}\n"
             "# ===== end recording snapshot =====\n"
+            "# ===== log =====\n"
         )
-        if not trace_log_writer.append_block(block):
-            logging.warning("recording snapshot could not be appended to the log")
+        trace_log_writer.start_new_run(header)
 
     trace_log_writer = AsyncBatchLogWriter(
         trace_log_path,
-        max_bytes=2_000_000,
-        backup_count=2,
+        # One file, one run: the runtime log is restarted at every Start Patrol
+        # (see start_patrol_log_document) and never rotates, so the attached
+        # file always holds exactly the run that is happening now.  The old
+        # 2 MB rotation silently cut a run in the middle and kept only its
+        # newest part.
+        max_bytes=0,
+        backup_count=0,
         formatter=_compact_log_formatter(),
         mirror=sys.stderr,
     )
@@ -1819,9 +1838,10 @@ def main() -> int:
 
         """
 
-        # Keep the attached log self-describing: if the recording changed since
-        # the header / previous start, append the current one now.
-        append_recording_snapshot("start patrol")
+        # The attached log is the evidence for ONE run: restart the file here
+        # (version + recording first) so it holds exactly the run being
+        # started, instead of a growing multi-run archive or a size-capped cut.
+        start_patrol_log_document("start patrol")
         # Layer-band drawing is diagnostic only. Do not make a live patrol
         # wait for it: the overlay's timed display and clean recapture caused
         # a visible freeze immediately after the start confirmation.

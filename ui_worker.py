@@ -4239,7 +4239,11 @@ class UiWorker(threading.Thread):
         self._put_release_state("progress", "正在校验安装包…")
         try:
             apply_staged_update(root, archive)
-        except UpdateError as exc:
+        except (UpdateError, UpdateCoreError) as exc:
+            # A package this installation cannot apply (wrong release kind,
+            # missing VERSION) must be reported HERE: the helper installs after
+            # the application exits, so a mismatch discovered there left the
+            # operator with nothing running.
             self._put_release_state("failed", str(exc))
             return
         except Exception:  # noqa: BLE001
@@ -8479,12 +8483,13 @@ class UiWorker(threading.Thread):
             LOG.info("%s已导出并复制文件：%s", log_type, target)
 
     def _copy_running_log(self) -> None:
-        """Attach the live log itself - the recording is already at its top.
+        """Attach the live log: one document per patrol run, recording on top.
 
-        ``work\\assistant.log`` now starts with the recording block and receives
-        a fresh snapshot whenever the recording changes, so there is nothing to
-        flush or rewrite: the toolbar copies that one file for the operator to
-        attach.
+        ``work\\assistant.log`` is restarted at every Start Patrol by
+        ``start_patrol_log_document`` and is never rotated, so the file holds
+        exactly the run that is happening now: version, the recording, then
+        that run's lines.  The toolbar copies that one file for the operator
+        to attach.
         """
 
         self._copy_log_file(

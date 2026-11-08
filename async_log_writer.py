@@ -18,12 +18,26 @@ from pathlib import Path
 from typing import Iterable, Optional, TextIO
 
 
+class _SectionBoundary:
+    """Queue marker: the file restarts at this point (one document per run).
+
+    It travels through the same buffer as the records, which is what makes the
+    reset order-exact: everything logged before the marker is written first,
+    everything logged after it follows the new header.
+    """
+
+    __slots__ = ("header",)
+
+    def __init__(self, header: str) -> None:
+        self.header = header
+
+
 class _RecordBuffer:
     """A bounded non-blocking record buffer with warning/error preference."""
 
     def __init__(self, capacity: int) -> None:
         self.capacity = max(100, int(capacity))
-        self._records: collections.deque[logging.LogRecord] = collections.deque()
+        self._records: collections.deque[object] = collections.deque()
         self._condition = threading.Condition()
 
     def put(self, record: logging.LogRecord) -> None:
@@ -35,22 +49,39 @@ class _RecordBuffer:
                     # Diagnostics are expendable when disk is unavailable;
                     # gameplay must never block to preserve every INFO line.
                     return
-                # Preserve the incoming warning/error by replacing the oldest
-                # lower-priority diagnostic when possible.
-                for index, existing in enumerate(self._records):
-                    if existing.levelno < logging.WARNING:
-                        del self._records[index]
-                        break
-                else:
-                    # The buffer contains only high-priority records.  Retain
-                    # recent evidence rather than stalling any worker.
-                    self._records.popleft()
+                self._make_room(logging.WARNING)
             self._records.append(record)
             self._condition.notify()
 
+    def put_section(self, header: str) -> None:
+        """Queue a file restart; it is never dropped for capacity."""
+
+        with self._condition:
+            if len(self._records) >= self.capacity:
+                self._make_room(logging.WARNING)
+            self._records.append(_SectionBoundary(header))
+            self._condition.notify()
+
+    def _make_room(self, incoming_level: int) -> None:
+        """Evict the oldest lower-priority record, keeping section markers.
+
+        Called with the buffer's condition held.
+        """
+
+        for index, existing in enumerate(self._records):
+            if isinstance(existing, _SectionBoundary):
+                continue
+            if getattr(existing, "levelno", logging.WARNING) < logging.WARNING:
+                del self._records[index]
+                return
+        for index, existing in enumerate(self._records):
+            if not isinstance(existing, _SectionBoundary):
+                del self._records[index]
+                return
+
     def take_batch(
         self, *, timeout: float, maximum_records: int
-    ) -> list[logging.LogRecord]:
+    ) -> list[object]:
         """Remove one batch after its short coalescing window expires."""
 
         with self._condition:
@@ -63,7 +94,7 @@ class _RecordBuffer:
             count = min(len(self._records), max(1, int(maximum_records)))
             return [self._records.popleft() for _ in range(count)]
 
-    def restore_front(self, records: Iterable[logging.LogRecord]) -> None:
+    def restore_front(self, records: Iterable[object]) -> None:
         """Retry a failed batch before newer buffered records."""
 
         values = list(records)
@@ -89,7 +120,13 @@ MAX_BATCH_RETRIES = 20
 
 
 class _BatchRotatingFileHandler(RotatingFileHandler):
-    """One combined write/flush per batch, retaining normal rotation rules."""
+    """One combined write/flush per batch, retaining normal rotation rules.
+
+    ``maxBytes=0`` disables rotation: the file then grows for as long as the
+    writer lives, which is what the runtime log (``work/assistant.log``) uses
+    so one document covers the whole application run instead of only the most
+    recent patrol round.
+    """
 
     def _format_one(self, record: logging.LogRecord) -> str:
         """Format one record; a malformed one becomes a readable placeholder.
@@ -126,36 +163,58 @@ class _BatchRotatingFileHandler(RotatingFileHandler):
             )
 
     def write_batch(
-        self, records: Iterable[logging.LogRecord], *,
+        self, records: Iterable[object], *,
         mirror: Optional[TextIO] = None, note: str = "",
     ) -> bool:
         records = list(records)
         if not records:
             return True
         try:
-            text = note + "".join(self._format_one(record) for record in records)
-            try:
-                text.encode("utf-8")
-            except UnicodeEncodeError:
-                text = text.encode("utf-8", "replace").decode("utf-8")
+            # One combined write per run of records between section markers.
+            # A marker means "this file now starts over", which is how the
+            # runtime log keeps exactly the current patrol run.
+            segments: list[tuple[bool, str]] = []
+            pending: list[str] = []
+            pending_note = note
+            for item in records:
+                if isinstance(item, _SectionBoundary):
+                    if pending or pending_note:
+                        segments.append((False, pending_note + "".join(pending)))
+                    pending = []
+                    pending_note = ""
+                    segments.append((True, item.header))
+                    continue
+                pending.append(self._format_one(item))
+            if pending or pending_note:
+                segments.append((False, pending_note + "".join(pending)))
+            if not segments:
+                return True
+            written: list[str] = []
             self.acquire()
             try:
-                if self.stream is None:
-                    self.stream = self._open()
-                if self.maxBytes > 0 and self.stream.tell() + len(text) >= self.maxBytes:
-                    self.doRollover()
-                self.stream.write(text)
-                self.flush()
-                if mirror is not None:
-                    try:
-                        mirror.write(text)
-                        mirror.flush()
-                    except Exception:
-                        # Console output is diagnostic only.  Its failure must
-                        # never reject an already-persisted log batch.
-                        pass
+                for restart, text in segments:
+                    text = self._utf8_safe(text)
+                    written.append(text)
+                    if restart:
+                        self._restart_file(text)
+                        continue
+                    if self.stream is None:
+                        self.stream = self._open()
+                    if (self.maxBytes > 0
+                            and self.stream.tell() + len(text) >= self.maxBytes):
+                        self.doRollover()
+                    self.stream.write(text)
+                    self.flush()
             finally:
                 self.release()
+            if mirror is not None:
+                try:
+                    mirror.write("".join(written))
+                    mirror.flush()
+                except Exception:
+                    # Console output is diagnostic only.  Its failure must
+                    # never reject an already-persisted log batch.
+                    pass
             return True
         except Exception:
             # Do not call logging from a writer failure: doing so would enqueue
@@ -165,6 +224,32 @@ class _BatchRotatingFileHandler(RotatingFileHandler):
             except Exception:
                 pass
             return False
+
+    @staticmethod
+    def _utf8_safe(text: str) -> str:
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            return text.encode("utf-8", "replace").decode("utf-8")
+        return text
+
+    def _restart_file(self, header: str) -> None:
+        """Truncate the log and start it with ``header``.
+
+        Called with the file lock held.  The previous content is replaced on
+        purpose: the runtime log is a one-run document, so the file always
+        describes the run that is happening now.
+        """
+
+        try:
+            self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+        with open(self.baseFilename, "w", encoding=self.encoding) as fresh:
+            fresh.write(header)
+            fresh.flush()
+        self.stream = self._open()
 
 
 class AsyncBatchLogHandler(logging.Handler):
@@ -202,7 +287,8 @@ class AsyncBatchLogWriter:
         self.handler = AsyncBatchLogHandler(self._buffer)
         self._file_handler = _BatchRotatingFileHandler(
             path,
-            maxBytes=max(1, int(max_bytes)),
+            # 0 means "never rotate": one file for the whole writer lifetime.
+            maxBytes=max(0, int(max_bytes)),
             backupCount=max(0, int(backup_count)),
             encoding="utf-8",
         )
@@ -227,6 +313,17 @@ class AsyncBatchLogWriter:
         self._stop.set()
         self._thread.join(timeout=max(0.0, float(drain_timeout)))
         self._file_handler.close()
+
+    def start_new_run(self, header: str) -> None:
+        """Restart the file at the next write boundary: one document per run.
+
+        The runtime log calls this at every Start Patrol, so the attached file
+        always describes exactly the run that is happening now instead of an
+        ever-growing history.  Ordering is exact: records logged before this
+        call are written first, records logged after it follow ``header``.
+        """
+
+        self._buffer.put_section(header)
 
     def append_block(self, text: str) -> bool:
         """Append one raw block (a recording snapshot) between normal batches.

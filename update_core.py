@@ -44,6 +44,14 @@ ARCHIVE_PREFIX = "MoonEclipse"
 # Abandoned partial downloads must not look like a usable archive later.
 ARCHIVE_SUFFIX = ".zip"
 _DOWNLOAD_PARTS = 8
+# The entry point a release ZIP must carry next to its VERSION for the install
+# it replaces.  ``runtime_paths.package_format`` decides which one applies.
+ARCHIVE_ENTRY_POINTS = {
+    "frozen": ("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe"),
+    "source": ("assistant.py",),
+}
+# The post-exit install/restart helper every package ships at its root.
+HELPER_NAME = "todohelper_update.ps1"
 
 
 class UpdateCoreError(RuntimeError):
@@ -197,6 +205,58 @@ def archive_version(archive: Path) -> str:
     return ""
 
 
+def archive_entry_point(archive: Path, fmt: str) -> Optional[str]:
+    """The package entry point inside ``archive`` for an install of ``fmt``.
+
+    A release ZIP is installed by copying its package root (the folder that
+    holds ``VERSION``) over the install root, so the entry point must sit next
+    to that ``VERSION``.  Returns ``None`` when no such package root matches.
+    """
+
+    wanted = ARCHIVE_ENTRY_POINTS.get(str(fmt), ())
+    if not wanted:
+        return None
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            names = [
+                info.filename.replace("\\", "/")
+                for info in bundle.infolist() if not info.is_dir()
+            ]
+    except (OSError, zipfile.BadZipFile):
+        return None
+    for name in names:
+        if name == "VERSION" or name.endswith("/VERSION"):
+            prefix = name[: -len("VERSION")]
+            for candidate in wanted:
+                if prefix + candidate in names:
+                    return prefix + candidate
+    return None
+
+
+def verify_archive_layout(archive: Path, fmt: str) -> None:
+    """Refuse a package that cannot replace THIS installation.
+
+    The install itself happens after the application exits, so a format
+    mismatch there leaves the operator with no running program - the field
+    report "the update finished but the client never restarted".  Checking the
+    layout here keeps the application open and turns that into a message.
+    """
+
+    if not ARCHIVE_ENTRY_POINTS.get(str(fmt)):
+        return
+    if archive_entry_point(archive, fmt) is not None:
+        return
+    expected = ("MoonEclipse.exe (免安装版)" if fmt == "frozen"
+                else "assistant.py (源码版)")
+    offered = ("assistant.py (源码版)" if fmt == "frozen"
+               else "MoonEclipse.exe (免安装版)")
+    raise UpdateCoreError(
+        f"下载的安装包与当前安装不匹配：当前需要 {expected} 的发布包，"
+        f"这个包是 {offered}。请让服务器 更新链接 指向 "
+        f"{'MoonEclipse-release-*.zip' if fmt == 'frozen' else 'MoonEclipse-<版本>.zip'}。"
+    )
+
+
 def verify_archive(archive: Path, release: ReleaseInfo) -> None:
     """Refuse an archive that is not the announced release."""
 
@@ -310,6 +370,38 @@ def stage_update(
     )
 
 
+def extract_package_helper(archive: Path, root: Path) -> Optional[Path]:
+    """Extract the update helper shipped inside ``archive``.
+
+    The helper that installs an update lives in the INSTALL ROOT, so it is the
+    one from the version that is running now - a restart fix would therefore
+    only take effect one update later, and the update that needs it is exactly
+    the one being started.  The archive was already verified as this release's
+    package, so running its own helper is the same trust decision as installing
+    its files.
+    """
+
+    destination = Path(root) / UPDATE_DIRECTORY / HELPER_NAME
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            entry = None
+            for info in bundle.infolist():
+                name = info.filename.replace("\\", "/")
+                if name == HELPER_NAME or name.endswith("/" + HELPER_NAME):
+                    entry = info
+                    break
+            if entry is None:
+                return None
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.open(entry) as source, open(destination, "wb") as handle:
+                shutil.copyfileobj(source, handle)
+    except (OSError, zipfile.BadZipFile) as exc:
+        LOG.warning("the package update helper could not be extracted: %s", exc)
+        return None
+    LOG.info("update helper will run from the package: %s", destination)
+    return destination
+
+
 def apply_staged_update(root: Path, archive: Path) -> None:
     """Hand a verified archive to the helper that installs it after exit.
 
@@ -325,12 +417,19 @@ def apply_staged_update(root: Path, archive: Path) -> None:
     version = archive_version(archive)
     if not version:
         raise UpdateCoreError("安装包缺少 VERSION，无法安装。")
+    # Never close the application for a package the helper cannot install: that
+    # combination leaves nothing running to report the failure.
+    verify_archive_layout(archive, package_format(root))
+    # Prefer the helper from the package being installed (see
+    # extract_package_helper); fall back to the installed copy.
+    helper = extract_package_helper(archive, root)
     schedule_package_update(
         DesktopUpdate(
             path=Path(archive), version=version, kind="zip",
             package_format=package_format(root),
         ),
         root,
+        helper=helper,
     )
 
 
@@ -450,10 +549,12 @@ def _host(link: str) -> str:
 
 
 __all__ = [
-    "ARCHIVE_PREFIX", "NOTICE_FILE", "ReleaseInfo", "UPDATE_DIRECTORY",
-    "UpdateCoreError", "announced_version", "apply_staged_update",
-    "archive_version", "clear_notice", "clear_staged_updates",
-    "download_package", "fetch_release_info", "is_newer", "notice_path",
+    "ARCHIVE_ENTRY_POINTS", "ARCHIVE_PREFIX", "HELPER_NAME", "NOTICE_FILE",
+    "ReleaseInfo", "UPDATE_DIRECTORY", "UpdateCoreError", "announced_version",
+    "apply_staged_update", "archive_entry_point", "archive_version",
+    "clear_notice", "clear_staged_updates",
+    "download_package", "extract_package_helper", "fetch_release_info",
+    "is_newer", "notice_path",
     "parse_release", "read_notice", "stage_update", "verify_archive",
-    "write_notice",
+    "verify_archive_layout", "write_notice",
 ]
