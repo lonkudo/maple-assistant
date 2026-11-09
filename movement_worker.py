@@ -12479,6 +12479,9 @@ class MovementWorker(threading.Thread):
             self._route_layer_index = None
             self._return_mode = "drop-to-route"
             self._return_from_floor = None
+            # A fresh descent: the first frame must try Alt+Down, not walk on a count
+            # left over from an earlier drop in this run.
+            self._reset_drop_walk_state("marker above the route at patrol start")
             LOG.warning(
                 "PATROL START: marker is above the recorded patrol route; "
                 "dropping until it enters the route"
@@ -13489,6 +13492,29 @@ class MovementWorker(threading.Thread):
             RECONNECT_DROP_EDGE_HOLD_SECONDS,
         )
 
+    def _reset_drop_walk_state(self, reason: str = "") -> None:
+        """Forget the Alt+Down -> walk bookkeeping of ONE descent.
+
+        This is what made a fresh v1.3.7 descent walk "randomly" without Alt+Down: the
+        chord counter survived the previous descent, so the next drop-to-route (for
+        example after a reconnect) began with the count already at the threshold and the
+        first decision frame walked.  Every descent starts from zero.
+        """
+
+        self._reconnect_drop_chords = 0
+        self._reconnect_drop_stalled_attempts = 0
+        self._reconnect_drop_best_y = None
+        self._reconnect_drop_attempt_y = None
+        self._reconnect_drop_attempt_at = float("-inf")
+        self._reconnect_drop_assessed_at = float("-inf")
+        self._reconnect_drop_edge_phase = None
+        self._reconnect_drop_edge_second_pass = False
+        self._reconnect_drop_edge_start_y = None
+        self._reconnect_drop_edge_cycles = 0
+        self._reconnect_drop_walk_abandoned = False
+        if reason:
+            LOG.info("DROP WALK: Alt+Down bookkeeping reset (%s)", reason)
+
     def _reset_drop_arrival(self) -> None:
         """Forget the drop-to-route landing evidence (movement thread only)."""
 
@@ -13500,6 +13526,8 @@ class MovementWorker(threading.Thread):
         self._drop_arrival_frames = 0
         self._drop_relaxed_y = None
         self._drop_relaxed_floor = None
+        # A descent boundary: its Alt+Down/walk count starts at zero here too.
+        self._reset_drop_walk_state()
 
     def _note_drop_descent(self, observation: MinimapObservation) -> None:
         """Remember where the current drop-to-route descent started and got to.
