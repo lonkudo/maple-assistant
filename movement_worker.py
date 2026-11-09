@@ -400,6 +400,14 @@ RECONNECT_DROP_EDGE_HOLD_SECONDS = 5.0
 # recovery hands the vertical state back to the normal route planner.
 RECONNECT_DROP_MAX_EDGE_CYCLES = 3
 RECONNECT_DROP_RECOVERY_MAX_SECONDS = 30.0
+# The operator's rule (2026-11-09): a failed drop must stay vertical.  The recovery
+# used to "hunt for a drop edge" - hold left, then right, 5 s each, up to three pass
+# pairs - which walked the character sideways while the game refused to descend
+# (field log 20:47: keep Alt+Down, but do not move left or right).  With this off the
+# stalled attempts only repeat Alt+Down; the bounded attempt counter still hands the
+# vertical state back to the normal route planner, and the edge-walk code stays in
+# place (flip it to True to restore the old behaviour).
+RECONNECT_DROP_EDGE_WALK_ENABLED = False
 
 # Unresolved-floor recovery (operator: "when we meet with unresolved floor we
 # shall alt+down to change layer").  A marker that matches no recorded band and
@@ -13319,6 +13327,14 @@ class MovementWorker(threading.Thread):
             return None
 
         phase = self._reconnect_drop_edge_phase
+        if phase is not None and not RECONNECT_DROP_EDGE_WALK_ENABLED:
+            # A walk left over from a previous decision is dropped instead of being
+            # held: the recovery must never move sideways (operator's rule).
+            LOG.info("RECONNECT DROP RECOVERY: dropping the %s edge walk", phase)
+            self._reconnect_drop_edge_phase = None
+            self._reconnect_drop_edge_second_pass = False
+            self._reconnect_drop_edge_start_y = None
+            phase = None
         if phase is not None:
             start_y = self._reconnect_drop_edge_start_y
             if (start_y is not None
@@ -13404,6 +13420,21 @@ class MovementWorker(threading.Thread):
             attempt_y, current_y,
         )
         if self._reconnect_drop_stalled_attempts < RECONNECT_DROP_STALLED_ATTEMPTS:
+            return None
+        if not RECONNECT_DROP_EDGE_WALK_ENABLED:
+            # Stay vertical: repeat Alt+Down instead of walking to an edge.  The
+            # counter keeps its value so every later attempt is still assessed, and
+            # the bounded recovery (RECONNECT_DROP_RECOVERY_MAX_SECONDS) hands the
+            # vertical state back on its own.  Log at the threshold and then every
+            # tenth attempt - one line per chord would flood the log.
+            if (self._reconnect_drop_stalled_attempts == RECONNECT_DROP_STALLED_ATTEMPTS
+                    or self._reconnect_drop_stalled_attempts % 10 == 0):
+                LOG.warning(
+                    "RECONNECT DROP RECOVERY: %d Alt+Down attempts stalled (X=%.6f); "
+                    "keeping Alt+Down - no left/right edge walk",
+                    self._reconnect_drop_stalled_attempts,
+                    float(player.x),
+                )
             return None
         # Start toward the nearer outer side: markers left of centre try the
         # right edge first; markers at/right of centre try the left edge.  If
