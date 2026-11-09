@@ -6830,6 +6830,11 @@ class UiWorker(threading.Thread):
         # bills its own CT_IN card and WS quota, so 测试api can run against it the
         # moment the service answers its health probe.
         local_backend = self._auto_lie_backend_is_local()
+        # Which service served this drill decides where its accounting goes.  The
+        # result drain runs later in another method, so the choice is recorded
+        # here instead of re-reading the radio (the operator may switch the group
+        # while a 测试api run is still playing).
+        self._api_test_local_backend = bool(local_backend)
         key = "" if local_backend else get_server_secret()
         if not local_backend and not key:
             try:
@@ -7078,10 +7083,14 @@ class UiWorker(threading.Thread):
                 elif state == "done":
                     self._set_api_test_status(f"测试api 完成: {detail}")
                     self._play_action_sound(True)
-                    # A completed manual API drill uses the same upstream
-                    # service as an in-game pass.  Count it immediately so
-                    # the authorization bar reflects the server response.
-                    self._enqueue_auto_lie_accounting("api-test")
+                    # A completed manual API drill counts for exactly one backend.
+                    # 云端测谎 charges the server quota, so the cloud accounting
+                    # event is queued for a cloud drill only: a 本地测谎 drill is
+                    # billed by the CT card and belongs to 本地测谎统计, and
+                    # queueing a cloud event here is what made 云端测谎统计 move
+                    # while 本地测谎统计 stayed empty.
+                    if not getattr(self, "_api_test_local_backend", False):
+                        self._enqueue_auto_lie_accounting("api-test")
                     self._report_local_lie_drill("success", detail)
                     self._api_test_idle()
                 elif state == "stopped":

@@ -17,6 +17,7 @@ import signal
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -744,10 +745,22 @@ def report_local_pass(
                     "latency_ms": latency_ms,
                     "detail": str(detail or "")[:200],
                     "ct_card": str(_state.get("online_card") or "")[:30],
-                    "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    # An explicit UTC offset: the server stores this instant, and a
+                    # naive string made an un-updated server answer 500 (Django 5
+                    # dropped django.utils.timezone.utc on that branch), which the
+                    # field log showed as "category=JSONDecodeError" on this path.
+                    "occurred_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 },
                 licensing.runtime_root() / licensing.ACTIVATION_SERVER_PIN_FILE,
             )
+            if isinstance(answer, dict) and answer.get("ok") is False:
+                # A rejected report is not an exception, so it would otherwise be
+                # invisible: say why, without ever echoing the card.
+                LOG.warning(
+                    "local lie service: the server did not accept pass %s (%s): %s",
+                    str(event_id)[:8], outcome, str(answer.get("message") or "")[:120],
+                )
+                return answer
             LOG.info("local lie service: pass %s reported (%s)", str(event_id)[:8], outcome)
             return answer
         except Exception:  # noqa: BLE001 - statistics are never critical
