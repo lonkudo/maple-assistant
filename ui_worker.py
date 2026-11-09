@@ -7331,12 +7331,25 @@ class UiWorker(threading.Thread):
         # starts it and keeps it listening; 关闭 and 云端测谎 stop it again (only an
         # instance this app started); reselecting 本地测谎 restarts it.  There is no
         # lazy start at a lie window and nothing for the operator to launch.
+        #
+        # A pass in flight owns the service: stopping it underneath the pass would
+        # abort the very lie window being answered, so the stop is deferred to the
+        # pass end (see _service_api_auto_lie).  A start is always allowed.
+        wanted = mode == AUTOLIE_BACKEND_LOCAL
+        running = self._worker_is_running(getattr(self, "_api_lie_pass_worker", None))
         try:
             import local_lie_service
 
-            local_lie_service.supervisor_set_active(
-                mode == AUTOLIE_BACKEND_LOCAL, application_root(__file__)
-            )
+            if not wanted and running:
+                self._local_lie_stop_pending = True
+                AUTO_LIE_LOG.info(
+                    "自动测谎: 本地测谎 service stop deferred - a pass is running"
+                )
+            else:
+                self._local_lie_stop_pending = False
+                local_lie_service.supervisor_set_active(
+                    wanted, application_root(__file__)
+                )
         except Exception:  # noqa: BLE001 - never break a selection change
             LOG.debug("本地测谎 supervisor switch failed", exc_info=True)
         if mode == AUTOLIE_BACKEND_LOCAL:
@@ -7927,6 +7940,22 @@ class UiWorker(threading.Thread):
                     self._api_test_status.configure(
                         text="自动过测谎: 后端中断，未点击确认也未恢复运行；请按 Esc 处理。"
                     )
+            # A selection change asked for the 本地测谎 service to stop while this
+            # pass was still using it.  Now that the pass is over, honour it.
+            if getattr(self, "_local_lie_stop_pending", False):
+                self._local_lie_stop_pending = False
+                if not self._auto_lie_backend_is_local():
+                    try:
+                        import local_lie_service
+
+                        local_lie_service.supervisor_set_active(
+                            False, application_root(__file__)
+                        )
+                        AUTO_LIE_LOG.info(
+                            "自动测谎: 本地测谎 service stopped now that the pass ended"
+                        )
+                    except Exception:  # noqa: BLE001 - service switching is best effort
+                        LOG.debug("本地测谎 deferred stop failed", exc_info=True)
         if not self._api_auto_lie_pending:
             return
         # One pass at a time.  A pending event waits for the running one, but not forever: a worker
@@ -8003,6 +8032,10 @@ class UiWorker(threading.Thread):
         self._pause_patrol_for_api_pass()
         pause_elapsed = time.perf_counter() - pause_started
         self._api_lie_pass_worker = worker
+        # Recorded here, before the worker runs: this is the backend the pass is
+        # actually served by, so its accounting cannot be diverted by a selection
+        # change (or by 本地测谎 becoming unavailable) while the pass is in flight.
+        self._api_lie_pass_local_backend = bool(local_backend)
         self._api_auto_lie_last_pass_started = time.monotonic()
         self._api_auto_lie_wait_logged = False
         self._api_auto_lie_runs += 1
@@ -8283,7 +8316,7 @@ class UiWorker(threading.Thread):
                 release_capture()
         event_id = str(getattr(worker, "accounting_event_id", "") or "")
         if event_id and not state.get("accounted"):
-            if self._auto_lie_backend_is_local():
+            if self._pass_served_by_local():
                 # 本地测谎: report the outcome to the local-service statistics
                 # endpoint instead of the cloud accounting queue (the local pass
                 # is billed by the CT service, not by 测谎次数).
@@ -8440,10 +8473,25 @@ class UiWorker(threading.Thread):
             AUTO_LIE_LOG.warning("自动过测谎: black-room marker loss confirmed during outcome watch")
             self._finish_auto_lie_outcome(state, "failed_marker_missing")
 
+    def _pass_served_by_local(self) -> bool:
+        """Which backend served the CURRENT pass, decided when it started.
+
+        Reading the 自动测谎 radio at outcome time was wrong: switching the group
+        (or losing the CT card, which greys 本地测谎 and disarms it) while a pass is
+        running sent a local pass's outcome to the cloud accounting queue - the
+        local row stayed pending for ever and the cloud was charged - or reported a
+        cloud pass to the local statistics.
+        """
+
+        recorded = getattr(self, "_api_lie_pass_local_backend", None)
+        if recorded is None:
+            return self._auto_lie_backend_is_local()
+        return bool(recorded)
+
     def _begin_auto_lie_accounting_event(self) -> Optional[str]:
         """Persist the server lifecycle record when the WS handshake is ready."""
 
-        if self._auto_lie_backend_is_local():
+        if self._pass_served_by_local():
             # 本地测谎 is billed by the CT service, so the cloud accounting row
             # would be wrong; report the pass to the local-service endpoint
             # instead (statistics only) and keep its event id for the outcome.
