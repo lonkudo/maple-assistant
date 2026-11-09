@@ -79,6 +79,9 @@ lie_accounting_pending.json
 微信图片_*.png
 nuitka-crash-report.xml
 CT_Lie3_track_custom2_GPU/
+# The vendor CT drill client: 341 MB of vendor material that also carries the
+# CT card.  It is read-only reference, never a source of this repository.
+CT_Lie3_KR_partner_api_DML/
 
 # The activation service is its own repository (see its own .git).
 activation_service/
