@@ -13470,11 +13470,11 @@ class MovementWorker(threading.Thread):
             "(best %.6f, now %.6f)",
             self._reconnect_drop_chords, best_y, current_y,
         )
-        # Alt+Down has failed enough: walk to an edge and let the character drop
-        # through it.  The FIRST direction is decided by X - walk toward the side the
-        # character already stands on (nearest edge), which is the shortest way off
-        # the platform - and the opposite edge is tried when that pass fails.
-        first_phase = "left" if float(player.x) < 0.5 else "right"
+        # Alt+Down has failed enough: walk to an edge and let the character drop through
+        # it.  The operator's sequence is exact: two Alt+Down chords first, and only then
+        # "right (when X < 0.5), left (X > 0.5)" - i.e. AWAY from the side the character
+        # already stands on.  The opposite edge is tried when that pass fails.
+        first_phase = "right" if float(player.x) < 0.5 else "left"
         self._reconnect_drop_edge_phase = first_phase
         self._reconnect_drop_edge_second_pass = False
         self._reconnect_drop_edge_started_at = now
