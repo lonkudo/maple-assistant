@@ -7399,6 +7399,66 @@ class UiWorker(threading.Thread):
 
         threading.Thread(target=job, name="local-lie-probe", daemon=True).start()
 
+    def _local_lie_access(self) -> Optional[bool]:
+        """Whether this activation code may use 本地测谎, or None while unknown.
+
+        The CT card is the access token: the licence reply carries it in the device
+        document, so a code without one has no 本地测谎.  Before the first reply
+        nothing is known and the selection must stay usable.
+        """
+
+        try:
+            import local_lie_service
+
+            if not local_lie_service.card_known():
+                return None
+            return bool(local_lie_service.has_online_card())
+        except Exception:  # noqa: BLE001 - an unavailable module must not lock the UI
+            LOG.debug("本地测谎 access could not be decided", exc_info=True)
+            return None
+
+    def _sync_local_lie_radio(self) -> None:
+        """Grey the 本地测谎 radio when the code has no CT card.
+
+        A code without a card cannot run the local backend, so the radio is
+        disabled and a saved 本地测谎 selection falls back to 关闭 (never to
+        云端测谎: that would start charging 测谎次数 without being asked).  The
+        state is applied only when it changes, because this runs on every UI tick.
+        """
+
+        buttons = list(getattr(self, "_api_auto_lie_buttons", []) or [])
+        if len(buttons) < 3:
+            return
+        access = self._local_lie_access()
+        allowed = access is not False
+        if allowed != getattr(self, "_local_lie_radio_allowed", None):
+            self._local_lie_radio_allowed = allowed
+            try:
+                buttons[2].configure(state="normal" if allowed else "disabled")
+            except Exception:  # noqa: BLE001 - a radio state is never fatal
+                LOG.debug("本地测谎 radio state could not be set", exc_info=True)
+            if not allowed:
+                AUTO_LIE_LOG.warning(
+                    "自动测谎: this activation code carries no CT card - "
+                    "本地测谎 is disabled (%s)",
+                    self._auto_lie_backend_label(),
+                )
+        if not allowed and self._auto_lie_backend_is_local():
+            # The selection is no longer reachable: disarm it instead of leaving a
+            # backend armed that cannot serve a lie window.
+            try:
+                self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
+                self._api_auto_lie_backend_changed()
+            except Exception:  # noqa: BLE001 - never break the UI tick
+                LOG.warning("本地测谎 could not fall back to 关闭", exc_info=True)
+                return
+            AUTO_LIE_LOG.warning(
+                "自动测谎: 本地测谎 fell back to 关闭 - the code has no CT card"
+            )
+            self._set_api_test_status(
+                "自动测谎 已切到 关闭：本机授权码没有 CT 卡，无法使用本地测谎。"
+            )
+
     def _activate_local_lie_clicked(self) -> None:
         """激活测谎: write a CT_ card for the local service and restart it.
 
@@ -12013,6 +12073,10 @@ class UiWorker(threading.Thread):
         service_note = self._local_lie_service_note()
         if service_note:
             notes.append(service_note)
+        # Why the 本地测谎 radio is greyed: the code has no CT card.  Said once, on
+        # the same hint line, so a greying radio is never unexplained.
+        if self._local_lie_access() is False:
+            notes.append("本地测谎: 本机授权码没有 CT 卡，本地测谎 已置灰")
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note
         self._local_lie_service_hint_shown = service_note
@@ -12043,6 +12107,9 @@ class UiWorker(threading.Thread):
         itself once the service is listening.
         """
 
+        # The 本地测谎 radio follows the code's CT card: without one the backend is
+        # out of reach, so the selection is greyed (and disarmed) on every tick.
+        self._sync_local_lie_radio()
         if getattr(self, "_auto_lie_backend_is_local", None) is not None:
             if (self._auto_lie_backend_is_local()
                     and self._local_lie_ready is False

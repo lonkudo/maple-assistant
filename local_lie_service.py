@@ -263,6 +263,41 @@ def has_online_card() -> bool:
     return card.strip().upper().startswith("CT_")
 
 
+def card_known() -> bool:
+    """Whether a licence reply has already said if this code has a CT card.
+
+    Before the first reply the desktop knows nothing, so the 本地测谎 selection must
+    not be locked out merely because the heartbeat has not answered yet.  A reply
+    that carries the device document is authoritative either way: a card sets
+    ``online_card``, a reply without one calls note_card_absent().
+    """
+
+    with _lock:
+        return bool(_state.get("card_checked"))
+
+
+def note_card_absent() -> None:
+    """The licence reply carries no CT card: this code has no 本地测谎 access.
+
+    The in-memory card is dropped so nothing can start the service with a stale
+    one.  The CT package's own credential file is left alone: this is a licence
+    statement, not a reason to rewrite another product's settings.
+    """
+
+    with _lock:
+        had = bool(str(_state.get("online_card") or ""))
+        _state["card_checked"] = True
+        _state["online_card"] = ""
+    if had:
+        LOG.warning(
+            "local lie service: the licence reply no longer carries a CT card, "
+            "本地测谎 stays off"
+        )
+    else:
+        LOG.info("local lie service: this activation code carries no CT card")
+
+
+
 def supervisor_set_active(active: bool, app_root=None) -> None:
     """Turn the pre-start supervisor on or off with the 本地测谎 selection.
 
@@ -319,6 +354,9 @@ def note_online_card(card: str) -> None:
     with _lock:
         if text:
             _state["online_card"] = text
+        # A licence reply reached us, so "does this code carry a CT card" is now
+        # answered either way - the 本地测谎 selection may be greyed on the truth.
+        _state["card_checked"] = True
         desired = _desired_active
         root = _desired_root
     if not text:
@@ -677,6 +715,12 @@ def apply_online_card(card_code: str) -> bool:
     card = str(card_code or "").strip()
     if not card:
         return False
+    # The card is known from the licence reply whether or not the CT package can
+    # be written right now, so the access decision (grey 本地测谎 or not) is taken
+    # from the reply itself, before any file work.
+    with _lock:
+        _state["online_card"] = card
+        _state["card_checked"] = True
     root = install_root()
     path = service_credentials_path(root)
     if path is None or not path.is_file():
@@ -690,6 +734,7 @@ def apply_online_card(card_code: str) -> bool:
     if str(settings.get("partner_license_code") or "").strip() == card:
         with _lock:
             _state["online_card"] = card
+            _state["card_checked"] = True
         return False
     settings["partner_license_code"] = card
     try:
@@ -701,6 +746,7 @@ def apply_online_card(card_code: str) -> bool:
         return False
     with _lock:
         _state["online_card"] = card
+        _state["card_checked"] = True
     LOG.info(
         "local lie service: CT card from the activation server written to %s (%s)",
         path, _mask(card),

@@ -931,6 +931,10 @@ def _with_server_device(
         try:
             import local_lie_service
 
+            # Authoritative: the reply without a card means this code has no
+            # 本地测谎 access, so the desktop greys that selection (it is not a
+            # "not arrived yet" guess - the device document was just delivered).
+            local_lie_service.note_card_absent()
             if local_lie_service.hint_state() == "no_card":
                 import logging as _logging
 
