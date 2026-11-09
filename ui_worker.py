@@ -3341,11 +3341,11 @@ class UiWorker(threading.Thread):
                     continue
                 hint = HoverTooltip(
                     button,
-                    "开启后扣减测谎次数，测谎程序自动接管鼠标，不需要操作，"
-                    "中途可以按esc中断，但是仍然扣费，如要手动操作，请不要开启"
+                    "开启后每测一次扣一次次数；期间自动接管鼠标，你不用操作，"
+                    "按 Esc 可以中断（仍然扣费）。想自己操作请先关闭"
                     if value == "cloud" else
-                    "本地测谎：连接 127.0.0.1:8765 的同行坐标服务，"
-                    "由本机服务计费（不扣在线测谎次数），点 测试本地测谎 可以先用本地服务试跑",
+                    "由本机测谎服务识别，使用测谎卡计次，不扣在线测谎次数；"
+                    "选好后可以先点 测试本地测谎 试跑一次",
                 )
                 hint.set_enabled(True)
                 self._bind_key_tooltips.append(hint)
@@ -3405,14 +3405,13 @@ class UiWorker(threading.Thread):
                 LOG.debug("api test slot could not be sized", exc_info=True)
             local_test_hint = HoverTooltip(
                 self._api_test_local_button,
-                "本地测谎：选择视频并按 5 fps 试跑一次，走 127.0.0.1:8765，"
-                "由本机服务计费，不扣在线测谎次数",
+                "用一段录好的视频试跑一次，看看能不能正常识别；不扣在线测谎次数",
             )
             local_test_hint.set_enabled(True)
             self._bind_key_tooltips.append(local_test_hint)
             cloud_test_hint = HoverTooltip(
                 self._api_test_cloud_button,
-                "云端测谎：选择视频并按 5 fps 试跑一次，走在线测谎服务，会计入测谎次数",
+                "用视频试跑一次，会扣在线测谎次数",
             )
             cloud_test_hint.set_enabled(True)
             self._bind_key_tooltips.append(cloud_test_hint)
@@ -4055,7 +4054,7 @@ class UiWorker(threading.Thread):
             try:
                 from tkinter import messagebox
                 messagebox.showinfo(
-                    "教学", "未找到教学图片。请确认 teach-assets 文件夹已随安装包提供。",
+                    "教学", "教学图片缺失，请重新安装助手",
                     parent=root,
                 )
             except Exception:
@@ -4408,8 +4407,8 @@ class UiWorker(threading.Thread):
 
         if not messagebox.askyesno(
             "安装更新",
-            f"下载并安装 v{version}？\n\n安装期间助手会关闭，完成后自动重启；"
-            "user_config.json 与助手配置都会保留。",
+            f"下载并安装 v{version}？\n\n安装时助手会关闭，装完自动重启，"
+            "你的设置都会保留。",
             parent=getattr(self, "_root", None),
         ):
             return
@@ -6816,33 +6815,24 @@ class UiWorker(threading.Thread):
     # ------------------------------------------------------------------ 测试api
 
     def _api_test_backend_text(self) -> str:
-        """Which backend 测试api will use, with the key's *source* (never the key itself).
+        """Client wording for "is the lie service ready", never internal detail.
 
-        The key is never stored in the package.  It arrives only in a validated
-        heartbeat response and remains in process memory until app exit.
+        The key and its source are diagnostics: they belong in the log, not on a
+        line a customer reads.
         """
 
         if not has_server_secret():
-            return "等待在线授权下发测谎密钥"
-        return "真实后端（密钥来源：授权服务器，仅运行内存）"
-
-    def _api_test_status_text(self) -> str:
-        video = getattr(self, "api_test_video", "")
-        chosen = f"上次视频：{Path(video).name}；" if video else ""
-        if self._auto_lie_backend_mode() == AUTOLIE_BACKEND_LOCAL:
-            return (f"测试本地测谎: 本地测谎（127.0.0.1:8765，本机服务计费，不扣在线测谎次数）；"
-                    f"{chosen}按 测试本地测谎 选择视频，"
-                    f"{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，"
-                    "开始上传前先等第二个窗口（鼠标只在视频画面内）。")
-        return (f"试跑只在 本地测谎 时出现：选 本地测谎 后点 测试本地测谎，"
-                f"{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，鼠标只在视频画面内。")
+            return "等待测谎授权"
+        return "测谎服务已就绪"
 
     def _api_test_clicked(self) -> None:
-        """测试api: pick a video file and run the drill on it (5 fps, mouse inside the picture)."""
+        """试跑: pick a video file and run the drill on it (5 fps, mouse inside the picture)."""
 
         factory = getattr(self, "api_test_video_factory", None)
         if not callable(factory):
-            self._set_api_test_status("测试api: 本机助手未启用视频测试工作线程。")
+            # Client wording only; the technical reason is a log line.
+            LOG.warning("api test: the video drill factory is not wired in this build")
+            self._set_api_test_status("试跑暂不可用，请重启助手再试")
             return
         if self._api_test_busy():
             return
@@ -6857,18 +6847,18 @@ class UiWorker(threading.Thread):
                 from api_lie_video import VideoDrillWindow as window_factory
             except Exception:
                 LOG.exception("api test: the video window could not be imported")
-                self._set_api_test_status("测试api: 无法载入视频窗口（详见运行日志）。")
+                self._set_api_test_status("视频窗口打不开，请重试")
                 return
         try:
             window = window_factory(
-                self._root, f"测试api — {video.name}",
+                self._root, f"测试本地测谎 — {video.name}",
                 on_close=self._api_test_window_closed,
                 on_toggle_mouse=self._api_test_toggle_mouse,
                 on_toggle_pause=self._api_test_toggle_pause,
             )
         except Exception:
             LOG.exception("api test: the video window could not be created")
-            self._set_api_test_status("测试api: 无法创建视频窗口（详见运行日志）。")
+            self._set_api_test_status("视频窗口打不开，请重试")
             return
         display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
         # 本地测谎: no online 测谎密钥 at all.  The local service on 127.0.0.1:8765
@@ -6886,7 +6876,7 @@ class UiWorker(threading.Thread):
                 window.close()
             except Exception:
                 pass
-            self._report_api_test_failure("测试api: 等待在线授权下发测谎密钥。")
+            self._report_api_test_failure("还没拿到测谎授权，请稍等一会再试")
             return
         if local_backend:
             ready, note = self._ensure_local_lie_service()
@@ -6895,7 +6885,8 @@ class UiWorker(threading.Thread):
                     window.close()
                 except Exception:
                     pass
-                self._report_api_test_failure(f"测试api（本地测谎）: {note}")
+                AUTO_LIE_LOG.info("自动测谎: 本地服务未就绪，试跑取消（%s）", note)
+                self._report_api_test_failure("本地测谎服务还没准备好，请等几秒再试")
                 return
         try:
             if local_backend:
@@ -6911,7 +6902,7 @@ class UiWorker(threading.Thread):
                 window.close()
             except Exception:
                 LOG.debug("video window close failed", exc_info=True)
-            self._report_api_test_failure("测试api: 工作线程创建失败（详见运行日志）。")
+            self._report_api_test_failure("试跑没能启动，请重试；多次失败请重启助手")
             return
         self.api_test_worker = worker
         self.api_test_window = window
@@ -6919,8 +6910,9 @@ class UiWorker(threading.Thread):
         self._api_test_display = display
         worker.image_rect = window.image_region()
         self._api_test_set_buttons("disabled")
-        LOG.info("api test (video): %s for %.0fs at 5 fps (key=%s)", video.name, seconds,
-                 "set" if key else "none -> mimic")
+        LOG.info("api test (video): %s for %.0fs at 5 fps (key=%s, backend=%s)",
+                 video.name, seconds, "set" if key else "none -> mimic",
+                 self._api_test_backend_text())
         # 本地测谎 statistics: a local drill is a local pass too.  Without this the
         # 本地测谎 panel stayed empty after 测试API (the field report: "全局测谎统计
         # moved but 本地测谎 did not"), because only the automatic pass reported.
@@ -6933,14 +6925,14 @@ class UiWorker(threading.Thread):
                 import local_lie_service
 
                 local_lie_service.report_local_pass(
-                    self._local_lie_drill_event, "pending", detail="测试API",
+                    self._local_lie_drill_event, "pending", detail="测试本地测谎",
                 )
             except Exception:  # noqa: BLE001 - statistics never block a drill
                 LOG.debug("本地测谎 测试API start report failed", exc_info=True)
         worker.start()
         self._set_api_test_status(
-            f"测试api: 正在播放 {video.name} - {seconds:.0f} 秒 @ 5 fps"
-            f"（{self._api_test_backend_text()}，鼠标只在视频画面内；Esc 或关闭窗口即停止）……")
+            f"测试本地测谎：正在试跑 {video.name}，约 {seconds:.0f} 秒；"
+            "鼠标只在视频画面内，按 Esc 或关闭窗口即停止")
         self._api_test_keep_focus()
 
     def _api_test_busy(self) -> bool:
@@ -6948,7 +6940,7 @@ class UiWorker(threading.Thread):
 
         worker = getattr(self, "api_test_worker", None)
         if worker is not None and getattr(worker, "running", False):
-            self._set_api_test_status("测试api: 已有一次测试在运行，请等它结束。")
+            self._set_api_test_status("试跑已经在进行，请等它结束")
             return True
         return False
 
@@ -6962,22 +6954,25 @@ class UiWorker(threading.Thread):
                 Path(__file__).resolve().parent / "detect_video")
             chosen = filedialog.askopenfilename(
                 parent=self._root,
-                title="选择要测试的视频（测试api 会按 5 fps 播放并上传）",
+                title="选择要试跑的视频",
                 initialdir=start,
                 filetypes=[("视频", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.m4v"),
                            ("所有文件", "*.*")],
             )
         except Exception as exc:
             LOG.exception("api test: the video picker failed")
-            self._set_api_test_status(f"测试api: 无法打开视频选择窗口 - {exc}")
+            LOG.warning("api test: picker error was %r", exc)
+            self._set_api_test_status("选择视频时出错了，请重试")
             return None
         text = str(chosen or "").strip()
         if not text:
-            self._set_api_test_status("测试api: 已取消（没有选择视频）。")
+            # Cancelling the picker is a normal action, not a failure to report.
+            LOG.debug("api test: the video picker was cancelled")
             return None
         video = Path(text)
         if not video.is_file():
-            self._set_api_test_status(f"测试api: 找不到视频文件 {video.name}。")
+            LOG.info("api test: the chosen video is gone (%s)", video.name)
+            self._set_api_test_status("视频文件找不到了，请重新选择")
             return None
         self._api_test_video_dir = str(video.parent)
         return video
@@ -7051,7 +7046,7 @@ class UiWorker(threading.Thread):
                 worker.request_stop()
             except Exception:
                 LOG.debug("video drill stop request failed", exc_info=True)
-            self._set_api_test_status("测试api: 视频窗口已关闭 - 正在停止……")
+            self._set_api_test_status("视频窗口已关闭，正在停止试跑")
         else:
             self._api_test_idle()
 
@@ -7064,8 +7059,8 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.debug("video drill mouse toggle failed", exc_info=True)
         self._set_api_test_status(
-            f"测试api: 鼠标跟随已{'开启' if enabled else '关闭'}"
-            f"（{'只在视频画面内移动' if enabled else '不再移动鼠标'}）。")
+            "试跑：鼠标跟随已开启（只在视频画面内移动）" if enabled
+            else "试跑：鼠标跟随已关闭")
 
     def _api_test_toggle_pause(self, paused: bool) -> None:
         worker = getattr(self, "api_test_worker", None)
@@ -7075,7 +7070,7 @@ class UiWorker(threading.Thread):
             worker.set_paused(bool(paused))
         except Exception:
             LOG.debug("video drill pause toggle failed", exc_info=True)
-        self._set_api_test_status(f"测试api: 已{'暂停' if paused else '继续'}。")
+        self._set_api_test_status("试跑：已暂停" if paused else "试跑：继续播放")
 
     def _api_test_keep_focus(self) -> None:
         """Keep the video window focused (throttled), so mouse input belongs to the video."""
@@ -7107,8 +7102,9 @@ class UiWorker(threading.Thread):
     def _set_api_test_status(self, text: str) -> None:
         # The status sink is deliberately NOT packed (the panel shows controls
         # only), so the running log is the channel an operator can read: without
-        # this line a failed 测试api press left nothing behind at all.
-        LOG.info("测试api: %s", text)
+        # this line a failed 试跑 press left nothing behind at all.  The text is
+        # client wording; anything technical is logged separately by the caller.
+        LOG.info("试跑: %s", text)
         if hasattr(self, "_api_test_status"):
             try:
                 self._configure_text_if_changed(
@@ -7118,15 +7114,14 @@ class UiWorker(threading.Thread):
                 LOG.debug("api test status could not be updated", exc_info=True)
 
     def _report_api_test_failure(self, text: str) -> None:
-        """A 测试API press could not start: log it, hint it, and show it.
+        """A 试跑 press could not start: log it, note it, and tell the client.
 
-        Field report: "I can't start 测试API on another machine" - the reason was
-        written only into the unpacked status sink, so the window simply closed
-        and nothing reached the log or the panel.
+        The dialog body is client wording plus where the details went, so a
+        non-technical operator knows both what happened and who can look into it.
         """
 
         self._set_api_test_status(text)
-        LOG.warning("测试api could not start: %s", text)
+        LOG.warning("试跑 could not start: %s", text)
         try:
             import local_lie_service
 
@@ -7137,17 +7132,22 @@ class UiWorker(threading.Thread):
             self._refresh_panel_hints()
         except Exception:  # noqa: BLE001
             LOG.debug("panel hint refresh failed", exc_info=True)
+        body = f"{text}\n\n详情已记录到运行日志。"
         try:
             from tkinter import messagebox
 
             messagebox.showerror(
-                "测试API", text, parent=getattr(self, "_root", None)
+                "测试本地测谎", body, parent=getattr(self, "_root", None)
             )
         except Exception:  # noqa: BLE001 - no window to attach to
-            LOG.info("测试API: %s", text)
+            LOG.info("试跑: %s", body)
 
     def _drain_api_test_results(self) -> None:
-        """Show the 测试api drill's progress on Tk's owning thread."""
+        """Show the 试跑 drill's progress on Tk's owning thread.
+
+        Only outcomes reach the client; per-frame and backend chatter stays in the
+        running log, where support can read it.
+        """
 
         self._drain_api_test_display()
         results = getattr(self, "api_test_results", None)
@@ -7170,14 +7170,10 @@ class UiWorker(threading.Thread):
                 continue
             state, detail = item
             try:
-                if state == "frame":
-                    self._set_api_test_status(f"测试api 帧 {detail}")
-                elif state == "backend":
-                    self._set_api_test_status(f"测试api 后端: {detail}")
-                elif state == "capture":
-                    self._set_api_test_status(f"测试api 已保存标注帧: {detail}")
+                if state in ("frame", "backend", "capture"):
+                    LOG.debug("试跑 progress: %s %s", state, detail)
                 elif state == "done":
-                    self._set_api_test_status(f"测试api 完成: {detail}")
+                    self._set_api_test_status("试跑完成")
                     self._play_action_sound(True)
                     # A completed manual API drill counts for exactly one backend.
                     # 云端测谎 charges the server quota, so the cloud accounting
@@ -7190,17 +7186,16 @@ class UiWorker(threading.Thread):
                     self._report_local_lie_drill("success", detail)
                     self._api_test_idle()
                 elif state == "stopped":
-                    self._set_api_test_status(f"测试api 已停止: {detail}")
+                    self._set_api_test_status("已停止试跑")
                     self._report_local_lie_drill("aborted", detail)
                     self._api_test_idle()
                 elif state == "failed":
-                    self._set_api_test_status(f"测试api 失败: {detail}")
+                    self._set_api_test_status("试跑失败")
                     self._play_action_sound(False)
                     self._report_local_lie_drill("failed", detail)
                     self._api_test_idle()
                 else:
-                    suffix = f": {detail}" if detail else ""
-                    self._set_api_test_status(f"测试api - {state}{suffix}")
+                    LOG.debug("试跑 progress: %s", state)
             finally:
                 try:
                     results.task_done()
@@ -7351,15 +7346,6 @@ class UiWorker(threading.Thread):
         # The drill button follows the selection: 本地测谎 exposes 测试本地测谎,
         # 云端测谎 exposes 测试云端测谎, 关闭 greys it.
         self._sync_api_test_buttons()
-        # The idle status line names the drill and its backend, so it follows the
-        # selection too - unless a drill is running and owns that line.
-        worker = getattr(self, "api_test_worker", None)
-        running = bool(worker is not None and getattr(worker, "running", False))
-        if not running and hasattr(self, "_api_test_status"):
-            try:
-                self._set_api_test_status(self._api_test_status_text())
-            except Exception:  # noqa: BLE001 - a status hint is never fatal
-                LOG.debug("api test status could not follow the selection", exc_info=True)
         self._api_auto_lie_on_change()
 
     def _probe_local_lie_service(self) -> None:
@@ -7454,9 +7440,6 @@ class UiWorker(threading.Thread):
                 return
             AUTO_LIE_LOG.warning(
                 "自动测谎: 本地测谎 fell back to 关闭 - the code has no CT card"
-            )
-            self._set_api_test_status(
-                "自动测谎 已切到 关闭：本机授权码没有 CT 卡，无法使用本地测谎。"
             )
 
     def _activate_local_lie_clicked(self) -> None:
@@ -12076,7 +12059,7 @@ class UiWorker(threading.Thread):
         # Why the 本地测谎 radio is greyed: the code has no CT card.  Said once, on
         # the same hint line, so a greying radio is never unexplained.
         if self._local_lie_access() is False:
-            notes.append("本地测谎: 本机授权码没有 CT 卡，本地测谎 已置灰")
+            notes.append("本地测谎未开通（授权码没有测谎卡），已置灰")
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note
         self._local_lie_service_hint_shown = service_note
@@ -12138,7 +12121,7 @@ class UiWorker(threading.Thread):
             import local_lie_service
 
             local_lie_service.report_local_pass(
-                event_id, outcome, detail=f"测试API {detail}".strip(),
+                event_id, outcome, detail=f"测试本地测谎 {detail}".strip(),
             )
         except Exception:  # noqa: BLE001 - statistics never block a drill
             LOG.debug("本地测谎 测试API report failed", exc_info=True)
@@ -12364,13 +12347,13 @@ class UiWorker(threading.Thread):
         trigger = getattr(worker, "trigger_logoff", None)
         if not callable(trigger):
             LOG.warning("定时下机: 清理内存工作线程不支持只下线")
-            self._set_timed_logout_note("清理内存未接入")
+            self._set_timed_logout_note("清理内存暂不可用")
             return
         try:
             accepted = bool(trigger())
         except Exception:  # noqa: BLE001 - never kill the poll tick
             LOG.exception("定时下机: 触发下线失败")
-            self._set_timed_logout_note("触发下线失败")
+            self._set_timed_logout_note("下线失败，请稍后重试")
             return
         if not accepted:
             LOG.info("定时下机: 下线流程已经在运行")
@@ -13715,9 +13698,6 @@ class UiWorker(threading.Thread):
                 else:
                     self._player_channel_wait_var.set(normalized_wait)
                 self._refresh_player_wait_hint()
-            if hasattr(self, "_api_test_status"):
-                # 测试api has no panel settings; the line only states the backend it will reach.
-                self._set_api_test_status(self._api_test_status_text())
             if "screen_blink_enabled" in data and hasattr(
                     self, "_screen_blink_var"
             ):
