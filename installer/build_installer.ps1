@@ -19,11 +19,26 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 # path: ``update_core``/``lanzou_source`` live there, shared with the desktop
 # application.  The built EXE remains a separate bootstrap artifact and is never
 # published inside MoonEclipse app manifests.
+#
+# The imaging stack is deliberately NOT followed.  Nuitka walks imports
+# statically, so ``licensing -> auto_lie_secret / local_lie_service -> autolie_api``
+# dragged the vendor package, cv2 (100 MB) and numpy (26 MB) into a bootstrap that
+# only downloads a ZIP and activates a code - the installer grew to 47 MB instead
+# of ~10 MB.  Both call sites are lazy and guarded (``from autolie_api.key_store
+# import mask_key`` sits inside a try/except in auto_lie_secret, and licensing
+# imports local_lie_service only inside functions), so excluding them changes
+# nothing for the installer's own work while keeping the payload small.
+$excludedModules = @(
+    "autolie_api", "cv2", "numpy", "image_io", "lie_geometry",
+    "lie_roi_geometry", "minimap_detector", "marker_detector", "map_identity"
+)
+$excludeArgs = $excludedModules | ForEach-Object { "--nofollow-import-to=$_" }
 $previousPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = if ($previousPythonPath) { "$root;$previousPythonPath" } else { $root }
 try {
     & $pythonExe -m nuitka --onefile --enable-plugin=tk-inter --windows-console-mode=disable `
         --output-dir=$work --output-filename=MoonEclipseInstaller.exe `
+        @excludeArgs `
         --include-data-file="$root\activation_server_pin.json=activation_server_pin.json" `
         --include-data-file="$root\license_public_key.json=license_public_key.json" `
         --include-module=licensing --include-module=pinned_tls `
