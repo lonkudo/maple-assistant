@@ -770,9 +770,96 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
     )
 
 
+def _legacy_app_root(root: Optional[Path] = None) -> Optional[Path]:
+    """The ``app\\`` folder of a pre-1.2.285 layout, when it sits under this root."""
+
+    base = Path(root) if root is not None else runtime_root()
+    legacy = base / "app"
+    try:
+        if legacy.is_dir() and legacy.resolve() != base.resolve():
+            return legacy
+    except OSError:
+        return None
+    return None
+
+
+def _adopt_legacy_app_authorization(root: Optional[Path] = None) -> None:
+    """Take over authorization documents an old ``app\\`` layout left behind.
+
+    Installs up to 1.2.284 kept everything in ``app\\``, so the activation lived at
+    ``app\\auth.json`` (plus ``cim_identity.dat`` and ``license_settings.json``).
+    The installer now unpacks at the selected root and drops that tree, and an
+    overlay update starts the app from the new root - either way the old folder is
+    no longer read, and the client had to activate again (field report: "why i
+    updated then previous auth info is lost").
+
+    Nothing is overwritten: a document is adopted only when this root has none (a
+    signed ``auth.json`` is authoritative and never replaced by a legacy copy).
+    """
+
+    legacy = _legacy_app_root(root)
+    if legacy is None:
+        return
+    base = Path(root) if root is not None else runtime_root()
+    for name in (LICENSE_FILE, CIM_IDENTITY_FILE, "license_settings.json"):
+        source = legacy / name
+        target = base / name
+        try:
+            if not source.is_file():
+                continue
+            if name == LICENSE_FILE:
+                if _signed_document_at(target) is not None:
+                    # This root already holds the authoritative entitlement.
+                    continue
+            elif target.exists():
+                continue
+            payload = source.read_bytes()
+            if name == LICENSE_FILE:
+                payload = _merge_local_state(payload, target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "wb", dir=target.parent, delete=False,
+            ) as handle:
+                handle.write(payload)
+                temporary = Path(handle.name)
+            os.replace(temporary, target)
+            SERVER_LOG.info(
+                "authorization file %s adopted from the legacy app folder", name
+            )
+        except OSError:
+            SERVER_LOG.warning(
+                "could not adopt %s from %s", name, legacy, exc_info=True
+            )
+
+
+def _merge_local_state(payload: bytes, target: Path) -> bytes:
+    """Carry over the display metadata (``_local``) of an unsigned local document."""
+
+    try:
+        existing = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return payload
+    if not isinstance(existing, dict):
+        return payload
+    local = existing.get(AUTH_LOCAL_STATE_KEY)
+    if not isinstance(local, dict) or not local:
+        return payload
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return payload
+    if not isinstance(document, dict):
+        return payload
+    document[AUTH_LOCAL_STATE_KEY] = local
+    return json.dumps(document, ensure_ascii=True, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+
+
 def verify_license(root: Optional[Path] = None) -> LicenseStatus:
     """Verify the installed license without throwing into the application."""
 
+    # An older ``app\\`` layout keeps the activation one level down; adopt it before
+    # anything decides this install is unlicensed.
+    _adopt_legacy_app_authorization(root)
     _migrate_legacy_license_document(root)
     # A same-folder legacy license is the direct predecessor and therefore
     # takes precedence over an app-side fallback left by an overlay build.

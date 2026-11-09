@@ -465,23 +465,78 @@ def _migrate_legacy_install(root: Path) -> None:
                 "installer: migrated %d configuration file(s) %s -> %s",
                 copied, source, target,
             )
+    # The activation is NOT in 助手配置: a pre-1.2.285 layout keeps auth.json,
+    # cim_identity.dat and license_settings.json at the app root, and this
+    # installer deletes that app\ tree below.  Adopt them first, or an update
+    # silently ends in "未授权" and the client has to activate again.
+    _adopt_legacy_root_authorization(root)
+
+
+# Authorization documents a pre-root-layout install keeps at the app root.
+LEGACY_ROOT_AUTHORIZATION = (
+    "auth.json", "cim_identity.dat", "license_settings.json", "license.json",
+)
+
+
+def _adopt_legacy_root_authorization(root: Path) -> list[str]:
+    """Copy authorization documents out of a legacy ``app\\`` root.
+
+    Returns the names that are now present at ``root`` (adopted or already there)
+    so the cleanup can prove it is not about to destroy the activation.  An
+    existing root document always wins: only a missing one is taken over.
+    """
+
+    legacy = root / "app"
+    if not legacy.is_dir():
+        return []
+    adopted: list[str] = []
+    for name in LEGACY_ROOT_AUTHORIZATION:
+        source = legacy / name
+        target = root / name
+        if not source.is_file():
+            continue
+        if target.exists():
+            adopted.append(name)
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            adopted.append(name)
+            logging.info(
+                "installer: adopted %s from the legacy app folder before cleanup", name
+            )
+        except OSError:
+            logging.warning(
+                "installer: could not adopt %s from %s", name, legacy, exc_info=True
+            )
+    return adopted
 
 
 def _legacy_config_missing(root: Path) -> list[str]:
-    """Legacy config files that are still absent from the selected root."""
+    """Legacy user data that is still absent from the selected root.
+
+    Covers the legacy ``助手配置`` documents AND the authorization files a
+    pre-1.2.285 layout keeps at the ``app\\`` root: the caller deletes that tree, and
+    destroying an un-adopted ``auth.json`` means the client has to activate again.
+    """
 
     app_dir = _legacy_app_dir(root)
     if app_dir is None:
         return []
+    missing: list[str] = []
     source = app_dir / CONFIG_DIRECTORY
-    if not source.is_dir():
-        return []
-    target = root / CONFIG_DIRECTORY
-    return [
-        str(item.relative_to(source))
-        for item in source.rglob("*")
-        if item.is_file() and not (target / item.relative_to(source)).exists()
-    ]
+    if source.is_dir():
+        target = root / CONFIG_DIRECTORY
+        missing.extend(
+            str(item.relative_to(source))
+            for item in source.rglob("*")
+            if item.is_file() and not (target / item.relative_to(source)).exists()
+        )
+    for name in LEGACY_ROOT_AUTHORIZATION:
+        legacy_file = app_dir / name
+        if legacy_file.is_file() and not (root / name).exists():
+            missing.append(name)
+    return missing
 
 
 def _previous_install_profile_code(root: Path) -> str:
