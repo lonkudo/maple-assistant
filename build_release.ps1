@@ -153,8 +153,15 @@ if (Test-Path $configIn) {
     # 助手配置 is intentionally the portable configuration/export boundary.
     # Keep generated image caches and private authorization out of releases by
     # shipping JSON recording/config documents only.
+    #
+    # user_config.json is the CLIENT'S OWN settings document (patrol route,
+    # recording layers, calibration).  It must never travel inside a package:
+    # every install path copies the package over the install root, so a shipped
+    # copy replaces the user's configuration on update.  The app writes its
+    # defaults on first run instead, and 助手配置 stays user data.
     Get-ChildItem -LiteralPath $configIn -Recurse -File | Where-Object {
-        $_.Extension -ieq ".json" -and $_.Name -ne "auth.json"
+        $_.Extension -ieq ".json" -and $_.Name -ne "auth.json" -and
+        $_.Name -inotmatch '^user_config\.json$'
     } | ForEach-Object {
         $relative = $_.FullName.Substring($configIn.Length + 1)
         $target = Join-Path $configRoot $relative

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -26,6 +27,8 @@ _PACKAGE_NAME = re.compile(r"(?:mooneclipse|todohelper|maple.*assistant)", re.IG
 _FROZEN_ENTRY_NAMES = {"mooneclipse.exe", "todohelper.exe", "mapleassistant.exe"}
 _CONFIG_IMPORT_REPLACE_ATTEMPTS = 15
 _CONFIG_IMPORT_REPLACE_RETRY_SECONDS = 0.20
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateError(RuntimeError):
@@ -262,10 +265,14 @@ def _copy_package(source: Path, destination: Path) -> int:
         for name in files:
             source_file = base_path / name
             relative = relative_base / name
-            # ``user_config.json`` is handled separately after the program
-            # files are copied, so its content timestamp can decide whether
-            # it should overwrite the running configuration.
-            if relative.as_posix() == "user_config.json":
+            # The client's own settings document is user data and is NEVER part of
+            # an update: a package used to carry 助手配置/user_config.json, and this
+            # copy step replaced the user's patrol route, recording layers and
+            # calibration with that template.  Matching the file NAME (not just the
+            # package-root path) is what closes that hole.  The name test also
+            # covers packages built before user_config.json was dropped from the
+            # release, and a deliberate import goes through import_user_config().
+            if name.casefold() == "user_config.json":
                 continue
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -277,12 +284,13 @@ def _copy_package(source: Path, destination: Path) -> int:
 def apply_desktop_update(
     package: DesktopUpdate, install_root: Path,
 ) -> UpdateResult:
-    """Copy a validated package into the running folder, including config.
+    """Copy a validated package into the running folder, never its user config.
 
-    ``user_config.json`` is copied when supplied in the package.  For a ZIP,
-    a same-folder Desktop ``user_config.json`` is also accepted, so users can
-    update their map settings even though ordinary public releases omit their
-    private configuration by default.
+    The package contributes PROGRAM files only.  ``user_config.json`` is the
+    client's own settings document: it is not shipped in a release any more, and
+    even an older package that still carries one cannot replace it here.  The only
+    way a configuration moves is a deliberate one - the user drops a
+    ``user_config.json`` next to the ZIP (below), or imports it from the panel.
     """
 
     destination = Path(install_root).resolve()
@@ -302,14 +310,25 @@ def apply_desktop_update(
         if source_version != package.version:
             raise UpdateError("更新包版本校验失败。")
         copied = _copy_package(source, destination)
-        config_source = source / "user_config.json"
-        if not config_source.is_file() and package.kind == "zip":
+        # A package's own user_config.json is never applied.  Releases no longer
+        # carry one; this keeps an older package (or a hand-made ZIP) from
+        # replacing the client's settings during an update.
+        config_source: Optional[Path] = None
+        if (source / "user_config.json").is_file():
+            logger.info(
+                "update: the package carries a user_config.json; the client's own "
+                "configuration is kept instead"
+            )
+        if package.kind == "zip":
             neighbour = package.path.parent / "user_config.json"
             if neighbour.is_file():
+                # A document the USER placed next to the ZIP is a deliberate
+                # import (the documented way to move map settings between
+                # machines), so that one is applied.
                 config_source = neighbour
         config_copied = False
         config_unchanged = False
-        if config_source.is_file():
+        if config_source is not None:
             installed_config = destination / "user_config.json"
             source_tag = user_config_version(config_source)
             installed_tag = user_config_version(installed_config)
