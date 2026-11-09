@@ -1508,3 +1508,50 @@ the durable `api/v1/lie-events` accounting queue, which local passes deliberatel
   point, which the pass treats as "no answer" (never as a crash).
 * The release now bundles the service (≈341 MB, excluded items: `test_files`, runtime
   logs/licence state, the stale `AppHost*.exe`).
+
+### Troubleshooting: "本机未开通本地测谎服务"
+
+The panel hint has exactly three failure-free wordings and one failure wording:
+
+| Hint | Meaning |
+| --- | --- |
+| `本机未开通本地测谎服务` | 本地测谎 is selected but the licence reply carried **no** `CT_` card, so the service is deliberately not started |
+| `本地测谎启动失败` | a card did arrive, but the service never came up on 8765 (its own `data\logs\client.log` says why) |
+| `已启动` | the service answers `/v1/health` |
+| *(nothing)* | the selection is 关闭 / 云端测谎 |
+
+The first one is almost always a **server-side** state, not a client bug — the client
+reads `device.ct_card` from the heartbeat reply and starts the service the moment it
+appears. Work through it in this order:
+
+1. `work\assistant.log`: is the heartbeat accepted but the CT card missing?
+   ```
+   license-heartbeat INFO license heartbeat accepted license_id=…
+   local lie service INFO 本地测谎 selected, but the licence server has not delivered a CT card yet
+   ```
+   When the card arrives instead you see `local lie service: the CT card arrived; pre-starting the service`.
+2. On the licence server, print the exact value the heartbeat would send — the device
+   document only ships the card of the code **bound to that fingerprint** and not revoked/expired:
+   ```bash
+   python manage.py shell -c "from licensing.models import FingerprintSecurityState as F; \
+   from licensing.services import device_summary; \
+   s = F.objects.get(fingerprint_hash='<64-hex>'); \
+   print(repr(device_summary(s).get('ct_card')))"
+   ```
+   `''` → the card is on another code, or the bound code is revoked/expired.
+3. Check the reply itself (proves which build is answering):
+   ```bash
+   curl -s -X POST https://211.149.169.194:8443/api/v1/validate \
+        -H "Content-Type: application/json" \
+        -d '{"fingerprint":"<64-hex>","license_id":"<license id>"}'
+   ```
+   No `ct_card` inside `device` → the worker still runs the old code or has not been
+   migrated: `git pull`, `python manage.py migrate` (migration `0019`), **restart the
+   worker**, and rebuild the console (`cd operator_console && npm ci && npm run build`)
+   so the CT 卡 column exists for editing at all.
+4. The client only learns the card from a **reply**: after any server-side change,
+   restart MoonEclipse or press the caption ↻ refresh to force a heartbeat.
+
+The same rule applies to 测试API in 本地测谎: without a service on 8765 it fails with
+`http://127.0.0.1:8765 未就绪` and a message box — that is the card gate above, not the
+drill.

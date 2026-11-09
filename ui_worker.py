@@ -258,6 +258,9 @@ AUTOLIE_BACKEND_LOCAL = "local"
 LOCAL_LIE_PROBE_ATTEMPTS = 5
 LOCAL_LIE_PROBE_INTERVAL_SECONDS = 2.0
 LOCAL_LIE_PROBE_RETRY_SECONDS = 10.0
+# The app owns the service: if 8765 is still down this long after the previous
+# start attempt, start it again (never ask the operator to run the launcher).
+LOCAL_LIE_START_RETRY_SECONDS = 45.0
 
 
 def seconds_until_next_gmt8_midnight_refresh() -> float:
@@ -3347,6 +3350,18 @@ class UiWorker(threading.Thread):
             # The old attribute name is read by the tooltip refresh path and by
             # the tests that assert the selection is a mouse-only control.
             self._api_auto_lie_check = self._api_auto_lie_buttons[1]
+            # Pre-start the local service AT LAUNCH when 本地测谎 is the saved
+            # backend: it must already be listening long before a lie window can
+            # appear (a cold start takes seconds, a pass cannot wait for it).
+            if saved_api_auto_lie and saved_api_auto_lie_backend == AUTOLIE_BACKEND_LOCAL:
+                try:
+                    import local_lie_service
+
+                    local_lie_service.supervisor_set_active(
+                        True, application_root(__file__)
+                    )
+                except Exception:  # noqa: BLE001 - a missing folder is not fatal
+                    LOG.debug("本地测谎 pre-start could not be armed", exc_info=True)
             # 测试api is back on this line: with 本地测谎 selected it runs the drill
             # against 127.0.0.1:8765, so the operator has a one-click local test
             # right next to the selection that chooses the backend.
@@ -7193,6 +7208,18 @@ class UiWorker(threading.Thread):
         armed = mode in (AUTOLIE_BACKEND_CLOUD, AUTOLIE_BACKEND_LOCAL)
         self._api_auto_lie_var.set(armed)
         self._api_auto_lie_change_origin = "mouse"
+        # Pre-start / stop the local service with the selection itself: 本地测谎
+        # starts it and keeps it listening; 关闭 and 云端测谎 stop it again (only an
+        # instance this app started); reselecting 本地测谎 restarts it.  There is no
+        # lazy start at a lie window and nothing for the operator to launch.
+        try:
+            import local_lie_service
+
+            local_lie_service.supervisor_set_active(
+                mode == AUTOLIE_BACKEND_LOCAL, application_root(__file__)
+            )
+        except Exception:  # noqa: BLE001 - never break a selection change
+            LOG.debug("本地测谎 supervisor switch failed", exc_info=True)
         if mode == AUTOLIE_BACKEND_LOCAL:
             # 本地测谎 has its own connection: report it the moment it is chosen
             # instead of failing on the first lie window.
@@ -7765,12 +7792,17 @@ class UiWorker(threading.Thread):
         if local_backend:
             ready, note = self._ensure_local_lie_service()
             if not ready:
+                # The service is pre-started with the app and supervised while
+                # 本地测谎 is selected, so it must already be listening when a lie
+                # window appears.  Do NOT wait for a cold start here: report it,
+                # and let the supervisor restart it for the next window.
                 AUTO_LIE_LOG.warning(
-                    "自动过测谎 (本地测谎): the lie event is dropped - %s", note
+                    "自动过测谎 (本地测谎): the service is not listening (%s) - "
+                    "the supervisor will pre-start it again", note,
                 )
                 if hasattr(self, "_api_test_status"):
                     self._api_test_status.configure(
-                        text=f"自动测谎（本地测谎）: 未连接 - {note}"
+                        text=f"自动测谎（本地测谎）: 服务未监听 - {note}"
                     )
                 return
         try:

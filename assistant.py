@@ -462,7 +462,11 @@ def main() -> int:
     try:
         import local_lie_service
 
-        local_lie_service.start_in_background(application_root(__file__))
+        # Pre-start is owned by the 本地测谎 selection (supervisor_set_active): the
+        # UI restores the saved backend at startup and starts/stops the service on
+        # every change, so launching with 本地测谎 selected starts it immediately
+        # and switching to 关闭/云端测谎 stops it again.
+        local_lie_service.stop_supervisor()
     except Exception:  # noqa: BLE001 - a missing service folder is not fatal
         logging.getLogger(__name__).debug(
             "local lie service could not be scheduled", exc_info=True
@@ -3162,6 +3166,7 @@ def main() -> int:
         try:
             import local_lie_service
 
+            local_lie_service.stop_supervisor()
             local_lie_service.stop_started_service()
         except Exception:  # noqa: BLE001 - never block the shutdown
             logging.getLogger(__name__).debug(

@@ -30,6 +30,11 @@ LAUNCHER_NAMES = ("启动_后台.vbs", "launch_background.vbs")
 # takes ~20s cold, so the startup wait is generous but never blocks the UI.
 START_WAIT_SECONDS = 45.0
 PROBE_INTERVAL_SECONDS = 0.5
+# Pre-start supervision: how often the supervisor re-checks that 8765 answers.
+SUPERVISE_INTERVAL_SECONDS = 10.0
+# Startup supervision: a first launch can exit while the licence/WS are being
+# provisioned, so a service that is not listening is retried after this delay.
+RETRY_BACKOFF_SECONDS = 20.0
 
 _lock = threading.Lock()
 _state: dict[str, object] = {
@@ -195,6 +200,10 @@ def ensure_started(
     if process is None:
         with _lock:
             _state.update(state="failed", note="本地测谎服务无法启动（缺少启动器）")
+            if has_online_card():
+                # A card WAS delivered, yet the service cannot come up: on this
+                # machine that means the card did not validate.
+                _state["card_rejected"] = True
         return False, str(_state["note"])
     deadline = time.monotonic() + max(1.0, float(wait_seconds))
     while time.monotonic() < deadline:
@@ -204,24 +213,161 @@ def ensure_started(
             pids = _service_pids(root)
             with _lock:
                 _state.update(state="running", note=note, pids=pids,
-                              started_by_app=True)
+                              started_by_app=True, card_rejected=False)
             LOG.info("local lie service: started (pid=%s, %s)", pids, note)
             return True, note
     with _lock:
         _state.update(state="failed", note="本地测谎服务启动超时（8765 未响应）")
+        if has_online_card():
+            # The licence server gave us a CT card and the service still refuses to
+            # listen: its own log shows 启动月卡验票失败 for an unactivated card.
+            _state["card_rejected"] = True
     LOG.warning("local lie service: still not answering after %.0fs",
                 wait_seconds)
     return False, str(_state["note"])
 
 
-def start_in_background(app_root: Path | str) -> threading.Thread:
-    """Start the service without blocking the caller (the UI thread)."""
+_supervisor_thread = None
+_supervisor_stop = threading.Event()
+# The selection wants 本地测谎 (_desired_active), the install root the supervisor
+# uses (_desired_root), and the CT card the licence server delivered
+# (_state["online_card"]).  The service is started only when the selection wants it
+# AND a CT_ card exists - it is never started blindly at launch.
+_desired_active = False
+_desired_root: Optional[Path] = None
+
+
+def _supervisor_job(root, interval: float) -> None:
+    first = True
+    while not _supervisor_stop.is_set():
+        try:
+            if not is_running():
+                if first:
+                    LOG.info("local lie service: pre-starting with the app (%s)", root)
+                else:
+                    LOG.info("local lie service: 8765 stopped answering; "
+                             "pre-starting it again")
+                ensure_started(root)
+        except Exception:  # noqa: BLE001 - supervision never dies
+            LOG.warning("local lie service: supervisor start failed", exc_info=True)
+        first = False
+        _supervisor_stop.wait(interval)
+
+
+def has_online_card() -> bool:
+    """Whether the licence server has delivered a CT_ card for this session."""
+
+    with _lock:
+        card = str(_state.get("online_card") or "")
+    return card.strip().upper().startswith("CT_")
+
+
+def supervisor_set_active(active: bool, app_root=None) -> None:
+    """Turn the pre-start supervisor on or off with the 本地测谎 selection.
+
+    The operator's rule has two halves: the service is pre-started while 本地测谎
+    is selected (never lazily at a lie window), but it must NOT be started blindly
+    - the first licence reply decides.  Without a CT_ card in that reply there is
+    nothing to activate, so the service stays off and the panel says so.
+    """
+
+    global _supervisor_thread, _desired_active, _desired_root
+    if not active:
+        _supervisor_stop.set()
+        with _lock:
+            _supervisor_thread = None
+            _desired_active = False
+            _state["card_rejected"] = False
+        stop_started_service()
+        LOG.info("local lie service: pre-start disabled (selection left 本地测谎)")
+        return
+    root = Path(app_root) if app_root is not None else install_root()
+    with _lock:
+        _desired_active = True
+        _desired_root = root
+        running = _supervisor_thread is not None and _supervisor_thread.is_alive()
+    if not has_online_card():
+        LOG.info(
+            "local lie service: 本地测谎 selected, but the licence server has not "
+            "delivered a CT card yet - the service is not started until it does"
+        )
+        return
+    if running:
+        return
+    _start_supervisor_thread(root)
+
+
+def _start_supervisor_thread(root: Path) -> None:
+    global _supervisor_thread
+    with _lock:
+        if _supervisor_thread is not None and _supervisor_thread.is_alive():
+            return
+        _supervisor_stop.clear()
+        _supervisor_thread = threading.Thread(
+            target=_supervisor_job, args=(root, SUPERVISE_INTERVAL_SECONDS),
+            name="local-lie-supervisor", daemon=True,
+        )
+        _supervisor_thread.start()
+    LOG.info("local lie service: pre-start enabled (本地测谎 + CT card present)")
+
+
+def note_online_card(card: str) -> None:
+    """Record the CT card from the licence reply and pre-start if it is wanted."""
+
+    text = str(card or "").strip()
+    with _lock:
+        if text:
+            _state["online_card"] = text
+        desired = _desired_active
+        root = _desired_root
+    if not text:
+        return
+    if desired:
+        LOG.info("local lie service: the CT card arrived; pre-starting the service")
+        _start_supervisor_thread(root or install_root())
+
+
+def stop_supervisor() -> None:
+    """Application shutdown: stop supervising and stop what we started."""
+
+    _supervisor_stop.set()
+
+def start_in_background(
+    app_root: Path | str | None = None, *, attempts: int = 3,
+) -> threading.Thread:
+    """Start the service without blocking the caller (the UI thread).
+
+    Retries: a single attempt is not enough in the field.  The service can exit
+    on its first launch (licence/WS being provisioned), and a folder that appears
+    a second later (an install finishing) must not mean "the user has to start it
+    by hand".  Each attempt re-resolves the folder and logs at WARNING when it
+    ends without a listening service, so the running log always says why.
+    """
 
     def job() -> None:
-        try:
-            ensure_started(app_root)
-        except Exception:  # noqa: BLE001 - startup must never break the app
-            LOG.warning("local lie service: background start failed", exc_info=True)
+        root = Path(app_root) if app_root is not None else install_root()
+        for attempt in range(1, max(1, int(attempts)) + 1):
+            try:
+                ok, note = ensure_started(root)
+            except Exception:  # noqa: BLE001 - startup must never break the app
+                LOG.warning("local lie service: start attempt %d failed",
+                            attempt, exc_info=True)
+                ok, note = False, "启动异常"
+            if ok:
+                return
+            if is_running():
+                return
+            if attempt < attempts:
+                LOG.info(
+                    "local lie service: attempt %d/%d did not get 8765 listening "
+                    "(%s); retrying in %ds", attempt, attempts, note,
+                    int(RETRY_BACKOFF_SECONDS),
+                )
+                time.sleep(RETRY_BACKOFF_SECONDS)
+        LOG.warning(
+            "local lie service: 8765 is still not listening after %d attempt(s) - "
+            "see the service's own data\\logs\\client.log", attempts,
+        )
 
     thread = threading.Thread(target=job, name="local-lie-service", daemon=True)
     thread.start()
@@ -425,9 +571,20 @@ def clear_local_binding(app_root: Path | str) -> int:
 
 
 def install_root() -> Path:
-    """The folder this module lives in - the assistant's install root."""
+    """The assistant's install root (works for source AND frozen builds).
 
-    return Path(__file__).resolve().parent
+    ``__file__`` is reliable in the source tree, but inside a Nuitka build the
+    module path is not the program folder, so the canonical helper is used first.
+    A wrong root here means "the packaged service folder was not found" and the
+    service silently never starts - the field symptom "已启动 by hand only".
+    """
+
+    try:
+        from runtime_paths import application_root
+
+        return Path(application_root())
+    except Exception:  # noqa: BLE001 - never break a start attempt
+        return Path(__file__).resolve().parent
 
 
 # Optional probe the UI installs: True while a lie pass is running, so a key
@@ -547,6 +704,9 @@ def apply_online_card(card_code: str) -> bool:
         "local lie service: CT card from the activation server written to %s (%s)",
         path, _mask(card),
     )
+    # The card is the gate for pre-starting: now that it exists, a 本地测谎
+    # selection may start the service (no blind start without it).
+    note_online_card(card)
     with _lock:
         started_by_app = bool(_state.get("started_by_app"))
     if started_by_app and not _busy():
@@ -642,26 +802,63 @@ def activate(
     return True, detail
 
 
-def hint_text() -> str:
-    """One short sentence for the 图层校准与巡逻 hint line, or ""."""
+def hint_state() -> str:
+    """Which hint_text() branch applies right now: off/no_card/starting/up/failed."""
 
     with _lock:
         state = str(_state.get("state") or "idle")
-        note = str(_state.get("note") or "")
+        rejected = bool(_state.get("card_rejected"))
+        desired = _desired_active
+    if not desired:
+        return "off"
+    if not has_online_card():
+        return "no_card"
+    if rejected:
+        return "failed"
+    if state in ("running", "external"):
+        return "up"
+    if state == "starting":
+        return "starting"
     if state in ("idle", "missing"):
+        return "off"
+    return "failed"
+
+def hint_text() -> str:
+    """One short sentence for the 图层校准与巡逻 hint line, or "".
+
+    The wording is the operator's:
+      * 本地测谎 selected without a CT_ card from the licence reply
+            -> 本地测谎服务: 本机未开通本地测谎服务
+      * a card arrived but the service would not come up / validate it
+            -> 本地测谎服务: 本地测谎启动失败
+      * service answering /v1/health
+            -> 本地测谎服务: 已启动
+      * selection 关闭 or 云端测谎 (or nothing to say)
+            -> no hint at all
+    """
+
+    with _lock:
+        state = str(_state.get("state") or "idle")
+        rejected = bool(_state.get("card_rejected"))
+        desired = _desired_active
+    if not desired:
         return ""
+    if not has_online_card():
+        return "本地测谎服务: 本机未开通本地测谎服务"
+    if rejected:
+        return "本地测谎服务: 本地测谎启动失败"
+    if state in ("running", "external"):
+        return "本地测谎服务: 已启动"
     if state == "starting":
         return "本地测谎服务: 正在启动…"
-    if state == "running":
-        return "本地测谎服务: 已启动（127.0.0.1:8765）"
-    if state == "external":
-        return "本地测谎服务: 已在运行"
-    return f"本地测谎服务: 启动失败 - {note}" if note else "本地测谎服务: 启动失败"
-
+    if state in ("idle", "missing"):
+        return ""
+    return "本地测谎服务: 本地测谎启动失败"
 
 def reset_for_tests() -> None:
     with _lock:
-        _state.update(state="idle", note="", root="", started_by_app=False, pids=[])
+        _state.update(state="idle", note="", root="", started_by_app=False, pids=[],
+                      card_rejected=False)
 
 
 __all__ = [

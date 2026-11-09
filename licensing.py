@@ -922,6 +922,25 @@ def _with_server_device(
             AUTO_LIE_LOG.debug(
                 "the local lie service card could not be applied", exc_info=True
             )
+    elif isinstance(card_source, dict):
+        # The reply IS the device document, so this is authoritative: the code
+        # bound to this device has no CT card, and 本地测谎 therefore stays off
+        # (field log 12:31:46: "本地测谎 selected, but the licence server has not
+        # delivered a CT card yet" followed by 测试api failing on 8765).  Say it
+        # once, with the fix in the message, instead of only in the panel hint.
+        try:
+            import local_lie_service
+
+            if local_lie_service.hint_state() == "no_card":
+                import logging as _logging
+
+                _logging.getLogger("local-lie-service").warning(
+                    "the licence reply carries no CT card - set ct_card on this "
+                    "device's activation code (manager site / admin / "
+                    "code_action ct_card); 本地测谎 stays off until then"
+                )
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
     if not isinstance(device, dict) and not isinstance(usage, dict):
         return status
     # The full device document remains the compatibility response.  The

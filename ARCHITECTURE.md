@@ -1202,3 +1202,39 @@ excludes `test_files`, runtime `data\logs`/`data\license`, `__pycache__` and a s
 `AppHost*.exe`. It also injects the machine's saved CT_IN code into the **bundled** config
 (the repository copy stays clean) so a fresh install can validate the card. Both
 `build_release.ps1` and `build_protected_release.ps1` call it.
+
+### How `ct_card` travels, and why it is the start gate
+
+```
+activation code row (ct_card, max 30, nullable)          ← operator: console CT 卡 column
+   → services.device_summary():  "ct_card": bound code's card, or ""
+   → services.validate() success: ActivationResult(…, device=device_summary(state), …)
+   → api._response():            data["device"] = result.device        (whole dict)
+   → client licensing._with_server_device(): device["ct_card"]
+   → local_lie_service.apply_online_card(card) → writes partner_license_code
+   → supervisor_set_active(本地测谎) → ensure_started() → /v1/health
+```
+
+`device_summary()` uses `_active_codes_for_fingerprint(...)[0]`, so:
+
+* the card must be on the code **currently bound to this fingerprint**;
+* a revoked or expired code contributes nothing (the device document says `""`);
+* a device with no bound active code also gets `""`.
+
+Empty card ⇒ `supervisor_set_active(True)` only records the wish (log
+`本地测谎 selected, but the licence server has not delivered a CT card yet`) and the panel
+shows `本机未开通本地测谎服务`. A card that arrived but does not make the service listen sets
+`card_rejected` and the panel shows `本地测谎启动失败`. That is why the client never starts the
+service blindly: `licensing._with_server_device()` also logs a WARNING when an accepted
+reply carries no `ct_card`, naming the three ways to set it.
+
+### Console surface (server repo)
+
+* `CodesView` — CT 卡（本地测谎） column: inline input + 保存 → `codes/<id>/ct_card`
+  (`api.setCodeCard`); empty clears the card.
+* `LocalLieView` / dashboard panel — 本地测谎 usage from `console/api/local-lie/stats`:
+  total / success / failed / pending, average latency, usage per CT card. Usage only, no
+  quota charge.
+* Deployment: `git pull` → `manage.py migrate` (migration `0019`) → restart the worker →
+  `cd operator_console && npm ci && npm run build` (the bundle is built on the server, it
+  is not in Git). Skipping the build is what leaves the manager site without the field.
