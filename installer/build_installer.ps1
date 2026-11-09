@@ -20,23 +20,34 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 # application.  The built EXE remains a separate bootstrap artifact and is never
 # published inside MoonEclipse app manifests.
 #
-# The imaging stack is deliberately NOT followed.  Nuitka walks imports
-# statically, so ``licensing -> auto_lie_secret / local_lie_service -> autolie_api``
-# dragged the vendor package, cv2 (100 MB) and numpy (26 MB) into a bootstrap that
-# only downloads a ZIP and activates a code - the installer grew to 47 MB instead
-# of ~10 MB.  Both call sites are lazy and guarded (``from autolie_api.key_store
-# import mask_key`` sits inside a try/except in auto_lie_secret, and licensing
-# imports local_lie_service only inside functions), so excluding them changes
-# nothing for the installer's own work while keeping the payload small.
+# The imaging stack and the CT-service bridge are deliberately NOT followed.
+# Nuitka walks imports statically, so ``licensing -> auto_lie_secret /
+# local_lie_service -> autolie_api`` dragged the vendor package, cv2 (100 MB) and
+# numpy (26 MB) into a bootstrap that only downloads a ZIP and activates a code -
+# the installer grew to 47 MB instead of ~10 MB.  local_lie_service also pulled
+# pywin32 (win32api/win32process/pythoncom), which a bootstrap has no use for.
+# Every such call site is lazy and guarded (``from autolie_api.key_store import
+# mask_key`` sits inside a try/except in auto_lie_secret; licensing imports
+# local_lie_service only inside functions whose bodies catch Exception), so the
+# installer's own work is unchanged while the payload stays a bootstrap.
 $excludedModules = @(
     "autolie_api", "cv2", "numpy", "image_io", "lie_geometry",
-    "lie_roi_geometry", "minimap_detector", "marker_detector", "map_identity"
+    "lie_roi_geometry", "minimap_detector", "marker_detector", "map_identity",
+    "local_lie_service", "local_lie_backend",
+    "win32api", "win32process", "win32con", "win32gui", "pythoncom", "pywintypes",
+    # The process pool only exists because concurrent.futures is imported for its
+    # ThreadPoolExecutor; nothing in this bootstrap calls ProcessPoolExecutor.
+    # Nuitka's own multiprocessing plugin is disabled for the same reason (leaving
+    # it on makes the exclusion a FATAL conflict), which also drops the
+    # multiprocessing -> xmlrpc -> xml.parsers.expat / decimal chain.
+    "multiprocessing", "xmlrpc", "xml"
 )
 $excludeArgs = $excludedModules | ForEach-Object { "--nofollow-import-to=$_" }
 $previousPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = if ($previousPythonPath) { "$root;$previousPythonPath" } else { $root }
 try {
     & $pythonExe -m nuitka --onefile --enable-plugin=tk-inter --windows-console-mode=disable `
+        --disable-plugin=multiprocessing `
         --output-dir=$work --output-filename=MoonEclipseInstaller.exe `
         @excludeArgs `
         --include-data-file="$root\activation_server_pin.json=activation_server_pin.json" `
