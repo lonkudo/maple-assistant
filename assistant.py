@@ -2491,12 +2491,16 @@ def main() -> int:
         interval_hours=1.0,
         flash_callback=screen_blinker.request_blink,
         alert_callback=_message_alert,
-        # 循环 is a diagnostic event like 测谎 and 掉线: the operator asked for its
-        # screenshot/MP4 recording back ("restore 循环 screenshots for testing
-        # recording"), so a countdown that reaches zero writes the same
-        # screenshots/countdown_<stamp>/ run instead of only flashing + notifying.
-        # The recorder consumes the shared 5-FPS frames; it never opens a capture.
-        event_callback=screenshot_recorder.on_countdown,
+        # 循环 screenshot/MP4 recording is commented out again on the operator's
+        # word ("comment the 循环 again, screenshots have good color pattern now,
+        # the picture is good again"): the temporary restore had only been there to
+        # test the recorder's colours, and that is settled.  A countdown therefore
+        # just flashes and notifies, exactly as before.
+        #
+        # The recorder keeps its entry point, so re-enabling is this one line:
+        #     event_callback=screenshot_recorder.on_countdown,
+        # (writes screenshots/countdown_<stamp>/frame_*.jpg + a composed MP4).
+        event_callback=None,
     )
     lie_detector_worker = LieDetectorWorker(
         lie_detector_frames,
