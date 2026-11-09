@@ -5373,6 +5373,7 @@ class MovementWorker(threading.Thread):
         # reconnect start.  Ordinary Start Patrol and ordinary fall recovery
         # continue to use their existing drop behaviour unchanged.
         self._reconnect_drop_recovery_armed = False
+        self._reconnect_drop_walk_abandoned = False
         self._reconnect_drop_armed_at = float("-inf")
         self._reconnect_drop_edge_cycles = 0
         self._reconnect_drop_attempt_y: Optional[float] = None
@@ -12396,6 +12397,7 @@ class MovementWorker(threading.Thread):
         # A manual start never inherits a reconnect fallback.  An automatic
         # reconnect start is the sole caller allowed to arm it.
         self._reconnect_drop_recovery_armed = bool(reconnect_restart)
+        self._reconnect_drop_walk_abandoned = False
         # The bound is measured from arming: a recovery that keeps cycling cannot
         # own the vertical state forever (see RECONNECT_DROP_MAX_EDGE_CYCLES).
         self._reconnect_drop_armed_at = time.monotonic()
@@ -12932,25 +12934,27 @@ class MovementWorker(threading.Thread):
     def _note_reconnect_drop_attempt(
         self, observation: MinimapObservation, now: float,
     ) -> None:
-        """Remember a real Alt+Down attempt for the reconnect-only fallback."""
+        """Remember a real Alt+Down attempt for the drop-to-route walk fallback."""
 
-        if (not self._reconnect_drop_recovery_armed
-                or self._return_mode != "drop-to-route"
+        if (not self._drop_walk_active()
                 or observation.player is None):
             return
         self._reconnect_drop_attempt_y = float(observation.player.y)
         self._reconnect_drop_attempt_at = float(now)
 
     def _reconnect_drop_abandon(self, reason: str) -> None:
-        """Stop the reconnect edge-walk recovery and hand the vertical state back.
+        """Stop the drop-to-route walk recovery and hand the vertical state back.
 
         Mirrors ``DROP TO FIRST``'s bounded hand-back: the normal route planner
         keeps the return mode, and the marker-only landing test
-        (``_drop_landing_floor``) owns the descent from here.  Idempotent.
+        (``_drop_landing_floor``) owns the descent from here.  Idempotent, and it also
+        serves a drop-to-route that no reconnect armed: the log line is emitted once
+        per abandoned recovery, and the caller re-bounds the next one.
         """
 
-        if not self._reconnect_drop_recovery_armed:
+        if self._reconnect_drop_walk_abandoned:
             return
+        self._reconnect_drop_walk_abandoned = True
         LOG.warning(
             "RECONNECT DROP RECOVERY: abandoning the edge-walk recovery (%s); the "
             "normal drop keeps the marker-only landing test - a character that cannot "
@@ -13301,21 +13305,33 @@ class MovementWorker(threading.Thread):
         self._unresolved_edge_start_y = None
         return None
 
+    def _drop_walk_active(self) -> bool:
+        """Whether the drop-to-route descent may walk after Alt+Down fails.
+
+        The operator's rule: "keep alt+down, and when he failed to drop down walk left or
+        right - decided by X".  This must NOT be limited to the reconnect-only recovery
+        flag: the v1.3.5 field log (21:22:28..40) shows a start-patrol drop-to-route
+        pressing Alt+Down for twelve seconds with no ``RECONNECT DROP RECOVERY`` line at
+        all, because the flag was not armed for that start - so a character standing on a
+        platform above the route never walked and never got down.
+        """
+
+        return self._return_mode == "drop-to-route"
+
     def _reconnect_drop_recovery_decision(
         self, observation: MinimapObservation, now: float,
     ) -> Optional[MovementDecision]:
-        """Return the post-reconnect edge-walk recovery action, when needed.
+        """Return the drop-to-route edge-walk recovery action, when needed.
 
-        This is intentionally not a general stuck/drop routine.  It is armed
-        only by ``prepare_patrol_start(..., reconnect_restart=True)`` and only
-        while the normal return mode is ``drop-to-route``.  A normal descent
-        that gains Y never reaches either edge-walk phase.
+        Alt+Down is always tried first; after RECONNECT_DROP_STALLED_ATTEMPTS chords that
+        gain no marker Y the character walks toward an edge (direction by X) so it can
+        drop through it.  Applies to every ``drop-to-route`` descent, not only a
+        reconnect restart.  A normal descent that gains Y never reaches either edge-walk
+        phase.
         """
 
         player = observation.player
-        if (not self._reconnect_drop_recovery_armed
-                or self._return_mode != "drop-to-route"
-                or player is None):
+        if not self._drop_walk_active() or player is None:
             return None
         current_y = float(player.y)
 
@@ -13324,8 +13340,12 @@ class MovementWorker(threading.Thread):
         # marker Y every chord", so an unbounded recovery would keep alternating
         # Alt+Down and edge walks while the attack stays blocked - his 14:19 log
         # did exactly that for 20 s, at HP 30 % -> 21 %, without ever ending.
-        if (self._reconnect_drop_armed_at > float("-inf")
-                and now - self._reconnect_drop_armed_at
+        if self._reconnect_drop_armed_at <= float("-inf"):
+            # A drop-to-route that no reconnect armed: start its own bound now, so the
+            # walk phase cannot run unchecked either, and let a new descent try again.
+            self._reconnect_drop_armed_at = now
+            self._reconnect_drop_walk_abandoned = False
+        if (now - self._reconnect_drop_armed_at
                 >= RECONNECT_DROP_RECOVERY_MAX_SECONDS):
             self._reconnect_drop_abandon(
                 "%.0fs without a confirmed landing floor"

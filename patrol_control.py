@@ -369,6 +369,10 @@ class PatrolSnapshot:
     patrol_start_layer: str = ""
     patrol_end_layer: str = ""
     patrol_range_set: bool = False
+    # The recording's own first floor (the profile's ``first_layer``).  An automatic
+    # restart after a reconnect starts the patrol here instead of at the detected/
+    # anchor layer, so the character never begins with a descent it cannot make.
+    first_layer: str = ""
     # Split boundaries are global X dividers.  They are deliberately kept
     # outside individual layers: one recorded split represents the same map
     # partition all the way from layer1 to the highest layer.
@@ -504,6 +508,7 @@ class PatrolController:
                     self._profile.get("patrol_start_layer")
                     and self._profile.get("patrol_end_layer")
                 ),
+                first_layer=str(self._profile.get("first_layer") or ""),
                 split_points=tuple(deepcopy(self._split_points_locked())),
             )
 

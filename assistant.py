@@ -1831,6 +1831,32 @@ def main() -> int:
             )
             detected_name = fallback
         anchor_name = str(detected_name)
+        if reconnect_restart:
+            # Operator's rule (2026-11-09): "on auto reconnect we shall start from
+            # layer1".  A reconnect respawns the character anywhere (his log: marker
+            # Y=0.380208 while the patrol route begins at 0.493292), and starting the
+            # restart from the detected/anchor layer made the patrol open with a
+            # drop-to-route descent it could not perform - Alt+Down retried for twelve
+            # seconds.  Starting from the recording's own first layer keeps the route
+            # plan intact and lets the out-of-route return logic bring the character
+            # down (walking to an edge when Alt+Down fails).
+            start_layer = str(getattr(snapshot, "first_layer", "") or "")
+            if start_layer and start_layer in snapshot.layers:
+                if start_layer != anchor_name:
+                    logging.warning(
+                        "MAP SESSION: reconnect restart starts the patrol from %s "
+                        "(recording first layer; the marker detected %s)",
+                        start_layer, anchor_name,
+                    )
+                anchor_name = start_layer
+                anchor_layer_override = None
+                startup_above_route = False
+            else:
+                logging.warning(
+                    "MAP SESSION: reconnect restart could not use the recording's "
+                    "first layer (%r); starting from %s",
+                    start_layer, anchor_name,
+                )
         if split_points and anchor_layer_override is None:
             split_layer = snapshot.layers.get(anchor_name, {})
             parts = split_layer.get("part_points") if isinstance(split_layer, dict) else None
