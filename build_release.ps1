@@ -63,9 +63,35 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
                    "additional_functions_settings.json",
                    "yolo_detection_settings.json",
                    # 文档只留在仓库里：发布版不显示 README.md / ARCHITECTURE.md。
-                   "README.md", "ARCHITECTURE.md")
+                   "README.md", "ARCHITECTURE.md",
+                   # 部署地址表只随编译产物 endpoints_protected.pyd 分发（见下），
+                   # 源码版不随包发布，否则 IP/端口 会以明文出现在用户目录里。
+                   "endpoints_protected.py",
+                   # 厂商参考样例（不是运行时文件）会明文打印部署地址。
+                   "ct_lie3_remote_workflow_sample.py")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
+# The live endpoint table ships COMPILED: Nuitka --module produces a .pyd, so the
+# package carries no readable address list.  auto_lie_backend imports this module,
+# so a build without it cannot start - fail loudly instead of shipping a package
+# that raises at import time.
+$endpointsSource = Join-Path $root "endpoints_protected.py"
+$endpointsDir = Join-Path $root "work\endpoints-pyd"
+$endpointsPyd = @(Get-ChildItem -LiteralPath $endpointsDir -File -Filter "endpoints_protected*.pyd" -ErrorAction SilentlyContinue) |
+    Sort-Object -Property Name | Select-Object -First 1
+if (-not $endpointsPyd -and (Test-Path -LiteralPath $endpointsSource)) {
+    Write-Host "building the compiled endpoint table (endpoints_protected.pyd)..." -ForegroundColor Cyan
+    & $python -m nuitka --module $endpointsSource --output-dir=$endpointsDir 2>&1 |
+        Select-Object -Last 2
+    $endpointsPyd = @(Get-ChildItem -LiteralPath $endpointsDir -File -Filter "endpoints_protected*.pyd" -ErrorAction SilentlyContinue) |
+        Sort-Object -Property Name | Select-Object -First 1
+}
+if ($endpointsPyd) {
+    Copy-Item -LiteralPath $endpointsPyd.FullName -Destination (Join-Path $out $endpointsPyd.Name) -Force
+    Write-Host "  endpoints: compiled $($endpointsPyd.Name) (no plaintext address list)" -ForegroundColor Cyan
+} else {
+    throw "endpoints_protected.pyd is missing: the release would ship a plaintext endpoint table or fail to start."
+}
 Copy-Item -LiteralPath $versionFile -Destination (Join-Path $out "VERSION")
 # A version overlay must not replace the package launcher with the development launcher: write the
 # launcher into the package so an update keeps using the installed .venv.  There is one environment
@@ -234,6 +260,16 @@ if (Test-Path $apiIn) {
         # key file in a release, even though vendor source remains read-only.
         $_.Name -ne "key_secret.txt" -and
         $_.Name -ne "2.7.0.md" -and
+        # ip_port.txt is the vendor's own PLAINTEXT address list.  End users must
+        # not be able to read the deployment's IP/port table, so it is never
+        # packaged: endpoints_protected.py owns the table and ships compiled
+        # (endpoints_protected.pyd), and the vendor loader falls back to its
+        # built-in defaults if it ever wants a file.
+        $_.Name -ne "ip_port.txt" -and
+        # Vendor reference samples are not runtime data and they print the
+        # deployment address in plaintext; a test asserts their content in the
+        # repository, which is where they stay.
+        $_.Name -ne "ct_lie3_remote_workflow_sample.py" -and
         $_.FullName -notlike "*sample_captures*" -and
         $_.FullName -notlike "*__pycache__*" -and
         $_.Extension -ne ".pyc"

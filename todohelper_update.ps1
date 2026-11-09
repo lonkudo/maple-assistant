@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Persistent MoonEclipse restart and ZIP-update helper.
 

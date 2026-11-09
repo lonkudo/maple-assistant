@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build a source-free Nuitka release after the normal release has been field-approved.
 
@@ -320,6 +320,9 @@ try {
     $mirrored = 0
     Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
         if ($_.Extension -in ".py", ".pyc") { return }
+        # The endpoint table is compiled INTO this executable; the .pyd belongs to
+        # the source layout only, so a mirrored copy would be dead weight.
+        if ($_.Name -like "endpoints_protected*.pyd") { return }
         $relative = $_.FullName.Substring($stage.Length + 1)
         if ($excluded -contains $relative.Split('\')[0]) { return }
         $target = Join-Path $dataRoot $relative

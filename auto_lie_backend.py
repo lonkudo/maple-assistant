@@ -4,10 +4,12 @@ The bundled ``autolie_api`` folder is vendor reference material and keeps its
 original endpoint list. The application selects its live service here so an
 endpoint migration never changes vendor files or the licensing backend.
 
-Both live deployments are listed here.  The application probes a random small
-set before a live pass and then formally handshakes on a reported-available
-worker.  Keeping this deployment list outside ``autolie_api`` means endpoint
-migrations never modify vendor reference material.
+The deployment table itself lives in ``endpoints_protected``: releases ship that
+module compiled (``endpoints_protected.pyd``) and not as source, so the plaintext
+addresses are not readable in an end-user package, and the vendor's own
+``autolie_api/ip_port.txt`` is no longer packaged at all.  Both live deployments
+are listed there.  The application probes a random small set before a live pass and
+then formally handshakes on a reported-available worker.
 """
 
 from __future__ import annotations
@@ -15,23 +17,7 @@ from __future__ import annotations
 import secrets
 from typing import Optional, Sequence
 
-# Every live WebSocket service instance, grouped by host.
-AUTO_LIE_WS_ENDPOINTS: tuple[tuple[str, int], ...] = (
-    ("222.215.232.230", 48001),
-    ("222.215.232.230", 48002),
-    ("222.215.232.230", 48003),
-    ("222.215.232.230", 48007),
-    ("222.215.232.230", 48009),
-    ("222.215.232.230", 48011),
-    ("222.215.232.230", 48013),
-    ("222.215.232.230", 48015),
-    ("117.50.223.113", 8001),
-    ("117.50.223.113", 8002),
-    ("117.50.223.113", 8003),
-    ("117.50.223.113", 8007),
-    ("117.50.223.113", 8009),
-    ("117.50.223.113", 8011),
-)
+from endpoints_protected import WS_ENDPOINTS as AUTO_LIE_WS_ENDPOINTS
 
 
 def host_ports(host: str) -> tuple[int, ...]:

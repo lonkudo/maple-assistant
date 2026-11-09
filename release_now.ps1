@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     One-command full checkpoint: optionally run tests, then rebuild the
     the distributable folder and its versioned zip (1.0.0 style).

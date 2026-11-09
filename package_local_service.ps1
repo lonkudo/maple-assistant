@@ -1,4 +1,4 @@
-# Bundle the packaged CT partner API (the local lie-detection service) into a release.
+﻿# Bundle the packaged CT partner API (the local lie-detection service) into a release.
 #
 # The assistant starts this service on 127.0.0.1:8765 when the local backend is
 # selected (see local_lie_service.py) and finds it at
@@ -87,46 +87,35 @@ if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
     throw "local lie service has no data\ct_login_config.json (card / WS key): $config"
 }
 
-# The CT_IN 月卡 is NOT device independent: the activated ticket lives in
-# data\license (per machine, excluded from the bundle), so a fresh machine can
-# only validate the card when its code is in data\ct_login_config.json.  Field
-# report from another machine:
-#   "CT_IN 月卡启动验票失败，同行服务未启动 ... 原因：未配置或未激活 CT_IN 月卡"
-# The code is therefore copied from this machine's licence state into the BUNDLED
-# config (the repository copy stays untouched).  The value is never printed.
-$cardPath = Join-Path $Source "data\license\ct_partner_last_code.json"
-if (Test-Path -LiteralPath $cardPath -PathType Leaf) {
-    $card = ""
-    try {
-        $state = Get-Content -LiteralPath $cardPath -Raw | ConvertFrom-Json
-        if ($state.PSObject.Properties.Name -contains "license_code") {
-            $card = [string]$state.license_code
-        }
-    } catch {
-        Write-Warning "local lie service: the saved CT_IN code could not be read: $($_.Exception.Message)"
-    }
-    if ($card) {
-        $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json
-        $current = ""
-        if ($settings.PSObject.Properties.Name -contains "partner_license_code") {
-            $current = [string]$settings.partner_license_code
-        }
-        if (-not $current) {
-            $settings | Add-Member -NotePropertyName partner_license_code `
-                -NotePropertyValue $card -Force
-            $json = $settings | ConvertTo-Json -Depth 8
-            # No BOM: the service parses this file with a strict UTF-8 reader.
-            [System.IO.File]::WriteAllText(
-                $config, $json, (New-Object System.Text.UTF8Encoding($false)))
-            Write-Host "local lie service: CT_IN card code written into the bundled data\ct_login_config.json (value not printed)"
-        } else {
-            Write-Host "local lie service: data\ct_login_config.json already carries a CT_IN card code"
-        }
-    } else {
-        Write-Warning "local lie service: no saved CT_IN code on this machine; the bundled service cannot validate the card elsewhere."
-    }
-} else {
-    Write-Warning "local lie service: no data\license\ct_partner_last_code.json; set partner_license_code by hand before shipping."
+# The CT_IN 月卡 code is a per-customer credential, NOT package content.  The
+# desktop receives it from the activation server in the device document and writes
+# it into THIS file at runtime (local_lie_service.apply_online_card), so a bundled
+# copy only leaked the operator's own card to every download.  The packaged copy is
+# therefore scrubbed: the file stays (the service reads it at startup), but with an
+# empty partner_license_code.  The repository copy is never touched here.
+#
+# Field behaviour that still holds: without a code in this file the vendor service
+# cannot validate its 月卡, which is exactly why the desktop writes it before the
+# service is started - the supervisor only starts it once a CT card arrived.
+$settings = $null
+try {
+    $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json
+} catch {
+    throw "local lie service: data\ct_login_config.json is not valid JSON: $($_.Exception.Message)"
+}
+if ($null -eq $settings -or $settings -is [System.Array]) {
+    throw "local lie service: data\ct_login_config.json must be a JSON object."
+}
+$hasCard = $settings.PSObject.Properties.Name -contains "partner_license_code"
+if ($hasCard -and [string]$settings.partner_license_code) {
+    $settings.partner_license_code = ""
+    # No BOM: the service parses this file with a strict UTF-8 reader.
+    [System.IO.File]::WriteAllText(
+        $config, ($settings | ConvertTo-Json -Depth 8),
+        (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "local lie service: bundled ct_login_config.json scrubbed (partner card removed)" -ForegroundColor Cyan
+} elseif ($hasCard) {
+    Write-Host "local lie service: bundled ct_login_config.json already carries no partner card"
 }
 
 $mb = [math]::Round($bytes / 1MB, 1)

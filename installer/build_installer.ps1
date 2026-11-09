@@ -1,4 +1,4 @@
-<# Build the separate MoonEclipse installer executable; it is never included in app updates. #>
+﻿<# Build the separate MoonEclipse installer executable; it is never included in app updates. #>
 param(
     [string]$Python = ""
 )
