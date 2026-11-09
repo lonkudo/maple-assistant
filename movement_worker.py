@@ -5374,6 +5374,7 @@ class MovementWorker(threading.Thread):
         # continue to use their existing drop behaviour unchanged.
         self._reconnect_drop_recovery_armed = False
         self._reconnect_drop_walk_abandoned = False
+        self._reconnect_drop_chords = 0
         self._reconnect_drop_armed_at = float("-inf")
         self._reconnect_drop_edge_cycles = 0
         self._reconnect_drop_attempt_y: Optional[float] = None
@@ -12406,6 +12407,7 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_attempt_at = float("-inf")
         self._reconnect_drop_assessed_at = float("-inf")
         self._reconnect_drop_stalled_attempts = 0
+        self._reconnect_drop_chords = 0
         # Best (furthest down the map -> largest) marker Y since arming.  Progress is
         # measured against this, so a wobbling marker cannot fake a descent.
         self._reconnect_drop_best_y: Optional[float] = None
@@ -12939,6 +12941,7 @@ class MovementWorker(threading.Thread):
         if (not self._drop_walk_active()
                 or observation.player is None):
             return
+        self._reconnect_drop_chords += 1
         self._reconnect_drop_attempt_y = float(observation.player.y)
         self._reconnect_drop_attempt_at = float(now)
 
@@ -12963,6 +12966,7 @@ class MovementWorker(threading.Thread):
         )
         self._reconnect_drop_recovery_armed = False
         self._reconnect_drop_stalled_attempts = 0
+        self._reconnect_drop_chords = 0
         self._reconnect_drop_best_y = None
         self._reconnect_drop_attempt_y = None
         self._reconnect_drop_edge_phase = None
@@ -13378,6 +13382,7 @@ class MovementWorker(threading.Thread):
                     reference_y, current_y, phase,
                 )
                 self._reconnect_drop_stalled_attempts = 0
+                self._reconnect_drop_chords = 0
                 self._reconnect_drop_best_y = None
                 self._reconnect_drop_attempt_y = None
                 self._reconnect_drop_edge_phase = None
@@ -13424,6 +13429,7 @@ class MovementWorker(threading.Thread):
                 RECONNECT_DROP_MAX_EDGE_CYCLES,
             )
             self._reconnect_drop_stalled_attempts = 0
+            self._reconnect_drop_chords = 0
             self._reconnect_drop_best_y = None
             self._reconnect_drop_attempt_y = None
             self._reconnect_drop_edge_phase = None
@@ -13431,43 +13437,36 @@ class MovementWorker(threading.Thread):
             self._reconnect_drop_edge_start_y = None
             return None
 
-        attempt_y = self._reconnect_drop_attempt_y
-        attempt_at = self._reconnect_drop_attempt_at
-        if (attempt_y is None
-                or self._reconnect_drop_assessed_at == attempt_at
-                or now - attempt_at < self.drop_retry_seconds):
-            return None
-        self._reconnect_drop_assessed_at = attempt_at
-        self._reconnect_drop_attempt_y = None
-        # Each physical drop chord is assessed exactly once, and progress is measured
-        # against the BEST marker Y seen since the recovery was armed - not against
-        # the Y of the previous chord.  The marker wobbles while the character stands
-        # still (field log 20:47: 0.380208 -> 0.348958 -> 0.369792 -> 0.380208), and
-        # the old per-chord comparison read that return as +0.031 of descent, cleared
-        # the counter and kept Alt+Down retrying for ever.  That is exactly why the
-        # character "don't walk left or right" when the drop failed.
+        # Assessment is by CHORD COUNT, not by a timer.  The old gate required
+        # ``now - attempt_at >= drop_retry_seconds`` (1.0 s) but every new chord
+        # refreshed ``attempt_at``, and the live chord cadence is 0.4-0.6 s (field log
+        # 21:22: "no descent after 0.41s ... 0.59s"), so the verdict could never fire
+        # and Alt+Down repeated for ever.  Counting chords is independent of pacing:
+        # two Alt+Down chords go out first, and only then does the walk start.
         best_y = self._reconnect_drop_best_y
         if best_y is None:
-            # Seed the reference with the Y of the first chord and then only ever
-            # RAISE it (max): a wobble dip below the starting point must not become
-            # the reference, or the return to the start would read as a descent and
-            # the walk would never start (v1.3.3's infinite Alt+Down).
-            best_y = float(attempt_y)
+            best_y = current_y
             self._reconnect_drop_best_y = best_y
         if current_y >= best_y + RECONNECT_DROP_Y_PROGRESS:
-            self._reconnect_drop_best_y = max(best_y, current_y)
+            self._reconnect_drop_best_y = current_y
+            self._reconnect_drop_chords = 0
             self._reconnect_drop_stalled_attempts = 0
             return None
-        self._reconnect_drop_stalled_attempts += 1
-        LOG.info(
-            "RECONNECT DROP RECOVERY: Alt+Down attempt %d/%d made no downward Y progress "
-            "(best %.6f, now %.6f)",
-            self._reconnect_drop_stalled_attempts,
-            RECONNECT_DROP_STALLED_ATTEMPTS,
-            best_y, current_y,
-        )
-        if self._reconnect_drop_stalled_attempts < RECONNECT_DROP_STALLED_ATTEMPTS:
+        self._reconnect_drop_stalled_attempts = int(self._reconnect_drop_chords)
+        if self._reconnect_drop_chords < RECONNECT_DROP_STALLED_ATTEMPTS:
+            LOG.info(
+                "RECONNECT DROP RECOVERY: Alt+Down chord %d/%d has not descended yet "
+                "(best %.6f, now %.6f)",
+                self._reconnect_drop_chords,
+                RECONNECT_DROP_STALLED_ATTEMPTS,
+                best_y, current_y,
+            )
             return None
+        LOG.info(
+            "RECONNECT DROP RECOVERY: %d Alt+Down chords made no downward Y progress "
+            "(best %.6f, now %.6f)",
+            self._reconnect_drop_chords, best_y, current_y,
+        )
         # Alt+Down has failed enough: walk to an edge and let the character drop
         # through it.  The FIRST direction is decided by X - walk toward the side the
         # character already stands on (nearest edge), which is the shortest way off
@@ -13889,6 +13888,7 @@ class MovementWorker(threading.Thread):
             self._reconnect_drop_attempt_at = float("-inf")
             self._reconnect_drop_assessed_at = float("-inf")
             self._reconnect_drop_stalled_attempts = 0
+            self._reconnect_drop_chords = 0
             self._reconnect_drop_best_y = None
             self._reconnect_drop_edge_phase = None
             self._reconnect_drop_edge_second_pass = False
