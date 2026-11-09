@@ -280,13 +280,19 @@ class EndpointTests(unittest.TestCase):
 
 
 class UiRowTests(unittest.TestCase):
-    """The panel row: one 测试api button that plays a video.  No 时长 box, no 密钥 button."""
+    """The panel row: one drill button in a shared slot, which plays a video.
+
+    The operator renamed 测试API into 测试本地测谎 / 测试云端测谎: the two share one
+    place, and only the one the 自动测谎 selection allows is reachable.
+    """
 
     def test_the_panel_has_only_the_video_button_and_no_settings(self):
-        """The redundant controls are gone: one button, and no length/key widgets at all."""
+        """The redundant controls are gone: one slot, and no length/key widgets at all."""
 
         source = Path("ui_worker.py").read_text(encoding="utf-8")
-        self.assertIn('text="测试API"', source)
+        self.assertIn('text="测试本地测谎"', source)
+        self.assertIn('text="测试云端测谎"', source)
+        self.assertNotIn('text="测试API"', source)
         for gone in ("测试api（抓屏）", "_api_test_seconds_box", "_api_test_seconds_var",
                      "_api_test_key_button", "_api_test_change_key",
                      "_api_test_screen_clicked", "_load_api_test_settings",

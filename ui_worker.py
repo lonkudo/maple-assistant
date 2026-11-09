@@ -3339,7 +3339,7 @@ class UiWorker(threading.Thread):
                     "中途可以按esc中断，但是仍然扣费，如要手动操作，请不要开启"
                     if value == "cloud" else
                     "本地测谎：连接 127.0.0.1:8765 的同行坐标服务，"
-                    "由本机服务计费（不扣在线测谎次数），点 测试api 可以先用本地服务试跑",
+                    "由本机服务计费（不扣在线测谎次数），点 测试本地测谎 可以先用本地服务试跑",
                 )
                 hint.set_enabled(True)
                 self._bind_key_tooltips.append(hint)
@@ -3362,23 +3362,57 @@ class UiWorker(threading.Thread):
                     )
                 except Exception:  # noqa: BLE001 - a missing folder is not fatal
                     LOG.debug("本地测谎 pre-start could not be armed", exc_info=True)
-            # 测试api is back on this line: with 本地测谎 selected it runs the drill
-            # against 127.0.0.1:8765, so the operator has a one-click local test
-            # right next to the selection that chooses the backend.
-            self._api_test_button = ttk.Button(
-                auto_lie_row,
-                text="测试API",
+            # 测试本地测谎 and 测试云端测谎 live in ONE slot: a drill always runs on
+            # whichever backend the group selects, so at most one of the two is
+            # reachable.  The slot frame is frozen at the wider label, so switching
+            # the selection never reflows this row (operator: "share the same place,
+            # don't make UI expand").
+            self._api_test_slot = ttk.Frame(auto_lie_row)
+            self._api_test_slot.pack(side="left", padx=(10, 0))
+            self._api_test_local_button = ttk.Button(
+                self._api_test_slot,
+                text="测试本地测谎",
                 command=self._api_test_clicked,
                 takefocus=False,
             )
-            self._api_test_button.pack(side="left", padx=(10, 0))
-            api_test_hint = HoverTooltip(
-                self._api_test_button,
-                "选择视频并按 5 fps 试跑一次测谎（鼠标只在视频窗口内）。"
-                "选了「本地测谎」时走 127.0.0.1:8765，本地服务自计费，不扣在线测谎次数",
+            self._api_test_cloud_button = ttk.Button(
+                self._api_test_slot,
+                text="测试云端测谎",
+                command=self._api_test_clicked,
+                takefocus=False,
             )
-            api_test_hint.set_enabled(True)
-            self._bind_key_tooltips.append(api_test_hint)
+            self._api_test_arm_state = "normal"
+            self._api_test_slot.pack_propagate(False)
+            try:
+                self._api_test_slot.configure(
+                    width=max(
+                        self._api_test_local_button.winfo_reqwidth(),
+                        self._api_test_cloud_button.winfo_reqwidth(),
+                    ),
+                    height=max(
+                        self._api_test_local_button.winfo_reqheight(),
+                        self._api_test_cloud_button.winfo_reqheight(),
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - a sizing hint is never fatal
+                LOG.debug("api test slot could not be sized", exc_info=True)
+            local_test_hint = HoverTooltip(
+                self._api_test_local_button,
+                "本地测谎：选择视频并按 5 fps 试跑一次，走 127.0.0.1:8765，"
+                "由本机服务计费，不扣在线测谎次数",
+            )
+            local_test_hint.set_enabled(True)
+            self._bind_key_tooltips.append(local_test_hint)
+            cloud_test_hint = HoverTooltip(
+                self._api_test_cloud_button,
+                "云端测谎：选择视频并按 5 fps 试跑一次，走在线测谎服务，会计入测谎次数",
+            )
+            cloud_test_hint.set_enabled(True)
+            self._bind_key_tooltips.append(cloud_test_hint)
+            # ``_api_test_button`` stays the name the state helpers and the tests
+            # read; both real buttons are driven together by _api_test_set_buttons.
+            self._api_test_button = self._api_test_cloud_button
+            self._sync_api_test_buttons()
             self._reconnect_var = tk.BooleanVar(value=saved_reconnect_enabled)
             self._reconnect_check = ttk.Checkbutton(
                 reconnect_row,
@@ -6788,8 +6822,18 @@ class UiWorker(threading.Thread):
     def _api_test_status_text(self) -> str:
         video = getattr(self, "api_test_video", "")
         chosen = f"上次视频：{Path(video).name}；" if video else ""
-        return (f"测试api: {self._api_test_backend_text()}；{chosen}"
-                f"按 测试api 选择视频，{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，"
+        mode = self._auto_lie_backend_mode()
+        if mode == AUTOLIE_BACKEND_LOCAL:
+            drill = "测试本地测谎"
+            backend = "本地测谎（127.0.0.1:8765，本机服务计费，不扣在线测谎次数）"
+        elif mode == AUTOLIE_BACKEND_CLOUD:
+            drill = "测试云端测谎"
+            backend = self._api_test_backend_text()
+        else:
+            return ("自动测谎 已关闭：选 云端测谎 或 本地测谎 之后才能试跑"
+                    f"（{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，鼠标只在视频画面内）。")
+        return (f"{drill}: {backend}；{chosen}"
+                f"按 {drill} 选择视频，{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，"
                 "开始上传前先等第二个窗口（鼠标只在视频画面内）。")
 
     def _api_test_clicked(self) -> None:
@@ -6938,13 +6982,57 @@ class UiWorker(threading.Thread):
         return video
 
     def _api_test_set_buttons(self, state: str) -> None:
-        button = getattr(self, "_api_test_button", None)
-        if button is None:
+        """Arm or disarm every drill button (the two share one slot)."""
+
+        self._api_test_arm_state = state
+        seen: set[int] = set()
+        for name in ("_api_test_button", "_api_test_local_button",
+                     "_api_test_cloud_button"):
+            button = getattr(self, name, None)
+            if button is None or id(button) in seen:
+                continue
+            seen.add(id(button))
+            try:
+                button.configure(state=state)
+            except Exception:
+                LOG.debug("api test button state could not be set", exc_info=True)
+        self._sync_api_test_buttons()
+
+    def _sync_api_test_buttons(self) -> None:
+        """Show the drill button the 自动测谎 selection allows.
+
+        本地测谎 shows 测试本地测谎 and hides the cloud one; 云端测谎 is the mirror.
+        关闭 keeps 测试云端测谎 visible but greyed instead of hiding it, so the slot
+        never changes size and the operator still sees what the drill needs.
+        """
+
+        local = getattr(self, "_api_test_local_button", None)
+        cloud = getattr(self, "_api_test_cloud_button", None)
+        if local is None or cloud is None:
             return
+        mode = self._auto_lie_backend_mode()
+        visible = local if mode == AUTOLIE_BACKEND_LOCAL else cloud
+        hidden = cloud if visible is local else local
+        # ``winfo_manager`` says whether pack owns the widget; ``winfo_ismapped``
+        # would also be false for a packed button on a hidden tab, and then the
+        # "hidden" one would never be unpacked and both would show up later.
+        def managed(button: Any) -> bool:
+            return bool(button.winfo_manager())
+
         try:
-            button.configure(state=state)
+            if not managed(visible):
+                visible.pack(side="left", fill="both", expand=True)
+            if managed(hidden):
+                hidden.pack_forget()
+        except Exception:  # noqa: BLE001 - never break a selection change
+            LOG.debug("api test button could not be swapped", exc_info=True)
+        armed = str(getattr(self, "_api_test_arm_state", "normal")) == "normal"
+        try:
+            visible.configure(
+                state="normal" if armed and mode != AUTOLIE_BACKEND_OFF else "disabled"
+            )
         except Exception:
-            LOG.debug("api test button state could not be set", exc_info=True)
+            LOG.debug("api test button could not be re-armed", exc_info=True)
 
     def _api_test_window_closed(self) -> None:
         """The operator closed the video window: stop the drill."""
@@ -7252,6 +7340,18 @@ class UiWorker(threading.Thread):
             # 本地测谎 has its own connection: report it the moment it is chosen
             # instead of failing on the first lie window.
             self._probe_local_lie_service()
+        # The drill button follows the selection: 本地测谎 exposes 测试本地测谎,
+        # 云端测谎 exposes 测试云端测谎, 关闭 greys it.
+        self._sync_api_test_buttons()
+        # The idle status line names the drill and its backend, so it follows the
+        # selection too - unless a drill is running and owns that line.
+        worker = getattr(self, "api_test_worker", None)
+        running = bool(worker is not None and getattr(worker, "running", False))
+        if not running and hasattr(self, "_api_test_status"):
+            try:
+                self._set_api_test_status(self._api_test_status_text())
+            except Exception:  # noqa: BLE001 - a status hint is never fatal
+                LOG.debug("api test status could not follow the selection", exc_info=True)
         self._api_auto_lie_on_change()
 
     def _probe_local_lie_service(self) -> None:
