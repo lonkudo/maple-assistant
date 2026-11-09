@@ -1142,6 +1142,26 @@ def main() -> int:
         debug_minimap_fallback=MINIMAP_FALLBACK_REGION, # <------ ADD THIS LINE
     )
 
+    def reconnect_restart_start(
+        snapshot: Any, detected_name: str, above_route: bool,
+    ) -> tuple[str, bool, bool]:
+        """Where an automatic reconnect restart begins, and whether it still drops.
+
+        The operator's rule is "on auto reconnect we shall start from layer1", so a
+        restart starts at the recording's own first layer even when the marker sits
+        elsewhere.  ``above_route`` is returned UNCHANGED: when the respawn is above the
+        route the restart must still open with the drop-to-route descent (Alt+Down twice,
+        then the edge walk).  Dropping that flag made the worker start horizontal patrol
+        while the character was far above the route, which looked like "randomly walking,
+        never trying Alt+Down" (local log 22:10:18).
+        """
+
+        start_layer = str(getattr(snapshot, "first_layer", "") or "")
+        layers = getattr(snapshot, "layers", {}) or {}
+        if start_layer and start_layer in layers:
+            return start_layer, bool(above_route), True
+        return str(detected_name), bool(above_route), False
+
     def prepare_map_session(*, stationary_reanchor: bool = True, show_overlays: bool = True,
                             show_startup_marker: bool = False,
                             require_layer: bool = True,
@@ -1834,14 +1854,20 @@ def main() -> int:
         if reconnect_restart:
             # Operator's rule (2026-11-09): "on auto reconnect we shall start from
             # layer1".  A reconnect respawns the character anywhere (his log: marker
-            # Y=0.380208 while the patrol route begins at 0.493292), and starting the
-            # restart from the detected/anchor layer made the patrol open with a
-            # drop-to-route descent it could not perform - Alt+Down retried for twelve
-            # seconds.  Starting from the recording's own first layer keeps the route
-            # plan intact and lets the out-of-route return logic bring the character
-            # down (walking to an edge when Alt+Down fails).
-            start_layer = str(getattr(snapshot, "first_layer", "") or "")
-            if start_layer and start_layer in snapshot.layers:
+            # Y=0.380208 while the patrol route begins at 0.493292), so the restart
+            # begins at the recording's own first layer instead of at the marker's
+            # anchor layer.
+            #
+            # ``startup_above_route`` is deliberately KEPT: when the marker is above the
+            # route the restart must still open with the drop-to-route descent (Alt+Down,
+            # then the edge walk).  Clearing it here made the worker start horizontal
+            # patrol immediately - the 22:10:18 local log shows "PATROL START: detected
+            # layer1 in patrol range; starting at left cycle 1/1" while the marker was
+            # 0.3246 away from layer1, i.e. the character walked and never dropped.
+            start_layer, startup_above_route, used_first_layer = reconnect_restart_start(
+                snapshot, anchor_name, startup_above_route
+            )
+            if used_first_layer:
                 if start_layer != anchor_name:
                     logging.warning(
                         "MAP SESSION: reconnect restart starts the patrol from %s "
@@ -1850,7 +1876,6 @@ def main() -> int:
                     )
                 anchor_name = start_layer
                 anchor_layer_override = None
-                startup_above_route = False
             else:
                 logging.warning(
                     "MAP SESSION: reconnect restart could not use the recording's "
