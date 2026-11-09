@@ -2491,9 +2491,12 @@ def main() -> int:
         interval_hours=1.0,
         flash_callback=screen_blinker.request_blink,
         alert_callback=_message_alert,
-        # Countdown/loop reminders do not create screenshots or MP4s.  The
-        # recorder is reserved for an actual lie-window investigation.
-        event_callback=None,
+        # 循环 is a diagnostic event like 测谎 and 掉线: the operator asked for its
+        # screenshot/MP4 recording back ("restore 循环 screenshots for testing
+        # recording"), so a countdown that reaches zero writes the same
+        # screenshots/countdown_<stamp>/ run instead of only flashing + notifying.
+        # The recorder consumes the shared 5-FPS frames; it never opens a capture.
+        event_callback=screenshot_recorder.on_countdown,
     )
     lie_detector_worker = LieDetectorWorker(
         lie_detector_frames,

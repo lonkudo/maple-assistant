@@ -235,7 +235,14 @@ class VideoWriter:
 
 
 def to_bgr(image: Any) -> Optional[np.ndarray]:
-    """Any supported image -> BGR numpy array (None when the type is unknown)."""
+    """Any supported image -> BGR numpy array (None when the type is unknown).
+
+    A PIL image carries **RGB** pixels while cv2 speaks BGR, so a PIL frame must be
+    reordered here.  It used to be handed to the ndarray branch unchanged, which
+    wrote every screenshot and every recorded lie frame with red and blue swapped
+    (field report: "the screenshot shifted the game color").  A numpy array is
+    already BGR by convention and is passed through untouched.
+    """
 
     if isinstance(image, np.ndarray):
         if image.ndim == 2:
@@ -249,7 +256,18 @@ def to_bgr(image: Any) -> Optional[np.ndarray]:
         array = np.asarray(image)
     except Exception:
         return None
-    return to_bgr(array) if isinstance(array, np.ndarray) else None
+    if not isinstance(array, np.ndarray):
+        return None
+    if getattr(image, "mode", None) is None:
+        # Not a PIL image: keep the old "arrays are BGR" contract.
+        return to_bgr(array)
+    if array.ndim == 2:
+        return cv2.cvtColor(array, cv2.COLOR_GRAY2BGR)
+    if array.ndim == 3 and array.shape[2] == 4:
+        return cv2.cvtColor(array, cv2.COLOR_RGBA2BGR)
+    if array.ndim == 3 and array.shape[2] == 3:
+        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+    return None
 
 
 def frame_files(folder: Path, prefixes: Sequence[str] = ("frame_", "frame-")) -> list[Path]:
