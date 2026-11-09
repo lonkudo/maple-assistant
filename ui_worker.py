@@ -6871,6 +6871,22 @@ class UiWorker(threading.Thread):
         self._api_test_set_buttons("disabled")
         LOG.info("api test (video): %s for %.0fs at 5 fps (key=%s)", video.name, seconds,
                  "set" if key else "none -> mimic")
+        # 本地测谎 statistics: a local drill is a local pass too.  Without this the
+        # 本地测谎 panel stayed empty after 测试API (the field report: "全局测谎统计
+        # moved but 本地测谎 did not"), because only the automatic pass reported.
+        self._local_lie_drill_event = ""
+        if local_backend:
+            import uuid as _uuid
+
+            self._local_lie_drill_event = str(_uuid.uuid4())
+            try:
+                import local_lie_service
+
+                local_lie_service.report_local_pass(
+                    self._local_lie_drill_event, "pending", detail="测试API",
+                )
+            except Exception:  # noqa: BLE001 - statistics never block a drill
+                LOG.debug("本地测谎 测试API start report failed", exc_info=True)
         worker.start()
         self._set_api_test_status(
             f"测试api: 正在播放 {video.name} - {seconds:.0f} 秒 @ 5 fps"
@@ -7066,13 +7082,16 @@ class UiWorker(threading.Thread):
                     # service as an in-game pass.  Count it immediately so
                     # the authorization bar reflects the server response.
                     self._enqueue_auto_lie_accounting("api-test")
+                    self._report_local_lie_drill("success", detail)
                     self._api_test_idle()
                 elif state == "stopped":
                     self._set_api_test_status(f"测试api 已停止: {detail}")
+                    self._report_local_lie_drill("aborted", detail)
                     self._api_test_idle()
                 elif state == "failed":
                     self._set_api_test_status(f"测试api 失败: {detail}")
                     self._play_action_sound(False)
+                    self._report_local_lie_drill("failed", detail)
                     self._api_test_idle()
                 else:
                     suffix = f": {detail}" if detail else ""
@@ -11918,6 +11937,27 @@ class UiWorker(threading.Thread):
         if note == getattr(self, "_local_lie_service_hint_shown", None):
             return
         self._refresh_panel_hints()
+
+    def _report_local_lie_drill(self, outcome: str, detail: str = "") -> None:
+        """Finish the 本地测谎 statistics row of a 测试API drill.
+
+        测试API is a local pass too: without this the 本地测谎 panel never moved
+        (the field report "全局测谎统计 moved but 本地测谎 did not").  The start
+        row was opened in ``_api_test_clicked``; this closes the same event.
+        """
+
+        event_id = str(getattr(self, "_local_lie_drill_event", "") or "")
+        if not event_id:
+            return
+        self._local_lie_drill_event = ""
+        try:
+            import local_lie_service
+
+            local_lie_service.report_local_pass(
+                event_id, outcome, detail=f"测试API {detail}".strip(),
+            )
+        except Exception:  # noqa: BLE001 - statistics never block a drill
+            LOG.debug("本地测谎 测试API report failed", exc_info=True)
 
     def _refresh_dingtalk_status(self) -> None:
         """Compatibility alias: the 钉钉 state is part of the shared hint now."""

@@ -841,10 +841,10 @@ def hint_text() -> str:
         state = str(_state.get("state") or "idle")
         rejected = bool(_state.get("card_rejected"))
         desired = _desired_active
-    if not desired:
-        return ""
-    if not has_online_card():
+    if desired and not has_online_card():
         return "本地测谎服务: 本机未开通本地测谎服务"
+    if not desired and state not in ("running", "external", "starting"):
+        return ""
     if rejected:
         return "本地测谎服务: 本地测谎启动失败"
     if state in ("running", "external"):
