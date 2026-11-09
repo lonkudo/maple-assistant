@@ -250,6 +250,12 @@ UPDATE_NOTICE_TOOLTIP_LINES = 8
 AUTOLIE_BACKEND_OFF = "off"
 AUTOLIE_BACKEND_CLOUD = "cloud"
 AUTOLIE_BACKEND_LOCAL = "local"
+# 测试云端测谎 is built and wired (same command as 测试本地测谎, the drill already
+# reaches the cloud backend when 云端测谎 is selected) but the operator keeps it
+# hidden: every cloud run charges the online 测谎次数, so only 测试本地测谎 - which
+# the CT card pays for - is exposed.  Flip this to True to bring the button back;
+# nothing else has to change.
+API_TEST_CLOUD_BUTTON_VISIBLE = False
 # 本地测谎 probe cadence.  The service validates its licence and handshakes the
 # coordinate cloud BEFORE it listens on 8765 (~5-20 s cold), so the first probe
 # after selecting it usually sees "connection refused" (field log 00:34:38).  The
@@ -3363,10 +3369,11 @@ class UiWorker(threading.Thread):
                 except Exception:  # noqa: BLE001 - a missing folder is not fatal
                     LOG.debug("本地测谎 pre-start could not be armed", exc_info=True)
             # 测试本地测谎 and 测试云端测谎 live in ONE slot: a drill always runs on
-            # whichever backend the group selects, so at most one of the two is
-            # reachable.  The slot frame is frozen at the wider label, so switching
-            # the selection never reflows this row (operator: "share the same place,
-            # don't make UI expand").
+            # whichever backend the group selects, so at most one of the two can be
+            # reachable.  The slot frame is frozen at the wider label, so showing or
+            # hiding the button never reflows this row (operator: "share the same
+            # place, don't make UI expand").  测试云端测谎 is only built, never packed,
+            # while API_TEST_CLOUD_BUTTON_VISIBLE is false.
             self._api_test_slot = ttk.Frame(auto_lie_row)
             self._api_test_slot.pack(side="left", padx=(10, 0))
             self._api_test_local_button = ttk.Button(
@@ -6822,19 +6829,13 @@ class UiWorker(threading.Thread):
     def _api_test_status_text(self) -> str:
         video = getattr(self, "api_test_video", "")
         chosen = f"上次视频：{Path(video).name}；" if video else ""
-        mode = self._auto_lie_backend_mode()
-        if mode == AUTOLIE_BACKEND_LOCAL:
-            drill = "测试本地测谎"
-            backend = "本地测谎（127.0.0.1:8765，本机服务计费，不扣在线测谎次数）"
-        elif mode == AUTOLIE_BACKEND_CLOUD:
-            drill = "测试云端测谎"
-            backend = self._api_test_backend_text()
-        else:
-            return ("自动测谎 已关闭：选 云端测谎 或 本地测谎 之后才能试跑"
-                    f"（{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，鼠标只在视频画面内）。")
-        return (f"{drill}: {backend}；{chosen}"
-                f"按 {drill} 选择视频，{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，"
-                "开始上传前先等第二个窗口（鼠标只在视频画面内）。")
+        if self._auto_lie_backend_mode() == AUTOLIE_BACKEND_LOCAL:
+            return (f"测试本地测谎: 本地测谎（127.0.0.1:8765，本机服务计费，不扣在线测谎次数）；"
+                    f"{chosen}按 测试本地测谎 选择视频，"
+                    f"{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，"
+                    "开始上传前先等第二个窗口（鼠标只在视频画面内）。")
+        return (f"试跑只在 本地测谎 时出现：选 本地测谎 后点 测试本地测谎，"
+                f"{API_TEST_VIDEO_SECONDS:.0f} 秒 @ 5 fps，鼠标只在视频画面内。")
 
     def _api_test_clicked(self) -> None:
         """测试api: pick a video file and run the drill on it (5 fps, mouse inside the picture)."""
@@ -6999,11 +7000,12 @@ class UiWorker(threading.Thread):
         self._sync_api_test_buttons()
 
     def _sync_api_test_buttons(self) -> None:
-        """Show the drill button the 自动测谎 selection allows.
+        """Show the drill button the 自动测谎 selection allows, and nothing else.
 
-        本地测谎 shows 测试本地测谎 and hides the cloud one; 云端测谎 is the mirror.
-        关闭 keeps 测试云端测谎 visible but greyed instead of hiding it, so the slot
-        never changes size and the operator still sees what the drill needs.
+        本地测谎 exposes 测试本地测谎.  云端测谎 and 关闭 show no drill at all: the slot
+        keeps its frozen size, so the row neither grows nor jumps when the button
+        comes and goes.  测试云端测谎 stays in the build but is never packed while
+        ``API_TEST_CLOUD_BUTTON_VISIBLE`` is false.
         """
 
         local = getattr(self, "_api_test_local_button", None)
@@ -7011,28 +7013,34 @@ class UiWorker(threading.Thread):
         if local is None or cloud is None:
             return
         mode = self._auto_lie_backend_mode()
-        visible = local if mode == AUTOLIE_BACKEND_LOCAL else cloud
-        hidden = cloud if visible is local else local
+        show_local = mode == AUTOLIE_BACKEND_LOCAL
+        show_cloud = bool(
+            API_TEST_CLOUD_BUTTON_VISIBLE and mode == AUTOLIE_BACKEND_CLOUD
+        )
         # ``winfo_manager`` says whether pack owns the widget; ``winfo_ismapped``
         # would also be false for a packed button on a hidden tab, and then the
-        # "hidden" one would never be unpacked and both would show up later.
+        # hidden one would never be unpacked and both would show up later.
         def managed(button: Any) -> bool:
             return bool(button.winfo_manager())
 
-        try:
-            if not managed(visible):
-                visible.pack(side="left", fill="both", expand=True)
-            if managed(hidden):
-                hidden.pack_forget()
-        except Exception:  # noqa: BLE001 - never break a selection change
-            LOG.debug("api test button could not be swapped", exc_info=True)
+        for button, wanted in ((local, show_local), (cloud, show_cloud)):
+            try:
+                if wanted and not managed(button):
+                    button.pack(side="left", fill="both", expand=True)
+                elif not wanted and managed(button):
+                    button.pack_forget()
+            except Exception:  # noqa: BLE001 - never break a selection change
+                LOG.debug("api test button could not be swapped", exc_info=True)
         armed = str(getattr(self, "_api_test_arm_state", "normal")) == "normal"
-        try:
-            visible.configure(
-                state="normal" if armed and mode != AUTOLIE_BACKEND_OFF else "disabled"
-            )
-        except Exception:
-            LOG.debug("api test button could not be re-armed", exc_info=True)
+        for button, wanted in ((local, show_local), (cloud, show_cloud)):
+            if not wanted:
+                continue
+            try:
+                button.configure(
+                    state="normal" if armed and mode != AUTOLIE_BACKEND_OFF else "disabled"
+                )
+            except Exception:
+                LOG.debug("api test button could not be re-armed", exc_info=True)
 
     def _api_test_window_closed(self) -> None:
         """The operator closed the video window: stop the drill."""
