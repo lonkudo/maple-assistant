@@ -243,6 +243,21 @@ UPDATE_ICON_INK_GREEN = "#ffffff"
 UPDATE_ICON_BUSY = "#2f6fd0"
 # Tooltip line budget: enough for the version, a few note lines and the hint.
 UPDATE_NOTICE_TOOLTIP_LINES = 8
+# --- 自动测谎 backend group ------------------------------------------------------
+# The old 自动测谎 checkbox is a three-way group now, because the lie pass has two
+# backends: the vendor cloud service (unchanged) and the CT partner API that the
+# local package runs on 127.0.0.1:8765.  ``off`` keeps the old unticked state.
+AUTOLIE_BACKEND_OFF = "off"
+AUTOLIE_BACKEND_CLOUD = "cloud"
+AUTOLIE_BACKEND_LOCAL = "local"
+# 本地测谎 probe cadence.  The service validates its licence and handshakes the
+# coordinate cloud BEFORE it listens on 8765 (~5-20 s cold), so the first probe
+# after selecting it usually sees "connection refused" (field log 00:34:38).  The
+# probe retries a few times, and the poll re-probes while the panel is not
+# connected, so the hint heals itself once the service is up.
+LOCAL_LIE_PROBE_ATTEMPTS = 5
+LOCAL_LIE_PROBE_INTERVAL_SECONDS = 2.0
+LOCAL_LIE_PROBE_RETRY_SECONDS = 10.0
 
 
 def seconds_until_next_gmt8_midnight_refresh() -> float:
@@ -1488,6 +1503,26 @@ class UiWorker(threading.Thread):
         # the next real lie window normally.
         self._api_auto_lie_ignore_until_clear = False
         self._api_auto_lie_change_origin = "unknown"
+        # 本地测谎 (127.0.0.1:8765): result of the last health probe and the note
+        # the panel shows.  None = not probed yet in this session.
+        self._local_lie_ready: Optional[bool] = None
+        self._local_lie_note: str = ""
+        # A key refresh from the activation server restarts the local service,
+        # but never underneath a live lie pass.
+        try:
+            import local_lie_service
+
+            local_lie_service.set_busy_probe(
+                lambda: self._worker_is_running(self._api_lie_pass_worker)
+            )
+        except Exception:  # noqa: BLE001 - the probe is best effort
+            LOG.debug("local lie service busy probe could not be installed",
+                      exc_info=True)
+        # (ok, note) of a finished 激活测谎 run, consumed by the Tk poll.
+        self._local_lie_activate_result: Optional[tuple[bool, str]] = None
+        # Set by the probe thread, consumed by the Tk poll (widgets are only
+        # touched on the Tk thread).
+        self._local_lie_report_pending = False
         self._latest_capture_frame: Any = None
         self._auto_lie_outcome_state: Optional[dict[str, Any]] = None
         self._auto_lie_success_box = LieSuccessBoxDetector()
@@ -3236,43 +3271,99 @@ class UiWorker(threading.Thread):
                 self._load_reconnect_settings()
             )
             saved_api_auto_lie = self._load_api_auto_lie_setting()
+            saved_api_auto_lie_backend = self._load_api_auto_lie_backend_setting()
             AUTO_LIE_LOG.info(
-                "自动过测谎: selection loaded as %s",
+                "自动过测谎: selection loaded as %s (backend=%s)",
                 "ON" if saved_api_auto_lie else "OFF",
+                saved_api_auto_lie_backend,
             )
             # Keep cleanup, lie, and reconnect as separate selections.  清理内存
             # only hands the logged-out client to 自动重连; it must never
             # silently alter the reconnect selection itself.
+            # 自动测谎 owns a line of its own (operator: "自动测谎 take a line, 自动重连
+            # put to a new line following 自动测谎") - the label, three radios and
+            # 测试API do not fit beside the reconnect settings.
+            auto_lie_row = ttk.Frame(extra_panel)
+            auto_lie_row.pack(fill="x", pady=(4, 0))
             reconnect_row = ttk.Frame(extra_panel)
             reconnect_row.pack(fill="x", pady=(4, 0))
+            # 自动测谎 is a grouped selection now, not a checkbox: the lie pass has
+            # two backends and the old on/off switch alone could not say which.
+            #   关闭      - the feature is off (the old unticked checkbox)
+            #   云端测谎  - the vendor ROI-track service (everything as before)
+            #   本地测谎  - the CT partner API on 127.0.0.1:8765
+            # ``_api_auto_lie_var`` stays the armed boolean every existing code
+            # path reads; the radios are its author.
             self._api_auto_lie_var = tk.BooleanVar(value=saved_api_auto_lie)
-            self._api_auto_lie_check = ttk.Checkbutton(
-                reconnect_row,
-                text="自动测谎",
-                variable=self._api_auto_lie_var,
-                command=self._api_auto_lie_on_change,
+            self._api_auto_lie_backend_var = tk.StringVar(
+                value=("off" if not saved_api_auto_lie else saved_api_auto_lie_backend)
+            )
+            auto_lie_label = ttk.Label(auto_lie_row, text="自动测谎")
+            auto_lie_label.pack(side="left")
+            # Patrol sends global key input.  If a temporary game stall leaves
+            # the dashboard foreground, Space/Enter must not silently change
+            # this security-sensitive selection.  It remains a mouse control.
+            self._api_auto_lie_buttons: list[Any] = []
+            for value, label in (
+                ("off", "关闭"),
+                ("cloud", "云端测谎"),
+                ("local", "本地测谎"),
+            ):
+                button = ttk.Radiobutton(
+                    auto_lie_row,
+                    text=label,
+                    value=value,
+                    variable=self._api_auto_lie_backend_var,
+                    command=self._api_auto_lie_backend_changed,
+                    takefocus=False,
+                )
+                button.bind(
+                    "<ButtonPress-1>", self._mark_auto_lie_mouse_change, add="+"
+                )
+                button.bind(
+                    "<space>", self._block_auto_lie_keyboard_toggle, add="+"
+                )
+                button.bind(
+                    "<Return>", self._block_auto_lie_keyboard_toggle, add="+"
+                )
+                button.pack(side="left")
+                self._api_auto_lie_buttons.append(button)
+                if value == "off":
+                    continue
+                hint = HoverTooltip(
+                    button,
+                    "开启后扣减测谎次数，测谎程序自动接管鼠标，不需要操作，"
+                    "中途可以按esc中断，但是仍然扣费，如要手动操作，请不要开启"
+                    if value == "cloud" else
+                    "本地测谎：连接 127.0.0.1:8765 的同行坐标服务，"
+                    "由本机服务计费（不扣在线测谎次数），点 测试api 可以先用本地服务试跑",
+                )
+                hint.set_enabled(True)
+                self._bind_key_tooltips.append(hint)
+            # 激活测谎 is gone on purpose: the activation code now carries its
+            # ct_card, the licence server returns it in the device document and
+            # local_lie_service.apply_online_card() writes it, so there is nothing
+            # for the operator to type.
+            # The old attribute name is read by the tooltip refresh path and by
+            # the tests that assert the selection is a mouse-only control.
+            self._api_auto_lie_check = self._api_auto_lie_buttons[1]
+            # 测试api is back on this line: with 本地测谎 selected it runs the drill
+            # against 127.0.0.1:8765, so the operator has a one-click local test
+            # right next to the selection that chooses the backend.
+            self._api_test_button = ttk.Button(
+                auto_lie_row,
+                text="测试API",
+                command=self._api_test_clicked,
                 takefocus=False,
             )
-            # Patrol sends global key input.  If a temporary game stall leaves
-            # the dashboard foreground, Space/Enter must not silently toggle
-            # this security-sensitive selection.  It remains a mouse control.
-            self._api_auto_lie_check.bind(
-                "<ButtonPress-1>", self._mark_auto_lie_mouse_change, add="+"
+            self._api_test_button.pack(side="left", padx=(10, 0))
+            api_test_hint = HoverTooltip(
+                self._api_test_button,
+                "选择视频并按 5 fps 试跑一次测谎（鼠标只在视频窗口内）。"
+                "选了「本地测谎」时走 127.0.0.1:8765，本地服务自计费，不扣在线测谎次数",
             )
-            self._api_auto_lie_check.bind(
-                "<space>", self._block_auto_lie_keyboard_toggle, add="+"
-            )
-            self._api_auto_lie_check.bind(
-                "<Return>", self._block_auto_lie_keyboard_toggle, add="+"
-            )
-            self._api_auto_lie_check.pack(side="left")
-            auto_lie_hint = HoverTooltip(
-                self._api_auto_lie_check,
-                "开启后扣减测谎次数，测谎程序自动接管鼠标，不需要操作，"
-                "中途可以按esc中断，但是仍然扣费，如要手动操作，请不要开启",
-            )
-            auto_lie_hint.set_enabled(True)
-            self._bind_key_tooltips.append(auto_lie_hint)
+            api_test_hint.set_enabled(True)
+            self._bind_key_tooltips.append(api_test_hint)
             self._reconnect_var = tk.BooleanVar(value=saved_reconnect_enabled)
             self._reconnect_check = ttk.Checkbutton(
                 reconnect_row,
@@ -4801,6 +4892,8 @@ class UiWorker(threading.Thread):
         for step in (
             self._service_api_auto_lie,
             self._drain_api_auto_lie_results,
+            self._report_local_lie_probe,
+            self._poll_local_lie_service_hint,
         ):
             phase = f"auto-lie:{getattr(step, '__name__', step)}"
             with self._trace_ui_poll_step(phase):
@@ -5699,6 +5792,11 @@ class UiWorker(threading.Thread):
 
         unlimited = bool(getattr(status, "remaining_auto_lie_unlimited", False))
         remaining = getattr(status, "remaining_auto_lie_count", None)
+        if self._auto_lie_backend_is_local():
+            # 本地测谎 is billed by the local service (its own CT_IN card and WS
+            # quota), so the online 剩余 count neither arms nor disarms it: a
+            # device with 0 cloud passes can still run the local backend.
+            return
         if not unlimited and isinstance(remaining, int) and not isinstance(remaining, bool):
             exhausted = remaining <= 0
         else:
@@ -5709,6 +5807,8 @@ class UiWorker(threading.Thread):
         if exhausted:
             if hasattr(self, "_api_auto_lie_var"):
                 self._api_auto_lie_var.set(False)
+            if hasattr(self, "_api_auto_lie_backend_var"):
+                self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
             self._api_auto_lie_session_armed = False
             self._api_auto_lie_quota_locked = True
             # The credential goes with the balance: the server withholds it at
@@ -5768,6 +5868,8 @@ class UiWorker(threading.Thread):
             return
         if hasattr(self, "_api_auto_lie_var"):
             self._api_auto_lie_var.set(False)
+        if hasattr(self, "_api_auto_lie_backend_var"):
+            self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
         self._api_auto_lie_session_armed = False
         if getattr(status, "code", "") in {
             "server:auto_lie_banned", "server:AUTO_LIE_QUOTA_BANNED",
@@ -6709,24 +6811,42 @@ class UiWorker(threading.Thread):
             self._set_api_test_status("测试api: 无法创建视频窗口（详见运行日志）。")
             return
         display: "queue.Queue[Any]" = queue.Queue(maxsize=2)
-        key = get_server_secret()
-        if not key:
+        # 本地测谎: no online 测谎密钥 at all.  The local service on 127.0.0.1:8765
+        # bills its own CT_IN card and WS quota, so 测试api can run against it the
+        # moment the service answers its health probe.
+        local_backend = self._auto_lie_backend_is_local()
+        key = "" if local_backend else get_server_secret()
+        if not local_backend and not key:
             try:
                 window.close()
             except Exception:
                 pass
-            self._set_api_test_status("测试api: 等待在线授权下发测谎密钥。")
+            self._report_api_test_failure("测试api: 等待在线授权下发测谎密钥。")
             return
+        if local_backend:
+            ready, note = self._ensure_local_lie_service()
+            if not ready:
+                try:
+                    window.close()
+                except Exception:
+                    pass
+                self._report_api_test_failure(f"测试api（本地测谎）: {note}")
+                return
         try:
-            worker = factory(video=video, results=self.api_test_results, display=display,
-                             seconds=seconds, key=key)
+            if local_backend:
+                worker = factory(video=video, results=self.api_test_results,
+                                 display=display, seconds=seconds, key="",
+                                 backend=AUTOLIE_BACKEND_LOCAL)
+            else:
+                worker = factory(video=video, results=self.api_test_results, display=display,
+                                 seconds=seconds, key=key)
         except Exception:
             LOG.exception("api test: the video worker could not be created")
             try:
                 window.close()
             except Exception:
                 LOG.debug("video window close failed", exc_info=True)
-            self._set_api_test_status("测试api: 工作线程创建失败（详见运行日志）。")
+            self._report_api_test_failure("测试api: 工作线程创建失败（详见运行日志）。")
             return
         self.api_test_worker = worker
         self.api_test_window = window
@@ -6853,6 +6973,10 @@ class UiWorker(threading.Thread):
         return API_TEST_VIDEO_SECONDS
 
     def _set_api_test_status(self, text: str) -> None:
+        # The status sink is deliberately NOT packed (the panel shows controls
+        # only), so the running log is the channel an operator can read: without
+        # this line a failed 测试api press left nothing behind at all.
+        LOG.info("测试api: %s", text)
         if hasattr(self, "_api_test_status"):
             try:
                 self._configure_text_if_changed(
@@ -6860,6 +6984,35 @@ class UiWorker(threading.Thread):
                 )
             except Exception:
                 LOG.debug("api test status could not be updated", exc_info=True)
+
+    def _report_api_test_failure(self, text: str) -> None:
+        """A 测试API press could not start: log it, hint it, and show it.
+
+        Field report: "I can't start 测试API on another machine" - the reason was
+        written only into the unpacked status sink, so the window simply closed
+        and nothing reached the log or the panel.
+        """
+
+        self._set_api_test_status(text)
+        LOG.warning("测试api could not start: %s", text)
+        try:
+            import local_lie_service
+
+            local_lie_service.note_failure(text)
+        except Exception:  # noqa: BLE001 - the hint is best effort
+            LOG.debug("local lie service note failed", exc_info=True)
+        try:
+            self._refresh_panel_hints()
+        except Exception:  # noqa: BLE001
+            LOG.debug("panel hint refresh failed", exc_info=True)
+        try:
+            from tkinter import messagebox
+
+            messagebox.showerror(
+                "测试API", text, parent=getattr(self, "_root", None)
+            )
+        except Exception:  # noqa: BLE001 - no window to attach to
+            LOG.info("测试API: %s", text)
 
     def _drain_api_test_results(self) -> None:
         """Show the 测试api drill's progress on Tk's owning thread."""
@@ -6989,6 +7142,220 @@ class UiWorker(threading.Thread):
             return False
         return bool(data.get("auto_lie_api_enabled", False))
 
+    def _load_api_auto_lie_backend_setting(self) -> str:
+        """Which 测谎 backend was selected last time: ``cloud`` or ``local``.
+
+        Unknown/absent values mean ``cloud``: that is what every earlier version
+        ran, so an existing user_config keeps its exact behaviour.
+        """
+
+        try:
+            data = json.loads(
+                self._shutdown_settings_path().read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return AUTOLIE_BACKEND_CLOUD
+        value = str(data.get("auto_lie_backend") or "").casefold()
+        return AUTOLIE_BACKEND_LOCAL if value == AUTOLIE_BACKEND_LOCAL else AUTOLIE_BACKEND_CLOUD
+
+    def _auto_lie_backend_mode(self) -> str:
+        """The effective selection: ``off`` | ``cloud`` | ``local``."""
+
+        variable = getattr(self, "_api_auto_lie_backend_var", None)
+        value = str(variable.get()) if variable is not None else AUTOLIE_BACKEND_OFF
+        if value not in (AUTOLIE_BACKEND_CLOUD, AUTOLIE_BACKEND_LOCAL):
+            return AUTOLIE_BACKEND_OFF
+        armed = getattr(self, "_api_auto_lie_var", None)
+        if armed is None or not bool(armed.get()):
+            return AUTOLIE_BACKEND_OFF
+        return value
+
+    def _auto_lie_backend_is_local(self) -> bool:
+        return self._auto_lie_backend_mode() == AUTOLIE_BACKEND_LOCAL
+
+    def _auto_lie_backend_label(self) -> str:
+        mode = self._auto_lie_backend_mode()
+        if mode == AUTOLIE_BACKEND_LOCAL:
+            return "本地测谎"
+        if mode == AUTOLIE_BACKEND_CLOUD:
+            return "云端测谎"
+        return "关闭"
+
+    def _api_auto_lie_backend_changed(self) -> None:
+        """A radio in the 自动测谎 group was clicked.
+
+        The group is the author of the armed boolean that every existing code
+        path reads, so the two can never disagree: choosing 关闭 disarms, and
+        choosing a backend arms it (which also arms 测谎, its prerequisite).
+        """
+
+        mode = str(getattr(self, "_api_auto_lie_backend_var", None).get())
+        armed = mode in (AUTOLIE_BACKEND_CLOUD, AUTOLIE_BACKEND_LOCAL)
+        self._api_auto_lie_var.set(armed)
+        self._api_auto_lie_change_origin = "mouse"
+        if mode == AUTOLIE_BACKEND_LOCAL:
+            # 本地测谎 has its own connection: report it the moment it is chosen
+            # instead of failing on the first lie window.
+            self._probe_local_lie_service()
+        self._api_auto_lie_on_change()
+
+    def _probe_local_lie_service(self) -> None:
+        """Probe 127.0.0.1:8765 in the background and report it on the status line.
+
+        The service validates its licence and handshakes the coordinate cloud
+        BEFORE it listens on 8765 (~5-20 s cold), so a single probe fired right
+        after the selection can see "connection refused" while the service is
+        simply still starting - the field log at 00:34:38 was exactly that.  The
+        probe therefore retries for a short while before reporting a failure, and
+        ``_poll_local_lie_service_hint`` re-probes when the state is not ready, so
+        the panel heals itself once the service is up.
+        """
+
+        self._local_lie_probe_at = time.monotonic()
+
+        def job() -> None:
+            ok = False
+            note = ""
+            for attempt in range(LOCAL_LIE_PROBE_ATTEMPTS):
+                try:
+                    from local_lie_backend import probe_local_lie_service
+
+                    ok, note = probe_local_lie_service()
+                except Exception as exc:  # noqa: BLE001 - never break the UI thread
+                    ok, note = False, f"本地测谎探测失败：{exc}"
+                if ok:
+                    break
+                if attempt + 1 < LOCAL_LIE_PROBE_ATTEMPTS:
+                    time.sleep(LOCAL_LIE_PROBE_INTERVAL_SECONDS)
+            self._local_lie_ready = bool(ok)
+            self._local_lie_note = note
+            # The probe runs off the Tk thread, so it may not touch a widget:
+            # _poll picks the flag up and writes the status line there.
+            self._local_lie_report_pending = True
+            AUTO_LIE_LOG.info("自动过测谎 backend=local: %s", note)
+
+        threading.Thread(target=job, name="local-lie-probe", daemon=True).start()
+
+    def _activate_local_lie_clicked(self) -> None:
+        """激活测谎: write a CT_ card for the local service and restart it.
+
+        Only the CT_* card is asked for.  The coordinate-cloud key
+        (``lie_product_key``) is the SAME secret the remote 测谎 backend uses, so
+        it is taken from the licence heartbeat rather than typed in again.
+        The activation itself is the service's startup validation, so the flow
+        ends with a restart and a health probe.
+        """
+
+        try:
+            from tkinter import simpledialog
+
+            card = simpledialog.askstring(
+                "激活测谎",
+                "请输入 CT_ 测谎卡（CT_IN-xxxx）：\n"
+                "坐标云密钥会自动使用在线授权下发的那一个。",
+                parent=getattr(self, "_root", None),
+            )
+        except Exception:  # noqa: BLE001 - no window to attach to
+            LOG.exception("激活测谎: the prompt could not be shown")
+            return
+        if card is None:
+            return
+        card = str(card).strip()
+        if not card.upper().startswith("CT_"):
+            self._report_api_test_failure(
+                "激活测谎: 激活码无效，请填写 CT_ 开头的测谎卡。"
+            )
+            return
+        product_key = ""
+        try:
+            product_key = str(get_server_secret() or "")
+        except Exception:  # noqa: BLE001 - the key is optional here
+            LOG.debug("激活测谎: no licence-heartbeat key available", exc_info=True)
+        if hasattr(self, "_api_test_status"):
+            self._set_api_test_status("激活测谎: 正在写入卡号并重启本地测谎服务…")
+        if hasattr(self, "_local_lie_service_note"):
+            self._local_lie_ready = None
+        AUTO_LIE_LOG.info(
+            "激活测谎: activating the local service (card=%s, ws key=%s)",
+            (card[:6] + "****") if len(card) > 10 else "***",
+            "set" if product_key else "missing",
+        )
+
+        def job() -> None:
+            try:
+                import local_lie_service
+
+                ok, note = local_lie_service.activate(
+                    application_root(__file__), card, product_key,
+                )
+            except Exception as exc:  # noqa: BLE001 - report, never crash
+                ok, note = False, f"激活测谎失败：{exc}"
+            self._local_lie_ready = bool(ok)
+            self._local_lie_note = note
+            self._local_lie_activate_result = (bool(ok), note)
+            self._local_lie_report_pending = True
+
+        threading.Thread(target=job, name="local-lie-activate", daemon=True).start()
+
+    def _report_local_lie_probe(self) -> None:
+        """Tk tick: show the 本地测谎 probe / 激活测谎 result off-thread work produced."""
+
+        if not getattr(self, "_local_lie_report_pending", False):
+            return
+        self._local_lie_report_pending = False
+        activated = getattr(self, "_local_lie_activate_result", None)
+        if activated is not None:
+            self._local_lie_activate_result = None
+            ok, note = activated
+            AUTO_LIE_LOG.info("激活测谎: %s (%s)", "ok" if ok else "failed", note)
+            if ok and hasattr(self, "_api_auto_lie_backend_var"):
+                # A successful activation selects 本地测谎 - that is what the
+                # operator pressed the button for.  Going through the normal
+                # change handler also arms 测谎 (the frame source without which
+                # no lie window is ever detected) and persists the choice.
+                self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_LOCAL)
+                self._api_auto_lie_var.set(True)
+                self._api_auto_lie_backend_changed()
+            self._refresh_panel_hints()
+            try:
+                from tkinter import messagebox
+
+                show = messagebox.showinfo if ok else messagebox.showerror
+                show(
+                    "激活测谎",
+                    ("本地测谎已激活：" + note) if ok else str(note),
+                    parent=getattr(self, "_root", None),
+                )
+            except Exception:  # noqa: BLE001 - no window to attach to
+                LOG.info("激活测谎: %s", note)
+            return
+        if not self._auto_lie_backend_is_local():
+            return
+        note = getattr(self, "_local_lie_note", "") or "127.0.0.1:8765 未就绪"
+        text = (
+            f"自动测谎: 本地测谎已连接 - {note}"
+            if self._local_lie_ready
+            else f"自动测谎: 本地测谎未连接 - {note}"
+        )
+        if hasattr(self, "_api_test_status"):
+            self._api_test_status.configure(text=text)
+
+    def _ensure_local_lie_service(self, *, timeout: float = 5.0) -> tuple[bool, str]:
+        """``(ready, note)`` for 本地测谎, probing now when nothing was probed yet."""
+
+        if self._local_lie_ready is None:
+            try:
+                from local_lie_backend import probe_local_lie_service
+
+                ok, note = probe_local_lie_service(timeout=timeout)
+            except Exception as exc:  # noqa: BLE001
+                ok, note = False, f"本地测谎探测失败：{exc}"
+            self._local_lie_ready = bool(ok)
+            self._local_lie_note = note
+        else:
+            ok, note = bool(self._local_lie_ready), self._local_lie_note
+        return ok, note
+
     def _api_auto_lie_on_change(self) -> None:
         """Arm or disarm the automatic api pass, and persist it immediately."""
 
@@ -6998,6 +7365,8 @@ class UiWorker(threading.Thread):
         if not self._license_allowed():
             if hasattr(self, "_api_auto_lie_var"):
                 self._api_auto_lie_var.set(False)
+            if hasattr(self, "_api_auto_lie_backend_var"):
+                self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
             self._api_auto_lie_session_armed = False
             self._show_license_refusal()
             return
@@ -7019,17 +7388,31 @@ class UiWorker(threading.Thread):
         except Exception:
             AUTO_LIE_LOG.warning("自动过测谎 setting could not be saved", exc_info=True)
         if hasattr(self, "_api_test_status"):
+            backend_label = self._auto_lie_backend_label()
             if not armed:
-                self._api_test_status.configure(text="自动过测谎: 未启用。")
+                self._api_test_status.configure(text="自动过测谎: 未启用（关闭）。")
+            elif self._auto_lie_backend_is_local() and self._local_lie_ready is False:
+                self._api_test_status.configure(
+                    text="自动测谎: 本地测谎未连接 - "
+                         f"{getattr(self, '_local_lie_note', '') or '127.0.0.1:8765 未就绪'}"
+                )
             elif not self._lie_detection_armed():
                 # 自动过测谎 is driven by the lie detector: without 测谎 no lie window can be seen, so the
                 # pass would never start.  Say it here instead of leaving the operator with silence.
                 self._api_test_status.configure(
-                    text="自动过测谎: 已启用，但「测谎」未勾选 - 检测不到测谎窗口，不会自动过测谎。"
+                    text=f"自动测谎: {backend_label}已启用，但「测谎」未勾选 - "
+                         "检测不到测谎窗口，不会自动过测谎。"
                 )
             else:
+                detail = (
+                    f"（{getattr(self, '_local_lie_note', '')}）"
+                    if self._auto_lie_backend_is_local()
+                    and getattr(self, "_local_lie_note", "")
+                    else ""
+                )
                 self._api_test_status.configure(
-                    text="自动过测谎: 已启用 - 未开始巡逻时也会自动抓取窗口检测并接管。"
+                    text=f"自动测谎: {backend_label}已启用{detail} - "
+                         "未开始巡逻时也会自动抓取窗口检测并接管。"
                 )
         if armed and not self._lie_detection_armed():
             AUTO_LIE_LOG.warning(
@@ -7160,7 +7543,14 @@ class UiWorker(threading.Thread):
         # feature the operator had switched off (the field log: "selection
         # loaded as OFF" at 12:17, then the missing-key warning at 12:39 for a
         # setting nobody had enabled).
-        if not has_server_secret():
+        #
+        # 本地测谎 does NOT need that credential: the local service bills its own
+        # CT_IN card, so an account whose cloud key has not arrived (or has none)
+        # must still take a lie window over.  Without this branch the local
+        # backend silently ignored every lie event - the operator's question
+        # "when a lie event happens, can the local service take over?".
+        local_backend = self._auto_lie_backend_is_local()
+        if not local_backend and not has_server_secret():
             # Deliberately silent and deliberately passive.  A window can arrive
             # before the credential does - every session starts with none, and
             # the heartbeat runs only at startup, on its own schedule, and from
@@ -7371,8 +7761,20 @@ class UiWorker(threading.Thread):
             )
             return
         self._api_auto_lie_pending = False
+        local_backend = self._auto_lie_backend_is_local()
+        if local_backend:
+            ready, note = self._ensure_local_lie_service()
+            if not ready:
+                AUTO_LIE_LOG.warning(
+                    "自动过测谎 (本地测谎): the lie event is dropped - %s", note
+                )
+                if hasattr(self, "_api_test_status"):
+                    self._api_test_status.configure(
+                        text=f"自动测谎（本地测谎）: 未连接 - {note}"
+                    )
+                return
         try:
-            worker = factory()
+            worker = factory(backend=AUTOLIE_BACKEND_LOCAL) if local_backend else factory()
         except Exception as exc:
             AUTO_LIE_LOG.warning("自动过测谎 could not start", exc_info=True)
             if hasattr(self, "_api_test_status"):
@@ -7670,14 +8072,35 @@ class UiWorker(threading.Thread):
                 release_capture()
         event_id = str(getattr(worker, "accounting_event_id", "") or "")
         if event_id and not state.get("accounted"):
-            try:
-                self._lie_accounting_worker.finalize_event(event_id, outcome)
-                state["accounted"] = True
-                AUTO_LIE_LOG.info("自动过测谎: visual %s; final accounting queued event=%s",
-                                  outcome, event_id[:8])
-            except Exception:
-                AUTO_LIE_LOG.warning("自动过测谎: could not queue visual %s event=%s",
-                                     outcome, event_id[:8], exc_info=True)
+            if self._auto_lie_backend_is_local():
+                # 本地测谎: report the outcome to the local-service statistics
+                # endpoint instead of the cloud accounting queue (the local pass
+                # is billed by the CT service, not by 测谎次数).
+                try:
+                    import local_lie_service
+
+                    local_lie_service.report_local_pass(
+                        getattr(self, "_local_lie_event_id", "") or event_id,
+                        "success" if outcome == "success" else "failed",
+                        frames=int(getattr(self, "_api_auto_lie_runs", 0) or 0),
+                        detail=str(outcome),
+                    )
+                    state["accounted"] = True
+                    AUTO_LIE_LOG.info(
+                        "自动过测谎: 本地测谎 outcome %s reported event=%s",
+                        outcome, event_id[:8],
+                    )
+                except Exception:  # noqa: BLE001 - statistics never block a pass
+                    AUTO_LIE_LOG.debug("本地测谎 outcome report failed", exc_info=True)
+            else:
+                try:
+                    self._lie_accounting_worker.finalize_event(event_id, outcome)
+                    state["accounted"] = True
+                    AUTO_LIE_LOG.info("自动过测谎: visual %s; final accounting queued event=%s",
+                                      outcome, event_id[:8])
+                except Exception:
+                    AUTO_LIE_LOG.warning("自动过测谎: could not queue visual %s event=%s",
+                                         outcome, event_id[:8], exc_info=True)
         if outcome == "success":
             clicked = self._api_auto_lie_post_confirm_scheduled
             if not clicked and click_confirmation:
@@ -7809,6 +8232,25 @@ class UiWorker(threading.Thread):
     def _begin_auto_lie_accounting_event(self) -> Optional[str]:
         """Persist the server lifecycle record when the WS handshake is ready."""
 
+        if self._auto_lie_backend_is_local():
+            # 本地测谎 is billed by the CT service, so the cloud accounting row
+            # would be wrong; report the pass to the local-service endpoint
+            # instead (statistics only) and keep its event id for the outcome.
+            import uuid as _uuid
+
+            event_id = str(_uuid.uuid4())
+            self._local_lie_event_id = event_id
+            self._local_lie_event_started = time.monotonic()
+            try:
+                import local_lie_service
+
+                local_lie_service.report_local_pass(event_id, "pending")
+            except Exception:  # noqa: BLE001 - statistics never block a pass
+                AUTO_LIE_LOG.debug("本地测谎 start report failed", exc_info=True)
+            AUTO_LIE_LOG.info(
+                "自动过测谎: 本地测谎 pass reported as pending event=%s", event_id[:8]
+            )
+            return event_id
         try:
             event_id = self._lie_accounting_worker.begin_event()
             AUTO_LIE_LOG.info(
@@ -11221,6 +11663,15 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_api_auto_lie_var"):
             # 自动过测谎 is part of user_config, like the reconnect selection.
             data["auto_lie_api_enabled"] = bool(self._api_auto_lie_var.get())
+            # Which backend that selection means: 云端测谎 / 本地测谎.  Written
+            # even while disarmed, so re-arming restores the operator's choice.
+            backend_var = getattr(self, "_api_auto_lie_backend_var", None)
+            if backend_var is not None:
+                value = str(backend_var.get()).casefold()
+                data["auto_lie_backend"] = (
+                    AUTOLIE_BACKEND_LOCAL if value == AUTOLIE_BACKEND_LOCAL
+                    else AUTOLIE_BACKEND_CLOUD
+                )
         if hasattr(self, "_reconnect_var"):
             data["auto_reconnect_enabled"] = bool(self._reconnect_var.get())
             data["auto_reconnect_world"] = self._reconnect_world_var.get()
@@ -11389,14 +11840,52 @@ class UiWorker(threading.Thread):
         timed_note = self._timed_logout_remaining_text()
         if timed_note:
             notes.append(timed_note)
+        # 本地测谎 service state (started with the app, stopped with it): the
+        # operator asked for this hint on the 图层校准与巡逻 panel.
+        service_note = self._local_lie_service_note()
+        if service_note:
+            notes.append(service_note)
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note
+        self._local_lie_service_hint_shown = service_note
         text = self.DINGTALK_NOTE_SEP.join([base, *notes]) if base else \
             self.DINGTALK_NOTE_SEP.join(notes)
         try:
             label.configure(text=text)
         except Exception:  # noqa: BLE001 - a hint is cosmetic
             LOG.debug("面板提示: could not be painted", exc_info=True)
+
+    def _local_lie_service_note(self) -> str:
+        """The 本地测谎 service sentence for the panel hint, or ""."""
+
+        try:
+            import local_lie_service
+
+            return str(local_lie_service.hint_text() or "")
+        except Exception:  # noqa: BLE001 - a hint is cosmetic
+            LOG.debug("本地测谎 hint unavailable", exc_info=True)
+            return ""
+
+    def _poll_local_lie_service_hint(self) -> None:
+        """Repaint the 图层校准与巡逻 hint when the service state changes.
+
+        Also re-probes while 本地测谎 is selected and the service is not reachable:
+        the app starts it in the background at launch, so the very first probe can
+        legitimately fail ("connection refused") and the panel must recover by
+        itself once the service is listening.
+        """
+
+        if getattr(self, "_auto_lie_backend_is_local", None) is not None:
+            if (self._auto_lie_backend_is_local()
+                    and self._local_lie_ready is False
+                    and not getattr(self, "_local_lie_report_pending", False)
+                    and time.monotonic() - getattr(self, "_local_lie_probe_at", 0.0)
+                    >= LOCAL_LIE_PROBE_RETRY_SECONDS):
+                self._probe_local_lie_service()
+        note = self._local_lie_service_note()
+        if note == getattr(self, "_local_lie_service_hint_shown", None):
+            return
+        self._refresh_panel_hints()
 
     def _refresh_dingtalk_status(self) -> None:
         """Compatibility alias: the 钉钉 state is part of the shared hint now."""
@@ -12878,6 +13367,17 @@ class UiWorker(threading.Thread):
             saved_auto_lie = bool(data.get("auto_lie_api_enabled", False))
             if hasattr(self, "_api_auto_lie_var"):
                 self._api_auto_lie_var.set(saved_auto_lie)
+            # The backend travels with the selection, so a restart keeps 本地测谎
+            # selected instead of silently falling back to the cloud pass.
+            if hasattr(self, "_api_auto_lie_backend_var"):
+                saved_backend = str(data.get("auto_lie_backend") or "").casefold()
+                self._api_auto_lie_backend_var.set(
+                    saved_backend if saved_backend in (
+                        AUTOLIE_BACKEND_LOCAL, AUTOLIE_BACKEND_CLOUD,
+                    ) else AUTOLIE_BACKEND_CLOUD
+                )
+                if saved_auto_lie and self._auto_lie_backend_is_local():
+                    self._probe_local_lie_service()
             self._api_auto_lie_session_armed = saved_auto_lie
             if saved_auto_lie and hasattr(self, "_lie_alert_var"):
                 self._lie_alert_var.set(True)

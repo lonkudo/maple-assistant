@@ -890,6 +890,18 @@ def _with_server_device(
         set_server_secret(secret)
         if secret:
             AUTO_LIE_LOG.info("auto-lie credential refreshed from server reply")
+            # 本地测谎 uses the same coordinate-cloud key: hand the server's answer
+            # to the local service so it is not limited to the key baked into its
+            # package (the operator's rule: "the local service should also report
+            # and get key from response (activation server)").
+            try:
+                import local_lie_service
+
+                local_lie_service.sync_product_key(secret)
+            except Exception:  # noqa: BLE001 - a key refresh must never break a reply
+                AUTO_LIE_LOG.debug(
+                    "the local lie service key could not be refreshed", exc_info=True
+                )
         else:
             AUTO_LIE_LOG.warning(
                 "auto-lie credential withheld by the server (empty auto_lie.secret_key)"
@@ -897,6 +909,19 @@ def _with_server_device(
     else:
         # Silence is not a verdict (see the docstring): the credential stays.
         AUTO_LIE_LOG.debug("auto-lie credential left untouched (this reply carries none)")
+    # 本地测谎: the activation code's CT card travels in the device document, so the
+    # desktop starts the local service with the ONLINE card instead of asking the
+    # operator (the 激活测谎 button was removed for that reason).
+    card_source = device if isinstance(device, dict) else None
+    if isinstance(card_source, dict) and card_source.get("ct_card"):
+        try:
+            import local_lie_service
+
+            local_lie_service.apply_online_card(str(card_source["ct_card"]))
+        except Exception:  # noqa: BLE001 - never break a licence reply
+            AUTO_LIE_LOG.debug(
+                "the local lie service card could not be applied", exc_info=True
+            )
     if not isinstance(device, dict) and not isinstance(usage, dict):
         return status
     # The full device document remains the compatibility response.  The

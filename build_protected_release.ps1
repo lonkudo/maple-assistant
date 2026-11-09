@@ -479,6 +479,17 @@ pause
     [System.Text.Encoding]::ASCII
 )
 
+# 本地测谎: ship the packaged CT partner service next to the executable, so the
+# assistant can start it on 127.0.0.1:8765 by itself (local_lie_service.py looks
+# for CT_Lie3_KR_partner_api_DML next to the program files).  Only runtime files
+# are copied - see package_local_service.ps1 for the exclusion list.
+$localServicePackager = Join-Path $root "package_local_service.ps1"
+if (Test-Path -LiteralPath $localServicePackager) {
+    & $localServicePackager -Destination $dist.FullName
+} else {
+    Write-Warning "package_local_service.ps1 is missing: the local lie service stays external."
+}
+
 # Ship the complete standalone directory.  The executable's embedded Python
 # runtime lives beside MoonEclipse.exe, so distributing only the .exe would
 # be broken.  Operator-side license inventory/private material was never

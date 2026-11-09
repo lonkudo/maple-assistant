@@ -704,6 +704,18 @@ class ApiLieTestWorker(threading.Thread):
                 self.stats.frames += 1
                 self.stats.bytes_sent += frame.byte_size
                 next_frame_id += 1
+                # Evidence for a pass whose backend never answers: the frame we
+                # SENT, throttled, saved with the ROI box.  Without this a backend
+                # that returns nothing (the local service does that for a picture
+                # it cannot recognise) left no screenshot at all - the operator's
+                # "why no screenshot of auto lie?".
+                sent_at = time.perf_counter()
+                if sent_at - last_capture_saved >= CAPTURE_EVERY_SECONDS:
+                    last_capture_saved = sent_at
+                    path = self._save_annotated(image, frame.geometry, None,
+                                               frame.frame_id, log)
+                    if path is not None:
+                        self._report("capture", str(path))
 
             # End the frame feed, then drain the bounded server window before
             # finishing the round.  The same worker remains the socket owner.
@@ -809,6 +821,10 @@ class ApiLieTestWorker(threading.Thread):
         label = f"api test frame {frame_id}"
         if point is not None and point.x is not None:
             label += f"  slot({point.x:.0f},{point.y:.0f}) {point.decision}"
+        elif point is not None:
+            # The backend answered without a point: say so on the evidence itself,
+            # that is what the operator needs to see in the saved picture.
+            label += f"  no point ({point.decision or 'no result'})"
         cv2.putText(canvas, label, (left, max(24, top - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(canvas, label, (left, max(24, top - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7,

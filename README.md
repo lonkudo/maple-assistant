@@ -1452,3 +1452,59 @@ ssh -i "$keyDir/forbestop22_key" -o IdentitiesOnly=yes -T git@github.com   # Hi 
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for component ownership, data flow, and concurrency rules.
+
+## 本地测谎 (local lie-detection backend)
+
+`自动测谎` is a three-way selection, next to `自动重连`:
+
+```
+自动测谎  (关闭) (云端测谎) (本地测谎)  [测试API]
+自动重连  [world ▾] 频道 [n]  [重连消息]
+```
+
+* **云端测谎** — unchanged: the vendor ROI-track WebSocket backend, billed with the
+  licence-heartbeat credential.
+* **本地测谎** — the packaged CT partner API on `http://127.0.0.1:8765`
+  (`CT_Lie3_KR_partner_api_DML/`, bundled by `package_local_service.ps1`). It bills its
+  own CT_IN card and WS quota, so no online 测谎密钥 and no cloud 测谎次数 are used.
+* **关闭** — the old unticked checkbox.
+
+The choice is persisted as `auto_lie_backend` (`cloud`/`local`) next to
+`auto_lie_api_enabled`; an unknown value means `cloud`, so older configs behave exactly
+as before.
+
+### Activation comes from the server
+
+The activation code carries a `ct_card` field on the licence server. It is returned in
+the device document of every `activate`/`validate`/heartbeat reply, and
+`local_lie_service.apply_online_card()` writes it into the service's
+`data\ct_login_config.json` as `partner_license_code`. **There is nothing to type** —
+the manual `激活测谎` button was removed for this reason. A card change restarts the
+service (never under a live pass).
+
+### Service lifecycle and the panel hint
+
+* The app starts the service at launch when the folder ships and `8765` is not already
+  listening (`local_lie_service.start_in_background`), and stops it at shutdown **only
+  if the app started it** — a hand-launched instance survives.
+* The state is shown on the `图层校准与巡逻` hint line:
+  `本地测谎服务: 正在启动… / 已启动（127.0.0.1:8765）/ 已在运行 / 启动失败 - <原因>`.
+* The probe retries for ~10 s and re-probes every 10 s while not connected, because the
+  service validates its licence and handshakes the cloud *before* binding 8765.
+
+### Reporting
+
+Each local pass is reported to `POST api/v1/local-lie-events` (`pending` when the
+backend is ready, then `success`/`failed`). The server stores it in
+`LocalLieServiceEvent` for statistics — no quota is charged. Cloud passes keep using
+the durable `api/v1/lie-events` accounting queue, which local passes deliberately skip.
+
+### Notes
+
+* `测试API` in 本地测谎 plays the chosen video against the local service and needs no
+  key; a failed start now writes a WARNING to `work\assistant.log`, the reason on the
+  panel hint and a message box (it used to fail silently).
+* Only the `lie3main` view is recognised by the local model; other clips return no
+  point, which the pass treats as "no answer" (never as a crash).
+* The release now bundles the service (≈341 MB, excluded items: `test_files`, runtime
+  logs/licence state, the stale `AppHost*.exe`).

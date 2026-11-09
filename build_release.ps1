@@ -252,6 +252,18 @@ if (Test-Path $aimIn) {
     Copy-Item (Join-Path $ttIn "README.md") $ttOut -ErrorAction SilentlyContinue
 }
 
+# --- 本地测谎服务（CT 同行坐标服务）-------------------------------------------
+# 本地测谎 要连接 127.0.0.1:8765 的同行坐标服务。程序启动时会自己拉起它（见
+# local_lie_service.py），所以服务随包发布到 CT_Lie3_KR_partner_api_DML\，与程序
+# 文件同级。只打运行必需的文件（启动器、TaskBroker*.exe、_internal、模式模板、
+# data\ct_login_config.json）；日志、license、test_files 与旧的 AppHost*.exe 不打。
+$localServicePackager = Join-Path $root "package_local_service.ps1"
+if (Test-Path -LiteralPath $localServicePackager) {
+    & $localServicePackager -Destination $out
+} else {
+    Write-Warning "package_local_service.ps1 缺失：本地测谎服务不会随包发布。"
+}
+
 # --- 汇总 ----------------------------------------------------------------------
 $files = Get-ChildItem $out -Recurse -File
 $totalMB = [math]::Round(($files | Measure-Object Length -Sum).Sum / 1MB, 1)

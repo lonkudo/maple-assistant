@@ -1131,3 +1131,74 @@ repository ignores `operator_console/node_modules/` and
 server** (`npm ci && npm run build`), never shipped through Git.
 
 For a component-level guide, start with the source modules named above, then follow their constructor wiring in `assistant.py`. This preserves the intended direction of dependency: UI and workers depend on coordinator-provided interfaces; they do not depend directly on one another.
+
+## 本地测谎 backend, the CT partner service, and `ct_card` (v1.2.307+)
+
+### Two backends behind one 测谎 selection
+
+`ui_worker` owns a three-way group (`AUTOLIE_BACKEND_OFF/CLOUD/LOCAL`) whose radios are
+the **author** of the long-standing armed boolean `_api_auto_lie_var`; every disarm path
+(quota exhausted, server ban, 测谎 unticked, licence refusal) also resets the group, so
+the two can never disagree. The effective mode is `_auto_lie_backend_mode()`.
+
+The pass itself is the same worker either way — `api_lie_test.ApiLieTestWorker` (live
+lie window) and `api_lie_video.VideoDrillWorker` (测试API) only receive a different
+`backend_opener`, which returns `(client, note, mimic)`:
+
+| Mode | Opener | Billing |
+| --- | --- | --- |
+| 云端测谎 | `assistant.open_prepared_auto_lie_backend` (vendor `autolie_api` WS) | licence-heartbeat key + 测谎次数 |
+| 本地测谎 | `assistant._local_lie_opener` → `local_lie_backend.open_local_lie_backend` | the CT service's own CT_IN card and WS quota |
+
+### `local_lie_backend.py` — protocol adapter
+
+The partner API is HTTP (`/v1/health`, `/v1/session`, `/v1/frame`, `/v1/close`); the
+drills speak one small client protocol (`send_frame_rtf1`, `send_frame_base64`,
+`poll_results`, `end_round`, `close`, `_pending`). `LocalLieClient` maps one onto the
+other and translates answers into the vendor `frame_result` shape (`ok`→`success`,
+`ms`→`timing_ms`, `x`/`y` unchanged as protocol-ROI pixels).
+
+Two rules there are load-bearing:
+
+* a frame the service cannot resolve publishes **no answer** (or `hold_prev` once a point
+  is known). Passing an `ok:false` answer with null coordinates straight through crashed
+  the drill with `ValueError: frame_result carries no x/y`;
+* HTTP failures become `ConnectionError`, which is what makes the drills treat a dead or
+  restarted service as "backend interrupted" instead of hanging.
+
+### `local_lie_service.py` — lifecycle and activation
+
+* discovery: `CT_Lie3_KR_partner_api_DML\` next to the program files;
+* `ensure_started()` probes health, launches the packaged launcher hidden, waits for
+  8765, and records the service PIDs whose executable lives inside that folder;
+* `stop_started_service()` terminates **only** those PIDs (a hand-launched instance is
+  never touched); `set_busy_probe()` keeps a key refresh from restarting the service
+  under a live pass;
+* `apply_online_card()` / `write_credentials()` write `partner_license_code` (and the WS
+  key only when the package ships none — its own `ws_product_key` wins) without a BOM;
+* `report_local_pass()` posts to `api/v1/local-lie-events` from a background thread.
+
+`licensing._with_server_device()` is the single entry point for server-driven state: it
+stores `auto_lie.secret_key`, forwards the device document's `ct_card` to
+`apply_online_card()`, and refreshes the WS key through `sync_product_key()`.
+
+### Server contract (repo `activation_service`)
+
+* `ActivationCode.ct_card` — `CharField(max_length=30, null=True, blank=True)`, operator
+  CRUD through `issue-codes` (`ct_card`), `code_action/ct_card` and the Django admin;
+  returned by `services.device_summary()` as `ct_card`.
+* `LocalLieServiceEvent` — one row per local pass (`event_id` pk, `fingerprint_hash`,
+  `license_id`, `ct_card`, `outcome` pending/success/failed/aborted, `frames`,
+  `latency_ms`, `detail`, `occurred_at/recorded_at/finalized_at`), migration `0019`.
+* `POST api/v1/local-lie-events` — idempotent per `event_id`, charges nothing;
+  `GET console/api/local-lie/stats` — `total/success/failed/aborted/pending/
+  average_latency_ms/cards[]`.
+
+### Packaging
+
+`package_local_service.ps1` copies the service into a release (launchers, `TaskBroker*.exe`,
+`_internal`, `modes\tw_jingdian`, `data\ct_login_config.json`, reference images) and
+excludes `test_files`, runtime `data\logs`/`data\license`, `__pycache__` and a stale
+`AppHost*.exe`. It also injects the machine's saved CT_IN code into the **bundled** config
+(the repository copy stays clean) so a fresh install can validate the card. Both
+`build_release.ps1` and `build_protected_release.ps1` call it.

@@ -455,6 +455,18 @@ def main() -> int:
         return 0
     args = parse_args()
     _clear_previous_log_files()
+    # 本地测谎: bring the local service up with the app when this build ships it
+    # and it is not already listening.  Backgrounded - licence validation and the
+    # WS handshake take seconds and must never delay the UI.  Shutdown stops it
+    # again, but only when THIS app started it.
+    try:
+        import local_lie_service
+
+        local_lie_service.start_in_background(application_root(__file__))
+    except Exception:  # noqa: BLE001 - a missing service folder is not fatal
+        logging.getLogger(__name__).debug(
+            "local lie service could not be scheduled", exc_info=True
+        )
     # The recording is needed for the log header, so the config store is
     # created before the log writers own the file.
     config_store = get_config_store(args.config)
@@ -2263,20 +2275,60 @@ def main() -> int:
     AUTO_LIE_TRACK_SECONDS = 15.0
     AUTO_LIE_FEED_DELAY_SECONDS = 3.0
 
+    def _local_lie_opener(frame_standard: float = 5.0):
+        """Opener for 本地测谎: the CT partner API on 127.0.0.1:8765.
+
+        The drills catch ``BackendError`` from their opener, so a local-service
+        failure is translated into that type instead of escaping the thread.
+        """
+
+        def opener(log):
+            from autolie_api.connect import BackendError
+            from local_lie_backend import LocalLieError, open_local_lie_backend
+
+            try:
+                session = open_local_lie_backend(
+                    log, frame_standard=frame_standard,
+                )
+            except LocalLieError as exc:
+                raise BackendError(str(exc)) from exc
+            except (OSError, ValueError) as exc:
+                raise BackendError(f"本地测谎连接失败：{exc}") from exc
+            return session.client, session.note, session.mimic
+
+        return opener
+
     def make_api_test_video_worker(*, video, results, display, seconds=30.0, key="",
-                                   fps=5.0):
+                                   fps=5.0, backend="cloud"):
         """The 测试api drill on a chosen video: play it at 5 fps and aim inside the picture only.
 
         A new worker per press (a thread cannot restart).  ``display`` carries the frames the UI
         thread must draw; the worker reads back ``worker.image_rect`` (the picture rectangle) to
         confine the mouse to the video area.  The key is not a panel setting any more: it ships
         from the validated licensing heartbeat and remains only in this process's memory.
+
+        ``backend="local"`` points the same drill at 127.0.0.1:8765 instead: the
+        local service bills its own CT_IN card and quota, so no key is used.
         """
 
         from api_lie_video import VideoDrillWorker
 
         from auto_lie_backend import host_ports, select_auto_lie_ws_endpoints
 
+        if str(backend).casefold() == "local":
+            return VideoDrillWorker(
+                video=video,
+                results=results,
+                display=display,
+                stop_event=stop_event,
+                key="",
+                seconds=seconds,
+                fps=fps,
+                transport="rtf1",
+                aim_enabled=True,
+                window_title=args.window_title,
+                backend_opener=_local_lie_opener(fps),
+            )
         # One randomly chosen host, with all of that host's ports handed over:
         # the drill's own probe then picks the best instance of that host.
         host, _port = select_auto_lie_ws_endpoints()[0]
@@ -2314,20 +2366,29 @@ def main() -> int:
         image = np.asarray(frame.image.convert("RGB"))[:, :, ::-1].copy()
         return image, frame.window_rect
 
-    def make_api_auto_lie_worker():
-        """One automatic pass for one lie window - the SAME workflow as 测试api (the video drill)."""
+    def make_api_auto_lie_worker(backend="cloud"):
+        """One automatic pass for one lie window - the SAME workflow as 测试api (the video drill).
+
+        ``backend="local"`` runs the pass against 本地测谎 (127.0.0.1:8765): the
+        frame, the capture, the aim and the outcome handling are identical, only
+        the client changes, and no online 测谎密钥 is needed.
+        """
 
         from api_lie_test import ApiLieTestWorker
         # The detector timestamp is attached by the UI before this worker is
         # started.  Connection/handshake therefore consumes part of the
         # three-second visual settle instead of starting a fresh wait.
 
-        auto_lie_logger.info("自动过测谎: starting a pass for the lie window")
+        local = str(backend).casefold() == "local"
+        auto_lie_logger.info(
+            "自动过测谎: starting a pass for the lie window (%s)",
+            "本地测谎 127.0.0.1:8765" if local else "云端测谎",
+        )
         return ApiLieTestWorker(
             results=api_auto_lie_results,
             stop_event=stop_event,
             window_title=args.window_title,
-            key=get_server_secret(),
+            key="" if local else get_server_secret(),
             key_sender=key_sender,
             fps=5.0,
             transport="rtf1",
@@ -2346,7 +2407,8 @@ def main() -> int:
             capture_fn=capture_shared_auto_lie_frame,
             on_capture_start=lie_active.set,
             on_capture_stop=lie_active.clear,
-            backend_opener=open_prepared_auto_lie_backend,
+            backend_opener=(_local_lie_opener(5.0) if local
+                            else open_prepared_auto_lie_backend),
         )
 
     def _on_disconnect_event() -> None:
@@ -3095,6 +3157,16 @@ def main() -> int:
         for worker in core_workers:
             worker.join(timeout=5)
         supervisor.join(timeout=1)
+        # 本地测谎: stop the service only if this app started it; a service the
+        # operator launched by hand keeps running.
+        try:
+            import local_lie_service
+
+            local_lie_service.stop_started_service()
+        except Exception:  # noqa: BLE001 - never block the shutdown
+            logging.getLogger(__name__).debug(
+                "local lie service stop failed", exc_info=True
+            )
         if ui_log_handler is not None:
             root_logger.removeHandler(ui_log_handler)
         root_logger.removeHandler(trace_log_handler)

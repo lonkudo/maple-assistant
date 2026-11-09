@@ -299,6 +299,7 @@ class VideoDrillWorker(threading.Thread):
         await_seconds: float = AWAIT_SECOND_WINDOW_SEC,
         log_folder: Optional[Path] = None,
         window_title: str = "",
+        backend_opener: Optional[Callable[[Any], tuple[Any, str, Any]]] = None,
     ) -> None:
         super().__init__(name="api-lie-video", daemon=True)
         self.video = Path(video)
@@ -319,6 +320,11 @@ class VideoDrillWorker(threading.Thread):
         self.await_seconds = max(0.0, float(await_seconds))
         self.window_title = str(window_title)
         self.log_folder = Path(log_folder) if log_folder is not None else None
+        # 本地测谎: the same drill pointed at the CT partner API on 127.0.0.1:8765.
+        # The opener returns ``(client, note, mimic)`` exactly like the vendor
+        # ``open_backend`` session, so the drill body is backend-agnostic; None
+        # keeps the cloud WebSocket path.
+        self.backend_opener = backend_opener
 
         self.stats: dict[str, Any] = {}
         self.log: Optional[RunLog] = None
@@ -969,6 +975,8 @@ class VideoDrillWorker(threading.Thread):
         return new_client, new_mimic, note
 
     def _open(self, log: RunLog):
+        if self.backend_opener is not None:
+            return self.backend_opener(log)
         session = open_backend(key=self.key, host=self.host, ports=self.ports,
                               transport=self.transport, frame_standard=self.fps,
                               use_mimic=self.use_mimic, log=log,
