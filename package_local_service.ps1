@@ -1,4 +1,4 @@
-﻿# Bundle the packaged CT partner API (the local lie-detection service) into a release.
+# Bundle the packaged CT partner API (the local lie-detection service) into a release.
 #
 # The assistant starts this service on 127.0.0.1:8765 when the local backend is
 # selected (see local_lie_service.py) and finds it at
@@ -124,11 +124,12 @@ if ($hasCard -and [string]$settings.partner_license_code) {
     $settings.partner_license_code = ""
     $configChanged = $true
 }
-# A WS key that still carries the vendor's template text (the shipped placeholder
-# is Chinese, which no real key contains) would fail the startup handshake, so it
-# is cleared as well: the service then uses its own data\build_profile.json key.
+# The WS key is cleared as well, template OR real: a template (the vendor's
+# Chinese placeholder) would fail the startup handshake, and a real key is a
+# credential a release should not carry in plain text - the service falls back to
+# the same key in its own data\build_profile.json.
 $hasKey = $settings.PSObject.Properties.Name -contains "lie_product_key"
-if ($hasKey -and ([string]$settings.lie_product_key) -match '[^\x20-\x7E]') {
+if ($hasKey -and [string]$settings.lie_product_key) {
     $settings.lie_product_key = ""
     $configChanged = $true
 }
