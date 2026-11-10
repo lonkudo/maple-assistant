@@ -48,14 +48,15 @@ The update icon in the title bar turns green when the activation server announce
   745×496 and posts it; the cloud byte caps do not apply to a loopback service. The
   answer is still in the 372×248 protocol space, so the aim geometry is unchanged
   (`745/372 = 2.0027`, `496/248 = 2`).
-- **A withdrawn CT card now wins, and only the radio's LOOK changes.** The licence reply
-  is authoritative: a reply without `ct_card` stops a service this app started and
-  **ignores a card cached in `data\ct_login_config.json`**. 本地测谎 stays selectable —
-  the radio keeps `state=normal`, is painted with the grey `Greyed.TRadiobutton` style and
-  labelled `本地测谎（未开通）` — because a missing card is a state to show, not a reason to
-  take the operator's choice away; a pass that is actually asked to start reports the
-  missing service itself. The 图层校准与巡逻 hint line says just `本地测谎未开通`, once, with
-  the reason left to the radio label and its tooltip. The cached card
+- **A withdrawn CT card greys the radio out of reach.** The licence reply is
+  authoritative: a reply without `ct_card` stops a service this app started and
+  **ignores a card cached in `data\ct_login_config.json`**. The 本地测谎 radio is then
+  `state=disabled` (not clickable) and painted with the grey `Greyed.TRadiobutton` style,
+  labelled `本地测谎（未开通）`; the group variable is never assigned, so it is not silently
+  switched to 关闭, and the armed boolean is withdrawn so no lie window tries a backend
+  that cannot serve it. A card-bearing reply makes it selectable again and re-arms the
+  same selection. The 图层校准与巡逻 hint line says just `本地测谎未开通`, once, with the
+  reason left to the radio label and its tooltip. The cached card
   only decides in the window before the first reply of a session, and
   `ensure_started()` rewrites it when a replaced package reset the file.
 - **A start that fails no longer freezes the local backend.** `ensure_started()` called
@@ -1591,7 +1592,7 @@ The panel hint has exactly three failure-free wordings and one failure wording:
 
 | Hint | Meaning |
 | --- | --- |
-| `本地测谎未开通` | the licence reply carried **no** `CT_` card, so the 本地测谎 radio is greyed (label `本地测谎（未开通）`, still selectable) and the service is deliberately not started |
+| `本地测谎未开通` | the licence reply carried **no** `CT_` card, so the 本地测谎 radio is greyed, not clickable (label `本地测谎（未开通）`) and the service is deliberately not started |
 | `本地测谎启动失败` | a card did arrive, but the service never came up on 8765 (its own `data\logs\client.log` says why) |
 | `已启动` | the service answers `/v1/health` |
 | *(nothing)* | the selection is 关闭 / 云端测谎 |

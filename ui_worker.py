@@ -7459,15 +7459,15 @@ class UiWorker(threading.Thread):
     def _sync_local_lie_radio(self) -> None:
         """Grey the 本地测谎 radio when the code has no CT card.
 
-        The radio stays **clickable**: a missing CT card is a state to show, not a
-        reason to take the operator's choice away.  Only its LOOK changes - the grey
-        `Greyed.TRadiobutton` style and the label `本地测谎（未开通）` while no card is
-        known, and the plain label again once one arrives.  The selection, the armed
-        boolean and the service supervisor are all left alone: selecting a backend the
-        machine cannot serve is reported when a pass is actually asked to start
-        (`_ensure_local_lie_service`), and the hint line says `本地测谎未开通`.
+        The radio is greyed **and not clickable** while no CT card is known - the
+        operator's rule for this state: a backend the machine cannot serve must not be
+        pickable.  Only its LOOK and its `state` change; the group variable is never
+        assigned (forcing 关闭 read as "the assistant switched me to 关闭"), and the
+        armed boolean is withdrawn so no lie window tries a backend that cannot serve
+        it.  A card-bearing reply restores both the normal look and the arming.
 
-        The look is applied only when it changes, because this runs on every UI tick.
+        The transition is applied only when it changes, because this runs on every UI
+        tick.
         """
 
         buttons = list(getattr(self, "_api_auto_lie_buttons", []) or [])
@@ -7475,32 +7475,60 @@ class UiWorker(threading.Thread):
             return
         access = self._local_lie_access()
         allowed = access is not False
-        if allowed == getattr(self, "_local_lie_radio_allowed", None):
-            return
-        self._local_lie_radio_allowed = allowed
-        try:
-            if allowed:
-                buttons[2].configure(
-                    state="normal", text="本地测谎", style="TRadiobutton"
+        if allowed != getattr(self, "_local_lie_radio_allowed", None):
+            self._local_lie_radio_allowed = allowed
+            try:
+                if allowed:
+                    buttons[2].configure(
+                        state="normal", text="本地测谎", style="TRadiobutton"
+                    )
+                else:
+                    # Disabled AND explicitly grey: `state=disabled` alone keeps the
+                    # theme's normal text colour (`SystemWindowText`) and read as
+                    # "not greyed"; the style plus the label say what happened.
+                    buttons[2].configure(
+                        state=self.LOCAL_LIE_GREYED_STATE,
+                        text="本地测谎（未开通）",
+                        style="Greyed.TRadiobutton",
+                    )
+            except Exception:  # noqa: BLE001 - a radio look is never fatal
+                LOG.debug("本地测谎 radio look could not be set", exc_info=True)
+            if not allowed:
+                AUTO_LIE_LOG.warning(
+                    "自动测谎: this activation code carries no CT card - 本地测谎 is "
+                    "greyed and cannot be selected (%s)",
+                    str(getattr(self, "_api_auto_lie_backend_var", None).get()),
                 )
-            else:
-                # Greyed but still selectable.  `state=disabled` would block the
-                # click, and its text keeps the theme colour anyway
-                # (`SystemWindowText`), so the explicit grey style plus the label is
-                # what actually communicates the state.
-                buttons[2].configure(
-                    state="normal", text="本地测谎（未开通）",
-                    style="Greyed.TRadiobutton",
-                )
-        except Exception:  # noqa: BLE001 - a radio look is never fatal
-            LOG.debug("本地测谎 radio look could not be set", exc_info=True)
-        if not allowed:
-            AUTO_LIE_LOG.warning(
-                "自动测谎: this activation code carries no CT card - 本地测谎 is "
-                "greyed (still selectable); the service will report it when a pass "
-                "asks for it (%s)",
-                str(getattr(self, "_api_auto_lie_backend_var", None).get()),
+        if not allowed and self._auto_lie_backend_is_local():
+            # The radio cannot be clicked away from 本地测谎 either, so the armed
+            # boolean is what must not stay on: a lie window would otherwise try a
+            # backend the machine cannot serve.
+            armed_var = getattr(self, "_api_auto_lie_var", None)
+            if armed_var is not None and bool(armed_var.get()):
+                try:
+                    armed_var.set(False)
+                    self._api_auto_lie_change_origin = "no_card"
+                    self._set_api_test_status(
+                        "自动测谎: 本地测谎未开通，已暂停（测谎卡恢复后自动继续）。"
+                    )
+                except Exception:  # noqa: BLE001 - never break the UI tick
+                    LOG.debug("自动测谎 could not be disarmed without a card",
+                              exc_info=True)
+        elif (allowed
+                and getattr(self, "_api_auto_lie_change_origin", "") == "no_card"
+                and str(getattr(self, "_api_auto_lie_backend_var", None).get())
+                == AUTOLIE_BACKEND_LOCAL):
+            # The card came back while 本地测谎 was still selected: resume the same
+            # way a click would, so the operator does not have to re-pick it.
+            self._api_auto_lie_change_origin = ""
+            AUTO_LIE_LOG.info(
+                "自动测谎: the CT card returned - 本地测谎 is selectable and re-armed"
             )
+            try:
+                self._api_auto_lie_backend_changed()
+            except Exception:  # noqa: BLE001 - never break the UI tick
+                LOG.debug("本地测谎 could not be re-armed after the card returned",
+                          exc_info=True)
 
     def _activate_local_lie_clicked(self) -> None:
         """激活测谎: write a CT_ card for the local service and restart it.
@@ -12093,6 +12121,10 @@ class UiWorker(threading.Thread):
     # service note does not already say it, so the panel line never carries the same
     # fact twice (the 1.3.9 build printed the prefix sentence next to a longer copy).
     LOCAL_LIE_GREYED_NOTE = "本地测谎未开通"
+    # How a 本地测谎 radio without a CT card is presented: greyed AND not pickable.
+    # Kept as one named value because the operator has been explicit about it twice -
+    # "grey it rather than switch me to 关闭" and then "still selectable, fix it".
+    LOCAL_LIE_GREYED_STATE = "disabled"
 
     def _dingtalk_note_text(self) -> str:
         """The ONE short 钉钉 state appended to the panel hint.

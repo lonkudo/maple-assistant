@@ -1240,14 +1240,14 @@ while 本地测谎 is the supervisor's target, and `_refresh_panel_hints()` only
 that note does not already contain it. The 1.3.9 build printed both the prefixed service
 sentence and a longer copy on the same line.
 
-Only the LOOK changes.  `_sync_local_lie_radio()` never touches `state`, the group variable
-or `_api_auto_lie_var`: the radio stays `state=normal` and selectable, gets the grey
-`Greyed.TRadiobutton` style plus the label `本地测谎（未开通）` while no card is known, and
-returns to the plain label when one arrives. Two earlier attempts were rejected by the
-operator for exactly these reasons - assigning the group to 关闭 read as "the assistant
-switched me to 关闭", and `state=disabled` made the choice unselectable. A pass that is
-asked to start on a card-less machine reports it through `_ensure_local_lie_service()`,
-and the panel line carries the short form `本地测谎未开通`.
+`_sync_local_lie_radio()` changes three things and nothing else: the widget `state`
+(`LOCAL_LIE_GREYED_STATE = "disabled"`, i.e. not clickable), the look
+(`Greyed.TRadiobutton` at `#a0a0a0`, label `本地测谎（未开通）`) and, indirectly, the armed
+boolean - withdrawn while no card is known, restored through
+`_api_auto_lie_backend_changed()` when one arrives. The **group variable is never
+assigned**: forcing 关闭 read as "the assistant switched me to 关闭" and was the operator's
+first complaint about this state. Both facts are pinned by the harness (24/24). The panel
+line carries the short form `本地测谎未开通`, once.
 
 ### Server contract (repo `activation_service`)
 
