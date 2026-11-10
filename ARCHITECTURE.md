@@ -1235,6 +1235,11 @@ text colour (`SystemWindowText`) under this build and read as "not greyed". The 
 repaint gate watches the ACCESS state as well as the service note - gating it on the note
 alone meant a greying radio whose note was `""` never repainted the sentence at all.
 
+The panel line carries the short form `本地测谎未开通`, **once**: `hint_text()` returns it
+while 本地测谎 is the supervisor's target, and `_refresh_panel_hints()` only adds it when
+that note does not already contain it. The 1.3.9 build printed both the prefixed service
+sentence and a longer copy on the same line.
+
 The radio is disabled **in place**: the group variable keeps the operator's selection
 (本地测谎 stays selected, greyed) and only the armed boolean `_api_auto_lie_var` is
 withdrawn, because a lie window must never start a backend the machine cannot serve.

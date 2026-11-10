@@ -55,7 +55,8 @@ The update icon in the title bar turns green when the activation server announce
   `data\ct_login_config.json`**. When a card returns the same selection is re-armed by
   itself. While greyed the radio also *looks* it - explicit grey style plus the label
   `本地测谎（未开通）`, because a disabled ttk radio keeps the normal text colour in this
-  theme - and the hint line says `本地测谎未开通（授权码没有测谎卡），已置灰`. The cached card
+  theme - and the 图层校准与巡逻 hint line says just `本地测谎未开通`, once, with the reason
+  left to the radio label and its tooltip. The cached card
   only decides in the window before the first reply of a session, and
   `ensure_started()` rewrites it when a replaced package reset the file.
 - **A start that fails no longer freezes the local backend.** `ensure_started()` called
@@ -1591,7 +1592,7 @@ The panel hint has exactly three failure-free wordings and one failure wording:
 
 | Hint | Meaning |
 | --- | --- |
-| `本地测谎未开通（授权码没有测谎卡），已置灰` | 本地测谎 is selected but the licence reply carried **no** `CT_` card, so the radio is greyed (and labelled `本地测谎（未开通）`) and the service is deliberately not started |
+| `本地测谎未开通` | the licence reply carried **no** `CT_` card, so the 本地测谎 radio is greyed (label `本地测谎（未开通）`) and the service is deliberately not started |
 | `本地测谎启动失败` | a card did arrive, but the service never came up on 8765 (its own `data\logs\client.log` says why) |
 | `已启动` | the service answers `/v1/health` |
 | *(nothing)* | the selection is 关闭 / 云端测谎 |

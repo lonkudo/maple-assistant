@@ -7508,8 +7508,7 @@ class UiWorker(threading.Thread):
                     armed_var.set(False)
                     self._api_auto_lie_change_origin = "no_card"
                     self._set_api_test_status(
-                        "自动测谎: 本地测谎未开通（授权码没有测谎卡），已置灰并暂停"
-                        "（测谎卡恢复后自动继续）。"
+                        "自动测谎: 本地测谎未开通，已暂停（测谎卡恢复后自动继续）。"
                     )
                 except Exception:  # noqa: BLE001 - never break the UI tick
                     LOG.debug("自动测谎 could not be disarmed without a card",
@@ -12121,9 +12120,10 @@ class UiWorker(threading.Thread):
     # owning a row of its own: the note is appended to whatever that line
     # currently says and re-appended on every poll tick.
     DINGTALK_NOTE_SEP = " · "
-    # The one sentence that explains a greyed 本地测谎 radio.  It names the cause
-    # and the state, and both the panel hint and the 自动测谎 status line use it.
-    LOCAL_LIE_GREYED_NOTE = "本地测谎未开通（授权码没有测谎卡），已置灰"
+    # The operator's short form for a 本地测谎 without a CT card.  Used ONLY when the
+    # service note does not already say it, so the panel line never carries the same
+    # fact twice (the 1.3.9 build printed the prefix sentence next to a longer copy).
+    LOCAL_LIE_GREYED_NOTE = "本地测谎未开通"
 
     def _dingtalk_note_text(self) -> str:
         """The ONE short 钉钉 state appended to the panel hint.
@@ -12186,12 +12186,13 @@ class UiWorker(threading.Thread):
         service_note = self._local_lie_service_note()
         if service_note:
             notes.append(service_note)
-        # Why the 本地测谎 radio is greyed: the code has no CT card.  Appended from
-        # the ACCESS state, never from the service note: the note is empty whenever
-        # the supervisor wish is off (which it is as soon as the backend is
-        # disarmed), and gating this sentence on it was why the hint kept showing
-        # the bare state or nothing at all.
-        if self._local_lie_access() is False and "已置灰" not in (service_note or ""):
+        # One sentence only: the service note already says 本地测谎未开通 while
+        # 本地测谎 is the supervisor's target, so this only covers the case where the
+        # radio is greyed but that note is empty.  It is derived from the ACCESS
+        # state (not from the note) because the note is empty as soon as the backend
+        # is disarmed - the reason the sentence never painted in 1.3.9.
+        if (self._local_lie_access() is False
+                and "本地测谎未开通" not in (service_note or "")):
             notes.append(self.LOCAL_LIE_GREYED_NOTE)
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note
