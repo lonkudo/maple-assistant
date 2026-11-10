@@ -7459,14 +7459,15 @@ class UiWorker(threading.Thread):
     def _sync_local_lie_radio(self) -> None:
         """Grey the 本地测谎 radio when the code has no CT card.
 
-        The radio is disabled in place: the operator's selection is kept (they asked
-        for 本地测谎, and it must come back by itself when a card arrives), only the
-        arming is withdrawn, so no lie window can start a pass that cannot be
-        served.  Forcing the group to 关闭 used to destroy that choice and looked
-        like the assistant silently decided for the operator.
+        The radio stays **clickable**: a missing CT card is a state to show, not a
+        reason to take the operator's choice away.  Only its LOOK changes - the grey
+        `Greyed.TRadiobutton` style and the label `本地测谎（未开通）` while no card is
+        known, and the plain label again once one arrives.  The selection, the armed
+        boolean and the service supervisor are all left alone: selecting a backend the
+        machine cannot serve is reported when a pass is actually asked to start
+        (`_ensure_local_lie_service`), and the hint line says `本地测谎未开通`.
 
-        The state is applied only when it changes, because this runs on every UI
-        tick.
+        The look is applied only when it changes, because this runs on every UI tick.
         """
 
         buttons = list(getattr(self, "_api_auto_lie_buttons", []) or [])
@@ -7474,64 +7475,32 @@ class UiWorker(threading.Thread):
             return
         access = self._local_lie_access()
         allowed = access is not False
-        if allowed != getattr(self, "_local_lie_radio_allowed", None):
-            self._local_lie_radio_allowed = allowed
-            try:
-                if allowed:
-                    buttons[2].configure(state="normal", text="本地测谎",
-                                         style="TRadiobutton")
-                else:
-                    # Grey it VISIBLY: a disabled Radiobutton keeps its normal text
-                    # colour under some ttk versions, which read as "not greyed" -
-                    # the explicit style plus the label says what happened.
-                    buttons[2].configure(state="disabled", text="本地测谎（未开通）",
-                                         style="Greyed.TRadiobutton")
-            except Exception:  # noqa: BLE001 - a radio state is never fatal
-                LOG.debug("本地测谎 radio state could not be set", exc_info=True)
-            if not allowed:
-                AUTO_LIE_LOG.warning(
-                    "自动测谎: this activation code carries no CT card - "
-                    "本地测谎 is greyed and disarmed (%s)",
-                    str(getattr(self, "_api_auto_lie_backend_var", None).get()),
+        if allowed == getattr(self, "_local_lie_radio_allowed", None):
+            return
+        self._local_lie_radio_allowed = allowed
+        try:
+            if allowed:
+                buttons[2].configure(
+                    state="normal", text="本地测谎", style="TRadiobutton"
                 )
-        if not allowed and self._auto_lie_backend_is_local():
-            # The selection stays 本地测谎 (the radio shows it, greyed); the armed
-            # boolean is what must not stay on, or a lie window would try a backend
-            # the machine cannot serve.  No backend var assignment here - that is
-            # what used to look like "the app switched me to 关闭".
-            armed_var = getattr(self, "_api_auto_lie_var", None)
-            if armed_var is not None and bool(armed_var.get()):
-                selection = str(
-                    getattr(self, "_api_auto_lie_backend_var", None).get()
+            else:
+                # Greyed but still selectable.  `state=disabled` would block the
+                # click, and its text keeps the theme colour anyway
+                # (`SystemWindowText`), so the explicit grey style plus the label is
+                # what actually communicates the state.
+                buttons[2].configure(
+                    state="normal", text="本地测谎（未开通）",
+                    style="Greyed.TRadiobutton",
                 )
-                try:
-                    armed_var.set(False)
-                    self._api_auto_lie_change_origin = "no_card"
-                    self._set_api_test_status(
-                        "自动测谎: 本地测谎未开通，已暂停（测谎卡恢复后自动继续）。"
-                    )
-                except Exception:  # noqa: BLE001 - never break the UI tick
-                    LOG.debug("自动测谎 could not be disarmed without a card",
-                              exc_info=True)
-                AUTO_LIE_LOG.warning(
-                    "自动测谎: disarmed without switching the selection (%s) - "
-                    "the code has no CT card", selection,
-                )
-        elif (allowed
-                and getattr(self, "_api_auto_lie_change_origin", "") == "no_card"
-                and str(getattr(self, "_api_auto_lie_backend_var", None).get())
-                == AUTOLIE_BACKEND_LOCAL):
-            # The card came back while 本地测谎 was still selected: resume the same
-            # way a click would, so the operator does not have to re-pick it.
-            self._api_auto_lie_change_origin = ""
-            AUTO_LIE_LOG.info(
-                "自动测谎: the CT card returned - 本地测谎 is re-armed"
+        except Exception:  # noqa: BLE001 - a radio look is never fatal
+            LOG.debug("本地测谎 radio look could not be set", exc_info=True)
+        if not allowed:
+            AUTO_LIE_LOG.warning(
+                "自动测谎: this activation code carries no CT card - 本地测谎 is "
+                "greyed (still selectable); the service will report it when a pass "
+                "asks for it (%s)",
+                str(getattr(self, "_api_auto_lie_backend_var", None).get()),
             )
-            try:
-                self._api_auto_lie_backend_changed()
-            except Exception:  # noqa: BLE001 - never break the UI tick
-                LOG.debug("本地测谎 could not be re-armed after the card returned",
-                          exc_info=True)
 
     def _activate_local_lie_clicked(self) -> None:
         """激活测谎: write a CT_ card for the local service and restart it.
