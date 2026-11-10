@@ -54,8 +54,10 @@ The update icon in the title bar turns green when the activation server announce
   `state=disabled` (not clickable) and painted with the grey `Greyed.TRadiobutton` style,
   labelled `本地测谎（未开通）`; the group variable is never assigned, so it is not silently
   switched to 关闭, and the armed boolean is withdrawn so no lie window tries a backend
-  that cannot serve it. A card-bearing reply makes it selectable again and re-arms the
-  same selection. The 图层校准与巡逻 hint line says just `本地测谎未开通`, once, with the
+  that cannot serve it. The greying is **re-asserted on every tick** (a settings apply in
+  this dashboard re-enables the row's widgets, which left a clickable greyed radio), and
+  测试本地测谎 is disabled by the same gate - hidden drills included. A card-bearing reply
+  makes both selectable again and re-arms the same selection. The 图层校准与巡逻 hint line says just `本地测谎未开通`, once, with the
   reason left to the radio label and its tooltip. The cached card
   only decides in the window before the first reply of a session, and
   `ensure_started()` rewrites it when a replaced package reset the file.

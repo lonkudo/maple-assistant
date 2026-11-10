@@ -7067,12 +7067,20 @@ class UiWorker(threading.Thread):
             except Exception:  # noqa: BLE001 - never break a selection change
                 LOG.debug("api test button could not be swapped", exc_info=True)
         armed = str(getattr(self, "_api_test_arm_state", "normal")) == "normal"
+        # 本地测谎 without a CT card cannot serve a pass, so its drill is not
+        # clickable either - the operator reported the button as still clickable
+        # while the radio said 未开通.  A hidden drill is disabled too, so no path
+        # can pack and use it behind a missing card.
+        local_has_card = self._local_lie_access() is not False
         for button, wanted in ((local, show_local), (cloud, show_cloud)):
-            if not wanted:
-                continue
+            usable = local_has_card if button is local else True
             try:
                 button.configure(
-                    state="normal" if armed and mode != AUTOLIE_BACKEND_OFF else "disabled"
+                    state=(
+                        "normal"
+                        if wanted and armed and mode != AUTOLIE_BACKEND_OFF and usable
+                        else "disabled"
+                    )
                 )
             except Exception:
                 LOG.debug("api test button could not be re-armed", exc_info=True)
@@ -7466,8 +7474,11 @@ class UiWorker(threading.Thread):
         armed boolean is withdrawn so no lie window tries a backend that cannot serve
         it.  A card-bearing reply restores both the normal look and the arming.
 
-        The transition is applied only when it changes, because this runs on every UI
-        tick.
+        The look is RE-ASSERTED every tick, not only on the transition: something in
+        this dashboard re-enables the row's widgets after a settings apply, and a
+        one-shot `configure()` therefore left a clickable "本地测谎（未开通）" on
+        screen (the operator's report).  A cheap state/text read decides whether the
+        write is needed, and a mismatch is logged with the value that was found.
         """
 
         buttons = list(getattr(self, "_api_auto_lie_buttons", []) or [])
@@ -7475,29 +7486,34 @@ class UiWorker(threading.Thread):
             return
         access = self._local_lie_access()
         allowed = access is not False
-        if allowed != getattr(self, "_local_lie_radio_allowed", None):
+        local = buttons[2]
+        wanted_state = "normal" if allowed else self.LOCAL_LIE_GREYED_STATE
+        wanted_text = "本地测谎" if allowed else "本地测谎（未开通）"
+        wanted_style = "TRadiobutton" if allowed else "Greyed.TRadiobutton"
+        found_state = self._radio_state(local)
+        found_text = self._radio_text(local)
+        transition = allowed != getattr(self, "_local_lie_radio_allowed", None)
+        if transition or found_state != wanted_state or found_text != wanted_text:
             self._local_lie_radio_allowed = allowed
             try:
-                if allowed:
-                    buttons[2].configure(
-                        state="normal", text="本地测谎", style="TRadiobutton"
-                    )
-                else:
-                    # Disabled AND explicitly grey: `state=disabled` alone keeps the
-                    # theme's normal text colour (`SystemWindowText`) and read as
-                    # "not greyed"; the style plus the label say what happened.
-                    buttons[2].configure(
-                        state=self.LOCAL_LIE_GREYED_STATE,
-                        text="本地测谎（未开通）",
-                        style="Greyed.TRadiobutton",
-                    )
+                local.configure(state=wanted_state, text=wanted_text,
+                                style=wanted_style)
             except Exception:  # noqa: BLE001 - a radio look is never fatal
                 LOG.debug("本地测谎 radio look could not be set", exc_info=True)
-            if not allowed:
+            if not allowed and transition:
                 AUTO_LIE_LOG.warning(
                     "自动测谎: this activation code carries no CT card - 本地测谎 is "
-                    "greyed and cannot be selected (%s)",
+                    "greyed and cannot be selected (%s); radio state=%s text=%s",
                     str(getattr(self, "_api_auto_lie_backend_var", None).get()),
+                    self._radio_state(local),
+                    self._radio_text(local),
+                )
+            elif not transition and not allowed:
+                # Something re-enabled the widget after the fact.  Say so: a silent
+                # re-assertion would hide the culprit forever.
+                AUTO_LIE_LOG.warning(
+                    "自动测谎: the greying was lost (%s -> %s, %r -> %r); re-applied",
+                    found_state, wanted_state, found_text, wanted_text,
                 )
         if not allowed and self._auto_lie_backend_is_local():
             # The radio cannot be clicked away from 本地测谎 either, so the armed
@@ -7529,6 +7545,24 @@ class UiWorker(threading.Thread):
             except Exception:  # noqa: BLE001 - never break the UI tick
                 LOG.debug("本地测谎 could not be re-armed after the card returned",
                           exc_info=True)
+
+    @staticmethod
+    def _radio_state(widget) -> str:
+        """The widget's ttk state, for the log (a look that did not apply is silent)."""
+
+        try:
+            return str(widget.cget("state"))
+        except Exception:  # noqa: BLE001 - logging helper
+            return "?"
+
+    @staticmethod
+    def _radio_text(widget) -> str:
+        """The widget's label, for the log."""
+
+        try:
+            return str(widget.cget("text"))
+        except Exception:  # noqa: BLE001 - logging helper
+            return "?"
 
     def _activate_local_lie_clicked(self) -> None:
         """激活测谎: write a CT_ card for the local service and restart it.
