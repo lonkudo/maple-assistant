@@ -2044,6 +2044,15 @@ class UiWorker(threading.Thread):
             )
             style.configure("Locked.TButton", foreground="#777777")
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
+            # 本地测谎 without a CT card: the radio is greyed, and a disabled
+            # Radiobutton alone is easy to miss in this theme (its text keeps the
+            # normal colour under some ttk versions), so the grey is explicit and
+            # the label says why it is unavailable.
+            style.configure("Greyed.TRadiobutton", foreground="#a0a0a0")
+            style.map(
+                "Greyed.TRadiobutton",
+                foreground=[("disabled", "#a0a0a0"), ("!disabled", "#a0a0a0")],
+            )
             # Recorded coordinates are the widest left-side cells. A compact
             # record style keeps all three inside the 500px column.
             style.configure("Record.TButton", font=("Segoe UI", 8), padding=(1, 1))
@@ -7468,14 +7477,22 @@ class UiWorker(threading.Thread):
         if allowed != getattr(self, "_local_lie_radio_allowed", None):
             self._local_lie_radio_allowed = allowed
             try:
-                buttons[2].configure(state="normal" if allowed else "disabled")
+                if allowed:
+                    buttons[2].configure(state="normal", text="本地测谎",
+                                         style="TRadiobutton")
+                else:
+                    # Grey it VISIBLY: a disabled Radiobutton keeps its normal text
+                    # colour under some ttk versions, which read as "not greyed" -
+                    # the explicit style plus the label says what happened.
+                    buttons[2].configure(state="disabled", text="本地测谎（未开通）",
+                                         style="Greyed.TRadiobutton")
             except Exception:  # noqa: BLE001 - a radio state is never fatal
                 LOG.debug("本地测谎 radio state could not be set", exc_info=True)
             if not allowed:
                 AUTO_LIE_LOG.warning(
                     "自动测谎: this activation code carries no CT card - "
                     "本地测谎 is greyed and disarmed (%s)",
-                    self._auto_lie_backend_label(),
+                    str(getattr(self, "_api_auto_lie_backend_var", None).get()),
                 )
         if not allowed and self._auto_lie_backend_is_local():
             # The selection stays 本地测谎 (the radio shows it, greyed); the armed
@@ -12104,6 +12121,9 @@ class UiWorker(threading.Thread):
     # owning a row of its own: the note is appended to whatever that line
     # currently says and re-appended on every poll tick.
     DINGTALK_NOTE_SEP = " · "
+    # The one sentence that explains a greyed 本地测谎 radio.  It names the cause
+    # and the state, and both the panel hint and the 自动测谎 status line use it.
+    LOCAL_LIE_GREYED_NOTE = "本地测谎未开通（授权码没有测谎卡），已置灰"
 
     def _dingtalk_note_text(self) -> str:
         """The ONE short 钉钉 state appended to the panel hint.
@@ -12166,12 +12186,13 @@ class UiWorker(threading.Thread):
         service_note = self._local_lie_service_note()
         if service_note:
             notes.append(service_note)
-        # Why the 本地测谎 radio is greyed: the code has no CT card.  The service
-        # note already says it while 本地测谎 is selected; this covers the case where
-        # the radio is greyed but the selection sits on 关闭/云端测谎.
-        if (self._local_lie_access() is False
-                and "已置灰" not in service_note):
-            notes.append("本地测谎未开通（授权码没有测谎卡），已置灰")
+        # Why the 本地测谎 radio is greyed: the code has no CT card.  Appended from
+        # the ACCESS state, never from the service note: the note is empty whenever
+        # the supervisor wish is off (which it is as soon as the backend is
+        # disarmed), and gating this sentence on it was why the hint kept showing
+        # the bare state or nothing at all.
+        if self._local_lie_access() is False and "已置灰" not in (service_note or ""):
+            notes.append(self.LOCAL_LIE_GREYED_NOTE)
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note
         self._local_lie_service_hint_shown = service_note
@@ -12213,8 +12234,14 @@ class UiWorker(threading.Thread):
                     >= LOCAL_LIE_PROBE_RETRY_SECONDS):
                 self._probe_local_lie_service()
         note = self._local_lie_service_note()
-        if note == getattr(self, "_local_lie_service_hint_shown", None):
+        # The greyed sentence is derived from the access state, not from `note`, so
+        # the repaint gate has to watch that state as well - otherwise a greying
+        # radio whose service note stayed "" never repainted the hint at all.
+        access = self._local_lie_access()
+        if (note == getattr(self, "_local_lie_service_hint_shown", None)
+                and access == getattr(self, "_local_lie_access_hint_shown", None)):
             return
+        self._local_lie_access_hint_shown = access
         self._refresh_panel_hints()
 
     def _report_local_lie_drill(self, outcome: str, detail: str = "") -> None:

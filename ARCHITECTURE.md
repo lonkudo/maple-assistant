@@ -1229,6 +1229,12 @@ document and never changes the card decision.
 on change; `card_known()` reports "decided" for both cases so a cardless reply really
 greys and a silent one does not.
 
+The grey is explicit: `Greyed.TRadiobutton` pins the foreground to `#a0a0a0` and the
+label becomes `本地测谎（未开通）`, because a disabled ttk radio keeps the theme's normal
+text colour (`SystemWindowText`) under this build and read as "not greyed". The hint
+repaint gate watches the ACCESS state as well as the service note - gating it on the note
+alone meant a greying radio whose note was `""` never repainted the sentence at all.
+
 The radio is disabled **in place**: the group variable keeps the operator's selection
 (本地测谎 stays selected, greyed) and only the armed boolean `_api_auto_lie_var` is
 withdrawn, because a lie window must never start a backend the machine cannot serve.
