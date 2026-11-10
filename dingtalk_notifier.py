@@ -389,6 +389,11 @@ class DingTalkNotifier(threading.Thread):
         key = str(event_type or "").strip()
         if not key:
             return
+        if self.stop_event.is_set():
+            # Shutting down: an alert queued now would be delivered by a worker
+            # the operator believes has already closed the app.
+            LOG.debug("钉钉提醒: %s dropped - the app is stopping", key)
+            return
         label = EVENT_LABELS.get(key, key)
         with self._lock:
             if not (self._enabled and self._webhook):
@@ -423,6 +428,10 @@ class DingTalkNotifier(threading.Thread):
         return False
 
     def _deliver(self, kind: str, label: str) -> None:
+        if self.stop_event.is_set():
+            # Already queued when the shutdown began: do not touch the network.
+            LOG.info("钉钉提醒: %s dropped - the app is stopping", label)
+            return
         with self._lock:
             webhook = self._webhook
             machine_name = self._machine_name

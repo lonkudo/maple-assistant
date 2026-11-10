@@ -254,6 +254,10 @@ class TelegramNotifier(threading.Thread):
     def notify(self, event_type: str) -> None:
         """Queue one event; this call never performs network work or raises."""
 
+        if self.stop_event.is_set():
+            # Same rule as the 钉钉 channel: an alert queued during shutdown
+            # would be delivered from an application the operator has closed.
+            return
         with self._lock:
             enabled = self._enabled
         if enabled:

@@ -1032,6 +1032,13 @@ def _with_server_device(
                 )
         except Exception:  # noqa: BLE001 - diagnostics only
             pass
+    elif not isinstance(device, dict) and isinstance(usage, dict):
+        # A usage-only reply (the lie-event accounting on
+        # /api/v1/local-lie-events) is NOT a licence document: it says nothing
+        # about the CT card, so it must never change the 本地测谎 decision.  Only a
+        # reply that carries the device document is authoritative, and the server
+        # always emits ``ct_card`` in it - empty when this code has no card.
+        pass
     if not isinstance(device, dict) and not isinstance(usage, dict):
         return status
     # The full device document remains the compatibility response.  The

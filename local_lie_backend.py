@@ -50,10 +50,105 @@ SESSION_TIMEOUT_SEC = 20.0
 # The partner API's own frame standard is 3..7 and the drills feed at 5 fps.
 DEFAULT_FRAME_STANDARD = 5
 DEFAULT_INFER = "dml"
+# The picture THIS service wants: the lie3main big picture, not the cloud
+# protocol's 372x248 slot.  同行对接使用说明.txt (2026-11 build, exe HostSvc3da4):
+# "你的程序把「lie3main 大图」POST 上来", and the package's own reference client and
+# its test_files/replay_main_5fps frames are all 744x496.  The answer still comes
+# back in the 372x248 protocol space (``coord_space: roi_top_left``,
+# ``roi_size: 372x248``) - 745/372 = 2.0027, 496/248 = 2.0 - so the geometry that
+# maps an answer onto the screen stays exactly the same.
+LIE3MAIN_SIZE = (745, 496)
 
 
 class LocalLieError(RuntimeError):
     """The local service is unusable; the message is meant for the panel."""
+
+
+def resize_to_lie3main(content_bgr: Any) -> Any:
+    """Scale the ROI content to the lie3main size this service documents.
+
+    The service answers in the 372x248 protocol space whatever the input size is,
+    and the two are an exact 2x mapping (745/372 = 2.0027, 496/248 = 2.0), so a
+    resize here changes nothing about the geometry - it only hands the vendor's
+    ONNX kernel the pixel scale it was packaged for (its own replay frames are
+    744x496).
+    """
+
+    import cv2
+
+    height, width = content_bgr.shape[:2]
+    if (width, height) == LIE3MAIN_SIZE:
+        return content_bgr
+    return cv2.resize(content_bgr, LIE3MAIN_SIZE, interpolation=cv2.INTER_LINEAR)
+
+
+def _encode_jpeg(image_bgr: Any, quality: int) -> bytes:
+    import cv2
+
+    ok, buffer = cv2.imencode(
+        ".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    )
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    return buffer.tobytes()
+
+
+def build_lie3main_frame(
+    client_bgr: Any,
+    box: Optional[tuple[int, int, int, int]] = None,
+    *,
+    frame_id: int = 1,
+    interval_sec: float = 0.2,
+    window_rect: Optional[tuple[int, int, int, int]] = None,
+    client_size: Optional[tuple[int, int]] = None,
+    quality: Optional[int] = None,
+) -> Any:
+    """Screenshot -> the payload the LOCAL service wants, with its geometry.
+
+    Same signature and same returned ``SlotFrame`` as the cloud
+    ``build_slot_frame``, so a drill can call whichever its client asks for.  The
+    difference is the picture: the cloud protocol needs the 372x248 slot, this
+    service documents the lie3main big picture (see :data:`LIE3MAIN_SIZE`).  The
+    attached ``RoiGeometry`` is identical in meaning - the answer is still read in
+    the 372x248 space and mapped back through the crop - so nothing downstream
+    changes.
+    """
+
+    from autolie_api.intergration import (
+        JPEG_QUALITY,
+        RoiGeometry,
+        SlotFrame,
+        crop_region,
+        fit_slot,
+        to_base64,
+    )
+
+    started = time.perf_counter()
+    height, width = client_bgr.shape[:2]
+    size = (int(client_size[0]), int(client_size[1])) if client_size else (width, height)
+    rect = (
+        tuple(int(value) for value in window_rect)
+        if window_rect is not None else (0, 0, size[0], size[1])
+    )
+    crop, clamped = crop_region(client_bgr, box)
+    content = fit_slot(crop)
+    content_bgr = crop[
+        content[1]:content[1] + content[3],
+        content[0]:content[0] + content[2],
+    ]
+    geometry = RoiGeometry(
+        box=clamped, client_size=size, window_rect=rect, content_box=content
+    )
+    picture = resize_to_lie3main(content_bgr)
+    jpeg = _encode_jpeg(picture, int(quality if quality is not None else JPEG_QUALITY))
+    return SlotFrame(
+        jpeg=jpeg,
+        base64_text=to_base64(jpeg),
+        geometry=geometry,
+        frame_id=int(frame_id),
+        interval_sec=float(interval_sec),
+        encode_ms=(time.perf_counter() - started) * 1000.0,
+    )
 
 
 def _opener():
@@ -101,13 +196,19 @@ def probe_local_lie_service(
     handshake = payload.get("ws_startup_handshake") or {}
     parts = [f"{base_url(host, port)} 就绪"]
     if licence and not licence.get("ok"):
-        parts.append("月卡未通过")
+        # The 2026-11 build names the failure (activate_failed / no_valid_license),
+        # which is what tells the operator the CT_IN card is missing.
+        reason = str(licence.get("error_code") or licence.get("error") or "").strip()
+        parts.append("月卡未通过" + (f"({reason})" if reason else ""))
     if licence.get("license_expire"):
         parts.append(f"月卡 {licence['license_expire']}")
     if handshake.get("ok"):
         parts.append(f"次数 {handshake.get('quota_left')}")
     if payload.get("local_infer_available") is False:
         parts.append("本地模型不可用")
+    choices = payload.get("infer_choices")
+    if isinstance(choices, list) and choices:
+        parts.append("推理 " + "/".join(str(item) for item in choices))
     return True, "，".join(parts)
 
 
@@ -137,6 +238,11 @@ def open_local_lie_backend(
 
 class LocalLieClient:
     """The CT partner API presented as the drills' client protocol."""
+
+    # The drills ask for these two: the picture this backend wants is the
+    # lie3main big picture (not the cloud 372x248 slot), and the cloud's byte caps
+    # do not apply to a loopback service that takes raw JPEG/PNG.
+    protocol_caps = False
 
     def __init__(
         self, *, host: str = LOCAL_LIE_HOST, port: int = LOCAL_LIE_PORT,
@@ -203,6 +309,23 @@ class LocalLieClient:
         LOG.info("%s %s", message, fields)
 
     # -------------------------------------------------------------------- frames
+    def build_frame(
+        self, client_bgr: Any,
+        box: Optional[tuple[int, int, int, int]] = None,
+        *,
+        frame_id: int = 1,
+        interval_sec: float = 0.2,
+        window_rect: Optional[tuple[int, int, int, int]] = None,
+        client_size: Optional[tuple[int, int]] = None,
+        quality: Optional[int] = None,
+    ) -> Any:
+        """The drill's frame builder for THIS backend (the lie3main picture)."""
+
+        return build_lie3main_frame(
+            client_bgr, box, frame_id=frame_id, interval_sec=interval_sec,
+            window_rect=window_rect, client_size=client_size, quality=quality,
+        )
+
     def send_frame_rtf1(self, frame_id: int, jpeg: bytes, *,
                         frame_interval_sec: float = 0.2) -> None:
         self.send_frame_base64(jpeg, frame_interval_sec=frame_interval_sec,

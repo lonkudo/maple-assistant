@@ -4722,19 +4722,50 @@ class UiWorker(threading.Thread):
             LOG.warning("maximize toggle failed", exc_info=True)
 
     def _on_debug_window_close(self) -> None:
-        """Persist the reminder deadline and UI geometry, then destroy."""
+        """Stop every worker, persist the deadline and geometry, then destroy.
+
+        The close owns the shutdown, so it sets the shared ``stop_event`` HERE
+        instead of relying on ``assistant.main`` observing that Tk returned.
+        Before this, closing the window only saved state and destroyed the root:
+        the reminder timer was stopped later, by a hand-off in the main loop, so
+        any path that lost that hand-off (a raising settle call, a worker the
+        main loop never reached) left an armed 循环 countdown running after the
+        window was gone - and every expiry pushed another 循环提醒 to 钉钉 while
+        the operator believed the app was closed ("the loop countdown timer was
+        not killed when application closed, so the dingtalk message was sent
+        repeatedly").  Setting the event first makes the countdown, both message
+        notifiers and the capture loop observe the shutdown immediately.
+        """
+
         root = self._root
         if root is not None:
+            stop = getattr(self, "stop_event", None)
+            if stop is not None:
+                stop.set()
+            LOG.info(
+                "debug UI closing: stop event set, the countdown and the "
+                "message channels stop before the window goes away"
+            )
             # Closing normally is an interrupted pass outcome.  The queue gets
             # a bounded best-effort transmit chance without delaying gameplay.
-            self._lie_accounting_worker.settle_for_shutdown(timeout=0.5)
+            # Guarded: this call used to be the only statement before the save,
+            # so one failure here stopped ``destroy`` from ever running - the
+            # dashboard stayed open with the countdown still armed.
+            try:
+                self._lie_accounting_worker.settle_for_shutdown(timeout=0.5)
+            except Exception:  # noqa: BLE001 - the close must always complete
+                LOG.warning("lie accounting could not settle on close",
+                            exc_info=True)
             self._save_countdown_resume_state()
             try:
                 _save_window_geometry(self._geometry_for_save(root))
             except Exception:
                 LOG.debug("could not save debug UI geometry on close",
                           exc_info=True)
-            root.destroy()
+            try:
+                root.destroy()
+            except Exception:  # noqa: BLE001 - already gone is still closed
+                LOG.debug("root was already destroyed on close", exc_info=True)
 
     def _geometry_for_save(self, root: Any) -> str:
         """Geometry for persistence (whole window, caption included).
@@ -13541,6 +13572,18 @@ class UiWorker(threading.Thread):
         remaining = deadline_at - time.time()
         if remaining <= 0.0:
             LOG.info("countdown resume deadline expired; leaving 循环 unselected")
+            # Make that sentence true.  ``_countdown_on_change`` runs before
+            # this restore and arms the worker from a FULL interval whenever
+            # ``countdown_enabled`` was saved, so the early return left 循环
+            # running: an app the operator had closed came back armed and kept
+            # pushing a 循环提醒 per interval.  An expired saved deadline is not
+            # a reason to re-arm, so the selection and the worker are disarmed
+            # and that state is persisted.
+            self._countdown_enabled_var.set(False)
+            data = self._shutdown_collect_data()
+            self._shutdown_save_settings(data)
+            self._countdown_apply_to_worker(data)
+            self._countdown_refresh_grey()
             return
 
         # Restore against the same 1..300 minute UI range.

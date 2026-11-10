@@ -296,6 +296,18 @@ class CountdownWorker(threading.Thread):
             self._firing = True
         LOG.info("COUNTDOWN reached zero: triggering reminders and resetting")
         try:
+            if self.stop_event.is_set():
+                # The app is closing/closed.  The deadline is already re-armed
+                # above, but dispatching now would push one more 循环 alert
+                # (sound, flash, 钉钉/Telegram) from an application the operator
+                # has just closed - the reported "the countdown was not killed
+                # when the application closed, the DingTalk message kept
+                # arriving".  A fire that races the shutdown is simply skipped.
+                LOG.info(
+                    "COUNTDOWN reached zero while the app is stopping; "
+                    "reminders skipped"
+                )
+                return
             if self._event_callback is not None:
                 try:
                     self._event_callback()

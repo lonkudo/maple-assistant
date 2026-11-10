@@ -36,6 +36,46 @@ If a required library is missing, the normal package repairs itself: the hidden 
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
+### Current release behavior (v1.3.8)
+
+- **本地测谎 follows the 2026-11 CT package.** The vendor rebuilds renamed the service
+  binary (`AppHostd83e.exe` → `HostSvc3da4.exe`), so discovery now reads
+  `data\build_profile.json` → `client_exe_stem` and falls back to any `*.exe` beside the
+  launchers; a hand-named glob no longer decides whether 本地测谎 can start.
+- **The local backend sends the picture its own documentation asks for.** The CT service
+  documents the `lie3main` big picture (745×496) and its reference client and replay
+  frames are that size, so `LocalLieClient.build_frame()` crops the lie ROI, scales it to
+  745×496 and posts it; the cloud byte caps do not apply to a loopback service. The
+  answer is still in the 372×248 protocol space, so the aim geometry is unchanged
+  (`745/372 = 2.0027`, `496/248 = 2`).
+- **A withdrawn CT card now wins.** The licence reply is authoritative: a reply without
+  `ct_card` greys 本地测谎, falls a saved selection back to 关闭, stops a service this app
+  started, and **ignores a card cached in `data\ct_login_config.json`**. A later reply
+  that carries a card re-enables it. The cached card only decides in the window before
+  the first reply of a session, and `ensure_started()` rewrites it when a replaced
+  package reset the file.
+- **A start that fails no longer freezes the local backend.** `ensure_started()` called
+  `has_online_card()` from inside its own non-reentrant lock, so any failed start (no
+  card, licence refused, cold start) deadlocked the caller while holding the lock — every
+  later probe, hint and supervisor iteration stopped. The lock is re-entrant and the card
+  is read outside it now.
+- **The CT service config survives us.** The 2026-11 drop ships
+  `data\ct_login_config.json` in GBK with Chinese placeholders; the reader accepts
+  UTF-8/UTF-8-BOM/GBK/CP936 and the writer emits ASCII-only JSON, so a write keeps every
+  key we never read (`vm_pierce_*`, `lie3_ort_ep`, `lie3_http_ws_fallback`, …). A document
+  that cannot be parsed is never overwritten. The vendor's own `ws_product_key`
+  (`LIE-PLANET-001`) is never replaced by the activation-server key — it handshakes
+  successfully — and a *placeholder* key is replaced by the package's own.
+- **钉钉/循环 stop with the app.** Closing the window now sets the shared stop event
+  itself (the countdown, both message channels and the capture loop observe it before the
+  window disappears), a fire that races the shutdown dispatches nothing, the notifiers
+  drop events once stopping, and a restored 循环 whose saved deadline already expired is
+  disarmed instead of re-armed for a full interval. A non-daemon worker that refuses to
+  stop can no longer keep the process alive holding the single-instance mutex.
+- **Drop-to-route walks on the far edge only after two Alt+Down chords fail**
+  (`right` when the marker is left of centre, `left` otherwise), and every descent starts
+  by trying Alt+Down again — the behaviour from v1.3.5–v1.3.7 kept intact.
+
 ### Current release behavior (v1.2.2)
 
 - The application is branded **TodoHelper**: its visible title, standalone executable, launchers, installer, and release ZIPs use that name. The configured game-window title remains independent and is unchanged.
@@ -1482,6 +1522,23 @@ the device document of every `activate`/`validate`/heartbeat reply, and
 the manual `激活测谎` button was removed for this reason. A card change restarts the
 service (never under a live pass).
 
+The reply is the authority, and the precedence is one list
+(`local_lie_service.current_card()`):
+
+1. a reply that arrived **without** `ct_card` wins outright — 本地测谎 is greyed, a saved
+   selection falls back to 关闭, a service this app started is stopped, and a card cached
+   in `data\ct_login_config.json` (written by an earlier session, or left behind by a
+   replaced package) is **ignored**;
+2. a later reply **with** a card clears that verdict and re-enables;
+3. only before the first reply of a session does the card written in the config decide —
+   which is what keeps a working install usable during the first seconds. If the package
+   was replaced (its config ships an empty card) `ensure_started()` writes the remembered
+   card back before launching.
+
+Reply shapes that must not change the decision: a `usage`-only reply (the
+`api/v1/local-lie-events` accounting call) is not a licence document and never withdraws
+a card.
+
 ### Service lifecycle and the panel hint
 
 * The app starts the service at launch when the folder ships and `8765` is not already
@@ -1499,6 +1556,16 @@ backend is ready, then `success`/`failed`). The server stores it in
 `LocalLieServiceEvent` for statistics — no quota is charged. Cloud passes keep using
 the durable `api/v1/lie-events` accounting queue, which local passes deliberately skip.
 
+### The packaged service (2026-11 build)
+
+| Item | Value |
+| --- | --- |
+| Service binary | `HostSvc3da4.exe` (declared in `data\build_profile.json` → `client_exe_stem`; **the vendor renames it on every build**) |
+| Endpoints | `GET /v1/health`, `POST /v1/session` (`infer` dml/cpu, `frame_standard` 3–7), `POST /v1/frame` (raw JPEG/PNG bytes), `POST /v1/close` |
+| Frame we send | the `lie3main` crop, scaled to **745×496** (its reference client and replay frames are that size); the answer stays in the 372×248 space |
+| Local tracking | `_internal\ct_tw_jingdian_ws_track.py` + `ct_tw_jingdian_import_shim.py` — a package that lacks them answers every frame with `ModuleNotFoundError` (seen with a half-extracted zip) |
+| Config | `data\ct_login_config.json`: UTF-8 in this drop, GBK in an earlier 2026-11 drop; the reader accepts both and the writer emits ASCII-only JSON |
+
 ### Notes
 
 * `测试API` in 本地测谎 plays the chosen video against the local service and needs no
@@ -1506,8 +1573,13 @@ the durable `api/v1/lie-events` accounting queue, which local passes deliberatel
   panel hint and a message box (it used to fail silently).
 * Only the `lie3main` view is recognised by the local model; other clips return no
   point, which the pass treats as "no answer" (never as a crash).
-* The release now bundles the service (≈341 MB, excluded items: `test_files`, runtime
-  logs/licence state, the stale `AppHost*.exe`).
+* The release bundles the service (≈341 MB, excluded items: `test_files`, runtime
+  logs/licence state, a stale `AppHost*.exe`). `package_local_service.ps1` scrubs the CT
+  card **and** a template `lie_product_key` from the bundled config (the service then uses
+  its own `build_profile.json` key), reading the document in whatever code page it ships.
+* The vendor build may log `CUDA 依赖未就绪: 未找到 cudart64_13.dll` — the CUDA execution
+  provider is then unavailable and the ONNX session runs on CPU/DirectML. We ask for
+  `infer=dml`; measured answers are 7–20 ms per frame on this machine.
 
 ### Troubleshooting: "本机未开通本地测谎服务"
 
@@ -1524,21 +1596,38 @@ The first one is almost always a **server-side** state, not a client bug — the
 reads `device.ct_card` from the heartbeat reply and starts the service the moment it
 appears. Work through it in this order:
 
+0. **"I cleared the card on the manager site and the desktop still gets one."**
+   The heartbeat reply describes the fields of **one** activation code, and a device may
+   hold several active codes. Until v1.3.8 the server answered with
+   `device_summary(state)`, i.e. `active_codes[0]` — the code with the earliest expiry —
+   instead of the code the request authenticated with, so clearing one row looked like it
+   did nothing. Two ways to settle it:
+   * deploy the fix (the reply now uses the authenticated code:
+     `device_summary(state, code=record)`), then clear the card on the code the desktop
+     actually holds, or
+   * use the device action that clears **every** active code at once:
+     `POST /console/api/devices/<equipment_id>/clear-ct-cards`.
+   Verify the reply itself, without the app:
+   `.venv\Scripts\python.exe work\ct_card_raw_reply.py` prints `device.ct_card`
+   (`<empty>` means the card is gone).
 1. `work\assistant.log`: is the heartbeat accepted but the CT card missing?
    ```
    license-heartbeat INFO license heartbeat accepted license_id=…
    local lie service INFO 本地测谎 selected, but the licence server has not delivered a CT card yet
    ```
    When the card arrives instead you see `local lie service: the CT card arrived; pre-starting the service`.
+   When a reply withdraws a card you see `the licence reply carries no CT card - 本地测谎 is greyed`.
 2. On the licence server, print the exact value the heartbeat would send — the device
    document only ships the card of the code **bound to that fingerprint** and not revoked/expired:
    ```bash
-   python manage.py shell -c "from licensing.models import FingerprintSecurityState as F; \
+   python manage.py shell -c "from licensing.models import FingerprintSecurityState as F, ActivationCode as C; \
    from licensing.services import device_summary; \
    s = F.objects.get(fingerprint_hash='<64-hex>'); \
-   print(repr(device_summary(s).get('ct_card')))"
+   print(repr(device_summary(s).get('ct_card'))); \
+   print(list(C.objects.filter(fingerprint_hash=s.fingerprint_hash, is_revoked=False).values_list('id', 'ct_card')))"
    ```
-   `''` → the card is on another code, or the bound code is revoked/expired.
+   `''` → the card is on another code, or the bound code is revoked/expired. The second
+   line lists every active code with its own card, which is what the old reply hid.
 3. Check the reply itself (proves which build is answering):
    ```bash
    curl -s -X POST https://211.149.169.194:8443/api/v1/validate \

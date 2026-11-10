@@ -1154,9 +1154,10 @@ lie window) and `api_lie_video.VideoDrillWorker` (测试API) only receive a diff
 
 The partner API is HTTP (`/v1/health`, `/v1/session`, `/v1/frame`, `/v1/close`); the
 drills speak one small client protocol (`send_frame_rtf1`, `send_frame_base64`,
-`poll_results`, `end_round`, `close`, `_pending`). `LocalLieClient` maps one onto the
-other and translates answers into the vendor `frame_result` shape (`ok`→`success`,
-`ms`→`timing_ms`, `x`/`y` unchanged as protocol-ROI pixels).
+`poll_results`, `end_round`, `close`, `_pending`, plus two optional attributes the drills
+ask for). `LocalLieClient` maps one onto the other and translates answers into the vendor
+`frame_result` shape (`ok`→`success`, `ms`→`timing_ms`, `x`/`y` unchanged as protocol-ROI
+pixels).
 
 Two rules there are load-bearing:
 
@@ -1166,27 +1167,83 @@ Two rules there are load-bearing:
 * HTTP failures become `ConnectionError`, which is what makes the drills treat a dead or
   restarted service as "backend interrupted" instead of hanging.
 
+The **picture** is backend-owned (v1.3.8). The cloud RoiTrack protocol wants the
+372×248 slot, while the CT service documents the `lie3main` big picture (745×496 — its own
+reference client and `test_files/replay_main_5fps` frames are that size). So the client
+exposes
+
+* `build_frame(...)` — crop the lie ROI, fit the 1.5 aspect, scale to **745×496**, JPEG q90;
+* `protocol_caps = False` — the cloud byte caps do not apply to a loopback service that
+  takes raw JPEG/PNG.
+
+Both drills call `getattr(client, "build_frame", None) or build_slot_frame` and gate
+`check_caps` on `protocol_caps`, so the cloud path is byte-identical to before. The
+returned `RoiGeometry` keeps its meaning: the answer is read in the 372×248 space and
+mapped through the crop, and a resize to 745×496 does not change that because
+`745/372 = 2.0027` and `496/248 = 2` (`scale_x = content_w / 372`).
+
 ### `local_lie_service.py` — lifecycle and activation
 
-* discovery: `CT_Lie3_KR_partner_api_DML\` next to the program files;
-* `ensure_started()` probes health, launches the packaged launcher hidden, waits for
-  8765, and records the service PIDs whose executable lives inside that folder;
+* discovery: `CT_Lie3_KR_partner_api_DML\` next to the program files. The binary is
+  **renamed by the vendor on almost every build** (`TaskBroker0a5a.exe` → `AppHostd83e.exe`
+  → `HostSvc3da4.exe`), so `_binary_names()` reads `data\build_profile.json` →
+  `client_exe_stem` first and then globs `TaskBroker*`/`AppHost*`/`HostSvc*`/any `*.exe`;
+* `ensure_started()` probes health, normalises a template WS key, restores a remembered CT
+  card the package config lost, launches the packaged launcher hidden, waits for 8765, and
+  records the service PIDs whose executable lives inside that folder;
 * `stop_started_service()` terminates **only** those PIDs (a hand-launched instance is
   never touched); `set_busy_probe()` keeps a key refresh from restarting the service
   under a live pass;
-* `apply_online_card()` / `write_credentials()` write `partner_license_code` (and the WS
-  key only when the package ships none — its own `ws_product_key` wins) without a BOM;
+* the lock guarding `_state` is a **`RLock`**: the failure paths used to call
+  `has_online_card()` (which takes the same lock) from inside their own `with _lock`
+  block, so one failed start deadlocked the caller while holding the lock and froze every
+  later probe, hint and supervisor iteration;
+* the config is read through an encoding chain (UTF-8-sig/UTF-8/GBK/CP936/Latin-1) and
+  written as **ASCII-only** JSON without a BOM, so the vendor's locale reader and ours
+  agree. A document that cannot be parsed is never overwritten. Unknown keys survive every
+  write (`vm_pierce_*`, `lie3_ort_ep`, `lie3_client_infer_mode`, `lie3_http_ws_fallback`);
+* WS key policy: the vendor's own `build_profile.json` key is never replaced by the
+  activation-server key (it handshakes successfully); a *placeholder* key is replaced by
+  the package's own; the activation key is used only by a package that ships none;
 * `report_local_pass()` posts to `api/v1/local-lie-events` from a background thread.
 
 `licensing._with_server_device()` is the single entry point for server-driven state: it
 stores `auto_lie.secret_key`, forwards the device document's `ct_card` to
-`apply_online_card()`, and refreshes the WS key through `sync_product_key()`.
+`apply_online_card()`, and refreshes the WS key through `sync_product_key()`. A
+`usage`-only reply (the local-lie accounting call) is explicitly **not** a licence
+document and never changes the card decision.
+
+### 本地测谎 access: one precedence list (v1.3.8)
+
+`current_card()` decides the greyed/bold state of the 本地测谎 radio and the start gate:
+
+1. a reply that ended in `note_card_absent()` (`card_denied`) wins outright — a card
+   cached in the service config is **ignored**, the radio is disabled, a saved selection
+   falls back to 关闭, and a service this app started is stopped;
+2. otherwise the in-memory card from the last reply;
+3. otherwise the card already written in `data\ct_login_config.json` — the service
+   validates that file itself, so this keeps a working install usable in the window
+   before the first reply of a session.
+
+`ui_worker._sync_local_lie_radio()` runs on every poll tick and applies the verdict only
+on change; `card_known()` reports "decided" for both cases so a cardless reply really
+greys and a silent one does not.
 
 ### Server contract (repo `activation_service`)
 
 * `ActivationCode.ct_card` — `CharField(max_length=30, null=True, blank=True)`, operator
   CRUD through `issue-codes` (`ct_card`), `code_action/ct_card` and the Django admin;
   returned by `services.device_summary()` as `ct_card`.
+* **a device may hold several active codes**, so `device_summary(state, *, code=None)`
+  takes the code a request authenticated with (v1.3.8): `services.validate()` passes the
+  record it looked up by `license_id`. Before that it always answered with
+  `active_codes[0]` (earliest expiry), so a heartbeat authenticated by code B could be
+  told code A's card — the operator cleared the card the manager showed and the desktop
+  kept receiving the other code's card, which looked like a cache. There is no cache: the
+  card is read live per request.
+* `POST console/api/devices/<equipment_id>/clear-ct-cards` — clears `ct_card` on **every**
+  active code of one device (audited, returns the cleared count), so an operator cannot
+  clear the wrong row.
 * `LocalLieServiceEvent` — one row per local pass (`event_id` pk, `fingerprint_hash`,
   `license_id`, `ct_card`, `outcome` pending/success/failed/aborted, `frames`,
   `latency_ms`, `detail`, `occurred_at/recorded_at/finalized_at`), migration `0019`.
@@ -1207,26 +1264,46 @@ excludes `test_files`, runtime `data\logs`/`data\license`, `__pycache__` and a s
 
 ```
 activation code row (ct_card, max 30, nullable)          ← operator: console CT 卡 column
-   → services.device_summary():  "ct_card": bound code's card, or ""
-   → services.validate() success: ActivationResult(…, device=device_summary(state), …)
+   → services.device_summary(state, code=record):     "ct_card": the AUTHENTICATED code's card, or ""
+   → services.validate() success: ActivationResult(…, device=device_summary(state, code=record), …)
    → api._response():            data["device"] = result.device        (whole dict)
    → client licensing._with_server_device(): device["ct_card"]
    → local_lie_service.apply_online_card(card) → writes partner_license_code
    → supervisor_set_active(本地测谎) → ensure_started() → /v1/health
 ```
 
-`device_summary()` uses `_active_codes_for_fingerprint(...)[0]`, so:
+`device_summary()` uses the code the request authenticated with, or - where no code is
+known (ban/expiry/failure paths) - `_active_codes_for_fingerprint(...)[0]`, so:
 
-* the card must be on the code **currently bound to this fingerprint**;
+* the card must be on the code **bound to this fingerprint** that the client holds;
 * a revoked or expired code contributes nothing (the device document says `""`);
 * a device with no bound active code also gets `""`.
 
 Empty card ⇒ `supervisor_set_active(True)` only records the wish (log
 `本地测谎 selected, but the licence server has not delivered a CT card yet`) and the panel
 shows `本机未开通本地测谎服务`. A card that arrived but does not make the service listen sets
-`card_rejected` and the panel shows `本地测谎启动失败`. That is why the client never starts the
-service blindly: `licensing._with_server_device()` also logs a WARNING when an accepted
-reply carries no `ct_card`, naming the three ways to set it.
+`card_rejected` and the panel shows `本地测谎启动失败`. A reply that **withdraws** a card sets
+`card_denied`, which outranks the cached config card (see the precedence list above).
+That is why the client never starts the service blindly: `licensing._with_server_device()`
+also logs a WARNING when an accepted reply carries no `ct_card`, naming the three ways to
+set it.
+
+### Shutdown rules (v1.3.8)
+
+Closing the dashboard is the one place that owns the shutdown: it sets the shared stop
+event **before** destroying the window, so the 循环 countdown, both message channels and
+the capture loop observe it immediately. Supporting rules:
+
+* `CountdownWorker._fire_and_reset()` dispatches nothing when the stop event is set — a
+  fire that races the close used to push one more 循环提醒 to 钉钉 from an app the operator
+  had already closed;
+* `DingTalkNotifier.notify()/_deliver()` and `TelegramNotifier.notify()` drop events once
+  stopping (a queued alert is not sent from a closing process);
+* a restored 循环 whose saved `timer.json` deadline already expired is disarmed instead of
+  being re-armed for a full interval by the startup `_countdown_on_change()`;
+* `assistant._force_exit_if_a_thread_is_stuck()` runs last, after every log writer is
+  closed and the single-instance mutex released: a non-daemon `capture_worker` wedged in a
+  Win32 call can otherwise keep the process (and the mutex) alive after the window is gone.
 
 ### Console surface (server repo)
 

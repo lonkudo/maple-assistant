@@ -99,21 +99,46 @@ if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
 # service is started - the supervisor only starts it once a CT card arrived.
 $settings = $null
 try {
-    $settings = Get-Content -LiteralPath $config -Raw | ConvertFrom-Json
+    # The 2026-11 vendor package (build_profile.client_version 1.0.0, exe
+    # AppHostd83e.exe) writes this document in GBK/CP936: its placeholders are the
+    # Chinese words for "your monthly card / your coordinate key", and 0xC4 is not
+    # valid UTF-8.  Get-Content without -Encoding decodes with whatever code page
+    # this machine happens to use, so read the bytes and try UTF-8 strictly first.
+    $configBytes = [System.IO.File]::ReadAllBytes($config)
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        $configText = $strictUtf8.GetString($configBytes)
+    } catch {
+        $configText = [System.Text.Encoding]::Default.GetString($configBytes)
+    }
+    $settings = $configText | ConvertFrom-Json
 } catch {
     throw "local lie service: data\ct_login_config.json is not valid JSON: $($_.Exception.Message)"
 }
 if ($null -eq $settings -or $settings -is [System.Array]) {
     throw "local lie service: data\ct_login_config.json must be a JSON object."
 }
+$configChanged = $false
 $hasCard = $settings.PSObject.Properties.Name -contains "partner_license_code"
 if ($hasCard -and [string]$settings.partner_license_code) {
     $settings.partner_license_code = ""
-    # No BOM: the service parses this file with a strict UTF-8 reader.
+    $configChanged = $true
+}
+# A WS key that still carries the vendor's template text (the shipped placeholder
+# is Chinese, which no real key contains) would fail the startup handshake, so it
+# is cleared as well: the service then uses its own data\build_profile.json key.
+$hasKey = $settings.PSObject.Properties.Name -contains "lie_product_key"
+if ($hasKey -and ([string]$settings.lie_product_key) -match '[^\x20-\x7E]') {
+    $settings.lie_product_key = ""
+    $configChanged = $true
+}
+if ($configChanged) {
+    # No BOM, and ConvertTo-Json escapes non-ASCII, so the result parses under any
+    # code page - the vendor's locale reader and a strict UTF-8 reader agree.
     [System.IO.File]::WriteAllText(
         $config, ($settings | ConvertTo-Json -Depth 8),
         (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "local lie service: bundled ct_login_config.json scrubbed (partner card removed)" -ForegroundColor Cyan
+    Write-Host "local lie service: bundled ct_login_config.json scrubbed (partner card / placeholder key removed)" -ForegroundColor Cyan
 } elseif ($hasCard) {
     Write-Host "local lie service: bundled ct_login_config.json already carries no partner card"
 }

@@ -27,6 +27,14 @@ LOG = logging.getLogger(__name__)
 # does not ship it, so a missing folder is a normal state, not an error.
 SERVICE_FOLDER = Path("CT_Lie3_KR_partner_api_DML") / "CT_Lie3_KR_partner_api_DML"
 LAUNCHER_NAMES = ("启动_后台.vbs", "launch_background.vbs")
+# The vendor renames the service binary on almost every build: TaskBroker0a5a.exe
+# in the 1.2.x package, AppHostd83e.exe in the first 2026-11 drop, and
+# HostSvc3da4.exe in the one the operator installed now.  Discovery therefore
+# never trusts one name: it asks the package's own data/build_profile.json
+# (client_exe_stem) first and falls back to any *.exe beside the launchers.
+BINARY_PATTERNS = (
+    "TaskBroker*.exe", "AppHost*.exe", "HostSvc*.exe", "*Svc*.exe", "*.exe",
+)
 # Readiness: licence validation + WS handshake happen before 8765 listens, which
 # takes ~20s cold, so the startup wait is generous but never blocks the UI.
 START_WAIT_SECONDS = 45.0
@@ -37,13 +45,23 @@ SUPERVISE_INTERVAL_SECONDS = 10.0
 # provisioned, so a service that is not listening is retried after this delay.
 RETRY_BACKOFF_SECONDS = 20.0
 
-_lock = threading.Lock()
+# Re-entrant on purpose: several helpers take it (``has_online_card`` and
+# ``card_known`` read the state) and the failure paths of ``ensure_started`` call
+# them from inside their own ``with _lock`` block.  With a plain Lock that nesting
+# deadlocked the calling thread **while holding the lock**, which froze every later
+# probe, hint and supervisor iteration - the field symptom "本地测谎 一直显示正在
+# 启动/没有任何反应" after one start that could not come up (no CT card, licence
+# refused, or a slow cold start).
+_lock = threading.RLock()
 _state: dict[str, object] = {
     "state": "idle",       # idle | missing | starting | running | failed | external
     "note": "",
     "root": "",
     "started_by_app": False,
     "pids": [],
+    # Set by note_card_absent(): the licence reply said this code has no CT card, so
+    # a cached card in the service config must not keep 本地测谎 selectable.
+    "card_denied": False,
 }
 
 
@@ -68,7 +86,7 @@ def find_service_root(app_root: Path | str) -> Optional[Path]:
             continue
         if any((candidate / name).is_file() for name in LAUNCHER_NAMES):
             return candidate
-        if any(candidate.glob("TaskBroker*.exe")) or any(candidate.glob("AppHost*.exe")):
+        if _binary_names(candidate):
             return candidate
     return None
 
@@ -121,14 +139,32 @@ def _service_pids(root: Path) -> list[int]:
     return sorted(set(pids))
 
 
+def _build_profile_exe_stem(root: Path) -> str:
+    """The service binary name the package itself declares, or ""."""
+
+    profile = _read_service_settings(Path(root) / "data" / "build_profile.json")
+    if not isinstance(profile, dict):
+        return ""
+    return str(profile.get("client_exe_stem") or "").strip()
+
+
 def _binary_names(root: Path) -> list[str]:
-    names = []
-    for pattern in ("TaskBroker*.exe", "AppHost*.exe"):
+    """Executables in the service folder, the package's declared one first."""
+
+    names: list[str] = []
+    stem = _build_profile_exe_stem(root)
+    if stem and (root / f"{stem}.exe").is_file():
+        names.append(f"{stem}.exe")
+    for pattern in BINARY_PATTERNS:
         try:
             names.extend(item.name for item in root.glob(pattern))
         except OSError:
             continue
-    return sorted(set(names))
+    ordered: list[str] = []
+    for name in names:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
 
 
 def _pids_by_name(image: str) -> list[int]:
@@ -197,11 +233,39 @@ def ensure_started(
         _state.update(state="starting", note="正在启动本地测谎服务…",
                       root=str(root), started_by_app=True, pids=[])
     LOG.info("local lie service: starting %s", root)
+    # The updated package ships its template (placeholder) WS key; a start with that
+    # text in the config fails the handshake and 8765 never listens, so it is
+    # normalized to the package's own key first - whatever put the card there.
+    try:
+        normalize_placeholder_ws_key(root)
+    except Exception:  # noqa: BLE001 - a cleanup must never block the start
+        LOG.debug("local lie service: WS key normalization failed", exc_info=True)
+    # A replaced vendor package ships an EMPTY card (the 2026-11 drop does), while
+    # the licence reply already delivered one earlier in this session.  Put it back
+    # before launching, or the service refuses to listen (no_valid_license) and the
+    # panel keeps 本地测谎 enabled for a backend that cannot serve a pass.
+    try:
+        with _lock:
+            memory_card = str(_state.get("online_card") or "").strip()
+        with _lock:
+            denied = bool(_state.get("card_denied"))
+        if memory_card and not denied and config_card(root) != memory_card:
+            write_credentials(root, memory_card)
+            LOG.info(
+                "local lie service: the service config had lost its CT card (%s); "
+                "rewrote it before starting",
+                _mask(memory_card),
+            )
+    except LocalLieServiceError as exc:
+        LOG.warning("local lie service: the CT card could not be restored (%s)", exc)
+    except Exception:  # noqa: BLE001 - a repair must never block the start
+        LOG.debug("local lie service: CT card restore failed", exc_info=True)
     process = _launch(root)
     if process is None:
+        rejected = has_online_card()      # read outside the lock (see _lock)
         with _lock:
             _state.update(state="failed", note="本地测谎服务无法启动（缺少启动器）")
-            if has_online_card():
+            if rejected:
                 # A card WAS delivered, yet the service cannot come up: on this
                 # machine that means the card did not validate.
                 _state["card_rejected"] = True
@@ -217,11 +281,12 @@ def ensure_started(
                               started_by_app=True, card_rejected=False)
             LOG.info("local lie service: started (pid=%s, %s)", pids, note)
             return True, note
+    # The licence server gave us a CT card and the service still refuses to listen:
+    # its own log shows 启动月卡验票失败 for an unactivated card.
+    rejected = has_online_card()          # read outside the lock (see _lock)
     with _lock:
         _state.update(state="failed", note="本地测谎服务启动超时（8765 未响应）")
-        if has_online_card():
-            # The licence server gave us a CT card and the service still refuses to
-            # listen: its own log shows 启动月卡验票失败 for an unactivated card.
+        if rejected:
             _state["card_rejected"] = True
     LOG.warning("local lie service: still not answering after %.0fs",
                 wait_seconds)
@@ -255,46 +320,104 @@ def _supervisor_job(root, interval: float) -> None:
         _supervisor_stop.wait(interval)
 
 
-def has_online_card() -> bool:
-    """Whether the licence server has delivered a CT_ card for this session."""
+def config_card(app_root: Path | str | None = None) -> str:
+    """The CT_ card the service's OWN config currently carries, or "".
+
+    This is what the service will validate at startup, so it is the truth about
+    whether 本地测谎 can run on this machine right now.  It matters because the
+    memory card comes from a licence reply: replacing the vendor package (or a
+    reply that carries no device document) leaves memory and config disagreeing,
+    and the panel used to look "enabled" while the service had no card at all.
+    """
+
+    root = Path(app_root) if app_root is not None else install_root()
+    path = service_credentials_path(root)
+    if path is None or not path.is_file():
+        return ""
+    settings = _read_service_settings(path)
+    if not isinstance(settings, dict):
+        return ""
+    card = str(settings.get("partner_license_code") or "").strip()
+    return card if card.upper().startswith("CT_") else ""
+
+
+def current_card(app_root: Path | str | None = None) -> str:
+    """The CT_ card this machine may start the service with, or "".
+
+    Precedence, and the ONE rule for 本地测谎 access:
+
+    1. a licence reply that ended in ``note_card_absent()`` wins outright - the
+       activation server said this code has no CT card, so a card cached in the
+       service config (written by an earlier session, or left by a replaced
+       package) must NOT keep the backend selectable;
+    2. otherwise the in-memory card from the last reply;
+    3. otherwise the card already written into the service config, which the
+       service validates itself - this is what keeps a working install usable
+       when no reply has arrived yet in this session.
+    """
 
     with _lock:
-        card = str(_state.get("online_card") or "")
-    return card.strip().upper().startswith("CT_")
+        if _state.get("card_denied"):
+            return ""
+        card = str(_state.get("online_card") or "").strip()
+    return card or config_card(app_root)
+
+
+def has_online_card() -> bool:
+    """Whether a usable CT_ card exists (licence reply OR the service config)."""
+
+    return current_card().upper().startswith("CT_")
 
 
 def card_known() -> bool:
-    """Whether a licence reply has already said if this code has a CT card.
+    """Whether it is already decided if this machine has 本地测谎 access.
 
     Before the first reply the desktop knows nothing, so the 本地测谎 selection must
     not be locked out merely because the heartbeat has not answered yet.  A reply
     that carries the device document is authoritative either way: a card sets
-    ``online_card``, a reply without one calls note_card_absent().
+    ``online_card``, a reply without one calls note_card_absent().  A card already
+    written into the service config decides it too - the service validates that
+    file itself, so a silent or cardless reply must not grey a working install.
     """
 
     with _lock:
-        return bool(_state.get("card_checked"))
+        decided = bool(_state.get("card_checked"))
+    return decided or bool(config_card())
 
 
 def note_card_absent() -> None:
     """The licence reply carries no CT card: this code has no 本地测谎 access.
 
-    The in-memory card is dropped so nothing can start the service with a stale
-    one.  The CT package's own credential file is left alone: this is a licence
-    statement, not a reason to rewrite another product's settings.
+    Authoritative, and it outranks a card cached in the service config: the reply
+    is the server saying "no card on this code", so the backend is greyed even if
+    an earlier session (or a replaced package) left a CT_ card in
+    ``data/ct_login_config.json``.  A later reply that carries a card clears the
+    verdict again.
+
+    The card file itself is left alone - it belongs to the vendor package, and only
+    a reply that PROVES a card may write it - but a service THIS app started is
+    stopped, so nothing keeps billing on a credential the server withdrew.
     """
 
     with _lock:
         had = bool(str(_state.get("online_card") or ""))
         _state["card_checked"] = True
+        _state["card_denied"] = True
         _state["online_card"] = ""
-    if had:
+    cached = config_card()
+    if had or cached:
         LOG.warning(
-            "local lie service: the licence reply no longer carries a CT card, "
-            "本地测谎 stays off"
+            "local lie service: the licence reply carries no CT card - 本地测谎 is "
+            "greyed%s",
+            " (a card cached in the service config is ignored)" if cached else "",
         )
     else:
         LOG.info("local lie service: this activation code carries no CT card")
+    try:
+        stop_started_service()
+    except Exception:  # noqa: BLE001 - a stop must never break a licence reply
+        LOG.debug("local lie service: could not stop after the card was withdrawn",
+                  exc_info=True)
 
 
 
@@ -354,6 +477,8 @@ def note_online_card(card: str) -> None:
     with _lock:
         if text:
             _state["online_card"] = text
+            # A reply that carries a card overrules an earlier "no card" verdict.
+            _state["card_denied"] = False
         # A licence reply reached us, so "does this code carry a CT card" is now
         # answered either way - the 本地测谎 selection may be greyed on the truth.
         _state["card_checked"] = True
@@ -475,6 +600,138 @@ def _mask(secret: str) -> str:
     return text[:6] + "*" * (len(text) - 10) + text[-4:]
 
 
+# The CT package's own settings file, in the encodings it is actually shipped in.
+# The 2026-11 package (build_profile.client_version 1.0.0, exe AppHostd83e.exe)
+# ships ``data/ct_login_config.json`` as **GBK/CP936**, because the vendor writes
+# it with a locale ``open()`` on a Chinese Windows: its placeholders are the
+# Chinese words 你的月卡号 / 你的坐标云密钥, and 0xC4 is not valid UTF-8.  Our
+# writers READ it strictly as UTF-8 before, so ``json.loads`` raised
+# ``UnicodeDecodeError`` (a ValueError), the ``except`` branch fell back to an
+# empty dict, and the next write replaced the WHOLE vendor document with one key -
+# losing license_server_url, lie3_backend, the vm_pierce_* switches, the ORT
+# endpoint and the http/ws fallback flags.  Reading through the fallback chain and
+# writing ASCII-only JSON (escaped Unicode is identical under UTF-8 and CP936)
+# keeps the file readable for the service whichever code page it uses.
+_SERVICE_CONFIG_ENCODINGS = ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1")
+# A value that is still the vendor's template cannot be used as a credential.
+_PLACEHOLDER_HINTS = ("你的", "填", "your", "xxxx", "change", "todo")
+
+
+def _looks_like_placeholder(value: object) -> bool:
+    """Whether a config value is still the vendor's template text."""
+
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.casefold()
+    return any(hint in lowered or hint in text for hint in _PLACEHOLDER_HINTS)
+
+
+def _read_service_settings(path: Path) -> Optional[dict]:
+    """Parse the package's config whatever encoding it was shipped in.
+
+    ``None`` means "the document could not be understood": callers must then
+    leave the file alone rather than overwrite settings they never read.
+    """
+
+    try:
+        blob = Path(path).read_bytes()
+    except OSError:
+        return None
+    text: Optional[str] = None
+    for encoding in _SERVICE_CONFIG_ENCODINGS:
+        try:
+            text = blob.decode(encoding)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _write_service_settings(path: Path, settings: dict) -> None:
+    """Write the config as ASCII-only JSON, so any code page parses it.
+
+    No BOM (the service's reader is strict about UTF-8) and ``ensure_ascii``:
+    escaped Unicode means the bytes are valid UTF-8 *and* valid GBK, so the
+    vendor's locale reader and our own reader see the same document.
+    """
+
+    Path(path).write_text(
+        json.dumps(settings, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+
+
+def _load_service_settings(path: Path, *, what: str) -> Optional[dict]:
+    """Read the config, or record why the caller must not write it."""
+
+    settings = _read_service_settings(path)
+    if settings is None:
+        LOG.warning(
+            "local lie service: %s is not readable as JSON (any of %s); "
+            "leaving it untouched so the package's own settings survive",
+            path, "/".join(_SERVICE_CONFIG_ENCODINGS),
+        )
+        return None
+    return settings
+
+
+def _package_ws_key_or_empty(app_root: Path | str, settings: dict) -> str:
+    """A usable WS key for the file: the real one it has, else the package's own.
+
+    The updated package ships the *placeholder* ``LIE-你的坐标云密钥`` where a key
+    belongs.  Sending that to the coordinate cloud fails the startup handshake
+    (``handshake_failed``) and 8765 never listens, so a placeholder is replaced
+    with the package's own ``build_profile.json`` key - the same key the service
+    would have used had the field been empty.
+    """
+
+    current = str(settings.get("lie_product_key") or "").strip()
+    if not _looks_like_placeholder(current):
+        return current
+    return _build_profile_ws_key(app_root)
+
+
+def normalize_placeholder_ws_key(app_root: Path | str) -> bool:
+    """Replace a template WS key with the package's own, before the service starts.
+
+    Called on the way into every start: the operator may put the CT_IN code in
+    ``data/ct_login_config.json`` by hand (the vendor's documented way) without a
+    licence reply ever arriving, and the shipped placeholder key would then fail
+    the startup handshake.  Returns True when the file changed.
+    """
+
+    path = service_credentials_path(app_root)
+    if path is None or not path.is_file():
+        return False
+    settings = _read_service_settings(path)
+    if settings is None:
+        return False
+    current = str(settings.get("lie_product_key") or "").strip()
+    if not _looks_like_placeholder(current):
+        return False
+    replacement = _build_profile_ws_key(app_root)
+    if not replacement:
+        return False          # nothing better to write: leave the file alone
+    settings["lie_product_key"] = replacement
+    try:
+        _write_service_settings(path, settings)
+    except OSError as exc:
+        LOG.warning("local lie service: the WS key could not be written (%s)", exc)
+        return False
+    LOG.info(
+        "local lie service: the placeholder WS key in %s was replaced by the "
+        "package's own key (%s) so the startup handshake can pass",
+        path.name, _mask(replacement),
+    )
+    return True
+
+
 def _build_profile_ws_key(app_root: Path | str) -> str:
     """The WS product key the service package itself ships, or ""."""
 
@@ -484,10 +741,7 @@ def _build_profile_ws_key(app_root: Path | str) -> str:
     path = root / "data" / "build_profile.json"
     if not path.is_file():
         return ""
-    try:
-        profile = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
+    profile = _read_service_settings(path)
     if not isinstance(profile, dict):
         return ""
     return str(profile.get("ws_product_key") or "").strip()
@@ -503,9 +757,16 @@ def _product_key_writable(app_root: Path | str, settings: dict) -> bool:
     ``:8888``; the heartbeat key is issued for the ``8001-8003`` cloud).
     """
 
-    if str(settings.get("lie_product_key") or "").strip():
-        return True                      # ours already: keep it refreshed
-    return not _build_profile_ws_key(app_root)
+    if _looks_like_placeholder(settings.get("lie_product_key")):
+        # Nothing usable yet: ours may fill it only when the package ships none.
+        return not _build_profile_ws_key(app_root)
+    own = _build_profile_ws_key(app_root)
+    if own and str(settings.get("lie_product_key") or "").strip().casefold() == own.casefold():
+        # The vendor's OWN key for its own endpoint.  The handshake of the 2026-11
+        # build succeeds with it (measured: ws_startup_handshake ok, quota 6172), so
+        # it is never replaced by the activation server's cloud key.
+        return False
+    return True                          # ours already: keep it refreshed
 
 
 def write_credentials(
@@ -519,9 +780,16 @@ def write_credentials(
     endpoint with it (``ws://<host>:8888``), while the licence heartbeat's key
     belongs to the ``8001-8003`` cloud the REMOTE 测谎 backend uses.  Overwriting
     a working key would point the service at the wrong endpoint, so the caller's
-    key is written ONLY when the field is empty and the package carries none of
-    its own.  The file is written without a BOM - the service parses it with a
-    strict UTF-8 reader.
+    key is written ONLY when the config field is empty (or still the vendor's
+    placeholder) and the package carries none of its own.  The document keeps every
+    other setting it was shipped with, including the ones we never read
+    (``vm_pierce_*``, ``lie3_ort_ep``, the http/ws fallback flags).  It is written
+    as ASCII-only JSON without a BOM: the 2026-11 package ships this file in GBK,
+    so escaped Unicode is the only form both readers agree on.
+
+    A placeholder ``lie_product_key`` is replaced with the package's own
+    ``build_profile.json`` key, because the literal template text would fail the
+    startup WS handshake and 8765 would never listen.
     """
 
     path = service_credentials_path(app_root)
@@ -530,12 +798,13 @@ def write_credentials(
     card = str(card_code or "").strip()
     if not card.upper().startswith("CT_"):
         raise LocalLieServiceError("激活码无效：请输入 CT_ 开头的测谎卡。")
-    try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(settings, dict):
-            settings = {}
-    except (OSError, ValueError):
-        settings = {}
+    settings = _load_service_settings(path, what="the service credentials")
+    if settings is None:
+        # Never replace a document that could not be read: that is how our write
+        # used to wipe the vendor's license_server_url / backend / vm switches.
+        raise LocalLieServiceError(
+            "本地测谎服务配置无法解析，为避免覆盖其原有设置，本次没有写入激活信息。"
+        )
     settings["partner_license_code"] = card
     key = str(product_key or "").strip()
     if key and _product_key_writable(app_root, settings):
@@ -545,15 +814,21 @@ def write_credentials(
             "(card=%s, key=%s)",
             _mask(card), _mask(key),
         )
-    elif key:
-        LOG.info(
-            "local lie service: keeping the package's own WS product key for now "
-            "(the activation-server key is only used by a package that ships none)"
-        )
+    else:
+        own = _package_ws_key_or_empty(app_root, settings)
+        if own and str(settings.get("lie_product_key") or "").strip() != own:
+            settings["lie_product_key"] = own
+            LOG.info(
+                "local lie service: the placeholder WS key was replaced by the "
+                "package's own key (%s)", _mask(own),
+            )
+        if key:
+            LOG.info(
+                "local lie service: keeping the package's own WS product key for now "
+                "(the activation-server key is only used by a package that ships none)"
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_service_settings(path, settings)
     LOG.info(
         "local lie service: credentials written to %s (card=%s, ws key=%s)",
         path, _mask(card), _mask(str(settings.get("lie_product_key") or "")) or "none",
@@ -665,15 +940,29 @@ def sync_product_key(product_key: str, app_root: Path | str | None = None) -> bo
     path = service_credentials_path(root)
     if path is None or not path.is_file():
         return False
-    try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(settings, dict):
-            settings = {}
-    except (OSError, ValueError):
+    settings = _load_service_settings(path, what="the service credentials")
+    if settings is None:
         return False
+    placeholder_fix = _package_ws_key_or_empty(root, settings)
     if str(settings.get("lie_product_key") or "").strip() == key:
         return False
     if not _product_key_writable(root, settings):
+        # Still clean the vendor's template key up, so the service can handshake
+        # with the package's own key instead of the placeholder text.
+        if (placeholder_fix
+                and str(settings.get("lie_product_key") or "").strip() != placeholder_fix):
+            settings["lie_product_key"] = placeholder_fix
+            try:
+                _write_service_settings(path, settings)
+            except OSError as exc:
+                LOG.warning("local lie service: the WS key could not be written (%s)", exc)
+                return False
+            LOG.info(
+                "local lie service: placeholder WS key replaced by the package's own "
+                "key (%s); the activation-server key was not applied",
+                _mask(placeholder_fix),
+            )
+            return True
         LOG.info(
             "local lie service: WS key refresh skipped - the package's own key is "
             "in use (as requested while testing the local service)"
@@ -681,9 +970,7 @@ def sync_product_key(product_key: str, app_root: Path | str | None = None) -> bo
         return False
     settings["lie_product_key"] = key
     try:
-        path.write_text(
-            json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _write_service_settings(path, settings)
     except OSError as exc:
         LOG.warning("local lie service: the WS key could not be written (%s)", exc)
         return False
@@ -725,22 +1012,32 @@ def apply_online_card(card_code: str) -> bool:
     path = service_credentials_path(root)
     if path is None or not path.is_file():
         return False
-    try:
-        settings = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(settings, dict):
-            settings = {}
-    except (OSError, ValueError):
-        settings = {}
-    if str(settings.get("partner_license_code") or "").strip() == card:
+    settings = _load_service_settings(path, what="the service credentials")
+    if settings is None:
+        # The card is still known from the reply (the access decision above), but
+        # an unreadable document is left alone instead of being replaced.
+        return False
+    changed = False
+    if str(settings.get("partner_license_code") or "").strip() != card:
+        settings["partner_license_code"] = card
+        changed = True
+    # The updated package ships the WS key as a placeholder; replacing it with the
+    # package's own key is what lets the startup handshake succeed.
+    own = _package_ws_key_or_empty(root, settings)
+    if own and str(settings.get("lie_product_key") or "").strip() != own:
+        settings["lie_product_key"] = own
+        changed = True
+        LOG.info(
+            "local lie service: placeholder WS key replaced by the package's own "
+            "key (%s)", _mask(own),
+        )
+    if not changed:
         with _lock:
             _state["online_card"] = card
             _state["card_checked"] = True
         return False
-    settings["partner_license_code"] = card
     try:
-        path.write_text(
-            json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _write_service_settings(path, settings)
     except OSError as exc:
         LOG.warning("local lie service: the online card could not be written (%s)", exc)
         return False
@@ -917,7 +1214,7 @@ def hint_text() -> str:
 def reset_for_tests() -> None:
     with _lock:
         _state.update(state="idle", note="", root="", started_by_app=False, pids=[],
-                      card_rejected=False)
+                      card_rejected=False, card_denied=False)
 
 
 __all__ = [

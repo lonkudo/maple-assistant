@@ -697,10 +697,16 @@ class VideoDrillWorker(threading.Thread):
                                    at_tick=tick, feed_ticks=feed_ticks,
                                    since_start=round(time.perf_counter() - started, 2))
                 round_frame_id += 1
-                built = build_slot_frame(client_bgr, roi_box, frame_id=round_frame_id,
-                                         interval_sec=interval, window_rect=self.image_rect,
-                                         quality=JPEG_QUALITY)
-                caps_ok, caps_reason = check_caps(built)
+                # Same rule as the single-frame drill: the backend owns the picture
+                # format (cloud = 372x248 slot + caps, 本地测谎 = lie3main + no caps).
+                build_frame = getattr(client, "build_frame", None) or build_slot_frame
+                built = build_frame(client_bgr, roi_box, frame_id=round_frame_id,
+                                     interval_sec=interval, window_rect=self.image_rect,
+                                     quality=JPEG_QUALITY)
+                if getattr(client, "protocol_caps", True):
+                    caps_ok, caps_reason = check_caps(built)
+                else:
+                    caps_ok, caps_reason = True, ""
                 if not caps_ok:
                     # keep §3 intact: a skipped frame must not leave a hole in the sequence
                     round_frame_id -= 1

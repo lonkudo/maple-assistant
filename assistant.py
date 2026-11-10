@@ -166,6 +166,47 @@ def _release_single_instance_mutex(handle: int | None) -> None:
     kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
+def _stuck_non_daemon_threads() -> list[threading.Thread]:
+    """Non-daemon threads still alive once the shutdown joins are done."""
+
+    current = threading.current_thread()
+    return [
+        thread for thread in threading.enumerate()
+        if thread is not current and not thread.daemon and thread.is_alive()
+    ]
+
+
+def _force_exit_if_a_thread_is_stuck() -> None:
+    """Leave the process even when a non-daemon worker refuses to stop.
+
+    ``capture_worker`` is deliberately non-daemon, so a normal shutdown waits for
+    the game-window capture to finish.  When that capture is stuck inside a Win32
+    call (hung or minimised game window) the interpreter waits for it forever: the
+    dashboard is gone, every worker was told to stop, the operator saw the app
+    close - yet ``MoonEclipse.exe`` stays in Task Manager holding the
+    single-instance mutex, so the next launch silently exits and reminds of
+    nothing.  The operator reads that as "it was not killed".  Everything is
+    flushed by the time this runs (log writers closed, mutex released), so
+    forcing the exit can only drop a thread that already refused to stop.
+    """
+
+    stuck = _stuck_non_daemon_threads()
+    if not stuck:
+        return
+    logging.getLogger(__name__).warning(
+        "shutdown: %d non-daemon thread(s) still alive after the joins (%s); "
+        "forcing the process to exit so a stuck capture cannot keep the app alive",
+        len(stuck),
+        ", ".join(thread.name for thread in stuck),
+    )
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - a console-less launch has no streams
+        pass
+    os._exit(0)
+
+
 def _show_already_running_notice() -> None:
     """Explain a duplicate launch when the hidden launcher has no console."""
 
@@ -3246,6 +3287,10 @@ def main() -> int:
         server_log_writer.close(drain_timeout=1.0)
         trace_log_writer.close(drain_timeout=1.0)
         _release_single_instance_mutex(singleton_handle)
+        # Last step, after every writer is closed: a capture thread wedged inside
+        # Win32 would otherwise keep the process (and the mutex) alive after the
+        # window is gone.  See ``_force_exit_if_a_thread_is_stuck``.
+        _force_exit_if_a_thread_is_stuck()
     return 0
 
 

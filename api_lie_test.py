@@ -686,14 +686,20 @@ class ApiLieTestWorker(threading.Thread):
                     if measured_source == "red-border":
                         box, roi_source = measured_box, measured_source
                         self._report("roi", f"已锁定红色测谎区域 ROI={box}")
-                frame = build_slot_frame(image, box, frame_id=next_frame_id,
-                                         interval_sec=interval, window_rect=rect,
-                                         quality=JPEG_QUALITY)
-                ok, reason = check_caps(frame)
-                if not ok:
-                    self.stats.failures += 1
-                    self._report("frame", f"{next_frame_id}: 超过协议上限（{reason}）")
-                    continue
+                # The backend decides what picture it wants: the cloud protocol
+                # needs the 372x248 slot, the local CT service documents the
+                # lie3main big picture (745x496) and takes raw JPEG/PNG, so its
+                # own byte caps do not apply either.
+                build_frame = getattr(client, "build_frame", None) or build_slot_frame
+                frame = build_frame(image, box, frame_id=next_frame_id,
+                                    interval_sec=interval, window_rect=rect,
+                                    quality=JPEG_QUALITY)
+                if getattr(client, "protocol_caps", True):
+                    ok, reason = check_caps(frame)
+                    if not ok:
+                        self.stats.failures += 1
+                        self._report("frame", f"{next_frame_id}: 超过协议上限（{reason}）")
+                        continue
                 if not burst.submit(client, frame_id=next_frame_id, jpeg=frame.jpeg,
                                     frame_interval_sec=interval,
                                     context=(frame, image, rect)):
