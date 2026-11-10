@@ -1184,7 +1184,7 @@ def hint_text() -> str:
 
     The wording is the operator's:
       * 本地测谎 selected without a CT_ card from the licence reply
-            -> 本地测谎服务: 本机未开通本地测谎服务
+            -> 本地测谎未开通（授权码没有测谎卡），已置灰
       * a card arrived but the service would not come up / validate it
             -> 本地测谎服务: 本地测谎启动失败
       * service answering /v1/health
@@ -1198,7 +1198,9 @@ def hint_text() -> str:
         rejected = bool(_state.get("card_rejected"))
         desired = _desired_active
     if desired and not has_online_card():
-        return "本地测谎服务: 本机未开通本地测谎服务"
+        # The operator's wording: name the cause and the visible state, so a greyed
+        # radio on the 自动测谎 row is never left unexplained.
+        return "本地测谎未开通（授权码没有测谎卡），已置灰"
     if not desired and state not in ("running", "external", "starting"):
         return ""
     if rejected:

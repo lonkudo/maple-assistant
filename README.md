@@ -48,12 +48,14 @@ The update icon in the title bar turns green when the activation server announce
   745×496 and posts it; the cloud byte caps do not apply to a loopback service. The
   answer is still in the 372×248 protocol space, so the aim geometry is unchanged
   (`745/372 = 2.0027`, `496/248 = 2`).
-- **A withdrawn CT card now wins.** The licence reply is authoritative: a reply without
-  `ct_card` greys 本地测谎, falls a saved selection back to 关闭, stops a service this app
-  started, and **ignores a card cached in `data\ct_login_config.json`**. A later reply
-  that carries a card re-enables it. The cached card only decides in the window before
-  the first reply of a session, and `ensure_started()` rewrites it when a replaced
-  package reset the file.
+- **A withdrawn CT card now wins, and greys the radio in place.** The licence reply is
+  authoritative: a reply without `ct_card` disables the 本地测谎 radio (greyed, the
+  selection **stays** 本地测谎 - it is not silently switched to 关闭), withdraws only the
+  arming, stops a service this app started, and **ignores a card cached in
+  `data\ct_login_config.json`**. When a card returns the same selection is re-armed by
+  itself. The hint line says `本地测谎未开通（授权码没有测谎卡），已置灰`. The cached card
+  only decides in the window before the first reply of a session, and
+  `ensure_started()` rewrites it when a replaced package reset the file.
 - **A start that fails no longer freezes the local backend.** `ensure_started()` called
   `has_online_card()` from inside its own non-reentrant lock, so any failed start (no
   card, licence refused, cold start) deadlocked the caller while holding the lock — every
@@ -1587,7 +1589,7 @@ The panel hint has exactly three failure-free wordings and one failure wording:
 
 | Hint | Meaning |
 | --- | --- |
-| `本机未开通本地测谎服务` | 本地测谎 is selected but the licence reply carried **no** `CT_` card, so the service is deliberately not started |
+| `本地测谎未开通（授权码没有测谎卡），已置灰` | 本地测谎 is selected but the licence reply carried **no** `CT_` card, so the radio is greyed and the service is deliberately not started |
 | `本地测谎启动失败` | a card did arrive, but the service never came up on 8765 (its own `data\logs\client.log` says why) |
 | `已启动` | the service answers `/v1/health` |
 | *(nothing)* | the selection is 关闭 / 云端测谎 |

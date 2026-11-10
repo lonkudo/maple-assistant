@@ -7450,10 +7450,14 @@ class UiWorker(threading.Thread):
     def _sync_local_lie_radio(self) -> None:
         """Grey the 本地测谎 radio when the code has no CT card.
 
-        A code without a card cannot run the local backend, so the radio is
-        disabled and a saved 本地测谎 selection falls back to 关闭 (never to
-        云端测谎: that would start charging 测谎次数 without being asked).  The
-        state is applied only when it changes, because this runs on every UI tick.
+        The radio is disabled in place: the operator's selection is kept (they asked
+        for 本地测谎, and it must come back by itself when a card arrives), only the
+        arming is withdrawn, so no lie window can start a pass that cannot be
+        served.  Forcing the group to 关闭 used to destroy that choice and looked
+        like the assistant silently decided for the operator.
+
+        The state is applied only when it changes, because this runs on every UI
+        tick.
         """
 
         buttons = list(getattr(self, "_api_auto_lie_buttons", []) or [])
@@ -7470,21 +7474,48 @@ class UiWorker(threading.Thread):
             if not allowed:
                 AUTO_LIE_LOG.warning(
                     "自动测谎: this activation code carries no CT card - "
-                    "本地测谎 is disabled (%s)",
+                    "本地测谎 is greyed and disarmed (%s)",
                     self._auto_lie_backend_label(),
                 )
         if not allowed and self._auto_lie_backend_is_local():
-            # The selection is no longer reachable: disarm it instead of leaving a
-            # backend armed that cannot serve a lie window.
+            # The selection stays 本地测谎 (the radio shows it, greyed); the armed
+            # boolean is what must not stay on, or a lie window would try a backend
+            # the machine cannot serve.  No backend var assignment here - that is
+            # what used to look like "the app switched me to 关闭".
+            armed_var = getattr(self, "_api_auto_lie_var", None)
+            if armed_var is not None and bool(armed_var.get()):
+                selection = str(
+                    getattr(self, "_api_auto_lie_backend_var", None).get()
+                )
+                try:
+                    armed_var.set(False)
+                    self._api_auto_lie_change_origin = "no_card"
+                    self._set_api_test_status(
+                        "自动测谎: 本地测谎未开通（授权码没有测谎卡），已置灰并暂停"
+                        "（测谎卡恢复后自动继续）。"
+                    )
+                except Exception:  # noqa: BLE001 - never break the UI tick
+                    LOG.debug("自动测谎 could not be disarmed without a card",
+                              exc_info=True)
+                AUTO_LIE_LOG.warning(
+                    "自动测谎: disarmed without switching the selection (%s) - "
+                    "the code has no CT card", selection,
+                )
+        elif (allowed
+                and getattr(self, "_api_auto_lie_change_origin", "") == "no_card"
+                and str(getattr(self, "_api_auto_lie_backend_var", None).get())
+                == AUTOLIE_BACKEND_LOCAL):
+            # The card came back while 本地测谎 was still selected: resume the same
+            # way a click would, so the operator does not have to re-pick it.
+            self._api_auto_lie_change_origin = ""
+            AUTO_LIE_LOG.info(
+                "自动测谎: the CT card returned - 本地测谎 is re-armed"
+            )
             try:
-                self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
                 self._api_auto_lie_backend_changed()
             except Exception:  # noqa: BLE001 - never break the UI tick
-                LOG.warning("本地测谎 could not fall back to 关闭", exc_info=True)
-                return
-            AUTO_LIE_LOG.warning(
-                "自动测谎: 本地测谎 fell back to 关闭 - the code has no CT card"
-            )
+                LOG.debug("本地测谎 could not be re-armed after the card returned",
+                          exc_info=True)
 
     def _activate_local_lie_clicked(self) -> None:
         """激活测谎: write a CT_ card for the local service and restart it.
@@ -12135,9 +12166,11 @@ class UiWorker(threading.Thread):
         service_note = self._local_lie_service_note()
         if service_note:
             notes.append(service_note)
-        # Why the 本地测谎 radio is greyed: the code has no CT card.  Said once, on
-        # the same hint line, so a greying radio is never unexplained.
-        if self._local_lie_access() is False:
+        # Why the 本地测谎 radio is greyed: the code has no CT card.  The service
+        # note already says it while 本地测谎 is selected; this covers the case where
+        # the radio is greyed but the selection sits on 关闭/云端测谎.
+        if (self._local_lie_access() is False
+                and "已置灰" not in service_note):
             notes.append("本地测谎未开通（授权码没有测谎卡），已置灰")
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note

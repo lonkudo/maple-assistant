@@ -1229,6 +1229,14 @@ document and never changes the card decision.
 on change; `card_known()` reports "decided" for both cases so a cardless reply really
 greys and a silent one does not.
 
+The radio is disabled **in place**: the group variable keeps the operator's selection
+(本地测谎 stays selected, greyed) and only the armed boolean `_api_auto_lie_var` is
+withdrawn, because a lie window must never start a backend the machine cannot serve.
+Assigning the group to 关闭 - what the first cut did - destroyed the operator's choice and
+read as "the assistant switched me to 关闭". A card-bearing reply restores the arming
+through the same `_api_auto_lie_backend_changed()` path a click uses. The hint line
+carries the reason once: `本地测谎未开通（授权码没有测谎卡），已置灰`.
+
 ### Server contract (repo `activation_service`)
 
 * `ActivationCode.ct_card` — `CharField(max_length=30, null=True, blank=True)`, operator
