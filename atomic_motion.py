@@ -176,16 +176,19 @@ class AtomicMotionRunner:
                 return False
             if not self._allowed(allowed):
                 return False
-            if tap("alt", hold_seconds=JUMP_ATTACK_ALT_HOLD_SECONDS) is False:
-                return False
             recoil_executor = self._jump_counterattack_executor
             if jump_counterattack_enabled and callable(recoil_executor):
-                # ``None`` means there is no ordinary held patrol direction
-                # (for example a stationary correction), so retain ordinary
-                # 跳打 instead of inventing a direction reversal.
+                # The movement callback must claim its direction lock BEFORE
+                # Alt is sent.  Emitting Alt here first let a route update
+                # retain that lock through its handoff, after which the
+                # callback saw no eligible held patrol direction and silently
+                # degraded into an ordinary jump attack.
                 recoil_result = recoil_executor(
                     key,
                     lambda seconds: self._wait_allowed(seconds, allowed),
+                    lambda: tap(
+                        "alt", hold_seconds=JUMP_ATTACK_ALT_HOLD_SECONDS,
+                    ) is not False,
                     self._tap_attack,
                     JUMP_COUNTERATTACK_OPPOSITE_HOLD_SECONDS,
                     JUMP_COUNTERATTACK_ATTACK_GAP_SECONDS,
@@ -194,14 +197,19 @@ class AtomicMotionRunner:
                     if recoil_result:
                         LOG.info(
                             "atomic motion %s executed: alt %.0fms + opposite walk %.0fms "
-                            "+ gap %.0fms + attack %s",
+                            "+ attack %s while the opposite direction is held "
+                            "+ settle %.0fms",
                             label,
                             JUMP_ATTACK_ALT_HOLD_SECONDS * 1000.0,
                             JUMP_COUNTERATTACK_OPPOSITE_HOLD_SECONDS * 1000.0,
-                            JUMP_COUNTERATTACK_ATTACK_GAP_SECONDS * 1000.0,
                             key,
+                            JUMP_COUNTERATTACK_ATTACK_GAP_SECONDS * 1000.0,
                         )
                     return bool(recoil_result)
+            if not self._allowed(allowed):
+                return False
+            if tap("alt", hold_seconds=JUMP_ATTACK_ALT_HOLD_SECONDS) is False:
+                return False
             if not self._wait_allowed(JUMP_ATTACK_AIR_GAP_SECONDS, allowed):
                 LOG.info("atomic motion %s cancelled during %.0fms airborne gap",
                          label, JUMP_ATTACK_AIR_GAP_SECONDS * 1000.0)

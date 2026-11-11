@@ -16784,6 +16784,7 @@ class MovementWorker(threading.Thread):
         self,
         attack_key: str,
         wait_allowed: Callable[[float], bool],
+        alt_tap: Callable[[], bool],
         attack_tap: Callable[[str], bool],
         opposite_hold_seconds: float,
         attack_gap_seconds: float,
@@ -16791,11 +16792,12 @@ class MovementWorker(threading.Thread):
         """Borrow an active patrol hold for one atomic 跳反打 sequence.
 
         ``None`` intentionally asks the combat runner to fall back to ordinary
-        跳打: there is no continuous Left/Right hold to reverse during a
-        stationary correction, climb, drop, or idle frame.  A real patrol hold
-        is released and restored under the same locks the MovementWorker uses
-        for its own direction changes, preventing a later stale key-up from
-        cancelling the restored walk.
+        跳打 only when no ordinary held patrol direction exists *before the
+        jump begins* (stationary correction, climb, drop, or idle frame). A
+        real patrol hold is claimed before Alt, released and restored under
+        the same locks the MovementWorker uses for its own direction changes.
+        That prevents a route handoff from moving the directional part past
+        the jump and turning 跳反打 into an ordinary jump attack.
         """
 
         key_down = getattr(self.key_sender, "key_down", None)
@@ -16803,8 +16805,29 @@ class MovementWorker(threading.Thread):
         if not callable(key_down) or not callable(key_up):
             return None
         with self._direction_lock, self._hold_lock:
-            direction = self._walk_hold_key
+            held = self._walk_hold_key
+            if held in ("left", "right"):
+                direction, borrowing = held, True
+            else:
+                # 站桩攻击 never holds a direction - the field log is nothing but
+                # "no held patrol direction to borrow (hold=None)" while the
+                # character stands on its anchor attacking.  跳反打 still has a
+                # meaning there: reverse the side the character is facing, which
+                # is the side it last walked/turned to.
+                direction = self._jump_counterattack_reference_direction()
+                borrowing = False
             if direction not in ("left", "right"):
+                # Nothing known at all: say it once per interval.  The silent
+                # version looked like 跳反打 "worked" while the beat was really an
+                # ordinary jump attack.
+                now = time.monotonic()
+                if now - getattr(self, "_jump_counterattack_note_at", 0.0) >= 10.0:
+                    self._jump_counterattack_note_at = now
+                    LOG.info(
+                        "跳反打: no facing or walked direction to reverse "
+                        "(hold=%s); this beat stays an ordinary jump attack",
+                        held,
+                    )
                 return None
             if (not self._patrol_input_allowed()
                     or (self.direction_transition_event is not None
@@ -16815,25 +16838,42 @@ class MovementWorker(threading.Thread):
             released = False
             opposite_down = False
             try:
+                # The direction lock is already held, so Alt and the
+                # following release/reverse pair cannot be separated by a
+                # movement-worker handoff.  This ordering is the requested
+                # 跳反打 timeline: Alt first, then the original direction up.
+                if not alt_tap():
+                    return False
+                if not wait_allowed(0.0):
+                    return False
                 # Release only the patrol worker's current ownership claim;
                 # other worker claims, if any, stay represented by the shared
-                # key ledger rather than being forcibly scrubbed.
-                if key_up(direction) is False:
-                    return False
-                released = True
-                self._walk_hold_key = None
+                # key ledger rather than being forcibly scrubbed.  When nothing
+                # is held (站桩) there is no claim to release and no direction to
+                # restore afterwards - the jump simply leaves the anchor.
+                if borrowing:
+                    if key_up(direction) is False:
+                        return False
+                    released = True
+                    self._walk_hold_key = None
                 if key_down(opposite) is False:
                     return False
                 opposite_down = True
                 if not wait_allowed(opposite_hold_seconds):
                     return False
+                # Dispatch the attack WHILE the borrowed opposite direction is
+                # still down.  The game takes the attack's facing - and the
+                # small backward displacement that makes 跳反打 visible - from
+                # the direction held at the attack edge.  Releasing it first and
+                # attacking ``attack_gap_seconds`` later is the operator's
+                # report: "the character just jump and attack, don't move".
+                if not attack_tap(attack_key):
+                    return False
+                if not wait_allowed(attack_gap_seconds):
+                    return False
                 if key_up(opposite) is False:
                     return False
                 opposite_down = False
-                if not wait_allowed(attack_gap_seconds):
-                    return False
-                if not attack_tap(attack_key):
-                    return False
                 return True
             finally:
                 if opposite_down:
@@ -16844,6 +16884,26 @@ class MovementWorker(threading.Thread):
                 if released and self._patrol_input_allowed():
                     if key_down(direction) is not False:
                         self._walk_hold_key = direction
+
+    def _jump_counterattack_reference_direction(self) -> Optional[str]:
+        """The side the character is facing/travelling, for 跳反打 while standing.
+
+        站桩攻击 never holds a direction, so the live hold cannot answer this.
+        The stationary attack keeps confirming a facing (``_stationary_facing_command``
+        is recorded where the recovery walk's key went down), the 朝向 option is the
+        configured fallback, and the last walked side covers everything else.  Only
+        a session that has never moved a single step returns ``None``.
+        """
+
+        for attribute in (
+            "_stationary_facing_command",
+            "stationary_facing_direction",
+            "_last_walk_direction",
+        ):
+            value = str(getattr(self, attribute, "") or "").casefold()
+            if value in ("left", "right"):
+                return value
+        return None
 
     def _perform_combat_attack(self, attack_key: str, *, label: str) -> bool:
         """Run a correction/counter combat tap through the atomic runner.
@@ -16864,6 +16924,11 @@ class MovementWorker(threading.Thread):
             return bool(runner.execute_combat_attack(
                 attack_key,
                 jump_attack_enabled=self.jump_attack_enabled,
+                # 跳反打 is a global attack option: the fixed-interval attack
+                # worker already passes it, and leaving it out here made every
+                # route/correction beat an ordinary jump attack - the operator's
+                # "the character just jumps and attacks, it does not move".
+                jump_counterattack_enabled=self.jump_counterattack_enabled,
                 charge_attack_enabled=delivery == "charge",
                 charge_hold_seconds=random.uniform(
                     self.charge_min_seconds, self.charge_max_seconds,
