@@ -64,6 +64,11 @@ class AtomicMotionRunner:
         # It owns the authoritative Left/Right hold ledger, which is the only
         # safe place to borrow a patrol direction for 跳反打.
         self._jump_counterattack_executor: Callable[..., bool | None] | None = None
+        # 跳反打 is a 巡逻模式 feature: the operator asked for it "only when
+        # 巡逻模式 and 跳打 are selected".  The gate is wired to the movement
+        # worker, which is the only owner of the mode flags.
+        self._jump_counterattack_gate: Callable[[], bool] | None = None
+        self._jump_counterattack_note_at = 0.0
 
     def set_jump_counterattack_executor(
         self, executor: Callable[..., bool | None] | None,
@@ -71,6 +76,21 @@ class AtomicMotionRunner:
         """Attach the movement-owned directional recoil executor."""
 
         self._jump_counterattack_executor = executor
+
+    def set_jump_counterattack_gate(
+        self, gate: Callable[[], bool] | None,
+    ) -> None:
+        """Attach the mode gate: True only while 巡逻模式 + 跳打 are selected."""
+
+        self._jump_counterattack_gate = gate
+
+    def _jump_counterattack_last_note_at(self, now: float) -> bool:
+        """Rate-limit the diagnostic for a gate that suppressed 跳反打."""
+
+        if now - self._jump_counterattack_note_at < 10.0:
+            return False
+        self._jump_counterattack_note_at = now
+        return True
 
     def active_name(self) -> str:
         """Return the active sequence label, or ``''`` when idle."""
@@ -177,7 +197,25 @@ class AtomicMotionRunner:
             if not self._allowed(allowed):
                 return False
             recoil_executor = self._jump_counterattack_executor
-            if jump_counterattack_enabled and callable(recoil_executor):
+            # 跳反打 runs ONLY while 巡逻模式 and 跳打 are selected.  The mode gate
+            # is the movement worker's decision; when it says no, the beat stays a
+            # plain jump attack (跳打) instead of reversing a direction that the
+            # current mode does not own.
+            gate_ok = True
+            gate = self._jump_counterattack_gate
+            if callable(gate):
+                try:
+                    gate_ok = bool(gate())
+                except Exception:
+                    LOG.exception("jump counterattack gate failed")
+                    gate_ok = False
+            if jump_counterattack_enabled and not gate_ok:
+                if self._jump_counterattack_last_note_at(time.monotonic()):
+                    LOG.info(
+                        "跳反打: not in 巡逻模式 with 跳打 selected; the beat stays a "
+                        "plain jump attack",
+                    )
+            if jump_counterattack_enabled and gate_ok and callable(recoil_executor):
                 # The movement callback must claim its direction lock BEFORE
                 # Alt is sent.  Emitting Alt here first let a route update
                 # retain that lock through its handoff, after which the

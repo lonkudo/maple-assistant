@@ -2908,6 +2908,13 @@ def main() -> int:
     )
     if callable(jump_counterattack_hook):
         jump_counterattack_hook(movement_worker.execute_jump_counterattack_recoil)
+    # 跳反打 is a 巡逻模式 + 跳打 feature: the runner asks the movement worker,
+    # which owns the mode flags, before every counter attack beat.
+    jump_counterattack_gate = getattr(
+        atomic_motion_runner, "set_jump_counterattack_gate", None,
+    )
+    if callable(jump_counterattack_gate):
+        jump_counterattack_gate(movement_worker.jump_counterattack_allowed_now)
     # 定时巡逻 stage of 站桩攻击: the attack gap is doubled while that stage runs.
     # MovementWorker owns the stage, so the cadence asks it instead of keeping a
     # second copy of the flag that could drift.

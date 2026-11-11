@@ -16756,6 +16756,30 @@ class MovementWorker(threading.Thread):
 
         self.jump_attack_enabled = bool(enabled)
 
+    def jump_counterattack_allowed_now(self) -> bool:
+        """跳反打 runs only in 巡逻模式 with 跳打 selected.
+
+        The operator's rule: "enable 跳反打 only when selected 巡逻模式 and 跳打".
+        站桩攻击, 定时巡逻 and 活花巡逻 all attack without owning a patrol
+        direction, so reversing one there produced the mode mix-up that looked
+        like a broken 跳反打.  The AtomicMotionRunner asks this before every
+        counter attack beat.
+        """
+
+        if not bool(getattr(self, "jump_attack_enabled", False)):
+            return False
+        if not bool(getattr(self, "jump_counterattack_enabled", False)):
+            return False
+        if not bool(getattr(self, "patrol_enabled", False)):
+            return False
+        if bool(getattr(self, "stationary_attack_enabled", False)):
+            return False
+        if bool(getattr(self, "flower_patrol_mode", False)):
+            return False
+        if bool(getattr(self, "_stationary_timed_patrol_active", False)):
+            return False
+        return True
+
     def set_jump_counterattack_enabled(self, enabled: bool) -> None:
         """Toggle the optional 跳打 directional recoil without changing route logic."""
 
