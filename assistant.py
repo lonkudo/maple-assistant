@@ -2903,6 +2903,11 @@ def main() -> int:
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
     movement_worker.set_attack_slot(attack_slot)
+    jump_counterattack_hook = getattr(
+        atomic_motion_runner, "set_jump_counterattack_executor", None,
+    )
+    if callable(jump_counterattack_hook):
+        jump_counterattack_hook(movement_worker.execute_jump_counterattack_recoil)
     # 定时巡逻 stage of 站桩攻击: the attack gap is doubled while that stage runs.
     # MovementWorker owns the stage, so the cadence asks it instead of keeping a
     # second copy of the flag that could drift.

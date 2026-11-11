@@ -23,6 +23,8 @@ LOG = logging.getLogger(__name__)
 # 100 ms after the jump starts: Alt held 45 ms, then 55 ms of airborne gap.
 JUMP_ATTACK_ALT_HOLD_SECONDS = 0.045
 JUMP_ATTACK_AIR_GAP_SECONDS = 0.055
+JUMP_COUNTERATTACK_OPPOSITE_HOLD_SECONDS = 0.045
+JUMP_COUNTERATTACK_ATTACK_GAP_SECONDS = 0.010
 ATTACK_TAP_HOLD_SECONDS = 0.045
 CHARGE_HOLD_MIN_SECONDS = 0.1
 CHARGE_HOLD_MAX_SECONDS = 5.0
@@ -58,6 +60,17 @@ class AtomicMotionRunner:
         self._charge_cancel = threading.Event()
         self._charge_finished = threading.Event()
         self._charge_finished.set()
+        # The MovementWorker registers this optional callback after it exists.
+        # It owns the authoritative Left/Right hold ledger, which is the only
+        # safe place to borrow a patrol direction for 跳反打.
+        self._jump_counterattack_executor: Callable[..., bool | None] | None = None
+
+    def set_jump_counterattack_executor(
+        self, executor: Callable[..., bool | None] | None,
+    ) -> None:
+        """Attach the movement-owned directional recoil executor."""
+
+        self._jump_counterattack_executor = executor
 
     def active_name(self) -> str:
         """Return the active sequence label, or ``''`` when idle."""
@@ -130,6 +143,7 @@ class AtomicMotionRunner:
         key: str,
         *,
         jump_attack_enabled: bool,
+        jump_counterattack_enabled: bool = False,
         charge_attack_enabled: bool = False,
         charge_hold_seconds: float = 0.5,
         allowed: Callable[[], bool] | None = None,
@@ -164,6 +178,30 @@ class AtomicMotionRunner:
                 return False
             if tap("alt", hold_seconds=JUMP_ATTACK_ALT_HOLD_SECONDS) is False:
                 return False
+            recoil_executor = self._jump_counterattack_executor
+            if jump_counterattack_enabled and callable(recoil_executor):
+                # ``None`` means there is no ordinary held patrol direction
+                # (for example a stationary correction), so retain ordinary
+                # 跳打 instead of inventing a direction reversal.
+                recoil_result = recoil_executor(
+                    key,
+                    lambda seconds: self._wait_allowed(seconds, allowed),
+                    self._tap_attack,
+                    JUMP_COUNTERATTACK_OPPOSITE_HOLD_SECONDS,
+                    JUMP_COUNTERATTACK_ATTACK_GAP_SECONDS,
+                )
+                if recoil_result is not None:
+                    if recoil_result:
+                        LOG.info(
+                            "atomic motion %s executed: alt %.0fms + opposite walk %.0fms "
+                            "+ gap %.0fms + attack %s",
+                            label,
+                            JUMP_ATTACK_ALT_HOLD_SECONDS * 1000.0,
+                            JUMP_COUNTERATTACK_OPPOSITE_HOLD_SECONDS * 1000.0,
+                            JUMP_COUNTERATTACK_ATTACK_GAP_SECONDS * 1000.0,
+                            key,
+                        )
+                    return bool(recoil_result)
             if not self._wait_allowed(JUMP_ATTACK_AIR_GAP_SECONDS, allowed):
                 LOG.info("atomic motion %s cancelled during %.0fms airborne gap",
                          label, JUMP_ATTACK_AIR_GAP_SECONDS * 1000.0)

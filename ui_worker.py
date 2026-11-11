@@ -2694,6 +2694,45 @@ class UiWorker(threading.Thread):
                 self._stationary_pickup_control.max_label,
             ]
 
+            # This is intentionally a separate line: it modifies only the
+            # return from the timed-patrol circuit, never a normal stationary
+            # correction or a knockback recovery.
+            delayed_return_row = ttk.Frame(fixed_panel)
+            self._stationary_delayed_return_row = delayed_return_row
+            self._stationary_delayed_return_enabled_var = tk.BooleanVar(value=False)
+            delayed_return_button = ttk.Checkbutton(
+                delayed_return_row,
+                text="延时回桩",
+                width=7,
+                variable=self._stationary_delayed_return_enabled_var,
+                command=self._fixed_on_change,
+            )
+            delayed_return_button.pack(side="left")
+            self._stationary_delayed_return_controls = [delayed_return_button]
+            delayed_return_hint = HoverTooltip(
+                delayed_return_button,
+                "等待1~3 秒再回桩点",
+            )
+            delayed_return_hint.set_enabled(True)
+            self._bind_key_tooltips.append(delayed_return_hint)
+
+            self._jump_counterattack_enabled_var = tk.BooleanVar(value=False)
+            jump_counterattack_button = ttk.Checkbutton(
+                delayed_return_row,
+                text="跳反打",
+                width=6,
+                variable=self._jump_counterattack_enabled_var,
+                command=self._fixed_on_change,
+            )
+            jump_counterattack_button.pack(side="left", padx=(8, 0))
+            self._jump_counterattack_button = jump_counterattack_button
+            jump_counterattack_hint = HoverTooltip(
+                jump_counterattack_button,
+                "跳起来的时候反打，适用于移动速度快的怪物比如白狼",
+            )
+            jump_counterattack_hint.set_enabled(True)
+            self._bind_key_tooltips.append(jump_counterattack_hint)
+
             step_row = ttk.Frame(stationary_options_row)
             self._small_step_options_row = step_row
             self._small_step_row = step_row
@@ -2704,7 +2743,7 @@ class UiWorker(threading.Thread):
                 variable=self._small_step_enabled_var,
                 command=self._fixed_on_change,
             )
-            small_step_button.pack(side="left", padx=(0, 4))
+            small_step_button.pack(side="left", padx=(0, 2))
             small_step_hint = HoverTooltip(
                 small_step_button,
                 "可以用来防止空打（空打指的是站桩连续攻击近一分钟后伤害会消失）。",
@@ -2719,14 +2758,27 @@ class UiWorker(threading.Thread):
                 range_mode=True, value_type=float, step=0.1,
                 lower_bound=5.0, upper_bound=60.0, unit="s",
                 value_width=5,
-                # Same five-character range requirement as 捡东西 above.
-                extra_width_px=16,
+                # Keep this cadence range compact: the 后摇 field follows in
+                # the same row.
+                extra_width_px=4,
                 before_change=lambda: self._undo_capture_callback("小碎步间隔"),
                 on_change=self._fixed_on_change,
             )
             self._small_step_interval_var = self._small_step_control.minimum_var
             self._small_step_max_seconds_var = self._small_step_control.maximum_var
             self._small_step_control.pack(side="left")
+            ttk.Label(step_row, text="后摇").pack(side="left", padx=(4, 1))
+            self._small_step_post_attack_control = NumericValueRangeControl(
+                step_row,
+                tk_module=tk, ttk_module=ttk,
+                minimum=0.70,
+                range_mode=False, value_type=float, step=0.05,
+                lower_bound=0.20, upper_bound=5.00, unit="s",
+                value_width=5,
+                before_change=lambda: self._undo_capture_callback("小碎步后摇"),
+                on_change=self._fixed_on_change,
+            )
+            self._small_step_post_attack_control.pack(side="left")
 
             self._fixed_status = ttk.Label(
                 fixed_panel, text="巡逻攻击未启用。", justify="left",
@@ -6268,6 +6320,11 @@ class UiWorker(threading.Thread):
                 pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
                 if callable(pickup_setter):
                     pickup_setter(False, 0.0, 0.0)
+                delayed_return_setter = getattr(
+                    mover, "set_stationary_delayed_return_enabled", None,
+                )
+                if callable(delayed_return_setter):
+                    delayed_return_setter(False)
                 flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
                 if callable(flower_cycle_setter):
                     flower_cycle_setter(False, 0.0, 0.0)
@@ -6275,7 +6332,7 @@ class UiWorker(threading.Thread):
                 LOG.debug("license lock could disable stationary actions", exc_info=True)
         for variable_name in (
             "_jump_attack_enabled_var", "_stationary_pickup_enabled_var",
-            "_small_step_enabled_var",
+            "_stationary_delayed_return_enabled_var", "_small_step_enabled_var",
         ):
             variable = getattr(self, variable_name, None)
             try:
@@ -10621,6 +10678,10 @@ class UiWorker(threading.Thread):
                 self._attack_delivery_var.get()
                 if hasattr(self, "_attack_delivery_var") else "stand"
             ),
+            "jump_counterattack_enabled": bool(
+                getattr(self, "_jump_counterattack_enabled_var", None).get()
+                if hasattr(self, "_jump_counterattack_enabled_var") else False
+            ),
             "charge_min_seconds": self._charge_hold_range_seconds()[0],
             "charge_max_seconds": self._charge_hold_range_seconds()[1],
             "jump_attack_enabled": bool(
@@ -10633,6 +10694,7 @@ class UiWorker(threading.Thread):
             ),
             "small_step_min_seconds": self._small_step_range_seconds()[0],
             "small_step_max_seconds": self._small_step_range_seconds()[1],
+            "small_step_post_attack_seconds": self._small_step_post_attack_seconds(),
             "stationary_facing_direction": str(
                 getattr(self, "_stationary_facing_direction_var", None).get()
                 if hasattr(self, "_stationary_facing_direction_var") else "right"
@@ -10643,6 +10705,10 @@ class UiWorker(threading.Thread):
             ),
             "stationary_pickup_min_minutes": self._stationary_pickup_range_minutes()[0],
             "stationary_pickup_max_minutes": self._stationary_pickup_range_minutes()[1],
+            "stationary_delayed_return_enabled": bool(
+                getattr(self, "_stationary_delayed_return_enabled_var", None).get()
+                if hasattr(self, "_stationary_delayed_return_enabled_var") else False
+            ),
             "dual_stationary_posts": self._dual_stationary_posts_data(),
             "dual_stationary_switch_min_minutes": self._dual_stationary_switch_range_minutes()[0],
             "dual_stationary_switch_max_minutes": self._dual_stationary_switch_range_minutes()[1],
@@ -10972,6 +11038,15 @@ class UiWorker(threading.Thread):
         minimum, maximum = control.get_bounds()
         return float(minimum), float(maximum)
 
+    def _small_step_post_attack_seconds(self) -> float:
+        """Return 小碎步's single post-attack quiet period in seconds."""
+
+        control = getattr(self, "_small_step_post_attack_control", None)
+        if control is None:
+            return 0.70
+        minimum, _maximum = control.get_bounds()
+        return float(minimum)
+
     def _set_small_step_gap(self, value: Optional[float]) -> None:
         """Compatibility helper: express the old gap as a range maximum."""
         base = self._small_step_gap_seconds() if value is None else value
@@ -11119,6 +11194,21 @@ class UiWorker(threading.Thread):
             and delivery_var is not None
             and str(delivery_var.get()) == "charge"
         )
+        jump_counterattack_enabled = bool(
+            fixed_attack_enabled
+            and delivery_var is not None
+            and str(delivery_var.get()) == "jump"
+        )
+        jump_counterattack_button = getattr(self, "_jump_counterattack_button", None)
+        if jump_counterattack_button is not None:
+            try:
+                jump_counterattack_button.state([
+                    "!disabled" if jump_counterattack_enabled else "disabled"
+                ])
+            except Exception:
+                jump_counterattack_button.configure(
+                    state="normal" if jump_counterattack_enabled else "disabled"
+                )
         charge_label = getattr(self, "_charge_hold_label", None)
         if charge_label is not None:
             try:
@@ -11139,6 +11229,7 @@ class UiWorker(threading.Thread):
         stationary_facing_row = getattr(self, "_stationary_facing_row", None)
         pickup_row = getattr(self, "_stationary_pickup_row", None)
         small_step_row = getattr(self, "_small_step_options_row", None)
+        delayed_return_row = getattr(self, "_stationary_delayed_return_row", None)
         dual_row = getattr(self, "_dual_stationary_row", None)
         # Keep the fourth options row mounted in every mode.  Dead-flower
         # mode must grey unavailable patrol-attack controls rather than
@@ -11155,6 +11246,8 @@ class UiWorker(threading.Thread):
             pickup_row.pack(side="left")
         if small_step_row is not None and not small_step_row.winfo_manager():
             small_step_row.pack(side="left", padx=(4, 0))
+        if delayed_return_row is not None and not delayed_return_row.winfo_manager():
+            delayed_return_row.pack(fill="x", pady=(2, 0))
         if stationary_facing_row is not None:
             stationary_facing_row.pack_forget()
         if dual_row is not None:
@@ -11172,6 +11265,19 @@ class UiWorker(threading.Thread):
                 widget.state(["!disabled" if flower_cycle_enabled else "disabled"])
             except Exception:
                 widget.configure(state="normal" if flower_cycle_enabled else "disabled")
+        for widget in getattr(self, "_stationary_delayed_return_controls", []):
+            if widget is None:
+                continue
+            try:
+                widget.state([
+                    "!disabled" if (mode in ("stationary", "dual_stationary")
+                                      and self._license_allowed()) else "disabled"
+                ])
+            except Exception:
+                widget.configure(
+                    state=("normal" if (mode in ("stationary", "dual_stationary")
+                                      and self._license_allowed()) else "disabled")
+                )
 
     def _fixed_attack_range(self, changed: Optional[str] = None) -> tuple[float, float]:
         """Return the reusable cadence component's ordered range."""
@@ -11219,6 +11325,7 @@ class UiWorker(threading.Thread):
         self._charge_hold_range_seconds()
         for control_name in (
             "_small_step_control",
+            "_small_step_post_attack_control",
             "_stationary_pickup_control",
             "_dual_stationary_switch_control",
         ):
@@ -11327,6 +11434,10 @@ class UiWorker(threading.Thread):
             5.0, float(data.get("charge_max_seconds", charge_min_seconds)),
         ))
         worker.jump_attack = jump_attack_enabled
+        worker.jump_counterattack_enabled = bool(
+            data.get("jump_counterattack_enabled", False)
+            and jump_attack_enabled
+        )
         worker.attack_delivery = delivery
         worker.charge_min_seconds = charge_min_seconds
         worker.charge_max_seconds = charge_max_seconds
@@ -11381,6 +11492,14 @@ class UiWorker(threading.Thread):
                 jump_setter = getattr(mover, "set_jump_attack_enabled", None)
                 if callable(jump_setter):
                     jump_setter(jump_attack_enabled)
+            jump_counterattack_setter = getattr(
+                mover, "set_jump_counterattack_enabled", None,
+            )
+            if callable(jump_counterattack_setter):
+                jump_counterattack_setter(bool(
+                    data.get("jump_counterattack_enabled", False)
+                    and jump_attack_enabled
+                ))
             counterattack_setter = getattr(mover, "set_counterattack", None)
             if callable(counterattack_setter):
                 counterattack_setter(
@@ -11430,6 +11549,11 @@ class UiWorker(threading.Thread):
                 0.0, step_max - step_worker.step_interval
             )
         if mover is not None:
+            mover.small_step_post_attack_seconds = max(0.20, min(
+                5.00,
+                float(data.get("small_step_post_attack_seconds", 0.70)),
+            ))
+        if mover is not None:
             direction = str(data.get("stationary_facing_direction", "right"))
             setter = getattr(mover, "set_stationary_facing_direction", None)
             if callable(setter):
@@ -11458,6 +11582,14 @@ class UiWorker(threading.Thread):
                     and mode in ("stationary", "dual_stationary"),
                     pickup_min * 60.0,
                     max(0.0, pickup_max - pickup_min) * 60.0,
+                )
+            delayed_return_setter = getattr(
+                mover, "set_stationary_delayed_return_enabled", None,
+            )
+            if callable(delayed_return_setter):
+                delayed_return_setter(
+                    bool(data.get("stationary_delayed_return_enabled", False))
+                    and mode in ("stationary", "dual_stationary")
                 )
             flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
             if callable(flower_cycle_setter):
@@ -11508,6 +11640,14 @@ class UiWorker(threading.Thread):
                     + "–"
                     + f"{interval_max:.2f}".rstrip("0").rstrip(".")
                 )
+                jump_delivery_text = ""
+                if self._jump_attack_enabled_var.get():
+                    jump_delivery_text = (
+                        "跳反打已启用；" if bool(
+                            getattr(self, "_jump_counterattack_enabled_var", None).get()
+                            if hasattr(self, "_jump_counterattack_enabled_var") else False
+                        ) else "跳跃后 100ms 攻击；"
+                    )
                 if mode == "dead_flower":
                     self._fixed_status.configure(
                         text="死花模式已启用 - 双层花点按 Buff1 定时上下移动；单层仅 Buff 与 HP/MP。"
@@ -11518,7 +11658,7 @@ class UiWorker(threading.Thread):
                               f"{self._fixed_attack_key_var.get()}；"
                               f"开始运行时记录临时位置；"
                               f"只有正确配置楼层，才能寻路回去；"
-                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}间隔 "
+                              f"{jump_delivery_text}间隔 "
                               f"{interval_text}s。")
                     )
                 elif mode == "dual_stationary":
@@ -11538,7 +11678,7 @@ class UiWorker(threading.Thread):
                     self._fixed_status.configure(
                         text=(f"巡逻攻击已启用 - 按键 "
                               f"{self._fixed_attack_key_var.get()}；"
-                              f"{'跳跃后 200ms 攻击；' if self._jump_attack_enabled_var.get() else ''}间隔 "
+                              f"{jump_delivery_text}间隔 "
                               f"{interval_text}s。")
                     )
             else:
@@ -11654,6 +11794,11 @@ class UiWorker(threading.Thread):
                         )) else "stand"
                     )
                 self._attack_delivery_var.set(delivery)
+            if ("jump_counterattack_enabled" in data
+                    and hasattr(self, "_jump_counterattack_enabled_var")):
+                self._jump_counterattack_enabled_var.set(bool(
+                    data["jump_counterattack_enabled"]
+                ))
             charge_control = getattr(self, "_charge_hold_control", None)
             if charge_control is not None:
                 try:
@@ -11677,10 +11822,25 @@ class UiWorker(threading.Thread):
                     small_min + float(data.get("small_step_gap_seconds", 0.0)),
                 ))
                 small_step_control.set_bounds(small_min, small_max)
+            small_step_post_attack_control = getattr(
+                self, "_small_step_post_attack_control", None,
+            )
+            if small_step_post_attack_control is not None:
+                try:
+                    small_step_post_attack_control.set_bounds(float(data.get(
+                        "small_step_post_attack_seconds", 0.70,
+                    )))
+                except (TypeError, ValueError):
+                    small_step_post_attack_control.set_bounds(0.70)
             if ("stationary_pickup_enabled" in data
                     and hasattr(self, "_stationary_pickup_enabled_var")):
                 self._stationary_pickup_enabled_var.set(bool(
                     data["stationary_pickup_enabled"]
+                ))
+            if ("stationary_delayed_return_enabled" in data
+                    and hasattr(self, "_stationary_delayed_return_enabled_var")):
+                self._stationary_delayed_return_enabled_var.set(bool(
+                    data["stationary_delayed_return_enabled"]
                 ))
             pickup_control = getattr(self, "_stationary_pickup_control", None)
             if pickup_control is not None:

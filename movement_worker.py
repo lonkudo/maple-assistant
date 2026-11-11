@@ -4862,6 +4862,7 @@ class MovementWorker(threading.Thread):
         # it only while their existing arbiter token already owns admission.
         self.atomic_motion_runner = atomic_motion_runner
         self.jump_attack_enabled = False
+        self.jump_counterattack_enabled = False
         self.attack_delivery = "stand"
         self.charge_min_seconds = 0.5
         self.charge_max_seconds = 0.5
@@ -5004,6 +5005,10 @@ class MovementWorker(threading.Thread):
         # UI keeps this aligned with the configured fixed-attack key.  The
         # atomic 小碎步 owns two explicit taps between its two directions.
         self.small_step_attack_key = "ctrl"
+        # Maple can consume the returning direction while the 小碎步 attack is
+        # still animating.  The UI owns this configurable post-attack quiet
+        # period; keep the existing 0.70s behaviour as the default.
+        self.small_step_post_attack_seconds = 0.70
         # Shared with AttackWorker after construction.  A stationary hit uses
         # this to replace one already-planned attack key, never to inject a
         # competing counterattack movement transaction.
@@ -5094,6 +5099,11 @@ class MovementWorker(threading.Thread):
         self.stationary_pickup_enabled = False
         self.stationary_pickup_interval_seconds = 900.0  # 15.0m
         self.stationary_pickup_jitter_seconds = 0.0
+        # Optional pause at the end of a 定时巡逻 circuit.  This is deliberately
+        # a movement-only pause: it never claims the climb/input gate, so the
+        # fixed attack cadence, buffs and potions continue independently.
+        self.stationary_delayed_return_enabled = False
+        self._stationary_return_pause_until = 0.0
         self._stationary_pickup_next_at = float("inf")
         self._stationary_pickup_phase: Optional[str] = None
         # A pickup round gets one automatic retry after it falls off the
@@ -9809,6 +9819,7 @@ class MovementWorker(threading.Thread):
             self._stationary_timed_patrol_active = False
             self._stationary_timed_patrol_returning = False
             self._stationary_timed_patrol_pending_rearm = False
+            self._stationary_return_pause_until = 0.0
             self._clear_stationary_pickup_leg_progress()
             self._stationary_return_dismount_direction = None
             self._reset_stationary_y_recovery()
@@ -9849,6 +9860,7 @@ class MovementWorker(threading.Thread):
         self._stationary_timed_patrol_active = False
         self._stationary_timed_patrol_returning = False
         self._stationary_timed_patrol_pending_rearm = False
+        self._stationary_return_pause_until = 0.0
         self._clear_stationary_pickup_leg_progress()
         self._stationary_return_dismount_direction = None
         self._reset_stationary_y_recovery()
@@ -11062,6 +11074,7 @@ class MovementWorker(threading.Thread):
         self._stationary_timed_patrol_active = False
         self._stationary_timed_patrol_returning = False
         self._stationary_timed_patrol_pending_rearm = False
+        self._stationary_return_pause_until = 0.0
         self._stationary_pickup_next_at = (
             time.monotonic() + self._stationary_pickup_delay()
             if self.stationary_pickup_enabled else float("inf")
@@ -11072,6 +11085,18 @@ class MovementWorker(threading.Thread):
             self.stationary_pickup_interval_seconds / 60.0,
             self.stationary_pickup_jitter_seconds,
         )
+
+    def set_stationary_delayed_return_enabled(self, enabled: bool) -> None:
+        """Enable the optional 1.0-3.0s movement-only pause before 回桩.
+
+        The caller already limits this to 站桩模式 and 双桩模式.  Clearing the
+        setting also clears an already-armed pause immediately, so mode changes
+        cannot leave a hidden movement hold behind.
+        """
+
+        self.stationary_delayed_return_enabled = bool(enabled)
+        if not self.stationary_delayed_return_enabled:
+            self._stationary_return_pause_until = 0.0
 
     def _stationary_pickup_delay(self) -> float:
         return self.stationary_pickup_interval_seconds + random.uniform(
@@ -11758,6 +11783,20 @@ class MovementWorker(threading.Thread):
         anchor = self._stationary_attack_anchor
         if anchor is None:
             return MovementDecision(None, "stationary attack awaiting start position")
+        pause_until = self._stationary_return_pause_until
+        if pause_until > 0.0:
+            remaining = pause_until - time.monotonic()
+            if remaining > 0.0:
+                # Do not set a climb/return state here.  This holds only the
+                # movement decision while regular attacks, buffs and potions
+                # remain eligible to run.
+                self._stationary_x_settled = False
+                return MovementDecision(
+                    None,
+                    f"stationary delayed return movement pause ({remaining:.1f}s remaining)",
+                )
+            self._stationary_return_pause_until = 0.0
+            LOG.info("STATIONARY RETURN: delayed movement pause finished; returning to 桩")
         # A focus dip can interrupt a borrowed route-return immediately after
         # its last movement decision.  On route-enabled maps the old cleanup
         # intentionally kept the return/climb latch, so the AttackWorker
@@ -13802,6 +13841,27 @@ class MovementWorker(threading.Thread):
                         reason="timed patrol return selected closest post",
                         restart_timer=False,
                     )
+                if self.stationary_delayed_return_enabled:
+                    delay_seconds = random.uniform(1.0, 3.0)
+                    self._release_climb_up()
+                    self._climb_state = ClimbState()
+                    self._return_mode = None
+                    self._return_arrival_floor = None
+                    self._patrol_busy_until = 0.0
+                    self._stationary_pickup_return_active = False
+                    self._stationary_return_pause_until = (
+                        time.monotonic() + delay_seconds
+                    )
+                    if floor in self._route_layers:
+                        self._route_layer_index = self._route_layers.index(floor)
+                    self._route_phase = "left"
+                    self._reanchor_tracker_to_layer(floor, observation)
+                    LOG.info(
+                        "STATIONARY RETURN: delaying movement %.2fs before returning to 桩; "
+                        "attacks/buffs/potions remain active",
+                        delay_seconds,
+                    )
+                    return
                 LOG.info("TIMED STATIONARY PATROL: route return reached %s", floor)
                 self._finish_return(floor, observation)
                 return
@@ -15803,6 +15863,15 @@ class MovementWorker(threading.Thread):
                     reason="timed patrol selected closest post",
                     restart_timer=False,
                 )
+            if self.stationary_delayed_return_enabled:
+                delay_seconds = random.uniform(1.0, 3.0)
+                self._stationary_return_pause_until = time.monotonic() + delay_seconds
+                LOG.info(
+                    "STATIONARY RETURN: delaying movement %.2fs before returning to 桩; "
+                    "attacks/buffs/potions remain active",
+                    delay_seconds,
+                )
+                return
             LOG.info("TIMED STATIONARY PATROL: completed on anchor layer; restoring stationary attack")
             return
         self._stationary_timed_patrol_returning = True
@@ -16473,7 +16542,13 @@ class MovementWorker(threading.Thread):
             # Post-attack recovery is intentionally long.  The second
             # direction is only useful after the cast animation can no longer
             # consume it as a movement input.
-            if not self._wait_for_patrol_motion(0.70):
+            post_attack_wait = max(
+                0.20,
+                min(5.00, float(getattr(
+                    self, "small_step_post_attack_seconds", 0.70,
+                ))),
+            )
+            if not self._wait_for_patrol_motion(post_attack_wait):
                 return False
             if not self._patrol_input_allowed():
                 return False
@@ -16492,8 +16567,8 @@ class MovementWorker(threading.Thread):
             self._stationary_facing_requested = None
             self._stationary_x_settled = True
         LOG.info(
-            "small-step complete: %s -> attack -> wait 0.70s -> %s; facing target=%s",
-            first, second, resume_direction or "right",
+            "small-step complete: %s -> attack -> wait %.2fs -> %s; facing target=%s",
+            first, post_attack_wait, second, resume_direction or "right",
         )
         return True
 
@@ -16681,6 +16756,11 @@ class MovementWorker(threading.Thread):
 
         self.jump_attack_enabled = bool(enabled)
 
+    def set_jump_counterattack_enabled(self, enabled: bool) -> None:
+        """Toggle the optional 跳打 directional recoil without changing route logic."""
+
+        self.jump_counterattack_enabled = bool(enabled)
+
     def set_attack_delivery(
         self, delivery: str, charge_min_seconds: float = 0.5,
         charge_max_seconds: float = 0.5,
@@ -16699,6 +16779,71 @@ class MovementWorker(threading.Thread):
         maximum = max(minimum, min(5.0, float(charge_max_seconds)))
         self.charge_min_seconds = minimum
         self.charge_max_seconds = maximum
+
+    def execute_jump_counterattack_recoil(
+        self,
+        attack_key: str,
+        wait_allowed: Callable[[float], bool],
+        attack_tap: Callable[[str], bool],
+        opposite_hold_seconds: float,
+        attack_gap_seconds: float,
+    ) -> Optional[bool]:
+        """Borrow an active patrol hold for one atomic 跳反打 sequence.
+
+        ``None`` intentionally asks the combat runner to fall back to ordinary
+        跳打: there is no continuous Left/Right hold to reverse during a
+        stationary correction, climb, drop, or idle frame.  A real patrol hold
+        is released and restored under the same locks the MovementWorker uses
+        for its own direction changes, preventing a later stale key-up from
+        cancelling the restored walk.
+        """
+
+        key_down = getattr(self.key_sender, "key_down", None)
+        key_up = getattr(self.key_sender, "key_up", None)
+        if not callable(key_down) or not callable(key_up):
+            return None
+        with self._direction_lock, self._hold_lock:
+            direction = self._walk_hold_key
+            if direction not in ("left", "right"):
+                return None
+            if (not self._patrol_input_allowed()
+                    or (self.direction_transition_event is not None
+                        and self.direction_transition_event.is_set())
+                    or not wait_allowed(0.0)):
+                return False
+            opposite = "left" if direction == "right" else "right"
+            released = False
+            opposite_down = False
+            try:
+                # Release only the patrol worker's current ownership claim;
+                # other worker claims, if any, stay represented by the shared
+                # key ledger rather than being forcibly scrubbed.
+                if key_up(direction) is False:
+                    return False
+                released = True
+                self._walk_hold_key = None
+                if key_down(opposite) is False:
+                    return False
+                opposite_down = True
+                if not wait_allowed(opposite_hold_seconds):
+                    return False
+                if key_up(opposite) is False:
+                    return False
+                opposite_down = False
+                if not wait_allowed(attack_gap_seconds):
+                    return False
+                if not attack_tap(attack_key):
+                    return False
+                return True
+            finally:
+                if opposite_down:
+                    key_up(opposite)
+                # Restore the same patrol direction even when the sequence
+                # was cancelled mid-way.  The movement hold manager retains
+                # its original expiry and can release it normally afterward.
+                if released and self._patrol_input_allowed():
+                    if key_down(direction) is not False:
+                        self._walk_hold_key = direction
 
     def _perform_combat_attack(self, attack_key: str, *, label: str) -> bool:
         """Run a correction/counter combat tap through the atomic runner.

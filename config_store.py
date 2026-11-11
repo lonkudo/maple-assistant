@@ -70,6 +70,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "attack_mode": "fixed", "min_interval_seconds": 3.0,
         "max_interval_seconds": 3.1, "attack_key": "ctrl",
         "attack_delivery": "stand",
+        "jump_counterattack_enabled": False,
         "charge_min_seconds": 0.5, "charge_max_seconds": 0.5,
         "combo_attack_enabled": False,
         "combo_attack_slots": [
@@ -84,8 +85,12 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "stationary_facing_direction": "right",
         "small_step_min_seconds": 5.0,
         "small_step_max_seconds": 5.0,
+        # The post-attack quiet period inside 小碎步.  It is intentionally
+        # separate from the interval between complete 小碎步 pairs.
+        "small_step_post_attack_seconds": 0.70,
         "stationary_pickup_min_minutes": 15.0,
         "stationary_pickup_max_minutes": 15.0,
+        "stationary_delayed_return_enabled": False,
         "dual_stationary_switch_min_minutes": 15.0,
         "dual_stationary_switch_max_minutes": 15.0,
     },

@@ -103,6 +103,7 @@ class AttackWorker(threading.Thread):
         # registered into the motion-arbiter queue.
         self.jump_attack = bool(jump_attack)
         self.jump_attack_delay = max(0.0, float(jump_attack_delay))
+        self.jump_counterattack_enabled = False
         # Delivery is selected by the shared UI group: stand, jump, charge,
         # or none.  A charge owns only its combat key; patrol Left/Right stays
         # outside this lane.
@@ -230,6 +231,7 @@ class AttackWorker(threading.Thread):
             return runner.execute_combat_attack(
                 key,
                 jump_attack_enabled=self.jump_attack,
+                jump_counterattack_enabled=self.jump_counterattack_enabled,
                 charge_attack_enabled=delivery == "charge",
                 charge_hold_seconds=random.uniform(
                     self.charge_min_seconds, self.charge_max_seconds,

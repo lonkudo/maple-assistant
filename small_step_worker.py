@@ -45,6 +45,33 @@ class SmallStepWorker(threading.Thread):
             self.step_interval + random.uniform(0.0, self.step_jitter_seconds),
         )
 
+    def _wait_for_micro_step_to_finish(self) -> bool:
+        """Wait until the arbiter has drained the 小碎步 we just queued.
+
+        ``request_micro_step`` admits a complete two-direction transaction,
+        not merely its first key-down.  Starting the cadence clock at request
+        time shortened a five-second interval by the transaction's own
+        duration (notably its configurable post-attack wait).  The arbiter's
+        pending probe is the ownership boundary for that transaction, so use
+        it to start the next cadence only after the pair has ended.
+        """
+
+        pending = getattr(self.motion_arbiter, "micro_step_pending", None)
+        if not callable(pending):
+            # Compatibility with an older arbiter: preserve its former
+            # best-effort cadence instead of blocking this worker forever.
+            return True
+        while not self.stop_event.is_set():
+            try:
+                if not pending():
+                    return True
+            except Exception:
+                LOG.debug("small-step completion probe failed", exc_info=True)
+                return True
+            if self.stop_event.wait(0.02):
+                return False
+        return False
+
     def run(self) -> None:
         LOG.info(
             "small-step worker started offset=%.3fs interval=%.3fs enabled=%s",
@@ -65,6 +92,11 @@ class SmallStepWorker(threading.Thread):
             elif self.motion_arbiter is not None:
                 if self.motion_arbiter.request_micro_step():
                     LOG.info("small-step queued")
+                    # The complete sequence may include a configurable
+                    # 0.20-5.00s post-attack wait.  Do not let that time eat
+                    # into the configured "每 N 秒" interval.
+                    if not self._wait_for_micro_step_to_finish():
+                        break
                 else:
                     refusal = ""
                     probe = getattr(self.motion_arbiter, "last_refusal", None)

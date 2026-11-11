@@ -966,11 +966,11 @@ A reading that is merely *between* two bands but within the nearest-floor allowa
 
 **巡逻攻击** performs the configured attack key at its selected fixed interval. **小碎步** is an optional timed motion with its own interval.
 
-**小碎步** is an atomic left/right correction. Each direction is held for 220 ms with a 100 ms neutral gap; normal patrol resumes only after the sequence completes.
+**小碎步** is an atomic left/right correction. Its first and return directions are each held for 100 ms, with one attack between them. The configurable **后摇** is the post-attack quiet period before the return direction: it is a single `0.20–5.00 s` direct-value field in 0.05 s steps and defaults to 0.70 s. The configured `每 … s` cadence starts only after the complete pair finishes, including 后摇 and the return release; it never starts when the pair is merely queued, so the motion’s own duration cannot make consecutive 小碎步 appear too frequent.
 
 **站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
 
-The attack-delivery choice is **站打**, **跳打**, **蓄力**, or **不打**. 站打 taps the configured attack key, 跳打 performs the established jump-then-attack sequence, and 蓄力 holds the configured key for a random inclusive value between its two displayed seconds values before releasing it. During a charge, ordinary patrol Left/Right can still run, but other action-key motions wait; HP/MP recovery can interrupt the hold. Selecting 不打, or setting the attack key to `-`, suppresses normal attack output.
+The attack-delivery choice is **站打**, **跳打**, **蓄力**, or **不打**. 站打 taps the configured attack key, 跳打 performs the established jump-then-attack sequence, and 蓄力 holds the configured key for a random inclusive value between its two displayed seconds values before releasing it. During a charge, ordinary patrol Left/Right can still run, but other action-key motions wait; HP/MP recovery can interrupt the hold. Selecting 不打, or setting the attack key to `-`, suppresses normal attack output. **跳反打** is available only with 跳打 and only while ordinary patrol owns a continuous Left/Right hold: after Alt it briefly releases that held direction, taps the opposite direction for 45 ms, waits 10 ms, taps the attack key, and restores the original patrol hold. Stationary, climb, drop, and endpoint-turn states fall back to ordinary 跳打 instead.
 
 **死花模式** is separate from combat patrol and sends only buffs plus HP/MP items. With
 **重置花** unchecked it never moves, regardless of recorded flower points. With **重置花**
@@ -1063,6 +1063,8 @@ Two related rules protect that motion:
 ### 定时巡逻 (stand-still timed route)
 
 **定时巡逻** is available in 站桩模式 and 双桩模式. When its timer fires from a settled 桩, it borrows the selected recorded patrol route, patrols every route layer exactly once with the normal rope/jump/drop logic, then returns to the anchor layer and the nearest valid 桩. It sends no `Z` pickup input while moving. Its inclusive random interval is displayed in minutes (`每 … m`, 1.0m to 30.0m); persisted configuration and the movement worker continue to use seconds.
+
+**延时回桩** is available only in 站桩模式 and 双桩模式. After a 定时巡逻 circuit reaches the return layer and chooses its nearest valid 桩, it pauses movement for one random `1.0–3.0 s` delay before starting that return. This delay owns no input gate: normal attacks, buffs, and HP/MP items continue during it.
 
 ## Alerts and recovery
 
