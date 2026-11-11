@@ -17,15 +17,20 @@ from __future__ import annotations
 from pathlib import Path
 
 # Every live WebSocket service instance, grouped by host.
+# 222.215.232.230 (48001, 48002, 48003, 48007, 48009, 48011, 48013, 48015) was
+# retired on the operator's word; only 117.50.223.113 stays live.  Keeping the old
+# rows commented here (rather than deleting them) records that the client must not
+# be pointed at that host again without a decision - the list is what a pass walks
+# in random order, so a stale row would silently send passes there.
 WS_ENDPOINTS: tuple[tuple[str, int], ...] = (
-    ("222.215.232.230", 48001),
-    ("222.215.232.230", 48002),
-    ("222.215.232.230", 48003),
-    ("222.215.232.230", 48007),
-    ("222.215.232.230", 48009),
-    ("222.215.232.230", 48011),
-    ("222.215.232.230", 48013),
-    ("222.215.232.230", 48015),
+    # ("222.215.232.230", 48001),
+    # ("222.215.232.230", 48002),
+    # ("222.215.232.230", 48003),
+    # ("222.215.232.230", 48007),
+    # ("222.215.232.230", 48009),
+    # ("222.215.232.230", 48011),
+    # ("222.215.232.230", 48013),
+    # ("222.215.232.230", 48015),
     ("117.50.223.113", 8001),
     ("117.50.223.113", 8002),
     ("117.50.223.113", 8003),
