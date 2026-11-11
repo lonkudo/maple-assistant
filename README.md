@@ -755,6 +755,39 @@ The interface calculates each main column from its widest supported content when
 
 Every hint shown to the operator is Chinese, including the refusal reasons printed under **图层校准与巡逻** — a failed recording names the cause in Chinese (for example 最上层无法录制绳索点, 该楼层尚未录制, 未找到游戏窗口, 巡逻启动时未检测到黄色角色标记) instead of mixing an English reason into a Chinese prefix. Messages that only reach the log or a developer remain English on purpose, so a traceback can be searched for by its original wording.
 
+## Auto reconnect assets and Chinese install paths
+
+Auto reconnect is asset driven: the page signatures (`page_login_connect_target.jpg`,
+`page_world_grid1/2_target.jpg`, `page_channel_grid1/2_target.jpg`) fix which window is on
+screen, `login_page_target.jpg` is the login page's colour reference, and
+`channel_number_templates_<size>.npz` recognises channel digits. All of them live in
+`recording-assets\`, which both packages ship (normal package: `MoonEclipse\recording-assets\`;
+standalone: `recording-assets\` beside `MoonEclipse.exe`).
+
+A Chinese install folder (`D:\蛇夫G\助手\…`) used to break this, because OpenCV's own file
+calls cannot open a non-ASCII path — every signature reported "missing" and the reconnect
+then ran blind on preset coordinates. The rule every asset path follows now:
+
+| Asset kind | Read/written through | Why it works under a Chinese folder |
+| --- | --- | --- |
+| images (`*.jpg`, `*.png`) | `image_io.read_image` / `save_reference` (`np.fromfile` + `cv2.imdecode`, `cv2.imencode` + `write_bytes`) | Python's Unicode-aware I/O does the file work; cv2 only sees bytes |
+| channel templates (`*.npz`) | `np.load` | also Python-level I/O |
+| video (测试api / 循环 MP4) | `image_io.VideoCapture` / `VideoWriter` | a non-ASCII source is copied to a temporary ASCII path, and the MP4 is moved back on release |
+| the asset folder itself | `application_root()` plus the parent walk in `_login_reference_paths()` | finds `recording-assets\` for a source tree, a Nuitka build and a nested extraction |
+
+Measured with `work/reconnect_chinese_assets_check.py` (46/46) inside four field-style
+folders (`蛇夫G`, `助手`, `测试 中文路径`, `D盘 副本`): every loader returns its data, a
+screenshot writes to `中文截图 名称.jpg` and reads back, an `中文 录像.mp4` round-trips, and a
+simulated frozen run resolves `ROOT`/`ASSETS_DIR` inside `蛇夫G EXE 版`. A control in the same
+check shows plain `cv2.imread` returning `None` on those paths, so the reader is what saves
+it — never add a direct `cv2.imread`/`cv2.VideoCapture` call for a path that can contain
+non-ASCII characters.
+
+Two template assets are optional and a missing one is tolerated: `login_connect_target.jpg`
+(the exact-art route for the 连接 button) is **not** shipped, so that route stays inactive and
+reconnect uses the preset coordinates; `offline_prompt_square.png` ships with the release
+even though the source tree keeps it outside `recording-assets\`.
+
 ## Recording a map
 
 Record each map before enabling a route:
@@ -1300,6 +1333,41 @@ If a hotkey does nothing, the log names the cause: an active IME can swallow the
 the IME to 英数/半角英数, or set `"delivery": "hook"` in `hotkey.json`.
 
 For a minimap-less area, return to a normal map before expecting patrol or disconnect monitoring to resume.
+
+### Memory: what is bounded, and how to read a growth report
+
+A patrol process churns a 1366×768×3 frame about five times a second, so its working set
+rises quickly and then flattens. Everything long-lived inside the assistant is bounded:
+
+| Buffer | Bound |
+| --- | --- |
+| shared capture bus | one frame per subscriber (`_latest`), never a history |
+| log pipeline → disk (`AsyncBatchLogHandler`) | `_RecordBuffer.capacity`, oldest INFO line evicted; WARNING/ERROR kept |
+| in-app running log | `queue(maxsize=300)` plus `deque(maxlen=500)` history |
+| running-log panel | last 8 lines (`del self._log_display_lines[:-8]`) |
+| UI poll trace | rebuilt every poll |
+| 循环 / 测谎 recordings and MP4s | streamed to disk through `image_io.VideoWriter`, bounded by `max_frames` |
+| marker sizes, minimap box history, arbiter queues, undo history | `deque(maxlen=…)` / ten snapshots |
+
+A scan for containers that are only ever appended to (36 hits) found every one of them
+either built once at UI construction or explicitly trimmed. The per-frame analysis chain
+(`MinimapDetector.detect` → `analyze_minimap` → marker detection → `MapStructureTracker`)
+was measured under `tracemalloc`: 54.6 bytes/frame over the first 1500 frames and **0.6
+bytes/frame** over the next 2000, i.e. retention does not scale with iterations — freed
+churn, not a leak.
+
+So if Task Manager shows growth, look at *which* process:
+
+* assistant climbing then flattening → allocation churn, expected;
+* **`HostSvc3da4.exe`** (the local lie service, ONNX + DirectML) climbing → it is the vendor
+  service's own arena, not the assistant;
+* assistant climbing linearly and never flattening → a real leak, and the useful detail is
+  the rate plus which feature ran (patrol only, lie passes, 自动重连).
+
+`自动重开` reacts to **system** memory (98 %), not to the assistant's own working set, so it
+will not fire for a leak that only grows slowly. Re-running
+`work/memory_leak_scan.py` (static) and `work/frame_path_memory_check.py` (per-frame
+retention) is the quickest way to re-check after a change.
 
 ### Runtime timing and diagnostic logs
 

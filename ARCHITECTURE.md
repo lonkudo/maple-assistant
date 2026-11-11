@@ -1020,6 +1020,60 @@ stay actions and never move a band.
 5. **Workers communicate intent, not raw state mutations.** A worker may request a motion or alert; it must not independently overwrite another worker’s session state.
 6. **Release is mandatory.** Stop, focus loss, and worker failure must clear every held key through the shared sender. Stop Patrol clears the automation gate and redraws its stopped state in the UI callback; the potentially slower sender scrub runs on `patrol-stop-cleanup` in the background. It never waits for the retired YOLO subprocess.
 7. **Vendor boundaries remain intact.** Extend auto-lie behavior in the adapter layer, never by editing `autolie_api/`.
+8. **Asset I/O goes through `image_io`.** Never call `cv2.imread`/`cv2.imwrite`/`cv2.VideoCapture` directly for a path that can contain non-ASCII characters (see *Asset I/O and non-ASCII paths*).
+9. **Long-lived containers are bounded.** Anything appended per frame, per tick or per event needs a `maxlen`, a trim, or an eviction rule (see *Memory discipline*).
+
+## Asset I/O and non-ASCII paths
+
+The reconnect workflow — and the lie drills, the minimap reference and the 循环 recorder —
+all read bundled assets from `recording-assets\`, which lives under the install folder. An
+install folder may be Chinese (`D:\蛇夫G\助手\…`), and OpenCV's file API cannot open such a
+path: every page signature then reported "missing" and the reconnect ran blind on preset
+coordinates.
+
+The boundary is therefore `image_io`, and nothing else:
+
+* `read_image` → `np.fromfile` + `cv2.imdecode`, `save_reference` → `cv2.imencode` +
+  `Path.write_bytes`; cv2 only ever sees bytes, never a path;
+* `VideoCapture` copies a non-ASCII source to a temporary ASCII path and deletes the copy on
+  `release()`; `VideoWriter` writes to a temporary ASCII path and moves the result onto the
+  target, so an MP4 still lands in a Chinese `screenshots\`;
+* `np.load` covers the channel-template `.npz` (Python-level I/O);
+* `application_root()` resolves the runtime folder for a source tree, a Nuitka build and an
+  extraction nested one level down, and `_login_reference_paths()` walks that folder plus
+  its parents looking for `recording-assets\`, so the folder's own name never matters.
+
+`work/reconnect_chinese_assets_check.py` (46/46) pins this: four field-style Chinese
+folders, a Chinese screenshot name, an MP4 round trip, a simulated frozen run resolving
+`ROOT`/`ASSETS_DIR` in `蛇夫G EXE 版`, and a control proving plain `cv2.imread` returns
+`None` on the same paths.
+
+## Memory discipline
+
+A capture loop at 5 fps allocates and frees a 1366×768×3 frame five times a second, so a
+rising working set is normal up to the point where the allocator stops returning pages.
+What must never happen is a container that grows per frame, per tick or per event, so each
+long-lived buffer is bounded explicitly:
+
+| Buffer | Bound |
+| --- | --- |
+| `CapturedFrameBus` | `_latest` only; one slot per subscriber queue |
+| `_RecordBuffer` behind `AsyncBatchLogHandler` | `capacity`, oldest INFO evicted, section markers kept |
+| `UiLogHandler` | `queue(maxsize=…)` + `deque(maxlen=history)` |
+| running-log panel | `del self._log_display_lines[:-8]` |
+| `_ui_poll_trace_steps` | rebuilt per poll |
+| lie / 循环 recorders | streamed to disk, `max_frames` |
+| marker sizes, minimap box history, arbiter `_pending`/`_queued`, undo history | `deque(maxlen=…)`, ten snapshots |
+
+Measured (`work/frame_path_memory_check.py`): the per-frame chain retains 54.6 bytes/frame
+over the first 1500 frames and 0.6 bytes/frame over the next 2000 — retention does not scale
+with iterations. `work/memory_leak_scan.py` is the static companion: it reports every
+`self.<attr> = []`/`deque()` that is later appended to, so a new unbounded buffer shows up in
+review instead of in a field report.
+
+`auto_restart_worker` samples **system** memory (98 % threshold), not the assistant's own
+working set, so a slow leak of a few MB per hour is not covered by it; the way to identify
+one is the per-process working set over time, plus which feature was running.
 
 ## Packaging and release surfaces
 
