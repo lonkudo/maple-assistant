@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     One-command full checkpoint: optionally run tests, then rebuild the
     the distributable folder and its versioned zip (1.0.0 style).
@@ -90,21 +90,27 @@ function Restore-VersionFile {
     }
 }
 Write-Host "release version: v$version" -ForegroundColor Green
-# build_release.ps1 must stay UTF-8 WITH BOM - Windows PowerShell 5.1 cannot
-# parse its Chinese script text without it, and some editors strip the BOM.
-# Repair automatically so the one-command flow always works.
-$buildScript = Join-Path $root "build_release.ps1"
-$bytes = [System.IO.File]::ReadAllBytes($buildScript)
-if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
-    $text = [System.IO.File]::ReadAllText($buildScript, [System.Text.Encoding]::UTF8)
-    [System.IO.File]::WriteAllText(
-        $buildScript, $text, (New-Object System.Text.UTF8Encoding $true)
-    )
-    Write-Host "build_release.ps1 BOM re-added (UTF-8 with BOM)" -ForegroundColor Yellow
+# Scripts with Chinese text must stay UTF-8 WITH BOM - Windows PowerShell 5.1
+# decodes a BOM-less file with the ANSI code page, which can eat the quote that
+# follows a Chinese string and turn the script into a parse error at run time.
+# Some editors (and patch tools) strip the BOM, so repair automatically: the
+# one-command flow must never ship an installer that 安装.bat cannot parse.
+foreach ($scriptName in @("build_release.ps1", "install.ps1")) {
+    $scriptPath = Join-Path $root $scriptName
+    if (-not (Test-Path -LiteralPath $scriptPath)) { continue }
+    $bytes = [System.IO.File]::ReadAllBytes($scriptPath)
+    if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+        $text = [System.IO.File]::ReadAllText($scriptPath, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText(
+            $scriptPath, $text, (New-Object System.Text.UTF8Encoding $true)
+        )
+        Write-Host "$scriptName BOM re-added (UTF-8 with BOM)" -ForegroundColor Yellow
+    }
 }
 $zips = @()
 # One package only: no CPU/CUDA split (the API does the work, there is no local model).
 Write-Host "building the MoonEclipse package..." -ForegroundColor Cyan
+$buildScript = Join-Path $root "build_release.ps1"
 & powershell -NoProfile -ExecutionPolicy Bypass `
     -File $buildScript -Version $version -Zip 2>&1
 if ($LASTEXITCODE -ne 0) {

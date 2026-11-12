@@ -224,6 +224,19 @@ if (-not (Invoke-PipMirrored @("-r", "requirements.txt"))) {
     throw "pip 依赖安装失败"
 }
 
+# 截图依赖 win32con / win32gui / win32ui。 其中 win32ui 是 MFC 编译的，机器上没有
+# 「Microsoft Visual C++ 2015-2022 x64 运行库」时会在导入阶段报 DLL load failed，
+# 助手随后把截图失败说成「截图需要 pywin32」——模块其实都在。 这里先验证并给出
+# 可执行的下一步，安装过程本身不因此失败。
+$win32Probe = & $venvPy -c "import win32con, win32gui, win32ui; print('ok')" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Warning "win32 截图模块加载失败：$win32Probe"
+    Write-Host "  请安装 Microsoft Visual C++ 2015-2022 x64 运行库（vc_redist.x64.exe）后重新运行 安装.bat；" -ForegroundColor Yellow
+    Write-Host "  若已安装仍报错，请把上面这一行报错原文发给开发者。" -ForegroundColor Yellow
+    Write-Host ""
+}
+
 # ---- 4. 生成启动器 ------------------------------------------------------------
 # 启动器内容必须为纯 ASCII：cmd 会用系统代码页解码 .bat，中文会乱码并破坏语法。
 # BAT 只调用隐藏的 Windows Script Host。VBS 直接用 runas 启动 pythonw，

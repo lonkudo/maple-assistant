@@ -79,7 +79,17 @@ $endpointsSource = Join-Path $root "endpoints_protected.py"
 $endpointsDir = Join-Path $root "work\endpoints-pyd"
 $endpointsPyd = @(Get-ChildItem -LiteralPath $endpointsDir -File -Filter "endpoints_protected*.pyd" -ErrorAction SilentlyContinue) |
     Sort-Object -Property Name | Select-Object -First 1
-if (-not $endpointsPyd -and (Test-Path -LiteralPath $endpointsSource)) {
+# The cache in work\endpoints-pyd is only a build accelerant.  Treating its mere
+# existence as "up to date" shipped a stale table once: the 2026-11-09 .pyd (built
+# while 222.215.232.230 was still live) was copied into every later package, so the
+# retired host stayed a live endpoint behind a comment-only edit of the source.
+# Recompile whenever the source is newer than the cached module.
+$endpointsStale = $endpointsPyd -and (Test-Path -LiteralPath $endpointsSource) -and
+    ((Get-Item -LiteralPath $endpointsSource).LastWriteTimeUtc -gt $endpointsPyd.LastWriteTimeUtc)
+if ((-not $endpointsPyd -or $endpointsStale) -and (Test-Path -LiteralPath $endpointsSource)) {
+    if ($endpointsStale) {
+        Write-Host "endpoints_protected.py is newer than the cached .pyd; recompiling the endpoint table" -ForegroundColor Yellow
+    }
     Write-Host "building the compiled endpoint table (endpoints_protected.pyd)..." -ForegroundColor Cyan
     & $python -m nuitka --module $endpointsSource --output-dir=$endpointsDir 2>&1 |
         Select-Object -Last 2

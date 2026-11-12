@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Build a source-free Nuitka release after the normal release has been field-approved.
 
@@ -492,6 +492,36 @@ if (Test-Path -LiteralPath $localServicePackager) {
 } else {
     Write-Warning "package_local_service.ps1 is missing: the local lie service stays external."
 }
+
+# Screenshot dependency of the FROZEN package: every win32*.pyd is bundled, but
+# ``win32ui.pyd`` (the DC/BitBlt path capture_worker uses) is linked against
+# MFC, and Nuitka copies only the C runtime (vcruntime140*.dll).  On a machine
+# without the Microsoft Visual C++ 2015-2022 x64 Redistributable the import
+# fails with "DLL load failed while importing win32ui", which capture_worker
+# reports as "截图需要 pywin32" - a screenshot that cannot work although all
+# three modules are present.  Verified 2026-11-11 by reading the PE import
+# tables: win32gui/win32api/win32process/pythoncom/pywintypes need only
+# vcruntime140(_1), win32ui also needs mfc140u.dll.  Ship that runtime beside
+# the executable so a clean Windows install can screenshot.
+$mfcCandidates = @(
+    "mfc140u.dll", "mfc140.dll",
+    "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+    "concrt140.dll"
+)
+$mfcSystemDir = Join-Path $env:WINDIR "System32"
+$mfcCopied = @()
+foreach ($mfcName in $mfcCandidates) {
+    $mfcSource = Join-Path $mfcSystemDir $mfcName
+    if (Test-Path -LiteralPath $mfcSource) {
+        Copy-Item -LiteralPath $mfcSource `
+            -Destination (Join-Path $dist.FullName $mfcName) -Force
+        $mfcCopied += $mfcName
+    }
+}
+if ($mfcCopied -notcontains "mfc140u.dll") {
+    throw "mfc140u.dll was not found in $mfcSystemDir, but win32ui.pyd requires it: the frozen package would fail on its first screenshot."
+}
+Write-Host "  pywin32 capture runtime: bundled $($mfcCopied -join ', ')" -ForegroundColor Cyan
 
 # Ship the complete standalone directory.  The executable's embedded Python
 # runtime lives beside MoonEclipse.exe, so distributing only the .exe would
