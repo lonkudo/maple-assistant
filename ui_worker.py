@@ -1394,6 +1394,7 @@ class UiWorker(threading.Thread):
         map_identity_store: Optional[MapIdentityStore] = None,
         status_worker: Any = None,
         attack_worker: Any = None,
+        random_rest_worker: Any = None,
         random_jump_worker: Any = None,
         small_step_worker: Any = None,
         hotkey_queue: Optional["queue.Queue[str]"] = None,
@@ -1452,6 +1453,10 @@ class UiWorker(threading.Thread):
         # Fixed-rate attack worker (AttackWorker) the Fixed Attack panel
         # toggles: enabled flag, interval and attack key are applied live.
         self.attack_worker = attack_worker
+        # 随机休息 schedule: the panel only decides whether it is enabled (and in
+        # which attack modes); the worker owns the 75-120 min / 3-15 s timing and
+        # the movement+attack pause itself.
+        self.random_rest_worker = random_rest_worker
         # Independent Alt timer. It shares only the attack worker's runtime
         # gating events and exposes no configurable key binding.
         self.random_jump_worker = random_jump_worker
@@ -2378,6 +2383,23 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(8, 0))
+            # 随机休息 sits with the mode it belongs to, because it only exists
+            # for the patrol/standing modes (巡逻攻击 / 站桩攻击 / 双桩模式).  The
+            # panel greys it out everywhere else instead of hiding it, so the
+            # option is discoverable without changing the panel geometry.
+            self._random_rest_row = ttk.Frame(fixed_panel)
+            self._random_rest_row.pack(fill="x", pady=(4, 0))
+            self._random_rest_var = tk.BooleanVar(value=False)
+            self._random_rest_check = ttk.Checkbutton(
+                self._random_rest_row, text="随机休息",
+                variable=self._random_rest_var,
+                command=self._fixed_on_change,
+            )
+            self._random_rest_check.pack(side="left")
+            ttk.Label(
+                self._random_rest_row, text="每75m~120m 休息3s~15s",
+                foreground="#808080",
+            ).pack(side="left", padx=(8, 0))
             # These rows configure attacks only.  死花模式 still leaves the
             # mode selector and its 重置花 controls available, but must make
             # every normal attack option visibly unavailable.
@@ -3042,6 +3064,39 @@ class UiWorker(threading.Thread):
             self._buff5_interval_label = self._buff5_interval_control.min_label
             ttk.Label(buff5_row, text="每隔").pack(side="left", padx=(8, 2))
             self._buff5_interval_control.pack(side="left")
+            buff6_row = ttk.Frame(drug_right)
+            buff6_row.pack(fill="x", pady=(2, 0))
+            self._buff6_use_var = tk.BooleanVar(value=False)
+            buff6_use_button = ttk.Checkbutton(
+                buff6_row, text="增益 5", width=6, variable=self._buff6_use_var,
+                command=self._drug_on_change,
+            )
+            buff6_use_button.pack(side="left")
+            self._buff6_key_var = tk.StringVar(value="-")
+            buff6_key_button = ttk.Button(
+                buff6_row, text=self._buff6_key_var.get(), width=10,
+                style="Locked.TButton",
+                command=lambda: self._bind_capture_begin(
+                    buff6_key_button, self._buff6_key_var,
+                    "_buff6_key_previous",
+                    lambda: self._drug_on_change(),
+                ),
+            )
+            buff6_key_button.pack(side="left", padx=(0, 4))
+            self._buff6_key_button = buff6_key_button
+            self._attach_bind_hint(buff6_key_button)
+            self._buff6_interval_control = NumericValueRangeControl(
+                buff6_row, tk_module=tk, ttk_module=ttk,
+                minimum=600, range_mode=False, value_type=int, step=1,
+                lower_bound=5, upper_bound=600, unit="s", value_width=5,
+                extra_width_px=12,
+                before_change=lambda: self._undo_capture_callback("增益5间隔"),
+                on_change=self._drug_on_change,
+            )
+            self._buff6_interval_var = self._buff6_interval_control.minimum_var
+            self._buff6_interval_label = self._buff6_interval_control.min_label
+            ttk.Label(buff6_row, text="每隔").pack(side="left", padx=(8, 2))
+            self._buff6_interval_control.pack(side="left")
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
 
@@ -10658,6 +10713,13 @@ class UiWorker(threading.Thread):
         interval_min, interval_max = self._fixed_attack_range()
         return {
             "attack_mode": str(self._attack_mode_var.get()),
+            # 随机休息 is a mode-scoped option (巡逻攻击 / 站桩攻击 / 双桩模式); the
+            # saved flag is kept even when another mode greys it out, so switching
+            # back restores the operator's choice.
+            "random_rest_enabled": bool(
+                self._random_rest_var.get()
+                if hasattr(self, "_random_rest_var") else False
+            ),
             "min_interval_seconds": interval_min,
             "max_interval_seconds": interval_max,
             "attack_key": self._fixed_attack_key_var.get().strip(),
@@ -11157,6 +11219,20 @@ class UiWorker(threading.Thread):
         dual_stationary_enabled = mode == "dual_stationary" and self._license_allowed()
         flower_cycle_enabled = mode in ("stationary", "dual_stationary", "dead_flower") and self._license_allowed()
         dead_flower_mode = mode == "dead_flower"
+        # 随机休息 only exists where the character patrols or stands on a 桩.
+        rest_allowed = (
+            mode in ("fixed", "stationary", "dual_stationary")
+            and self._license_allowed()
+        )
+        rest_row = getattr(self, "_random_rest_row", None)
+        if rest_row is not None:
+            self._set_panel_state(rest_row, disabled=not rest_allowed)
+        rest_worker = getattr(self, "random_rest_worker", None)
+        rest_var = getattr(self, "_random_rest_var", None)
+        if rest_worker is not None and rest_var is not None:
+            rest_setter = getattr(rest_worker, "set_enabled", None)
+            if callable(rest_setter):
+                rest_setter(bool(rest_var.get()) and rest_allowed)
         pickup_label = getattr(self, "_stationary_pickup_enabled_button", None)
         if pickup_label is not None:
             # The same persisted interval control drives two different route
@@ -11733,6 +11809,10 @@ class UiWorker(threading.Thread):
             if not self._YOLO_MONSTER_DETECTION_ENABLED:
                 if self._attack_mode_var.get() not in ("fixed", "flower_patrol", "stationary", "dual_stationary", "dead_flower"):
                     self._attack_mode_var.set("fixed")
+            # 随机休息: restore the saved choice; the mode rules decide afterwards
+            # whether it is actually in effect (``_fixed_refresh_rows``).
+            if hasattr(self, "_random_rest_var"):
+                self._random_rest_var.set(bool(data.get("random_rest_enabled", False)))
             # Migrate old ``interval + random_gap`` values into the new
             # explicit inclusive interval range.  A legacy 0.90 + 0.10s
             # setting therefore becomes 0.90–1.00s with identical timing.
@@ -11972,6 +12052,7 @@ class UiWorker(threading.Thread):
             getattr(self, "_buff3_interval_control", None),
             getattr(self, "_buff4_interval_control", None),
             getattr(self, "_buff5_interval_control", None),
+            getattr(self, "_buff6_interval_control", None),
         ):
             if control is not None:
                 control.normalize()
@@ -12003,6 +12084,10 @@ class UiWorker(threading.Thread):
             self._buff5_interval_label.configure(
                 text=f"{int(round(self._buff5_interval_var.get()))}s"
             )
+        if hasattr(self, "_buff6_interval_label"):
+            self._buff6_interval_label.configure(
+                text=f"{int(round(self._buff6_interval_var.get()))}s"
+            )
         if hasattr(self, "_buff1_key_button"):
             self._buff1_key_button.configure(text=self._buff1_key_var.get())
         if hasattr(self, "_buff2_key_button"):
@@ -12013,6 +12098,8 @@ class UiWorker(threading.Thread):
             self._buff4_key_button.configure(text=self._buff4_key_var.get())
         if hasattr(self, "_buff5_key_button"):
             self._buff5_key_button.configure(text=self._buff5_key_var.get())
+        if hasattr(self, "_buff6_key_button"):
+            self._buff6_key_button.configure(text=self._buff6_key_var.get())
         data = {
             "hp_key": self._hp_key_var.get().strip(),
             "mp_key": self._mp_key_var.get().strip(),
@@ -12025,17 +12112,20 @@ class UiWorker(threading.Thread):
             "buff3_key": self._buff3_key_var.get().strip(),
             "buff4_key": self._buff4_key_var.get().strip(),
             "buff5_key": self._buff5_key_var.get().strip(),
+            "buff6_key": self._buff6_key_var.get().strip(),
             "buff_interval_unit": "seconds",
             "buff1_interval": int(round(float(self._buff1_interval_var.get()))),
             "buff2_interval": int(round(float(self._buff2_interval_var.get()))),
             "buff3_interval": int(round(float(self._buff3_interval_var.get()))),
             "buff4_interval": int(round(float(self._buff4_interval_var.get()))),
             "buff5_interval": int(round(float(self._buff5_interval_var.get()))),
+            "buff6_interval": int(round(float(self._buff6_interval_var.get()))),
             "buff1_enabled": bool(self._buff1_use_var.get()),
             "buff2_enabled": bool(self._buff2_use_var.get()),
             "buff3_enabled": bool(self._buff3_use_var.get()),
             "buff4_enabled": bool(self._buff4_use_var.get()),
             "buff5_enabled": bool(self._buff5_use_var.get()),
+            "buff6_enabled": bool(self._buff6_use_var.get()),
         }
         self._drug_save_settings(data)
         self._drug_apply_to_worker(data)
@@ -12072,6 +12162,8 @@ class UiWorker(threading.Thread):
                 self._buff4_key_var.set(str(data["buff4_key"]))
             if "buff5_key" in data:
                 self._buff5_key_var.set(str(data["buff5_key"]))
+            if "buff6_key" in data:
+                self._buff6_key_var.set(str(data["buff6_key"]))
             # Older configuration files stored minutes.  The explicit unit
             # tag makes the one-time conversion unambiguous, including 5s.
             legacy_minutes = data.get("buff_interval_unit") != "seconds"
@@ -12081,6 +12173,7 @@ class UiWorker(threading.Thread):
                 ("buff3_interval", self._buff3_interval_var),
                 ("buff4_interval", self._buff4_interval_var),
                 ("buff5_interval", self._buff5_interval_var),
+                ("buff6_interval", self._buff6_interval_var),
             ):
                 if name not in data:
                     continue
@@ -12098,6 +12191,8 @@ class UiWorker(threading.Thread):
                 self._buff4_use_var.set(bool(data["buff4_enabled"]))
             if "buff5_enabled" in data:
                 self._buff5_use_var.set(bool(data["buff5_enabled"]))
+            if "buff6_enabled" in data:
+                self._buff6_use_var.set(bool(data["buff6_enabled"]))
         except (KeyError, TypeError, ValueError):
             LOG.warning("ignored malformed drug settings", exc_info=True)
             return

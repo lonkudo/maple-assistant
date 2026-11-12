@@ -794,8 +794,12 @@ LAYER_UP_REACH_FACTOR = 0.7
 # 0.750000 are only 0.001908 apart, so the old flat 0.003 put the up-jump
 # landing row 0.750000 inside BOTH bands.  Kept identical to
 # ``patrol_control.LAYER_BAND_UPPER_EDGE_REACH`` / ``..._LOWER_EDGE_REACH``.
-LAYER_BAND_UPPER_EDGE_REACH = 0.0015
-LAYER_BAND_LOWER_EDGE_REACH = 0.003
+# Swapped by the operator ("no point to make bottom have more tolerance"):
+# 0.003 above the topmost recorded row, 0.0015 below the lowest one.  Both stay
+# far under one marker row, so a band still admits only its own recorded rows -
+# the asymmetry only decides which side the edge can reach toward.
+LAYER_BAND_UPPER_EDGE_REACH = 0.003
+LAYER_BAND_LOWER_EDGE_REACH = 0.0015
 
 # Last-resort gap for a single-supporter layer (or a ``layer_y``-only layer)
 # whose recording carries no layout at all, so one marker row cannot be derived.
@@ -899,9 +903,9 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     band = (uppermost point Y - ``LAYER_BAND_UPPER_EDGE_REACH``,
             lowermost point Y + ``LAYER_BAND_LOWER_EDGE_REACH``)
 
-    The reach is 0.0015 above the topmost row and 0.003 below the lowermost one
-    (was a flat 0.003 on both sides, and before that 0.7 * y_tolerance above and
-    max(y_tolerance / 3, one marker row) below).  A layer whose points span a Y
+    The reach is 0.003 above the topmost row and 0.0015 below the lowermost one
+    (it was 0.0015/0.003, before that a flat 0.003 on both sides, and before that
+    0.7 * y_tolerance above and max(y_tolerance / 3, one marker row) below).  A layer whose points span a Y
     range (wide platform / minimap perspective) is detected while standing
     anywhere between its recorded ends, which is why the band spans the envelope
     rather than a mean.  Falls back to ``layer_y`` when the layer has no
@@ -932,8 +936,8 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     if not values:
         return None
     # A one-point layer is a reference point, not a sampled platform, but it
-    # gets the same edges as a multi-point one: 0.0015 above the topmost row and
-    # 0.003 below the lowermost one.  ``jump_points`` are intentionally not part
+    # gets the same edges as a multi-point one: 0.003 above the topmost row and
+    # 0.0015 below the lowermost one.  ``jump_points`` are intentionally not part
     # of ``_layer_point_ys``, so they cannot shift a band.
     return (
         min(values) - LAYER_BAND_UPPER_EDGE_REACH,
@@ -972,9 +976,9 @@ def _runtime_supporter_layer_band(
     to one row and a standing character's own step and jump arc are read a
     couple of rows above the point it stands on.  That is what lets the
     temporary point decide the band's UPPER edge: the recorded envelope now
-    reaches only ``LAYER_BAND_UPPER_EDGE_REACH`` (0.0015), so the point's wider
+    reaches only ``LAYER_BAND_UPPER_EDGE_REACH`` (0.003), so the point's wider
     window wins in practice.  Below, the point gets one third of the tolerance,
-    and the recorded side adds ``LAYER_BAND_LOWER_EDGE_REACH`` (0.003).
+    and the recorded side adds ``LAYER_BAND_LOWER_EDGE_REACH`` (0.0015).
 
     A layer with no recording at all keeps the documented one-sided
     single-supporter envelope, with the temporary point as that supporter.
@@ -3244,6 +3248,13 @@ class MovementWorker(threading.Thread):
             self._rescue_off_route_frames = 0
             self._rescue_last_pos = None
             return
+        if self._rest_remaining() > 0:
+            # A scheduled rest stands still on purpose; counting its frames
+            # would launch a false rescue in the middle of a break.
+            self._rescue_stuck_frames = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_last_pos = None
+            return
         if self.stationary_attack_enabled and not self._stationary_timed_patrol_active:
             # 站桩攻击 stands still BY DESIGN: every frame is "stuck" for this
             # detector, which would probe the character (walk right then left,
@@ -4246,9 +4257,10 @@ class MovementWorker(threading.Thread):
         # This used to poll ``attack_motion_active()`` for up to 1.0 s before the
         # first return key after a knockback, because Maple can swallow a
         # direction that arrives during an attack animation.  Blocking the send
-        # for the remainder of the 0.73 s attack grace left the character
-        # standing for three or four captures while the movement worker sat
-        # inside this call - the operator's "he does not walk back immediately".
+        # for the remainder of the attack grace (0.73 s then, 1.2 s now) left
+        # the character standing for three or four captures while the movement
+        # worker sat inside this call - the operator's "he does not walk back
+        # immediately".
         # A key the animation really swallows is caught by the progress watch
         # above (``STATIONARY_RETURN_REARM_NO_PROGRESS_FRAMES``), which releases
         # and re-arms the same direction after three captures without X
@@ -4347,7 +4359,19 @@ class MovementWorker(threading.Thread):
                             self.motion_arbiter, "attack_motion_active", None
                         )
                         if callable(attack_motion_active):
-                            deadline = time.monotonic() + 1.0
+                            # Cover the arbiter's WHOLE animation window.  A fixed
+                            # 1.0s cap is shorter than attack_grace_seconds (1.2s),
+                            # so the opposite direction went out while the client
+                            # was still animating - exactly the press it swallows,
+                            # the same failure class as a buff tap issued too early.
+                            grace = float(
+                                getattr(
+                                    self.motion_arbiter,
+                                    "attack_grace_seconds",
+                                    0.0,
+                                ) or 0.0
+                            )
+                            deadline = time.monotonic() + max(1.0, grace + 0.10)
                             while (attack_motion_active()
                                    and time.monotonic() < deadline):
                                 if not self._wait_for_patrol_motion(0.02):
@@ -5205,6 +5229,12 @@ class MovementWorker(threading.Thread):
         self._rescue_off_route_frames = 0
         self._rescue_off_route_anchor: Optional[Point] = None
         self._rescue_active = False
+        # 随机休息: while this deadline is in the future the worker emits no
+        # movement input and holds the attack workers off.  It is deliberately
+        # a private gate (like ``_rescue_active``) so patrol stays enabled and
+        # the UI never reports a stopped patrol for a scheduled rest.
+        self._rest_deadline = 0.0
+        self.rest_pause_count = 0
         self.rescue_cycle_limit = max(1, int(rescue_cycle_limit))
         self._rescue_cycles = 0
         self.rescue_probe_attack_block_seconds = max(
@@ -5663,6 +5693,8 @@ class MovementWorker(threading.Thread):
         self._return_arrival_floor = None
         self._descending_to_first = False
         self._rescue_active = False
+        if self._rest_deadline:
+            self.cancel_rest("patrol stopped")
         self._patrol_abort_event.set()
         force_key_up = getattr(self.key_sender, "force_key_up", None)
         if callable(force_key_up):
@@ -5708,9 +5740,72 @@ class MovementWorker(threading.Thread):
         if self.pickup_active_event is not None:
             self.pickup_active_event.clear()
 
+    def _rest_remaining(self) -> float:
+        """Seconds left of a scheduled 随机休息 (0.0 when not resting)."""
+
+        return max(0.0, self._rest_deadline - time.monotonic())
+
+    def request_rest(self, seconds: float) -> bool:
+        """Pause movement AND attack input for ``seconds`` (随机休息).
+
+        A scheduled rest must not disturb the patrol state: the route, the
+        pinned layer and the current leg all stay exactly as they are, the
+        character simply stops walking and stops attacking for a few seconds,
+        then continues on the same leg.  Both input paths are gated:
+
+        * movement: held walk/climb keys are released and no new command is
+          issued while the rest lasts (``_rest_remaining()``);
+        * attack: the shared climbing/dropping events are raised, which is
+          the same 'action input is active' block the self-rescue probe uses
+          to keep the attack workers quiet.
+        """
+
+        duration = float(seconds)
+        if duration <= 0 or not self._patrol_input_allowed():
+            return False
+        if (self.reconnect_active_event is not None
+                and self.reconnect_active_event.is_set()):
+            # The reconnect sequence owns the keyboard and the login screens
+            # hide the minimap; a scheduled rest there would fight it.
+            LOG.info("随机休息: skipped, auto reconnect owns the input")
+            return False
+        self._rest_deadline = time.monotonic() + duration
+        self.rest_pause_count += 1
+        self._release_climb_up()
+        self._release_walk_hold()
+        if self.moving_active_event is not None:
+            self.moving_active_event.clear()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.set()
+        LOG.warning(
+            "随机休息: pausing movement and attack for %.1fs", duration,
+        )
+        return True
+
+    def cancel_rest(self, reason: str = "") -> None:
+        """End a scheduled rest early and hand the input paths back."""
+
+        if not self._rest_deadline:
+            return
+        self._rest_deadline = 0.0
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        if self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
+        # The rest is not a stall: do not let its stationary frames feed the
+        # self-rescue counter.
+        self._rescue_stuck_frames = 0
+        self._rescue_last_pos = None
+        LOG.warning("随机休息: resuming automation%s",
+                    f" ({reason})" if reason else "")
+
     def _patrol_input_allowed(self) -> bool:
         """Whether this worker may still finish the current motion."""
 
+        if self._rest_remaining() > 0:
+            return False
         return bool(
             not self.stop_event.is_set()
             and not self._patrol_abort_event.is_set()
@@ -17591,6 +17686,15 @@ class MovementWorker(threading.Thread):
                     self.last_observation = observation
                     self.last_decision = MovementDecision(
                         None, "self-rescue owns movement input"
+                    )
+                    continue
+                # 随机休息 keeps consuming frames (position history, floor
+                # detection and the mini-map stay warm) but issues no walk,
+                # climb or drop command until the deadline passes.
+                if self._rest_remaining() > 0:
+                    self.last_observation = observation
+                    self.last_decision = MovementDecision(
+                        None, "random rest owns movement input"
                     )
                     continue
                 coordinate_layout = None

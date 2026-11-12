@@ -57,14 +57,14 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "hp_key": "delete", "mp_key": "end", "hp_threshold": 50,
         "mp_threshold": 30, "hp_enabled": True, "mp_enabled": True,
         "buff1_key": "home", "buff2_key": "insert", "buff3_key": "pageup",
-        "buff4_key": "pagedown", "buff5_key": "-",
+        "buff4_key": "pagedown", "buff5_key": "-", "buff6_key": "-",
         "buff_interval_unit": "seconds",
         "buff1_interval": 600.0, "buff2_interval": 600.0,
         "buff3_interval": 600.0, "buff4_interval": 600.0,
-        "buff5_interval": 600.0,
+        "buff5_interval": 600.0, "buff6_interval": 600.0,
         "buff1_enabled": False, "buff2_enabled": False,
         "buff3_enabled": False, "buff4_enabled": False,
-        "buff5_enabled": False,
+        "buff5_enabled": False, "buff6_enabled": False,
     },
     "fixed_attack": {
         "attack_mode": "fixed", "min_interval_seconds": 3.0,
@@ -196,7 +196,10 @@ DEFAULT_SYSTEM_CONFIG: dict[str, Any] = {
         "stair_jump_lead_seconds": .15,
         "stair_jump_climb_arrival_grace_seconds": 2.0,
         "other_player_check_interval_seconds": 0.0,
-        "rescue_check_interval_seconds": 300.0, "rescue_stuck_frames": 20,
+        # 8 frames is 1.6 s at the 5 fps capture cadence: the operator shortened
+        # the stuck window from 20 frames after the rescue probe proved a real
+        # stall is never acted on until Left/Right have failed to move the marker.
+        "rescue_check_interval_seconds": 300.0, "rescue_stuck_frames": 8,
         "rescue_cycle_limit": 3,
         "rescue_probe_attack_block_seconds": 2.0,
         "rescue_probe_settle_seconds": .2,

@@ -10,13 +10,18 @@ buff timers collide and the jump or buff tap silently does nothing.
   non-blocking; duplicate pending events collapse to one);
 - one worker thread dequeues and executes them one at a time;
 - a jump locks out further motion for ``jump_motion_seconds`` (default 0.9s)
-  and a buff for ``buff_motion_seconds`` (default 0.6s);
+  and a buff for ``buff_motion_seconds`` (default 1.0s);
 - while events are queued or executing, fixed attack is suppressed;
 - only when the motion window is over does the next event dequeue - or the
   attack worker fire again;
-- every event additionally waits a short ``attack_grace_seconds`` (default
-  0.73s) after the last attack tap, so an attack motion that just started
-  cannot swallow the jump/buff tap.
+- every event additionally waits ``attack_grace_seconds`` (default 1.2s) after
+  the last attack tap, so an attack animation that just started cannot swallow
+  the jump/buff tap.  1.2s is the measured preflight-clear time: the previous
+  0.73s window expired while a longer attack animation was still playing, so the
+  buff key was emitted into a client that ignored it (operator, 2026-11-12:
+  "an attack has 1.5 seconds of animation motions, will then a buff be
+  swallowed?").  The value is a constructor argument, so a map whose attack is
+  shorter or longer can set it without touching the code.
 
 Attack taps are not queued (they keep their own cadence), but they do acquire
 an atomic short-lived reservation before emitting input.  This matters: an
@@ -85,7 +90,7 @@ class MotionArbiter(threading.Thread):
         # ``_duration_for``): one post-cast quiet period covers both motions
         # instead of two constants that can drift apart.
         step_motion_seconds: float = 0.70,
-        attack_grace_seconds: float = 0.73,
+        attack_grace_seconds: float = 1.2,
         delivery_retry_seconds: float = _DELIVERY_RETRY_SECONDS,
     ) -> None:
         super().__init__(name="motion-arbiter", daemon=True)
@@ -112,6 +117,11 @@ class MotionArbiter(threading.Thread):
         self.step_motion_seconds = max(
             0.0, float(step_motion_seconds)
         )
+        # The shared attack grace is the attack-animation window: no motion key
+        # (buff, jump, skill) is emitted inside it, because the client silently
+        # discards a key pressed while the animation is still running.  1.2s is
+        # the operator's measured preflight-clear time; keep it a parameter so a
+        # per-map override never needs a code change.
         self.attack_grace_seconds = max(0.0, float(attack_grace_seconds))
         self.delivery_retry_seconds = max(0.0, float(delivery_retry_seconds))
         # How long a buff may wait for the safe-stage gate before it says so.

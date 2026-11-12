@@ -713,6 +713,8 @@ def main() -> int:
         StatusWorker,
         WindowKeySender,
     )
+    from buff_scheduler import BuffScheduler
+    from random_rest_worker import RandomRestWorker
     from attack_worker import AttackWorker
     from attack_slot import AttackSlot
     from atomic_motion import AtomicMotionRunner
@@ -2059,6 +2061,13 @@ def main() -> int:
         stop_event,
         climbing_active_event=action_motion_active,
         automation_active_event=automation_active,
+        # The attack-animation window every buff/skill tap must wait out: the
+        # client silently drops a key pressed while the animation is still
+        # running. 1.2s is the operator's measured preflight-clear time; a map
+        # profile may override it without a code change.
+        attack_grace_seconds=float(
+            calibration.get("attack_grace_seconds", 1.2)
+        ),
     )
     # Short multi-key combat sequences have their own atomic lane.  They are
     # admitted by the existing arbiter lease/token but do not become FIFO
@@ -2661,9 +2670,20 @@ def main() -> int:
         status_state_path=str(
             Path(__file__).with_name("work") / "status_state.json"
         ),
-        motion_arbiter=motion_arbiter,
         charge_active_callback=atomic_motion_runner.charge_active,
         charge_interrupt_callback=atomic_motion_runner.interrupt_charge,
+    )
+    # 增益1..5 have their own schedule: they must not stop because the HP/MP bar
+    # read stopped, and a cast must never be judged by an HP/MP delta.  Delivery
+    # still goes through MotionArbiter (safe-stage gate, attack-animation window,
+    # one key at a time).
+    buff_scheduler = BuffScheduler(
+        key_sender,
+        stop_event,
+        config_provider=lambda: status_worker.detector.config,
+        automation_active_event=automation_active,
+        motion_arbiter=motion_arbiter,
+        charge_active_callback=atomic_motion_runner.charge_active,
     )
     trade_worker = TradeWorker(
         trade_frames,
@@ -2898,8 +2918,17 @@ def main() -> int:
                 calibration.get("rescue_check_interval_seconds", 300.0)
             ),
             rescue_stuck_frames=five_fps_frames(
-                calibration.get("rescue_stuck_frames", 20), 5
+                calibration.get("rescue_stuck_frames", 8), 5
             ),
+    )
+    # 随机休息: a short stand-still every 75-120 minutes.  The panel decides
+    # whether it is enabled (and in which attack modes); this worker owns the
+    # timing and asks MovementWorker to pause movement AND attack input.
+    random_rest_worker = RandomRestWorker(
+        stop_event,
+        request_rest=movement_worker.request_rest,
+        end_rest=movement_worker.cancel_rest,
+        automation_active_event=automation_active,
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
     movement_worker.set_attack_slot(attack_slot)
@@ -2941,12 +2970,12 @@ def main() -> int:
     # exist; neither worker imports or controls the other directly.
     status_worker.hp_drop_callback = movement_worker.notify_hp_drop
     # 死花模式 uses 增益 1 (the UI's buff2 row) as its flower-to-flower
-    # cadence. StatusWorker owns its timer/key; MovementWorker owns only the
+    # cadence. BuffScheduler owns its timer/key; MovementWorker owns only the
     # reached-flower gate and the subsequent private rope movement.
-    status_worker.buff2_flower_gate_callback = movement_worker.dead_flower_buff2_delivery_allowed
-    status_worker.buff2_flower_completed_callback = movement_worker.notify_dead_flower_buff2_delivered
+    buff_scheduler.buff2_flower_gate_callback = movement_worker.dead_flower_buff2_delivery_allowed
+    buff_scheduler.buff2_flower_completed_callback = movement_worker.notify_dead_flower_buff2_delivered
     movement_worker.set_dead_flower_buff2_request(
-        status_worker.request_buff2_at_flower_point
+        buff_scheduler.request_buff2_at_flower_point
     )
     stair_jump_worker = StairJumpWorker(
         stop_event,
@@ -3056,6 +3085,8 @@ def main() -> int:
         character_worker,
         movement_worker,
         status_worker,
+        buff_scheduler,
+        random_rest_worker,
         motion_arbiter,
         *attack_workers,
         small_step_worker,
@@ -3085,6 +3116,7 @@ def main() -> int:
             map_identity_store=map_identity_store,
             status_worker=status_worker,
             attack_worker=attack_worker,
+            random_rest_worker=random_rest_worker,
             small_step_worker=small_step_worker,
             hotkey_queue=hotkey_actions,
             hotkey_worker=hotkey_worker,

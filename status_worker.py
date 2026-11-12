@@ -60,19 +60,10 @@ GHOST_WINDOW_TITLE_SUFFIXES = (
 # also the only event that can be "sent" and still do nothing in the game, so it
 # is verified at both ends of the hold and retried a bounded number of times.
 _ACTION_TAP_HOLD_SECONDS = 0.045
-_BUFF_TAP_HOLD_SECONDS = 0.200
 _ACTION_TAP_ATTEMPTS = 3
 _ACTION_TAP_RETRY_SECONDS = 0.06
 # One delivery warning per interval, so a stolen focus cannot flood the log.
 _DELIVERY_WARN_INTERVAL = 2.0
-
-# A periodic buff is tapped every interval, so a swallowed tap costs minutes.
-# Nothing in the sender can prove the GAME consumed the key, but the HUD can:
-# a cast almost always moves HP/MP.  After a buff tap the worker therefore
-# watches the next reading and reports what actually happened - the missing
-# evidence that made "the log says executed, the game does nothing"
-# undiagnosable.
-_BUFF_VERIFY_SECONDS = 2.5
 
 # Keys the UI bind buttons may capture.  The ordinary Q--M letter keys and
 # slash are useful skill bindings; Z remains reserved for pickup/movement.
@@ -1959,16 +1950,19 @@ class StatusConfig:
     buff3_key: str = "pageup"
     buff4_key: str = "pagedown"
     buff5_key: str = "-"
+    buff6_key: str = "-"
     buff1_interval: float = 600.0
     buff2_interval: float = 600.0
     buff3_interval: float = 600.0
     buff4_interval: float = 600.0
     buff5_interval: float = 600.0
+    buff6_interval: float = 600.0
     buff1_enabled: bool = False
     buff2_enabled: bool = False
     buff3_enabled: bool = False
     buff4_enabled: bool = False
     buff5_enabled: bool = False
+    buff6_enabled: bool = False
     # Three side-by-side bars in the fixed-pixel info bar.  Measured on the
     # current real client at the 1080x768 preset (425x32 capture): HP red
     # x 367-499, MP blue x 502-631, EXP yellow x 641-771 - each bar is ~130 px
@@ -2193,7 +2187,6 @@ class StatusWorker(threading.Thread):
         potion_verify_seconds: float = 1.25,
         potion_verify_retries: int = 1,
         status_state_path: Optional[str] = None,
-        motion_arbiter: Any = None,
         charge_active_callback: Any = None,
         charge_interrupt_callback: Any = None,
         hp_drop_callback: Any = None,
@@ -2204,14 +2197,9 @@ class StatusWorker(threading.Thread):
         self.stop_event = stop_event
         self.detector = detector or BarStatusDetector()
         self.automation_active_event = automation_active_event
-        # Optional MotionArbiter: periodic buff taps are queued and executed
-        # in a motion-free window instead of being fired straight into
-        # whatever action motion is playing.  HP/MP potions stay urgent and
-        # keep their direct, bar-verified path.
-        self.motion_arbiter = motion_arbiter
-        # Ordinary timed buffs defer while the attack key is held for a
-        # charge.  HP/MP recovery instead interrupts that hold first: health
-        # must never wait for a configured multi-second charge to finish.
+        # Ordinary timed buffs live in ``buff_scheduler``; this worker keeps only
+        # the HP/MP responsibility.  ``charge_active_callback`` is still needed
+        # here for the priority potion path (health interrupts a charge).
         self.charge_active_callback = charge_active_callback
         self.charge_interrupt_callback = charge_interrupt_callback
         self.potion_cooldown = max(0.0, potion_cooldown)
@@ -2244,26 +2232,8 @@ class StatusWorker(threading.Thread):
         # Monotonic timestamps of the last completed timed action (per row).
         # 增益为"定时触发"，不从开局立即触发：起始时间戳设为当前时刻，
         # 第一个增益会在 interval 秒后才按（用户会先手动触发第一次增益）。
-        self._last_buff = {"buff1": time.monotonic(), "buff2": time.monotonic(),
-                          "buff3": time.monotonic(), "buff4": time.monotonic(),
-                          "buff5": time.monotonic()}
-        # Buff 2/3/4/5 can wait in MotionArbiter while climbing. Keep one local
-        # in-flight marker so an elapsed timer cannot enqueue duplicates; it
-        # clears only when the arbiter reports success/failure.
-        self._buff_pending = {"buff2": False, "buff3": False, "buff4": False,
-                              "buff5": False}
-        self._buff_timer_lock = threading.Lock()
-        # Optional Dead Flower integration.  UI mapping is fixed: buff1 is
-        # 饲料, buff2 is 增益 1.  The flower cadence owns only 增益 1's timer
-        # at a reached flower point; 饲料 remains an ordinary periodic drug.
-        self.buff2_flower_gate_callback: Any = None
-        self.buff2_flower_completed_callback: Any = None
-        # Buff landing verification: the HUD readings before a buff tap, so the
-        # next frames can prove whether the game cast anything at all.
-        self._buff_verification: dict[str, Optional[dict[str, Any]]] = {
-            "buff1": None, "buff2": None, "buff3": None, "buff4": None,
-            "buff5": None,
-        }
+        # NOTE: the 增益 schedule itself now lives in ``buff_scheduler`` - it is
+        # not an HP/MP concern and must not stop because a bar read stopped.
         self._last_hp: Optional[int] = None
         self._last_mp: Optional[int] = None
         # Last READABLE ratio per resource and whether it was below its
@@ -2424,193 +2394,7 @@ class StatusWorker(threading.Thread):
         self._potion_verification[name] = None
         return False
 
-    def _arm_buff_verification(self, name: str, key: str) -> None:
-        """Remember the HUD resources so the next frames can prove a cast.
-
-        Called right after a buff key reported "sent".  The comparison baseline
-        is the most recent HUD reading, so the very next reading decides it.
-        """
-
-        self._buff_verification[name] = {
-            "key": str(key),
-            "hp_before": self._last_hp,
-            "mp_before": self._last_mp,
-            "deadline": time.monotonic() + _BUFF_VERIFY_SECONDS,
-        }
-
-    def _verify_buff_effects(self, reading: Any, now: float) -> None:
-        """Report whether each pending buff tap actually changed the HUD.
-
-        A "cast detected" line means the game consumed the key; the warning
-        means it did not, which is the case an operator must know about (an
-        in-game key binding that no longer matches the configured buff key, or
-        a key the client refuses to consume).
-        """
-
-        for name, pending in self._buff_verification.items():
-            if pending is None:
-                continue
-            hp_now, mp_now = getattr(reading, "hp", None), getattr(reading, "mp", None)
-            hp_before, mp_before = pending["hp_before"], pending["mp_before"]
-            readable = hp_now is not None or mp_now is not None
-            changed = (
-                (hp_before is not None and hp_now is not None and hp_now != hp_before)
-                or (mp_before is not None and mp_now is not None and mp_now != mp_before)
-            )
-            if changed:
-                LOG.info(
-                    "%s %s: cast detected (HP %s -> %s, MP %s -> %s)",
-                    name.upper(), pending["key"], hp_before, hp_now,
-                    mp_before, mp_now,
-                )
-                self._buff_verification[name] = None
-                continue
-            if now < float(pending["deadline"]):
-                continue
-            self._buff_verification[name] = None
-            if not readable:
-                LOG.warning(
-                    "%s %s: could not verify the cast (HP/MP unreadable)",
-                    name.upper(), pending["key"],
-                )
-                continue
-            LOG.warning(
-                "%s %s: no HP/MP change within %.1fs after the tap - the game "
-                "did not cast anything (check that the in-game skill is bound "
-                "to %s, and that the window really had focus)",
-                name.upper(), pending["key"], _BUFF_VERIFY_SECONDS,
-                pending["key"],
-            )
-
-    def request_buff2_at_flower_point(self) -> bool:
-        """Make 增益 1 due at a recorded Dead Flower point.
-
-        This is intentionally a request, not a key send: the next normal
-        status-frame tick still owns the actual 增益 1 delivery and applies the
-        placement gate.  It returns false when 增益 1 is not configured, so a
-        flower route never silently starts moving without its timing source.
-        """
-
-        config = self.detector.config
-        if not (config.buff2_enabled and config.buff2_key and config.buff2_interval > 0):
-            return False
-        with self._buff_timer_lock:
-            self._last_buff["buff2"] = float("-inf")
-        return True
-
-    def _check_buffs(self, now: float) -> None:
-        """Tap the periodic buff keys when their timer elapses.
-
-        Time-based (unlike the HP/MP potions), so this runs before the
-        bar-confidence gate: the bound key is sent every ``buffN_interval``
-        seconds while automation is active (the run loop already gates on the
-        automation event).
-        """
-
-        config = self.detector.config
-        for name, key, interval, enabled in (
-            ("buff1", config.buff1_key, config.buff1_interval,
-             config.buff1_enabled),
-            ("buff2", config.buff2_key, config.buff2_interval,
-             config.buff2_enabled),
-            ("buff3", config.buff3_key, config.buff3_interval,
-             config.buff3_enabled),
-            ("buff4", config.buff4_key, config.buff4_interval,
-             config.buff4_enabled),
-            ("buff5", config.buff5_key, config.buff5_interval,
-             config.buff5_enabled),
-        ):
-            # "-" is the UI's unbound placeholder.  Treat it exactly like
-            # an empty key so an enabled, but not yet bound, 增益4 cannot send
-            # an invalid input request into the arbiter.
-            if (not enabled or not key or key not in BINDABLE_KEYS
-                    or interval <= 0):
-                continue
-            with self._buff_timer_lock:
-                due = now - self._last_buff[name] >= interval
-                pending = self._buff_pending.get(name, False)
-            if not due or pending:
-                continue
-            if name == "buff1":
-                # 宠物食品 is a periodic drug, not an action buff.  It is
-                # intentionally sent directly and never pauses patrol or
-                # joins MotionArbiter's directional handoff.
-                if self._charge_active():
-                    continue
-                if self.key_sender.tap(key, hold_seconds=_BUFF_TAP_HOLD_SECONDS):
-                    with self._buff_timer_lock:
-                        self._last_buff[name] = time.monotonic()
-                    LOG.warning("宠物食品 refresh: used %s (every %.0fs)",
-                                key, interval)
-                    self._arm_buff_verification(name, key)
-                continue
-            if name == "buff2":
-                # Dead Flower opens this gate only while waiting at a reached
-                # flower.  In every other mode, buff2 follows its existing
-                # MotionArbiter path below unchanged.
-                gate = self.buff2_flower_gate_callback
-                flower_gate_open = False
-                if callable(gate):
-                    try:
-                        flower_gate_open = bool(gate())
-                    except Exception:
-                        LOG.exception("增益1 flower placement gate failed; keeping timer due")
-                        continue
-                if flower_gate_open:
-                    if self._charge_active():
-                        continue
-                    if self.key_sender.tap(key, hold_seconds=_BUFF_TAP_HOLD_SECONDS):
-                        with self._buff_timer_lock:
-                            self._last_buff[name] = time.monotonic()
-                        LOG.warning("增益1 花点 refresh: used %s (every %.0fs)", key, interval)
-                        self._arm_buff_verification(name, key)
-                        completed = self.buff2_flower_completed_callback
-                        if callable(completed):
-                            try:
-                                completed()
-                            except Exception:
-                                LOG.exception("增益1 flower completion callback failed")
-                    continue
-            if self.motion_arbiter is not None:
-                # The timer is deliberately NOT restarted when queued.  It
-                # restarts only after the arbiter has tapped the key, waited
-                # through the action window, and called this completion hook.
-                def _completed(ok: bool, *, _name: str = name,
-                               _key: str = key, _interval: float = interval) -> None:
-                    with self._buff_timer_lock:
-                        self._buff_pending[_name] = False
-                        if ok:
-                            self._last_buff[_name] = time.monotonic()
-                    if ok:
-                        LOG.warning("%s refresh: completed %s (every %.0fs)",
-                                    _name.upper(), _key, _interval)
-                        self._arm_buff_verification(_name, _key)
-                    else:
-                        LOG.warning("%s refresh: not sent; timer remains due",
-                                    _name.upper())
-
-                # Claim the local pending marker *before* handing the request
-                # to the arbiter.  The arbiter can execute very quickly on an
-                # idle patrol; claiming afterward could overwrite its already
-                # delivered completion callback and leave the timer stuck.
-                with self._buff_timer_lock:
-                    self._buff_pending[name] = True
-                if self.motion_arbiter.request_buff(key, _completed):
-                    LOG.warning("%s refresh: queued %s (every %.0fs)",
-                                name.upper(), key, interval)
-                else:
-                    with self._buff_timer_lock:
-                        self._buff_pending[name] = False
-                continue
-            if self.key_sender.tap(key):
-                with self._buff_timer_lock:
-                    self._last_buff[name] = time.monotonic()
-                LOG.warning("%s refresh: tapped %s (every %.0fs)",
-                            name.upper(), key, interval)
-                self._arm_buff_verification(name, key)
-
     def _process_frame(self, frame: object) -> None:
-        self._check_buffs(time.monotonic())
         status_image = getattr(frame, "status_image", None)
         if hasattr(frame, "status_image"):
             if status_image is None:
@@ -2717,9 +2501,10 @@ class StatusWorker(threading.Thread):
             self._low_count["mp"] = 0
             self._low_latched["mp"] = False
             self._potion_verification["mp"] = None
-        # Did each buff tap actually reach the game?  Reported from the HUD,
-        # because the sender can only prove the key was emitted.
-        self._verify_buff_effects(reading, now)
+        # Buff landing used to be judged here, from an HP/MP delta.  That was the
+        # wrong signal (most buffs do not move HP/MP) and the wrong worker; the
+        # schedule lives in ``buff_scheduler`` now and this worker only feeds the
+        # potion decision.
         self._last_hp = reading.hp
         self._last_mp = reading.mp
 
@@ -2767,7 +2552,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
 
     ``data`` uses the UI's form: key names, integer percents (0..100) for
     ``hp_threshold``/``mp_threshold``, and seconds for the periodic buff
-    ``buff1_interval`` through ``buff5_interval``. Unsupported or
+    ``buff1_interval`` through ``buff6_interval``. Unsupported or
     unknown keys are ignored (the existing binding stays).
     """
 
@@ -2779,11 +2564,13 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         ("buff3_key", "buff3_key"),
         ("buff4_key", "buff4_key"),
         ("buff5_key", "buff5_key"),
+        ("buff6_key", "buff6_key"),
         ("buff1_enabled", "buff1_enabled"),
         ("buff2_enabled", "buff2_enabled"),
         ("buff3_enabled", "buff3_enabled"),
         ("buff4_enabled", "buff4_enabled"),
         ("buff5_enabled", "buff5_enabled"),
+        ("buff6_enabled", "buff6_enabled"),
     ):
         if data_key not in data:
             continue
@@ -2813,6 +2600,7 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
         ("buff3_interval", "buff3_interval"),
         ("buff4_interval", "buff4_interval"),
         ("buff5_interval", "buff5_interval"),
+        ("buff6_interval", "buff6_interval"),
     ):
         if data_key not in data:
             continue

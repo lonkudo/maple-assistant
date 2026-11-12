@@ -57,17 +57,6 @@ class FakeSender:
         return True
 
 
-class DeferredBuffArbiter:
-    """Records a buff request and completes it only when the test says so."""
-
-    def __init__(self) -> None:
-        self.requests = []
-
-    def request_buff(self, key, on_complete=None) -> bool:
-        self.requests.append((key, on_complete))
-        return True
-
-
 class StatusTests(unittest.TestCase):
     def test_disable_input_refocuses_before_resetting_held_keys(self) -> None:
         sender = WindowKeySender("MapleStory", dry_run=False)
@@ -371,85 +360,6 @@ class StatusTests(unittest.TestCase):
         worker._process_frame(status_image(0.4, 0.1))
         self.assertEqual(sender.keys, ["delete", "end"])
 
-    def test_buff_cast_is_verified_by_the_hud(self) -> None:
-        # The sender can only prove the key was emitted; the HUD proves the game
-        # consumed it.  A buff that moved HP/MP must be reported as cast.
-        sender = FakeSender()
-        worker = StatusWorker(queue.Queue(), sender, threading.Event())
-        worker._last_hp, worker._last_mp = 552, 349
-        worker._arm_buff_verification("buff2", "pagedown")
-        with self.assertLogs("status_worker", level="INFO") as captured:
-            worker._verify_buff_effects(
-                StatusReading(hp=552, mp=330, hp_ratio=1.0, mp_ratio=0.9,
-                              confidence=1.0),
-                time.monotonic(),
-            )
-        self.assertIsNone(worker._buff_verification["buff2"])
-        self.assertTrue(
-            any("cast detected" in line for line in captured.output),
-            captured.output,
-        )
-
-    def test_buff_that_the_game_ignores_is_reported(self) -> None:
-        # The exact field symptom: the log says "executed", the game does
-        # nothing.  After the grace window the worker must say so, because the
-        # next buff attempt is a whole interval away.
-        sender = FakeSender()
-        worker = StatusWorker(queue.Queue(), sender, threading.Event())
-        worker._last_hp, worker._last_mp = 552, 349
-        worker._arm_buff_verification("buff2", "pagedown")
-        with self.assertLogs("status_worker", level="WARNING") as captured:
-            worker._verify_buff_effects(
-                StatusReading(hp=552, mp=349, hp_ratio=1.0, mp_ratio=0.9,
-                              confidence=1.0),
-                time.monotonic() + 10.0,
-            )
-        self.assertIsNone(worker._buff_verification["buff2"])
-        self.assertTrue(
-            any("did not cast anything" in line for line in captured.output),
-            captured.output,
-        )
-
-    def test_buff_verification_without_hud_values_says_so(self) -> None:
-        sender = FakeSender()
-        worker = StatusWorker(queue.Queue(), sender, threading.Event())
-        worker._arm_buff_verification("buff3", "insert")
-        with self.assertLogs("status_worker", level="WARNING") as captured:
-            worker._verify_buff_effects(
-                StatusReading(hp=None, mp=None, hp_ratio=None, mp_ratio=None,
-                              confidence=0.0),
-                time.monotonic() + 10.0,
-            )
-        self.assertTrue(
-            any("could not verify" in line for line in captured.output),
-            captured.output,
-        )
-
-    def test_arbiter_buff_completion_arms_the_verification(self) -> None:
-        class QueuedArbiter:
-            def __init__(self) -> None:
-                self.requests: list[tuple[str, object]] = []
-
-            def request_buff(self, key, on_complete=None):
-                self.requests.append((key, on_complete))
-                return True
-
-        sender = FakeSender()
-        arbiter = QueuedArbiter()
-        worker = StatusWorker(queue.Queue(), sender, threading.Event(),
-                              motion_arbiter=arbiter)
-        worker.detector.config = replace(
-            worker.detector.config,
-            buff2_key="pagedown", buff2_interval=1.0, buff2_enabled=True,
-            buff1_enabled=False, buff3_enabled=False,
-        )
-        worker._last_buff["buff2"] = time.monotonic() - 10.0
-        worker._last_hp, worker._last_mp = 552, 349
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual([key for key, _ in arbiter.requests], ["pagedown"])
-        arbiter.requests[0][1](True)
-        self.assertIsNotNone(worker._buff_verification["buff2"])
-
     def test_potion_effect_is_verified_and_retried_once_when_bar_stays_low(self) -> None:
         sender = FakeSender()
         worker = StatusWorker(
@@ -516,85 +426,6 @@ class StatusTests(unittest.TestCase):
         })
         self.assertEqual(ignored.buff1_key, config.buff1_key)
         self.assertEqual(ignored.buff2_interval, config.buff2_interval)
-
-    def test_periodic_buff_taps_on_interval_timer(self) -> None:
-        sender = FakeSender()
-        worker = StatusWorker(queue.Queue(), sender, threading.Event())
-        worker.detector.config = replace(
-            worker.detector.config,
-            buff1_key="home", buff1_interval=60.0, buff1_enabled=True,
-            buff2_key="insert", buff2_interval=60.0, buff2_enabled=True,
-        )
-        # 增益不从开局立即触发（用户会先手动触发第一次）：启动后第一帧不按。
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, [])
-        # 计时器到期后按一次（回拨时间戳模拟时间流逝）。
-        worker._last_buff["buff1"] = time.monotonic() - 61.0
-        worker._last_buff["buff2"] = time.monotonic() - 61.0
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, ["home", "insert"])
-        # Interval not elapsed yet: no repeat.
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, ["home", "insert"])
-        # Backdate both timers: next frame refreshes both buffs again.
-        worker._last_buff["buff1"] = time.monotonic() - 61.0
-        worker._last_buff["buff2"] = time.monotonic() - 61.0
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, ["home", "insert", "home", "insert"])
-
-    def test_queued_buff_restarts_its_timer_only_after_completion(self) -> None:
-        sender = FakeSender()
-        arbiter = DeferredBuffArbiter()
-        worker = StatusWorker(
-            queue.Queue(), sender, threading.Event(), motion_arbiter=arbiter,
-        )
-        worker.detector.config = replace(
-            worker.detector.config,
-            buff1_enabled=False,
-            buff2_key="insert", buff2_interval=60.0, buff2_enabled=True,
-        )
-        original = time.monotonic() - 61.0
-        worker._last_buff["buff2"] = original
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual([key for key, _ in arbiter.requests], ["insert"])
-        # A queued request does not reset the deadline or pile up a duplicate.
-        self.assertEqual(worker._last_buff["buff2"], original)
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(len(arbiter.requests), 1)
-        arbiter.requests[0][1](True)
-        self.assertGreater(worker._last_buff["buff2"], original)
-        self.assertFalse(worker._buff_pending["buff2"])
-
-    def test_pet_food_is_direct_periodic_drug_not_arbiter_motion(self) -> None:
-        sender = FakeSender()
-        arbiter = DeferredBuffArbiter()
-        worker = StatusWorker(
-            queue.Queue(), sender, threading.Event(), motion_arbiter=arbiter,
-        )
-        worker.detector.config = replace(
-            worker.detector.config,
-            buff1_key="home", buff1_interval=60.0, buff1_enabled=True,
-            buff2_enabled=False, buff3_enabled=False,
-        )
-        worker._last_buff["buff1"] = time.monotonic() - 61.0
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, ["home"])
-        self.assertEqual(arbiter.requests, [])
-
-    def test_disabled_or_unbound_buff_never_taps(self) -> None:
-        sender = FakeSender()
-        worker = StatusWorker(queue.Queue(), sender, threading.Event())
-        # Defaults: both buff rows disabled -> nothing fires.
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, [])
-        # Enabled but empty keys still never fire.
-        worker.detector.config = replace(
-            worker.detector.config,
-            buff1_key="", buff2_key="",
-            buff1_enabled=True, buff2_enabled=True,
-        )
-        worker._process_frame(status_image(1.0, 1.0))
-        self.assertEqual(sender.keys, [])
 
     def test_new_scan_codes_cover_potion_keys(self) -> None:
         sender = WindowKeySender("game")
