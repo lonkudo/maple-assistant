@@ -714,6 +714,7 @@ def main() -> int:
         WindowKeySender,
     )
     from buff_scheduler import BuffScheduler
+    from time_drug_worker import TimeDrugWorker
     from random_rest_worker import RandomRestWorker
     from attack_worker import AttackWorker
     from attack_slot import AttackSlot
@@ -842,14 +843,15 @@ def main() -> int:
     AUTO_LIE_HANDSHAKE_TIMEOUT_SECONDS = 0.5
 
     def warm_auto_lie_endpoint() -> None:
-        """Probe six random ports and cache the least-loaded quick reply.
+        """Probe every usable WebSocket port and cache the least-loaded reply.
 
-        A probe is only a capacity observation, never a reservation.  For the
-        first 300 ms of each six-port concurrent batch, collect every healthy
-        result with a positive ``slots_left`` and select the largest value.
-        If that short observation window has no usable answer, retain the old
-        latency-first rule: use the first later reply that has a free slot.
-        The full randomized order remains cached for handshake fallbacks.
+        A probe is only a capacity observation, never a reservation.  All ports of
+        the table race in one batch, so a single 300 ms sample sees the whole
+        deployment: collect every healthy result with a positive ``slots_left`` and
+        select the largest value.  If that short observation window has no usable
+        answer, retain the old latency-first rule: use the first later reply that
+        has a free slot.  The full randomized order remains cached for handshake
+        fallbacks.
         """
 
         try:
@@ -880,89 +882,86 @@ def main() -> int:
                     )
                     return None
 
-            for offset in range(0, len(candidates), 6):
-                batch = candidates[offset:offset + 6]
-                executor = ThreadPoolExecutor(
-                    max_workers=len(batch),
-                    thread_name_prefix="auto-lie-probe",
-                )
-                futures = {
-                    executor.submit(probe_one, host, int(port)): (host, int(port))
-                    for host, port in batch
-                }
-                chosen_without_waiting = False
-                quick_available: list[tuple[object, int]] = []
-                sampled_futures: set[object] = set()
+            executor = ThreadPoolExecutor(
+                max_workers=max(1, len(candidates)),
+                thread_name_prefix="auto-lie-probe",
+            )
+            futures = {
+                executor.submit(probe_one, host, int(port)): (host, int(port))
+                for host, port in candidates
+            }
+            chosen_without_waiting = False
+            quick_available: list[tuple[object, int]] = []
+            sampled_futures: set[object] = set()
+            try:
+                # Every port of the table probes in this one batch; let them race
+                # for a small, fixed capacity sample.
+                # `as_completed` preserves actual arrival order for the
+                # fallback path below, unlike inspecting an unordered set
+                # of completed futures.
+                quick_deadline = time.monotonic() + 0.300
                 try:
-                    # Let six probes race for a small, fixed capacity sample.
-                    # `as_completed` preserves actual arrival order for the
-                    # fallback path below, unlike inspecting an unordered set
-                    # of completed futures.
-                    quick_deadline = time.monotonic() + 0.300
-                    try:
-                        for future in as_completed(
-                            futures,
-                            timeout=max(0.0, quick_deadline - time.monotonic()),
-                        ):
-                            sampled_futures.add(future)
-                            host, port = futures[future]
-                            result = future.result()
-                            tried.append(f"{host}:{port}")
-                            slots_left = getattr(result, "slots_left", None)
-                            if (result is not None
-                                    and isinstance(slots_left, (int, float))
-                                    and int(slots_left) > 0):
-                                quick_available.append((result, len(tried)))
-                            else:
-                                full.append(f"{host}:{port}")
-                    except FuturesTimeoutError:
-                        # The bounded sample is complete.  Do not wait for
-                        # slow ports merely to compare capacity.
-                        pass
-
-                    if quick_available:
-                        # Higher reported free capacity wins.  Arrival order
-                        # resolves an equal-capacity tie, keeping selection
-                        # deterministic within this batch.
-                        best, _arrival = max(
-                            quick_available,
-                            key=lambda item: (
-                                int(getattr(item[0], "slots_left", 0)),
-                                -item[1],
-                            ),
-                        )
-                        chosen_without_waiting = True
-                    else:
-                        # No usable capacity sample appeared in 300 ms.  Keep
-                        # the previous behavior exactly: accept the first
-                        # later positive-slot response and immediately proceed.
-                        remaining_futures = [
-                            future for future in futures
-                            if future not in sampled_futures
-                        ]
-                        for future in as_completed(remaining_futures):
-                            host, port = futures[future]
-                            result = future.result()
-                            tried.append(f"{host}:{port}")
-                            slots_left = getattr(result, "slots_left", None)
-                            if (result is not None
-                                    and isinstance(slots_left, (int, float))
-                                    and int(slots_left) > 0):
-                                best = result
-                                chosen_without_waiting = True
-                                break
+                    for future in as_completed(
+                        futures,
+                        timeout=max(0.0, quick_deadline - time.monotonic()),
+                    ):
+                        sampled_futures.add(future)
+                        host, port = futures[future]
+                        result = future.result()
+                        tried.append(f"{host}:{port}")
+                        slots_left = getattr(result, "slots_left", None)
+                        if (result is not None
+                                and isinstance(slots_left, (int, float))
+                                and int(slots_left) > 0):
+                            quick_available.append((result, len(tried)))
+                        else:
                             full.append(f"{host}:{port}")
-                finally:
-                    # The selected endpoint is just a probe observation, so
-                    # slow sibling probes must never delay the later formal
-                    # handshake.  A full/unreachable batch is allowed to
-                    # finish so its next batch starts with a clean state.
-                    if chosen_without_waiting:
-                        for sibling in futures:
-                            sibling.cancel()
-                    executor.shutdown(wait=not chosen_without_waiting)
-                if best is not None:
-                    break
+                except FuturesTimeoutError:
+                    # The bounded sample is complete.  Do not wait for
+                    # slow ports merely to compare capacity.
+                    pass
+
+                if quick_available:
+                    # Higher reported free capacity wins.  Arrival order
+                    # resolves an equal-capacity tie, keeping selection
+                    # deterministic within this batch.
+                    best, _arrival = max(
+                        quick_available,
+                        key=lambda item: (
+                            int(getattr(item[0], "slots_left", 0)),
+                            -item[1],
+                        ),
+                    )
+                    chosen_without_waiting = True
+                else:
+                    # No usable capacity sample appeared in 300 ms.  Keep
+                    # the previous behavior exactly: accept the first
+                    # later positive-slot response and immediately proceed.
+                    remaining_futures = [
+                        future for future in futures
+                        if future not in sampled_futures
+                    ]
+                    for future in as_completed(remaining_futures):
+                        host, port = futures[future]
+                        result = future.result()
+                        tried.append(f"{host}:{port}")
+                        slots_left = getattr(result, "slots_left", None)
+                        if (result is not None
+                                and isinstance(slots_left, (int, float))
+                                and int(slots_left) > 0):
+                            best = result
+                            chosen_without_waiting = True
+                            break
+                        full.append(f"{host}:{port}")
+            finally:
+                # The selected endpoint is just a probe observation, so
+                # slow sibling probes must never delay the later formal
+                # handshake.  A full/unreachable batch is allowed to
+                # finish so the executor ends with a clean state.
+                if chosen_without_waiting:
+                    for sibling in futures:
+                        sibling.cancel()
+                executor.shutdown(wait=not chosen_without_waiting)
             if best is None:
                 raise RuntimeError(
                     "no WebSocket endpoint reported a remaining slot ("
@@ -974,7 +973,7 @@ def main() -> int:
                 auto_lie_endpoint["candidates"] = candidates
             auto_lie_logger.info(
                 "AUTO LIE preflight ready: cached WebSocket endpoint %s "
-                "(slots_left=%s, %.0f ms; six-port capacity sample, %d of %d candidate(s) replied)",
+                "(slots_left=%s, %.0f ms; port capacity sample, %d of %d candidate(s) replied)",
                 best.endpoint, best.slots_left, best.rtt_ms, len(tried), len(candidates),
             )
         except Exception as exc:
@@ -2673,7 +2672,7 @@ def main() -> int:
         charge_active_callback=atomic_motion_runner.charge_active,
         charge_interrupt_callback=atomic_motion_runner.interrupt_charge,
     )
-    # 增益1..5 have their own schedule: they must not stop because the HP/MP bar
+    # 增益 1..4 have their own schedule: they must not stop because the HP/MP bar
     # read stopped, and a cast must never be judged by an HP/MP delta.  Delivery
     # still goes through MotionArbiter (safe-stage gate, attack-animation window,
     # one key at a time).
@@ -2683,6 +2682,15 @@ def main() -> int:
         config_provider=lambda: status_worker.detector.config,
         automation_active_event=automation_active,
         motion_arbiter=motion_arbiter,
+        charge_active_callback=atomic_motion_runner.charge_active,
+    )
+    # 时间药 (饲料 / 补药) are consumed per press, so they are tapped ONCE by
+    # their own worker and never touch the arbiter or the 增益 double tap.
+    time_drug_worker = TimeDrugWorker(
+        key_sender,
+        stop_event,
+        config_provider=lambda: status_worker.detector.config,
+        automation_active_event=automation_active,
         charge_active_callback=atomic_motion_runner.charge_active,
     )
     trade_worker = TradeWorker(
@@ -2969,13 +2977,13 @@ def main() -> int:
     # and the arbiter-backed reaction.  Wire them only after both workers
     # exist; neither worker imports or controls the other directly.
     status_worker.hp_drop_callback = movement_worker.notify_hp_drop
-    # 死花模式 uses 增益 1 (the UI's buff2 row) as its flower-to-flower
-    # cadence. BuffScheduler owns its timer/key; MovementWorker owns only the
+    # 死花模式 uses 补药 (storage row buff2) as its flower-to-flower cadence.
+    # TimeDrugWorker owns its timer/key; MovementWorker owns only the
     # reached-flower gate and the subsequent private rope movement.
-    buff_scheduler.buff2_flower_gate_callback = movement_worker.dead_flower_buff2_delivery_allowed
-    buff_scheduler.buff2_flower_completed_callback = movement_worker.notify_dead_flower_buff2_delivered
+    time_drug_worker.aux_drug_flower_gate_callback = movement_worker.dead_flower_buff2_delivery_allowed
+    time_drug_worker.aux_drug_flower_completed_callback = movement_worker.notify_dead_flower_buff2_delivered
     movement_worker.set_dead_flower_buff2_request(
-        buff_scheduler.request_buff2_at_flower_point
+        time_drug_worker.request_aux_drug_at_flower_point
     )
     stair_jump_worker = StairJumpWorker(
         stop_event,
@@ -3086,6 +3094,7 @@ def main() -> int:
         movement_worker,
         status_worker,
         buff_scheduler,
+        time_drug_worker,
         random_rest_worker,
         motion_arbiter,
         *attack_workers,

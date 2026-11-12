@@ -1344,6 +1344,9 @@ class MovementTests(unittest.TestCase):
         worker._rescue_last_pos = Point(.8, .5168)
         # y=0.6302 is outside the layer1 band (0.4968 .. 0.5168).
         off_route = MinimapObservation(Point(.8032, .6302), None, .9, (0, 0, 1, 1))
+        # A frame that is not commanding a walk (wait/pause) keeps the off-route
+        # counter: that branch is the one that owns a non-walking frame.
+        worker.last_decision = MovementDecision(None, "waiting for the marker")
         with mock.patch.object(worker, "_trigger_rescue") as rescue:
             for _ in range(19):
                 worker._rescue_stuck_check(off_route, 101.0)
@@ -1354,14 +1357,43 @@ class MovementTests(unittest.TestCase):
             worker._rescue_stuck_check(off_route, 101.0)
             rescue.assert_called_once()
             self.assertEqual(worker._rescue_off_route_frames, 0)
-        # An active climb legitimately passes between layer bands: no rescue.
+        # On a horizontal walk the SAME run covers on-route and off-band frames:
+        # the marker's Y flickers across the band edge while the character walks,
+        # and two counters resetting each other meant neither ever reached the
+        # threshold (field log 2026-11-12 22:39:49-22:39:55: `now on layer1` /
+        # `now on none` alternating while X stayed at 0.258974).
+        worker.last_decision = MovementDecision("left", "patrol walk")
+        worker._rescue_last_check = 150.0
+        # The run's anchor is the position the walk started from; every following
+        # frame that cannot move 0.02 away from it counts.
+        worker._rescue_last_pos = Point(.8032, .6302)
+        worker._rescue_stuck_frames = 0
+        with mock.patch.object(worker, "_trigger_rescue") as rescue_walk:
+            for _ in range(19):
+                worker._rescue_stuck_check(off_route, 151.0)
+            self.assertEqual(worker._rescue_stuck_frames, 19)
+            rescue_walk.assert_not_called()
+            worker._rescue_stuck_check(off_route, 151.0)
+            rescue_walk.assert_called_once()
+        # A climb legitimately passes between layer bands, so its own axis (Y)
+        # decides: while the marker keeps climbing there is no rescue...
         worker._rescue_last_check = 200.0
         worker._climb_state.phase = "climbing-up"
         worker._climb_state.up_held = True
         with mock.patch.object(worker, "_trigger_rescue") as rescue2:
-            for _ in range(25):
-                worker._rescue_stuck_check(off_route, 201.0)
+            for frame in range(25):
+                climbing = MinimapObservation(
+                    Point(.8032, .6302 - frame * .01), None, .9, (0, 0, 1, 1),
+                )
+                worker._rescue_stuck_check(climbing, 201.0 + frame * .2)
             rescue2.assert_not_called()
+        # ... and a climb whose Y stops moving is stuck after all (Alt+Down
+        # cannot leave a rope): the operator's rule "on the rope the stall has y".
+        worker._rescue_last_check = 300.0
+        with mock.patch.object(worker, "_trigger_rescue") as rescue3:
+            for _ in range(21):
+                worker._rescue_stuck_check(off_route, 301.0)
+            rescue3.assert_called_once()
         worker._climb_state.phase = "idle"
         worker._climb_state.up_held = False
 
@@ -1399,7 +1431,10 @@ class MovementTests(unittest.TestCase):
             rescue.assert_not_called()
 
         self.assertLess(worker._rescue_off_route_frames, 20)
-        self.assertEqual(worker._rescue_stuck_frames, 0)
+        # X advances 0.01 per frame, so the unified horizontal run never gets
+        # past ~2 frames before the anchor is passed; what matters is that it
+        # stayed below the threshold and no rescue was launched.
+        self.assertLess(worker._rescue_stuck_frames, 20)
 
     def test_slow_cumulative_patrol_progress_is_not_stuck(self):
         # Each frame can move less than the jitter tolerance, but progress

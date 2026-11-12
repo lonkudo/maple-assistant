@@ -77,6 +77,15 @@ foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 # that raises at import time.
 $endpointsSource = Join-Path $root "endpoints_protected.py"
 $endpointsDir = Join-Path $root "work\endpoints-pyd"
+# Nuitka lives in the package environment (Python 3.10), which is also the
+# interpreter the shipped .pyd must match.  The compile step used to reference an
+# undefined $python, so a stale cache could not be refreshed at all ("The
+# expression after '&' ... was not valid").  Fall back to PATH, and fail below
+# with a clear message rather than silently shipping the old table.
+$endpointsPython = Join-Path $root ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $endpointsPython)) {
+    $endpointsPython = "python"
+}
 $endpointsPyd = @(Get-ChildItem -LiteralPath $endpointsDir -File -Filter "endpoints_protected*.pyd" -ErrorAction SilentlyContinue) |
     Sort-Object -Property Name | Select-Object -First 1
 # The cache in work\endpoints-pyd is only a build accelerant.  Treating its mere
@@ -91,8 +100,24 @@ if ((-not $endpointsPyd -or $endpointsStale) -and (Test-Path -LiteralPath $endpo
         Write-Host "endpoints_protected.py is newer than the cached .pyd; recompiling the endpoint table" -ForegroundColor Yellow
     }
     Write-Host "building the compiled endpoint table (endpoints_protected.pyd)..." -ForegroundColor Cyan
-    & $python -m nuitka --module $endpointsSource --output-dir=$endpointsDir 2>&1 |
-        Select-Object -Last 2
+    # Nuitka reports its progress on stderr, and this script runs with
+    # $ErrorActionPreference = "Stop" - so `2>&1` turned the first informational
+    # line into a terminating NativeCommandError and aborted the whole release.
+    # Capture the log with stderr noise tolerated and gate on the exit code.
+    $endpointsPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $endpointsBuildLog = & $endpointsPython -m nuitka --module $endpointsSource --output-dir=$endpointsDir 2>&1
+        $endpointsBuildExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $endpointsPreference
+    }
+    if ($endpointsBuildLog) {
+        $endpointsBuildLog | Select-Object -Last 2 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    }
+    if ($endpointsBuildExit -ne 0) {
+        throw "compiling the endpoint table failed (nuitka exit $endpointsBuildExit)"
+    }
     $endpointsPyd = @(Get-ChildItem -LiteralPath $endpointsDir -File -Filter "endpoints_protected*.pyd" -ErrorAction SilentlyContinue) |
         Sort-Object -Property Name | Select-Object -First 1
 }

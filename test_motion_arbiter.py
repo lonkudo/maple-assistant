@@ -57,8 +57,9 @@ class MotionArbiterTests(unittest.TestCase):
         arbiter = self._arbiter(sender, threading.Event())
         self.assertTrue(arbiter.request_buff("home"))
         self.assertTrue(arbiter.request_jump())
-        self.assertTrue(wait_until(lambda: len(sender.taps) >= 2))
-        self.assertEqual(sender.taps, ["home", "alt"])
+        # One buff event is a DOUBLE tap (150 ms + gap + 150 ms), then the jump.
+        self.assertTrue(wait_until(lambda: len(sender.taps) >= 3))
+        self.assertEqual(sender.taps, ["home", "home", "alt"])
 
     def test_duplicate_requests_collapse_while_pending(self) -> None:
         # Without an executor thread the queue is pure: two jump requests
@@ -142,15 +143,16 @@ class MotionArbiterTests(unittest.TestCase):
         self.assertEqual(set(sender.taps), {"home"})
 
     def test_buff_lost_to_a_focus_dip_is_retried_and_delivered(self) -> None:
-        # The tap fails twice (focus stolen) and then succeeds: the buff must
-        # still fire instead of being lost for its whole refresh interval.
+        # The first two presses fail (focus stolen) and the third succeeds: the
+        # buff must still fire instead of being lost for its whole refresh
+        # interval.  A delivered buff event costs two presses (the double tap).
         sender = FakeSender(failures=2)
         stop = threading.Event()
         arbiter = self._arbiter(sender, stop, grace=0.0, delivery_retry=2.0)
         completed: list[bool] = []
         self.assertTrue(arbiter.request_buff("home", completed.append))
         self.assertTrue(wait_until(lambda: completed == [True], timeout=3.0))
-        self.assertEqual(len(sender.taps), 3)
+        self.assertEqual(len(sender.taps), 4)
         self.assertTrue(wait_until(lambda: arbiter.is_idle(), timeout=2.0))
 
     def test_failed_jump_is_not_kept_queued(self) -> None:

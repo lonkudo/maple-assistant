@@ -36,7 +36,7 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 LOG = logging.getLogger(__name__)
@@ -65,6 +65,70 @@ _DELIVERY_RETRY_DELAY = 0.15
 # making a left/right walk decision).
 _GATE_WAIT_WARN_SECONDS = 4.0
 
+# Buff keys are double-tapped: 150 ms press, a short release, then the same press
+# again.  The operator's measurement - a single short press is dropped by the
+# client often enough to lose a whole refresh, and one long hold is not what the
+# client wants either, so the insurance is a second tap rather than a longer
+# hold.  The gap must outlast one input-poll slice, otherwise the client merges
+# the two presses into one hold and the second tap buys nothing.
+BUFF_TAP_HOLD_SECONDS = 0.150
+BUFF_DOUBLE_TAP_GAP_SECONDS = 0.080
+
+
+def buff_double_tap(
+    key_sender: Any,
+    key: str,
+    *,
+    hold_seconds: float = BUFF_TAP_HOLD_SECONDS,
+    gap_seconds: float = BUFF_DOUBLE_TAP_GAP_SECONDS,
+    wait: Optional[Callable[[float], Any]] = None,
+) -> bool:
+    """Double-tap one periodic buff key; True when the first press was accepted.
+
+    Every buff owner (the periodic scheduler, the arbiter's own executor and
+    ``MovementWorker.perform_arbiter_buff``) goes through this one function, so
+    the hold and the gap cannot drift apart between them.  A sender that only
+    implements ``tap(key)`` keeps working: its own hold is used for both presses.
+
+    The second press is the recovery for a client that swallowed the first one,
+    so it is best-effort - the buff already counts as delivered once the first
+    press was claimed, and a refused second press only logs.
+    """
+
+    tap = getattr(key_sender, "tap", None)
+    if not callable(tap) or not key:
+        return False
+    hold = max(0.01, min(1.0, float(hold_seconds)))
+    gap = max(0.0, float(gap_seconds))
+
+    def press() -> bool:
+        try:
+            return tap(key, hold_seconds=hold) is not False
+        except TypeError:
+            # Legacy sender without the hold argument: its own default applies.
+            return tap(key) is not False
+
+    try:
+        if not press():
+            return False
+    except Exception:  # noqa: BLE001 - the caller retries an undelivered buff
+        LOG.exception("buff double tap: the first press of %s failed", key)
+        return False
+    if gap:
+        try:
+            if callable(wait):
+                wait(gap)
+            else:
+                time.sleep(gap)
+        except Exception:  # noqa: BLE001 - a stop/shutdown wait must not break it
+            time.sleep(gap)
+    try:
+        if not press():
+            LOG.warning("buff double tap: the second press of %s was refused", key)
+    except Exception:  # noqa: BLE001 - the first press already delivered the buff
+        LOG.exception("buff double tap: the second press of %s failed", key)
+    return True
+
 
 class MotionArbiter(threading.Thread):
     """One-at-a-time executor for jump/buff motion keys."""
@@ -78,7 +142,7 @@ class MotionArbiter(threading.Thread):
         automation_active_event: Optional[threading.Event] = None,
         jump_motion_seconds: float = 0.9,
         buff_motion_seconds: float = 1.0,
-        buff_tap_hold_seconds: float = 0.20,
+        buff_tap_hold_seconds: float = BUFF_TAP_HOLD_SECONDS,
         micro_step_motion_seconds: float = 0.25,
         micro_step_pre_step_quiet_seconds: float = 0.20,
         facing_motion_seconds: float = 0.10,
@@ -1176,7 +1240,13 @@ class MotionArbiter(threading.Thread):
             if callable(callback):
                 tap_ok = callback(key, self.buff_tap_hold_seconds) is not False
             else:
-                tap_ok = self.key_sender.tap(key, hold_seconds=self.buff_tap_hold_seconds) is not False
+                # No movement owner wired: double-tap here, with the same hold and
+                # gap every other buff path uses.
+                tap_ok = buff_double_tap(
+                    self.key_sender, key,
+                    hold_seconds=self.buff_tap_hold_seconds,
+                    wait=self.stop_event.wait,
+                )
         except Exception:
             LOG.exception("motion arbiter tap failed key=%s", key)
         if tap_ok:

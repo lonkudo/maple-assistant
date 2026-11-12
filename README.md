@@ -10,6 +10,7 @@ Two packages are published for each version:
 
 | Package | Audience | Start |
 | --- | --- | --- |
+| `1.3.22` | `release/v1.3.22` | 时间药 split (饲料 / 补药 one-tap rows, 增益 1..4 double-tap), the measured endpoint table with a whole-list preflight, guarded licence heartbeat with a 75 s pending watchdog, turn-over attacks no longer waiting out the animation window, the axis-aware stall detector with the shipped 2.0 s window, and release-tooling repairs. |
 | `MoonEclipse-<version>.zip` | normal package, needs a Python environment | extract, run `安装.bat` once, then `启动助手.bat` |
 | `MoonEclipse-release-<version>.zip` | standalone package, no Python installation | extract, run `启动助手.bat` |
 
@@ -45,6 +46,52 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+
+### Current release behavior (v1.3.17 – v1.3.22)
+
+- **The drug panel split into 时间药 and 增益.** The six timed rows are now
+  `饲料` / `补药` (time drugs) plus `增益 1..4` (casts). A time drug is consumed by
+  the press, so it is tapped **once** (150 ms) and never through `MotionArbiter`;
+  `time_drug_worker.py` owns those two rows. The four 增益 rows keep
+  `buff_scheduler.py` and are now **double-tapped** (150 ms + 80 ms release +
+  150 ms, `BUFF_TAP_HOLD_SECONDS` / `BUFF_DOUBLE_TAP_GAP_SECONDS`), because a
+  single press is dropped by the client often enough to lose a whole refresh.
+  `饲料` also stays a single tap. Storage field names are unchanged
+  (`buff1`…`buff6`), so an old `user_config.json` keeps every key, interval and
+  enable and only the labels moved; the panel keeps its previous width.
+  `补药` still drives the 死花模式 flower-to-flower cadence.
+- **The deployment table lists only the ports that really serve, and the preflight
+  probes every usable port in one batch.** WebSocket: `117.50.223.113` 8001, 8003,
+  8007, 8009, 8010, 8013 and the 8888 dispatcher. 8002, 8011 and 8012 answer the
+  HTTP sync service only (a WebSocket upgrade there is always `404`), so they are
+  no longer counted as workers, and 8888 is double-bound (about a third of its
+  connections reach the HTTP service, so a failed probe is simply skipped).
+- **The vendor's Chinese integration notes no longer ship.** `使用说明.txt` and
+  `同行对接使用说明.txt` are excluded from both packages by
+  `package_local_service.ps1`; nothing reads them at runtime.
+- **Online authorization can no longer freeze the header.** The heartbeat round is
+  exception-guarded and always publishes a verdict, the result is applied after the
+  `正在验证在线授权…` indicator is cleared, and a 75 s watchdog
+  (`LICENSE_PENDING_WATCHDOG_SECONDS`) resolves a check that never answers into a
+  retryable failure with a working `↻`.
+- **Turn-over attacks resumed.** The direction-handoff gate is released as soon as
+  the turn's own inputs are down (neutral gap + post-send guard), instead of being
+  held until the 1.2 s attack-animation window expired — that alone cost every turn
+  a full second without attacks. The swallowed-reverse repair now watches X without
+  holding the gate.
+- **The stall detector judges the axis that can move.** A horizontal patrol leg is
+  judged on **X only** (the marker's Y flickers across a band edge and used to reset
+  the run), rope/climb/jump/stair/return stages accept **Y**, and drop stages —
+  chord, fall and the stand between chords — are skipped outright rather than
+  measured. After a probe proves the character can move, the detector pauses for
+  `RESCUE_PROBE_BACKOFF_SECONDS = 15` instead of probing (and blocking attacks)
+  every two seconds. The window the app really uses comes from
+  `system_config.json` (`rope_calibration.rescue_stuck_frames`, now **8 → 10 frames
+  ≈ 2.0 s**; the code default was being overridden by the shipped file, which still
+  carried 20 → 25 frames ≈ 5 s).
+- **Release tooling.** The compiled endpoint table now really recompiles when its
+  source is newer: the build script referenced an undefined interpreter and Nuitka's
+  stderr aborted the script under `$ErrorActionPreference = "Stop"`.
 
 ### Current release behavior (v1.3.16)
 
@@ -455,16 +502,19 @@ operator: the 被撞反击 reaction and the automatic lie pass.
   successful customer unbinds per equipment per GMT+8 calendar day. A rejected
   request never copies the code or locks the current desktop.
 - **Automatic-lie capacity selection is fast and distributed.**
-  `auto_lie_backend.py` holds fourteen `host:port` WebSocket instances:
-  `221.10.121.69` ports 48001–48003 and 48007/48009/48011/48013/48015, plus
-  `117.50.223.113` ports 8001–8003 and 8007/8009/8011. The startup preflight
-  shuffles the full list, probes a concurrent random group of three, and accepts
-  the *first responding* instance with `slots_left > 0`; it does not wait for
-  slower sibling probes. The winning probe is only a capacity observation, not a
-  reservation, so the live pass always creates a fresh authenticated connection
-  and may fail over through the rest of the same shuffled order if its handshake
-  fails. The old `fingerprint % 3` assignment is gone, so a device is not pinned
-  to one worker or host.
+  `auto_lie_backend.py` holds the live deployment in `endpoints_protected.py`
+  (shipped compiled): WebSocket `117.50.223.113` ports **8001, 8003, 8007, 8009,
+  8010, 8013 and the 8888 dispatcher**. Ports 8002, 8011 and 8012 answer the HTTP
+  sync service only — a WebSocket upgrade there is always `404` — so they are kept
+  in the HTTP list instead of costing a preflight slot, and 8888 is double-bound
+  (about a third of its connections land on the HTTP service, so a refused probe is
+  simply skipped). The startup preflight probes **every** usable port in one
+  concurrent batch and accepts the instance with the highest `slots_left`, breaking
+  ties by arrival order; it does not wait for slower siblings. The winning probe is
+  only a capacity observation, not a reservation, so the live pass always creates a
+  fresh authenticated connection and may fail over through the rest of the same
+  shuffled order if its handshake fails. The old `fingerprint % 3` assignment is
+  gone, so a device is not pinned to one worker or host.
 - **All automatic-lie logging lives in `auto_lie.log`.** The credential lines, the
   durable event-accounting lines, and the connection trace of the accounting
   request used to be written to the licensing connection log
@@ -1075,7 +1125,7 @@ right-click changes it by ten steps downward. Range controls enforce their order
 The fixed **attack interval** remains a `0.20–30.00s` range with `0.05s` precision, so `0.25s`
 remains `0.25s` rather than being rounded to `0.3s`.
 
-HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input. The five periodic rows (饲料, 增益1..4) are joined by **增益5** (`buff6`): the same key binding, `5–600 s` interval and 使用 checkbox, saved as `buff6_*`, and unbound/disabled by default. Their timer lives in `buff_scheduler.py`, not in the HP/MP worker: a 100 ms tick independent of the HUD capture, delivered through the motion arbiter with a 200 ms hold, so a buff no longer stops when the status bar stops being readable.
+HP and MP potions have priority over ordinary combat actions. The six timed rows are two **时间药** and four **增益**: `饲料` (`buff1`) and `补药` (`buff2`) are consumed by the press, so `time_drug_worker.py` taps each one **once** for 150 ms and never through the motion arbiter; `增益 1..4` (`buff3`…`buff6`) belong to `buff_scheduler.py` and are **double-tapped** (150 ms + 80 ms + 150 ms) through `MotionArbiter.request_buff()`, because a single press is often dropped. Both workers run a 100 ms tick that is independent of the HUD capture, so a row no longer stops when the status bar stops being readable, and a refused key keeps its timer due so the dose is retried instead of skipped for a whole interval. The storage fields keep their historical names (`buff1`…`buff6`), so an existing `user_config.json` needs no migration. `补药` also drives the 死花模式 flower cadence.
 
 ### 被撞反击 (hit reaction)
 
@@ -1212,19 +1262,27 @@ and restored at the next start.
 
 Self-rescue is guarded so a normal attack animation cannot be mistaken for a
 genuine movement stall. After 8 consecutive near-unchanged minimap captures
-(`rescue_stuck_frames`, a legacy 4 fps count = `ceil(8 × 1.25) = 10` frames, about
-**two seconds** at the shared 5 FPS cadence), the movement worker blocks attacks
-for 2.0 seconds (`rescue_probe_attack_block_seconds`) and performs a bounded probe:
-two sampled frames of Right, then two sampled frames of Left
-(`RESCUE_STALL_PROBE_FRAMES = 2`, `RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20`). If
-the live marker moves by at least 0.006 X during either nudge, the character is
-not stuck and no drop/restart is attempted.
+(`rescue_stuck_frames` in `system_config.json`, a legacy 4 fps count =
+`ceil(8 × 1.25) = 10` frames, about **two seconds** at the shared 5 FPS cadence),
+the movement worker blocks attacks for 2.0 seconds
+(`rescue_probe_attack_block_seconds`) and performs a bounded probe: two sampled
+frames of Right, then two sampled frames of Left (`RESCUE_STALL_PROBE_FRAMES = 2`,
+`RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20`). If the live marker moves by at least
+0.006 X during either nudge, the character is not stuck and no drop/restart is
+attempted; the detector then pauses for `RESCUE_PROBE_BACKOFF_SECONDS = 15` so a
+stationary fight cannot make it probe — and block its own attacks — every two
+seconds.
 
-Because the window is now two seconds, a long attack animation, a buff or a
-knockback can trigger the probe; that is deliberate and cheap — the probe aborts
-and patrol continues. Two cases never count as a stall: an active attack
-(`attack_state.json`) and a scheduled 随机休息 break, whose frames stand still by
-design.
+**Which axis counts is decided per stage.** A plain horizontal patrol leg is
+measured on **X only**: the minimap marker's Y flickers across a layer-band edge
+while the character walks, and a Y-aware test read that flicker as movement and
+reset the run, so the stall could never be detected. A rope climb, a stair/jump
+point, a jump grab, a return leg and 跳打 in the air are measured on **Y** as well,
+because there X stands still by design. Drop stages — the Alt+Down chord, the fall
+after it and the stand on the platform between chords — are skipped outright: a
+fixed X there is not a stall. 站桩攻击, the 死花等待 for its `补药` cadence, a
+scheduled 随机休息 break and an active YOLO attack (`attack_state.json`) never
+count, and neither does a frame that is not commanding a walk at all.
 
 The probe owns only movement input; it does **not** stop the shared patrol
 controller. Capture and marker tracking continue normally, while ordinary

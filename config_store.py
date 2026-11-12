@@ -54,6 +54,11 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
                                 "awaiting_left_rope_right"}},
     },
     "drug": {
+        # The six timed rows keep their historical field names so every saved
+        # configuration stays valid.  Panel row -> owning worker:
+        #   buff1 饲料   buff2 补药    (time drugs: one tap each)
+        #   buff3 增益 1     buff4 增益 2    buff5 增益 3     buff6 增益 4
+        #   (增益 rows: double tap, delivered through MotionArbiter)
         "hp_key": "delete", "mp_key": "end", "hp_threshold": 50,
         "mp_threshold": 30, "hp_enabled": True, "mp_enabled": True,
         "buff1_key": "home", "buff2_key": "insert", "buff3_key": "pageup",

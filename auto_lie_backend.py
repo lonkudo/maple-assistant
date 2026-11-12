@@ -7,9 +7,11 @@ endpoint migration never changes vendor files or the licensing backend.
 The deployment table itself lives in ``endpoints_protected``: releases ship that
 module compiled (``endpoints_protected.pyd``) and not as source, so the plaintext
 addresses are not readable in an end-user package, and the vendor's own
-``autolie_api/ip_port.txt`` is no longer packaged at all.  Both live deployments
-are listed there.  The application probes a random small set before a live pass and
-then formally handshakes on a reported-available worker.
+``autolie_api/ip_port.txt`` is no longer packaged at all.  The one live deployment
+is listed there: the three WebSocket ports on 117.50.223.113 (8001, 8003 and the
+8888 dispatcher) plus 8002, which carries the HTTP sync transport instead.  The
+application probes the WS set before a live pass and then formally handshakes on a
+reported-available instance.
 """
 
 from __future__ import annotations
@@ -40,9 +42,9 @@ def select_auto_lie_ws_endpoints() -> tuple[tuple[str, int], ...]:
     """All live service instances in a random order.
 
     The choice is deliberately random rather than a fingerprint modulo: the
-    modulo spread known devices over one host's three workers, so adding a
-    second host (or losing one) left the assignment lopsided, and a device
-    whose worker was down had no alternative to fall back to.  The caller walks
+    modulo spread known devices over one host's worker ports, so adding a
+    service (or losing one) left the assignment lopsided, and a device
+    whose instance was down had no alternative to fall back to.  The caller walks
     this list, keeps the first instance that answers, and uses the next entry
     whenever a handshake fails.
     """

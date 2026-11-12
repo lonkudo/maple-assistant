@@ -6,7 +6,8 @@
 # next to the program files.
 #
 # Only what the service needs to RUN is copied:
-#   * the launcher chain (start_*.bat / *.vbs / the two readme files)
+#   * the launcher chain (start_*.bat / *.vbs; the vendor's two Chinese
+#     integration documents are NOT shipped - see below)
 #   * the service binary (TaskBroker*.exe; a stale AppHost*.exe is dropped when a
 #     TaskBroker is present, because the shipped launcher starts the TaskBroker)
 #   * _internal\ (the frozen runtime, ONNX models, tcl/tk data)
@@ -60,6 +61,7 @@ $skipDirs = @("test_files", "logs", "license", "__pycache__")
 
 $copied = 0
 $bytes = 0L
+$skippedTopLevelTxt = 0
 Get-ChildItem -LiteralPath $Source -Recurse -Force | ForEach-Object {
     $relative = $_.FullName.Substring($Source.Length).TrimStart('\')
     if (-not $relative) { return }
@@ -69,6 +71,17 @@ Get-ChildItem -LiteralPath $Source -Recurse -Force | ForEach-Object {
     }
     if ($_.Name -like "*.pyc") { return }
     if ($hasTaskBroker -and $_.Name -like "AppHost*") { return }
+    # The vendor's own onboarding documents (the Chinese "how to use" notes and the
+    # "integrating with us" note) are written for the integrator, not for end users,
+    # and the operator asked for them to stay out of the release.  They are the only
+    # top-level .txt files in the package and nothing reads them at runtime, so the
+    # rule is "no top-level .txt".  A name list would need the Chinese literals, and
+    # this script must stay ASCII: Windows PowerShell decodes a BOM-less script with
+    # the ANSI code page, which is exactly what used to break its parsing.
+    if (-not $_.PSIsContainer -and $segments.Count -eq 1 -and $_.Name -like "*.txt") {
+        $script:skippedTopLevelTxt++
+        return
+    }
     $out = Join-Path $target $relative
     if ($_.PSIsContainer) {
         New-Item -ItemType Directory -Path $out -Force | Out-Null
@@ -145,4 +158,7 @@ if ($configChanged) {
 }
 
 $mb = [math]::Round($bytes / 1MB, 1)
+if ($script:skippedTopLevelTxt -gt 0) {
+    Write-Host "local lie service: $($script:skippedTopLevelTxt) vendor document(s) left out of the package (top-level .txt)" -ForegroundColor Cyan
+}
 Write-Host "local lie service bundled: $copied file(s), $mb MB -> $target" -ForegroundColor Green

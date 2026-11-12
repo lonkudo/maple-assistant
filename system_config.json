@@ -69,7 +69,7 @@
     "stair_jump_climb_arrival_grace_seconds": 2.0,
     "other_player_check_interval_seconds": 0.0,
     "rescue_check_interval_seconds": 300.0,
-    "rescue_stuck_frames": 20,
+    "rescue_stuck_frames": 8,
     "patrol_enabled": false
   }
 }

@@ -1,4 +1,4 @@
-"""Periodic 增益1..5 schedule, deliberately outside the HP/MP worker.
+"""Periodic 增益 1..4 schedule, deliberately outside the HP/MP worker.
 
 Why this is its own worker
 --------------------------
@@ -34,19 +34,29 @@ from typing import Any, Callable, Optional
 # The UI's bindable-key set lives with the HUD worker, which owns the drug panel
 # config this scheduler reads.  Importing the constant keeps one source of truth.
 from status_worker import BINDABLE_KEYS
+# The buff tap shape is shared with every other buff owner (MotionArbiter and
+# MovementWorker.perform_arbiter_buff): 150 ms press, short release, 150 ms press.
+from motion_arbiter import BUFF_TAP_HOLD_SECONDS, buff_double_tap
 
 LOG = logging.getLogger(__name__)
 
-# How long a buff key is held down.  Measured: a shorter press is dropped by the
-# game client often enough that a whole refresh is lost, and each miss costs one
-# interval (minutes).
-BUFF_TAP_HOLD_SECONDS = 0.200
+# How a 增益 key is pressed: twice, 150 ms each, with a short release between
+# (``motion_arbiter.buff_double_tap``).  Measured: a single shorter press is
+# dropped by the game client often enough that a whole refresh is lost, and each
+# miss costs one interval (minutes); one longer hold is not what the client wants.
+# The constant itself lives with the other buff tap parameters.
+#
+# Only 增益 rows live here.  The panel's 时间药 rows (饲料 / 补药) are
+# consumed per press, so they are single-tapped by ``time_drug_worker`` instead.
 
 # Evaluation cadence.  Deliberately independent of the HUD capture rate: the
 # buff must not stop because a status frame stopped.
 TICK_SECONDS = 0.1
 
-BUFF_NAMES = ("buff1", "buff2", "buff3", "buff4", "buff5", "buff6")
+# 增益 1 .. 增益 4.  The storage fields keep their historical names (the two
+# 时间药 rows own ``buff1``/``buff2``), so every saved configuration still maps to
+# the row it was recorded on.
+BUFF_NAMES = ("buff3", "buff4", "buff5", "buff6")
 
 
 class BuffScheduler(threading.Thread):
@@ -76,25 +86,18 @@ class BuffScheduler(threading.Thread):
         self._config_provider = config_provider
         self.automation_active_event = automation_active_event
         self.motion_arbiter = motion_arbiter
-        # Ordinary timed buffs defer while the attack key is held for a charge.
+        # A direct (no-arbiter) tap still defers while the attack key is held for a
+        # charge; the arbiter path serializes it anyway.
         self.charge_active_callback = charge_active_callback
         self.tick_seconds = max(0.02, float(tick_seconds))
         # Timers start "just fired": the operator triggers the first buff by hand
         # and the schedule takes over one interval later.
         self._last_buff: dict[str, float] = {name: time.monotonic() for name in BUFF_NAMES}
-        # Buff 2/3/4/5 can wait inside MotionArbiter (climbing, post-attack).  One
-        # local in-flight marker prevents an elapsed timer from queueing
-        # duplicates; it clears only when the arbiter reports the outcome.
-        self._buff_pending: dict[str, bool] = {
-            "buff2": False, "buff3": False, "buff4": False, "buff5": False,
-            "buff6": False,
-        }
+        # Buffs can wait inside MotionArbiter (climbing, post-attack).  One local
+        # in-flight marker prevents an elapsed timer from queueing duplicates; it
+        # clears only when the arbiter reports the outcome.
+        self._buff_pending: dict[str, bool] = {name: False for name in BUFF_NAMES}
         self._lock = threading.Lock()
-        # Optional 死花模式 integration.  The UI mapping is fixed: buff1 is 饲料,
-        # buff2 is 增益1.  The flower cadence only makes 增益1 due at a reached
-        # flower point; 饲料 stays an ordinary periodic drug.
-        self.buff2_flower_gate_callback: Any = None
-        self.buff2_flower_completed_callback: Any = None
 
     # ---- helpers -----------------------------------------------------------
     def _config(self) -> Any:
@@ -118,31 +121,9 @@ class BuffScheduler(threading.Thread):
         event = self.automation_active_event
         return True if event is None else bool(event.is_set())
 
-    def request_buff2_at_flower_point(self) -> bool:
-        """Make 增益1 due at a recorded Dead Flower point.
-
-        This is a request, not a key send: the next tick still owns the actual
-        delivery and applies the placement gate.  It returns false when 增益1 is
-        not configured, so a flower route never silently starts moving without
-        its timing source.
-        """
-
-        config = self._config()
-        if config is None:
-            return False
-        if not (
-            getattr(config, "buff2_enabled", False)
-            and getattr(config, "buff2_key", "")
-            and float(getattr(config, "buff2_interval", 0) or 0) > 0
-        ):
-            return False
-        with self._lock:
-            self._last_buff["buff2"] = float("-inf")
-        return True
-
     # ---- schedule ----------------------------------------------------------
     def _check_buffs(self, now: float) -> None:
-        """Tap each configured buff whose interval has elapsed."""
+        """Tap each configured 增益 whose interval has elapsed."""
 
         config = self._config()
         if config is None:
@@ -160,45 +141,6 @@ class BuffScheduler(threading.Thread):
                 pending = self._buff_pending.get(name, False)
             if not due or pending:
                 continue
-
-            if name == "buff1":
-                # 宠物食品 is a periodic drug, not an action buff.  It is sent
-                # directly and never joins the arbiter's directional handoff.
-                if self._charge_active():
-                    continue
-                if self.key_sender.tap(key, hold_seconds=BUFF_TAP_HOLD_SECONDS):
-                    with self._lock:
-                        self._last_buff[name] = time.monotonic()
-                    LOG.warning("宠物食品 refresh: used %s (every %.0fs)",
-                                key, interval)
-                continue
-
-            if name == "buff2":
-                # Dead Flower opens this gate only while waiting at a reached
-                # flower.  In every other mode buff2 follows the arbiter path.
-                gate = self.buff2_flower_gate_callback
-                flower_gate_open = False
-                if callable(gate):
-                    try:
-                        flower_gate_open = bool(gate())
-                    except Exception:
-                        LOG.exception("增益1 flower placement gate failed; keeping timer due")
-                        continue
-                if flower_gate_open:
-                    if self._charge_active():
-                        continue
-                    if self.key_sender.tap(key, hold_seconds=BUFF_TAP_HOLD_SECONDS):
-                        with self._lock:
-                            self._last_buff[name] = time.monotonic()
-                        LOG.warning("增益1 花点 refresh: used %s (every %.0fs)",
-                                    key, interval)
-                        completed = self.buff2_flower_completed_callback
-                        if callable(completed):
-                            try:
-                                completed()
-                            except Exception:
-                                LOG.exception("增益1 flower completion callback failed")
-                    continue
 
             if self.motion_arbiter is not None:
                 # The timer is deliberately NOT restarted when queued.  It
@@ -230,12 +172,23 @@ class BuffScheduler(threading.Thread):
                         self._buff_pending[name] = False
                 continue
 
-            # No arbiter: tap directly, still with the buff hold time.
-            if self.key_sender.tap(key, hold_seconds=BUFF_TAP_HOLD_SECONDS):
+            # No arbiter: double-tap directly, still with the buff hold time.  A
+            # held charge owns the keyboard, so the timer simply stays due.
+            if self._charge_active():
+                continue
+            if self._tap_buff(key):
                 with self._lock:
                     self._last_buff[name] = time.monotonic()
                 LOG.warning("%s refresh: tapped %s (every %.0fs)",
                             name.upper(), key, interval)
+
+    def _tap_buff(self, key: str) -> bool:
+        """Double-tap one 增益 key with the shared buff tap shape."""
+
+        return buff_double_tap(
+            self.key_sender, key, hold_seconds=BUFF_TAP_HOLD_SECONDS,
+            wait=self.stop_event.wait,
+        )
 
     # ---- thread ------------------------------------------------------------
     def run(self) -> None:

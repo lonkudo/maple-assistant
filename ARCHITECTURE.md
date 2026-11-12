@@ -288,13 +288,19 @@ GET list form remains available for a paged, non-sensitive list request.
 ### Automatic lie service endpoints
 
 `auto_lie_backend.py` owns the live RoiTrack deployment route, so an endpoint
-change never touches vendor files or the licensing backend. It lists fourteen
-WebSocket instances: `221.10.121.69` ports 48001–48003 and
-48007/48009/48011/48013/48015, and `117.50.223.113` ports 8001–8003 and
-8007/8009/8011. `select_auto_lie_ws_endpoints()` returns a system-entropy
-Fisher-Yates order. The choice is deliberately random rather than a fingerprint
-modulo: a modulo assignment leaves devices lopsided when workers are added,
-removed, or overloaded.
+change never touches vendor files or the licensing backend. The table itself lives
+in `endpoints_protected.py`, which releases ship compiled as a `.pyd`: WebSocket
+`117.50.223.113` ports **8001, 8003, 8007, 8009, 8010, 8013 and the 8888
+dispatcher**, plus the HTTP sync instances 8002, 8011 and 8012. The split is
+measured, not assumed: 8002/8011/8012 answer every WebSocket upgrade with `404`
+because the HTTP sync service owns them, 8888 serves both transports so roughly a
+third of its connections land on the wrong one, and a probe that fails is simply
+skipped by the preflight. `select_auto_lie_ws_endpoints()` returns a
+system-entropy Fisher-Yates order over the WS rows and the startup preflight probes
+that whole set in one concurrent batch (highest `slots_left` wins, arrival order
+breaks ties). The choice is deliberately random rather than a fingerprint modulo:
+a modulo assignment leaves devices lopsided when workers are added, removed, or
+overloaded.
 
 `assistant.py` consumes that order twice:
 
@@ -375,6 +381,19 @@ active only until its next three-hour heartbeat; that failed validation locks
 automation. Server schema updates should be additive and code rollbacks should
 remain compatible with the migrated schema rather than attempting a destructive
 database downgrade.
+
+**A pending online check can never freeze the desktop (v1.3.22).** The header shows
+`正在验证在线授权…` and the automation panels stay locked while
+`_license_online_validation_pending` is set, so that indicator must always resolve.
+Three rules guarantee it: `UiWorker._license_heartbeat_round()` wraps one validation
+round in `try/except` and turns any raise into a `heartbeat_error` verdict (a dead
+heartbeat thread used to leave the yellow text on screen with no way out);
+`_drain_license_heartbeat_results()` clears the indicator **before** applying the
+verdict, so a failure while rendering it cannot keep the header pending; and
+`LICENSE_PENDING_WATCHDOG_SECONDS = 75` resolves a check that never answers into a
+`heartbeat_timeout` failure that keeps the `↻` refresh usable and asks for a
+background retry. The same module therefore never reports an unknown local-service
+or CIM state as a licence verdict, and an operator always has a button to press.
 
 ### Shared capture pipeline
 
@@ -552,19 +571,27 @@ ordinary patrol hold is never interrupted by it.
 
 `attack_worker.py` performs fixed-interval attack in one selected delivery form: stand tap, jump attack, charge hold, or no attack. Charge holds the attack key for an inclusive random value between `charge_min_seconds` and `charge_max_seconds` (0.1–5.0 s), through `AtomicMotionRunner`. Its charge gate admits only the owning charge key and ordinary patrol Left/Right; queued buffs and other action-key motions defer until release. HP/MP recovery may cancel the charge, waits at most 80 ms for the handoff plus 100 ms for release, and then takes priority. With 跳反打 enabled, `AtomicMotionRunner` remains the transaction owner: it delegates only the patrol-direction handoff to `MovementWorker.execute_jump_counterattack_recoil()`, which holds the shared direction/hold locks, releases the current patrol Left/Right claim, taps the opposite direction for 45 ms, waits 10 ms, taps the attack, then restores the original hold. It returns `None` outside an ordinary continuous patrol hold so the runner falls back to ordinary jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
 
-**Periodic 增益 belong to their own worker (v1.3.16).** `buff_scheduler.py` owns the
-`饲料`/`增益1..5` timers (`buff1`…`buff6`), not `StatusWorker`: one thread, one lock, a
-100 ms tick, reading the row config through a provider so the drug panel's edits apply
-live. `StatusWorker` keeps only HP/MP potions, the HUD publication and
-`apply_drug_settings`. Two consequences are deliberate: a buff keeps firing when the
-status capture stalls or the bar cannot be read, and a cast is no longer judged by an
-HP/MP delta (that signal wrongly reported "did not cast" for every buff that does not
-touch HP/MP, and because the timer had already been restarted the next attempt was a
-whole interval away). Delivery is unchanged: `buff2`…`buff6` go through
-`MotionArbiter.request_buff()`, `饲料` (`buff1`) and the 死花 flower-point `增益1` are
-direct taps, and every tap holds the key `BUFF_TAP_HOLD_SECONDS = 0.200`. A queued buff
-whose completion is not reported keeps its timer due, so a refused delivery retries
-instead of waiting a full interval.
+**The six timed rows are two 时间药 and four 增益 (v1.3.22).** Both workers keep their
+timers out of `StatusWorker` — one thread, one lock, a 100 ms tick, reading the row
+config through a provider so the drug panel's edits apply live — and `StatusWorker`
+keeps only HP/MP potions, the HUD publication and `apply_drug_settings`. Two
+consequences are deliberate: a row keeps firing when the status capture stalls or the
+bar cannot be read, and a cast is no longer judged by an HP/MP delta (that signal
+wrongly reported "did not cast" for every buff that does not touch HP/MP, and because
+the timer had already been restarted the next attempt was a whole interval away).
+
+`time_drug_worker.TimeDrugWorker` owns `饲料` (`buff1`) and `补药` (`buff2`). They are
+consumed by the press, so each refresh is exactly ONE 150 ms press
+(`TIME_DRUG_TAP_HOLD_SECONDS`), sent directly and never through the arbiter; a held
+charge defers them and a refused press keeps the timer due. `buff_scheduler.BuffScheduler`
+owns `增益 1..4` (`buff3`…`buff6`) through `MotionArbiter.request_buff()`, and each
+refresh is a DOUBLE tap — `BUFF_TAP_HOLD_SECONDS = 0.150`, an 80 ms release
+(`BUFF_DOUBLE_TAP_GAP_SECONDS`) and the same press again — because the client drops a
+single short press often enough to lose a whole refresh. A queued buff whose completion
+is not reported keeps its timer due, so a refused delivery retries instead of waiting a
+full interval. The storage field names are historical and unchanged, which is what lets
+an old `user_config.json` keep every key, interval and enable; `补药` additionally opens
+the 死花模式 flower gate through the same worker.
 
 **The attack-animation window is `attack_grace_seconds` (v1.3.16).** `MotionArbiter`
 refuses to emit any motion key inside that window after the last attack tap; it was a
@@ -1043,14 +1070,30 @@ when it recorded an up jump point:
 
 ### Stall rescue (v1.2.290, thresholds v1.3.16)
 
-`_rescue_stuck_check` counts two things: on-route frames whose X/Y move by less than
-`0.02` from a **fixed anchor** (not from the previous frame, so slow walking is not a
-stall), and off-route frames whose marker matches no recorded layer band. The threshold is
-`rescue_stuck_frames`, a legacy 4 fps frame count converted to the live 5 fps stream by
-`five_fps_frames(v) = ceil(v × 1.25)`; the default is **8 → 10 frames ≈ 2 s** (it was 20 →
-25 frames ≈ 5 s). Exempt: no patrol/route, auto-reconnect, the planned descent to the
-first layer, 站桩攻击 (it stands still by design), an active attack (`attack_state.json`,
-written only by the YOLO subprocess), and a scheduled **随机休息** break.
+`_rescue_stuck_check` measures progress from a **fixed anchor** (not from the previous
+frame, so slow walking is not a stall) and the axis it uses depends on the stage, because
+only one stage can move along X:
+
+- a plain horizontal patrol leg → **X only** (`RESCUE_STUCK_STEP_TOLERANCE = 0.02`). The
+  marker's Y flickers across a layer-band edge while the character walks (the field trace
+  alternates `now on layer1` / `now on none` with X frozen), and a Y-aware test counted
+  that flicker as progress and reset the run, which is why a real freeze never rescued.
+  On-route and off-band frames share this one run, so the band flicker cannot reset it;
+- a rope climb, a stair/jump point that owns Up, a jump grab, a return leg and 跳打 in the
+  air → **either axis**, because X stands still there by design and Y is the only proof of
+  life. A climb whose Y also stops is still rescued;
+- an Alt+Down drop — the chord, the fall after it and the stand on the platform between
+  two chords — is **skipped outright**: a fixed X there is the plan, not a stall.
+
+The threshold is `rescue_stuck_frames`, a legacy 4 fps frame count converted to the live
+5 fps stream by `five_fps_frames(v) = ceil(v × 1.25)`. It is read from
+`config_store.read_section("rope_calibration")`, i.e. from the packaged
+`system_config.json` — the code default is only a fallback — and ships as **8 → 10 frames
+≈ 2 s** (it still carried 20 → 25 frames ≈ 5 s until v1.3.22, which is why the field log
+showed a 25-frame rescue). Exempt: no patrol/route, auto-reconnect, the planned descent to
+the first layer, 站桩攻击, the 死花 waiting for its `补药` cadence, a scheduled
+**随机休息** break, an active attack (`attack_state.json`, written only by the YOLO
+subprocess), and any frame that is not commanding a walk at all.
 
 `_rescue_verify_stuck_by_probe` presses Left then Right, two captured frames
 each, and compares the marker X (`RESCUE_STALL_PROBE_FRAMES`,
@@ -1064,7 +1107,9 @@ waiting for the landing (`_landing_floor_after_rescue_jump`). A confirmed stall 
 never answered with Alt+Down, and the unresolved-floor recovery runs the same
 walk probe before its first chord. Because the window is now two seconds, the
 probe also fires for a long attack animation, a buff or a knockback; that is
-accepted on purpose, since the probe aborts and only costs a pause.
+accepted on purpose, since the probe aborts and only costs a pause — and after an
+aborted probe the detector stays quiet for `RESCUE_PROBE_BACKOFF_SECONDS = 15`, so a
+stationary fight cannot cost a probe (and an attack block) every two seconds.
 
 ### Floor resolution (v1.2.290)
 

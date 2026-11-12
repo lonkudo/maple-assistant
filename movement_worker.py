@@ -31,6 +31,7 @@ from marker_detector import (
     detect_red_diamonds,
     detect_yellow_diamond,
 )
+from motion_arbiter import BUFF_TAP_HOLD_SECONDS, buff_double_tap
 from patrol_control import CoordinateLayout, _layer_present_actions
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
@@ -137,7 +138,7 @@ MOVEMENT_STATUS_POSITION_LOG_DELTA = 0.003
 # 死花模式: flower points sit on one rope.  Their X is the recorded rope X;
 # a pair of distinct Y positions makes an Up/Down loop.  The tolerance is a
 # little wider than one minimap marker row, while still keeping adjacent rope
-# stops separate. 增益1's configured interval drives the transition between
+# stops separate. 补药's configured interval drives the transition between
 # flower points; the route never invents a separate dwell timer.
 DEAD_FLOWER_X_TOLERANCE = 0.018
 DEAD_FLOWER_Y_TOLERANCE = 0.018
@@ -162,6 +163,15 @@ ROPE_STALL_ALIGNMENT_RANGE = 0.03
 # jumps toward the next target - Alt+Down cannot leave a rope.
 RESCUE_STALL_PROBE_FRAMES = 2
 RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20
+# How far the marker must travel before a freeze stops counting as one run.  The
+# minimap diamond advances in ~0.005 steps, so a single frame rarely reaches this:
+# it is the accumulated travel from the run's anchor that has to.
+RESCUE_STUCK_STEP_TOLERANCE = 0.02
+# After a rescue probe proves that the character CAN move (a fight keeps it still,
+# it was not stuck), the stall check stays quiet for this long.  Without the pause
+# a stationary fight tripped the probe every two seconds, and each probe blocks the
+# attack workers while it walks the character.
+RESCUE_PROBE_BACKOFF_SECONDS = 15.0
 # A rescue jump aims at the route's next target.  When the character already
 # sits within this distance of it the side is decided by the sign of the gap.
 RESCUE_JUMP_TARGET_DEAD_BAND = 0.005
@@ -211,6 +221,23 @@ DIRECTION_SWITCH_POST_SEND_GUARD_SECONDS = 0.06
 # interval.  This is deliberately not a long "wait for attack" pause.
 ENDPOINT_TURN_REARM_RELEASE_GAP_SECONDS = 0.020
 ENDPOINT_TURN_REARM_MIN_PROGRESS_X = 0.003
+# An endpoint reversal is one physical sequence: the old direction is released,
+# DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS pass, the reverse key goes down, and
+# DIRECTION_SWITCH_POST_SEND_GUARD_SECONDS of settle follow.  The attack gate has
+# to cover exactly that sequence, no more.  It used to stay closed while the
+# swallowed-reverse repair below waited for the MotionArbiter's attack animation
+# window (the same 1.2 s the buff preflight clearance uses) to expire, so a turn
+# that coincided with an attack cost a full animation window in which the cadence
+# could not fire - and with a short attack interval the animation never ended at
+# all (operator, 2026-11-12: "a big empty time after we turnover and don't
+# attack").  The buff preflight is a different question and must not gate a turn.
+#
+# After the turn is sent, the repair watches X for this long before deciding the
+# reverse press was swallowed.  It is an observation window, not a gate: the
+# cadence keeps attacking throughout, and a real walk covers the progress
+# threshold in a few milliseconds, so the window only has to outlast the attack
+# animation that can mask the walk.
+ENDPOINT_TURN_REARM_OBSERVE_SECONDS = 1.5
 # Jump records are X-precise, but the marker can be one or more vertical
 # minimap pixels away while grabbing/climbing a rope.  Keep a little more
 # than one X pixel and about two Y pixels: narrower than the earlier loose
@@ -3255,6 +3282,14 @@ class MovementWorker(threading.Thread):
             self._rescue_off_route_frames = 0
             self._rescue_last_pos = None
             return
+        if now < self._rescue_suppressed_until:
+            # The last probe PROVED the character can move (a fight holds it in
+            # place, it was not stuck), so stop measuring for a moment instead of
+            # probing - and blocking the attacks - every two seconds.
+            self._rescue_stuck_frames = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_last_pos = None
+            return
         if self.stationary_attack_enabled and not self._stationary_timed_patrol_active:
             # 站桩攻击 stands still BY DESIGN: every frame is "stuck" for this
             # detector, which would probe the character (walk right then left,
@@ -3262,6 +3297,17 @@ class MovementWorker(threading.Thread):
             # platform edge, drop it a floor - destroying the very standing
             # spot the mode protects.  The temporary anchor owns displacement
             # recovery in this mode instead.
+            return
+        if (self.dead_flower_mode
+                and str(getattr(self, "_dead_flower_phase", "") or "")
+                == "flower-await-buff2"):
+            # 死花模式 parks on the flower on purpose until its 补药 cadence is
+            # delivered: the character is supposed to stand motionless there, and
+            # rescuing it would drag it off the flower it is waiting for.  The
+            # walking phases of that mode (ground-left/right/rope) stay covered.
+            self._rescue_stuck_frames = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_last_pos = None
             return
         if now - self._rescue_last_check >= self.rescue_check_interval_seconds:
             if self._rescue_max_stuck >= self.rescue_stuck_frames:
@@ -3285,6 +3331,88 @@ class MovementWorker(threading.Thread):
             self._rescue_stuck_frames = 0
             self._rescue_max_stuck = 0
             self._rescue_last_pos = None
+            return
+        # Which axis proves that the character is still moving?
+        #
+        # EXACTLY ONE stage is judged on X alone: a plain horizontal patrol walk.
+        # Every other stage legitimately holds X still, and judging those on X
+        # would rescue a character that is doing precisely what it was told:
+        #
+        #   * a rope climb - X is constant by definition and Y is the lift;
+        #   * an Alt+Down drop - the chord, the fall after it AND the stand on the
+        #     intermediate platform between two chords all sit at one X, so a drop
+        #     is skipped outright below instead of measured;
+        #   * a stair/jump point that owns Up, and the 跳打 jump in the air;
+        #   * a return leg (climbing/dropping back to the route);
+        #   * 站桩/双桩 and 死花 waiting for its 补药 cadence (both return above);
+        #   * any frame that is not commanding a walk at all (wait/pause).
+        #
+        # On the X-only side the reason is measured: the marker's Y flickers across
+        # a band edge while the character walks (field log 22:39:49-22:39:53:
+        # `now on layer1` / `now on none` alternate while Y swings 0.531579 ->
+        # 0.605263 with X frozen at 0.258974), so a Y-aware test counted that
+        # flicker as progress and reset the run before it could ever reach
+        # ``rescue_stuck_frames``.
+        decision_key = getattr(getattr(self, "last_decision", None), "key", None)
+        dropping = bool(
+            (self.dropping_active_event is not None
+             and self.dropping_active_event.is_set())
+            or self._return_mode == "drop-to-route"
+            or self._descending_to_first
+        )
+        if dropping:
+            # A descent has its own machinery and stands on platforms between
+            # chords: X stays put there by design, so nothing about it is a stall.
+            self._rescue_stuck_frames = 0
+            self._rescue_off_route_frames = 0
+            self._rescue_last_pos = None
+            return
+        vertical_motion = bool(
+            self._movement_busy_now()                 # rope climb / stair worker
+            or self._return_mode is not None           # climb back to the route
+            or getattr(self, "_jump_point_up_held", False)
+            or decision_key in (
+                "climb", "jump_climb_left", "jump_climb_right", "jump_climb_up",
+                "drop", "stationary_jump",
+                "jump_point_left", "jump_point_right", "jump_point_up",
+            )
+        )
+        horizontal_leg = (
+            str(self._route_phase) in ("left", "right")
+            and decision_key in ("left", "right")
+            and not vertical_motion
+        )
+        if horizontal_leg:
+            last = self._rescue_last_pos
+            if last is None or abs(pos.x - last.x) >= RESCUE_STUCK_STEP_TOLERANCE:
+                self._rescue_last_pos = Point(pos.x, pos.y)
+                self._rescue_stuck_frames = 0
+                self._rescue_off_route_frames = 0
+                self._rescue_off_route_anchor = None
+                return
+            # The anchor stays put for the whole no-progress run: minimap X
+            # advances in ~0.005 steps, so adjacent-frame comparison alone would
+            # read a slow walk as frozen, while the accumulated travel does not.
+            self._rescue_stuck_frames += 1
+            self._rescue_max_stuck = max(
+                self._rescue_max_stuck, self._rescue_stuck_frames
+            )
+            self._rescue_off_route_frames = 0
+            self._rescue_off_route_anchor = None
+            if self._rescue_stuck_frames >= self.rescue_stuck_frames:
+                LOG.warning(
+                    "SELF-RESCUE: character stationary on a horizontal patrol leg "
+                    "for %d frames (x=%.6f, target=%s); verifying and restarting "
+                    "patrol",
+                    self._rescue_stuck_frames, pos.x,
+                    f"{self._last_route_target_x:.6f}"
+                    if getattr(self, "_last_route_target_x", None) is not None
+                    else "-",
+                )
+                self._rescue_stuck_frames = 0
+                self._rescue_max_stuck = 0
+                self._rescue_last_pos = None
+                self._trigger_rescue()
             return
         # Off-route: the marker is present but matches NO recorded layer
         # band (marker-Y check - the pinned world-Y must not be consulted
@@ -3320,8 +3448,8 @@ class MovementWorker(threading.Thread):
             # progress means the patrol is still working and must not drop.
             anchor = self._rescue_off_route_anchor
             if (anchor is None
-                    or abs(pos.x - anchor.x) >= 0.02
-                    or abs(pos.y - anchor.y) >= 0.02):
+                    or abs(pos.x - anchor.x) >= RESCUE_STUCK_STEP_TOLERANCE
+                    or abs(pos.y - anchor.y) >= RESCUE_STUCK_STEP_TOLERANCE):
                 self._rescue_off_route_anchor = Point(pos.x, pos.y)
                 self._rescue_off_route_frames = 1
             else:
@@ -3344,8 +3472,8 @@ class MovementWorker(threading.Thread):
         self._rescue_off_route_anchor = None
         last = self._rescue_last_pos
         if (last is not None
-                and abs(pos.x - last.x) < 0.02
-                and abs(pos.y - last.y) < 0.02):
+                and abs(pos.x - last.x) < RESCUE_STUCK_STEP_TOLERANCE
+                and abs(pos.y - last.y) < RESCUE_STUCK_STEP_TOLERANCE):
             self._rescue_stuck_frames += 1
             self._rescue_max_stuck = max(
                 self._rescue_max_stuck, self._rescue_stuck_frames
@@ -3731,6 +3859,13 @@ class MovementWorker(threading.Thread):
             # sampling the marker, but yields all route keys until this
             # rescue returns.
             if not self._rescue_verify_stuck_by_probe():
+                # The probe moved the character, so it was never stuck (a fight
+                # held it still).  Stop measuring for a moment: without this the
+                # same fight tripped another probe two seconds later, and every
+                # probe blocks the attack workers while it walks the character.
+                self._rescue_suppressed_until = (
+                    time.monotonic() + RESCUE_PROBE_BACKOFF_SECONDS
+                )
                 LOG.warning(
                     "SELF-RESCUE aborted: character moves when attacks are "
                     "blocked; resuming patrol (no drop, no restart)"
@@ -4053,8 +4188,8 @@ class MovementWorker(threading.Thread):
                         self._endpoint_turn_neutral_until = 0.0
                         self._endpoint_turn_rearm_direction = None
                         self._endpoint_turn_rearm_start_x = None
-                        self._endpoint_turn_rearm_waiting_for_attack = False
                         self._endpoint_turn_rearm_attempted = False
+                        self._endpoint_turn_rearm_deadline = None
                         self._transition_stuck_frames = 0
                 else:
                     self._transition_stuck_frames = 0
@@ -4289,7 +4424,8 @@ class MovementWorker(threading.Thread):
                     # itself goes down immediately afterwards: delaying it for
                     # an attack animation made endpoint reversals visibly
                     # stick.  A swallowed first direction is repaired by
-                    # _service_endpoint_turn_rearm() after that animation.
+                    # _service_endpoint_turn_rearm(), which no longer keeps the
+                    # gate closed while it waits for an animation-free capture.
                     neutral_remaining = (
                         self._endpoint_turn_neutral_until - time.monotonic()
                     )
@@ -4430,10 +4566,18 @@ class MovementWorker(threading.Thread):
                             getattr(self, "last_observation", None), "player", None
                         )
                         if current_player is not None:
+                            # The repair is armed, but it deliberately does NOT
+                            # own the attack gate: the turn's own inputs are
+                            # already down, and waiting for the animation to end
+                            # withheld every attack beat for up to
+                            # attack_grace_seconds (1.2 s).  The repair only
+                            # observes the next animation-free capture.
                             self._endpoint_turn_rearm_direction = decision.key
                             self._endpoint_turn_rearm_start_x = float(current_player.x)
-                            self._endpoint_turn_rearm_waiting_for_attack = True
                             self._endpoint_turn_rearm_attempted = False
+                            self._endpoint_turn_rearm_deadline = (
+                                time.monotonic() + ENDPOINT_TURN_REARM_OBSERVE_SECONDS
+                            )
                 # Automatic pickup no longer sends Z.  Movement therefore
                 # holds only the requested direction.
                 self._walk_hold_until = time.monotonic() + max(
@@ -4464,16 +4608,18 @@ class MovementWorker(threading.Thread):
             # The handoff reservation must never outlive this call: a key
             # send that raised (for example a SendInput failure) used to
             # leave the event set, so every later attack was skipped with
-            # "patrol direction handoff is active" until a restart.
+            # "patrol direction handoff is active" until a restart.  A pending
+            # swallowed-reverse repair is not a reason to keep it either - the
+            # repair observes the next animation-free capture on its own, and a
+            # gate held for that observation silenced the attack cadence for the
+            # whole attack animation window after every turn.
             if (direction_transition_started
-                    and self._endpoint_turn_rearm_direction is None
                     and self.direction_transition_event is not None):
                 self.direction_transition_event.clear()
             if endpoint_turn_completed:
                 self._endpoint_turn_expected_direction = None
                 self._endpoint_turn_neutral_until = 0.0
-                if (self._endpoint_turn_rearm_direction is None
-                        and self.direction_transition_event is not None):
+                if self.direction_transition_event is not None:
                     self.direction_transition_event.clear()
 
     def __init__(
@@ -4737,15 +4883,19 @@ class MovementWorker(threading.Thread):
         self._endpoint_turn_expected_direction: Optional[str] = None
         self._endpoint_turn_neutral_until = 0.0
         # A reverse direction sent during an attack can be accepted by the
-        # keyboard ledger but ignored by Maple.  Keep the handoff reservation
-        # through that one attack and, only if the first post-attack minimap
-        # sample still shows no reverse progress, issue one fresh release /
-        # press.  This state belongs to endpoint turns only; ordinary patrol
-        # walks retain their normal attack handoff behaviour.
+        # keyboard ledger but ignored by Maple.  Only if a minimap sample taken
+        # between two attack animations still shows no reverse progress does one
+        # fresh release / press follow.  The repair is an observation: it never
+        # owns ``direction_transition_event``, because holding that gate until the
+        # attack animation ended silenced the whole cadence after every turn (a
+        # 0.55s attack interval never leaves such a window, so the turn cost more
+        # than a second with no attack at all).  ``_endpoint_turn_rearm_deadline``
+        # bounds the observation.  This state belongs to endpoint turns only;
+        # ordinary patrol walks retain their normal attack handoff behaviour.
         self._endpoint_turn_rearm_direction: Optional[str] = None
         self._endpoint_turn_rearm_start_x: Optional[float] = None
-        self._endpoint_turn_rearm_waiting_for_attack = False
         self._endpoint_turn_rearm_attempted = False
+        self._endpoint_turn_rearm_deadline: Optional[float] = None
         self._transition_stuck_frames = 0
         # Frame heartbeat + stall reporting (see _stall_watchdog).
         self._last_frame_at: Optional[float] = None
@@ -5074,7 +5224,7 @@ class MovementWorker(threading.Thread):
         self._dead_flower_ground_next_at = float("inf")
         self._dead_flower_phase = "flower"
         self._dead_flower_target_index = 0
-        # StatusWorker owns the 增益1 key.  It must never mutate this
+        # TimeDrugWorker owns the 补药 key.  It must never mutate this
         # movement state directly from its own thread: it posts one delivery
         # event, which the 5-FPS movement loop consumes with its next marker.
         self._dead_flower_state_lock = threading.Lock()
@@ -5223,6 +5373,9 @@ class MovementWorker(threading.Thread):
         self._rescue_last_pos: Optional[Point] = None
         self._rescue_stuck_frames = 0
         self._rescue_max_stuck = 0
+        # A probe that proved the character can move pauses the detector for
+        # RESCUE_PROBE_BACKOFF_SECONDS (see _rescue_stuck_check).
+        self._rescue_suppressed_until = 0.0
         # Keep transient off-layer readings separate from the ordinary stuck
         # run. A single layer-band miss must never inherit earlier slow-walk
         # frames and launch the destructive Alt+Down rescue.
@@ -10287,14 +10440,18 @@ class MovementWorker(threading.Thread):
         return result
 
     def set_dead_flower_buff2_request(self, callback: Any) -> None:
-        """Wire StatusWorker's 增益 1 timer without sharing worker ownership."""
+        """Wire the 补药 timer without sharing worker ownership.
+
+        The timer and the key belong to ``time_drug_worker.TimeDrugWorker``;
+        this worker only decides when a flower point is reached.
+        """
 
         self._dead_flower_buff2_request = callback
 
     def dead_flower_buff2_delivery_allowed(self) -> bool:
-        """Allow 增益 1 only at the next reached flower point.
+        """Allow 补药 only at the next reached flower point.
 
-        ``False`` means StatusWorker must retain the normal 增益1 arbiter path.
+        ``False`` means the row simply uses its ordinary timer.
         It becomes ``True`` only for a multi-layer Dead Flower route waiting
         at its selected flower point.
         """
@@ -10307,7 +10464,7 @@ class MovementWorker(threading.Thread):
             return self._dead_flower_phase == "flower-await-buff2"
 
     def notify_dead_flower_buff2_delivered(self) -> None:
-        """Post an 增益 1 delivery for the movement worker to consume.
+        """Post an 补药 delivery for the movement worker to consume.
 
         This callback runs on StatusWorker.  Posting an event instead of
         changing target/keys here keeps 死花 rope movement fully owned by the
@@ -10320,12 +10477,12 @@ class MovementWorker(threading.Thread):
             if self._dead_flower_phase != "flower-await-buff2":
                 return
             self._dead_flower_buff2_delivery_pending = True
-        LOG.info("DEAD FLOWER: 增益1 delivered; movement event posted for next flower")
+        LOG.info("DEAD FLOWER: 补药 delivered; movement event posted for next flower")
 
     def _consume_dead_flower_buff2_delivery(
         self, flower_count: int, player_y: float,
     ) -> bool:
-        """Advance a delivered flower 增益1 on the movement-owner thread."""
+        """Advance a delivered flower 补药 on the movement-owner thread."""
 
         with self._dead_flower_state_lock:
             if not self._dead_flower_buff2_delivery_pending:
@@ -10335,7 +10492,7 @@ class MovementWorker(threading.Thread):
                 self._dead_flower_target_index + 1
             ) % max(1, flower_count)
             self._dead_flower_phase = "flower"
-            # 增益1 can only be delivered after the movement worker placed
+            # 补药 can only be delivered after the movement worker placed
             # the character at a recorded flower point.  That is positive
             # rope-attachment evidence for the next vertical leg.
             self._dead_flower_rope_attached = True
@@ -10343,7 +10500,7 @@ class MovementWorker(threading.Thread):
             self._dead_flower_target_source_y = float(player_y)
             next_index = self._dead_flower_target_index
         LOG.info(
-            "DEAD FLOWER: 增益1 confirmed on rope; moving immediately to distinct flower point %d/%d",
+            "DEAD FLOWER: 补药 confirmed on rope; moving immediately to distinct flower point %d/%d",
             next_index + 1, flower_count,
         )
         return True
@@ -10500,7 +10657,7 @@ class MovementWorker(threading.Thread):
     def _dead_flower_wait_for_buff2(
         self, target_index: int, flower_count: int, target: Point,
     ) -> None:
-        """Hold at a flower point until 增益 1 is actually delivered."""
+        """Hold at a flower point until 补药 is actually delivered."""
 
         self._dead_flower_release_vertical()
         self._release_walk_hold()
@@ -10510,24 +10667,24 @@ class MovementWorker(threading.Thread):
         if self._dead_flower_buff2_cycle_started:
             if newly_reached:
                 LOG.info(
-                    "DEAD FLOWER: reached flower point %d/%d (x=%.6f y=%.6f); waiting for 增益1 timer",
+                    "DEAD FLOWER: reached flower point %d/%d (x=%.6f y=%.6f); waiting for 补药 timer",
                     target_index + 1, flower_count, target.x, target.y,
                 )
             return
         # The first flower starts the cadence.  All later flower points wait
-        # for that same real 增益1 interval rather than restarting it.
+        # for that same real 补药 interval rather than restarting it.
         request = self._dead_flower_buff2_request
         accepted = bool(request()) if callable(request) else False
         if accepted:
             self._dead_flower_buff2_cycle_started = True
             self._dead_flower_buff2_unavailable_logged = False
             LOG.info(
-                "DEAD FLOWER: first flower point %d/%d (x=%.6f y=%.6f); 增益1 cadence started",
+                "DEAD FLOWER: first flower point %d/%d (x=%.6f y=%.6f); 补药 cadence started",
                 target_index + 1, flower_count, target.x, target.y,
             )
         elif not self._dead_flower_buff2_unavailable_logged:
             LOG.warning(
-                "DEAD FLOWER: flower route paused at flower point; enable 增益1 with a key and interval first"
+                "DEAD FLOWER: flower route paused at flower point; enable 补药 with a key and interval first"
             )
             self._dead_flower_buff2_unavailable_logged = True
 
@@ -10602,7 +10759,7 @@ class MovementWorker(threading.Thread):
         now = time.monotonic()
 
         # 重置花 is wall-clock driven, including while a one-flower route is
-        # waiting for the next 增益1 tap.  Check it before the Buff-wait
+        # waiting for the next 补药 tap.  Check it before the Buff-wait
         # branch: otherwise a single flower remains in flower-await-buff2
         # forever and can never leave the rope when its timer becomes due.
         if (self.dead_flower_ground_enabled
@@ -10629,7 +10786,7 @@ class MovementWorker(threading.Thread):
                 self._dead_flower_ground_next_at = now + self._dead_flower_ground_delay()
 
         if self._dead_flower_phase == "flower-await-buff2":
-            # StatusWorker owns the real 增益1 interval and calls
+            # TimeDrugWorker owns the real 补药 interval and calls
             # notify_dead_flower_buff2_delivered() after a successful tap.
             # Its event is consumed HERE, so this worker alone changes rope
             # target/direction state.
@@ -10638,17 +10795,17 @@ class MovementWorker(threading.Thread):
                 # next flower and put Up/Down down immediately.
                 pass
             elif not self._dead_flower_buff2_cycle_started:
-                # A user may enable/bind 增益1 while already waiting at the
+                # A user may enable/bind 补药 while already waiting at the
                 # first flower point. Retry the timer-start request on normal
                 # capture ticks; no key is sent from this worker.
                 target_index = min(self._dead_flower_target_index, len(flowers) - 1)
                 self._dead_flower_wait_for_buff2(
                     target_index, len(flowers), flowers[target_index],
                 )
-                self.last_decision = MovementDecision(None, "dead flower: waiting for 增益1")
+                self.last_decision = MovementDecision(None, "dead flower: waiting for 补药")
                 return
             else:
-                self.last_decision = MovementDecision(None, "dead flower: waiting for 增益1")
+                self.last_decision = MovementDecision(None, "dead flower: waiting for 补药")
                 return
 
         if self._dead_flower_phase == "ground-drop":
@@ -10766,7 +10923,7 @@ class MovementWorker(threading.Thread):
             )
             self._dead_flower_wait_for_buff2(target_index, len(flowers), target)
             self.last_decision = MovementDecision(
-                None, "dead flower attached at flower point; waiting for 增益1",
+                None, "dead flower attached at flower point; waiting for 补药",
             )
             return
         # Immediately after a Buff, target and source acceptance bands may
@@ -15667,8 +15824,8 @@ class MovementWorker(threading.Thread):
 
         self._endpoint_turn_rearm_direction = None
         self._endpoint_turn_rearm_start_x = None
-        self._endpoint_turn_rearm_waiting_for_attack = False
         self._endpoint_turn_rearm_attempted = False
+        self._endpoint_turn_rearm_deadline = None
         if self.direction_transition_event is not None:
             self.direction_transition_event.clear()
 
@@ -15681,29 +15838,26 @@ class MovementWorker(threading.Thread):
         100 ms neutral interval.  We do not delay a turn for the whole attack
         cadence.  If that first key collided with a pre-existing animation,
         however, Maple can ignore it even though the input ledger accepted it.
-        The first minimap sample after that animation ends is the only place
-        where a fresh release/press is allowed, and only if X did not progress
-        in the requested reverse direction.
+
+        Verification is positional: the press records the X it started from, and
+        any reverse travel within ``ENDPOINT_TURN_REARM_OBSERVE_SECONDS`` proves
+        the turn took (a real walk covers the ``ENDPOINT_TURN_REARM_MIN_PROGRESS_X``
+        threshold in a few milliseconds, so the window is generous).  Only when no
+        reverse travel is visible at all does one fresh release/press follow.
+
+        This observation NEVER holds the direction-handoff gate open.  It used to
+        wait for ``MotionArbiter.attack_motion_active()`` to report the attack
+        animation clear before it even looked at X - the same 1.2 s the buff
+        preflight clearance uses - so with a short attack interval the gate could
+        never open again and every turn bought a second and more with no attack at
+        all (operator, 2026-11-12).  The gate now covers only the turn's own input
+        sequence, and the repair watches the cadence run.
         """
 
         direction = self._endpoint_turn_rearm_direction
         start_x = self._endpoint_turn_rearm_start_x
         player = observation.player
         if direction not in ("left", "right") or start_x is None or player is None:
-            return
-        attack_motion_active = getattr(self.motion_arbiter, "attack_motion_active", None)
-        if callable(attack_motion_active) and attack_motion_active():
-            # The transition gate remains set, preventing a new attack from
-            # extending the exact animation that may have swallowed the turn.
-            return
-        if self._endpoint_turn_rearm_waiting_for_attack:
-            # Knockback can move X in the requested direction *during* the
-            # attack.  That does not prove the reverse key was accepted.
-            # Establish the baseline only after motion reports the prior
-            # attack finished, then require one fresh 5-FPS sample of reverse
-            # travel before declaring the first key-down good.
-            self._endpoint_turn_rearm_waiting_for_attack = False
-            self._endpoint_turn_rearm_start_x = float(player.x)
             return
         moved_reverse = (
             player.x >= start_x + ENDPOINT_TURN_REARM_MIN_PROGRESS_X
@@ -15723,6 +15877,12 @@ class MovementWorker(threading.Thread):
             # a bad edge recording into a repeated key-up/key-down loop; the
             # ordinary endpoint no-progress safeguard owns any later recovery.
             self._clear_endpoint_turn_rearm()
+            return
+        deadline = self._endpoint_turn_rearm_deadline
+        if deadline is not None and time.monotonic() < deadline:
+            # Still inside the observation window: the reverse walk (or the
+            # attack animation masking it) has time to show X travel.  Attacks
+            # are already free to continue, so waiting here costs nothing.
             return
 
         key_down = getattr(self.key_sender, "key_down", None)
@@ -16727,14 +16887,16 @@ class MovementWorker(threading.Thread):
             "climbing back" if mode == "climb-to-route" else "dropping back",
         )
 
-    def perform_arbiter_buff(self, key: str, hold_seconds: float = 0.20) -> bool:
+    def perform_arbiter_buff(
+        self, key: str, hold_seconds: float = BUFF_TAP_HOLD_SECONDS,
+    ) -> bool:
         """Tap one queued buff after cleanly yielding patrol movement.
 
         This is called only by MotionArbiter.  It releases the ordinary
         Left/Right(+Z) walk under the same directional lock used by climb,
-        drops and small-step, taps the buff, then leaves the next patrol frame
-        free to re-arm its previous direction.  It never runs during vertical
-        movement or a climb/transition.
+        drops and small-step, double-taps the buff, then leaves the next patrol
+        frame free to re-arm its previous direction.  It never runs during
+        vertical movement or a climb/transition.
         """
 
         if (not self._patrol_input_allowed()
@@ -16750,7 +16912,12 @@ class MovementWorker(threading.Thread):
             if self.moving_active_event is not None:
                 self.moving_active_event.clear()
             try:
-                sent = self.key_sender.tap(key, hold_seconds=hold_seconds) is not False
+                # The walk stays released across BOTH presses: a patrol frame
+                # landing between the two taps would put a direction key in the
+                # middle of the buff tap sequence.
+                sent = buff_double_tap(
+                    self.key_sender, key, hold_seconds=hold_seconds,
+                )
             except Exception:
                 LOG.exception("arbiter buff tap failed key=%s", key)
                 return False
@@ -16787,7 +16954,7 @@ class MovementWorker(threading.Thread):
             if not self.dead_flower_ground_enabled:
                 return not self._movement_busy_now()
             # With 重置花 on, Buffs are released only while the active flower
-            # route waits for its 增益1 cadence to be delivered.
+            # route waits for its 补药 cadence to be delivered.
             route = self._dead_flower_route()
             if route is None:
                 return not self._movement_busy_now()

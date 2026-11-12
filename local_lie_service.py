@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -233,6 +234,12 @@ def ensure_started(
         _state.update(state="starting", note="正在启动本地测谎服务…",
                       root=str(root), started_by_app=True, pids=[])
     LOG.info("local lie service: starting %s", root)
+    # A config carried over from another install can name the wrong
+    # authorization port; repair it before the service verifies anything.
+    try:
+        normalize_auth_server(root)
+    except Exception:  # noqa: BLE001 - a repair must never block the start
+        LOG.debug("local lie service: auth URL normalization failed", exc_info=True)
     # The updated package ships its template (placeholder) WS key; a start with that
     # text in the config fails the handshake and 8765 never listens, so it is
     # normalized to the package's own key first - whatever put the card there.
@@ -748,25 +755,146 @@ def _build_profile_ws_key(app_root: Path | str) -> str:
 
 
 def _product_key_writable(app_root: Path | str, settings: dict) -> bool:
-    """Whether a licence-server key may replace the local WS key.
+    """Whether the key delivered at heartbeat may become the local WS key.
 
-    The operator's rule for testing the local service: **the package's own key is
-    used**.  The activation-server key is only a fallback for a build that ships
-    none (or whose config already carries one of ours), because the two keys
-    belong to different endpoints (the package key handshakes the service's own
-    ``:8888``; the heartbeat key is issued for the ``8001-8003`` cloud).
+    The key the licence server hands out at heartbeat (``auto_lie.secret_key``,
+    the operator's ``tx_key``) is the credential the tracking WS authenticates
+    with, so it wins over the one baked into the vendor package.  It has to: the
+    packaged ``build_profile.json`` key is a shipped constant that the partner
+    server can revoke at any time, and when that happens the local service fails
+    its handshake with ``auth_denied: unknown_or_deleted_product_key`` and 8765
+    never listens - which is exactly the 2026-11 field case.
+
+    A placeholder (``LIE-你的坐标云密钥``) is still never written, and a package that
+    ships no key at all keeps the old behaviour (ours fills the field).
     """
 
     if _looks_like_placeholder(settings.get("lie_product_key")):
-        # Nothing usable yet: ours may fill it only when the package ships none.
+        # Nothing usable yet: the package's own key fills the field when it has
+        # one, otherwise the delivered key is the only candidate.
         return not _build_profile_ws_key(app_root)
-    own = _build_profile_ws_key(app_root)
-    if own and str(settings.get("lie_product_key") or "").strip().casefold() == own.casefold():
-        # The vendor's OWN key for its own endpoint.  The handshake of the 2026-11
-        # build succeeds with it (measured: ws_startup_handshake ok, quota 6172), so
-        # it is never replaced by the activation server's cloud key.
-        return False
-    return True                          # ours already: keep it refreshed
+    return True                          # a delivered key always replaces it
+
+
+
+# The CT card is authorized on this port only (vendor doc: "CT_IN 月卡：117:8004
+# 验票，product_id=ct_lie3_partner_in").  Pinning it in code keeps a config that
+# carries an old or hand-edited port from silently breaking the card check, whose
+# symptom is a service that starts and never listens.
+AUTH_SERVER_PORT = 8004
+AUTH_SERVER_FILE = "login_config.json"
+
+
+
+# The card format the vendor issues: CT_IN-XXXX-XXXX-XXXX-XXXX (27 characters).
+CARD_PATTERN = re.compile(r"^CT_[A-Z0-9]+(?:-[A-Z0-9]+){3,4}$")
+
+
+def canonical_card(value: object) -> str:
+    """The first well-formed CT card inside *value* ("" when there is none).
+
+    The server stores the card in a 30-character field, so a value pasted twice
+    ("CT_IN-.... CT_I") or padded arrives truncated.  Keeping the first clean
+    token makes the config usable and surfaces the truncation (masked) instead of
+    silently writing a broken code.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    for token in raw.replace(",", " ").replace(";", " ").split():
+        candidate = token.strip().upper()
+        if candidate.startswith("CT_") and CARD_PATTERN.match(candidate):
+            if candidate != raw.upper():
+                LOG.warning(
+                    "local lie service: the delivered CT card was not clean "
+                    "(len %d, %d token(s)); using %s",
+                    len(raw), len(raw.split()), _mask(candidate),
+                )
+            return candidate
+    return ""
+
+
+def _live_endpoint_host() -> str:
+    """The deployment host from the compiled endpoint table, or ""."""
+
+    try:
+        import endpoints_protected
+    except Exception:  # noqa: BLE001 - the table is optional for this helper
+        return ""
+    try:
+        hosts = endpoints_protected.endpoint_hosts()
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(hosts[0]) if hosts else ""
+
+
+def _auth_server_url(current: str = "") -> str:
+    """The CT card authorization URL, always on ``AUTH_SERVER_PORT``.
+
+    The configured host wins; only when it is empty - or names a retired
+    deployment - is the live host from the endpoint table used.
+    """
+
+    raw = str(current or "").strip()
+    scheme, host = "http", ""
+    if raw:
+        if "://" in raw:
+            scheme, rest = raw.split("://", 1)
+            scheme = scheme or "http"
+        else:
+            rest = raw
+        rest = rest.split("/", 1)[0]
+        host = rest.rpartition(":")[0] if ":" in rest else rest
+    host = host.strip()
+    if host == "222.215.232.230":
+        host = ""                      # retired deployment
+    if not host:
+        host = _live_endpoint_host()
+    if not host:
+        return raw                     # nothing to build from: leave it alone
+    return f"{scheme}://{host}:{AUTH_SERVER_PORT}"
+
+
+def normalize_auth_server(app_root: Path | str) -> bool:
+    """Force the card authorization port on both service config files.
+
+    ``data/ct_login_config.json`` is what the service verifies the card with; the
+    package-root ``login_config.json`` is what the engine shim reads.  A file is
+    only rewritten when its URL actually changes, and every other key it carries
+    is preserved.
+    """
+
+    changed = False
+    targets: list[Path] = []
+    credentials = service_credentials_path(app_root)
+    if credentials is not None and credentials.is_file():
+        targets.append(credentials)
+    root = find_service_root(app_root)
+    if root is not None:
+        legacy = root / AUTH_SERVER_FILE
+        if legacy.is_file():
+            targets.append(legacy)
+    for target in targets:
+        settings = _read_service_settings(target)
+        if not isinstance(settings, dict):
+            continue
+        current = str(settings.get("license_server_url") or "")
+        wanted = _auth_server_url(current)
+        if not wanted or wanted == current:
+            continue
+        settings["license_server_url"] = wanted
+        try:
+            _write_service_settings(target, settings)
+        except OSError as exc:
+            LOG.warning("local lie service: could not pin %s (%s)", target.name, exc)
+            continue
+        LOG.warning(
+            "local lie service: card authorization URL pinned to %s in %s (was %s)",
+            wanted, target.name, current or "(empty)",
+        )
+        changed = True
+    return changed
 
 
 def write_credentials(
@@ -795,7 +923,7 @@ def write_credentials(
     path = service_credentials_path(app_root)
     if path is None:
         raise LocalLieServiceError("未找到本地测谎服务目录，无法写入激活信息。")
-    card = str(card_code or "").strip()
+    card = canonical_card(card_code) or str(card_code or "").strip()
     if not card.upper().startswith("CT_"):
         raise LocalLieServiceError("激活码无效：请输入 CT_ 开头的测谎卡。")
     settings = _load_service_settings(path, what="the service credentials")
@@ -806,6 +934,13 @@ def write_credentials(
             "本地测谎服务配置无法解析，为避免覆盖其原有设置，本次没有写入激活信息。"
         )
     settings["partner_license_code"] = card
+    # The card can only validate on the documented authorization port.
+    auth_url = _auth_server_url(str(settings.get("license_server_url") or ""))
+    if auth_url and auth_url != str(settings.get("license_server_url") or ""):
+        LOG.warning(
+            "local lie service: card authorization URL corrected to %s", auth_url,
+        )
+        settings["license_server_url"] = auth_url
     key = str(product_key or "").strip()
     if key and _product_key_writable(app_root, settings):
         settings["lie_product_key"] = key
@@ -999,7 +1134,7 @@ def apply_online_card(card_code: str) -> bool:
     started is then restarted (never under a live pass).
     """
 
-    card = str(card_code or "").strip()
+    card = canonical_card(card_code) or str(card_code or "").strip()
     if not card:
         return False
     # The card is known from the licence reply whether or not the CT package can

@@ -1942,9 +1942,20 @@ class StatusConfig:
     mp_ratio_threshold: float = 0.3
     hp_enabled: bool = True
     mp_enabled: bool = True
-    # Periodic buff keys (the extra Drug panel rows): the bound key is
-    # tapped on a TIMER (``buffN_interval`` seconds, default 10 minutes)
-    # instead of a bar-ratio threshold.  Disabled or empty keys never fire.
+    # Periodic drug/buff keys: the bound key is tapped on a TIMER
+    # (``buffN_interval`` seconds, default 10 minutes) instead of a bar-ratio
+    # threshold.  Disabled or empty keys never fire.
+    #
+    # The field names are historical and deliberately unchanged, so every saved
+    # configuration keeps its keys, intervals and enables.  The panel rows they
+    # drive (and the worker that owns each row) are:
+    #
+    #   buff1 -> 饲料     (time drug: ONE tap,     ``time_drug_worker``)
+    #   buff2 -> 补药     (time drug: ONE tap,     ``time_drug_worker``)
+    #   buff3 -> 增益 1   (cast: double tap,       ``buff_scheduler``)
+    #   buff4 -> 增益 2   (cast: double tap,       ``buff_scheduler``)
+    #   buff5 -> 增益 3   (cast: double tap,       ``buff_scheduler``)
+    #   buff6 -> 增益 4   (cast: double tap,       ``buff_scheduler``)
     buff1_key: str = "home"
     buff2_key: str = "insert"
     buff3_key: str = "pageup"
@@ -2551,8 +2562,9 @@ def apply_drug_settings(config: StatusConfig, data: dict) -> StatusConfig:
     """Return a copy of ``config`` with the drug panel settings applied.
 
     ``data`` uses the UI's form: key names, integer percents (0..100) for
-    ``hp_threshold``/``mp_threshold``, and seconds for the periodic buff
-    ``buff1_interval`` through ``buff6_interval``. Unsupported or
+    ``hp_threshold``/``mp_threshold``, and seconds for the periodic drug/buff
+    timers ``buff1_interval`` through ``buff6_interval`` (buff1/buff2 are the
+    时间药 rows 饲料/补药, buff3..buff6 the 增益 1..4 rows).  Unsupported or
     unknown keys are ignored (the existing binding stays).
     """
 

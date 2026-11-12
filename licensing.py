@@ -1022,6 +1022,15 @@ def _with_server_device(
     device = answer.get("device") if isinstance(answer, dict) else None
     usage = answer.get("autolie_fingerprint_usage") if isinstance(answer, dict) else None
     auto_lie = answer.get("auto_lie") if isinstance(answer, dict) else None
+    # The tracking/coordinate-cloud key ("tx_key") may arrive either inside the
+    # ``auto_lie`` object or as its own top-level field, depending on the server
+    # generation.  Both names are the same credential the local 测谎 service
+    # authenticates its WS handshake with, so either one is used.
+    tx_key = ""
+    if isinstance(answer, dict):
+        tx_key = str(answer.get("tx_key") or "").strip()
+    if not tx_key and isinstance(auto_lie, dict):
+        tx_key = str(auto_lie.get("tx_key") or "").strip()
     if isinstance(auto_lie, dict):
         secret = str(auto_lie.get("secret_key") or "").strip()
         set_server_secret(secret)
@@ -1034,7 +1043,7 @@ def _with_server_device(
             try:
                 import local_lie_service
 
-                local_lie_service.sync_product_key(secret)
+                local_lie_service.sync_product_key(tx_key or secret)
             except Exception:  # noqa: BLE001 - a key refresh must never break a reply
                 AUTO_LIE_LOG.debug(
                     "the local lie service key could not be refreshed", exc_info=True
@@ -1046,6 +1055,17 @@ def _with_server_device(
     else:
         # Silence is not a verdict (see the docstring): the credential stays.
         AUTO_LIE_LOG.debug("auto-lie credential left untouched (this reply carries none)")
+        if tx_key:
+            # A reply that names only the tracking key still owes the local service
+            # its credential; the auto-lie block itself stays untouched.
+            try:
+                import local_lie_service
+
+                local_lie_service.sync_product_key(tx_key)
+            except Exception:  # noqa: BLE001 - never break a licence reply
+                AUTO_LIE_LOG.debug(
+                    "the local lie service tx_key could not be written", exc_info=True
+                )
     # 本地测谎: the activation code's CT card travels in the device document, so the
     # desktop starts the local service with the ONLINE card instead of asking the
     # operator (the 激活测谎 button was removed for that reason).

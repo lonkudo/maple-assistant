@@ -229,6 +229,13 @@ LICENSE_HEARTBEAT_FAILURE_RETRY_SECONDS = 10 * 60
 # firmware signals.  These are deliberate *CIM-only* retries; a server refusal
 # is never retried here because that could consume activation-failure quota.
 CIM_BOOT_RETRY_SECONDS = (3.0, 30.0, 60.0, 300.0)
+# The header stays on "正在验证在线授权…" and the panel stays locked while the
+# online check is pending, so a check that never reports back leaves the whole
+# application unusable with no way out ("the authorization never finished, the
+# application crashed").  After this long the pending state resolves as a
+# failure - the ↻ button and the next scheduled heartbeat keep trying in the
+# background - so the operator always gets an actionable screen back.
+LICENSE_PENDING_WATCHDOG_SECONDS = 75.0
 _GMT8 = timezone(timedelta(hours=8))
 
 # --- 更新图标 -----------------------------------------------------------------
@@ -1506,6 +1513,10 @@ class UiWorker(threading.Thread):
         self._api_auto_lie_quota_logged = False
         self._api_auto_lie_pending_since = 0.0
         self._api_auto_lie_wait_logged = False
+        # A lie window that arrived while the 本地测谎 service was down: logged once
+        # per window, and the start request is rate-limited.
+        self._api_auto_lie_service_wait_logged = False
+        self._local_lie_start_requested_at = 0.0
         # Debounce state: whether the window currently on screen has already been handled, when
         # the square was last seen to be gone, and when the last pass started.
         self._api_auto_lie_event_active = False
@@ -1520,6 +1531,12 @@ class UiWorker(threading.Thread):
         # 本地测谎 (127.0.0.1:8765): result of the last health probe and the note
         # the panel shows.  None = not probed yet in this session.
         self._local_lie_ready: Optional[bool] = None
+        # 试跑 requested while the local service was cold-starting: the drill is
+        # kept pending and started as soon as /v1/health answers, instead of
+        # being cancelled with "本地测谎服务还没准备好".
+        self._api_test_pending: Optional[tuple[Any, float]] = None
+        self._api_test_wait_started_at: float = 0.0
+        self._api_test_wait_job: Any = None
         self._local_lie_note: str = ""
         # A key refresh from the activation server restarts the local service,
         # but never underneath a live lie pass.
@@ -2383,23 +2400,9 @@ class UiWorker(threading.Thread):
                 variable=self._attack_mode_var,
                 command=self._fixed_on_mode_change,
             ).pack(side="left", padx=(8, 0))
-            # 随机休息 sits with the mode it belongs to, because it only exists
-            # for the patrol/standing modes (巡逻攻击 / 站桩攻击 / 双桩模式).  The
-            # panel greys it out everywhere else instead of hiding it, so the
-            # option is discoverable without changing the panel geometry.
-            self._random_rest_row = ttk.Frame(fixed_panel)
-            self._random_rest_row.pack(fill="x", pady=(4, 0))
-            self._random_rest_var = tk.BooleanVar(value=False)
-            self._random_rest_check = ttk.Checkbutton(
-                self._random_rest_row, text="随机休息",
-                variable=self._random_rest_var,
-                command=self._fixed_on_change,
-            )
-            self._random_rest_check.pack(side="left")
-            ttk.Label(
-                self._random_rest_row, text="每75m~120m 休息3s~15s",
-                foreground="#808080",
-            ).pack(side="left", padx=(8, 0))
+            # 随机休息 is created further down, inside the 延时回桩/跳反打 row: it is
+            # a mode-scoped optional modifier just like they are, and its interval
+            # is a hover tooltip rather than a permanent label on the panel.
             # These rows configure attacks only.  死花模式 still leaves the
             # mode selector and its 重置花 controls available, but must make
             # every normal attack option visibly unavailable.
@@ -2755,6 +2758,29 @@ class UiWorker(threading.Thread):
             jump_counterattack_hint.set_enabled(True)
             self._bind_key_tooltips.append(jump_counterattack_hint)
 
+            # 随机休息 shares this row, directly after 跳反打: like it, it is an
+            # optional modifier of the active mode (巡逻攻击 / 站桩攻击 /
+            # 双桩模式).  The panel greys it out everywhere else instead of hiding
+            # it, so the option stays discoverable without changing the panel
+            # geometry.  The 75m~120m / 3s~15s schedule is a hover hint, not a
+            # permanent label, so the row stays one line wide.
+            self._random_rest_var = tk.BooleanVar(value=False)
+            self._random_rest_check = ttk.Checkbutton(
+                delayed_return_row,
+                text="随机休息",
+                width=7,
+                variable=self._random_rest_var,
+                command=self._fixed_on_change,
+            )
+            self._random_rest_check.pack(side="left", padx=(8, 0))
+            random_rest_hint = HoverTooltip(
+                self._random_rest_check,
+                "每75m~120m 休息3s~15s",
+            )
+            random_rest_hint.set_enabled(True)
+            self._random_rest_hint = random_rest_hint
+            self._bind_key_tooltips.append(random_rest_hint)
+
             step_row = ttk.Frame(stationary_options_row)
             self._small_step_options_row = step_row
             self._small_step_row = step_row
@@ -2925,7 +2951,7 @@ class UiWorker(threading.Thread):
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
-                before_change=lambda: self._undo_capture_callback("宠物食品间隔"),
+                before_change=lambda: self._undo_capture_callback("饲料间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff1_interval_var = self._buff1_interval_control.minimum_var
@@ -2936,7 +2962,7 @@ class UiWorker(threading.Thread):
             buff2_row.pack(fill="x", pady=(2, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
             buff2_use_button = ttk.Checkbutton(
-                buff2_row, text="增益 1", width=6, variable=self._buff2_use_var,
+                buff2_row, text="补药", width=6, variable=self._buff2_use_var,
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
@@ -2958,7 +2984,7 @@ class UiWorker(threading.Thread):
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
-                before_change=lambda: self._undo_capture_callback("增益1间隔"),
+                before_change=lambda: self._undo_capture_callback("补药间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff2_interval_var = self._buff2_interval_control.minimum_var
@@ -2969,7 +2995,7 @@ class UiWorker(threading.Thread):
             buff3_row.pack(fill="x")
             self._buff3_use_var = tk.BooleanVar(value=False)
             buff3_use_button = ttk.Checkbutton(
-                buff3_row, text="增益 2", width=6, variable=self._buff3_use_var,
+                buff3_row, text="增益 1", width=6, variable=self._buff3_use_var,
                 command=self._drug_on_change,
             )
             buff3_use_button.pack(side="left")
@@ -2991,7 +3017,7 @@ class UiWorker(threading.Thread):
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
-                before_change=lambda: self._undo_capture_callback("增益2间隔"),
+                before_change=lambda: self._undo_capture_callback("增益1间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff3_interval_var = self._buff3_interval_control.minimum_var
@@ -3002,7 +3028,7 @@ class UiWorker(threading.Thread):
             buff4_row.pack(fill="x", pady=(2, 0))
             self._buff4_use_var = tk.BooleanVar(value=False)
             buff4_use_button = ttk.Checkbutton(
-                buff4_row, text="增益 3", width=6, variable=self._buff4_use_var,
+                buff4_row, text="增益 2", width=6, variable=self._buff4_use_var,
                 command=self._drug_on_change,
             )
             buff4_use_button.pack(side="left")
@@ -3024,7 +3050,7 @@ class UiWorker(threading.Thread):
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
-                before_change=lambda: self._undo_capture_callback("增益3间隔"),
+                before_change=lambda: self._undo_capture_callback("增益2间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff4_interval_var = self._buff4_interval_control.minimum_var
@@ -3035,7 +3061,7 @@ class UiWorker(threading.Thread):
             buff5_row.pack(fill="x", pady=(2, 0))
             self._buff5_use_var = tk.BooleanVar(value=False)
             buff5_use_button = ttk.Checkbutton(
-                buff5_row, text="增益 4", width=6, variable=self._buff5_use_var,
+                buff5_row, text="增益 3", width=6, variable=self._buff5_use_var,
                 command=self._drug_on_change,
             )
             buff5_use_button.pack(side="left")
@@ -3057,7 +3083,7 @@ class UiWorker(threading.Thread):
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
-                before_change=lambda: self._undo_capture_callback("增益4间隔"),
+                before_change=lambda: self._undo_capture_callback("增益3间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff5_interval_var = self._buff5_interval_control.minimum_var
@@ -3068,7 +3094,7 @@ class UiWorker(threading.Thread):
             buff6_row.pack(fill="x", pady=(2, 0))
             self._buff6_use_var = tk.BooleanVar(value=False)
             buff6_use_button = ttk.Checkbutton(
-                buff6_row, text="增益 5", width=6, variable=self._buff6_use_var,
+                buff6_row, text="增益 4", width=6, variable=self._buff6_use_var,
                 command=self._drug_on_change,
             )
             buff6_use_button.pack(side="left")
@@ -3090,7 +3116,7 @@ class UiWorker(threading.Thread):
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
-                before_change=lambda: self._undo_capture_callback("增益5间隔"),
+                before_change=lambda: self._undo_capture_callback("增益4间隔"),
                 on_change=self._drug_on_change,
             )
             self._buff6_interval_var = self._buff6_interval_control.minimum_var
@@ -5299,6 +5325,15 @@ class UiWorker(threading.Thread):
         if getattr(self, "_license_heartbeat_started", False):
             return
         self._license_heartbeat_started = True
+        if getattr(self, "_license_online_validation_pending", False):
+            # The header was put on "正在验证在线授权…" while the panel was being
+            # built; now that widgets exist the watchdog can guard it.
+            self._arm_license_pending()
+
+        def run_round(aggressive: bool) -> Optional[LicenseStatus]:
+            """One validation round; ``None`` means shutdown was requested."""
+
+            return self._license_heartbeat_round(aggressive)
 
         def heartbeat_loop() -> None:
             while not self.stop_event.is_set():
@@ -5307,35 +5342,9 @@ class UiWorker(threading.Thread):
                 # same round is then allowed the short retry burst.
                 aggressive = bool(self._license_refresh_aggressive)
                 self._license_refresh_aggressive = False
-                status = validate_via_server()
-                # Device-not-ready means the local CIM provider was not ready,
-                # not that the server rejected the entitlement.  Retry the
-                # live read after 3 s, 30 s, 60 s and 5 min.  ``force`` avoids
-                # the normal five-minute incomplete-fingerprint cache.
-                if status.code == "device_not_ready":
-                    for attempt, delay in enumerate(CIM_BOOT_RETRY_SECONDS, start=1):
-                        LOG.warning(
-                            "CIM unavailable; retry %d/%d in %.0fs",
-                            attempt, len(CIM_BOOT_RETRY_SECONDS), delay,
-                        )
-                        if self.stop_event.wait(delay):
-                            return
-                        status = validate_via_server(force_cim_refresh=True)
-                        if status.code != "device_not_ready":
-                            break
-                for _ in range(
-                    (LICENSE_REFRESH_RETRY_ATTEMPTS - 1) if aggressive else 0
-                ):
-                    if not license_refresh_retryable(status):
-                        break
-                    if self.stop_event.wait(LICENSE_REFRESH_RETRY_SECONDS):
-                        return
-                    status = validate_via_server()
-                if aggressive:
-                    LOG.info(
-                        "手动刷新：心跳完成（%s）",
-                        "有效" if status.valid else status.code,
-                    )
+                status = run_round(aggressive)
+                if status is None:          # shutdown requested mid-round
+                    return
                 try:
                     self._license_heartbeat_results.put_nowait((generation, status))
                 except Exception:
@@ -5369,6 +5378,56 @@ class UiWorker(threading.Thread):
             name="license-heartbeat",
             daemon=True,
         ).start()
+
+    def _license_heartbeat_round(self, aggressive: bool) -> Optional[LicenseStatus]:
+        """One online validation round; ``None`` means shutdown was requested.
+
+        Any raise is turned into a failed status instead of escaping: the header
+        stays on "正在验证在线授权…" and the panel stays locked while
+        ``_license_online_validation_pending`` is set, so a heartbeat thread that
+        died silently left the whole application frozen on that yellow text
+        (operator: "the authorization never finished, the application crashed").
+        A missing local-service folder, a locked configuration file, a CIM provider
+        that vanished between two calls, or any unforeseen error must therefore
+        still resolve the header.
+        """
+
+        try:
+            status = validate_via_server()
+            # Device-not-ready means the local CIM provider was not ready, not
+            # that the server rejected the entitlement.  Retry the live read after
+            # 3 s, 30 s, 60 s and 5 min.  ``force`` avoids the normal
+            # five-minute incomplete-fingerprint cache.
+            if status.code == "device_not_ready":
+                for attempt, delay in enumerate(CIM_BOOT_RETRY_SECONDS, start=1):
+                    LOG.warning(
+                        "CIM unavailable; retry %d/%d in %.0fs",
+                        attempt, len(CIM_BOOT_RETRY_SECONDS), delay,
+                    )
+                    if self.stop_event.wait(delay):
+                        return None
+                    status = validate_via_server(force_cim_refresh=True)
+                    if status.code != "device_not_ready":
+                        break
+            for _ in range(
+                (LICENSE_REFRESH_RETRY_ATTEMPTS - 1) if aggressive else 0
+            ):
+                if not license_refresh_retryable(status):
+                    break
+                if self.stop_event.wait(LICENSE_REFRESH_RETRY_SECONDS):
+                    return None
+                status = validate_via_server()
+            if aggressive:
+                LOG.info(
+                    "手动刷新：心跳完成（%s）",
+                    "有效" if status.valid else status.code,
+                )
+            return status
+        except Exception:  # noqa: BLE001 - a dead heartbeat froze the header
+            LOG.exception("在线授权验证异常；本次判定为失败并解锁界面")
+            return LicenseStatus(
+                False, "heartbeat_error", "在线授权验证异常，请稍后点右上角刷新重试。",
+            )
 
     def _wait_for_next_heartbeat(self, seconds: float) -> bool:
         """Sleep until the next scheduled heartbeat.
@@ -5413,11 +5472,70 @@ class UiWorker(threading.Thread):
         self._license_refresh_aggressive = True
         # The header says "正在验证在线授权…" until the result lands, exactly as
         # the startup heartbeat does.
-        self._license_online_validation_pending = True
+        self._arm_license_pending()
         self._license_heartbeat_request.set()
         LOG.info("手动刷新：已请求立即向授权服务器发送心跳。")
         self._refresh_license_ui()
         self._begin_license_refresh_cooldown(button)
+
+    def _arm_license_pending(self) -> None:
+        """Mark the online check pending and arm its watchdog.
+
+        Every path that shows the yellow "正在验证在线授权…" header goes through
+        here, so the indicator can never outlive
+        ``LICENSE_PENDING_WATCHDOG_SECONDS`` without a resolution.
+        """
+
+        self._license_online_validation_pending = True
+        root = getattr(self, "_root", None)
+        if root is None:
+            return
+        previous = getattr(self, "_license_pending_watchdog_job", None)
+        if previous is not None:
+            try:
+                root.after_cancel(previous)
+            except Exception:
+                LOG.debug("stale licence watchdog could not be cancelled", exc_info=True)
+        try:
+            self._license_pending_watchdog_job = root.after(
+                int(LICENSE_PENDING_WATCHDOG_SECONDS * 1000),
+                self._resolve_stale_license_pending,
+            )
+        except Exception:  # noqa: BLE001 - the retry loop still exists
+            LOG.debug("licence watchdog could not be armed", exc_info=True)
+
+    def _resolve_stale_license_pending(self) -> None:
+        """Resolve an online check that never reported back.
+
+        Nothing in the heartbeat path may leave the header pending forever: the
+        panel is locked while it is, so the operator would see a frozen
+        application on "正在验证在线授权…".  The verdict here is deliberately a
+        failure - the real state is unknown - and the normal failure policy
+        (locked UI plus the ↻ button and the scheduled retry) takes over.
+        """
+
+        self._license_pending_watchdog_job = None
+        if not getattr(self, "_license_online_validation_pending", False):
+            return
+        LOG.warning(
+            "在线授权验证 %.0fs 内没有结果；结束等待并允许重试",
+            LICENSE_PENDING_WATCHDOG_SECONDS,
+        )
+        self._license_online_validation_pending = False
+        try:
+            self._license_status = LicenseStatus(
+                False, "heartbeat_timeout",
+                "在线授权验证超时，请点右上角刷新重试。",
+            )
+            self._license_heartbeat_consecutive_failures += 1
+            self._lock_license_ui_only()
+            if hasattr(self, "_control_status"):
+                self._control_status.configure(text="在线授权验证超时，请点右上角刷新重试。")
+        except Exception:  # noqa: BLE001 - never raise from a watchdog
+            LOG.exception("在线授权超时状态无法呈现")
+        # Ask again in the background (not a tight loop: the heartbeat's own
+        # failure back-off governs how often the server is contacted).
+        self._license_heartbeat_request.set()
 
     def _begin_license_refresh_cooldown(self, button: Any) -> None:
         """Grey the caption refresh button and re-enable it after the cooldown."""
@@ -5472,37 +5590,48 @@ class UiWorker(threading.Thread):
         if generation != self._license_heartbeat_generation:
             self._license_online_validation_pending = False
             return
-        status = self._preserve_server_identity(status)
-        self._license_status = status
+        # Clear the pending indicator BEFORE the result is rendered.  The header
+        # text is driven by this flag, so an exception while applying the verdict
+        # (a Tk callback error, a widget that is not built yet, a local-service
+        # call that fails) used to leave the application frozen on
+        # "正在验证在线授权…" although the answer had already arrived.
         self._license_online_validation_pending = False
+        try:
+            status = self._preserve_server_identity(status)
+        except Exception:  # noqa: BLE001 - never leave the header pending
+            LOG.exception("在线授权结果无法应用（身份保留失败），按原样使用")
+        self._license_status = status
         if status.valid:
-            self._license_heartbeat_consecutive_failures = 0
-            self._remember_equipment_id(status.equipment_id)
-            was_locked = self._license_session_locked
-            self._license_session_locked = False
-            # Loading persisted controls may restore the saved Auto Lie
-            # checkbutton.  Do that first, then apply the server entitlement
-            # so a quota-disabled device cannot be switched back on by config.
-            if was_locked:
-                LOG.info("license heartbeat accepted; automation unlocked")
-                self._shutdown_load_settings()
-            self._refresh_license_ui()
-            self._set_license_visual_lock(False)
-            self._apply_auto_lie_entitlement(status)
-            self._apply_lie_quota_gate(status)
-            if hasattr(self, "_control_status"):
-                self._control_status.configure(
-                    text=("在线授权验证成功，自动功能已解锁。"
-                          if status.auto_lie_allowed
-                          else "在线授权验证成功，自动过测谎已被服务器停用。")
-                )
-            if hasattr(self, "_quick_message_status"):
-                self._quick_message_status.configure(
-                    text=("在线授权验证成功，自动功能已解锁。"
-                          if status.auto_lie_allowed
-                          else "在线授权验证成功，自动过测谎已被服务器停用。")
-                )
-            self._refresh_patrol_controls()
+            try:
+                self._license_heartbeat_consecutive_failures = 0
+                self._remember_equipment_id(status.equipment_id)
+                was_locked = self._license_session_locked
+                self._license_session_locked = False
+                # Loading persisted controls may restore the saved Auto Lie
+                # checkbutton.  Do that first, then apply the server entitlement
+                # so a quota-disabled device cannot be switched back on by config.
+                if was_locked:
+                    LOG.info("license heartbeat accepted; automation unlocked")
+                    self._shutdown_load_settings()
+                self._refresh_license_ui()
+                self._set_license_visual_lock(False)
+                self._apply_auto_lie_entitlement(status)
+                self._apply_lie_quota_gate(status)
+                if hasattr(self, "_control_status"):
+                    self._control_status.configure(
+                        text=("在线授权验证成功，自动功能已解锁。"
+                              if status.auto_lie_allowed
+                              else "在线授权验证成功，自动过测谎已被服务器停用。")
+                    )
+                if hasattr(self, "_quick_message_status"):
+                    self._quick_message_status.configure(
+                        text=("在线授权验证成功，自动功能已解锁。"
+                              if status.auto_lie_allowed
+                              else "在线授权验证成功，自动过测谎已被服务器停用。")
+                    )
+                self._refresh_patrol_controls()
+            except Exception:  # noqa: BLE001 - unlocked state is already committed
+                LOG.exception("在线授权成功但面板解锁失败")
             return
         self._license_heartbeat_consecutive_failures += 1
         LOG.warning(
@@ -6993,6 +7122,92 @@ class UiWorker(threading.Thread):
             return
         seconds = self._api_test_video_seconds()
         self._save_api_test_settings()
+        # 本地测谎: a cold service needs ~7-10 s (licence ticket + WS handshake), so
+        # a drill pressed during that window waits for it instead of failing.
+        self._api_test_begin_or_wait(video, seconds)
+
+    def _api_test_begin_or_wait(self, video: Any, seconds: float) -> None:
+        """Run the drill now, or wait for a starting 本地测谎 service."""
+
+        if self._auto_lie_backend_is_local():
+            ready, note = self._ensure_local_lie_service()
+            if not ready:
+                if self._api_test_pending is None:
+                    self._api_test_pending = (video, seconds)
+                    self._api_test_wait_started_at = time.monotonic()
+                    LOG.info(
+                        "试跑: 本地测谎服务还没就绪（%s）；等待其启动后自动开始", note
+                    )
+                    self._set_api_test_status(
+                        "本地测谎服务正在启动，就绪后自动开始试跑…"
+                    )
+                    self._api_test_schedule_wait_tick(delay_ms=700)
+                return
+        self._api_test_pending = None
+        self._api_test_wait_started_at = 0.0
+        self._begin_api_test(video, seconds)
+
+    def _api_test_schedule_wait_tick(self, *, delay_ms: int) -> None:
+        job = getattr(self, "_api_test_wait_job", None)
+        if job is not None:
+            try:
+                self._root.after_cancel(job)
+            except Exception:
+                LOG.debug("api test wait cancel failed", exc_info=True)
+        try:
+            self._api_test_wait_job = self._root.after(
+                int(delay_ms), self._api_test_wait_tick
+            )
+        except Exception:
+            LOG.debug("api test wait could not be scheduled", exc_info=True)
+            self._api_test_wait_job = None
+
+    def _api_test_wait_tick(self) -> None:
+        """Poll a cold-starting 本地测谎 service, then start the waiting drill."""
+
+        self._api_test_wait_job = None
+        pending = getattr(self, "_api_test_pending", None)
+        if pending is None:
+            return
+        started = float(getattr(self, "_api_test_wait_started_at", 0.0) or 0.0)
+        if started and time.monotonic() - started > 40.0:
+            self._api_test_pending = None
+            self._api_test_wait_started_at = 0.0
+            self._report_api_test_failure(
+                "本地测谎服务启动失败：40 秒内 127.0.0.1:8765 未响应（详见 运行日志）"
+            )
+            return
+        try:
+            from local_lie_backend import probe_local_lie_service
+
+            ok, note = probe_local_lie_service(timeout=1.0)
+        except Exception as exc:  # noqa: BLE001 - a probe never blocks the retry
+            ok, note = False, f"本地测谎探测失败：{exc}"
+        if ok:
+            self._local_lie_ready = True
+            self._local_lie_note = note
+            LOG.info("试跑: 本地测谎服务已就绪，开始等待中的试跑")
+            video, seconds = pending
+            self._api_test_begin_or_wait(video, seconds)
+            return
+        # Still starting: retry quickly, and keep the panel text honest.
+        self._api_test_schedule_wait_tick(delay_ms=700)
+
+    def _begin_api_test(self, video: Any, seconds: float) -> None:
+        """Start the drill on *video* (the body of the former _api_test_clicked)."""
+
+        # This method is also reached from the service wait-tick, which never runs
+        # the button handler, so every name the body needs is resolved HERE.  The
+        # split of _api_test_clicked missed this one and every 试跑 died with
+        # "NameError: name 'factory' is not defined".
+        factory = getattr(self, "api_test_video_factory", None)
+        if not callable(factory):
+            LOG.warning("api test: the video drill factory is not wired in this build")
+            self._report_api_test_failure("测试视频功能暂不可用（本版本未接入），请重启助手后再试")
+            return
+        local_backend = self._auto_lie_backend_is_local()
+        self._api_test_local_backend = bool(local_backend)
+        key = "" if local_backend else get_server_secret()
         window_factory = getattr(self, "api_test_window_factory", None)
         if window_factory is None:
             try:
@@ -7780,10 +7995,18 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_api_test_status"):
             self._api_test_status.configure(text=text)
 
-    def _ensure_local_lie_service(self, *, timeout: float = 5.0) -> tuple[bool, str]:
-        """``(ready, note)`` for 本地测谎, probing now when nothing was probed yet."""
+    def _ensure_local_lie_service(
+        self, *, timeout: float = 5.0, force_probe: bool = False,
+    ) -> tuple[bool, str]:
+        """``(ready, note)`` for 本地测谎, probing now when nothing was probed yet.
 
-        if self._local_lie_ready is None:
+        ``force_probe`` re-reads ``/v1/health`` even when a cached verdict exists: the
+        automatic pass must know whether the service is listening RIGHT NOW, because a
+        stale True sends the pass into a dead port and a stale False drops a lie event
+        the service could have served.
+        """
+
+        if force_probe or self._local_lie_ready is None:
             try:
                 from local_lie_backend import probe_local_lie_service
 
@@ -8216,24 +8439,45 @@ class UiWorker(threading.Thread):
                 since_last, AUTO_LIE_MIN_PASS_GAP_SECONDS,
             )
             return
-        self._api_auto_lie_pending = False
         local_backend = self._auto_lie_backend_is_local()
         if local_backend:
-            ready, note = self._ensure_local_lie_service()
+            # Ask the port directly: a cached verdict is not evidence for THIS
+            # window (a stale True aims the pass at a dead port).
+            ready, note = self._ensure_local_lie_service(force_probe=True)
             if not ready:
-                # The service is pre-started with the app and supervised while
-                # 本地测谎 is selected, so it must already be listening when a lie
-                # window appears.  Do NOT wait for a cold start here: report it,
-                # and let the supervisor restart it for the next window.
-                AUTO_LIE_LOG.warning(
-                    "自动过测谎 (本地测谎): the service is not listening (%s) - "
-                    "the supervisor will pre-start it again", note,
+                # The service is normally pre-started and supervised, but a real lie
+                # window can arrive during a cold start or a restart.  Dropping the
+                # event loses that window outright, so keep it pending, ask for a
+                # start, and retry on the next UI tick (bounded below like any other
+                # waiting event).
+                waited = time.monotonic() - getattr(
+                    self, "_api_auto_lie_pending_since", time.monotonic()
                 )
+                if waited >= AUTO_LIE_PENDING_MAX_SECONDS:
+                    self._api_auto_lie_pending = False
+                    AUTO_LIE_LOG.warning(
+                        "自动过测谎 (本地测谎): the service stayed down for %.0fs "
+                        "(%s) - dropping this lie window", waited, note,
+                    )
+                    return
+                self._api_auto_lie_pending = True
+                requested = self._local_lie_request_start(
+                    reason="a lie window is waiting"
+                )
+                if not getattr(self, "_api_auto_lie_service_wait_logged", False):
+                    self._api_auto_lie_service_wait_logged = True
+                    AUTO_LIE_LOG.warning(
+                        "自动过测谎 (本地测谎): the service is not listening (%s); "
+                        "keeping the lie window and retrying%s",
+                        note, " (start requested)" if requested else "",
+                    )
                 if hasattr(self, "_api_test_status"):
                     self._api_test_status.configure(
-                        text=f"自动测谎（本地测谎）: 服务未监听 - {note}"
+                        text=f"自动测谎（本地测谎）: 服务启动中，就绪后立即处理 - {note}"
                     )
                 return
+            self._api_auto_lie_service_wait_logged = False
+        self._api_auto_lie_pending = False
         try:
             worker = factory(backend=AUTOLIE_BACKEND_LOCAL) if local_backend else factory()
         except Exception as exc:
@@ -8279,6 +8523,47 @@ class UiWorker(threading.Thread):
             self._api_test_status.configure(
                 text=f"自动过测谎: 测谎窗口出现，正在处理（第 {self._api_auto_lie_runs} 次）…"
             )
+
+    def _local_lie_request_start(self, *, reason: str = "") -> bool:
+        """Ask the 本地测谎 service to start, at most once every few seconds.
+
+        The supervisor already pre-starts it whenever 本地测谎 is selected; this is the
+        direct request the automatic pass makes when a real lie window finds the port
+        closed (a restart that has not finished, or a supervisor that backed off).
+        Returns True when a start was requested.
+        """
+
+        now = time.monotonic()
+        last = getattr(self, "_local_lie_start_requested_at", 0.0)
+        if now - last < 3.0:
+            return False
+        self._local_lie_start_requested_at = now
+        root = None
+        try:
+            from runtime_paths import application_root
+
+            root = application_root(__file__)
+        except Exception:  # noqa: BLE001 - the module default is fine
+            root = None
+
+        def _start() -> None:
+            try:
+                import local_lie_service
+
+                ok, note = local_lie_service.ensure_started(root)
+                AUTO_LIE_LOG.info(
+                    "自动过测谎 (本地测谎): start requested%s -> %s (%s)",
+                    f" ({reason})" if reason else "",
+                    "running" if ok else "not yet",
+                    note,
+                )
+            except Exception:  # noqa: BLE001 - a start request never breaks a pass
+                AUTO_LIE_LOG.debug("本地测谎 start request failed", exc_info=True)
+
+        threading.Thread(
+            target=_start, name="local-lie-start-request", daemon=True,
+        ).start()
+        return True
 
     def _pause_patrol_for_api_pass(self) -> None:
         """Stand the patrol down while the automatic api pass answers the lie test.
@@ -11219,14 +11504,19 @@ class UiWorker(threading.Thread):
         dual_stationary_enabled = mode == "dual_stationary" and self._license_allowed()
         flower_cycle_enabled = mode in ("stationary", "dual_stationary", "dead_flower") and self._license_allowed()
         dead_flower_mode = mode == "dead_flower"
-        # 随机休息 only exists where the character patrols or stands on a 桩.
+        # 随机休息 only exists where the character patrols or stands on a 桩.  It
+        # shares a row with 延时回桩/跳反打, so only the checkbox is gated - the
+        # row's other controls keep their own rules.
         rest_allowed = (
             mode in ("fixed", "stationary", "dual_stationary")
             and self._license_allowed()
         )
-        rest_row = getattr(self, "_random_rest_row", None)
-        if rest_row is not None:
-            self._set_panel_state(rest_row, disabled=not rest_allowed)
+        rest_check = getattr(self, "_random_rest_check", None)
+        if rest_check is not None:
+            try:
+                rest_check.state(["!disabled" if rest_allowed else "disabled"])
+            except Exception:
+                rest_check.configure(state="normal" if rest_allowed else "disabled")
         rest_worker = getattr(self, "random_rest_worker", None)
         rest_var = getattr(self, "_random_rest_var", None)
         if rest_worker is not None and rest_var is not None:
@@ -11726,7 +12016,7 @@ class UiWorker(threading.Thread):
                     )
                 if mode == "dead_flower":
                     self._fixed_status.configure(
-                        text="死花模式已启用 - 双层花点按 Buff1 定时上下移动；单层仅 Buff 与 HP/MP。"
+                        text="死花模式已启用 - 双层花点按 补药 定时上下移动；单层仅 Buff 与 HP/MP。"
                     )
                 elif mode == "stationary":
                     self._fixed_status.configure(
@@ -14747,7 +15037,7 @@ class UiWorker(threading.Thread):
         self._refresh_patrol_controls()
         if dead_flower_mode:
             self._control_status.configure(
-                text="死花模式已开始：花点按 Buff1 定时循环；重置花到时才下绳巡逻。"
+                text="死花模式已开始：花点按 补药 定时循环；重置花到时才下绳巡逻。"
             )
         elif str(getattr(self, "_attack_mode_var", None).get()
                  if hasattr(self, "_attack_mode_var") else "fixed") == "flower_patrol":
