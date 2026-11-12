@@ -616,8 +616,18 @@ def device_request_code() -> str:
     return DEVICE_REQUEST_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def machine_fingerprint_hash(*, force_refresh: bool = False) -> str:
-    """Return the opaque, stable fingerprint sent to the fixed activation server."""
+def device_identity_for_request(
+    *, force_refresh: bool = False,
+) -> tuple[str, dict[str, str]]:
+    """The composite fingerprint together with the digests that produced it.
+
+    Every licensing request sends both halves.  The composite answers "is this
+    the same reading?", and the digests let the server answer "is this the same
+    EQUIPMENT?" when the composite legitimately changed - a system restore moves
+    ``MachineGuid`` back, and a PC that is still bringing WMI online reports only
+    two of the three signals.  They are read once here so the two halves of one
+    request can never disagree.
+    """
 
     components = machine_fingerprint_components(force_refresh=force_refresh)
     if len(components) < 2:
@@ -626,9 +636,17 @@ def machine_fingerprint_hash(*, force_refresh: bool = False) -> str:
         # Do not misreport this as a server or activation-code failure.
         raise DeviceNotReadyError("设备未就绪，稍后重试")
     material = json.dumps(components, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(
+    fingerprint = hashlib.sha256(
         f"MapleAssistant-online-fingerprint/v1\\0{material}".encode("ascii")
     ).hexdigest()
+    return fingerprint, dict(components)
+
+
+def machine_fingerprint_hash(*, force_refresh: bool = False) -> str:
+    """Return the opaque, stable fingerprint sent to the fixed activation server."""
+
+    fingerprint, _components = device_identity_for_request(force_refresh=force_refresh)
+    return fingerprint
 
 
 def machine_binding_from_request(code: str) -> dict[str, Any]:
@@ -704,6 +722,38 @@ def _load_public_key(root: Optional[Path] = None) -> Any:
         raise ValueError("授权公钥不可用") from exc
 
 
+def _document_fingerprint_status(
+    payload: dict[str, Any], license_id: str, edition: str,
+    root: Optional[Path],
+) -> Optional[LicenseStatus]:
+    """Exact composite check for a document that carries no per-signal binding.
+
+    Kept as its own step because a document issued by an older server has only
+    the composite to stand on, while a newer one ships ``machine_binding`` and is
+    judged by ``_machine_binding_status`` instead.
+    """
+
+    try:
+        try:
+            fingerprint = machine_fingerprint_hash()
+        except DeviceNotReadyError:
+            # CIM can be unavailable during the first seconds of Windows
+            # startup.  A DPAPI record is usable only on this same user
+            # profile and only for this same signed license, so it can
+            # keep local verification alive until the scheduled live
+            # heartbeat obtains a fresh CIM reading.
+            fingerprint = _sealed_fingerprint_for_license(license_id, root)
+            if fingerprint is None:
+                raise
+        if payload.get("fingerprint_hash") != fingerprint:
+            return LicenseStatus(False, "machine", "此授权码仅适用于另一台设备。", license_id, edition)
+    except DeviceNotReadyError as exc:
+        return LicenseStatus(False, "device_not_ready", str(exc), license_id, edition)
+    except ValueError as exc:
+        return LicenseStatus(False, "machine", str(exc), license_id, edition)
+    return None
+
+
 def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus:
     if not isinstance(document, dict):
         return LicenseStatus(False, "malformed", "授权文件格式错误。")
@@ -725,24 +775,24 @@ def _parse_document(document: Any, root: Optional[Path] = None) -> LicenseStatus
     if not license_id or edition not in _LEGACY_EDITION_VALUES:
         return LicenseStatus(False, "fields", "授权文件内容不完整。")
     if document_format == "maple-assistant-license/v2":
-        try:
-            try:
-                fingerprint = machine_fingerprint_hash()
-            except DeviceNotReadyError:
-                # CIM can be unavailable during the first seconds of Windows
-                # startup.  A DPAPI record is usable only on this same user
-                # profile and only for this same signed license, so it can
-                # keep local verification alive until the scheduled live
-                # heartbeat obtains a fresh CIM reading.
-                fingerprint = _sealed_fingerprint_for_license(license_id, root)
-                if fingerprint is None:
-                    raise
-            if payload.get("fingerprint_hash") != fingerprint:
-                return LicenseStatus(False, "machine", "此授权码仅适用于另一台设备。", license_id, edition)
-        except DeviceNotReadyError as exc:
-            return LicenseStatus(False, "device_not_ready", str(exc), license_id, edition)
-        except ValueError as exc:
-            return LicenseStatus(False, "machine", str(exc), license_id, edition)
+        binding = payload.get("machine_binding")
+        if binding is None:
+            # Legacy document: the single composite is the only device claim it
+            # makes, so equality is all that can be checked here.
+            status = _document_fingerprint_status(payload, license_id, edition, root)
+            if status is not None:
+                return status
+        else:
+            # The server recorded the digests behind the composite, so the same
+            # equipment may legitimately report a different composite (registry
+            # rollback, or one signal still unavailable at boot).  The digest
+            # rule replaces the equality test instead of being added to it -
+            # otherwise a restored PC would still be rejected by the stale hash.
+            machine_status = _machine_binding_status(binding, license_id, root)
+            if machine_status is not None:
+                return LicenseStatus(
+                    False, machine_status.code, machine_status.message, license_id, edition
+                )
     else:
         machine_status = _machine_binding_status(
             payload.get("machine_binding"), license_id, root,
@@ -1128,13 +1178,14 @@ def activate_via_server(code: str, root: Optional[Path] = None) -> LicenseStatus
 
     try:
         SERVER_LOG.info("activation requested")
-        fingerprint = machine_fingerprint_hash()
+        fingerprint, components = device_identity_for_request()
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/activate",
             {
                 "activation_code": "".join(str(code).upper().split()),
                 "fingerprint": fingerprint,
+                "components": components,
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
@@ -1191,10 +1242,15 @@ def preview_activation_transfer_via_server(code: str, root: Optional[Path] = Non
     clean_code = "".join(str(code or "").upper().split())
     try:
         SERVER_LOG.info("activation transfer preview requested")
+        fingerprint, components = device_identity_for_request()
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/activation-transfer/preview",
-            {"activation_code": clean_code, "fingerprint": machine_fingerprint_hash()},
+            {
+                "activation_code": clean_code,
+                "fingerprint": fingerprint,
+                "components": components,
+            },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
         status = _with_server_device(verify_license(root), answer)
@@ -1221,11 +1277,15 @@ def confirm_activation_transfer_via_server(token: str, root: Optional[Path] = No
 
     try:
         SERVER_LOG.info("activation transfer confirmation requested")
-        fingerprint = machine_fingerprint_hash()
+        fingerprint, components = device_identity_for_request()
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/activation-transfer/confirm",
-            {"transfer_token": str(token), "fingerprint": fingerprint},
+            {
+                "transfer_token": str(token),
+                "fingerprint": fingerprint,
+                "components": components,
+            },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
         document = answer["license"]
@@ -1325,12 +1385,14 @@ def unbind_device_via_server(
         return LicenseStatus(False, "unbind_missing_code", "本机没有可用的授权码，无法解绑。")
     try:
         SERVER_LOG.info("device self-unbind requested")
+        fingerprint, components = device_identity_for_request()
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/device-unbind",
             {
                 "activation_code": code,
-                "fingerprint": machine_fingerprint_hash(),
+                "fingerprint": fingerprint,
+                "components": components,
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
@@ -1365,13 +1427,16 @@ def _heartbeat_via_server(
         return LicenseStatus(False, "server", "授权文件缺少在线验证信息。")
     try:
         SERVER_LOG.info("license heartbeat requested")
-        fingerprint = machine_fingerprint_hash(force_refresh=force_cim_refresh)
+        fingerprint, components = device_identity_for_request(
+            force_refresh=force_cim_refresh
+        )
         answer = post_json(
             ACTIVATION_SERVER_ENDPOINT,
             "/api/v1/validate",
             {
                 "fingerprint": fingerprint,
                 "license_id": local.license_id,
+                "components": components,
             },
             runtime_root() / ACTIVATION_SERVER_PIN_FILE,
         )
@@ -1465,6 +1530,7 @@ __all__ = [
     "ACTIVATION_PREFIX", "LICENSE_FORMAT",
     "DEVICE_REQUEST_PREFIX", "LicenseStatus", "ActivationTransferPreview", "activate", "activation_code",
     "activate_via_server", "preview_activation_transfer_via_server", "confirm_activation_transfer_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
+    "device_identity_for_request", "machine_fingerprint_components", "machine_fingerprint_hash",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
     "report_lie_event_via_server", "set_device_memo_via_server", "unbind_device_via_server", "validate_via_server",
 ]

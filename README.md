@@ -24,6 +24,16 @@ the server issues one unified license type and the desktop does not gate
 features by an edition label. Legacy signed NORMAL/NP documents remain valid
 only for compatibility.
 
+The operator's `MoonEclipse` installer (`installer/MoonEclipseInstaller.exe`)
+does both steps at once: it asks for the activation code when the chosen folder
+is new, validates it, downloads the newest package, and — after extracting — binds
+the code to this PC and writes the signed `auth.json` into the install root plus
+the code into `助手配置\license_settings.json`. The client therefore opens already
+authorized; the same code does not have to be entered a second time. If that
+round trip fails (server unreachable, code already bound to another machine) the
+installation still completes and the completion dialog says to press 激活授权 with
+the same code.
+
 Standalone package:
 
 1. Extract the whole `MoonEclipse-release-<version>.zip` folder — the executable needs the files beside it, so running `MoonEclipse.exe` alone is not supported.
@@ -35,6 +45,52 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+
+### Current release behavior (v1.3.16)
+
+- **增益 (periodic buffs) left the HP/MP worker.** The five → six `饲料 / 增益1..5` rows
+  used to be driven by `StatusWorker`, the worker that reads the bottom HUD bar and
+  drinks potions, so a buff only fired when a status frame arrived and a cast was judged
+  by an HP/MP delta. A buff that does not touch HP/MP was therefore reported as "did not
+  cast" on every refresh while the buff was fine. `buff_scheduler.py` now owns the
+  schedule: one thread, one lock, a 100 ms tick, no HP/MP dependency, no dependency on
+  the HUD capture. Delivery still goes through `MotionArbiter` (safe-stage gate,
+  attack-animation window, one key at a time), the tap holds the key **200 ms**
+  (`BUFF_TAP_HOLD_SECONDS`), and 宠物食品 plus the 死花 flower-point 增益1 stay direct taps.
+- **增益5 is a sixth row (`buff6`).** Bound with the same key button, interval spinner
+  (5–600 s) and 使用 checkbox; saved as `buff6_key` / `buff6_interval` / `buff6_enabled`,
+  unbound (`-`) and disabled by default like 增益4.
+- **The attack-animation window is 1.2 s.** `attack_grace_seconds` was a hard-coded
+  0.73 s, which expired while a longer attack animation was still playing, so a buff or
+  jump key pressed at that moment was silently discarded by the client. It is now 1.2 s
+  (the operator's measured preflight-clear time), configurable per map profile as
+  `attack_grace_seconds`, and it also governs the opposite-direction press before an
+  endpoint turn (previously capped at a fixed 1.0 s).
+- **随机休息 (random rest).** New option next to the attack-mode radios, available only
+  in 巡逻攻击 / 站桩攻击 / 双桩模式: every **75–120 min** (redrawn after each break) the
+  character stops moving and stops attacking for **3–15 s** (also redrawn), then continues
+  on the same patrol leg. Patrol stays enabled, nothing re-anchors, potions and the buff
+  schedule keep working, and the rest frames are excluded from the stall detector. Hint
+  in the panel: `每75m~120m 休息3s~15s`. Saved as `random_rest_enabled`.
+- **Stuck detection reacts in 2 s.** `rescue_stuck_frames` default is 8 (was 20; the value
+  is a legacy 4 fps frame count, `ceil(v × 1.25)` frames on the current 5 fps stream):
+  20 → 5.0 s, 8 → **2.0 s** of no X/Y movement before the rescue probe. The probe is
+  unchanged and still aborts a false stall, so a shorter window costs a ~1 s pause rather
+  than a drop or restart.
+- **A restored or re-installed PC keeps its licence.** The online binding now stores the
+  per-signal device digests (`windows`/`firmware`/`board`, one-way) beside the composite
+  fingerprint and accepts a request when at least `minimum_matches = 2` of them agree. A
+  system restore (rolled-back `MachineGuid`) or a PC that could only read two signals no
+  longer answers `该授权码已绑定到另一台设备`; the code re-anchors to the new composite and the
+  device row — equipment id, counters, memo, ban — follows the PC. Old clients are
+  unaffected: they send no digests, receive documents without the new field, and keep the
+  exact-composite rule.
+- **The installer authorizes the installation.** After extracting the package the
+  installer calls `/api/v1/activate` with the same identity, writes the signed
+  `auth.json` into the install root and records the code in
+  `助手配置\license_settings.json`, so the client opens already licensed instead of asking
+  for the same code again. A failed round trip never fails the install; the completion
+  dialog then says to press 激活授权 with the same code.
 
 ### Current release behavior (v1.3.8)
 
@@ -541,6 +597,32 @@ share, and an address banned on the website never blocks activation or a
 heartbeat. Neither ban can be cleared by the other, and the website policy is
 inert until its reverse-proxy address header is configured on the server side.
 
+**"Same device" is decided by signals, not by one opaque hash.** The device
+composite is a SHA-256 over the readable subset of three signals —
+`windows` (registry `MachineGuid`), `firmware` (SMBIOS UUID) and `board`
+(baseboard serial) — and it legitimately changes for the same hardware: a system
+restore or disk-image rollback reverts `MachineGuid`, and a PC still bringing WMI
+online reports only two of the three. The server therefore stores the one-way
+digest of each signal beside the composite (`ActivationCode.binding_components`,
+`binding_minimum_matches = 2`) and accepts a request when **at least two
+digests still agree**; the binding then re-anchors to the composite the request
+actually reported. The device row — equipment id, counters, memo, ban — is moved
+to the new composite in the same transaction, so one physical PC keeps one
+equipment id. Consequences worth knowing:
+
+- A restored PC keeps working; it no longer answers `该授权码已绑定到另一台设备` and no
+  longer needs an operator unbind.
+- A code bound to a genuinely different machine is still refused, and a wrong
+  code still bans after ten attempts. A refusal caused only by the device check
+  never spends that failure budget, which is what used to ban a customer's own
+  restored PC within 24 hours.
+- Issued documents carry a `machine_binding` block (`components`,
+  `minimum_matches`) so the desktop can verify "still my device" offline; the
+  client's local check uses it when present and the composite equality rule when
+  it is absent.
+- Rows bound before this rule have no digests and keep exact-composite matching
+  until their device reports signals again (first successful heartbeat).
+
 The activation address is built into the desktop client:
 `https://211.149.169.194:8443`. Customers enter only their activation code;
 they never enter or choose a server address. Before the activation request body
@@ -979,13 +1061,21 @@ circuit before returning. Two or more flower points mean climb between their dis
 and refresh Buff1 at each timer boundary. Normal attack controls and 小碎步 are unavailable in
 this mode.
 
+**随机休息** is the only option here that touches both workers. It is available in 巡逻攻击,
+站桩攻击 and 双桩模式 (greyed out elsewhere) and takes a break every `75m~120m`, lasting
+`3s~15s`; both numbers are drawn fresh each time. During a break the movement worker issues no
+walk/climb/drop command and the attack workers see the shared action-input block, so the character
+simply stands still and then continues on the same leg. Patrol is not stopped, nothing re-anchors,
+potions and the 增益 schedule keep running, and the break frames are excluded from the stall
+detector. The panel hint reads `每75m~120m 休息3s~15s`.
+
 Numeric settings use the shared compact direct-value control rather than a slider. Hover enlarges a
 value; the mouse wheel changes it by one configured step; left-click changes it by ten steps upward;
 right-click changes it by ten steps downward. Range controls enforce their ordered inclusive bounds.
 The fixed **attack interval** remains a `0.20–30.00s` range with `0.05s` precision, so `0.25s`
 remains `0.25s` rather than being rounded to `0.3s`.
 
-HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input.
+HP and MP potions have priority over ordinary combat actions. Pet food is treated as a timed consumable and does not reserve movement input. The five periodic rows (饲料, 增益1..4) are joined by **增益5** (`buff6`): the same key binding, `5–600 s` interval and 使用 checkbox, saved as `buff6_*`, and unbound/disabled by default. Their timer lives in `buff_scheduler.py`, not in the HP/MP worker: a 100 ms tick independent of the HUD capture, delivered through the motion arbiter with a 200 ms hold, so a buff no longer stops when the status bar stops being readable.
 
 ### 被撞反击 (hit reaction)
 
@@ -1121,12 +1211,20 @@ and restored at the next start.
 ### Patrol self-rescue probe
 
 Self-rescue is guarded so a normal attack animation cannot be mistaken for a
-genuine movement stall. After 25 consecutive near-unchanged minimap captures
-(about five seconds at the shared 5 FPS cadence), the movement worker blocks
-attacks for 2.0 seconds and performs a bounded probe: right for 700 ms, wait
-200 ms, then left for 700 ms and wait 200 ms. If the live marker moves by at
-least 0.006 X during either nudge, the character is not stuck and no
-drop/restart is attempted.
+genuine movement stall. After 8 consecutive near-unchanged minimap captures
+(`rescue_stuck_frames`, a legacy 4 fps count = `ceil(8 × 1.25) = 10` frames, about
+**two seconds** at the shared 5 FPS cadence), the movement worker blocks attacks
+for 2.0 seconds (`rescue_probe_attack_block_seconds`) and performs a bounded probe:
+two sampled frames of Right, then two sampled frames of Left
+(`RESCUE_STALL_PROBE_FRAMES = 2`, `RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20`). If
+the live marker moves by at least 0.006 X during either nudge, the character is
+not stuck and no drop/restart is attempted.
+
+Because the window is now two seconds, a long attack animation, a buff or a
+knockback can trigger the probe; that is deliberate and cheap — the probe aborts
+and patrol continues. Two cases never count as a stall: an active attack
+(`attack_state.json`) and a scheduled 随机休息 break, whose frames stand still by
+design.
 
 The probe owns only movement input; it does **not** stop the shared patrol
 controller. Capture and marker tracking continue normally, while ordinary

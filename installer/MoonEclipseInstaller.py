@@ -22,10 +22,12 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from typing import Any
 
 import tkinter as tk
@@ -34,6 +36,7 @@ from tkinter import filedialog, messagebox, ttk
 from licensing import (  # noqa: E402
     ACTIVATION_SERVER_ENDPOINT,
     activation_code,
+    device_identity_for_request,
     machine_fingerprint_hash,
 )
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json  # noqa: E402
@@ -664,9 +667,16 @@ def _activate(code: str) -> tuple[str, Any]:
     server has published nothing).
     """
 
+    # Send the composite AND the per-signal digests behind it: a PC that was
+    # restored to an earlier disk state (rolled-back MachineGuid) or is still
+    # bringing WMI online reports a different composite for the SAME hardware,
+    # and the install must not be refused as "另一台设备" before the app that
+    # would re-anchor it is even installed.
+    fingerprint, components = device_identity_for_request()
     payload = {
         "activation_code": "".join(code.upper().split()),
-        "fingerprint": machine_fingerprint_hash(),
+        "fingerprint": fingerprint,
+        "components": components,
     }
     try:
         answer = post_json(
@@ -693,6 +703,160 @@ def _activate(code: str) -> tuple[str, Any]:
         )
         return token, release
     raise RuntimeError("授权失败：服务器未返回下载信息。")
+
+
+# The signed entitlement the desktop verifies, and the desktop's own record of
+# the code it was activated with (both are the client's own file names).
+ENTITLEMENT_FILE = "auth.json"
+ENTITLEMENT_LOCAL_KEY = "_local"
+LICENSE_SETTINGS_NAME = "license_settings.json"
+
+
+def _acquire_entitlement(code: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind this PC to the code and return its signed entitlement document.
+
+    ``/api/v1/installer/session`` only proves the code so the download may start;
+    it binds nothing and hands out no entitlement, which is why a freshly
+    installed copy used to open unlicensed and ask for the same code again.  This
+    second, mutating call performs the activation itself - the installer is the
+    customer's first contact with the product, so it is also the right place to
+    bind.
+
+    Returns ``(document, reply)``; the reply carries the equipment id and expiry
+    for the window to show.
+    """
+
+    fingerprint, components = device_identity_for_request()
+    payload = {
+        "activation_code": "".join(code.upper().split()),
+        "fingerprint": fingerprint,
+        "components": components,
+    }
+    try:
+        answer = post_json(
+            ACTIVATION_SERVER_ENDPOINT, "/api/v1/activate",
+            payload, PIN_ROOT / "activation_server_pin.json",
+        )
+    except PinnedTlsResponseError as exc:
+        raise RuntimeError(getattr(exc, "message", str(exc))) from exc
+    except PinnedTlsError as exc:
+        raise RuntimeError(f"无法连接到授权服务器（{exc}）") from exc
+    document = (answer or {}).get("license")
+    if not isinstance(document, dict) or "payload" not in document:
+        raise RuntimeError("授权服务器未返回授权文件。")
+    return document, dict(answer or {})
+
+
+def _write_entitlement(root: Path, document: dict[str, Any]) -> Path:
+    """Write the signed entitlement where the installed app reads it.
+
+    Mirrors ``licensing._persist_document`` exactly: ``<root>/auth.json``, the
+    desktop's own ``_local`` display state preserved when the file already
+    exists, and an atomic replace so a half-written document is never readable.
+    """
+
+    target = Path(root) / ENTITLEMENT_FILE
+    output = dict(document)
+    local: dict[str, Any] = {}
+    try:
+        existing = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = None
+    if isinstance(existing, dict):
+        candidate = existing.get(ENTITLEMENT_LOCAL_KEY, {})
+        if isinstance(candidate, dict) and candidate:
+            local = candidate
+        elif "payload" not in existing:
+            # Short-lived flat layout: keep the display fields as ``_local``.
+            local = {
+                key: value for key, value in existing.items()
+                if key not in {"payload", "signature", ENTITLEMENT_LOCAL_KEY}
+            }
+    if local:
+        output[ENTITLEMENT_LOCAL_KEY] = local
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=target.parent, delete=False,
+    ) as handle:
+        json.dump(output, handle, ensure_ascii=True, sort_keys=True, indent=2)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    os.replace(temporary, target)
+    return target
+
+
+def _write_license_settings(
+    root: Path, code: str, reply: dict[str, Any],
+) -> Path | None:
+    """Record the submitted code the way the desktop does.
+
+    A later run of this installer updates an existing folder without asking for
+    the code again (``_previous_install_profile_code`` reads exactly this file),
+    which only works while the code is stored beside the config.
+    """
+
+    target = _profile_search_dirs(root)[0] / LICENSE_SETTINGS_NAME
+    data: dict[str, Any] = {}
+    try:
+        loaded = json.loads(target.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        data = {}
+    data["activation_code"] = "".join(str(code).upper().split())
+    data["last_validation_valid"] = True
+    data["last_validation_code"] = "ACTIVATED"
+    data["last_validation_message"] = "安装程序已自动授权。"
+    data["last_validation_at"] = datetime.now(timezone.utc).isoformat()
+    equipment_id = str(reply.get("device", {}).get("equipment_id", "") if isinstance(
+        reply.get("device"), dict) else "").strip()
+    if len(equipment_id) == 8:
+        data["equipment_id"] = equipment_id
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, delete=False,
+        ) as handle:
+            json.dump(data, handle, ensure_ascii=True, sort_keys=True, indent=2)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+    except OSError:
+        logging.warning("installer: could not store %s", target, exc_info=True)
+        return None
+    return target
+
+
+def authorize_installation(root: Path, code: str) -> str:
+    """Make a finished installation licensed; return the note for the window.
+
+    Never raises: the customer already has a complete install at this point, and
+    a hiccup here must not turn it into a failed installation.  The returned text
+    says either "ready" or exactly what to do next.
+    """
+
+    try:
+        document, reply = _acquire_entitlement(code)
+    except Exception as exc:  # noqa: BLE001 - reported to the window as a note
+        logging.exception("installer: automatic authorization failed")
+        return f"自动授权未完成（{exc}）。请在助手窗口点「激活授权」输入同一授权码。"
+    try:
+        target = _write_entitlement(root, document)
+    except OSError as exc:
+        logging.exception("installer: could not write %s", ENTITLEMENT_FILE)
+        return f"授权文件写入失败（{exc}）。请在助手窗口点「激活授权」输入同一授权码。"
+    _write_license_settings(root, code, reply)
+    equipment_id = ""
+    device = reply.get("device")
+    if isinstance(device, dict):
+        equipment_id = str(device.get("equipment_id") or "")
+    logging.info(
+        "installer: entitlement written to %s (equipment %s)",
+        target, equipment_id or "unknown",
+    )
+    if equipment_id:
+        return f"本机已自动授权（设备码 {equipment_id}），启动后无需再次输入授权码。"
+    return "本机已自动授权，启动后无需再次输入授权码。"
 
 
 def _lens_outline(
@@ -1144,8 +1308,15 @@ class InstallerWindow:
                 update_dir.rmdir()
             except OSError:
                 pass
+            # Authorize the finished installation: the customer typed the code
+            # once, at the start, so the client must open already licensed
+            # instead of asking for the same code again.
+            self.events.put(("stage", "正在写入授权信息…"))
+            authorization_note = authorize_installation(root, code)
             first_setup = _start_first_install_setup(root)
-            self.events.put(("done", (root, first_setup, installed, version)))
+            self.events.put(
+                ("done", (root, first_setup, installed, version, authorization_note))
+            )
         except Exception as exc:  # noqa: BLE001 - reported in the window
             logging.exception("installer: install failed")
             self.events.put(("error", str(exc)))
@@ -1210,12 +1381,12 @@ class InstallerWindow:
                     self.running = False
                     self.install.state(["!disabled"])
                     self._set_progress(1.0)
-                    root, first_setup, changed, version = value
+                    root, first_setup, changed, version, authorization_note = value
                     if changed == 0:
                         self.status.configure(text=f"已是最新版本：{version}")
                         messagebox.showinfo(
                             "已是最新",
-                            f"当前安装已经是 {version}，无需更新。",
+                            f"当前安装已经是 {version}，无需更新。\n\n{authorization_note}",
                             parent=self.root,
                         )
                     else:
@@ -1225,7 +1396,9 @@ class InstallerWindow:
                             if first_setup
                             else f"更新完成（{version}，{changed} 个文件）。可双击安装目录里的“启动助手.bat”启动。"
                         )
-                        messagebox.showinfo("完成", message, parent=self.root)
+                        messagebox.showinfo(
+                            "完成", f"{message}\n\n{authorization_note}", parent=self.root,
+                        )
                 elif kind == "error":
                     self.running = False
                     self.install.state(["!disabled"])

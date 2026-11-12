@@ -78,6 +78,27 @@ pinned server request returns **激活验证失败** instead. This prevents a lo
 startup race from being presented as a server outage while keeping raw device
 values out of logs.
 
+**Device binding is by signal digests, not by one hash (v1.3.16).** The composite is
+a SHA-256 over the readable subset of `windows` (`MachineGuid`), `firmware` (SMBIOS
+UUID) and `board` (baseboard serial), and it changes for the same hardware when
+Windows rolls its registry back or when only two signals answer. Both sides therefore
+work with the per-signal digests: `licensing.device_identity_for_request()` returns the
+composite **and** the digests in one read, every licensing request carries
+`{fingerprint, components}`, and the server stores them on the binding
+(`ActivationCode.binding_components`, `binding_minimum_matches = 2`). A request is
+accepted when the composite matches or when at least two recorded digests still agree;
+the code then re-anchors to the composite that request reported, and
+`carry_device_state()` moves the device row (equipment id, counters, memo, ban) to that
+composite in the same transaction so one PC keeps one equipment id. Client document
+verification mirrors it: a payload carrying `machine_binding` is judged by
+`_machine_binding_status` (≥ `minimum_matches` digests), a payload without it by
+composite equality. A refusal caused only by the device check (`BOUND_CODE`,
+`DEVICE_MISMATCH`) records the attempt but never spends the 10-failure budget, because
+that is what used to ban a customer's own restored PC. Reverse compatibility: a client
+that sends no digests is answered with a document that has no `machine_binding` and
+keeps the exact-composite rule, and a heartbeat or activation can never claim a code
+that is currently unbound (an operator `unbind` must stay effective).
+
 The activation server is a separate Django repository and owns code issuance,
 device binding, expiry, bans, the PostgreSQL database, and private signing
 material. `LICENSE_SIGNING_PRIVATE_KEY` is an environment-only Base64url
@@ -531,6 +552,42 @@ ordinary patrol hold is never interrupted by it.
 
 `attack_worker.py` performs fixed-interval attack in one selected delivery form: stand tap, jump attack, charge hold, or no attack. Charge holds the attack key for an inclusive random value between `charge_min_seconds` and `charge_max_seconds` (0.1–5.0 s), through `AtomicMotionRunner`. Its charge gate admits only the owning charge key and ordinary patrol Left/Right; queued buffs and other action-key motions defer until release. HP/MP recovery may cancel the charge, waits at most 80 ms for the handoff plus 100 ms for release, and then takes priority. With 跳反打 enabled, `AtomicMotionRunner` remains the transaction owner: it delegates only the patrol-direction handoff to `MovementWorker.execute_jump_counterattack_recoil()`, which holds the shared direction/hold locks, releases the current patrol Left/Right claim, taps the opposite direction for 45 ms, waits 10 ms, taps the attack, then restores the original hold. It returns `None` outside an ordinary continuous patrol hold so the runner falls back to ordinary jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.
 
+**Periodic 增益 belong to their own worker (v1.3.16).** `buff_scheduler.py` owns the
+`饲料`/`增益1..5` timers (`buff1`…`buff6`), not `StatusWorker`: one thread, one lock, a
+100 ms tick, reading the row config through a provider so the drug panel's edits apply
+live. `StatusWorker` keeps only HP/MP potions, the HUD publication and
+`apply_drug_settings`. Two consequences are deliberate: a buff keeps firing when the
+status capture stalls or the bar cannot be read, and a cast is no longer judged by an
+HP/MP delta (that signal wrongly reported "did not cast" for every buff that does not
+touch HP/MP, and because the timer had already been restarted the next attempt was a
+whole interval away). Delivery is unchanged: `buff2`…`buff6` go through
+`MotionArbiter.request_buff()`, `饲料` (`buff1`) and the 死花 flower-point `增益1` are
+direct taps, and every tap holds the key `BUFF_TAP_HOLD_SECONDS = 0.200`. A queued buff
+whose completion is not reported keeps its timer due, so a refused delivery retries
+instead of waiting a full interval.
+
+**The attack-animation window is `attack_grace_seconds` (v1.3.16).** `MotionArbiter`
+refuses to emit any motion key inside that window after the last attack tap; it was a
+hard-coded 0.73 s and is now 1.2 s (configurable per map profile). The client discards a
+key pressed while its attack animation still runs, so the value is a safety window, not
+a nicety: 0.73 s expired mid-animation for longer attacks. The same constant feeds
+`attack_motion_active()`, which movement uses to decide that X progress may be masked by
+an animation (endpoint-turn re-arm, stationary-return re-arm, stair-stall window), and
+the opposite-direction press before an endpoint turn now derives its wait from it instead
+of a fixed 1.0 s cap.
+
+**随机休息 pauses both input paths (v1.3.16).** `random_rest_worker.RandomRestWorker`
+draws a gap of 75–120 min and then a break of 3–15 s, both fresh each time, and asks
+`MovementWorker.request_rest(seconds)`. That method sets a private deadline (the same
+pattern as `_rescue_active`, so patrol stays enabled and the UI never shows a stopped
+patrol), releases the held walk/climb keys, and raises the shared
+`climbing_active_event` / `dropping_active_event` that the attack workers treat as
+"action input is active". The movement frame loop yields with `random rest owns movement
+input`, `_patrol_input_allowed()` is false for the duration, and the frames are excluded
+from the stall counter. `cancel_rest()` (also called when patrol stops) clears the events
+and resets the counter; a request is refused while auto-reconnect owns the input.
+Potions and the buff schedule keep running during a break.
+
 `NumericValueRangeControl` is the reusable fixed-height UI primitive for direct numeric settings.
 It supports a single value or inclusive min/max range, preserves the surrounding label baseline,
 and owns no setting label itself. Wheel input changes one `step`; left-click changes `10 × step`
@@ -851,6 +908,22 @@ deleted only after every legacy config file is confirmed present at the root
 (`_legacy_config_missing`), and the downgrade guard compares the archive version
 with the folder's `VERSION` (`_installed_version`).
 
+**The installation authorizes itself (v1.3.16).** `/api/v1/installer/session` only proves
+the code so the download may start; it binds nothing and returns no entitlement, which is
+why a freshly installed copy used to open unlicensed. After the extraction and the legacy
+cleanup, `installer/MoonEclipseInstaller.py` calls `authorize_installation()`:
+`_acquire_entitlement()` posts `/api/v1/activate` with the same
+`{fingerprint, components}` identity, `_write_entitlement()` writes the signed document to
+`<install root>/auth.json` exactly like `licensing._persist_document` (atomic replace,
+existing `_local` display state preserved), and `_write_license_settings()` records the
+submitted code plus the equipment id in `<install root>/助手配置/license_settings.json`,
+which is also what `_previous_install_profile_code()` reads so a later update skips the
+prompt. The step never fails an otherwise complete installation: on any error it returns a
+note for the completion dialog and the client can still activate. That path deliberately
+uses `/api/v1/activate` rather than the preview/confirm pair because the installer runs
+before any heartbeat could re-anchor anything, and the tolerant device check
+(`binding_matches`) makes it accept a restored PC.
+
 ### In-application update and restart (v1.2.302)
 
 The helper that installs an update lives in the INSTALL ROOT, so it belongs to the
@@ -968,7 +1041,16 @@ when it recorded an up jump point:
 - The climbing path keeps its own rule: a point already used in this pass is not
   re-fired from the rope it just grabbed.
 
-### Stall rescue (v1.2.290)
+### Stall rescue (v1.2.290, thresholds v1.3.16)
+
+`_rescue_stuck_check` counts two things: on-route frames whose X/Y move by less than
+`0.02` from a **fixed anchor** (not from the previous frame, so slow walking is not a
+stall), and off-route frames whose marker matches no recorded layer band. The threshold is
+`rescue_stuck_frames`, a legacy 4 fps frame count converted to the live 5 fps stream by
+`five_fps_frames(v) = ceil(v × 1.25)`; the default is **8 → 10 frames ≈ 2 s** (it was 20 →
+25 frames ≈ 5 s). Exempt: no patrol/route, auto-reconnect, the planned descent to the
+first layer, 站桩攻击 (it stands still by design), an active attack (`attack_state.json`,
+written only by the YOLO subprocess), and a scheduled **随机休息** break.
 
 `_rescue_verify_stuck_by_probe` presses Left then Right, two captured frames
 each, and compares the marker X (`RESCUE_STALL_PROBE_FRAMES`,
@@ -980,7 +1062,9 @@ layers, with the route target and then the last walked side as fallbacks), then
 re-arms patrol from the nearest recorded floor (`_nearest_recorded_floor`) after
 waiting for the landing (`_landing_floor_after_rescue_jump`). A confirmed stall is
 never answered with Alt+Down, and the unresolved-floor recovery runs the same
-walk probe before its first chord.
+walk probe before its first chord. Because the window is now two seconds, the
+probe also fires for a long attack animation, a buff or a knockback; that is
+accepted on purpose, since the probe aborts and only costs a pause.
 
 ### Floor resolution (v1.2.290)
 
