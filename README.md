@@ -10,7 +10,6 @@ Two packages are published for each version:
 
 | Package | Audience | Start |
 | --- | --- | --- |
-| `1.3.22` | `release/v1.3.22` | 时间药 split (饲料 / 补药 one-tap rows, 增益 1..4 double-tap), the measured endpoint table with a whole-list preflight, guarded licence heartbeat with a 75 s pending watchdog, turn-over attacks no longer waiting out the animation window, the axis-aware stall detector with the shipped 2.0 s window, and release-tooling repairs. |
 | `MoonEclipse-<version>.zip` | normal package, needs a Python environment | extract, run `安装.bat` once, then `启动助手.bat` |
 | `MoonEclipse-release-<version>.zip` | standalone package, no Python installation | extract, run `启动助手.bat` |
 
@@ -46,6 +45,27 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+
+### Current release behavior (v1.3.23)
+
+- **A slow first start of the local 测谎 service is no longer reported as a
+  failure.** The first start after a package update is slow — the update has just
+  copied 339 MB of vendor files that Windows Defender is scanning, and the service
+  validates its monthly card at `117:8004` and completes a WS handshake before it
+  opens 8765 — and the old code turned that timeout into `启动失败` plus a latched
+  `card_rejected`, so the panel stayed wrong until the app was restarted. The start
+  now keeps the launcher handle: a launch that is still alive reads
+  `本地测谎服务: 正在启动…`, a launch that **exits** is a real failure reported with
+  its exit code, and `card_rejected` is set only in that case.
+- **One launcher at a time.** The supervisor's 10 s retry used to spawn a second
+  `HostSvc3da4.exe` while the first was still booting; the vendor binary is a
+  single-instance service, so the two collided on 8765 and neither ever listened.
+  A start now refuses to launch while a launcher of this app is alive.
+- **An instance from the previous app run is waited for, not raced.** If a process
+  of the service folder is still alive while 8765 is quiet, the start waits up to
+  `STALE_SERVICE_GRACE_SECONDS = 8` and adopts it as `external` when it answers —
+  without ever killing it, because a service the operator started by hand must keep
+  running.
 
 ### Current release behavior (v1.3.17 – v1.3.22)
 
@@ -1614,6 +1634,8 @@ number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.3.23` | `release/v1.3.23` | The local 测谎 start distinguishes booting from refusal (booting reads 正在启动, a launcher exit reports its code), only one launcher at a time, and a leftover instance from the previous run is waited for instead of raced. |
+| `1.3.22` | `release/v1.3.22` | 时间药 split (饲料 / 补药 one-tap rows, 增益 1..4 double-tap), the measured endpoint table with a whole-list preflight, guarded licence heartbeat with a 75 s pending watchdog, turn-over attacks no longer waiting out the animation window, the axis-aware stall detector with the shipped 2.0 s window, and release-tooling repairs. |
 | `1.2.163` | — | 测试API button hidden again, and both auto-lie missing-credential hints removed. **Untagged: the working tree is not committed.** |
 | `1.2.162` | — | Focus loss pauses instead of ending a patrol, a hung game's DWM ghost is not a focus loss, all automatic-lie logging moved to `auto_lie.log`, and the credential can never reach a log file. **Untagged.** |
 | `1.2.161` | — | A 站桩 knockback starts walking back immediately: the pre-emptive wait for an in-flight attack before the first return key is gone. **Untagged.** |

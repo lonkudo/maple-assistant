@@ -45,6 +45,10 @@ SUPERVISE_INTERVAL_SECONDS = 10.0
 # Startup supervision: a first launch can exit while the licence/WS are being
 # provisioned, so a service that is not listening is retried after this delay.
 RETRY_BACKOFF_SECONDS = 20.0
+# A service process from the previous app run can still hold 8765 for a moment
+# while it shuts down.  The start waits this long for it to answer or exit instead
+# of launching a second instance that the vendor binary would refuse.
+STALE_SERVICE_GRACE_SECONDS = 8.0
 
 # Re-entrant on purpose: several helpers take it (``has_online_card`` and
 # ``card_known`` read the state) and the failure paths of ``ensure_started`` call
@@ -212,6 +216,41 @@ def _launch(root: Path) -> Optional[subprocess.Popen]:
     return None
 
 
+# The launcher of the LAST attempt, kept so a slow first start can be watched
+# instead of guessed: a service that is still booting must not be reported as a
+# rejection, and a second launcher must not be spawned on top of it.
+_launch_process: Optional[subprocess.Popen] = None
+
+
+def _record_launch(process: subprocess.Popen) -> None:
+    """Remember the launcher we just started (see ``_launch_process``)."""
+
+    global _launch_process
+    with _lock:
+        _launch_process = process
+
+
+def _clear_launch() -> None:
+    global _launch_process
+    with _lock:
+        _launch_process = None
+
+
+def _launch_still_booting() -> Optional[int]:
+    """The pid of a launcher this app started that has not exited, or None."""
+
+    with _lock:
+        process = _launch_process
+    if process is None:
+        return None
+    try:
+        if process.poll() is None:
+            return int(process.pid)
+    except Exception:  # noqa: BLE001 - a dead handle means "not booting"
+        return None
+    return None
+
+
 def ensure_started(
     app_root: Path | str, *, wait_seconds: float = START_WAIT_SECONDS,
 ) -> tuple[bool, str]:
@@ -231,9 +270,61 @@ def ensure_started(
                           started_by_app=False, pids=[])
             LOG.info("local lie service: already running (%s)", note)
             return True, note
+        booting_pid = _launch_still_booting()
+        if booting_pid is not None:
+            # ONE launcher at a time.  Spawning a second vendor process while the
+            # first is still booting makes them collide on 8765 (the vendor binary
+            # is a single-instance service), so neither listens and the panel reads
+            # "本地测谎启动失败" until the operator restarts the app - the exact
+            # field report after a package update, whose first start is slow
+            # because Defender is still scanning the freshly copied 339 MB folder.
+            _state.update(
+                state="starting",
+                note="本地测谎服务正在启动（等待上一次启动完成）",
+                root=str(root), started_by_app=True,
+            )
+            LOG.info(
+                "local lie service: launcher pid=%s is still booting; not starting "
+                "a second instance", booting_pid,
+            )
+            return False, str(_state["note"])
         _state.update(state="starting", note="正在启动本地测谎服务…",
                       root=str(root), started_by_app=True, pids=[])
     LOG.info("local lie service: starting %s", root)
+    # A service process left over from the previous app run (a slow shutdown, or the
+    # instance the update replaced) still holds 8765 for a moment.  Launching on top
+    # of it makes the vendor binary refuse to start - it is a single-instance
+    # service - and the panel then reads 本地测谎启动失败 until the app is restarted.
+    # Wait for that process instead of racing it, and never kill it: a service the
+    # operator started by hand must keep running.
+    stale_pids = _service_pids(root)
+    if stale_pids:
+        LOG.info(
+            "local lie service: %d process(es) of the service folder are alive while "
+            "8765 stays quiet; waiting for them instead of starting a second instance",
+            len(stale_pids),
+        )
+        grace_deadline = time.monotonic() + STALE_SERVICE_GRACE_SECONDS
+        answered = False
+        while time.monotonic() < grace_deadline:
+            time.sleep(PROBE_INTERVAL_SECONDS)
+            running, note = _probe()
+            if running:
+                with _lock:
+                    _state.update(state="external", note=note, root=str(root),
+                                  started_by_app=False, pids=stale_pids)
+                LOG.info("local lie service: the running instance answered (%s)", note)
+                return True, note
+            if not _service_pids(root):
+                LOG.info("local lie service: the previous instance has exited; "
+                         "starting a fresh one")
+                answered = True          # reuse the flag: "stop waiting"
+                break
+        if not answered:
+            LOG.warning(
+                "local lie service: %d process(es) still hold the folder and 8765 "
+                "stays quiet; starting another instance anyway", len(stale_pids),
+            )
     # A config carried over from another install can name the wrong
     # authorization port; repair it before the service verifies anything.
     try:
@@ -277,20 +368,63 @@ def ensure_started(
                 # machine that means the card did not validate.
                 _state["card_rejected"] = True
         return False, str(_state["note"])
+    _record_launch(process)
     deadline = time.monotonic() + max(1.0, float(wait_seconds))
     while time.monotonic() < deadline:
         time.sleep(PROBE_INTERVAL_SECONDS)
         running, note = _probe()
         if running:
             pids = _service_pids(root)
+            _clear_launch()
             with _lock:
                 _state.update(state="running", note=note, pids=pids,
                               started_by_app=True, card_rejected=False)
             LOG.info("local lie service: started (pid=%s, %s)", pids, note)
             return True, note
+        if process.poll() is not None:
+            # The launcher itself exited and 8765 never opened: the service
+            # refused to start (licence/WS validation, or a port already taken by
+            # a leftover instance).  That IS a failure, and it is reported with
+            # the exit code instead of a bare timeout.
+            code = process.returncode
+            _clear_launch()
+            rejected = has_online_card()      # read outside the lock (see _lock)
+            with _lock:
+                _state.update(
+                    state="failed",
+                    note=f"本地测谎服务启动失败（进程已退出，代码 {code}）",
+                )
+                if rejected:
+                    _state["card_rejected"] = True
+            LOG.warning(
+                "local lie service: the launcher exited (code %s) before 8765 "
+                "answered; see data\\logs\\client.log in the service folder",
+                code,
+            )
+            return False, str(_state["note"])
+    # Still booting.  A first start after a package update has to unpack/validate a
+    # 339 MB vendor folder that Windows Defender is scanning at the same time, and
+    # the service validates its monthly card and does a WS handshake before it
+    # listens - that can take longer than this budget.  Report "starting" (not
+    # "rejected") and keep the launched process: latching a rejection here is what
+    # made a slow-but-successful first start look failed until the app restarted.
+    alive = process.poll() is None
+    if alive:
+        with _lock:
+            _state.update(
+                state="starting",
+                note="本地测谎服务正在启动（首次启动较慢，继续等待）",
+            )
+        LOG.warning(
+            "local lie service: still booting after %.0fs (pid=%s); keeping it and "
+            "waiting instead of reporting a failure",
+            wait_seconds, process.pid,
+        )
+        return False, str(_state["note"])
     # The licence server gave us a CT card and the service still refuses to listen:
     # its own log shows 启动月卡验票失败 for an unactivated card.
     rejected = has_online_card()          # read outside the lock (see _lock)
+    _clear_launch()
     with _lock:
         _state.update(state="failed", note="本地测谎服务启动超时（8765 未响应）")
         if rejected:
@@ -1350,9 +1484,14 @@ def hint_text() -> str:
     return "本地测谎服务: 本地测谎启动失败"
 
 def reset_for_tests() -> None:
+    global _launch_process
     with _lock:
         _state.update(state="idle", note="", root="", started_by_app=False, pids=[],
                       card_rejected=False, card_denied=False)
+        # The launcher handle belongs to the start attempt, so a reset must forget
+        # it as well: otherwise a later start sees "a launcher is still booting"
+        # and refuses to start the service at all.
+        _launch_process = None
 
 
 __all__ = [

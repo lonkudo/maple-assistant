@@ -580,6 +580,21 @@ bar cannot be read, and a cast is no longer judged by an HP/MP delta (that signa
 wrongly reported "did not cast" for every buff that does not touch HP/MP, and because
 the timer had already been restarted the next attempt was a whole interval away).
 
+**The local 测谎 service start distinguishes booting from refusal (v1.3.23).**
+`local_lie_service.ensure_started()` keeps the launcher handle
+(`_record_launch` / `_launch_still_booting`), so three outcomes are now distinct:
+the service answers (running), the launcher is still alive after the budget
+(`state="starting"`, no `card_rejected` — a first start after a package update is
+slow because Defender is scanning the freshly copied 339 MB folder and the service
+validates its card and WS handshake first), or the launcher **exited**
+(`state="failed"` with its exit code, which is the only case that latches
+`card_rejected`). While a launcher of this app is alive, no second vendor process
+is started — the binary is a single-instance service and two of them collide on
+8765, which is what left the panel on `启动失败` until the app restarted. A process
+left over from the previous run is waited for up to
+`STALE_SERVICE_GRACE_SECONDS = 8` and adopted as `external` if it answers; it is
+never killed, because a hand-started service must keep running.
+
 `time_drug_worker.TimeDrugWorker` owns `饲料` (`buff1`) and `补药` (`buff2`). They are
 consumed by the press, so each refresh is exactly ONE 150 ms press
 (`TIME_DRUG_TAP_HOLD_SECONDS`), sent directly and never through the arbiter; a held
