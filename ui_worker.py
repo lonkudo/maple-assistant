@@ -2820,7 +2820,7 @@ class UiWorker(threading.Thread):
             self._blurred_anchor_var = tk.BooleanVar(value=False)
             self._blurred_anchor_check = ttk.Checkbutton(
                 delayed_return_row,
-                text="模糊桩",
+                text="范围桩",
                 width=6,
                 variable=self._blurred_anchor_var,
                 command=self._fixed_on_change,
