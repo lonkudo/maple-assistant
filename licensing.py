@@ -254,6 +254,13 @@ class LicenseStatus:
     # ``{"total": int, "success": int, "failed": int}``.
     lie_detect_today: dict[str, int] = field(default_factory=dict)
     lie_detect_yesterday: dict[str, int] = field(default_factory=dict)
+    # 本地测谎 has an independent quota, but its pass statistics come from the
+    # same authorization server and are rendered when that backend is selected.
+    local_lie_detect_total: int = 0
+    local_lie_detect_success_total: int = 0
+    local_lie_detect_failed_total: int = 0
+    local_lie_detect_today: dict[str, int] = field(default_factory=dict)
+    local_lie_detect_yesterday: dict[str, int] = field(default_factory=dict)
     # The newest release the server knows about, as ``{"version": "1.2.292"}``.
     # ``None`` means the server said nothing (older server, or nothing published),
     # which is deliberately different from an empty version string.
@@ -1182,6 +1189,21 @@ def _with_server_device(
         lie_detect_today=_triple("lie_detect_today", status.lie_detect_today),
         lie_detect_yesterday=_triple(
             "lie_detect_yesterday", status.lie_detect_yesterday
+        ),
+        local_lie_detect_total=_counter(
+            "local_lie_detect_total", status.local_lie_detect_total
+        ),
+        local_lie_detect_success_total=_counter(
+            "local_lie_detect_success_total", status.local_lie_detect_success_total
+        ),
+        local_lie_detect_failed_total=_counter(
+            "local_lie_detect_failed_total", status.local_lie_detect_failed_total
+        ),
+        local_lie_detect_today=_triple(
+            "local_lie_detect_today", status.local_lie_detect_today
+        ),
+        local_lie_detect_yesterday=_triple(
+            "local_lie_detect_yesterday", status.local_lie_detect_yesterday
         ),
     )
 

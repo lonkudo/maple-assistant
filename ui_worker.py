@@ -1731,6 +1731,10 @@ class UiWorker(threading.Thread):
         # time-sensitive WebSocket/cursor path.  The worker persists its own
         # queue so an app restart cannot silently discard a completed event.
         self._lie_accounting_results: "queue.Queue[LicenseStatus]" = queue.Queue(maxsize=32)
+        # The local CT service reports its outcomes in a background thread.  It
+        # queues only the server's additive statistics document here; Tk owns
+        # the actual status update and header repaint.
+        self._local_lie_usage_results: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=8)
         self._lie_accounting_worker = LieAccountingWorker(
             self.stop_event,
             self._lie_accounting_results,
@@ -5245,6 +5249,7 @@ class UiWorker(threading.Thread):
             self._drain_device_memo_results,
             self._drain_device_unbind_results,
             self._drain_lie_accounting_results,
+            self._drain_local_lie_usage_results,
             self._drain_channel_update_events,
             self._drain_other_player_stop_events,
             self._drain_reconnect_results,
@@ -5816,6 +5821,90 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_control_status"):
             self._control_status.configure(text=latest.message)
 
+    def _queue_local_lie_usage_reply(self, answer: object) -> None:
+        """Receive one local-pass server reply without touching Tk off-thread."""
+
+        if not isinstance(answer, dict):
+            return
+        item = dict(answer)
+        try:
+            self._local_lie_usage_results.put_nowait(item)
+        except queue.Full:
+            # Header statistics are latest-value state, not an event stream.
+            try:
+                self._local_lie_usage_results.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._local_lie_usage_results.put_nowait(item)
+            except queue.Full:
+                LOG.debug("local lie statistics reply could not be queued")
+
+    def _drain_local_lie_usage_results(self) -> None:
+        """Apply local-service statistics from the latest successful reply."""
+
+        latest: Optional[dict[str, Any]] = None
+        while True:
+            try:
+                candidate = self._local_lie_usage_results.get_nowait()
+            except queue.Empty:
+                break
+            if candidate.get("ok") is True:
+                latest = candidate
+            else:
+                LOG.warning(
+                    "本地测谎 statistics report was rejected: %s",
+                    str(candidate.get("code") or candidate.get("message") or "unknown"),
+                )
+        if latest is None:
+            return
+        source = latest.get("autolie_fingerprint_usage")
+        if not isinstance(source, dict):
+            source = latest.get("device")
+        if not isinstance(source, dict):
+            return
+
+        status = self._license_status
+
+        def counter(name: str, current: int) -> int:
+            try:
+                return max(0, int(source.get(name, current) or 0))
+            except (TypeError, ValueError):
+                return current
+
+        def triple(name: str, current: dict[str, int]) -> dict[str, int]:
+            value = source.get(name)
+            if not isinstance(value, dict):
+                return current
+            result: dict[str, int] = {}
+            for key in ("total", "success", "failed"):
+                try:
+                    result[key] = max(0, int(value.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    result[key] = 0
+            return result
+
+        self._license_status = replace(
+            status,
+            local_lie_detect_total=counter(
+                "local_lie_detect_total", status.local_lie_detect_total
+            ),
+            local_lie_detect_success_total=counter(
+                "local_lie_detect_success_total", status.local_lie_detect_success_total
+            ),
+            local_lie_detect_failed_total=counter(
+                "local_lie_detect_failed_total", status.local_lie_detect_failed_total
+            ),
+            local_lie_detect_today=triple(
+                "local_lie_detect_today", status.local_lie_detect_today
+            ),
+            local_lie_detect_yesterday=triple(
+                "local_lie_detect_yesterday", status.local_lie_detect_yesterday
+            ),
+        )
+        self._refresh_license_ui()
+        LOG.info("本地测谎 statistics synchronized")
+
     def _refresh_license_ui(self) -> None:
         """Render the non-fatal authorization state in the always-visible UI."""
 
@@ -6113,6 +6202,7 @@ class UiWorker(threading.Thread):
                 widget.configure(text="")
             return
 
+        local_backend = self._auto_lie_backend_is_local()
         unlimited = bool(
             status.auto_lie_unlimited_mode
             or status.remaining_auto_lie_unlimited
@@ -6127,31 +6217,42 @@ class UiWorker(threading.Thread):
                     parsed.append(default)
             return tuple(parsed)  # type: ignore[return-value]
 
-        lifetime = (
-            status.lie_detect_total,
-            status.lie_detect_success_total,
-            status.lie_detect_failed_total,
-        )
-        today_total, today_success, today_failed = _values(
-            status.lie_detect_today, lifetime
-        )
-        yesterday_total, yesterday_success, yesterday_failed = _values(
-            status.lie_detect_yesterday, (0, 0, 0)
-        )
-        if unlimited:
-            try:
-                unsettled = max(0, int(status.auto_lie_unsettled_count))
-            except (TypeError, ValueError):
-                unsettled = 0
-            self._license_lie_prefix.configure(text="测谎 (未清算, ")
-            self._license_lie_remaining.configure(text=str(unsettled), foreground="#17803d")
-        else:
-            remaining = (
-                str(status.remaining_auto_lie_count)
-                if status.remaining_auto_lie_count is not None else "—"
+        if local_backend:
+            lifetime = (
+                status.local_lie_detect_total,
+                status.local_lie_detect_success_total,
+                status.local_lie_detect_failed_total,
             )
-            self._license_lie_prefix.configure(text="测谎 (剩余, ")
-            self._license_lie_remaining.configure(text=remaining, foreground="#777777")
+            today_source = status.local_lie_detect_today
+            yesterday_source = status.local_lie_detect_yesterday
+            self._license_lie_prefix.configure(text="本地测谎 (剩余, ")
+            self._license_lie_remaining.configure(text="无限", foreground="#777777")
+        else:
+            lifetime = (
+                status.lie_detect_total,
+                status.lie_detect_success_total,
+                status.lie_detect_failed_total,
+            )
+            today_source = status.lie_detect_today
+            yesterday_source = status.lie_detect_yesterday
+            if unlimited:
+                try:
+                    unsettled = max(0, int(status.auto_lie_unsettled_count))
+                except (TypeError, ValueError):
+                    unsettled = 0
+                self._license_lie_prefix.configure(text="云端测谎 (未清算, ")
+                self._license_lie_remaining.configure(text=str(unsettled), foreground="#17803d")
+            else:
+                remaining = (
+                    str(status.remaining_auto_lie_count)
+                    if status.remaining_auto_lie_count is not None else "—"
+                )
+                self._license_lie_prefix.configure(text="云端测谎 (剩余, ")
+                self._license_lie_remaining.configure(text=remaining, foreground="#777777")
+        today_total, today_success, today_failed = _values(today_source, lifetime)
+        yesterday_total, yesterday_success, yesterday_failed = _values(
+            yesterday_source, (0, 0, 0)
+        )
         self._license_lie_suffix.configure(text=")")
         self._license_lie_today_prefix.configure(text=" (今日, ")
         self._license_lie_total.configure(text=str(today_total))
@@ -7346,6 +7447,7 @@ class UiWorker(threading.Thread):
 
                 local_lie_service.report_local_pass(
                     self._local_lie_drill_event, "pending", detail="测试本地测谎",
+                    on_result=self._queue_local_lie_usage_reply,
                 )
             except Exception:  # noqa: BLE001 - statistics never block a drill
                 LOG.debug("本地测谎 测试API start report failed", exc_info=True)
@@ -8167,6 +8269,10 @@ class UiWorker(threading.Thread):
         AUTO_LIE_LOG.info(
             "自动过测谎 %s (source=%s)", "armed" if armed else "disarmed", origin
         )
+        # The header deliberately reflects the selected backend immediately:
+        # cloud quota/statistics while 云端测谎 is selected, and the server's
+        # local-service counters while 本地测谎 is selected.
+        self._refresh_license_ui()
 
     def _mark_auto_lie_mouse_change(self, _event: object = None) -> None:
         """Tag the following checkbutton command for diagnostics only."""
@@ -8916,6 +9022,7 @@ class UiWorker(threading.Thread):
                         "success" if outcome == "success" else "failed",
                         frames=int(getattr(self, "_api_auto_lie_runs", 0) or 0),
                         detail=str(outcome),
+                        on_result=self._queue_local_lie_usage_reply,
                     )
                     state["accounted"] = True
                     AUTO_LIE_LOG.info(
@@ -9091,7 +9198,9 @@ class UiWorker(threading.Thread):
             try:
                 import local_lie_service
 
-                local_lie_service.report_local_pass(event_id, "pending")
+                local_lie_service.report_local_pass(
+                    event_id, "pending", on_result=self._queue_local_lie_usage_reply,
+                )
             except Exception:  # noqa: BLE001 - statistics never block a pass
                 AUTO_LIE_LOG.debug("本地测谎 start report failed", exc_info=True)
             AUTO_LIE_LOG.info(
@@ -12978,6 +13087,7 @@ class UiWorker(threading.Thread):
 
             local_lie_service.report_local_pass(
                 event_id, outcome, detail=f"测试本地测谎 {detail}".strip(),
+                on_result=self._queue_local_lie_usage_reply,
             )
         except Exception:  # noqa: BLE001 - statistics never block a drill
             LOG.debug("本地测谎 测试API report failed", exc_info=True)

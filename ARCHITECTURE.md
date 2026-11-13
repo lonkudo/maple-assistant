@@ -1416,6 +1416,9 @@ mapped through the crop, and a resize to 745×496 does not change that because
   activation-server key (it handshakes successfully); a *placeholder* key is replaced by
   the package's own; the activation key is used only by a package that ships none;
 * `report_local_pass()` posts to `api/v1/local-lie-events` from a background thread.
+  Its reply callback only queues the additive usage document; `UiWorker` consumes the
+  latest reply on the Tk thread and repaints the header, never touching widgets from
+  the network thread.
 
 `licensing._with_server_device()` is the single entry point for server-driven state: it
 stores `auto_lie.secret_key`, forwards the device document's `ct_card` to
@@ -1480,6 +1483,16 @@ line carries the short form `本地测谎未开通`, once.
 * `POST api/v1/local-lie-events` — idempotent per `event_id`, charges nothing;
   `GET console/api/local-lie/stats` — `total/success/failed/aborted/pending/
   average_latency_ms/cards[]`.
+
+`device_summary()` additionally derives local-device lifetime, today, and yesterday
+triples from `LocalLieServiceEvent`, keyed by the authenticated fingerprint. They are
+returned through the established `device` document and the compact
+`autolie_fingerprint_usage` reply. Therefore a three-hour heartbeat and an immediate
+local-pass acknowledgement use one server-authoritative counter source; no separate
+client polling endpoint exists. `LicenseStatus` retains cloud and local triples
+separately, and `_render_lie_usage()` selects one only for presentation: 云端测谎 shows
+the cloud remaining/unsettled value, while 本地测谎 displays `剩余, 无限` with its local
+today/yesterday totals.
 
 ### Packaging
 

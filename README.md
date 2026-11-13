@@ -48,6 +48,13 @@ The update icon in the title bar turns green when the activation server announce
 
 ### Current release behavior (v1.3.24)
 
+- **The header names and separates its two measurement backends.** With 云端测谎
+  selected it reads `云端测谎 (剩余, N)` or `云端测谎 (未清算, N)` and continues to
+  show the cloud service's daily totals. With 本地测谎 selected it instead reads
+  `本地测谎 (剩余, 无限)` and shows that device's local CT-service totals for today
+  and yesterday. The statistics are authorization-server data, not a client-side
+  counter: a heartbeat refreshes both sets, while each local pending/final pass
+  reply refreshes the selected local line immediately.
 - **The 自动测谎 row can no longer show a backend while the feature is off.**
   Field report: the panel looked like 云端测谎 was selected although it was
   actually off, and every lie window was ignored.  The radio group and the armed
@@ -1825,6 +1832,9 @@ Each local pass is reported to `POST api/v1/local-lie-events` (`pending` when th
 backend is ready, then `success`/`failed`). The server stores it in
 `LocalLieServiceEvent` for statistics — no quota is charged. Cloud passes keep using
 the durable `api/v1/lie-events` accounting queue, which local passes deliberately skip.
+The local-event reply also carries additive device-local total/today/yesterday
+counters. `local_lie_service.report_local_pass()` hands that reply to the Tk-owned
+header queue, so no extra statistics poll is made after a local pass.
 
 ### The packaged service (2026-11 build)
 

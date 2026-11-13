@@ -5310,6 +5310,10 @@ class MovementWorker(threading.Thread):
         # fixed attack cadence, buffs and potions continue independently.
         self.stationary_delayed_return_enabled = False
         self._stationary_return_pause_until = 0.0
+        # A normal knockback recovery gets at most one delay.  It remains set
+        # after the timer expires until the marker returns to the 桩, so the
+        # next capture cannot draw another 1-3 second delay for the same leg.
+        self._stationary_delayed_recovery_return_active = False
         self._stationary_pickup_next_at = float("inf")
         self._stationary_pickup_phase: Optional[str] = None
         # A pickup round gets one automatic retry after it falls off the
@@ -10152,6 +10156,7 @@ class MovementWorker(threading.Thread):
             self._stationary_timed_patrol_returning = False
             self._stationary_timed_patrol_pending_rearm = False
             self._stationary_return_pause_until = 0.0
+            self._stationary_delayed_recovery_return_active = False
             self._clear_stationary_pickup_leg_progress()
             self._stationary_return_dismount_direction = None
             self._reset_stationary_y_recovery()
@@ -10194,6 +10199,7 @@ class MovementWorker(threading.Thread):
         self._stationary_timed_patrol_returning = False
         self._stationary_timed_patrol_pending_rearm = False
         self._stationary_return_pause_until = 0.0
+        self._stationary_delayed_recovery_return_active = False
         self._clear_stationary_pickup_leg_progress()
         self._stationary_return_dismount_direction = None
         self._reset_stationary_y_recovery()
@@ -11415,6 +11421,7 @@ class MovementWorker(threading.Thread):
         self._stationary_timed_patrol_returning = False
         self._stationary_timed_patrol_pending_rearm = False
         self._stationary_return_pause_until = 0.0
+        self._stationary_delayed_recovery_return_active = False
         self._stationary_pickup_next_at = (
             time.monotonic() + self._stationary_pickup_delay()
             if self.stationary_pickup_enabled else float("inf")
@@ -11437,6 +11444,7 @@ class MovementWorker(threading.Thread):
         self.stationary_delayed_return_enabled = bool(enabled)
         if not self.stationary_delayed_return_enabled:
             self._stationary_return_pause_until = 0.0
+            self._stationary_delayed_recovery_return_active = False
 
     def _stationary_pickup_delay(self) -> float:
         return self.stationary_pickup_interval_seconds + random.uniform(
@@ -12096,6 +12104,7 @@ class MovementWorker(threading.Thread):
         player = observation.player
         if player is None:
             return MovementDecision(None, "stationary attack waiting for marker")
+        dual_post_changed = False
         if self.dual_stationary_ready():
             now = time.monotonic()
             active_index = self._dual_stationary_active_index
@@ -12105,12 +12114,14 @@ class MovementWorker(threading.Thread):
                     reason="first movement frame selected nearest post",
                     restart_timer=True,
                 )
+                dual_post_changed = True
             elif now >= self._dual_stationary_next_switch_at:
                 self._activate_dual_stationary_post(
                     1 - active_index,
                     reason="换桩时间 reached",
                     restart_timer=True,
                 )
+                dual_post_changed = True
             # A route/fall return is not committed to the post used before
             # the interruption.  Once a marker is available again, return to
             # whichever of the two recorded posts is physically closest.
@@ -12123,6 +12134,7 @@ class MovementWorker(threading.Thread):
                         reason="return selected closest post",
                         restart_timer=False,
                     )
+                    dual_post_changed = True
         anchor = self._stationary_attack_anchor
         if anchor is None:
             return MovementDecision(None, "stationary attack awaiting start position")
@@ -12158,6 +12170,44 @@ class MovementWorker(threading.Thread):
             or (self.dropping_active_event is not None
                 and self.dropping_active_event.is_set())
         )
+        # 延时回桩 also covers one ordinary knockback return.  It deliberately
+        # does *not* cover an active rope/drop/route return, a dual-post change,
+        # or a Y-only recovery: those each have their own movement ownership and
+        # delaying them can strand the character off the route.  The latch stays
+        # set after the pause expires until this X leg genuinely reaches 桩.
+        outside_anchor_x = not self._stationary_anchor_x_accepted(
+            anchor.x, player.x,
+        )
+        ordinary_delayed_recovery = bool(
+            self.stationary_delayed_return_enabled
+            and outside_anchor_x
+            and not self._stationary_delayed_recovery_return_active
+            and not vertical_gate_active
+            and not dual_post_changed
+            and not self._stationary_timed_patrol_active
+            and not self._stationary_timed_patrol_returning
+            and not self._stationary_timed_patrol_pending_rearm
+            and not self._stationary_pickup_return_active
+            and not self._fall_pending
+            and not self._descending_to_first
+            and self._stationary_return_dismount_direction is None
+        )
+        if ordinary_delayed_recovery:
+            delay_seconds = random.uniform(1.0, 3.0)
+            self._stationary_delayed_recovery_return_active = True
+            self._stationary_return_pause_until = (
+                time.monotonic() + delay_seconds
+            )
+            self._stationary_x_settled = False
+            LOG.info(
+                "STATIONARY RETURN: knockback recovery delaying movement %.2fs "
+                "before returning to 桩; attacks/buffs/potions remain active",
+                delay_seconds,
+            )
+            return MovementDecision(
+                None,
+                f"stationary delayed return movement pause ({delay_seconds:.1f}s remaining)",
+            )
         if (at_anchor and vertical_gate_active
                 and self._stationary_return_dismount_direction is None):
             LOG.warning(
@@ -12259,6 +12309,7 @@ class MovementWorker(threading.Thread):
             )
             self._stationary_near_correction_next_at = 0.0
             self._stationary_blur_target_x = None
+            self._stationary_delayed_recovery_return_active = False
         else:
             # Outside the final approach zone, walk normally and do not
             # attack.  A layer-return can reach the anchor platform at its

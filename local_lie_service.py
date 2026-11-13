@@ -1368,6 +1368,7 @@ def apply_online_card(card_code: str) -> bool:
 def report_local_pass(
     event_id: str, outcome: str, *, frames: int = 0,
     latency_ms: Optional[float] = None, detail: str = "",
+    on_result: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> None:
     """Report one 本地测谎 pass to the activation server (background, best effort).
 
@@ -1400,6 +1401,13 @@ def report_local_pass(
                 },
                 licensing.runtime_root() / licensing.ACTIVATION_SERVER_PIN_FILE,
             )
+            if isinstance(answer, dict) and callable(on_result):
+                # This runs on the report thread.  The UI callback only queues
+                # the answer; it must never manipulate Tk from this worker.
+                try:
+                    on_result(answer)
+                except Exception:  # noqa: BLE001 - statistics stay best effort
+                    LOG.debug("local lie service: result callback failed", exc_info=True)
             if isinstance(answer, dict) and answer.get("ok") is False:
                 # A rejected report is not an exception, so it would otherwise be
                 # invisible: say why, without ever echoing the card.
