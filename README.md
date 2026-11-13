@@ -46,6 +46,20 @@ If a required library is missing, the normal package repairs itself: the hidden 
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
+### Current release behavior (v1.3.24)
+
+- **The 自动测谎 row can no longer show a backend while the feature is off.**
+  Field report: the panel looked like 云端测谎 was selected although it was
+  actually off, and every lie window was ignored.  The radio group and the armed
+  flag are two views of one selection, and three paths let them disagree: the
+  settings-restore path forced the group to 云端测谎 for a disarmed selection, the
+  **测谎 off** switch disarmed the flag but left the group on its backend, and the
+  save path rewrote 关闭 as 云端测谎, losing a 本地测谎 choice.  All of them now go
+  through `auto_lie_radio_value(armed, saved_backend)`: disarmed always shows
+  **关闭**, and an armed selection with no saved backend still means 云端测谎 (what
+  every version before the backend split ran), so an existing `user_config.json`
+  keeps its exact behaviour.
+
 ### Current release behavior (v1.3.23)
 
 - **A slow first start of the local 测谎 service is no longer reported as a
@@ -1634,6 +1648,7 @@ number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.3.24` | `release/v1.3.24` | The 自动测谎 radio group and its armed flag are one selection: a disarmed row always shows 关闭, a 测谎-off disarm can no longer leave 云端测谎 selected, and 关闭 no longer rewrites the saved backend. |
 | `1.3.23` | `release/v1.3.23` | The local 测谎 start distinguishes booting from refusal (booting reads 正在启动, a launcher exit reports its code), only one launcher at a time, and a leftover instance from the previous run is waited for instead of raced. |
 | `1.3.22` | `release/v1.3.22` | 时间药 split (饲料 / 补药 one-tap rows, 增益 1..4 double-tap), the measured endpoint table with a whole-list preflight, guarded licence heartbeat with a 75 s pending watchdog, turn-over attacks no longer waiting out the animation window, the axis-aware stall detector with the shipped 2.0 s window, and release-tooling repairs. |
 | `1.2.163` | — | 测试API button hidden again, and both auto-lie missing-credential hints removed. **Untagged: the working tree is not committed.** |

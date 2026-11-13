@@ -814,19 +814,23 @@ LAYER_UP_REACH_FACTOR = 0.7
 
 # Band edge reach around the recorded envelope, in normalised minimap Y.
 #
-# Asymmetric on purpose (operator, this session: "we shall only narrow down the
-# tolerance a little bit, on the upper side (not the bottom side)").  The reach
-# ABOVE a floor's topmost recorded row is what let one floor claim a row that
-# belongs to the floor above: layer1's top row 0.751908 and layer2's bottom row
-# 0.750000 are only 0.001908 apart, so the old flat 0.003 put the up-jump
-# landing row 0.750000 inside BOTH bands.  Kept identical to
+# Symmetric 0.02 on both sides (operator, this build: "change to 0.02 on both
+# end, lets try").  The band is now a real tolerance around the recorded rows
+# rather than a hairline: 0.02 is 1.9-2.9 marker rows depending on the
+# minimap height (0.006944 at 144 px ... 0.010417 at 96 px), so a marker drawn a
+# row high or a row low on the floor the character is actually standing on still
+# resolves to that floor.  Under the previous asymmetric hairline
+# (0.003 up / 0.0015 down, 0.34 / 0.17 of a row) both readings were REFUSED,
+# which is what made 开始巡逻 fail with "不属于任何已录制楼层" while the
+# character stood on the recorded row.
+#
+# Measured against the operator's 12 saved recordings: adjacent floors are
+# >= 0.035 apart (红庭2 4.00 rows), so 0.02 + 0.02 = 0.04 stays clear of every
+# pair except 红庭2 (0.004912 shared, 0.56 of a row); 皇冠_牧师 is next at
+# 0.041440 and stays clear by 0.24 rows.  Kept identical to
 # ``patrol_control.LAYER_BAND_UPPER_EDGE_REACH`` / ``..._LOWER_EDGE_REACH``.
-# Swapped by the operator ("no point to make bottom have more tolerance"):
-# 0.003 above the topmost recorded row, 0.0015 below the lowest one.  Both stay
-# far under one marker row, so a band still admits only its own recorded rows -
-# the asymmetry only decides which side the edge can reach toward.
-LAYER_BAND_UPPER_EDGE_REACH = 0.003
-LAYER_BAND_LOWER_EDGE_REACH = 0.0015
+LAYER_BAND_UPPER_EDGE_REACH = 0.02
+LAYER_BAND_LOWER_EDGE_REACH = 0.02
 
 # Last-resort gap for a single-supporter layer (or a ``layer_y``-only layer)
 # whose recording carries no layout at all, so one marker row cannot be derived.
@@ -930,9 +934,12 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     band = (uppermost point Y - ``LAYER_BAND_UPPER_EDGE_REACH``,
             lowermost point Y + ``LAYER_BAND_LOWER_EDGE_REACH``)
 
-    The reach is 0.003 above the topmost row and 0.0015 below the lowermost one
-    (it was 0.0015/0.003, before that a flat 0.003 on both sides, and before that
-    0.7 * y_tolerance above and max(y_tolerance / 3, one marker row) below).  A layer whose points span a Y
+    The reach is 0.02 on both sides (LAYER_BAND_UPPER/LOWER_EDGE_REACH): about
+    two marker rows, so standing anywhere on the recorded floor - including one
+    row high or low, the marker's own quantisation - stays inside its band.
+    Earlier rules were 0.003 up / 0.0015 down (a hairline that refused a
+    one-row-low reading), a flat 0.003, and before that 0.7 * y_tolerance above
+    and max(y_tolerance / 3, one marker row) below.  A layer whose points span a Y
     range (wide platform / minimap perspective) is detected while standing
     anywhere between its recorded ends, which is why the band spans the envelope
     rather than a mean.  Falls back to ``layer_y`` when the layer has no
@@ -963,9 +970,9 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     if not values:
         return None
     # A one-point layer is a reference point, not a sampled platform, but it
-    # gets the same edges as a multi-point one: 0.003 above the topmost row and
-    # 0.0015 below the lowermost one.  ``jump_points`` are intentionally not part
-    # of ``_layer_point_ys``, so they cannot shift a band.
+    # gets the same symmetric 0.02 edges as a multi-point one: 0.02 above the
+    # topmost row and 0.02 below the lowermost one.  ``jump_points`` are
+    # intentionally not part of ``_layer_point_ys``, so they cannot shift a band.
     return (
         min(values) - LAYER_BAND_UPPER_EDGE_REACH,
         max(values) + LAYER_BAND_LOWER_EDGE_REACH,
@@ -1001,11 +1008,11 @@ def _runtime_supporter_layer_band(
     It also brings the operator's own same-layer window with it - the accepted
     ``y_tolerance`` (0.020) plus one marker row, because the diamond quantises
     to one row and a standing character's own step and jump arc are read a
-    couple of rows above the point it stands on.  That is what lets the
-    temporary point decide the band's UPPER edge: the recorded envelope now
-    reaches only ``LAYER_BAND_UPPER_EDGE_REACH`` (0.003), so the point's wider
-    window wins in practice.  Below, the point gets one third of the tolerance,
-    and the recorded side adds ``LAYER_BAND_LOWER_EDGE_REACH`` (0.0015).
+    couple of rows above the point it stands on.  The recorded envelope now
+    reaches ``LAYER_BAND_UPPER_EDGE_REACH`` (0.02) itself, so both edges of the
+    temporary point agree with the recording's own tolerance.  Below, the point
+    gets one third of the tolerance, and the recorded side adds
+    ``LAYER_BAND_LOWER_EDGE_REACH`` (0.02).
 
     A layer with no recording at all keeps the documented one-sided
     single-supporter envelope, with the temporary point as that supporter.

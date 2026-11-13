@@ -403,12 +403,35 @@ class ConfigStore:
             return self.auth_path
         return self.system_path if section in SYSTEM_SECTIONS else self.user_path
 
+    def _legacy_license_state(self) -> dict[str, Any]:
+        """Authorization display state an older installer left in 助手配置.
+
+        The installer records the code the customer typed in
+        ``助手配置\\license_settings.json``.  The desktop keeps that same state as
+        ``auth.json``'s ``_local`` block, and releases installed before the
+        installer seeded ``_local`` therefore opened already licensed while the
+        window showed 授权码：未设置.  This read-only fallback only fills keys the
+        document does not carry, so a desktop-written value always wins and
+        nothing is rewritten behind the operator's back.
+        """
+
+        legacy = _read_json(self.legacy_root / SECTION_FILES["license"])
+        return {
+            key: value for key, value in legacy.items()
+            if key in DEFAULT_AUTH_CONFIG
+        }
+
     def read_section(self, section: str) -> dict[str, Any]:
         with self._lock:
             data = self._document_for_section(section)
             if section in AUTH_SECTIONS:
                 local = data.get(AUTH_LOCAL_STATE_KEY, {})
-                return deepcopy(local) if isinstance(local, dict) else {}
+                value = deepcopy(local) if isinstance(local, dict) else {}
+                if not str(value.get("activation_code") or "").strip():
+                    for key, fallback in self._legacy_license_state().items():
+                        if not str(value.get(key) or "").strip():
+                            value[key] = deepcopy(fallback)
+                return value
             value = data.get(section, DEFAULT_CONFIG.get(section, {}))
             return deepcopy(value) if isinstance(value, dict) else {}
 

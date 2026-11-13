@@ -1546,11 +1546,48 @@ def report_lie_event_via_server(
         return replace(local, code="server", message="激活验证失败")
 
 
+def verify_document(document: Any, root: Optional[Path] = None) -> LicenseStatus:
+    """Check a signed entitlement document without persisting anything.
+
+    Every desktop activation path persists only what ``_parse_document`` has
+    already accepted.  The installer writes the same ``auth.json`` directly from
+    a server reply, so it needs the same gate: an unverifiable signature, an
+    expired payload, or a document bound to another machine must never be
+    written and then presented to the customer as a licensed installation.
+    """
+
+    return _parse_document(document, root)
+
+
+def remember_boot_identity(
+    fingerprint: str, license_id: str, root: Optional[Path] = None,
+) -> bool:
+    """Seal this PC's server-accepted fingerprint for the desktop's boot bridge.
+
+    ``auth.json`` alone proves the entitlement but says nothing about *which*
+    equipment it belongs to; the DPAPI-sealed ``cim_identity.dat`` record does,
+    and it is what lets an already-authorized client start while CIM/WMI is
+    still waking up after a reboot (``_machine_binding_status`` and
+    ``_document_fingerprint_status`` both fall back to it).  Activation normally
+    writes it; the installer activates without ever running the desktop, so
+    without this the first start after an install has no bridge and stays
+    session-locked until a live heartbeat succeeds.
+
+    Returns ``True`` only when the written record is readable again by this
+    Windows profile, so a caller can report a real seal rather than an attempt.
+    """
+
+    _save_sealed_fingerprint(fingerprint, license_id, root)
+    return bool(fingerprint) and has_sealed_fingerprint(license_id, root)
+
+
 __all__ = [
     "ACTIVATION_PREFIX", "LICENSE_FORMAT",
-    "DEVICE_REQUEST_PREFIX", "LicenseStatus", "ActivationTransferPreview", "activate", "activation_code",
+    "DEVICE_REQUEST_PREFIX", "DeviceNotReadyError", "LicenseStatus",
+    "ActivationTransferPreview", "activate", "activation_code",
     "activate_via_server", "preview_activation_transfer_via_server", "confirm_activation_transfer_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "device_identity_for_request", "machine_fingerprint_components", "machine_fingerprint_hash",
+    "has_sealed_fingerprint", "remember_boot_identity", "verify_document",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
     "report_lie_event_via_server", "set_device_memo_via_server", "unbind_device_via_server", "validate_via_server",
 ]

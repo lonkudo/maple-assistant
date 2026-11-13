@@ -567,6 +567,16 @@ arms the same direction again. The watch is reset by any progress, by a change o
 direction, and whenever the decision is no longer a far stationary return, so an
 ordinary patrol hold is never interrupted by it.
 
+**The 自动测谎 radios and the armed flag are one selection (v1.3.24).**
+`ui_worker.auto_lie_radio_value(armed, saved_backend)` is the only writer of the
+radio group's value: a disarmed selection reads `off`, and an armed one reads
+`local`/`cloud` with an absent or unknown saved value meaning `cloud` (the rule
+every pre-backend-split config relies on).  The constructor, the settings-restore
+path and the "测谎 off disarms its dependents" path all use it, and the save path
+keeps the previously stored backend while the row reads 关闭.  Before this the
+panel could show 云端测谎 while `_auto_lie_backend_mode()` answered `off`, and a
+real lie window was ignored with no visible reason.
+
 ### Combat and consumables
 
 `attack_worker.py` performs fixed-interval attack in one selected delivery form: stand tap, jump attack, charge hold, or no attack. Charge holds the attack key for an inclusive random value between `charge_min_seconds` and `charge_max_seconds` (0.1–5.0 s), through `AtomicMotionRunner`. Its charge gate admits only the owning charge key and ordinary patrol Left/Right; queued buffs and other action-key motions defer until release. HP/MP recovery may cancel the charge, waits at most 80 ms for the handoff plus 100 ms for release, and then takes priority. With 跳反打 enabled, `AtomicMotionRunner` remains the transaction owner: it delegates only the patrol-direction handoff to `MovementWorker.execute_jump_counterattack_recoil()`, which holds the shared direction/hold locks, releases the current patrol Left/Right claim, taps the opposite direction for 45 ms, waits 10 ms, taps the attack, then restores the original hold. It returns `None` outside an ordinary continuous patrol hold so the runner falls back to ordinary jump attack. `drug_worker.py` prioritizes HP/MP thresholds and runs pet food as a non-movement timed consumable. Small-step and stair-jump logic are isolated from ordinary patrol decisions so recovery behavior does not repeatedly enqueue the same input.

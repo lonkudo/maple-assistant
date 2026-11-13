@@ -49,36 +49,33 @@ LAYER_UP_REACH_FACTOR = 0.7
 
 # Band edge reach around the recorded envelope, in normalised minimap Y.
 #
-# The two sides are deliberately asymmetric, and the operator swapped them
-# (this session: "no point to make bottom have more tolerance"):
+# Symmetric 0.02 (operator, this build: "change to 0.02 on both end, lets try").
+# One marker row is 0.006944 (144-px minimap) to 0.010417 (96-px minimap), so
+# 0.02 is a little under two to nearly three rows: a marker drawn one row high
+# or one row low on the floor the character is standing on stays inside that
+# floor's band.  The previous asymmetric hairline (0.003 up / 0.0015 down, a
+# third and a sixth of a row) refused both readings, which is what made a
+# 开始巡逻 refuse with "不属于任何已录制楼层" while the character was standing on
+# the recorded row.
 #
-#   upper (above a floor's topmost recorded row) = 0.003
-#   lower (below a floor's lowest recorded row)  = 0.0015
-#
-# Both values stay far below one marker row (0.007143 on the 140-px minimap,
-# 0.008772 on the 114-px one), so a standing reading on the recorded row is
-# always inside its own floor and neither edge can wander into a neighbour's
-# row by itself.
-#
-# Known consequence of the swap, kept here because it is the reason the values
-# used to be the other way round: on a map whose neighbouring floors were
-# recorded only 0.001908 apart (layer1 top 0.751908, layer2 bottom 0.750000),
-# layer1's new upper edge (0.751908 - 0.003 = 0.748908) again reaches below
-# layer2's bottom row, so an up-jump landing at 0.750000 sits inside BOTH bands.
-# That overlap is resolved by *ranking*, not by the edge: `_layer_y_candidates`
-# orders by distance to the nearest recorded row (layer2 at 0.000000 beats
-# layer1 at 0.001908), and the climb-arrival / next-layer tests widen the target
-# band by one marker row.  A map where a landing row is equidistant from both
-# floors would need a recorded support point, not a bigger edge.
-LAYER_BAND_UPPER_EDGE_REACH = 0.003
-LAYER_BAND_LOWER_EDGE_REACH = 0.0015
+# Overlap between neighbouring floors needs ``upper + lower`` to exceed the gap
+# between their recorded envelopes.  On the operator's 12 saved recordings the
+# gaps run 0.035 (红庭2, 4 rows) to 0.278 (军3), so 0.02 + 0.02 = 0.04 stays
+# clear everywhere except 红庭2, whose two floors are 0.035088 apart: there the
+# bands share 0.004912 (0.56 of a row) of the empty air between the recorded
+# rows, and ``_layer_y_candidates`` resolves that strip by distance to the
+# nearest recorded row.  皇冠_牧师 is the next tightest at 0.041440, i.e. clear
+# by 0.001440 (0.24 rows).
+LAYER_BAND_UPPER_EDGE_REACH = 0.02
+LAYER_BAND_LOWER_EDGE_REACH = 0.02
 
-# Schema stamp written into ``layer_band``.  Version 3 is the swapped edge reach
-# above (0.003 up / 0.0015 down).  ``_refresh_all_layer_bands()`` recomputes
-# every stored band from this rule on load, so an existing recording adopts the
-# new edges instead of keeping the old ones; the stamp makes a stale document
-# recognisable when a profile is inspected.
-LAYER_BAND_VERSION = 3
+# Schema stamp written into ``layer_band``.  Version 4 is the symmetric 0.02
+# reach.  3 was the swapped hairline (0.003 up / 0.0015 down), 2 its mirror, 1 a
+# flat 0.003.  ``_refresh_all_layer_bands()`` recomputes every stored band from
+# this rule on load, so an existing recording adopts the new edges instead of
+# keeping the old ones; the stamp makes a stale document recognisable when a
+# profile is inspected.
+LAYER_BAND_VERSION = 4
 
 # Last-resort ``small_gap`` for a single-supporter layer whose recording carries no layout at all, so one
 # marker row cannot be derived.  Kept identical to
@@ -152,10 +149,10 @@ def _layer_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, float]]
     if not values:
         return None
     # Keep the UI/controller interpretation exactly aligned with the movement
-    # worker: an asymmetric edge around the recorded envelope, 0.003 above the
-    # topmost row and 0.0015 below the lowermost one (see the constants).
-    # Jump points never enter _layer_point_ys, so their vertical coordinate
-    # cannot widen or shift a layer band.
+    # worker: a symmetric 0.02 tolerance around the recorded envelope - above the
+    # topmost row and below the lowermost one (see the constants).  Jump points
+    # never enter _layer_point_ys, so their vertical coordinate cannot widen or
+    # shift a layer band.
     return (
         min(values) - LAYER_BAND_UPPER_EDGE_REACH,
         max(values) + LAYER_BAND_LOWER_EDGE_REACH,
@@ -225,10 +222,9 @@ def _recalculate_layer_band(layer: Any) -> bool:
     jump lands on) belong to this floor instead of "no floor".  Jump points
     deliberately never change a layer's identity.  A single supporter produces
     the documented one-sided ``[y, y + small_gap]`` envelope; two or more
-    supporters span their observed top/bottom positions with the asymmetric
-    edge reach: ``LAYER_BAND_UPPER_EDGE_REACH`` (0.003) above the topmost row
-    and ``LAYER_BAND_LOWER_EDGE_REACH`` (0.0015) below the lowermost one.  The
-    same calculation produces the world-Y band.
+    supporters span their observed top/bottom positions with the symmetric edge
+    reach: ``LAYER_BAND_UPPER_EDGE_REACH`` / ``LAYER_BAND_LOWER_EDGE_REACH``
+    (both 0.02).  The same calculation produces the world-Y band.
     """
 
     if not isinstance(layer, dict):
@@ -243,8 +239,9 @@ def _recalculate_layer_band(layer: Any) -> bool:
         raw_upper = raw_lower = values[0]
     else:
         raw_upper, raw_lower = min(values), max(values)
-    # Asymmetric edge reach (operator's swap): 0.003 above the topmost recorded
-    # row, 0.0015 below the lowermost one.
+    # Symmetric edge reach (operator this build): 0.02 on both sides of the
+    # recorded envelope - about two marker rows, so the floor's own band admits
+    # the marker's one-row quantisation instead of refusing it as "no floor".
     y_upper = raw_upper - LAYER_BAND_UPPER_EDGE_REACH
     y_lower = raw_lower + LAYER_BAND_LOWER_EDGE_REACH
 
@@ -263,10 +260,10 @@ def _recalculate_layer_band(layer: Any) -> bool:
             pass
 
     band: dict[str, Any] = {
-        # 3 = swapped edge reach (upper 0.003 / lower 0.0015); 2 was
-        # (0.0015 / 0.003) and 1 a flat 0.003.  Every band is recomputed on
-        # load, so the stamp records which rule produced a document rather than
-        # gating the rebuild.
+        # 4 = symmetric 0.02 reach (this build); 3 was the swapped hairline
+        # (upper 0.003 / lower 0.0015), 2 its mirror, 1 a flat 0.003.  Every band
+        # is recomputed on load, so the stamp records which rule produced a
+        # document rather than gating the rebuild.
         "version": LAYER_BAND_VERSION,
         "supporter_count": len(values),
         "y_top": round(raw_upper, 6),

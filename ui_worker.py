@@ -257,11 +257,40 @@ UPDATE_NOTICE_TOOLTIP_LINES = 8
 AUTOLIE_BACKEND_OFF = "off"
 AUTOLIE_BACKEND_CLOUD = "cloud"
 AUTOLIE_BACKEND_LOCAL = "local"
-# 测试云端测谎 is built and wired (same command as 测试本地测谎, the drill already
-# reaches the cloud backend when 云端测谎 is selected) but the operator keeps it
-# hidden: every cloud run charges the online 测谎次数, so only 测试本地测谎 - which
-# the CT card pays for - is exposed.  Flip this to True to bring the button back;
-# nothing else has to change.
+
+
+def auto_lie_radio_value(armed: bool, saved_backend: object) -> str:
+    """The 自动测谎 radio value that matches *armed*.
+
+    The radio group and ``_api_auto_lie_var`` are two views of ONE selection, so
+    ``off`` must be shown whenever the feature is disarmed.  Leaving a backend on
+    the group while the armed flag was False made the panel show 云端测谎 selected
+    for a feature that was actually off, and every real lie window was then
+    ignored (operator: "looked, it is default to select 云端测谎 while actually it
+    is ticked off").  Both the constructor and every later restore/disarm path go
+    through this function, so the two views cannot drift apart again.
+
+    An ARMED selection whose saved backend is absent or unknown still means
+    ``cloud``: that is what every version before the backend split ran, so an
+    existing ``user_config.json`` keeps its exact behaviour.  This mirrors
+    ``_load_api_auto_lie_backend_setting()`` - both use the same rule.
+    """
+
+    if not armed:
+        return AUTOLIE_BACKEND_OFF
+    value = str(saved_backend or "").strip().casefold()
+    return (
+        AUTOLIE_BACKEND_LOCAL
+        if value == AUTOLIE_BACKEND_LOCAL
+        else AUTOLIE_BACKEND_CLOUD
+    )
+
+
+# 测试云端测谎 shares its slot with 测试本地测谎 and is shown only while 云端测谎 is
+# the selected backend.  It is commented out again on the operator's word: every
+# cloud run charges the online 测谎次数, so only 测试本地测谎 - which the CT card
+# pays for - stays exposed.  The button, its command and its gating are all
+# intact; flipping this constant to True brings it back with no other change.
 API_TEST_CLOUD_BUTTON_VISIBLE = False
 # 本地测谎 probe cadence.  The service validates its licence and handshakes the
 # coordinate cloud BEFORE it listens on 8765 (~5-20 s cold), so the first probe
@@ -3447,7 +3476,9 @@ class UiWorker(threading.Thread):
             # path reads; the radios are its author.
             self._api_auto_lie_var = tk.BooleanVar(value=saved_api_auto_lie)
             self._api_auto_lie_backend_var = tk.StringVar(
-                value=("off" if not saved_api_auto_lie else saved_api_auto_lie_backend)
+                value=auto_lie_radio_value(
+                    saved_api_auto_lie, saved_api_auto_lie_backend
+                )
             )
             auto_lie_label = ttk.Label(auto_lie_row, text="自动测谎")
             auto_lie_label.pack(side="left")
@@ -7174,7 +7205,8 @@ class UiWorker(threading.Thread):
             self._api_test_pending = None
             self._api_test_wait_started_at = 0.0
             self._report_api_test_failure(
-                "本地测谎服务启动失败：40 秒内 127.0.0.1:8765 未响应（详见 运行日志）"
+                "本地测谎服务启动失败：40 秒内 127.0.0.1:8765 未响应（详见 运行日志）",
+                service_failure=True,
             )
             return
         try:
@@ -7186,6 +7218,7 @@ class UiWorker(threading.Thread):
         if ok:
             self._local_lie_ready = True
             self._local_lie_note = note
+            self._note_local_lie_answering(note)
             LOG.info("试跑: 本地测谎服务已就绪，开始等待中的试跑")
             video, seconds = pending
             self._api_test_begin_or_wait(video, seconds)
@@ -7364,10 +7397,10 @@ class UiWorker(threading.Thread):
     def _sync_api_test_buttons(self) -> None:
         """Show the drill button the 自动测谎 selection allows, and nothing else.
 
-        本地测谎 exposes 测试本地测谎.  云端测谎 and 关闭 show no drill at all: the slot
-        keeps its frozen size, so the row neither grows nor jumps when the button
-        comes and goes.  测试云端测谎 stays in the build but is never packed while
-        ``API_TEST_CLOUD_BUTTON_VISIBLE`` is false.
+        本地测谎 exposes 测试本地测谎, 云端测谎 exposes 测试云端测谎, and 关闭 shows no
+        drill at all: the slot keeps its frozen size, so the row neither grows nor
+        jumps when the button comes and goes.  Both buttons run the same command -
+        the drill always uses whichever backend the group selects.
         """
 
         local = getattr(self, "_api_test_local_button", None)
@@ -7488,21 +7521,30 @@ class UiWorker(threading.Thread):
             except Exception:
                 LOG.debug("api test status could not be updated", exc_info=True)
 
-    def _report_api_test_failure(self, text: str) -> None:
+    def _report_api_test_failure(
+        self, text: str, *, service_failure: bool = False,
+    ) -> None:
         """A 试跑 press could not start: log it, note it, and tell the client.
 
         The dialog body is client wording plus where the details went, so a
         non-technical operator knows both what happened and who can look into it.
+
+        Only ``service_failure`` marks the 本地测谎 service as failed.  A missing
+        video drill, a licence that has not arrived, or a generic "could not
+        start" says nothing about the service, and recording it as a start
+        failure made the 图层校准与巡逻 hint read 本地测谎启动失败 while
+        127.0.0.1:8765 was answering normally.
         """
 
         self._set_api_test_status(text)
         LOG.warning("试跑 could not start: %s", text)
-        try:
-            import local_lie_service
+        if service_failure:
+            try:
+                import local_lie_service
 
-            local_lie_service.note_failure(text)
-        except Exception:  # noqa: BLE001 - the hint is best effort
-            LOG.debug("local lie service note failed", exc_info=True)
+                local_lie_service.note_failure(text)
+            except Exception:  # noqa: BLE001 - the hint is best effort
+                LOG.debug("local lie service note failed", exc_info=True)
         try:
             self._refresh_panel_hints()
         except Exception:  # noqa: BLE001
@@ -7766,12 +7808,28 @@ class UiWorker(threading.Thread):
                     time.sleep(LOCAL_LIE_PROBE_INTERVAL_SECONDS)
             self._local_lie_ready = bool(ok)
             self._local_lie_note = note
+            # A probe that answers is the strongest evidence there is: tell the
+            # service module, so a 启动失败 latched by an earlier attempt cannot
+            # keep the panel sentence on the 图层校准与巡逻 line.
+            if ok:
+                self._note_local_lie_answering(note)
             # The probe runs off the Tk thread, so it may not touch a widget:
             # _poll picks the flag up and writes the status line there.
             self._local_lie_report_pending = True
             AUTO_LIE_LOG.info("自动过测谎 backend=local: %s", note)
 
         threading.Thread(target=job, name="local-lie-probe", daemon=True).start()
+
+    @staticmethod
+    def _note_local_lie_answering(note: str = "") -> None:
+        """Tell 本地测谎's state machine that 127.0.0.1:8765 answered."""
+
+        try:
+            import local_lie_service
+
+            local_lie_service.note_service_answering(note)
+        except Exception:  # noqa: BLE001 - a hint must never break a probe
+            LOG.debug("本地测谎 answering state could not be recorded", exc_info=True)
 
     def _local_lie_access(self) -> Optional[bool]:
         """Whether this activation code may use 本地测谎, or None while unknown.
@@ -8015,6 +8073,10 @@ class UiWorker(threading.Thread):
                 ok, note = False, f"本地测谎探测失败：{exc}"
             self._local_lie_ready = bool(ok)
             self._local_lie_note = note
+            if ok:
+                # Same reason as _probe_local_lie_service: an answering service
+                # clears a stale 启动失败 latch on the panel hint.
+                self._note_local_lie_answering(note)
         else:
             ok, note = bool(self._local_lie_ready), self._local_lie_note
         return ok, note
@@ -11536,13 +11598,18 @@ class UiWorker(threading.Thread):
                     disabled=(dead_flower_mode or not self._license_allowed()),
                 )
         # Counterattack, pickup/reset and 小碎步 are intentionally one fixed
-        # third row.  Outside 站桩/双桩 it remains visible for orientation but
-        # is greyed and cannot alter the live route settings.
+        # third row.  被撞反击 belongs to 巡逻攻击 as well as to 站桩/双桩: a hit
+        # during a patrol walk is answered by the movement worker with a short
+        # step away from the hit plus the counterattack key, so the control is
+        # live there too.  The 站桩/双桩 children sharing this row (换桩, 朝向)
+        # are packed and gated separately below, so opening the row does not
+        # open them.  死花/跑花 keep it greyed: dead_flower already disables
+        # the row above, and 跑花 defers every attack to the supervisor.
         stationary_action_row = getattr(self, "_stationary_action_row", None)
         if stationary_action_row is not None:
             self._set_panel_state(
                 stationary_action_row,
-                disabled=not (mode in ("stationary", "dual_stationary")
+                disabled=not (mode in ("fixed", "stationary", "dual_stationary")
                               and self._license_allowed()),
             )
         for widget in getattr(self, "_attack_delivery_buttons", ()):
@@ -12576,14 +12643,17 @@ class UiWorker(threading.Thread):
         if hasattr(self, "_api_auto_lie_var"):
             # 自动过测谎 is part of user_config, like the reconnect selection.
             data["auto_lie_api_enabled"] = bool(self._api_auto_lie_var.get())
-            # Which backend that selection means: 云端测谎 / 本地测谎.  Written
-            # even while disarmed, so re-arming restores the operator's choice.
+            # Which backend that selection means: 云端测谎 / 本地测谎.  A disarmed
+            # selection shows 关闭, and then the PREVIOUS backend is kept instead of
+            # being rewritten as 云端测谎 - otherwise switching 关闭 for a moment
+            # silently changed what the next 开启 would run.
             backend_var = getattr(self, "_api_auto_lie_backend_var", None)
             if backend_var is not None:
                 value = str(backend_var.get()).casefold()
                 data["auto_lie_backend"] = (
-                    AUTOLIE_BACKEND_LOCAL if value == AUTOLIE_BACKEND_LOCAL
-                    else AUTOLIE_BACKEND_CLOUD
+                    value
+                    if value in (AUTOLIE_BACKEND_LOCAL, AUTOLIE_BACKEND_CLOUD)
+                    else self._load_api_auto_lie_backend_setting()
                 )
         if hasattr(self, "_reconnect_var"):
             data["auto_reconnect_enabled"] = bool(self._reconnect_var.get())
@@ -12621,6 +12691,11 @@ class UiWorker(threading.Thread):
         if (not lie_armed and hasattr(self, "_api_auto_lie_var")
                 and bool(self._api_auto_lie_var.get())):
             self._api_auto_lie_var.set(False)
+            # The radio group is the other view of the same selection: leaving it
+            # on 云端测谎/本地测谎 showed an armed backend for a feature that was
+            # just switched off.
+            if hasattr(self, "_api_auto_lie_backend_var"):
+                self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
             self._api_auto_lie_session_armed = False
             self._api_auto_lie_pending = False
             self.request_cancel_auto_lie_pass()
@@ -14339,13 +14414,15 @@ class UiWorker(threading.Thread):
             if hasattr(self, "_api_auto_lie_var"):
                 self._api_auto_lie_var.set(saved_auto_lie)
             # The backend travels with the selection, so a restart keeps 本地测谎
-            # selected instead of silently falling back to the cloud pass.
+            # selected instead of silently falling back to the cloud pass - but it
+            # may only be shown while the feature is actually armed: a backend left
+            # on the group for a disarmed selection makes the panel claim 云端测谎
+            # while every lie window is ignored.
             if hasattr(self, "_api_auto_lie_backend_var"):
-                saved_backend = str(data.get("auto_lie_backend") or "").casefold()
                 self._api_auto_lie_backend_var.set(
-                    saved_backend if saved_backend in (
-                        AUTOLIE_BACKEND_LOCAL, AUTOLIE_BACKEND_CLOUD,
-                    ) else AUTOLIE_BACKEND_CLOUD
+                    auto_lie_radio_value(
+                        saved_auto_lie, data.get("auto_lie_backend")
+                    )
                 )
                 if saved_auto_lie and self._auto_lie_backend_is_local():
                     self._probe_local_lie_service()
@@ -15781,6 +15858,7 @@ __all__ = [
     "DebugSnapshot",
     "UiLogHandler",
     "UiWorker",
+    "auto_lie_radio_value",
     "build_debug_snapshot",
     "layer_display_order",
     "monitor_work_area_for_pointer",

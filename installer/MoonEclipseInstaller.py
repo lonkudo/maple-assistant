@@ -35,9 +35,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from licensing import (  # noqa: E402
     ACTIVATION_SERVER_ENDPOINT,
+    DeviceNotReadyError,
     activation_code,
     device_identity_for_request,
     machine_fingerprint_hash,
+    remember_boot_identity,
+    verify_document,
 )
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json  # noqa: E402
 
@@ -684,6 +687,12 @@ def _activate(code: str) -> tuple[str, Any]:
             payload, PIN_ROOT / "activation_server_pin.json",
         )
     except PinnedTlsResponseError as exc:
+        if str(getattr(exc, "code", "")) == "BOUND_CODE":
+            # Not a dead end: the desktop answers the same refusal with the
+            # transfer the operator confirms, and this installer offers it too.
+            raise ActivationBoundElsewhereError(
+                getattr(exc, "message", "") or "该授权码已绑定到另一台设备。"
+            ) from exc
         raise RuntimeError(f"授权失败：{getattr(exc, 'message', str(exc))}") from exc
     except PinnedTlsError as exc:
         raise RuntimeError(f"授权失败：无法连接到授权服务器（{exc}）") from exc
@@ -712,7 +721,9 @@ ENTITLEMENT_LOCAL_KEY = "_local"
 LICENSE_SETTINGS_NAME = "license_settings.json"
 
 
-def _acquire_entitlement(code: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _acquire_entitlement(
+    code: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Bind this PC to the code and return its signed entitlement document.
 
     ``/api/v1/installer/session`` only proves the code so the download may start;
@@ -722,8 +733,11 @@ def _acquire_entitlement(code: str) -> tuple[dict[str, Any], dict[str, Any]]:
     customer's first contact with the product, so it is also the right place to
     bind.
 
-    Returns ``(document, reply)``; the reply carries the equipment id and expiry
-    for the window to show.
+    Returns ``(document, reply, fingerprint)``.  The reply carries the equipment
+    id for the window; the fingerprint is the composite this request proved, and
+    the caller seals it as the desktop's boot identity exactly as the desktop
+    would.  Raises ``DeviceNotReadyError`` when CIM/WMI is still starting, which
+    the window reports as ``DEVICE_NOT_READY_HINT`` instead of retrying.
     """
 
     fingerprint, components = device_identity_for_request()
@@ -744,15 +758,47 @@ def _acquire_entitlement(code: str) -> tuple[dict[str, Any], dict[str, Any]]:
     document = (answer or {}).get("license")
     if not isinstance(document, dict) or "payload" not in document:
         raise RuntimeError("授权服务器未返回授权文件。")
-    return document, dict(answer or {})
+    return document, dict(answer or {}), fingerprint
 
 
-def _write_entitlement(root: Path, document: dict[str, Any]) -> Path:
+def _local_state_seed(code: str, equipment_id: str = "") -> dict[str, Any]:
+    """The ``_local`` block the desktop writes after its own activation.
+
+    ``auth.json`` carries two different things: the signed entitlement the
+    verifier checks, and an unsigned ``_local`` block that only feeds the
+    window's 授权码 / 设备 / 备注 labels (see ``ui_worker._save_license_attempt``
+    and ``config_store.DEFAULT_AUTH_CONFIG``).  The installer used to write the
+    submitted code only into ``助手配置\\license_settings.json`` - a file no
+    current build reads for that label - so a freshly installed client opened
+    already licensed but displayed 授权码：未设置.
+    """
+
+    seed: dict[str, Any] = {}
+    stored = "".join(str(code or "").upper().split())
+    if stored:
+        seed["activation_code"] = stored
+        seed["last_validation_valid"] = True
+        seed["last_validation_code"] = "ACTIVATED"
+        seed["last_validation_message"] = "安装程序已自动授权。"
+        seed["last_validation_at"] = datetime.now(timezone.utc).isoformat()
+    equipment_id = str(equipment_id or "").strip()
+    if len(equipment_id) == 8:
+        seed["equipment_id"] = equipment_id
+    return seed
+
+
+def _write_entitlement(
+    root: Path, document: dict[str, Any],
+    code: str = "", equipment_id: str = "",
+) -> Path:
     """Write the signed entitlement where the installed app reads it.
 
-    Mirrors ``licensing._persist_document`` exactly: ``<root>/auth.json``, the
-    desktop's own ``_local`` display state preserved when the file already
-    exists, and an atomic replace so a half-written document is never readable.
+    Mirrors ``licensing._persist_document``: ``<root>/auth.json`` plus an atomic
+    replace so a half-written document is never readable.  ``_local`` is the
+    exception: the desktop's own state wins, and the installer's seed (the code
+    the customer just typed, the server-issued device code) fills only the keys
+    the existing document does not already carry - otherwise a fresh install
+    opens with an empty 授权码 in the window.
     """
 
     target = Path(root) / ENTITLEMENT_FILE
@@ -772,8 +818,12 @@ def _write_entitlement(root: Path, document: dict[str, Any]) -> Path:
                 key: value for key, value in existing.items()
                 if key not in {"payload", "signature", ENTITLEMENT_LOCAL_KEY}
             }
-    if local:
-        output[ENTITLEMENT_LOCAL_KEY] = local
+    # The installer's seed must never overwrite what the desktop already keeps
+    # (a memo, a newer validation record, an equipment id from a heartbeat).
+    merged = _local_state_seed(code, equipment_id)
+    merged.update(local)
+    if merged:
+        output[ENTITLEMENT_LOCAL_KEY] = merged
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=target.parent, delete=False,
@@ -786,13 +836,16 @@ def _write_entitlement(root: Path, document: dict[str, Any]) -> Path:
 
 
 def _write_license_settings(
-    root: Path, code: str, reply: dict[str, Any],
+    root: Path, code: str, reply: dict[str, Any], activated: bool = True,
 ) -> Path | None:
     """Record the submitted code the way the desktop does.
 
     A later run of this installer updates an existing folder without asking for
     the code again (``_previous_install_profile_code`` reads exactly this file),
-    which only works while the code is stored beside the config.
+    which only works while the code is stored beside the config.  The desktop
+    also falls back to it for the 授权码 label (``ConfigStore.read_section``), so
+    it is written even when automatic authorization failed: the customer should
+    not have to type the same code twice.
     """
 
     target = _profile_search_dirs(root)[0] / LICENSE_SETTINGS_NAME
@@ -804,9 +857,12 @@ def _write_license_settings(
     except (OSError, ValueError):
         data = {}
     data["activation_code"] = "".join(str(code).upper().split())
-    data["last_validation_valid"] = True
-    data["last_validation_code"] = "ACTIVATED"
-    data["last_validation_message"] = "安装程序已自动授权。"
+    data["last_validation_valid"] = bool(activated)
+    data["last_validation_code"] = "ACTIVATED" if activated else "PENDING"
+    data["last_validation_message"] = (
+        "安装程序已自动授权。" if activated
+        else "安装程序已记录授权码，自动授权未完成。"
+    )
     data["last_validation_at"] = datetime.now(timezone.utc).isoformat()
     equipment_id = str(reply.get("device", {}).get("equipment_id", "") if isinstance(
         reply.get("device"), dict) else "").strip()
@@ -827,33 +883,129 @@ def _write_license_settings(
     return target
 
 
+# Windows can still be bringing CIM/WMI up when a brand-new PC runs this
+# installer, and ``device_identity_for_request`` then refuses to report a partial
+# device.  The operator's rule is explicit: say so and stop - do not sit in a
+# retry loop before the customer has even seen the window work.  He runs it again.
+DEVICE_NOT_READY_HINT = "设备未就绪，稍后再试"
+
+
+class ActivationBoundElsewhereError(RuntimeError):
+    """The submitted code is bound to another device.
+
+    The desktop answers this with the two-phase transfer the operator confirms:
+    ``/api/v1/activation-transfer/preview`` reports which device holds the code
+    and issues a one-use token, and ``/api/v1/activation-transfer/confirm`` moves
+    the binding.  The installer carries that refusal as its own type so
+    ``_install_worker`` can ask the same question in the same order instead of
+    printing 该授权码已绑定到另一台设备 at the end.
+    """
+
+
+# The activation server keeps a confirmation token valid for 90 seconds; starting
+# the installer again re-runs the preview and issues a fresh one.
+TRANSFER_CONFIRMATION_SECONDS = 90
+
+
+def _transfer_preview(code: str) -> dict[str, Any]:
+    """Read-only: which device holds this code, and a one-use transfer token.
+
+    Mirrors ``licensing.preview_activation_transfer_via_server``.  Nothing is
+    moved here; only the confirmed second phase changes a binding.
+    """
+
+    fingerprint, components = device_identity_for_request()
+    answer = post_json(
+        ACTIVATION_SERVER_ENDPOINT, "/api/v1/activation-transfer/preview",
+        {
+            "activation_code": "".join(str(code).upper().split()),
+            "fingerprint": fingerprint,
+            "components": components,
+        },
+        PIN_ROOT / "activation_server_pin.json",
+    )
+    return dict(answer or {})
+
+
+def _transfer_confirm(token: str) -> dict[str, Any]:
+    """Consume a preview token and move the binding to this device."""
+
+    fingerprint, components = device_identity_for_request()
+    answer = post_json(
+        ACTIVATION_SERVER_ENDPOINT, "/api/v1/activation-transfer/confirm",
+        {
+            "transfer_token": str(token),
+            "fingerprint": fingerprint,
+            "components": components,
+        },
+        PIN_ROOT / "activation_server_pin.json",
+    )
+    return dict(answer or {})
+
+
 def authorize_installation(root: Path, code: str) -> str:
     """Make a finished installation licensed; return the note for the window.
 
     Never raises: the customer already has a complete install at this point, and
     a hiccup here must not turn it into a failed installation.  The returned text
-    says either "ready" or exactly what to do next.
+    says either "ready" or exactly what to do next.  Everything the desktop's own
+    first activation leaves behind is written here as well - the signed
+    entitlement, the ``_local`` display state, and the sealed boot identity - so
+    a fresh install opens licensed and with its 授权码 visible.
     """
 
     try:
-        document, reply = _acquire_entitlement(code)
+        document, reply, fingerprint = _acquire_entitlement(code)
+    except DeviceNotReadyError:
+        logging.warning("installer: device fingerprint not ready at authorization")
+        _write_license_settings(root, code, {}, activated=False)
+        return DEVICE_NOT_READY_HINT
     except Exception as exc:  # noqa: BLE001 - reported to the window as a note
         logging.exception("installer: automatic authorization failed")
+        # Remember the code anyway: the window's 授权码 label reads it, and the
+        # next installer run then updates this folder without asking again.
+        _write_license_settings(root, code, {}, activated=False)
         return f"自动授权未完成（{exc}）。请在助手窗口点「激活授权」输入同一授权码。"
-    try:
-        target = _write_entitlement(root, document)
-    except OSError as exc:
-        logging.exception("installer: could not write %s", ENTITLEMENT_FILE)
-        return f"授权文件写入失败（{exc}）。请在助手窗口点「激活授权」输入同一授权码。"
-    _write_license_settings(root, code, reply)
+    # The desktop never persists a document it has not verified itself; the
+    # installer writes the very same file, so it runs the very same check.
+    status = verify_document(document, root)
+    if not status.valid:
+        logging.error(
+            "installer: entitlement rejected locally code=%s message=%s",
+            status.code, status.message,
+        )
+        _write_license_settings(root, code, reply, activated=False)
+        return (
+            f"授权文件未通过本机校验（{status.message}）。"
+            "请在助手窗口点「激活授权」输入同一授权码。"
+        )
     equipment_id = ""
     device = reply.get("device")
     if isinstance(device, dict):
         equipment_id = str(device.get("equipment_id") or "")
+    try:
+        # ``code`` and the device id travel with the document: they are what the
+        # window shows as 授权码 / 设备, and a licensed but "code-less" first
+        # launch is exactly the report this signature exists to prevent.
+        target = _write_entitlement(root, document, code, equipment_id)
+    except OSError as exc:
+        logging.exception("installer: could not write %s", ENTITLEMENT_FILE)
+        _write_license_settings(root, code, reply, activated=False)
+        return f"授权文件写入失败（{exc}）。请在助手窗口点「激活授权」输入同一授权码。"
+    _write_license_settings(root, code, reply)
+    # ``auth.json`` proves the entitlement; this DPAPI record proves the equipment
+    # and is the desktop's boot bridge while CIM wakes up.  Activation writes it,
+    # so an installation that skips the desktop must write it too.
+    sealed = remember_boot_identity(fingerprint, status.license_id, root)
     logging.info(
-        "installer: entitlement written to %s (equipment %s)",
-        target, equipment_id or "unknown",
+        "installer: entitlement written to %s (equipment %s, boot identity %s)",
+        target, equipment_id or "unknown", "sealed" if sealed else "not sealed",
     )
+    if not sealed:
+        logging.warning(
+            "installer: could not seal the boot identity; the first start will "
+            "wait for a live online validation instead of using the boot bridge"
+        )
     if equipment_id:
         return f"本机已自动授权（设备码 {equipment_id}），启动后无需再次输入授权码。"
     return "本机已自动授权，启动后无需再次输入授权码。"
@@ -1100,6 +1252,10 @@ class InstallerWindow:
         self.root.resizable(False, False)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.running = False
+        # The activation-transfer confirmation is a Tk question: the install
+        # worker blocks on this event while the operator answers in the window.
+        self._transfer_event: threading.Event | None = None
+        self._transfer_answer: bool | None = None
         self.progress_value = 0.0
         self._total_bytes = 1
         self._stage_text = "准备就绪"
@@ -1245,11 +1401,31 @@ class InstallerWindow:
         ).start()
 
     def _install_worker(self, code: str, root: Path) -> None:
+        transfer_note = ""
         try:
             # Authentication first: an invalid code stops before any download.
             # The reply also carries the newest 更新链接 record, which is where
             # this installer learns the download address at all.
-            _token, release = _activate(code)
+            try:
+                _token, release = _activate(code)
+            except DeviceNotReadyError:
+                # Not a retry: the operator wants the customer told to run it
+                # again, not a window that silently waits on CIM/WMI.
+                logging.warning("installer: device fingerprint not ready")
+                self.events.put(("hint", DEVICE_NOT_READY_HINT))
+                return
+            except ActivationBoundElsewhereError as exc:
+                # Same two-phase order as the desktop's 更换授权: the server's
+                # preview names the current device, the operator confirms, and
+                # only the confirmation moves the binding.
+                logging.warning("installer: code bound elsewhere (%s)", exc)
+                transferred, note = self._offer_activation_transfer(code)
+                if not transferred:
+                    # Nothing was installed: a hint, not an "安装失败" report.
+                    self.events.put(("hint", note))
+                    return
+                transfer_note = note
+                _token, release = _activate(code)
             root = root.resolve()
             root.mkdir(parents=True, exist_ok=True)
             # An older layout keeps 助手配置 elsewhere (inside app\, or the
@@ -1313,6 +1489,10 @@ class InstallerWindow:
             # instead of asking for the same code again.
             self.events.put(("stage", "正在写入授权信息…"))
             authorization_note = authorize_installation(root, code)
+            if transfer_note:
+                # The customer moved the code from another PC during this run;
+                # the window must say so rather than present a plain activation.
+                authorization_note = f"{transfer_note}\n{authorization_note}"
             first_setup = _start_first_install_setup(root)
             self.events.put(
                 ("done", (root, first_setup, installed, version, authorization_note))
@@ -1320,6 +1500,90 @@ class InstallerWindow:
         except Exception as exc:  # noqa: BLE001 - reported in the window
             logging.exception("installer: install failed")
             self.events.put(("error", str(exc)))
+
+    def _offer_activation_transfer(self, code: str) -> tuple[bool, str]:
+        """Offer the desktop's 更换授权 flow; return ``(moved, note)``.
+
+        Phase one is the server's read-only preview: it names the device that
+        currently holds the code.  Phase two runs only after the operator has
+        confirmed in a dialog, and only it moves the binding.  A cancel or a
+        refusal returns ``(False, note)`` and nothing is installed.
+        """
+
+        try:
+            preview = _transfer_preview(code)
+        except Exception as exc:  # noqa: BLE001 - reported in the window
+            logging.exception("installer: activation transfer preview failed")
+            message = getattr(exc, "message", "") or str(exc)
+            return False, (
+                "该授权码已绑定到另一台设备，且无法读取其绑定信息（"
+                f"{message}）。请稍后再试，或在助手窗口点「激活授权」。"
+            )
+        if not preview.get("ok"):
+            return False, str(
+                preview.get("message") or "该授权码无法激活。"
+            )
+        token = str(preview.get("transfer_token") or "")
+        if not preview.get("bound_elsewhere") or not token:
+            # The preview does not see a foreign binding, so there is nothing to
+            # confirm; report the refusal the customer actually hit.
+            return False, "该授权码已绑定到另一台设备，且服务器未提供更换确认。"
+        old_id = str(preview.get("bound_equipment_id") or "").strip() or "未知设备"
+        if not self._ask_transfer_permission(old_id):
+            logging.info("installer: operator cancelled the activation transfer")
+            return False, "已取消更换授权，安装未开始。"
+        try:
+            _transfer_confirm(token)
+        except Exception as exc:  # noqa: BLE001 - reported in the window
+            logging.exception("installer: activation transfer confirmation failed")
+            message = getattr(exc, "message", "") or str(exc)
+            return False, (
+                f"更换授权失败（{message}）。请重新点击「开始安装 / 更新」再试。"
+            )
+        logging.info(
+            "installer: activation transferred from device %s to this PC", old_id
+        )
+        return True, f"已将授权从设备 {old_id} 更换到本机。"
+
+    def _ask_transfer_permission(self, old_id: str) -> bool:
+        """Ask on the Tk thread; the worker blocks until the answer arrives."""
+
+        event = threading.Event()
+        self._transfer_event = event
+        self._transfer_answer = None
+        self.events.put(("transfer-ask", old_id))
+        # The server keeps the confirmation token valid for 90 seconds, so a
+        # longer wait can only end in an expired confirmation; say so instead.
+        if not event.wait(TRANSFER_CONFIRMATION_SECONDS + 30.0):
+            logging.warning("installer: activation transfer question timed out")
+            self._transfer_event = None
+            self._transfer_answer = None
+            return False
+        answer = bool(self._transfer_answer)
+        self._transfer_event = None
+        self._transfer_answer = None
+        return answer
+
+    def _confirm_activation_transfer(self, old_id: str) -> bool:
+        """The 更换授权 question, worded exactly as the desktop asks it.
+
+        Runs on the Tk thread from ``_drain_events``; a nested event loop (the
+        modal dialog itself) can re-enter the drain, which only ever processes
+        other queued progress events, never this question twice.
+        """
+
+        try:
+            return bool(messagebox.askyesno(
+                "更换授权",
+                f"该授权码当前绑定设备：{old_id}。\n\n"
+                "确认后将解绑该设备并绑定到当前设备。\n"
+                "原设备将在下一次授权校验时停止运行。\n\n"
+                "确定要更换授权吗？",
+                parent=self.root,
+            ))
+        except Exception:  # noqa: BLE001 - a dialog failure must not hang the worker
+            logging.exception("installer: transfer confirmation dialog failed")
+            return False
 
     def _set_progress(self, fraction: float) -> None:
         fraction = max(0.0, min(1.0, fraction))
@@ -1370,6 +1634,23 @@ class InstallerWindow:
                 elif kind == "stage":
                     self._stage_text = str(value)
                     self.status.configure(text=self._stage_text)
+                elif kind == "transfer-ask":
+                    # The worker is blocked on ``_transfer_event``; answer it with
+                    # the operator's choice and nothing else.  A question whose
+                    # worker already gave up (timeout) is dropped unseen.
+                    event = self._transfer_event
+                    if event is None:
+                        continue
+                    self._transfer_answer = self._confirm_activation_transfer(
+                        str(value)
+                    )
+                    event.set()
+                elif kind == "hint":
+                    # A plain hint, not a failure: the install has not started.
+                    self.running = False
+                    self.install.state(["!disabled"])
+                    self.status.configure(text=str(value))
+                    messagebox.showinfo("提示", str(value), parent=self.root)
                 elif kind == "files":
                     # Text only: the bar belongs to the byte stream, and these
                     # phases have none, so they must not move it.

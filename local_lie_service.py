@@ -267,7 +267,7 @@ def ensure_started(
         running, note = _probe()
         if running:
             _state.update(state="external", note=note, root=str(root),
-                          started_by_app=False, pids=[])
+                          started_by_app=False, pids=[], card_rejected=False)
             LOG.info("local lie service: already running (%s)", note)
             return True, note
         booting_pid = _launch_still_booting()
@@ -312,7 +312,8 @@ def ensure_started(
             if running:
                 with _lock:
                     _state.update(state="external", note=note, root=str(root),
-                                  started_by_app=False, pids=stale_pids)
+                                  started_by_app=False, pids=stale_pids,
+                                  card_rejected=False)
                 LOG.info("local lie service: the running instance answered (%s)", note)
                 return True, note
             if not _service_pids(root):
@@ -455,10 +456,44 @@ def _supervisor_job(root, interval: float) -> None:
                     LOG.info("local lie service: 8765 stopped answering; "
                              "pre-starting it again")
                 ensure_started(root)
+            else:
+                # The service answers, so it is up - a rejection latched by an
+                # earlier attempt must not keep the panel at 本地测谎启动失败.
+                # ``ensure_started`` is deliberately not called here (nothing to
+                # start), which is exactly why the latch has to be cleared here.
+                note_service_answering()
         except Exception:  # noqa: BLE001 - supervision never dies
             LOG.warning("local lie service: supervisor start failed", exc_info=True)
         first = False
         _supervisor_stop.wait(interval)
+
+
+def note_service_answering(note: str = "") -> None:
+    """A probe proved 127.0.0.1:8765 answers: mark the service up.
+
+    ``card_rejected`` answers "did the CT card validate on this machine?", and it
+    is latched when a start attempt fails while a card is known.  A service that
+    ANSWERS has evidently validated its card, so the latch is stale by
+    definition.  Only a freshly launched success used to clear it, and the
+    supervisor skips ``ensure_started`` entirely once 8765 is quiet-free - so a
+    single failed attempt (a slow first start, a leftover instance holding the
+    port) left the panel reading 本地测谎启动失败 while passes were being served.
+    """
+
+    text = str(note or "").strip() or "127.0.0.1:8765 已响应"
+    with _lock:
+        previous = str(_state.get("state") or "idle")
+        started_by_app = bool(_state.get("started_by_app"))
+        _state.update(
+            state="running" if started_by_app else "external",
+            note=text,
+            card_rejected=False,
+        )
+    if previous not in ("running", "external"):
+        LOG.info(
+            "local lie service: 8765 answers, so the service is up (%s -> %s)",
+            previous, "running" if started_by_app else "external",
+        )
 
 
 def config_card(app_root: Path | str | None = None) -> str:
@@ -1438,10 +1473,13 @@ def hint_state() -> str:
         return "off"
     if not has_online_card():
         return "no_card"
+    if state in ("running", "external"):
+        # A service that answers is up.  The latch explains a service that will
+        # NOT come up; letting it win here is what kept the panel at
+        # 本地测谎启动失败 while the service was serving passes.
+        return "up"
     if rejected:
         return "failed"
-    if state in ("running", "external"):
-        return "up"
     if state == "starting":
         return "starting"
     if state in ("idle", "missing"):
@@ -1473,10 +1511,12 @@ def hint_text() -> str:
         return "本地测谎未开通"
     if not desired and state not in ("running", "external", "starting"):
         return ""
-    if rejected:
-        return "本地测谎服务: 本地测谎启动失败"
+    # Answering beats a stale rejection (see hint_state): a launched service that
+    # validates its card and listens is proof the card was NOT rejected.
     if state in ("running", "external"):
         return "本地测谎服务: 已启动"
+    if rejected:
+        return "本地测谎服务: 本地测谎启动失败"
     if state == "starting":
         return "本地测谎服务: 正在启动…"
     if state in ("idle", "missing"):
