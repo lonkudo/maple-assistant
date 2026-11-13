@@ -497,6 +497,24 @@ DROP_ARRIVAL_CONFIRM_FRAMES = 2
 # facing tap is about to nudge it) inside one column too.
 STATIONARY_ATTACK_X_TOLERANCE = 0.015
 STATIONARY_ATTACK_FACING_ZONE_SHIFT = 0.0075
+# 模糊桩 ("回归桩点的时候偏移一些"): the correction no longer convergences on the
+# exact 桩 pixel.  The zone is the half-width of a bigger resting area around the
+# anchor, and a return leg aims at a point drawn inside it, so the character
+# comes back near the 桩 instead of hunting the same pixel.  Two marker columns
+# on the operator's 67 px minimap (one column is 0.014925) - a few screen
+# pixels, well inside the attack reach, and it keeps the anchor's own layer
+# (``STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE`` is untouched because Y is not
+# blurred: its Alt-jump path needs the exact launch row).
+#
+# OPT-IN ONLY.  The behaviour it replaces is deliberate: outside the accepted
+# window the character always walks back to the 桩, because a tolerance band that
+# merely "holds" a small drift left it standing a pixel or two off the stake
+# (the operator rejected that).  This flag is his explicit request for the band.
+STATIONARY_ATTACK_BLUR_ZONE = 0.03
+# How far inside the zone a return leg may aim, as a fraction of the zone.  A
+# full-width draw means the temporary goal can use the complete accepted blur
+# zone (anchor +/-0.030 X), while the goal remains fixed for that whole leg.
+STATIONARY_ATTACK_BLUR_TARGET_JITTER = 1.0
 # The standing position has a Y half too, and it uses the same anchor band:
 # marker Y moves by a minimap pixel on its own, and a jump spent on that jitter
 # walks the character off its platform (observed in the field).  A jump is
@@ -5205,6 +5223,13 @@ class MovementWorker(threading.Thread):
         # configured recorded route, it borrows that route to climb back after
         # a fall.  It never writes an anchor into the map.
         self.stationary_attack_enabled = False
+        # 模糊桩: instead of walking back to the exact 桩 pixel, the return leg
+        # aims at a point drawn inside a small zone around the anchor and arrival
+        # is accepted anywhere inside that zone (see
+        # ``STATIONARY_ATTACK_BLUR_ZONE``).  Off by default and only settable
+        # while a 桩 mode is selected.
+        self.stationary_blur_enabled = False
+        self._stationary_blur_target_x: Optional[float] = None
         # 跑花模式 retains the ordinary patrol state machine.  This flag only
         # gates combat actions against the movement-owned confirmed layer.
         self.flower_patrol_mode = False
@@ -10047,6 +10072,57 @@ class MovementWorker(threading.Thread):
             self._pending_patrol_start_above_route = bool(above_route)
             self._pending_patrol_start_reconnect = bool(reconnect_restart)
 
+    def set_stationary_blur(self, enabled: bool) -> None:
+        """Apply the 模糊桩 selection (a wider 桩 zone with an offset return target).
+
+        Turned off by every mode change that leaves 站桩/双桩 and by every anchor
+        reset; the UI also pushes the flag on each settings change.  A target
+        drawn for the previous leg is dropped here, so a stale offset can never
+        be walked to after the operator changes the setting.
+        """
+
+        enabled = bool(enabled)
+        if self.stationary_blur_enabled != enabled:
+            self.stationary_blur_enabled = enabled
+            LOG.info(
+                "模糊桩 %s (zone +/-%.3f, return target offset up to %.3f)",
+                "enabled" if enabled else "disabled",
+                STATIONARY_ATTACK_BLUR_ZONE,
+                STATIONARY_ATTACK_BLUR_ZONE * STATIONARY_ATTACK_BLUR_TARGET_JITTER,
+            )
+        self._stationary_blur_target_x = None
+
+    def _stationary_blur_target_for_leg(
+        self, anchor_x: float, player_x: float,
+    ) -> Optional[float]:
+        """The offset point this return leg aims at, or ``None`` when blur is off.
+
+        Drawn ONCE per leg and kept until the marker is accepted or the anchor is
+        reset, so the direction never flips mid-correction: the target may sit on
+        either side of the 桩 (up to ``STATIONARY_ATTACK_BLUR_ZONE *
+        STATIONARY_ATTACK_BLUR_TARGET_JITTER``), and the walk simply stops on it
+        - crossing the 桩 is not a reversal.  ``player_x`` is accepted for the
+        caller's benefit and logged, but it does not bias the draw: a return that
+        always stopped on the approach side would rest on the same spot again,
+        which is the behaviour 模糊桩 exists to avoid.
+        """
+
+        if not self.stationary_blur_enabled:
+            self._stationary_blur_target_x = None
+            return None
+        target = self._stationary_blur_target_x
+        if target is None:
+            reach = STATIONARY_ATTACK_BLUR_ZONE * STATIONARY_ATTACK_BLUR_TARGET_JITTER
+            target = float(anchor_x) + random.uniform(-reach, reach)
+            self._stationary_blur_target_x = target
+            LOG.info(
+                "STATIONARY BLUR: this return leg aims at %.6f "
+                "(anchor %.6f, offset %+.6f, zone +/-%.3f, marker %.6f)",
+                target, float(anchor_x), target - float(anchor_x),
+                STATIONARY_ATTACK_BLUR_ZONE, float(player_x),
+            )
+        return target
+
     def set_stationary_attack_enabled(self, enabled: bool) -> None:
         """Select 站桩攻击, which is independent of recorded route data."""
 
@@ -10066,6 +10142,7 @@ class MovementWorker(threading.Thread):
             self._stationary_x_settled = False
             self._stationary_near_correction_next_at = 0.0
             self._stationary_step_target_x = None
+            self._stationary_blur_target_x = None
             self._stationary_facing_confirm_frames_remaining = 0
             self._stationary_pickup_phase = None
             self._stationary_pickup_failures = 0
@@ -10106,6 +10183,7 @@ class MovementWorker(threading.Thread):
         self._stationary_x_settled = False
         self._stationary_near_correction_next_at = 0.0
         self._stationary_step_target_x = None
+        self._stationary_blur_target_x = None
         self._stationary_facing_confirm_frames_remaining = 0
         self._stationary_pickup_phase = None
         self._stationary_pickup_failures = 0
@@ -10218,6 +10296,9 @@ class MovementWorker(threading.Thread):
         self._stationary_facing_requested = None
         self._stationary_x_settled = False
         self._stationary_near_correction_next_at = 0.0
+        # The blurred return target belonged to the post that was active; the
+        # new post draws its own on its first correction leg.
+        self._stationary_blur_target_x = None
         self._reset_stationary_y_recovery()
         if restart_timer:
             self._dual_stationary_next_switch_at = (
@@ -11719,6 +11800,9 @@ class MovementWorker(threading.Thread):
         self._stationary_runtime_layer_support = None
         self._stationary_near_correction_next_at = 0.0
         self._stationary_step_target_x = None
+        # A fresh 桩 owns a fresh blurred target (模糊桩): the offset drawn for the
+        # previous session must never steer this one.
+        self._stationary_blur_target_x = None
         self._stationary_facing_confirm_frames_remaining = 0
         self._stationary_ui_anchor_layer = None
         self._stationary_route_anchor_layer = None
@@ -12168,11 +12252,13 @@ class MovementWorker(threading.Thread):
                 or (facing_owed and position_at_turn_point)
                 or micro_step_in_flight):
             # Arrived: the anchor band is reached, so the position is settled
-            # from here on.
+            # from here on.  The 模糊桩 leg's offset target has served its
+            # purpose; the next leg draws a fresh one.
             self._stationary_x_settled = not bool(
                 self._stationary_facing_confirm_frames_remaining
             )
             self._stationary_near_correction_next_at = 0.0
+            self._stationary_blur_target_x = None
         else:
             # Outside the final approach zone, walk normally and do not
             # attack.  A layer-return can reach the anchor platform at its
@@ -12181,6 +12267,17 @@ class MovementWorker(threading.Thread):
             # ever walking across the layer.  Only the last +/-0.02 X uses
             # the short, attack-carrying correction below.
             self._stationary_x_settled = False
+            # 模糊桩: a genuine return leg (the marker is outside the resting
+            # zone, so a walk is really needed) draws ONE offset goal and keeps
+            # it until the marker is back inside the zone.  It is never drawn on
+            # a settled frame - doing that made the settling verdict itself
+            # random and produced the 14:16 churn.  Facing keeps owning the
+            # target while a tap is owed: its turn point is arithmetic on the
+            # real anchor.
+            if not facing_owed:
+                blur_goal = self._stationary_blur_target_for_leg(anchor.x, player.x)
+                if blur_goal is not None:
+                    correction_target_x = blur_goal
             # When a final facing is owed, the correction is aimed at its
             # opposite-side turn point rather than necessarily at X itself.
             # Use that live goal for direction: a marker already just to one
@@ -12508,6 +12605,14 @@ class MovementWorker(threading.Thread):
         This absorbs the known facing-tap nudge and one whole marker column of
         quantisation - a column is 0.014925 on the operator's 67 px minimap -
         without making either edge a movement target.
+
+        模糊桩 widens the half-window to ``STATIONARY_ATTACK_BLUR_ZONE``: a
+        knockback of one or two columns is simply "still at the 桩", so the
+        character is not walked back for it.  The centre is ALWAYS the anchor -
+        centring it on the per-leg offset point made the settling verdict
+        random from frame to frame, which walked the character and re-ran the
+        facing confirmation continuously (14:16 field log: 15 different return
+        targets in 4 s while the marker sat still on two columns).
         """
 
         facing = self._stationary_facing_target_for_frame()
@@ -12515,8 +12620,12 @@ class MovementWorker(threading.Thread):
             -STATIONARY_ATTACK_FACING_ZONE_SHIFT
             if facing == "left" else STATIONARY_ATTACK_FACING_ZONE_SHIFT
         )
-        lower = float(anchor_x) - STATIONARY_ATTACK_X_TOLERANCE + shift
-        upper = float(anchor_x) + STATIONARY_ATTACK_X_TOLERANCE + shift
+        half = (
+            max(STATIONARY_ATTACK_X_TOLERANCE, STATIONARY_ATTACK_BLUR_ZONE)
+            if self.stationary_blur_enabled else STATIONARY_ATTACK_X_TOLERANCE
+        )
+        lower = float(anchor_x) - half + shift
+        upper = float(anchor_x) + half + shift
         return lower <= float(player_x) <= upper
 
     def _stationary_attack_ready_for_player(

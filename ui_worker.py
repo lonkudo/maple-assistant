@@ -2810,6 +2810,26 @@ class UiWorker(threading.Thread):
             self._random_rest_hint = random_rest_hint
             self._bind_key_tooltips.append(random_rest_hint)
 
+            # 模糊桩 shares this row too, directly after 随机休息.  Unlike 随机休息
+            # it only means something on a 桩, so its own gate is 站桩攻击 /
+            # 双桩模式 (the row is greyed, never hidden, elsewhere).
+            self._blurred_anchor_var = tk.BooleanVar(value=False)
+            self._blurred_anchor_check = ttk.Checkbutton(
+                delayed_return_row,
+                text="模糊桩",
+                width=6,
+                variable=self._blurred_anchor_var,
+                command=self._fixed_on_change,
+            )
+            self._blurred_anchor_check.pack(side="left", padx=(8, 0))
+            blurred_anchor_hint = HoverTooltip(
+                self._blurred_anchor_check,
+                "回归桩点的时候偏移一些",
+            )
+            blurred_anchor_hint.set_enabled(True)
+            self._blurred_anchor_hint = blurred_anchor_hint
+            self._bind_key_tooltips.append(blurred_anchor_hint)
+
             step_row = ttk.Frame(stationary_options_row)
             self._small_step_options_row = step_row
             self._small_step_row = step_row
@@ -11067,6 +11087,11 @@ class UiWorker(threading.Thread):
                 self._random_rest_var.get()
                 if hasattr(self, "_random_rest_var") else False
             ),
+            # 模糊桩: a wider 桩 zone with an offset return target (站桩/双桩 only).
+            "blurred_anchor_enabled": bool(
+                self._blurred_anchor_var.get()
+                if hasattr(self, "_blurred_anchor_var") else False
+            ),
             "min_interval_seconds": interval_min,
             "max_interval_seconds": interval_max,
             "attack_key": self._fixed_attack_key_var.get().strip(),
@@ -11585,6 +11610,24 @@ class UiWorker(threading.Thread):
             rest_setter = getattr(rest_worker, "set_enabled", None)
             if callable(rest_setter):
                 rest_setter(bool(rest_var.get()) and rest_allowed)
+        # 模糊桩 exists only on a 桩 (站桩攻击 / 双桩模式): anywhere else it is greyed
+        # and the movement worker is told to disable it, so a mode change can
+        # never leave a wider 桩 zone armed.
+        blur_allowed = (
+            mode in ("stationary", "dual_stationary") and self._license_allowed()
+        )
+        blur_check = getattr(self, "_blurred_anchor_check", None)
+        if blur_check is not None:
+            try:
+                blur_check.state(["!disabled" if blur_allowed else "disabled"])
+            except Exception:
+                blur_check.configure(state="normal" if blur_allowed else "disabled")
+        blur_var = getattr(self, "_blurred_anchor_var", None)
+        mover = getattr(self, "movement_worker", None)
+        if mover is not None and blur_var is not None:
+            blur_setter = getattr(mover, "set_stationary_blur", None)
+            if callable(blur_setter):
+                blur_setter(bool(blur_var.get()) and blur_allowed)
         pickup_label = getattr(self, "_stationary_pickup_enabled_button", None)
         if pickup_label is not None:
             # The same persisted interval control drives two different route
@@ -11832,6 +11875,9 @@ class UiWorker(threading.Thread):
                 )
                 if callable(stationary_setter):
                     stationary_setter(False)
+                blur_setter = getattr(mover, "set_stationary_blur", None)
+                if callable(blur_setter):
+                    blur_setter(False)
                 pickup_setter = getattr(mover, "set_stationary_pickup_schedule", None)
                 if callable(pickup_setter):
                     pickup_setter(False, 0.0, 0.0)
@@ -11944,6 +11990,14 @@ class UiWorker(threading.Thread):
             )
             if callable(stationary_setter):
                 stationary_setter(mode in ("stationary", "dual_stationary"))
+            # 模糊桩 rides with the 桩 mode: saved on, but only armed while 站桩/双桩
+            # is the active mode.
+            blur_setter = getattr(mover, "set_stationary_blur", None)
+            if callable(blur_setter):
+                blur_setter(
+                    bool(data.get("blurred_anchor_enabled", False))
+                    and mode in ("stationary", "dual_stationary")
+                )
             dual_setter = getattr(mover, "set_dual_stationary_configuration", None)
             if callable(dual_setter):
                 legacy_switch_minutes = float(
@@ -12170,6 +12224,13 @@ class UiWorker(threading.Thread):
             # whether it is actually in effect (``_fixed_refresh_rows``).
             if hasattr(self, "_random_rest_var"):
                 self._random_rest_var.set(bool(data.get("random_rest_enabled", False)))
+            # 模糊桩 travels the same way: the saved tick is kept even while the
+            # row is greyed, so switching back to 站桩 restores the operator's
+            # choice.
+            if hasattr(self, "_blurred_anchor_var"):
+                self._blurred_anchor_var.set(bool(
+                    data.get("blurred_anchor_enabled", False)
+                ))
             # Migrate old ``interval + random_gap`` values into the new
             # explicit inclusive interval range.  A legacy 0.90 + 0.10s
             # setting therefore becomes 0.90–1.00s with identical timing.
