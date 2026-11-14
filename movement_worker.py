@@ -14212,10 +14212,30 @@ class MovementWorker(threading.Thread):
         climb kept this recovery from ever running - his 17:55 log: the floor was
         unresolved for four seconds, yet the character kept doing stationary X
         correction steps instead of Alt+Down.
+
+        站桩攻击 is a mode exemption of a different kind (v1.3.36): the standing
+        mode owns its temporary anchor and must work on a map with no recorded
+        layer, so the layer-change recovery never runs there.  Its 定时巡逻
+        circuit deliberately borrows a recorded route, so that stage keeps the
+        ordinary behaviour.
         """
 
         if not self.patrol_enabled:
             return "patrol is not enabled"
+        if (self.stationary_attack_enabled
+                and not self._stationary_timed_patrol_active):
+            # 站桩攻击 stands on its own temporary anchor, not on a recorded
+            # floor: the operator's rule is that it must start even when the
+            # map has no layer recorded at all (his 21:36 log: the anchor was
+            # captured - target=0.811538 was the 桩 - yet every frame was
+            # ``action=wait (unresolved floor; waiting for the Alt+Down layer
+            # change)``, so the anchor correction and its attacks never ran and
+            # the first chord dropped the character off the 桩).  The unresolved
+            # recovery exists to change the layer of a WALKING patrol, and it
+            # cannot resolve an anchor that is deliberately not a floor.  A
+            # character that really fell is handled by the fall/return logic,
+            # which needs a route anyway.
+            return ("站桩 attack keeps its temporary anchor")
         if self._return_mode is not None:
             return f"the {self._return_mode} return owns the layer"
         if self._descending_to_first:

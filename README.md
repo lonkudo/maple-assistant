@@ -153,8 +153,9 @@ The update icon in the title bar turns green when the activation server announce
   budget is 90 s, and the panel sentence is one of
   `等待授权信息 / 启动中 / 启动失败 / 启动成功`.
 - **A 本地测谎 test run needs a listening service.** `测试API` refuses with
-  `本地测谎服务未就绪，请启动后重试` while the panel says 等待授权信息, 启动中 or
-  启动失败, instead of opening a video against a backend that cannot answer.
+  `本地测谎启动中，请稍后再试` while the panel says 启动中, and with
+  `本地测谎服务未就绪，请启动后重试` while it says 等待授权信息 or 启动失败, instead
+  of opening a video against a backend that cannot answer.
 - **The panel hint line carries one 本地测谎 sentence, replaced rather than
   appended.** The base text a label carries is remembered and the older
   wordings are stripped as a whole, so a one-shot 钉钉 note can no longer grow
@@ -1950,9 +1951,9 @@ a card.
   listening (`local_lie_service.start_in_background`), and stops it at shutdown **only
   if the app started it** — a hand-launched instance survives.
 * The state is shown on the `图层校准与巡逻` hint line as exactly one sentence:
-  `本地测谎服务: 等待授权信息` (selected, but no validated reply of this session has
-  delivered the CT card yet), `本地测谎服务: 启动中`, `本地测谎服务: 启动失败`, or
-  `本地测谎服务: 启动成功` (127.0.0.1:8765 answers).
+  `本地测谎: 等待授权信息` (selected, but no validated reply of this session has
+  delivered the CT card yet), `本地测谎: 启动中`, `本地测谎: 启动失败`, or
+  `本地测谎: 启动成功` (127.0.0.1:8765 answers).
 * Selecting 本地测谎 waits up to 30 s for this session's validated heartbeat reply to
   deliver the CT card before it starts anything; a card sitting in the service config
   is used only when no reply arrives inside that window (an offline install), and the
@@ -2002,10 +2003,10 @@ The panel hint carries exactly one of these sentences:
 
 | Hint | Meaning |
 | --- | --- |
-| `本地测谎服务: 等待授权信息` | 本地测谎 is selected, but no validated reply of this session has delivered a `CT_` card yet; nothing is started on a card an earlier session left behind |
-| `本地测谎服务: 启动中` | a launch is in flight (up to 90 s on the first start after an update) |
-| `本地测谎服务: 启动失败` | the vendor process refused, exited, or all 8 attempts failed — the panel quotes the vendor's own `data\logs\client.log` reason |
-| `本地测谎服务: 启动成功` | the service answers `/v1/health` on 8765 |
+| `本地测谎: 等待授权信息` | 本地测谎 is selected, but no validated reply of this session has delivered a `CT_` card yet; nothing is started on a card an earlier session left behind |
+| `本地测谎: 启动中` | a launch is in flight (up to 90 s on the first start after an update) |
+| `本地测谎: 启动失败` | the vendor process refused, exited, or all 8 attempts failed — the panel quotes the vendor's own `data\logs\client.log` reason |
+| `本地测谎: 启动成功` | the service answers `/v1/health` on 8765 |
 | `本地测谎未开通` | the licence reply carried **no** `CT_` card, so the 本地测谎 radio is greyed, not clickable (label `本地测谎（未开通）`) and the service is deliberately not started |
 | *(nothing)* | the selection is 关闭 / 云端测谎 |
 
@@ -2059,7 +2060,8 @@ appears. Work through it in this order:
    restart MoonEclipse or press the caption ↻ refresh to force a heartbeat.
 
 The same rule applies to 测试API in 本地测谎: `测试API` refuses with
-`本地测谎服务未就绪，请启动后重试` while the panel says 等待授权信息, 启动中 or 启动失败,
+`本地测谎启动中，请稍后再试` while the service is starting and with
+`本地测谎服务未就绪，请启动后重试` while the panel says 等待授权信息 or 启动失败,
 and a call that still reaches the transport without a listening service fails with
 `http://127.0.0.1:8765 未就绪` and a message box — that is the card gate above, not the
 drill.

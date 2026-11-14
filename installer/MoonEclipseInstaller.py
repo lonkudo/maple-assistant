@@ -1149,9 +1149,12 @@ def _fetch_package(
         if on_stage is not None:
             on_stage(text_value)
 
-    def files(phase: str, done: int, total: int) -> None:
+    def files(
+        phase: str, done: int, total: int,
+        done_bytes: int = 0, total_bytes: int = 0,
+    ) -> None:
         if on_files is not None:
-            on_files(phase, done, total)
+            on_files(phase, done, total, done_bytes, total_bytes)
 
     try:
         archive = download_package(
@@ -1172,7 +1175,9 @@ def _fetch_package(
     stage("正在解压安装包…")
     _extract_bundle(
         archive, target_root,
-        on_entry=lambda done, total: files("解压", done, total),
+        on_entry=lambda done, total, done_bytes, total_bytes: files(
+            "解压", done, total, done_bytes, total_bytes,
+        ),
     )
 
     stage("正在校验文件…")
@@ -1220,11 +1225,19 @@ def _extract_bundle(
     ``preserve`` names top-level folders that are user data: their files are
     written only when missing, so shipping default configuration in the package
     cannot wipe a user's own.
+
+    ``on_entry`` receives ``(done, total, done_bytes, total_bytes)``.  The byte
+    pair is measured in the archive's own COMPRESSED bytes, so the extraction
+    report is directly comparable with the download line the operator has just
+    watched ("12.3/175.4 MB"): that total is the package, not the size the
+    unpacked tree happens to occupy.
     """
 
     root = target_root.resolve()
     with zipfile.ZipFile(archive) as bundle:
         members = [info for info in bundle.infolist() if not info.is_dir()]
+        total_bytes = sum(max(0, int(info.compress_size)) for info in members)
+        done_bytes = 0
         for index, info in enumerate(members, start=1):
             try:
                 relative = _safe_path(info.filename)
@@ -1233,15 +1246,19 @@ def _extract_bundle(
             destination = (root / relative).resolve()
             if root not in destination.parents:
                 raise RuntimeError(f"安装包内容无效：{info.filename}")
+            size = max(0, int(info.compress_size))
             if preserve and relative.parts and relative.parts[0] in preserve and destination.exists():
+                done_bytes += size
                 if on_entry is not None and (index % 32 == 0 or index == len(members)):
-                    on_entry(index, len(members))
+                    on_entry(index, len(members), done_bytes, total_bytes)
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             with bundle.open(info) as source, destination.open("wb") as output:
                 shutil.copyfileobj(source, output)
+            done_bytes += size
             if on_entry is not None and (index % 32 == 0 or index == len(members)):
-                on_entry(index, len(members))
+                on_entry(index, len(members), done_bytes, total_bytes)
+
 
 
 def _installed_version(root: Path) -> str:
@@ -1296,7 +1313,10 @@ class InstallerWindow:
         self._transfer_event: threading.Event | None = None
         self._transfer_answer: bool | None = None
         self.progress_value = 0.0
-        self._total_bytes = 1
+        # 0 = "the total is not known yet".  It is filled by the share's own
+        # size report (``scale``) before the first byte, so the status line can
+        # always say "downloaded / total" instead of only how much arrived.
+        self._total_bytes = 0
         self._stage_text = "准备就绪"
         self._phase_started: float | None = None
         # An existing install stays where it is; a first install defaults to
@@ -1646,13 +1666,35 @@ class InstallerWindow:
         self.progress.configure(maximum=PROGRESS_UNITS, value=fraction * PROGRESS_UNITS)
         self._paint_eclipse(fraction)
 
+    def _download_text(self, position: int) -> str:
+        """The download line: downloaded / total (+percent) and nothing invented.
+
+        A share always reports its size (the CDN probe or a range request proves
+        it), so the operator sees ``45.2/175.4 MB (26%)``; when a location does
+        not report one the downloaded figure stands alone rather than
+        ``45.2/0.0 MB``, which read like a missing total.
+        """
+
+        done = max(0, int(position)) / 1048576
+        total = max(0, int(self._total_bytes))
+        if total <= 0:
+            return f"{self._stage_text} {done:.1f} MB"
+        ratio = min(1.0, max(0.0, float(position) / float(total)))
+        return (
+            f"{self._stage_text} {done:.1f}/{total / 1048576:.1f} MB "
+            f"({ratio * 100:.0f}%)"
+        )
+
     def _drain_events(self) -> None:
         try:
             while True:
                 kind, value = self.events.get_nowait()
                 if kind == "plan":
                     count, total = value
-                    self._total_bytes = max(1, int(total))
+                    # The package is downloaded WHOLE, so the plan's byte figure
+                    # is not a real total any more: 0 means "not known yet" and
+                    # the share's own ``scale`` report supplies it.
+                    self._total_bytes = max(0, int(total))
                     self._stage_text = (
                         "正在下载更新安装包…" if count <= 1
                         else f"正在下载 {count} 个已更新文件…"
@@ -1662,19 +1704,20 @@ class InstallerWindow:
                     self.status.configure(text=self._stage_text)
                 elif kind == "scale":
                     # The parsed share reports its own size: restart the bar on
-                    # that instead of the plan's planned-bytes estimate.
-                    self._total_bytes = max(1, int(value))
+                    # that and show the total at once, before the first byte.
+                    self._total_bytes = max(0, int(value))
                     self._phase_started = None
                     self._set_progress(0.0)
+                    self.status.configure(text=self._download_text(0))
                 elif kind == "bytes":
                     position = max(0, int(value))
-                    total = max(1, int(self._total_bytes))
                     now = time.monotonic()
                     if position == 0 or self._phase_started is None:
                         self._phase_started = now
                         self._set_progress(0.0)
-                        self.status.configure(text=self._stage_text)
+                        self.status.configure(text=self._download_text(position))
                         continue
+                    total = max(1, int(self._total_bytes))
                     # Real bytes: what the sockets actually delivered, with the
                     # bar reserving the last fifth of the scale for the install.
                     self._set_progress(
@@ -1682,8 +1725,7 @@ class InstallerWindow:
                     )
                     elapsed = max(1e-6, now - self._phase_started)
                     self.status.configure(text=(
-                        f"{self._stage_text} "
-                        f"{position / 1048576:.1f}/{total / 1048576:.1f} MB"
+                        f"{self._download_text(position)}"
                         f" · {position / 1048576 / elapsed:.1f} MB/s"
                     ))
                 elif kind == "stage":
@@ -1708,11 +1750,23 @@ class InstallerWindow:
                     messagebox.showinfo("提示", str(value), parent=self.root)
                 elif kind == "files":
                     # Text only: the bar belongs to the byte stream, and these
-                    # phases have none, so they must not move it.
-                    phase, done, total = value
+                    # phases have none, so they must not move it.  The extraction
+                    # phase reports the package bytes it has unpacked, so the
+                    # line keeps saying "done/total" instead of a bare counter.
+                    phase, done, total, *sizes = value
+                    done_bytes = int(sizes[0]) if len(sizes) > 0 else 0
+                    total_bytes = int(sizes[1]) if len(sizes) > 1 else 0
                     total = max(1, int(total))
                     label = PROGRESS_LABELS.get(str(phase), "正在处理文件")
-                    self.status.configure(text=f"{label} {done}/{total}…")
+                    if total_bytes > 0:
+                        ratio = min(1.0, max(0.0, done_bytes / total_bytes))
+                        self.status.configure(text=(
+                            f"{label} {done_bytes / 1048576:.1f}/"
+                            f"{total_bytes / 1048576:.1f} MB "
+                            f"({ratio * 100:.0f}%)"
+                        ))
+                    else:
+                        self.status.configure(text=f"{label} {done}/{total}…")
                 elif kind == "done":
                     self.running = False
                     self.install.state(["!disabled"])

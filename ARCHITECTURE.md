@@ -1558,7 +1558,7 @@ mapped through the crop, and a resize to 745×496 does not change that because
   the network thread.
 * start policy (v1.3.35): selecting 本地测谎 arms the supervisor, which waits up to
   `CARD_REPLY_WAIT_SECONDS = 30` for a validated reply **of this session** to deliver
-  the CT card before it launches anything (panel: `本地测谎服务: 等待授权信息`). The
+  the CT card before it launches anything (panel: `本地测谎: 等待授权信息`). The
   reply path `note_online_card()` re-enters `supervisor_set_active()`, so the arriving
   card starts the service immediately; `apply_online_card()` calls `note_online_card()`
   before every early return, because a config that already carried the same card made
