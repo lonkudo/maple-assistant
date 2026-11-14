@@ -250,6 +250,19 @@ UPDATE_ICON_INK_GREEN = "#ffffff"
 UPDATE_ICON_BUSY = "#2f6fd0"
 # Tooltip line budget: enough for the version, a few note lines and the hint.
 UPDATE_NOTICE_TOOLTIP_LINES = 8
+# A byte count is never shown alone: the caption says ``下载更新 12.3/175.4 MB
+# (7%)`` so the operator can tell how much is left, not only how much arrived.
+# A share that does not report its size keeps the downloaded figure without
+# inventing a total.
+def download_progress_text(position: int, total: int) -> str:
+    """One caption sentence for the update download: done / total (+percent)."""
+
+    done = max(0, int(position)) / 1048576
+    whole = max(0, int(total)) / 1048576
+    if whole <= 0:
+        return f"下载更新 {done:.1f} MB"
+    ratio = min(1.0, max(0.0, float(position) / float(total)))
+    return f"下载更新 {done:.1f}/{whole:.1f} MB ({ratio * 100:.0f}%)"
 # --- 自动测谎 backend group ------------------------------------------------------
 # The old 自动测谎 checkbox is a three-way group now, because the lie pass has two
 # backends: the vendor cloud service (unchanged) and the CT partner API that the
@@ -4637,7 +4650,7 @@ class UiWorker(threading.Thread):
         """Worker: download, verify, then hand the archive to the restart helper."""
 
         root = self._install_root()
-        meter = {"position": 0}
+        meter = {"position": 0, "total": 0}
 
         if not release.links():
             # The heartbeat only announced a version and the detail request has
@@ -4656,15 +4669,17 @@ class UiWorker(threading.Thread):
 
         def on_total(total: int) -> None:
             meter["position"] = 0
-            if total > 0:
-                self._put_release_state(
-                    "progress", f"下载更新 0.0/{total / 1048576:.1f} MB"
-                )
+            meter["total"] = max(0, int(total))
+            # The total is known before the first byte arrives: say so at once
+            # (``0.0/175.4 MB``), so the caption never looks like a bare counter.
+            self._put_release_state(
+                "progress", download_progress_text(0, meter["total"])
+            )
 
         def on_bytes(position: int) -> None:
             meter["position"] = position
             self._put_release_state(
-                "progress", f"下载更新 {position / 1048576:.1f} MB"
+                "progress", download_progress_text(position, meter["total"])
             )
 
         def on_stage(text_value: str) -> None:
@@ -4681,7 +4696,14 @@ class UiWorker(threading.Thread):
             LOG.exception("更新失败：下载安装包时发生未预期错误")
             self._put_release_state("failed", "下载更新时发生未预期错误，请稍后重试。")
             return
-        self._put_release_state("progress", "正在校验安装包…")
+        try:
+            size = archive.stat().st_size
+        except OSError:
+            size = 0
+        self._put_release_state(
+            "progress",
+            f"正在校验安装包…（{size / 1048576:.1f} MB）" if size else "正在校验安装包…",
+        )
         try:
             apply_staged_update(root, archive)
         except (UpdateError, UpdateCoreError) as exc:
@@ -7293,6 +7315,8 @@ class UiWorker(threading.Thread):
                 state = "up"
             if state == "no_card":
                 message = "本地测谎未开通"
+            elif state == "starting":
+                message = "本地测谎启动中，请稍后再试"
             elif state != "up":
                 message = "本地测谎服务未就绪，请启动后重试"
             else:
@@ -7930,6 +7954,11 @@ class UiWorker(threading.Thread):
                 local_lie_service.supervisor_set_active(
                     wanted, application_root(__file__)
                 )
+                if wanted:
+                    # supervisor_set_active() records the starting state before
+                    # returning.  Show that exact state immediately instead of
+                    # waiting for the next  UI poll.
+                    self._refresh_panel_hints()
         except Exception:  # noqa: BLE001 - never break a selection change
             LOG.debug("本地测谎 supervisor switch failed", exc_info=True)
         if mode == AUTOLIE_BACKEND_LOCAL:

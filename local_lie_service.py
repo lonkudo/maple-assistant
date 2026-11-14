@@ -1928,11 +1928,11 @@ def hint_text() -> str:
     """One short sentence for the 图层校准与巡逻 hint line, or "".
 
     The operator's set (2026-11-13) is exactly these four service sentences:
-      * 本地测谎服务: 等待授权信息 - selected, waiting for a validated licence
+      * 本地测谎: 等待授权信息 - selected, waiting for a validated licence
         reply to deliver the CT card
-      * 本地测谎服务: 启动中       - a launch is in flight
-      * 本地测谎服务: 启动失败     - the service refused, died, or gave up
-      * 本地测谎服务: 启动成功     - /v1/health answers
+      * 本地测谎: 启动中       - a launch is in flight
+      * 本地测谎: 启动失败     - the service refused, died, or gave up
+      * 本地测谎: 启动成功     - /v1/health answers
     Plus 本地测谎未开通 when this activation code carries no CT card at all (that is
     an access fact, not a service state: the radio is labelled 本地测谎（未开通）),
     and nothing at all for 关闭 / 云端测谎.
@@ -1944,12 +1944,12 @@ def hint_text() -> str:
     if state == "no_card":
         return "本地测谎未开通"
     if state == "up":
-        return "本地测谎服务: 启动成功"
+        return "本地测谎: 启动成功"
     if state == "starting":
-        return "本地测谎服务: 启动中"
+        return "本地测谎: 启动中"
     if state == "waiting":
-        return "本地测谎服务: 等待授权信息"
-    return "本地测谎服务: 启动失败"
+        return "本地测谎: 等待授权信息"
+    return "本地测谎: 启动失败"
 
 def reset_for_tests() -> None:
     global _launch_process, _start_attempts, _selected_at, _heartbeat_wait_logged
