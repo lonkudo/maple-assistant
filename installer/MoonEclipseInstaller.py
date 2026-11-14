@@ -41,6 +41,7 @@ from licensing import (  # noqa: E402
     machine_fingerprint_hash,
     remember_boot_identity,
     verify_document,
+    warm_device_identity,
 )
 from pinned_tls import PinnedTlsError, PinnedTlsResponseError, post_json  # noqa: E402
 
@@ -887,7 +888,15 @@ def _write_license_settings(
 # installer, and ``device_identity_for_request`` then refuses to report a partial
 # device.  The operator's rule is explicit: say so and stop - do not sit in a
 # retry loop before the customer has even seen the window work.  He runs it again.
-DEVICE_NOT_READY_HINT = "设备未就绪，稍后再试"
+#
+# A short READINESS wait comes first (`warm_device_identity`): on a fresh PC the
+# two CIM reads are PowerShell calls with a 4 s budget and the providers are still
+# starting, so the single read reported 设备未就绪 and the install stopped on its
+# very first step, every time.  Waiting a few seconds for the signals is not a
+# retry of the activation - nothing is sent to the server - and it is what lets a
+# new machine install on the first try.
+DEVICE_NOT_READY_HINT = "设备未就绪，稍后重试"
+DEVICE_READY_WAIT_SECONDS = 8.0
 
 
 class ActivationBoundElsewhereError(RuntimeError):
@@ -955,6 +964,13 @@ def authorize_installation(root: Path, code: str) -> str:
     """
 
     try:
+        # The download can take minutes; re-read the signals first so a device that
+        # cooled down mid-install (a laptop resume, a provider restart) is warmed
+        # again before the entitlement is requested.
+        try:
+            warm_device_identity(DEVICE_READY_WAIT_SECONDS)
+        except Exception:  # noqa: BLE001 - the request below reports the truth
+            logging.debug("installer: readiness re-warm failed", exc_info=True)
         document, reply, fingerprint = _acquire_entitlement(code)
     except DeviceNotReadyError:
         logging.warning("installer: device fingerprint not ready at authorization")
@@ -968,13 +984,36 @@ def authorize_installation(root: Path, code: str) -> str:
         return f"自动授权未完成（{exc}）。请在助手窗口点「激活授权」输入同一授权码。"
     # The desktop never persists a document it has not verified itself; the
     # installer writes the very same file, so it runs the very same check.
+    #
+    # ONE exception, and it is the customer's first minute on a new PC: the check
+    # needs the machine's own hardware signals, and ``device_not_ready`` means the
+    # LOCAL read failed (CIM/WMI still warming up, Defender scanning the freshly
+    # copied 339 MB vendor folder) - not that the document is wrong.  Refusing to
+    # write in that window broke every fresh install with
+    # "授权文件未通过本机校验（设备未就绪，稍后重试）", and because nothing is
+    # written, every retry repeated it.  The server signed this document for the
+    # very composite this process proved moments ago, so the entitlement is
+    # written and the desktop re-verifies it on its first start (its own readiness
+    # retry schedule covers the same window).
     status = verify_document(document, root)
-    if not status.valid:
+    device_check_postponed = (not status.valid) and status.code == "device_not_ready"
+    if device_check_postponed:
+        logging.warning(
+            "installer: local device check postponed (%s); writing the server-signed "
+            "entitlement anyway - the desktop re-verifies it on first launch",
+            status.message,
+        )
+    elif not status.valid:
         logging.error(
             "installer: entitlement rejected locally code=%s message=%s",
             status.code, status.message,
         )
         _write_license_settings(root, code, reply, activated=False)
+        if status.code == "device_not_ready":
+            # Safety net: whatever produced this verdict, the customer's sentence
+            # is the plain one - never the 授权文件未通过本机校验 wrapper, which
+            # reads like a rejected code when the code is in fact fine.
+            return DEVICE_NOT_READY_HINT
         return (
             f"授权文件未通过本机校验（{status.message}）。"
             "请在助手窗口点「激活授权」输入同一授权码。"
@@ -1403,6 +1442,22 @@ class InstallerWindow:
     def _install_worker(self, code: str, root: Path) -> None:
         transfer_note = ""
         try:
+            # The device fingerprint is this installer's very first dependency, and
+            # on a brand-new PC the WMI providers behind it may still be starting.
+            # Wait briefly for the signals (read-only, nothing is sent to the
+            # server) instead of stopping the install on the first cold read.
+            try:
+                device_ready = bool(warm_device_identity(DEVICE_READY_WAIT_SECONDS))
+            except Exception:  # noqa: BLE001 - a readiness check never fails an install
+                logging.exception("installer: device readiness wait failed")
+                device_ready = False
+            if not device_ready:
+                logging.warning(
+                    "installer: device fingerprint still unavailable after %.0fs",
+                    DEVICE_READY_WAIT_SECONDS,
+                )
+                self.events.put(("hint", DEVICE_NOT_READY_HINT))
+                return
             # Authentication first: an invalid code stops before any download.
             # The reply also carries the newest 更新链接 record, which is where
             # this installer learns the download address at all.

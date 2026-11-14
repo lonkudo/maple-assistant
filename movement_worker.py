@@ -541,6 +541,92 @@ STATIONARY_ATTACK_SMALL_Y_GAP = STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE
 # jumping forever - and no further jump is sent until it leaves the 桩 and comes
 # back, which is when a fresh attempt is allowed.
 STATIONARY_ATTACK_SMALL_GAP_FRAMES = 5
+# 站桩 rescue: after the one recovery motion per arrival has been abandoned, the
+# marker still off its row for this many captured frames (10 at the shared 5 fps
+# cadence = ~2 s) earns ONE lateral dismount step toward the 桩.  That motion is
+# the return path's own 0.40 s rope dismount: it needs no vertical input, so it
+# works whether the character is hanging on a rope (an Alt+Down that grabbed one),
+# wedged against a platform edge, or held by a wall.  One attempt per arrival,
+# exactly like the recovery motion itself - a loop would be worse than standing.
+# 站桩 Y recovery (the operator's own rule, 2026-08-14): compare the anchor's Y
+# with the marker's Y; while they differ, send the input that points AT the anchor
+# row - Alt+Down when the 桩 is BELOW the marker, Alt (jump) when it is ABOVE -
+# and try again, up to STATIONARY_Y_MOTION_MAX_ATTEMPTS.  A motion that leaves the
+# marker on the SAME step - or that slides it down a rope by a row per press
+# instead of landing it - is not progress: the character is hanging, which on this
+# map means a ROPE above the 桩.  That judged-no-progress case triggers one lateral
+# ROPE RESCUE jump (left/right), exactly what the CLIMB stall path does, and the
+# Alt / Alt+Down attempts resume so the character can then reach the row.  The
+# episode is bounded: after the motion budget and the rope-rescue budget it stops
+# and lets the character attack from where it stands, and it re-arms when the
+# marker is back on the anchor row.
+STATIONARY_Y_MOTION_MAX_ATTEMPTS = 6
+# The episode never starts for a gap that is only the marker's own quantisation.
+# One marker row is 0.008772 while ``STATIONARY_ATTACK_Y_TOLERANCE`` is 0.006,
+# so a single-row wobble (knockback, world-Y jitter, the diamond's pixel grid)
+# used to open the Y episode and hold it for its 5 verdict frames - the 11:24 log
+# is exactly that: "action=y-gap 1/5" on a character standing still at its 桩.
+STATIONARY_Y_EPISODE_MIN_ROWS = 1.5
+# A drop chord may only be spent on a FLOOR-scale gap.  This is the regression
+# the 1.3.29 build introduced: before it, 站桩 only ever sent one Alt JUMP for an
+# upward gap (``stationary_drop`` did not exist - 0 hits in the 1.3.27 source),
+# so a row-sized mismatch at the 桩 was harmless.  With the downward branch a
+# 2.9-row gap pressed Alt+Down and the character fell THROUGH its platform to
+# layer1 (10:13 field log: 0.662791 -> 0.709302 -> 0.747556 -> 0.785088 = 14
+# rows), which started the whole fall / return / stair-hop loop.  The operator's
+# bench rows are 1-3 marker rows apart, so anything below this threshold is the
+# same platform: attack from the row instead, exactly like 1.3.27 did.
+STATIONARY_Y_DROP_MIN_ROWS = 6.0
+# 延时回桩: how long the character deliberately stands still after a knockback (or
+# after a timed-patrol return) before it walks back to the 桩.  The operator
+# reduced it from 1-3 s to 1-2 s (2026-08-15): the 3 s tail kept the character
+# idle far longer than the return itself needs.  One pair of constants drives
+# every pause site (ordinary knockback, timed-patrol return to the anchor layer,
+# timed-patrol completion) so they can never drift apart.
+STATIONARY_DELAYED_RETURN_MIN_SECONDS = 1.0
+STATIONARY_DELAYED_RETURN_MAX_SECONDS = 2.0
+# Progress test, mirroring the climb's own stall rule (``world_y_stall_change_
+# required``): one motion must close the gap by this many marker rows to count.
+# An Alt+Down that only slides the character down a rope moves ONE row per press
+# (log of record: 0.328947 -> 0.337719 -> 0.346491 in a 18-22 row gap), so this
+# threshold separates "landed" from "still hanging".  A gap smaller than the
+# threshold only needs closing that gap.
+STATIONARY_Y_PROGRESS_MIN_ROWS = 2.0
+# Judged-no-progress motions in a row that prove the character hangs on a rope.
+STATIONARY_Y_NO_PROGRESS_MAX = 2
+STATIONARY_Y_ROPE_RESCUE_MAX = 3
+STATIONARY_Y_ROPE_RESCUE_INTERVAL_SECONDS = 1.0
+# 站桩 X-correction stall (field log 09:51, 2026-08-15): a character holding a
+# ROPE ignores left/right completely, so the X correction repeated
+# "stationary correction executed: left (hold 0.11s) + attack" once a second for
+# 15 s while the marker stayed on x=0.386029 - and because X never settled, the
+# 桩 Y rule never ran, so the character never pressed Alt+Down and never got the
+# rope rescue.  Correction steps that leave the marker on the same column are
+# therefore evidence of a rope, not a reason to step again: after this many, the
+# frame is handed to the Y rule / rope rescue for
+# STATIONARY_X_STALL_HANDOVER_SECONDS.
+STATIONARY_X_STALL_MIN_STEPS = 3
+# The stall test's "the marker did not move" epsilon.  It is a FLOOR: the real
+# threshold is at least one marker column (``_stationary_marker_column``), because
+# the yellow diamond advances in whole pixels and anything finer than a column is
+# invisible.  The bare 0.003 was 0.39 of a column on the operator's 130 px canvas,
+# so a correction that landed short looked like a walk and a correction that
+# moved a column looked like a stall.
+STATIONARY_X_STALL_EPSILON = 0.003
+# A stuck hand-over may only spend a rope-rescue JUMP when the marker is really
+# away from the 桩.  Within this many marker columns it is quantisation, not a
+# rope: 17:49:50 fired `jump left` on a character standing ONE column (0.0077)
+# from its 桩 and knocked it off its row (y 0.536458 -> 0.463542).
+STATIONARY_STUCK_RESCUE_MIN_COLUMNS = 3.0
+STATIONARY_X_STALL_HANDOVER_SECONDS = 8.0
+# Once the rope-rescue budget is spent the episode pauses for this long and then
+# starts a FRESH, equally bounded one: standing still forever was the operator's
+# 09:51 report ("stuck on a rope but does nothing"), while repeating the attempts
+# without a pause is the hammering that this file has removed elsewhere.
+STATIONARY_X_STALL_QUIET_SECONDS = 15.0
+# Reference only, for log wording: one marker row on the operator's 114 px
+# minimap.  The real per-recording value comes from ``_layer_marker_row``.
+STATIONARY_MARKER_ROW_REFERENCE = 0.008772
 # After the single jump, the gap must survive this many further settled frames
 # before the attempt counts as failed: the character's own jump arc keeps the
 # marker away from its launch row for a moment, and that is not evidence.
@@ -1056,6 +1142,17 @@ def _runtime_supporter_layer_band(
     return min(recorded_upper, point_upper), max(recorded_lower, point_lower)
 
 
+# A drift re-anchor may never move the world origin by more than this fraction of
+# one floor gap.  Anything larger means the FLOOR BELIEF is wrong, not the
+# tracker: the world value is then marked untrusted and the marker decides.
+WORLD_REANCHOR_MAX_FLOOR_FRACTION = 1.0
+# A tracker that needs this many drift re-anchors inside one window is not
+# measuring the map; the world value is marked untrusted and the marker decides
+# the floor until a landing confirms one (see ``_world_drift_check``).
+WORLD_DRIFT_MAX_REANCHORS = 2
+WORLD_DRIFT_WINDOW_SECONDS = 20.0
+
+
 def _coherent_observed_world_points(
     layer: Any,
 ) -> list[tuple[float, float]]:
@@ -1067,9 +1164,21 @@ def _coherent_observed_world_points(
     When those two measurements move together, the change is real geometry
     (for example a left-high/right-low stair layer), not a phase-correlation
     alias. Such coherent readings may safely form a world-Y interval.
+
+    Two further requirements, both from the operator's 11:24 field log:
+
+    * every point must have been recorded in the SAME analysis frame.  His
+      layer2 had ``left_most`` recorded at 146x114 and ``right_most`` at
+      148x128, and their raw ``observed_world_y`` then differ by 2.2 world
+      units ON ONE FLOOR (3.3x the 0.676 floor gap), which an interpolated
+      "slope" turned into re-anchor targets 0.5-1.3 floors away from the
+      layer's own ``layer_world_y``.  A slope is only meaningful when every
+      sample was normalised through the same frame; a mixed-layout recording is
+      not evidence of geometry at all.
     """
 
     points: list[tuple[float, float, float]] = []
+    layouts: set[tuple[float, float]] = set()
     for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
         point = layer.get(point_name) if isinstance(layer, dict) else None
         coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
@@ -1080,12 +1189,30 @@ def _coherent_observed_world_points(
                 or "y_diamond" not in coordinate
                 or float(point.get("tracking_confidence", 0.0)) < 0.12):
             continue
+        recorded = coordinate.get("recorded_layout")
+        if isinstance(recorded, dict):
+            try:
+                layouts.add((
+                    round(float(recorded["analysis_width"]), 1),
+                    round(float(recorded["analysis_height"]), 1),
+                ))
+            except (KeyError, TypeError, ValueError):
+                layouts.add((0.0, 0.0))
         points.append((
             float(point["x"]),
             float(point["observed_world_y"]),
             float(coordinate["y_diamond"]),
         ))
     if len(points) < 2:
+        return []
+    if len(layouts) > 1:
+        LOG.info(
+            "WORLD-Y slope refused: the points were recorded in %d different "
+            "analysis frames (%s); their observed world Y is not comparable, so "
+            "the layer keeps its level anchor",
+            len(layouts),
+            ", ".join(f"{w:g}x{h:g}" for w, h in sorted(layouts)),
+        )
         return []
     offsets = [world_y - diamond_y for _, world_y, diamond_y in points]
     # A genuine slope changes local diamond Y and world Y by the same amount.
@@ -3247,15 +3374,27 @@ class MovementWorker(threading.Thread):
     def _rescue_stuck_check(
         self, observation: MinimapObservation, now: float
     ) -> None:
-        """Self-rescue stuck detection (checked once per 5-minute window).
+        """Self-rescue stuck detection - immediate, never on a timer.
 
-        Long patrols can wedge the character in a corner or on a rope with
-        no position change.  Within each ``rescue_check_interval_seconds``
-        window the run of consecutive unchanged minimap positions is tracked
-        (2 minimap pixels tolerance absorbs marker jitter); if it ever
-        reaches ``rescue_stuck_frames`` (default 25 at 5 fps) the character is stuck:
-        drop to layer1 and restart the patrol.  Frames where an attack is
-        active are skipped - movement is intentionally paused then.
+        Long patrols can wedge the character in a corner or on a rope with no
+        position change.  Two detections fire at once, each after
+        ``rescue_stuck_frames`` consecutive unchanged readings (2 minimap pixels
+        of tolerance absorb marker jitter):
+
+        * a horizontal patrol leg that makes no X progress, and
+        * a marker that matches NO recorded band while standing still (it fell
+          off, was knocked off, or the frame drifted off the recorded rows).
+
+        Both only *propose* a rescue: ``_rescue_verify_stuck_by_probe`` blocks
+        the attacks and walks the character left/right first, and a character
+        that moves was never stuck.
+
+        The old five-minute sweep over ``rescue_check_interval_seconds`` is
+        retired (operator, 2026-08-15: "retire this feature"): it could probe -
+        blocking the attack workers for two seconds and walking the character -
+        for a run that had already been handled or that had recovered by
+        itself.  Frames where an attack is active are still skipped - movement
+        is intentionally paused then.
 
         A MISSING yellow marker is deliberately *not* a self-rescue condition.
         It can mean a login/offline page, a minimap-less zone, or a transient
@@ -3335,13 +3474,15 @@ class MovementWorker(threading.Thread):
             self._rescue_last_pos = None
             return
         if now - self._rescue_last_check >= self.rescue_check_interval_seconds:
-            if self._rescue_max_stuck >= self.rescue_stuck_frames:
-                LOG.warning(
-                    "SELF-RESCUE: character stuck (%d unchanged frames in "
-                    "the window); dropping to layer1 and restarting patrol",
-                    self._rescue_max_stuck,
-                )
-                self._trigger_rescue()
+            # The five-minute sweep is RETIRED (operator, 2026-08-15: "retire
+            # this feature").  It could launch a probe - two seconds with the
+            # attack workers blocked and the character walked left then right -
+            # for a run that the immediate detections below had already handled,
+            # or minutes after the character had recovered by itself.  Both real
+            # detections fire immediately: a horizontal patrol leg with no X
+            # progress, and a stationary marker that matches no recorded band.
+            # This branch now only bounds the bookkeeping window so the counters
+            # cannot describe a run that is minutes old.
             self._rescue_stuck_frames = 0
             self._rescue_max_stuck = 0
             self._rescue_off_route_frames = 0
@@ -3398,7 +3539,8 @@ class MovementWorker(threading.Thread):
             or getattr(self, "_jump_point_up_held", False)
             or decision_key in (
                 "climb", "jump_climb_left", "jump_climb_right", "jump_climb_up",
-                "drop", "stationary_jump",
+                "drop", "stationary_jump", "stationary_drop",
+                "stationary_rope_jump_left", "stationary_rope_jump_right",
                 "jump_point_left", "jump_point_right", "jump_point_up",
             )
         )
@@ -4770,6 +4912,10 @@ class MovementWorker(threading.Thread):
         yolo_detection_active: bool = True,
         other_player_check_enabled: bool = False,
         other_player_check_interval_seconds: float = 60.0,
+        # Retired knob: the five-minute self-rescue sweep no longer triggers
+        # anything.  It is still accepted (config/UI pass it) and only bounds the
+        # bookkeeping window of the stuck counters; both detections fire
+        # immediately at ``rescue_stuck_frames``.
         rescue_check_interval_seconds: float = 300.0,
         rescue_stuck_frames: int = 25,
         # Consecutive self-rescue cycles that end below the patrol range
@@ -5312,7 +5458,7 @@ class MovementWorker(threading.Thread):
         self._stationary_return_pause_until = 0.0
         # A normal knockback recovery gets at most one delay.  It remains set
         # after the timer expires until the marker returns to the 桩, so the
-        # next capture cannot draw another 1-3 second delay for the same leg.
+        # next capture cannot draw another 1-2 second delay for the same leg.
         self._stationary_delayed_recovery_return_active = False
         self._stationary_pickup_next_at = float("inf")
         self._stationary_pickup_phase: Optional[str] = None
@@ -5366,14 +5512,28 @@ class MovementWorker(threading.Thread):
         # that must not be silent: this lets the movement loop log the drop and
         # re-queue the turn on the spot.
         self._stationary_facing_requested: Optional[str] = None
-        # Small-Y-gap bookkeeping for one arrival at the 桩: how many frames the
-        # gap has held, whether the single Alt jump has been spent, and whether
-        # that jump failed (the attempt is then abandoned until the character
-        # leaves the 桩 and comes back).  See
-        # ``_stationary_small_gap_jump_decision``.
-        self._stationary_y_small_gap_frames = 0
-        self._stationary_y_jump_spent = False
-        self._stationary_y_jump_abandoned = False
+        # Y-recovery episode state for one standing position: the motion budget
+        # (Alt / Alt+Down toward the 桩 row), the rope-rescue budget, and the
+        # judged-no-progress counter that recognises a character hanging on a
+        # rope.  See ``_stationary_y_motion_decision``.
+        self._stationary_y_attempts = 0
+        self._stationary_y_rope_jumps = 0
+        self._stationary_y_frames = 0
+        self._stationary_y_motion_spent = False
+        self._stationary_y_last_y: Optional[float] = None
+        self._stationary_y_no_progress = 0
+        self._stationary_y_rope_next_at = 0.0
+        self._stationary_y_gave_up_logged = False
+        self._stationary_rope_rescue_gave_up_logged = False
+        # X-correction stall evidence: the column each correction started from,
+        # how many corrections in a row left the marker there, and the hand-over
+        # window that gives the 桩 Y rule / rope rescue the frame instead of
+        # stepping a character that cannot walk.  See
+        # ``_stationary_attack_decision``.
+        self._stationary_x_stall_at: Optional[float] = None
+        self._stationary_x_stall_steps = 0
+        self._stationary_x_stall_handover_until = 0.0
+        self._stationary_x_stall_pause_until = 0.0
         self._walk_hold_key: Optional[str] = None
         self._walk_hold_z = False
         self._walk_hold_until = 0.0
@@ -5744,6 +5904,13 @@ class MovementWorker(threading.Thread):
             0.05, float(world_drift_reanchor_threshold)
         )
         self._last_world_drift_check = 0.0
+        # A tracker that keeps needing a drift re-anchor is not measuring the
+        # map any more (the log of record re-anchored twice in 2 s while the
+        # character stood still).  Count them inside one window; past the cap the
+        # world value is marked untrusted and the marker decides the floor until a
+        # landing confirms one.
+        self._world_drift_reanchors = 0
+        self._world_drift_window_started = 0.0
         self._last_fall_resolved_at: Optional[float] = None
         # Raw (pre-pin) world-Y reading of the current frame, captured where
         # the structure tracker result is merged so reconciliation and the
@@ -11876,17 +12043,34 @@ class MovementWorker(threading.Thread):
         return True
 
     def _reset_stationary_y_recovery(self) -> None:
-        """Forget this arrival's small-Y-gap bookkeeping.
+        """Forget the current Y-recovery episode.
 
         Called when the marker is back on the anchor row (the gap is fixed), when
         the character is plainly away from the 桩, on a fresh Start Patrol, and
-        when the mode is toggled - each of those begins a NEW arrival, and a new
-        arrival is allowed one fresh Alt jump.
+        when the mode is toggled - each of those begins a NEW episode, so the
+        motion budget and the rope-rescue budget both start again (see
+        ``_stationary_y_motion_decision``).
         """
 
-        self._stationary_y_small_gap_frames = 0
-        self._stationary_y_jump_spent = False
-        self._stationary_y_jump_abandoned = False
+        # Y-recovery episode state: motion budget, rope-rescue budget, and the
+        # judged-no-progress counter that recognises a rope hang (see
+        # ``_stationary_y_motion_decision``).
+        self._stationary_y_attempts = 0
+        self._stationary_y_rope_jumps = 0
+        self._stationary_y_frames = 0
+        self._stationary_y_motion_spent = False
+        self._stationary_y_last_y: Optional[float] = None
+        self._stationary_y_no_progress = 0
+        self._stationary_y_rope_next_at = 0.0
+        self._stationary_y_gave_up_logged = False
+        self._stationary_rope_rescue_gave_up_logged = False
+        # The X-stall evidence belongs to the same arrival: a character that was
+        # handed over to the Y rule because it could not walk starts that attempt
+        # again from scratch when it is back on the 桩.
+        self._stationary_x_stall_at: Optional[float] = None
+        self._stationary_x_stall_steps = 0
+        self._stationary_x_stall_handover_until = 0.0
+        self._stationary_x_stall_pause_until = 0.0
 
     def _clear_stationary_route_state(self) -> None:
         """Drop route/vertical state that 站桩攻击 must never carry.
@@ -11919,7 +12103,8 @@ class MovementWorker(threading.Thread):
             self._descending_to_first = False
 
     def _stationary_y_recovery_decision(
-        self, anchor: Point, player: Point
+        self, anchor: Point, player: Point, *, stuck: bool = False,
+        allow_rescue: bool = True,
     ) -> MovementDecision:
         """What to do about the standing Y while X is on the 桩.
 
@@ -11929,34 +12114,69 @@ class MovementWorker(threading.Thread):
         Two cases, in this order:
 
         1. the marker is back inside ``STATIONARY_ATTACK_Y_TOLERANCE`` of the
-           launch row - the gap is fixed, the arrival's bookkeeping resets and
+           launch row - the gap is fixed, the episode's bookkeeping resets and
            the character simply attacks;
         2. the marker is still on the anchor's own layer but off its standing
-           row - the bench's other row (bottom 0.310526 with the anchor on its
-           top at 0.278947) is the operator's own case, and a marker row or two
-           of jitter is the same thing written smaller.  When that gap has held
-           for ``STATIONARY_ATTACK_SMALL_GAP_FRAMES`` frames, ONE Alt jump is
-           tried.  A jump that reaches the anchor row ends the episode; one that
-           does not is abandoned until the character leaves the 桩 and comes back
-           (see ``_stationary_small_gap_jump_decision``).  The earlier build
-           excluded the wider row change from jumping at all, and the field log
-           showed what that costs: the character stood at
-           pos=(0.539474, 0.310526) with gap=+0.000000, sent no jump, and only
-           repeated attacks from the wrong row.
+           row - the operator's rule (2026-08-14) is a bounded retry loop in the
+           anchor's Y: Alt+Down while the 桩 is BELOW the marker, Alt while it is
+           ABOVE, and a lateral ROPE RESCUE jump when the marker's Y refuses to
+           move at all (a rope is holding it).  See
+           ``_stationary_y_motion_decision``.
 
-        A reading outside the anchor layer's band is left to the ordinary
-        route/fall logic.
+        ``stuck`` means the X correction has already proven this character cannot
+        WALK (``_stationary_attack_decision``'s stall hand-over).  Walking is then
+        not an option, so this rule keeps owning the frame even when its own
+        motion budget runs out: the lateral rope rescue takes over, and a quiet
+        window follows once that is spent too.
+
+        The layer band is not part of that loop: it only decides whether this
+        session may try at all.  A reading outside the anchor layer's band is left
+        to the ordinary route/fall logic.
         """
 
         gap_y = anchor.y - player.y
-        if abs(gap_y) <= STATIONARY_ATTACK_Y_TOLERANCE:
-            if self._stationary_y_jump_spent:
+        if abs(gap_y) <= max(
+                STATIONARY_ATTACK_Y_TOLERANCE,
+                STATIONARY_Y_EPISODE_MIN_ROWS * STATIONARY_MARKER_ROW_REFERENCE,
+        ):
+            if self._stationary_y_attempts:
                 LOG.info(
                     "stationary Y gap fixed: back on the launch position "
-                    "(y=%.6f anchor_y=%.6f) after the single recovery jump",
-                    player.y, anchor.y,
+                    "(y=%.6f anchor_y=%.6f) after %d motion(s), %d rope rescue(s)",
+                    player.y, anchor.y, self._stationary_y_attempts,
+                    self._stationary_y_rope_jumps,
                 )
+            # The rope-rescue bookkeeping belongs to THIS stuck episode, not to
+            # the Y gap being cleared here: losing it in the reset below made the
+            # rescue repeat forever instead of stopping after its budget.
+            rope_jumps = self._stationary_y_rope_jumps
+            rope_next_at = self._stationary_y_rope_next_at
+            rope_gave_up = self._stationary_rope_rescue_gave_up_logged
             self._reset_stationary_y_recovery()
+            if stuck:
+                # The row is right but the character still cannot walk, so the
+                # only thing left that can free it is leaving the rope - unless
+                # the marker is only a column or two off, where a jump is pure
+                # damage (see ``_stationary_stuck_handover_decision``).
+                self._stationary_y_rope_jumps = rope_jumps
+                self._stationary_y_rope_next_at = rope_next_at
+                self._stationary_rope_rescue_gave_up_logged = rope_gave_up
+                if not allow_rescue:
+                    return MovementDecision(
+                        None,
+                        "stationary Y is on its row and the X offset is one "
+                        "marker column of quantisation; no rescue jump",
+                    )
+                rescue = self._stationary_rope_rescue_decision(
+                    anchor, player,
+                    reason=(
+                        "the marker cannot walk although its Y is already on the "
+                        f"桩 row (x={player.x:.6f}, 桩 x={anchor.x:.6f})"
+                    ),
+                )
+                if rescue is not None:
+                    return rescue
+                return self._stationary_stuck_quiet_decision()
             return MovementDecision(
                 None, "stationary attack temporary safe zone"
             )
@@ -11980,6 +12200,7 @@ class MovementWorker(threading.Thread):
         )
         if not in_anchor_band:
             if runtime_band is not None or abs(gap_y) > STATIONARY_ATTACK_SMALL_Y_GAP:
+                # Off this floor entirely: the ordinary route/fall logic owns it.
                 self._reset_stationary_y_recovery()
                 return MovementDecision(
                     None,
@@ -11990,81 +12211,304 @@ class MovementWorker(threading.Thread):
             # layer), so the anchor's own same-layer window is the only
             # evidence and a small gap still earns the single attempt.
 
-        # X is on the 桩 and the Y is off its row: the operator's single-jump
-        # rule.
-        return self._stationary_small_gap_jump_decision(anchor, player, gap_y)
+        # X is on the 桩 and the Y is off its row: the operator's rule - walk the
+        # marker's Y onto the anchor row with Alt / Alt+Down, and use a lateral
+        # rope-rescue jump when the marker's Y refuses to move at all.  The layer
+        # band above only decides whether this session may try at all; the motion
+        # itself is expressed purely in the anchor's Y.
+        decision = self._stationary_y_motion_decision(anchor, player, gap_y)
+        if (stuck and allow_rescue and decision.key is None
+                and self._stationary_y_attempts >= STATIONARY_Y_MOTION_MAX_ATTEMPTS):
+            # The character cannot walk and the Y motions are spent: the rope
+            # rescue is the only remaining way out.  Its own no-progress rule
+            # already tried what it could, so this is the last window.
+            rescue = self._stationary_rope_rescue_decision(
+                anchor, player,
+                reason=(
+                    "the marker cannot walk and its Y motions are spent "
+                    f"(y={player.y:.6f}, 桩 y={anchor.y:.6f})"
+                ),
+            )
+            if rescue is not None:
+                return rescue
+            return self._stationary_stuck_quiet_decision()
+        return decision
 
-    def _stationary_small_gap_jump_decision(
+    def _stationary_y_motion_decision(
         self, anchor: Point, player: Point, gap_y: float,
     ) -> MovementDecision:
-        """One Alt jump for a Y gap at the 桩 that will not go away by itself.
+        """Drive the marker's Y onto the 桩 row - the operator's own algorithm.
 
-        The operator's rule: while the marker stays inside the accepted X of its
-        temporary anchor and its Y stays off the launch row for
-        ``STATIONARY_ATTACK_SMALL_GAP_FRAMES`` frames (any row of the anchor's own
-        layer counts - the bench's bottom row is 0.0316 below its top), try ONE
-        Alt jump.  A jump that puts the marker back on the anchor row ends the
-        episode.  A jump that does not is ABANDONED - the character keeps
-        attacking from where it stands instead of jumping forever - and no
-        further jump is sent until it leaves the 桩 and comes back, which is when
-        a fresh attempt is allowed.
+        Compare the anchor's Y with the marker's Y.  While they differ, send the
+        input that points AT the anchor row, because minimap Y grows downwards::
+
+            gap_y = anchor.y - player.y
+            gap_y > 0  -> the 桩 is BELOW the marker  -> Alt+Down (drop)
+            gap_y < 0  -> the 桩 is ABOVE the marker  -> Alt (jump)
+
+        Retry that up to ``STATIONARY_Y_MOTION_MAX_ATTEMPTS`` times.  A motion is
+        judged by how much of the gap it actually closed, the way the climb path
+        judges its own stall (``world_y_stall_change_required``): if the marker
+        moves by less than ``STATIONARY_Y_PROGRESS_MIN_ROWS`` the character did not
+        land anywhere - it slid an Alt+Down's worth down a rope.  After
+        ``STATIONARY_Y_NO_PROGRESS_MAX`` such motions the character is treated as
+        hanging on a ROPE above the 桩, and one lateral ROPE RESCUE jump
+        (``stationary_rope_jump_left`` / ``_right``) leaves the rope, exactly like
+        the climb stall recovery; the Alt / Alt+Down attempts then resume.
+
+        Everything here is expressed in the anchor's own Y.  The layer band, the
+        layer resolution and the route machinery are deliberately NOT involved:
+        this is the 桩's row, not a floor question.  The episode is bounded (motion
+        budget, then rope-rescue budget); after that it stops quietly and the
+        character attacks from where it stands until the marker is back on the
+        row, which re-arms everything (``_reset_stationary_y_recovery``).
         """
 
-        self._stationary_y_small_gap_frames += 1
-        if self._stationary_y_jump_abandoned:
-            return MovementDecision(
-                None,
-                "stationary Y gap: this arrival already spent its jump "
-                f"(marker y={player.y:.6f} anchor_y={anchor.y:.6f}); waiting for "
-                "the next arrival at the 桩",
-            )
-        if self._stationary_y_jump_spent:
-            # The jump is in flight or has just landed.  The character's own
-            # jump arc keeps the marker off its launch row for a moment, so the
-            # gap must survive a few more settled frames before the attempt
-            # counts as failed.
-            settle_frames = (
-                self._stationary_y_small_gap_frames
-                - STATIONARY_ATTACK_SMALL_GAP_FRAMES
-            )
-            if settle_frames <= STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES:
+        now = time.monotonic()
+        self._stationary_y_frames += 1
+        rows = abs(gap_y) / STATIONARY_MARKER_ROW_REFERENCE
+        toward = "below" if gap_y > 0 else "above"
+
+        # -- evidence: did the last motion actually close part of the gap? ----
+        if self._stationary_y_motion_spent:
+            settle = STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES
+            if self._stationary_y_frames <= settle:
                 return MovementDecision(
                     None,
-                    "stationary Y gap: waiting for the Alt jump to settle "
-                    f"({settle_frames}/"
-                    f"{STATIONARY_ATTACK_SMALL_GAP_JUMP_SETTLE_FRAMES})",
+                    "stationary Y: waiting for the last motion to settle "
+                    f"({self._stationary_y_frames}/{settle})",
                 )
-            self._stationary_y_jump_abandoned = True
-            LOG.warning(
-                "STATIONARY Y gap: the Alt jump did not restore "
-                "anchor_y=%.6f (marker y=%.6f); abandoning this attempt - no "
-                "further jump until the character leaves the 桩 and comes back",
-                anchor.y, player.y,
+            last_y = self._stationary_y_last_y
+            moved_rows = (
+                0.0 if last_y is None
+                else abs(float(player.y) - float(last_y))
+                / STATIONARY_MARKER_ROW_REFERENCE
             )
+            required_rows = min(rows, STATIONARY_Y_PROGRESS_MIN_ROWS)
+            self._stationary_y_motion_spent = False
+            self._stationary_y_last_y = float(player.y)
+            self._stationary_y_frames = 0
+            if moved_rows + 1e-9 >= required_rows:
+                self._stationary_y_no_progress = 0
+                LOG.info(
+                    "STATIONARY Y motion worked: marker y=%.6f moved %.1f row(s) "
+                    "of a %.0f row(s) %s gap (anchor y=%.6f)",
+                    player.y, moved_rows, rows, toward, anchor.y,
+                )
+            else:
+                self._stationary_y_no_progress += 1
+                LOG.warning(
+                    "STATIONARY Y motion #%d moved only %.1f row(s) of a %.0f "
+                    "row(s) %s gap (marker y=%.6f, anchor y=%.6f, needs %.1f) - "
+                    "no landing, still on a rope (%d/%d)",
+                    self._stationary_y_attempts, moved_rows, rows, toward,
+                    player.y, anchor.y, required_rows,
+                    self._stationary_y_no_progress,
+                    STATIONARY_Y_NO_PROGRESS_MAX,
+                )
+        else:
+            self._stationary_y_last_y = float(player.y)
+            if self._stationary_y_frames < STATIONARY_ATTACK_SMALL_GAP_FRAMES:
+                return MovementDecision(
+                    None,
+                    "stationary Y gap "
+                    f"({self._stationary_y_frames}/"
+                    f"{STATIONARY_ATTACK_SMALL_GAP_FRAMES} frames): waiting "
+                    f"before the next motion (桩 is {rows:.0f} row(s) {toward})",
+                )
+
+        # -- judged no progress: a rope above the 桩 is holding the character ---
+        if (self._stationary_y_no_progress >= STATIONARY_Y_NO_PROGRESS_MAX
+                and now >= self._stationary_y_rope_next_at):
+            stalled = self._stationary_y_no_progress
+            self._stationary_y_no_progress = 0
+            self._stationary_y_motion_spent = False
+            self._stationary_y_frames = 0
+            self._stationary_y_last_y = float(player.y)
+            rescue = self._stationary_rope_rescue_decision(
+                anchor, player,
+                reason=(
+                    f"{stalled} motion(s) did not land the marker on the 桩 row "
+                    f"(y={anchor.y:.6f}, {rows:.0f} row(s) {toward})"
+                ),
+            )
+            if rescue is not None:
+                return rescue
+
+        # -- budgets ---------------------------------------------------------
+        if self._stationary_y_attempts >= STATIONARY_Y_MOTION_MAX_ATTEMPTS:
+            if not self._stationary_y_gave_up_logged:
+                self._stationary_y_gave_up_logged = True
+                LOG.warning(
+                    "STATIONARY Y gap: %d motion(s) and %d rope rescue(s) did not "
+                    "reach anchor_y=%.6f (marker y=%.6f, %.0f row(s) %s); leaving "
+                    "the character where it stands until it is back on the row",
+                    self._stationary_y_attempts, self._stationary_y_rope_jumps,
+                    anchor.y, player.y, rows, toward,
+                )
+            return MovementDecision(
+                None, "stationary Y gap: recovery budget spent"
+            )
+
+        # -- can a chord actually reach the 桩 row from here? ----------------
+        if gap_y > 0 and rows < STATIONARY_Y_DROP_MIN_ROWS:
+            # A row or two below is the SAME platform: Alt+Down falls through
+            # it (10:13 field log: a 3-row "gap" became a 14-row fall onto
+            # layer1 and started the fall/return/stair-hop loop).  1.3.27 pressed
+            # nothing here and simply attacked from the row, so do that again.
             return MovementDecision(
                 None,
-                "stationary Y gap: the jump did not restore the anchor "
-                "row; abandoning this attempt",
+                f"stationary Y gap: the 桩 row is inside this platform "
+                f"({rows:.0f} row(s)); attacking from here",
             )
-        if self._stationary_y_small_gap_frames < STATIONARY_ATTACK_SMALL_GAP_FRAMES:
+
+        # -- fire the motion that points at the anchor row --------------------
+        self._stationary_y_attempts += 1
+        self._stationary_y_motion_spent = True
+        self._stationary_y_frames = 0
+        self._stationary_y_last_y = float(player.y)
+        if gap_y > 0:
+            LOG.info(
+                "STATIONARY Y gap: 桩 y=%.6f is %.0f row(s) BELOW the marker "
+                "(y=%.6f); Alt+Down (%d/%d)",
+                anchor.y, rows, player.y, self._stationary_y_attempts,
+                STATIONARY_Y_MOTION_MAX_ATTEMPTS,
+            )
             return MovementDecision(
-                None,
-                "stationary Y gap "
-                f"({self._stationary_y_small_gap_frames}/"
-                f"{STATIONARY_ATTACK_SMALL_GAP_FRAMES} frames): waiting before "
-                "the single recovery jump",
+                "stationary_drop",
+                f"stationary Y gap: Alt+Down toward the 桩 "
+                f"({self._stationary_y_attempts}/{STATIONARY_Y_MOTION_MAX_ATTEMPTS})",
+                self.drop_chord_hold_seconds,
             )
-        self._stationary_y_jump_spent = True
         LOG.info(
-            "STATIONARY Y gap: X is on the 桩 and the marker has held "
-            "y=%.6f (anchor_y=%.6f, gap %+.6f) for %d frames; trying ONE Alt jump",
-            player.y, anchor.y, gap_y, STATIONARY_ATTACK_SMALL_GAP_FRAMES,
+            "STATIONARY Y gap: 桩 y=%.6f is %.0f row(s) ABOVE the marker "
+            "(y=%.6f); Alt (%d/%d)",
+            anchor.y, rows, player.y, self._stationary_y_attempts,
+            STATIONARY_Y_MOTION_MAX_ATTEMPTS,
         )
         return MovementDecision(
             "stationary_jump",
-            f"stationary Y gap recovery jump (marker y={player.y:.6f} "
-            f"anchor_y={anchor.y:.6f})",
+            f"stationary Y gap: Alt toward the 桩 "
+            f"({self._stationary_y_attempts}/{STATIONARY_Y_MOTION_MAX_ATTEMPTS})",
             self.minimum_final_hold_seconds,
+        )
+
+    def _stationary_rope_rescue_decision(
+        self, anchor: Point, player: Point, *, reason: str,
+    ) -> Optional[MovementDecision]:
+        """One lateral jump that gets the character off a rope.
+
+        A character holding a rope answers nothing else: left/right are ignored
+        (it cannot walk), and Alt+Down only slides it down the rope one row per
+        press.  The escape is the same simultaneous direction+Alt chord the
+        CLIMB stall recovery uses to leave a rope.
+
+        Bounded by ``STATIONARY_Y_ROPE_RESCUE_MAX`` and paced by
+        ``STATIONARY_Y_ROPE_RESCUE_INTERVAL_SECONDS``; the two sides alternate
+        and the 桩's own side is tried first.  Returns ``None`` when the budget
+        or the pacing says "not now" - the caller then keeps its own fallback.
+        """
+
+        now = time.monotonic()
+        if now < self._stationary_y_rope_next_at:
+            return None
+        if self._stationary_y_rope_jumps >= STATIONARY_Y_ROPE_RESCUE_MAX:
+            if not self._stationary_rope_rescue_gave_up_logged:
+                self._stationary_rope_rescue_gave_up_logged = True
+                LOG.warning(
+                    "STATIONARY rope rescue: %d jump(s) did not free the "
+                    "character (marker x=%.6f y=%.6f, 桩 x=%.6f y=%.6f); leaving "
+                    "it standing until it is back on the 桩",
+                    self._stationary_y_rope_jumps, player.x, player.y,
+                    anchor.x, anchor.y,
+                )
+            return None
+        delta_x = float(anchor.x) - float(player.x)
+        if abs(delta_x) > 0.002:
+            direction = "right" if delta_x > 0 else "left"
+        else:
+            direction = "right" if self._stationary_y_rope_jumps % 2 == 0 else "left"
+        self._stationary_y_rope_jumps += 1
+        self._stationary_y_rope_next_at = (
+            now + STATIONARY_Y_ROPE_RESCUE_INTERVAL_SECONDS
+        )
+        LOG.warning(
+            "STATIONARY rope rescue: %s - jump %s (%d/%d)",
+            reason, direction, self._stationary_y_rope_jumps,
+            STATIONARY_Y_ROPE_RESCUE_MAX,
+        )
+        return MovementDecision(
+            f"stationary_rope_jump_{direction}",
+            f"rope rescue: jump {direction} to leave the rope "
+            f"({self._stationary_y_rope_jumps}/{STATIONARY_Y_ROPE_RESCUE_MAX})",
+            self.minimum_final_hold_seconds,
+        )
+
+    def _stationary_stuck_handover_decision(
+        self, anchor: Point, player: Point,
+    ) -> MovementDecision:
+        """The frame the X correction hands over because the marker cannot walk.
+
+        Reached only after ``STATIONARY_X_STALL_MIN_STEPS`` corrections failed to
+        move the marker: the character is held (a rope), so walking is not an
+        option.  The 桩 Y rule then owns the frame - Alt+Down / Alt toward the
+        anchor row, which is what actually moves a character on a rope, and whose
+        own no-progress rule fires the rope rescue.
+
+        A marker within ``STATIONARY_STUCK_RESCUE_MIN_COLUMNS`` of the 桩 may
+        still move VERTICALLY (a real row gap is never a wobble), but it never
+        earns a lateral JUMP: that is the diamond's own quantisation, not a rope.
+        The 17:49 field log fired ``jump left`` on a character standing ONE column
+        (0.0077) from its anchor and knocked it off its row (y 0.536458 ->
+        0.463542), which restarted the whole return churn.
+        """
+
+        allow_rescue = True
+        if player is not None and anchor is not None:
+            column = self._stationary_marker_column()
+            distance = abs(float(anchor.x) - float(player.x))
+            if column > 0 and distance < column * STATIONARY_STUCK_RESCUE_MIN_COLUMNS:
+                allow_rescue = False
+                LOG.info(
+                    "STATIONARY stuck hand-over: the marker is %.2f column(s) "
+                    "from the 桩 (x=%.6f, 桩 x=%.6f) - vertical recovery may run, "
+                    "but no lateral rescue jump for quantisation",
+                    distance / column, player.x, anchor.x,
+                )
+        return self._stationary_y_recovery_decision(
+            anchor, player, stuck=True, allow_rescue=allow_rescue,
+        )
+
+    def _stationary_stuck_quiet_decision(self) -> MovementDecision:
+        """Pause before the next bounded attempt at a character that cannot walk.
+
+        Every attempt of the current episode failed, so repeating them now is
+        pointless - but standing still for good is not right either (the 09:51
+        field report was exactly "stuck on a rope but does nothing").  The fresh
+        episode armed here is entered only after
+        ``STATIONARY_X_STALL_QUIET_SECONDS`` of real pause: the app keeps trying
+        to free the character at a slow, logged cadence instead of hammering
+        corrections.  The pause is a separate state from the hand-over window,
+        because the hand-over decision itself is still called every frame while
+        that window is open - re-arming from inside it jumped again immediately.
+        """
+
+        self._reset_stationary_y_recovery()
+        now = time.monotonic()
+        self._stationary_x_stall_handover_until = 0.0
+        self._stationary_x_stall_pause_until = (
+            now + STATIONARY_X_STALL_QUIET_SECONDS
+        )
+        LOG.warning(
+            "STATIONARY stuck: every bounded attempt of this episode is spent "
+            "(the marker neither walks nor reaches its 桩 row); the next attempt "
+            "starts in %.0fs",
+            STATIONARY_X_STALL_QUIET_SECONDS,
+        )
+        return MovementDecision(
+            None,
+            "stationary stuck: next attempt in "
+            f"{STATIONARY_X_STALL_QUIET_SECONDS:.0f}s",
         )
 
     def _request_stationary_step(
@@ -12193,7 +12637,10 @@ class MovementWorker(threading.Thread):
             and self._stationary_return_dismount_direction is None
         )
         if ordinary_delayed_recovery:
-            delay_seconds = random.uniform(1.0, 3.0)
+            delay_seconds = random.uniform(
+                STATIONARY_DELAYED_RETURN_MIN_SECONDS,
+                STATIONARY_DELAYED_RETURN_MAX_SECONDS,
+            )
             self._stationary_delayed_recovery_return_active = True
             self._stationary_return_pause_until = (
                 time.monotonic() + delay_seconds
@@ -12310,6 +12757,11 @@ class MovementWorker(threading.Thread):
             self._stationary_near_correction_next_at = 0.0
             self._stationary_blur_target_x = None
             self._stationary_delayed_recovery_return_active = False
+            # The marker is where it belongs: the X-stall evidence is spent, and
+            # so is any pause earned by an earlier stuck episode.
+            self._stationary_x_stall_at = None
+            self._stationary_x_stall_steps = 0
+            self._stationary_x_stall_pause_until = 0.0
         else:
             # Outside the final approach zone, walk normally and do not
             # attack.  A layer-return can reach the anchor platform at its
@@ -12343,6 +12795,22 @@ class MovementWorker(threading.Thread):
                     self.movement_hold_seconds,
                 )
             now = time.monotonic()
+            # X-stall: correction steps that leave the marker on the same column
+            # prove the character cannot walk at all - on this map that is a
+            # ROPE, which ignores left/right.  Repeating the correction is the
+            # 09:51 field failure: 15 s of "stationary correction executed: left
+            # (hold 0.11s) + attack" while the marker sat on x=0.386029, and the
+            # 桩 Y rule never ran because X never settled, so Alt+Down and the
+            # rope rescue were never tried.  While the hand-over window is open
+            # the Y rule owns the frame instead.
+            if now < self._stationary_x_stall_pause_until:
+                return MovementDecision(
+                    None,
+                    "stationary stuck: pausing before the next bounded attempt "
+                    f"({self._stationary_x_stall_pause_until - now:.0f}s)",
+                )
+            if now < self._stationary_x_stall_handover_until:
+                return self._stationary_stuck_handover_decision(anchor, player)
             if now < self._stationary_near_correction_next_at:
                 return MovementDecision(
                     None, "stationary X correction settling"
@@ -12358,9 +12826,46 @@ class MovementWorker(threading.Thread):
                     None,
                     f"stationary X correction {direction} not queued",
                 )
+            # Only a correction that was really queued is evidence: compare the
+            # column it started from with the column a previous queued correction
+            # started from.
+            previous_x = self._stationary_x_stall_at
+            # "Did the marker move?" must be measured in whole marker columns:
+            # the diamond only advances one column at a time, so an epsilon
+            # finer than a column both hides real movement and invents stalls.
+            stall_epsilon = max(
+                STATIONARY_X_STALL_EPSILON,
+                self._stationary_marker_column(),
+            )
+            if (previous_x is not None
+                    and abs(float(player.x) - previous_x) <= stall_epsilon):
+                self._stationary_x_stall_steps += 1
+            else:
+                self._stationary_x_stall_steps = 1
+            self._stationary_x_stall_at = float(player.x)
             self._stationary_near_correction_next_at = (
                 now + STATIONARY_ATTACK_NEAR_CORRECTION_INTERVAL_SECONDS
             )
+            if self._stationary_x_stall_steps >= STATIONARY_X_STALL_MIN_STEPS:
+                self._stationary_x_stall_steps = 0
+                self._stationary_x_stall_at = None
+                LOG.warning(
+                    "STATIONARY X stuck: %d queued correction(s) left the marker "
+                    "on x=%.6f (target_x=%.6f, 桩 x=%.6f) - the character cannot "
+                    "walk; handing the next frames to the 桩 Y rule and the rope "
+                    "rescue for %.0fs",
+                    STATIONARY_X_STALL_MIN_STEPS, player.x,
+                    correction_target_x, anchor.x,
+                    STATIONARY_X_STALL_HANDOVER_SECONDS,
+                )
+                self._stationary_x_stall_handover_until = (
+                    now + STATIONARY_X_STALL_HANDOVER_SECONDS
+                )
+                return MovementDecision(
+                    None,
+                    f"stationary X stuck: {STATIONARY_X_STALL_MIN_STEPS} "
+                    f"corrections did not move the marker; handing over",
+                )
             return MovementDecision(
                 None,
                 f"stationary X correction {direction} queued",
@@ -12626,9 +13131,65 @@ class MovementWorker(threading.Thread):
         # pong across the intended turning side.
         return abs(float(player_x) - float(target_x)) <= 0.003
 
-    @staticmethod
-    def _stationary_facing_turn_x(anchor_x: float, direction: str) -> float:
-        """Return the inner opposite-side turning point for a final facing tap."""
+    def _stationary_marker_column(self) -> float:
+        """One marker column in normalised X - the diamond's own quantisation.
+
+        The yellow diamond is drawn at whole minimap pixels, so X can only take
+        values one column apart (1 / analysis_width: 0.007692 on the operator's
+        130 px canvas, 0.006849 on the earlier 146 px one).  Anything the 站桩
+        logic measures finer than a column is not visible: a resting window whose
+        near side was 0.0075 could never accept the column at +0.007692, so the
+        correction walked forever and the X-stall hand-over then fired a false
+        rope jump (log 17:49:44-17:49:53).
+
+        The column comes from the anchor layer's recorded layout, exactly like
+        ``_layer_marker_row`` does for Y; the fallback is the value of the old
+        facing shift, i.e. the previous behaviour, when a layer has no layout.
+        """
+
+        layer_name = (
+            self._stationary_route_anchor_layer
+            or self._stationary_ui_anchor_layer
+        )
+        layer = (
+            getattr(self, "important_positions", {}).get(layer_name)
+            if layer_name else None
+        )
+        width: Optional[float] = None
+        if isinstance(layer, dict):
+            for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+                point = layer.get(point_name)
+                if not isinstance(point, dict):
+                    continue
+                coordinate = point.get("coordinate_v2")
+                if not isinstance(coordinate, dict):
+                    continue
+                layout = coordinate.get("recorded_layout")
+                if not isinstance(layout, dict):
+                    continue
+                try:
+                    width = float(layout["analysis_width"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if width > 1.0:
+                    break
+                width = None
+        if width is None or width <= 1.0:
+            return STATIONARY_ATTACK_FACING_ZONE_SHIFT
+        return 1.0 / width
+
+    def _stationary_facing_turn_x(
+        self, anchor_x: float, direction: str,
+    ) -> float:
+        """Return the inner opposite-side turning point for a final facing tap.
+
+        The turn point must sit on a column the marker can actually display: the
+        diamond quantises X to whole minimap pixels (1/analysis_width), so a
+        point 0.0045 from the 桩 - 0.6 of a column on the operator's 130 px
+        canvas - can never be reached, and the queued correction is dropped as
+        "the marker already reached its step target" forever (log 17:49:50:
+        player_x=0.611538 target_x=0.616038).
+        """
 
         direction = str(direction).casefold()
         shift = (
@@ -12640,11 +13201,17 @@ class MovementWorker(threading.Thread):
             if direction == "left"
             else float(anchor_x) - STATIONARY_ATTACK_X_TOLERANCE + shift
         )
-        return (
+        turn = (
             edge - STATIONARY_ATTACK_FACING_TURN_INSET
             if direction == "left"
             else edge + STATIONARY_ATTACK_FACING_TURN_INSET
         )
+        column = self._stationary_marker_column()
+        minimum = column * 1.05
+        offset = turn - float(anchor_x)
+        if abs(offset) < minimum:
+            offset = minimum if (offset >= 0 or direction == "right") else -minimum
+        return float(anchor_x) + offset
 
     def _stationary_anchor_x_accepted(self, anchor_x: float, player_x: float) -> bool:
         """Whether X is in the face-biased resting zone around the stake.
@@ -12664,6 +13231,14 @@ class MovementWorker(threading.Thread):
         random from frame to frame, which walked the character and re-ran the
         facing confirmation continuously (14:16 field log: 15 different return
         targets in 4 s while the marker sat still on two columns).
+
+        Both sides are also forced to be at least one marker COLUMN wide
+        (``_stationary_marker_column``).  The window used to be 0.015 shifted by
+        0.0075, i.e. 0.0075 on the near side, which is LESS than a column on a
+        130 px canvas (0.007692): the column next to the 桩 could never be
+        accepted, the correction walked it forever, and the stall hand-over then
+        fired a false rope jump (log 17:49:44-17:49:53 on layer2, anchor
+        x=0.611538, marker stuck on x=0.619231).
         """
 
         facing = self._stationary_facing_target_for_frame()
@@ -12675,9 +13250,13 @@ class MovementWorker(threading.Thread):
             max(STATIONARY_ATTACK_X_TOLERANCE, STATIONARY_ATTACK_BLUR_ZONE)
             if self.stationary_blur_enabled else STATIONARY_ATTACK_X_TOLERANCE
         )
+        # Keep the facing bias, but never let a side be narrower than the
+        # marker's own quantisation step.
+        half = max(half, self._stationary_marker_column() + abs(shift))
         lower = float(anchor_x) - half + shift
         upper = float(anchor_x) + half + shift
-        return lower <= float(player_x) <= upper
+        slack = 1e-6
+        return lower - slack <= float(player_x) <= upper + slack
 
     def _stationary_attack_ready_for_player(
         self, anchor: Point, player: Point,
@@ -12698,13 +13277,14 @@ class MovementWorker(threading.Thread):
             return False
         if not self._stationary_anchor_x_accepted(anchor.x, player.x):
             return False
-        if self._stationary_y_jump_spent and not self._stationary_y_jump_abandoned:
-            # The single Alt jump for a persistent Y gap owns this window.  The
-            # field log showed the failure of letting both run: the character
-            # stood off its anchor row while the fixed cadence kept pressing the
-            # attack key, so the jump and the attack swallowed each other.  Hold
-            # the cadence until the jump has either fixed the row or been
-            # abandoned; attacks resume immediately after either outcome.
+        if self._stationary_y_motion_spent:
+            # A Y-recovery motion (Alt / Alt+Down / rope rescue jump) owns this
+            # window while it is in flight: the field log showed the failure of
+            # letting both run - the character stood off its anchor row while the
+            # fixed cadence kept pressing the attack key, so the motion and the
+            # attack swallowed each other.  Attacks resume as soon as the motion
+            # has landed (or the marker is back on the row, which resets the
+            # episode).
             return False
         return (
             self._stationary_facing_command
@@ -13357,6 +13937,10 @@ class MovementWorker(threading.Thread):
             reason = self._world_y_untrusted_reason or "an unknown respawn offset"
             self._world_y_anchor_untrusted = False
             self._world_y_untrusted_reason = ""
+            # A marker-confirmed floor starts a clean drift episode: the counter
+            # that gives up on the world value must not carry the previous one.
+            self._world_drift_reanchors = 0
+            self._world_drift_window_started = 0.0
             LOG.info(
                 "WORLD-Y: the marker confirmed %s; re-anchored there and trusting "
                 "the scroll-compensated value again (it was off because of %s)",
@@ -14261,7 +14845,10 @@ class MovementWorker(threading.Thread):
                         restart_timer=False,
                     )
                 if self.stationary_delayed_return_enabled:
-                    delay_seconds = random.uniform(1.0, 3.0)
+                    delay_seconds = random.uniform(
+                        STATIONARY_DELAYED_RETURN_MIN_SECONDS,
+                        STATIONARY_DELAYED_RETURN_MAX_SECONDS,
+                    )
                     self._release_climb_up()
                     self._climb_state = ClimbState()
                     self._return_mode = None
@@ -15080,6 +15667,11 @@ class MovementWorker(threading.Thread):
         action is active, so it can never fight a climb/drop/return.
         """
 
+        if not self._world_y_trusted():
+            # The origin has no marker-confirmed anchor right now; only
+            # ``_confirm_world_y_anchor`` (a marker-confirmed landing) may set it,
+            # so a drifting value must not be re-anchored from a belief.
+            return
         if (now - self._last_world_drift_check
                 < self.world_drift_check_interval_seconds):
             return
@@ -15111,12 +15703,31 @@ class MovementWorker(threading.Thread):
             return
         gap = abs(self._raw_world_y - expected)
         if gap >= self.world_drift_reanchor_threshold:
+            if (now - self._world_drift_window_started
+                    > WORLD_DRIFT_WINDOW_SECONDS):
+                self._world_drift_window_started = now
+                self._world_drift_reanchors = 0
+            self._world_drift_reanchors += 1
+            if self._world_drift_reanchors > WORLD_DRIFT_MAX_REANCHORS:
+                self._note_world_y_untrusted(
+                    f"the world-Y origin needed {self._world_drift_reanchors} "
+                    "drift re-anchors inside "
+                    f"{WORLD_DRIFT_WINDOW_SECONDS:.0f}s while the character "
+                    "stood on its 桩"
+                )
+                return
             LOG.warning(
                 "WORLD-Y DRIFT: raw worldY %.6f is %.3f away from the %s "
-                "anchor at x=%.4f; re-anchoring",
+                "anchor at x=%.4f; re-anchoring (%d/%d in %.0fs)",
                 self._raw_world_y, gap, floor, observation.player.x,
+                self._world_drift_reanchors, WORLD_DRIFT_MAX_REANCHORS,
+                WORLD_DRIFT_WINDOW_SECONDS,
             )
-            self._reanchor_tracker_to_current_layer(observation)
+            # Strict: this floor is only BELIEVED (an in-band marker), so a
+            # correction of a floor or more is refused and the world value is
+            # marked untrusted instead - writing it would put the coordinate
+            # outside every recorded band and every floor would read unresolved.
+            self._reanchor_tracker_to_current_layer(observation, strict=True)
 
     def _note_fall_floor_candidate(self, floor: str) -> None:
         """Keep the lowest trustworthy outside-route floor seen in a fall."""
@@ -16286,7 +16897,10 @@ class MovementWorker(threading.Thread):
                     restart_timer=False,
                 )
             if self.stationary_delayed_return_enabled:
-                delay_seconds = random.uniform(1.0, 3.0)
+                delay_seconds = random.uniform(
+                    STATIONARY_DELAYED_RETURN_MIN_SECONDS,
+                    STATIONARY_DELAYED_RETURN_MAX_SECONDS,
+                )
                 self._stationary_return_pause_until = time.monotonic() + delay_seconds
                 LOG.info(
                     "STATIONARY RETURN: delaying movement %.2fs before returning to 桩; "
@@ -17750,11 +18364,50 @@ class MovementWorker(threading.Thread):
             structure_confidence=max(observation.structure_confidence, 1.0),
         )
 
+    def _world_floor_gap(self, layer_name: str) -> Optional[float]:
+        """Distance in world units from ``layer_name`` to its nearest neighbour.
+
+        This is the only world-Y quantity that is stable across sessions: the
+        absolute values depend on the session's scroll origin and on the canvas
+        the tracker is normalising against (his recording holds one floor with
+        points in 146x114 and 148x128), while the SPACING between two floors is
+        map geometry.
+        """
+
+        layer = self.important_positions.get(layer_name)
+        if not isinstance(layer, dict) or "layer_world_y" not in layer:
+            return None
+        try:
+            anchor = float(layer["layer_world_y"])
+        except (TypeError, ValueError):
+            return None
+        gaps = []
+        for name, other in self.important_positions.items():
+            if name == layer_name or not isinstance(other, dict):
+                continue
+            try:
+                gaps.append(abs(float(other["layer_world_y"]) - anchor))
+            except (KeyError, TypeError, ValueError):
+                continue
+        gaps = [gap for gap in gaps if gap > 1e-9]
+        return min(gaps) if gaps else None
+
     def _reanchor_tracker_to_layer(
         self,
         layer_name: str,
         observation: Optional[MinimapObservation] = None,
-    ) -> None:
+        *,
+        strict: bool = False,
+    ) -> bool:
+        """Point the world-Y origin at this floor's recorded anchor.
+
+        ``strict`` is the cruising drift watchdog: there the floor is only
+        *believed* (an in-band marker), so the origin may only be nudged by less
+        than one floor.  A larger correction means the belief is wrong - the
+        world value is marked untrusted and the marker decides the floor, instead
+        of writing an origin outside every recorded band (log 11:24).
+        """
+
         layer = self.important_positions.get(layer_name, {})
         canonical = _layer_world_anchor_at_x(
             layer,
@@ -17762,17 +18415,39 @@ class MovementWorker(threading.Thread):
              if observation is not None and observation.player is not None
              else None),
         )
+        limit: Optional[float] = None
+        if strict:
+            gap = self._world_floor_gap(layer_name)
+            if gap is not None:
+                limit = gap * WORLD_REANCHOR_MAX_FLOOR_FRACTION
         reanchor = getattr(self.structure_tracker, "reanchor_world_y", None)
         if canonical is not None and callable(reanchor):
-            reanchor(canonical)
-            return
+            try:
+                applied = reanchor(canonical, max_correction=limit)
+            except TypeError:
+                # A tracker without the limit accepts every correction.
+                applied = reanchor(canonical)
+            if applied is False:
+                raw = self._raw_world_y
+                distance = (
+                    abs(canonical - float(raw)) if raw is not None else 0.0
+                )
+                self._note_world_y_untrusted(
+                    f"the world-Y anchor for {layer_name} was {distance:.3f} "
+                    "away, more than one floor allows"
+                )
+                return False
+            return True
         start_session = getattr(self.structure_tracker, "start_session", None)
         if canonical is not None and callable(start_session):
             start_session(canonical)
+            return True
+        return False
 
     def _reanchor_tracker_to_current_layer(
-        self, observation: Optional[MinimapObservation] = None
-    ) -> None:
+        self, observation: Optional[MinimapObservation] = None,
+        *, strict: bool = False,
+    ) -> bool:
         floor = self._current_route_floor()
         # During a return climb the route index can still describe the stale
         # pre-fall floor (out-of-route floors never re-index it), so the
@@ -17793,7 +18468,97 @@ class MovementWorker(threading.Thread):
             elif self._return_from_floor is not None:
                 floor = self._return_from_floor
         if floor is not None:
-            self._reanchor_tracker_to_layer(floor, observation)
+            return self._reanchor_tracker_to_layer(
+                floor, observation, strict=strict,
+            )
+        return False
+
+    def _stationary_delayed_return_pause_active(self) -> bool:
+        """True while the 延时回桩 delay keeps MOVEMENT paused.
+
+        The pause exists to let the character stand still for 1-2 s after a
+        knockback before it walks back to the 桩.  It must hold the movement
+        decision only: it publishes no key of its own, so attacks, buffs and
+        potions cannot be swallowed by it (both pause sites log exactly that -
+        "attacks/buffs/potions remain active").  The shared motion-busy event is
+        therefore NOT raised for it; raising it stopped the fixed cadence, the
+        motion arbiter (buff/skill taps) and 小碎步 for the whole delay - the
+        operator's "延时回桩 seem to stop all workers".
+        """
+
+        until = self._stationary_return_pause_until
+        return bool(until > 0.0 and time.monotonic() < until)
+
+    def _stationary_off_anchor_exclusive(
+        self, anchor: Optional[Point], player: Optional[Point],
+    ) -> bool:
+        """Whether the 站桩 recovery must own the shared motion-busy event.
+
+        One place decides it, so the delayed-return pause can be excluded
+        explicitly instead of being folded into "the marker is off the 桩".
+        """
+
+        if not self.stationary_attack_enabled or anchor is None:
+            return False
+        if self._stationary_timed_patrol_route_walking():
+            # The timed patrol stage walks away from the stake on purpose: the
+            # anchor zone, the readiness check and the pickup-phase flag all
+            # describe "站桩 recovery", which would otherwise hold the whole
+            # route attack-free.  While the route is simply walking, the
+            # cadence must behave like normal patrol.
+            return False
+        if self._stationary_delayed_return_pause_active():
+            # 延时回桩: standing still by design - movement only.
+            return False
+        anchor_layer = (
+            self._stationary_route_anchor_layer
+            or self._stationary_ui_anchor_layer
+        )
+        player_on_anchor_layer = bool(
+            player is not None
+            and (
+                (anchor_layer is not None
+                 and self._layer_band_contains(anchor_layer, player.y))
+                or abs(anchor.y - player.y)
+                <= STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE
+            )
+        )
+        player_in_stationary_attack_zone = bool(
+            player_on_anchor_layer
+            and player is not None
+            # The SAME window the movement decision uses to call the marker
+            # settled (``_stationary_anchor_x_accepted``: +/-0.015, or the 范围桩
+            # blur zone, shifted toward the facing).  This used to be the raw
+            # symmetric ``STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE`` (0.030),
+            # which disagrees with that window in a 1.1-px band on the
+            # facing-far side: the marker was ACCEPTED (decision: "attack
+            # [steady]") while this gate still called it off the 桩 and raised
+            # the shared motion-busy event - the character stood with no attack
+            # and no walk.  Field log 16:22:08-16:22:13: marker x=0.390351,
+            # 桩 x=0.425439 (|dx|=0.0351, inside 范围桩's 0.0375 side) and six
+            # seconds of "attack skipped: movement recovery/action input is
+            # active" while the decision kept printing action=attack.
+            and self._stationary_anchor_x_accepted(anchor.x, player.x)
+        )
+        return bool(
+            # A route climb/drop is always exclusive, including its idle
+            # observations between physical key presses.
+            self._return_mode is not None
+            # Returning from another layer or walking toward the stake's resting
+            # window is not allowed to attack.  Only a marker the decision calls
+            # settled may use the attack-bearing arbiter correction motions.
+            or not player_in_stationary_attack_zone
+            # Being inside the final zone is not enough: a pending anchor step or
+            # the opposite-side facing tap owns its own attack.  Hold the normal
+            # cadence until fresh marker reads confirm the standing position and
+            # requested facing, otherwise both paths race for the arbiter and can
+            # look like a character freeze.
+            or player is None
+            or not self._stationary_attack_ready_for_player(anchor, player)
+            # A recorded jump point or a climb owns the keyboard for the frame
+            # it fires, so a cadence beat must not land on top of it.
+            or self._stationary_timed_patrol_input_busy()
+        )
 
     def _log_detected_layer(
         self,
@@ -18702,67 +19467,16 @@ class MovementWorker(threading.Thread):
                     active_target_x = None
                 climb_decision_active = decision.key in (
                     "climb", "jump_climb_left", "jump_climb_right",
-                    "jump_climb_up", "drop", "stationary_jump",
+                    "jump_climb_up", "drop", "stationary_jump", "stationary_drop",
+                    "stationary_rope_jump_left", "stationary_rope_jump_right",
                 )
                 anchor = self._stationary_attack_anchor
                 player = observation.player
-                anchor_layer = (
-                    self._stationary_route_anchor_layer
-                    or self._stationary_ui_anchor_layer
-                )
-                player_on_anchor_layer = bool(
-                    anchor is not None
-                    and player is not None
-                    and (
-                        (anchor_layer is not None
-                         and self._layer_band_contains(anchor_layer, player.y))
-                        or abs(anchor.y - player.y)
-                        <= STATIONARY_ATTACK_SAME_LAYER_Y_TOLERANCE
-                    )
-                )
-                player_in_stationary_attack_zone = bool(
-                    player_on_anchor_layer
-                    and player is not None
-                    and abs(anchor.x - player.x)
-                    <= STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE
-                )
-                stationary_recovery_exclusive = bool(
-                    self.stationary_attack_enabled
-                    and anchor is not None
-                    # The timed patrol stage walks away from the stake on
-                    # purpose: the anchor zone, the readiness check and the
-                    # pickup-phase flag all describe "站桩 recovery", which would
-                    # otherwise hold the whole route attack-free (the old
-                    # single-layer pickup was exclusive end to end).  While the
-                    # route is simply walking, the cadence must behave like
-                    # normal patrol - only its vertical input stays exclusive,
-                    # which the remaining terms and ``climbing_now`` below
-                    # already cover.
-                    and not self._stationary_timed_patrol_route_walking()
-                    and (
-                        # A route climb/drop is always exclusive, including
-                        # its idle observations between physical key presses.
-                        self._return_mode is not None
-                        # Returning from another layer or walking toward the
-                        # stake's final approach zone is not allowed to
-                        # attack.  Only the +/-0.03 X zone may use the
-                        # attack-bearing arbiter correction motions.
-                        or not player_in_stationary_attack_zone
-                        # Being inside the final zone is not enough: a
-                        # pending anchor step or the opposite-side facing tap
-                        # owns its own attack.  Hold the normal cadence until
-                        # fresh marker reads confirm the standing position and
-                        # requested facing, otherwise both paths race for the
-                        # arbiter and can look like a character freeze.
-                        or player is None
-                        or not self._stationary_attack_ready_for_player(
-                            anchor, player,
-                        )
-                        # A recorded jump point or a climb owns the keyboard for
-                        # the frame it fires, so a cadence beat must not land on
-                        # top of it.
-                        or self._stationary_timed_patrol_input_busy()
-                    )
+                # One decision, made in one place: whether the 站桩 recovery owns
+                # the shared motion-busy event (see the method for why the
+                # delayed-return pause must not).
+                stationary_recovery_exclusive = self._stationary_off_anchor_exclusive(
+                    anchor, player,
                 )
                 # This independent event gates fixed attacks only while the
                 # character is off-layer or returning to the 桩; its X
@@ -19375,6 +20089,32 @@ class MovementWorker(threading.Thread):
                         _send_tap(
                             self.key_sender,
                             MovementDecision("alt", decision.reason, decision.duration),
+                        )
+                    elif decision.key == "stationary_drop":
+                        # The 桩 is BELOW the marker: Alt+Down descends the
+                        # platform, exactly the chord the route's own drop path
+                        # uses.  A jump here would move the character further
+                        # away from its 桩 row.
+                        _drop_through_platform(
+                            self.key_sender,
+                            float(getattr(self, "drop_chord_hold_seconds", 0.10)),
+                        )
+                    elif decision.key in (
+                        "stationary_rope_jump_left", "stationary_rope_jump_right",
+                    ):
+                        # Rope rescue: the judged motions did not LAND the marker
+                        # on its row (it stayed put, or slid one row per press the
+                        # way a rope slide does), which means a rope is holding the
+                        # character above its 桩.  One direction + Alt chord (the
+                        # same simultaneous press the climb uses) leaves the rope,
+                        # then the Alt / Alt+Down attempts resume.
+                        direction = (
+                            "left" if decision.key.endswith("left") else "right"
+                        )
+                        _jump_up_chord_press(
+                            self.key_sender,
+                            (direction,) + tuple(self._jump_up_chord_keys),
+                            decision.duration,
                         )
                     else:
                         _send_tap(self.key_sender, decision)

@@ -32,7 +32,10 @@ the code into `助手配置\license_settings.json`. The client therefore opens a
 authorized; the same code does not have to be entered a second time. If that
 round trip fails (server unreachable, code already bound to another machine) the
 installation still completes and the completion dialog says to press 激活授权 with
-the same code.
+the same code. The machine's own hardware signals are read first, behind an 8 s
+readiness wait, and a `device_not_ready` verdict no longer refuses the write: the
+installer writes the server-signed document and the desktop re-verifies it on its
+first start.
 
 Standalone package:
 
@@ -44,7 +47,121 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
-The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, then installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, clears any other assistant instance that still holds the packaged files or the single-instance mutex, installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app through `MoonEclipse.exe`, then `launch_assistant.vbs`, then `启动助手.bat`, retrying once and logging the PID it started. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+
+### Current release behavior (v1.3.26 – v1.3.35)
+
+- **The installer activates a fresh PC like the desktop does.** `auth.json` is
+  seeded with the typed code and the server-issued device code, so the app opens
+  on 授权码 / 设备 instead of 未设置; `cim_identity.dat` is sealed at install
+  time; the entitlement is verified locally before it is written; and a
+  `BOUND_CODE` reply runs the desktop's two-phase 更换授权 instead of
+  dead-ending the install.  The machine's two hardware signals are read first,
+  with an 8 s readiness wait, and a `device_not_ready` verdict no longer refuses
+  the write: the installer writes the server-signed document anyway and the
+  desktop re-verifies it on first start.
+- **被撞反击 is live in 巡逻攻击 as well as 站桩/双桩**, and layer bands are a
+  symmetric 0.02 (`LAYER_BAND_VERSION` 4) instead of the 0.003 up / 0.0015 down
+  hairline: a marker drawn one minimap row high or low on the floor the
+  character is standing on stays inside that floor's band, so 开始巡逻 no longer
+  refuses with 不属于任何已录制楼层.
+- **站桩 recovery is measured in the marker's own rows and columns.** The
+  diamond is drawn at whole minimap pixels, so X can only advance one column at a
+  time (`1 / analysis_width`: 0.007692 on the operator's 130 px canvas,
+  0.006849 on the earlier 146 px one) and Y one row (`1 / analysis_height`).  The
+  resting window around a 桩 is therefore built from whole columns: ±0.015
+  shifted toward the selected facing by 0.0075, with each side forced to at least
+  one column, and the facing turn point snapped to 1.05 columns.  Before that the
+  near side was 0.0075 — narrower than the 0.007692 column — so the accepted
+  column could never be reached, the correction walked forever, and the X-stall
+  hand-over fired a false `jump left` on a one-column offset (17:49 log).
+- **A 桩 row one to five rows below is the same platform.** The drop needs
+  `STATIONARY_Y_DROP_MIN_ROWS` (6 rows): an Alt+Down on a shorter gap falls
+  through the platform (the 10:13 log turned a 3-row gap into a 14-row fall onto
+  layer1), so the character attacks from its row instead.  A 桩 above earns one
+  Alt per attempt, a real gap below earns Alt+Down, a motion that closes fewer
+  than 2 rows means "still on a rope" and after two of those one lateral
+  rope-rescue jump (at most 3, 1 s apart) leaves the rope.  The episode is capped
+  at 6 motions.
+- **The X correction hands the frame over instead of rewriting the same step.**
+  Three queued corrections that leave the marker on the same column open an 8 s
+  hand-over window in which the 桩 Y rule owns the decision (the 09:51 log spent
+  15 s on one column, correcting and attacking); when that episode is spent the
+  worker pauses 15 s and then starts one fresh bounded attempt, instead of
+  standing still for good.  A marker within 3 columns of its anchor never earns
+  that lateral jump: the offset is the diamond's own quantisation, and jumping it
+  knocked the character off its row (17:49: a 0.0077 offset, marker y 0.536458 →
+  0.463542, which restarted the whole return churn).
+- **范围桩** is the optional wide resting window (checkbox on the 延时回桩 row,
+  站桩 / 双桩 only).  It widens the half-window from 0.015 to 0.03, so a
+  knockback of one or two columns is simply "still at the 桩" and is not walked
+  back; each leg that really needs a walk draws ONE offset goal within ±0.03 of
+  the anchor and keeps it until the marker is accepted, so the character does not
+  return to the identical spot every time.  The window's centre always stays the
+  real anchor — centring it on the per-leg offset made the settled verdict random
+  from frame to frame (the 14:16 log drew 15 different targets in 4 s while the
+  marker sat still).
+- **延时回桩 is a 1.0–2.0 s movement-only pause and now covers a knockback
+  return as well as the 定时巡逻 circuit's return.**  No input gate is raised for
+  it, so the fixed cadence, buffs, potions and 小碎步 keep running (raising the
+  shared motion event, as the first build did, stopped all of them for the whole
+  delay).
+- **The attack gate and the movement decision now use one window.** The
+  AttackWorker is blocked by `stationary_recovery_active`, which
+  `_stationary_off_anchor_exclusive()` sets from the very
+  `_stationary_anchor_x_accepted()` test that decides `attack [steady]`.  A
+  symmetric 0.030 approach range used to be 0.0075 wider on the facing-far side,
+  so a marker the decision called settled kept the attacks blocked
+  (`attack skipped: movement recovery/action input is active` for six seconds in
+  the 16:22 log).
+- **The world-Y clock can no longer drift into another floor.** The two shift
+  estimators (reference and incremental) must agree within 0.35 diamond
+  (`ESTIMATOR_AGREEMENT_DIAMONDS`) before one may replace the other — the old
+  1.50 / 0.75 allowed a switch more than two floors apart — `reanchor_world_y()`
+  refuses a correction larger than one floor and logs the refusal, and a
+  cruising drift watch gives up (origin marked untrusted) after 2 re-anchors
+  inside 20 s.  The 11:24 log re-anchored +1.647 and then −1.602 while the
+  character stood still, which made every floor reading unresolved.
+- **The five-minute self-rescue sweep is retired** (operator: "retire this
+  feature").  Only the two immediate detections run — a patrol leg with no X
+  progress and a stationary marker that matches no recorded band — each still
+  verified by the left/right probe; the timer no longer probes a run it had
+  already handled, and after a probe that proved the character can move the
+  detector stays quiet for 15 s.
+- **An update restart can no longer be blocked by a second instance.** The
+  packaged helper enumerates every assistant instance (process names plus the
+  `startup_probe.py` command lines under the install root), waits for the
+  calling PID with a two-minute budget, stops the rest, waits up to 10 s for
+  none to remain, retries a locked file for 20 s, launches `MoonEclipse.exe` →
+  `launch_assistant.vbs` → `start_assistant.bat` / `启动助手.bat` with
+  `-PassThru`, judges that PID (the old single name scan reported "no MoonEclipse
+  process" while the app was alive), retries the launch once, and reports a real
+  failure in a popup that closes by itself.  A second instance held
+  `Local\TodoHelper.Singleton.v1`, so the fresh copy exited silently — that is
+  what "restart always failed" looked like.
+- **本地测谎 starts on this session's card, retries a bounded number of times,
+  and only probes the live deployment.** Selecting 本地测谎 waits up to 30 s for
+  a validated licence reply to deliver the CT card (`等待授权信息` while it
+  waits) instead of starting on a card an earlier session left behind; the
+  vendor's own start is a coin flip over its WS candidate list, so a failed
+  attempt retries after 3 s, the budget is 8 attempts, and exhaustion leaves
+  启动失败 rather than 启动中 for ever; the retired `221.10.121.69:44444`
+  deployment is dropped from `roi_track_servers` (in the package and at run
+  time), leaving only `117.50.223.113:8888`; a launcher wrapper's exit is no
+  longer a failure, and when the vendor process itself is gone the panel fails at
+  once with the vendor's own reason from `data\logs\client.log`.  The startup
+  budget is 90 s, and the panel sentence is one of
+  `等待授权信息 / 启动中 / 启动失败 / 启动成功`.
+- **A 本地测谎 test run needs a listening service.** `测试API` refuses with
+  `本地测谎服务未就绪，请启动后重试` while the panel says 等待授权信息, 启动中 or
+  启动失败, instead of opening a video against a backend that cannot answer.
+- **The panel hint line carries one 本地测谎 sentence, replaced rather than
+  appended.** The base text a label carries is remembered and the older
+  wordings are stripped as a whole, so a one-shot 钉钉 note can no longer grow
+  the line past its slot (the operator's "overflow hint") or print the service
+  state twice.
+- **`teach-assets/1.jpg` left the package.** The teaching viewer names its pages
+  in natural filename order, so the remaining pages still open in order.
 
 ### Current release behavior (v1.3.24)
 
@@ -1218,7 +1335,9 @@ The hover hint on the checkbox is the operator-facing warning: 建议在怪物�
 
 ### Position correction while standing
 
-站桩攻击 holds the recorded spot with one atomic motion per correction: a short direction hold — the tiny step inside the inner band, a longer walk when the character is further out — followed immediately by one attack. The attack belongs to the correction, so a correction can never be the moment a beat is lost; corrections repeat until the marker is back inside the arrival band (±0.006X), spaced by the arbiter's own correction reservation (**0.60 s**, shared with 被撞反击) rather than by the shorter 0.30 s re-request interval. A drift is always walked back: the character never settles a pixel or two away from its 桩. The small-step band ends at ±0.010X, and the correction spacing only spaces the corrections — it does not create a gap in which a beat is skipped.
+站桩攻击 holds the recorded spot with one atomic motion per correction: a short direction hold — the tiny step inside the inner band, a longer walk when the character is further out — followed immediately by one attack. The attack belongs to the correction, so a correction can never be the moment a beat is lost; corrections repeat until the marker is back inside its resting window, which is ±0.015 around the 桩 shifted 0.0075 toward the selected facing, with each side forced to be at least one marker **column** wide (the diamond quantises X to whole minimap pixels — see the v1.3.26 – v1.3.35 section). The correction target itself is always the real 桩. Spacing comes from the arbiter's own correction reservation (**0.60 s**, shared with 被撞反击) rather than from the shorter 0.30 s re-request interval, and that spacing only separates the corrections — it never creates a gap in which a beat is skipped. A drift is always walked back: the character never settles a pixel or two away from its 桩. Outside the last ±0.030X the character walks at normal speed, and only that final stretch uses the short, attack-carrying correction.
+
+**范围桩** (the checkbox on the 延时回桩 row, 站桩 / 双桩 only) widens that resting window to ±0.03, and each leg that genuinely needs a walk draws one offset goal inside it instead of returning to the identical spot. A knockback of one or two columns is then simply "still at the 桩" and is not answered with a walk. The window's centre remains the real anchor. When the corrections cannot move the marker at all — a rope — the decision hands the next frames to the 桩 Y rule and then pauses, instead of sending the same step and its attack for ever.
 
 When a normal return walk starts outside the final approach band, it first waits
 for an already-running attack animation to finish. Sending its initial Left or
@@ -1245,7 +1364,7 @@ Two related rules protect that motion:
 
 **定时巡逻** is available in 站桩模式 and 双桩模式. When its timer fires from a settled 桩, it borrows the selected recorded patrol route, patrols every route layer exactly once with the normal rope/jump/drop logic, then returns to the anchor layer and the nearest valid 桩. It sends no `Z` pickup input while moving. Its inclusive random interval is displayed in minutes (`每 … m`, 1.0m to 30.0m); persisted configuration and the movement worker continue to use seconds.
 
-**延时回桩** is available only in 站桩模式 and 双桩模式. After a 定时巡逻 circuit reaches the return layer and chooses its nearest valid 桩, it pauses movement for one random `1.0–3.0 s` delay before starting that return. This delay owns no input gate: normal attacks, buffs, and HP/MP items continue during it.
+**延时回桩** is available only in 站桩模式 and 双桩模式. After a 定时巡逻 circuit reaches the return layer and chooses its nearest valid 桩, it pauses movement for one random `1.0–2.0 s` delay before starting that return. A plain knockback that leaves the marker outside its resting window earns the same delay, so the character stands still for a moment before it walks back. This delay owns no input gate: normal attacks, buffs, and HP/MP items continue during it, and 小碎步 keeps its own cadence.
 
 ## Alerts and recovery
 
@@ -1331,6 +1450,13 @@ route input yields to the probe for at most 1.8 seconds. Therefore a rejected
 probe does not show `巡逻已停止`, does not enter `patrol-paused`, and does not
 turn a normal attack handoff into a misleading `wait` action. Only a confirmed
 stuck condition can proceed to the existing recovery path.
+
+The old five-minute sweep over `rescue_check_interval_seconds` is retired
+(operator: "retire this feature"). It could probe — blocking the attacks and
+walking the character left and right — for a run the immediate detections had
+already handled, or minutes after the character had recovered by itself. The
+only detections now are the two immediate ones above, and the timer survives
+only to bound their bookkeeping window.
 
 Every optional alert control has a hover explanation: **循环** raises an alarm
 when its remaining time reaches zero; **声音** plays the dingdong sound;
@@ -1655,7 +1781,9 @@ number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
-| `1.3.24` | `release/v1.3.24` | The 自动测谎 radio group and its armed flag are one selection: a disarmed row always shows 关闭, a 测谎-off disarm can no longer leave 云端测谎 selected, and 关闭 no longer rewrites the saved backend. |
+| `1.3.27` – `1.3.35` | — | 站桩 recovery in the marker's own rows and columns, 范围桩, 延时回桩 `1.0–2.0 s`, the world-Y floor guard, the retired five-minute rescue sweep, the multi-instance relaunch helper, the installer readiness wait, and the 本地测谎 start policy. **Untagged: the source is the commit that carries this document; the intermediate builds `1.3.27` – `1.3.34` were superseded and pruned.** |
+| `1.3.26` | — | Installer activation parity, 被撞反击 in 巡逻攻击, a healed 本地测谎 hint, and symmetric 0.02 layer bands. **Committed, untagged.** |
+| `1.3.24` | — | The 自动测谎 radio group and its armed flag are one selection: a disarmed row always shows 关闭, a 测谎-off disarm can no longer leave 云端测谎 selected, and 关闭 no longer rewrites the saved backend. **No tag exists for this version, so the exact source of the built package is not recoverable.** |
 | `1.3.23` | `release/v1.3.23` | The local 测谎 start distinguishes booting from refusal (booting reads 正在启动, a launcher exit reports its code), only one launcher at a time, and a leftover instance from the previous run is waited for instead of raced. |
 | `1.3.22` | `release/v1.3.22` | 时间药 split (饲料 / 补药 one-tap rows, 增益 1..4 double-tap), the measured endpoint table with a whole-list preflight, guarded licence heartbeat with a 75 s pending watchdog, turn-over attacks no longer waiting out the animation window, the axis-aware stall detector with the shipped 2.0 s window, and release-tooling repairs. |
 | `1.2.163` | — | 测试API button hidden again, and both auto-lie missing-credential hints removed. **Untagged: the working tree is not committed.** |
@@ -1821,10 +1949,17 @@ a card.
 * The app starts the service at launch when the folder ships and `8765` is not already
   listening (`local_lie_service.start_in_background`), and stops it at shutdown **only
   if the app started it** — a hand-launched instance survives.
-* The state is shown on the `图层校准与巡逻` hint line:
-  `本地测谎服务: 正在启动… / 已启动（127.0.0.1:8765）/ 已在运行 / 启动失败 - <原因>`.
-* The probe retries for ~10 s and re-probes every 10 s while not connected, because the
-  service validates its licence and handshakes the cloud *before* binding 8765.
+* The state is shown on the `图层校准与巡逻` hint line as exactly one sentence:
+  `本地测谎服务: 等待授权信息` (selected, but no validated reply of this session has
+  delivered the CT card yet), `本地测谎服务: 启动中`, `本地测谎服务: 启动失败`, or
+  `本地测谎服务: 启动成功` (127.0.0.1:8765 answers).
+* Selecting 本地测谎 waits up to 30 s for this session's validated heartbeat reply to
+  deliver the CT card before it starts anything; a card sitting in the service config
+  is used only when no reply arrives inside that window (an offline install), and the
+  log says so. The start itself waits up to 90 s — the vendor validates its monthly
+  card and handshakes the cloud before it binds 8765 — and a vendor process that exits
+  is reported at once with the vendor's own reason. A failed attempt retries after 3 s,
+  with a budget of 8 attempts before the panel settles on 启动失败.
 
 ### Reporting
 
@@ -1863,16 +1998,18 @@ header queue, so no extra statistics poll is made after a local pass.
 
 ### Troubleshooting: "本机未开通本地测谎服务"
 
-The panel hint has exactly three failure-free wordings and one failure wording:
+The panel hint carries exactly one of these sentences:
 
 | Hint | Meaning |
 | --- | --- |
+| `本地测谎服务: 等待授权信息` | 本地测谎 is selected, but no validated reply of this session has delivered a `CT_` card yet; nothing is started on a card an earlier session left behind |
+| `本地测谎服务: 启动中` | a launch is in flight (up to 90 s on the first start after an update) |
+| `本地测谎服务: 启动失败` | the vendor process refused, exited, or all 8 attempts failed — the panel quotes the vendor's own `data\logs\client.log` reason |
+| `本地测谎服务: 启动成功` | the service answers `/v1/health` on 8765 |
 | `本地测谎未开通` | the licence reply carried **no** `CT_` card, so the 本地测谎 radio is greyed, not clickable (label `本地测谎（未开通）`) and the service is deliberately not started |
-| `本地测谎启动失败` | a card did arrive, but the service never came up on 8765 (its own `data\logs\client.log` says why) |
-| `已启动` | the service answers `/v1/health` |
 | *(nothing)* | the selection is 关闭 / 云端测谎 |
 
-The first one is almost always a **server-side** state, not a client bug — the client
+`本地测谎未开通` is almost always a **server-side** state, not a client bug — the client
 reads `device.ct_card` from the heartbeat reply and starts the service the moment it
 appears. Work through it in this order:
 
@@ -1921,6 +2058,8 @@ appears. Work through it in this order:
 4. The client only learns the card from a **reply**: after any server-side change,
    restart MoonEclipse or press the caption ↻ refresh to force a heartbeat.
 
-The same rule applies to 测试API in 本地测谎: without a service on 8765 it fails with
+The same rule applies to 测试API in 本地测谎: `测试API` refuses with
+`本地测谎服务未就绪，请启动后重试` while the panel says 等待授权信息, 启动中 or 启动失败,
+and a call that still reaches the transport without a listening service fails with
 `http://127.0.0.1:8765 未就绪` and a message box — that is the card gate above, not the
 drill.

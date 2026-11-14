@@ -26,7 +26,56 @@ function Write-UpdateLog([string]$message) {
     Add-Content -LiteralPath $log -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $message" -Encoding UTF8
 }
 
-function Wait-ForTarget([int]$targetProcessId) {
+function Get-RunningAssistantIds([string]$installRoot) {
+    # EVERY assistant instance that can hold the singleton mutex or the packaged
+    # .pyd files, not just the one that asked for the update.  The helper used to
+    # wait for -TargetPid only; a second instance (left over from an earlier
+    # restart, or started by hand with 启动助手) then kept $root\endpoints_
+    # protected.pyd open - the 1.3.14/1.3.29 logs - and, worse, kept
+    # Local\TodoHelper.Singleton.v1, so the freshly started instance hit the
+    # singleton guard and exited silently ("restart failed", 1.3.33/1.3.34).
+    $ids = @()
+    foreach ($name in @("MoonEclipse", "TodoHelper", "MapleAssistant")) {
+        $ids += @(Get-Process -Name $name -ErrorAction SilentlyContinue |
+            ForEach-Object { [int]$_.Id })
+    }
+    # A source-layout install runs pythonw.exe startup_probe.py from this root.
+    # ``Get-Process`` objects expose no CommandLine, so ask CIM for those two
+    # names only (a whole-process WMI query would be needlessly slow here).
+    try {
+        $pythons = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction Stop)
+        foreach ($process in $pythons) {
+            $commandLine = [string]$process.CommandLine
+            if ($commandLine -and
+                    $commandLine -like "*startup_probe.py*" -and
+                    $commandLine -like ("*" + $installRoot + "*")) {
+                $ids += [int]$process.ProcessId
+            }
+        }
+    } catch {
+        Write-UpdateLog ("could not enumerate python processes: " + $_.Exception.Message)
+    }
+    return @($ids | Where-Object { $_ -and $_ -ne $PID -and $_ -ne $TargetPid } |
+        Sort-Object -Unique)
+}
+
+function Stop-RunningAssistants([string]$installRoot) {
+    $stopped = @()
+    foreach ($id in @(Get-RunningAssistantIds $installRoot)) {
+        try {
+            Stop-Process -Id $id -Force -ErrorAction Stop
+            $stopped += $id
+        } catch {
+            Write-UpdateLog ("could not stop pid " + $id + ": " + $_.Exception.Message)
+        }
+    }
+    if ($stopped.Count -gt 0) {
+        Write-UpdateLog ("stopped other assistant instance(s): " + ($stopped -join ","))
+    }
+    return $stopped
+}
+
+function Wait-ForTarget([int]$targetProcessId, [string]$installRoot) {
     # Two minutes: a patrol stop, a shutdown save and an antivirus scan of the
     # exiting image can all take a while, and giving up early meant the whole
     # update was abandoned with nothing installed.
@@ -40,14 +89,33 @@ function Wait-ForTarget([int]$targetProcessId) {
     throw "Timed out waiting for MoonEclipse to exit."
 }
 
+function Wait-ForNoAssistants([string]$installRoot, [int]$seconds = 10) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    do {
+        if (@(Get-RunningAssistantIds $installRoot).Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return (@(Get-RunningAssistantIds $installRoot).Count -eq 0)
+}
+
 function Show-OperatorMessage([string]$message) {
+    # The helper runs with CREATE_NO_WINDOW.  A BLOCKING MessageBox used to sit
+    # invisible behind the game (or after this process ended), so the operator
+    # only saw "the app closed and did not come back".  Log first, then show a
+    # message that gives up by itself.
+    Write-UpdateLog "MESSAGE: $message"
     try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        [System.Windows.Forms.MessageBox]::Show(
-            $message, "MoonEclipse update", 0, 16) | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        [void]$shell.Popup($message, 20, "MoonEclipse update", 48)
     } catch {
-        # No interactive desktop: the log is the only channel left.
-        Write-UpdateLog "MESSAGE (no window): $message"
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            [System.Windows.Forms.MessageBox]::Show(
+                $message, "MoonEclipse update", 0, 16) | Out-Null
+        } catch {
+            # No interactive desktop: the log is the only channel left.
+            Write-UpdateLog "MESSAGE (no window): $message"
+        }
     }
 }
 
@@ -68,6 +136,11 @@ function Find-PackageRoot([string]$stage, [string]$format) {
 }
 
 function Copy-Package([string]$source, [string]$destination) {
+    # A file the exiting/lingering assistant still maps (the packaged
+    # endpoints_protected.pyd is the one the field logs name) fails the whole
+    # copy.  Retry that file for a few seconds before giving up, so a slow
+    # unmapping never leaves the package half applied.
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
     Get-ChildItem -LiteralPath $source -Recurse -Force | ForEach-Object {
         $relative = $_.FullName.Substring($source.Length).TrimStart('\')
         if (-not $relative -or $relative -match '^(\.git|\.venv|work|node_modules)(\\|$)') { return }
@@ -83,9 +156,23 @@ function Copy-Package([string]$source, [string]$destination) {
         $target = Join-Path $destination $relative
         if ($_.PSIsContainer) {
             New-Item -ItemType Directory -Path $target -Force | Out-Null
-        } else {
-            New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
-            Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+            return
+        }
+        New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                Copy-Item -LiteralPath $_.FullName -Destination $target -Force -ErrorAction Stop
+                return
+            } catch {
+                $locked = $_.Exception.Message -match 'another process|使用|being used'
+                if (-not $locked -or [DateTime]::UtcNow -ge $deadline) {
+                    throw
+                }
+                if ($attempt -eq 1) {
+                    Write-UpdateLog ("retrying " + $relative + " while another process releases it")
+                }
+                Start-Sleep -Milliseconds 500
+            }
         }
     }
 }
@@ -138,7 +225,14 @@ try {
     Write-UpdateLog ("helper started mode=" + $Mode + " pid=" + $TargetPid +
         " root=" + $root + " format=" + $PackageFormat +
         " package=" + $(if ($PackagePath) { $PackagePath } else { "(none)" }))
-    Wait-ForTarget $TargetPid
+    Wait-ForTarget $TargetPid $root
+    # A second/lingering instance would keep the singleton mutex and the packaged
+    # .pyd files: the copy then failed with "file in use" and, later, the new
+    # instance exited silently on the mutex.  Clear the field before installing.
+    [void](Stop-RunningAssistants $root)
+    if (-not (Wait-ForNoAssistants $root 10)) {
+        Write-UpdateLog "WARNING: an assistant instance is still alive; the copy may fail with a locked file"
+    }
 } catch {
     Write-UpdateLog "FAILED: $($_.Exception.Message)"
     Show-OperatorMessage ("MoonEclipse did not exit, so the update was not installed." + [Environment]::NewLine +
@@ -245,56 +339,92 @@ if ($ConfigSource) {
 # instance, and closing it terminates the assistant ("I closed the cmd window
 # and the application closed").  The shipped launcher chain hides it, so the
 # helper's own start must hide it too.
-$started = ""
-foreach ($name in @("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe")) {
-    $candidate = Join-Path $root $name
-    if (-not (Test-Path -LiteralPath $candidate)) { continue }
-    try {
-        Start-Process -FilePath $candidate -WorkingDirectory $root -WindowStyle Hidden -ErrorAction Stop
-        $started = $name
-        break
-    } catch {
-        Write-UpdateLog "$name start failed: $($_.Exception.Message)"
-    }
-}
-$launcher = Join-Path $root "launch_assistant.vbs"
-if (-not $started -and (Test-Path -LiteralPath $launcher)) {
-    try {
-        Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", $launcher) -WorkingDirectory $root -WindowStyle Hidden -ErrorAction Stop
-        $started = "launch_assistant.vbs"
-    } catch {
-        Write-UpdateLog "launcher start failed: $($_.Exception.Message)"
-    }
-}
-if (-not $started) {
-    foreach ($name in @("start_assistant.bat")) {
-        $candidate = Join-Path $root $name
+function Start-Assistant([string]$installRoot) {
+    # Returns the pid of the instance that was started (0 when unknown).  The
+    # packaged executable is tried first, then the launcher chain the operator
+    # uses himself (启动助手.bat -> launch_assistant.vbs, which asks for
+    # elevation), then the batch file directly.
+    foreach ($name in @("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe")) {
+        $candidate = Join-Path $installRoot $name
         if (-not (Test-Path -LiteralPath $candidate)) { continue }
         try {
-            Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$candidate`"") -WorkingDirectory $root -WindowStyle Hidden -ErrorAction Stop
-            $started = $name
-            break
+            $process = Start-Process -FilePath $candidate -WorkingDirectory $installRoot `
+                -WindowStyle Hidden -PassThru -ErrorAction Stop
+            Write-UpdateLog ("restart launched via " + $name + " pid=" + $process.Id)
+            return [int]$process.Id
         } catch {
             Write-UpdateLog "$name start failed: $($_.Exception.Message)"
         }
     }
-}
-if ($started) {
-    Write-UpdateLog "restart launched via $started"
-    # An elevated launcher shows a UAC prompt first, so allow it time to appear
-    # before judging the start as failed.
-    Start-Sleep -Seconds 8
-    $alive = @(Get-Process -Name "MoonEclipse", "pythonw", "python" -ErrorAction SilentlyContinue)
-    if ($alive.Count -eq 0) {
-        Write-UpdateLog "WARNING: no MoonEclipse process 8s after the restart (UAC declined, or the new install cannot start)"
-    } else {
-        $aliveIds = ($alive | ForEach-Object { $_.Id }) -join ","
-        Write-UpdateLog "restart confirmed: pid=$aliveIds"
+    $launcher = Join-Path $installRoot "launch_assistant.vbs"
+    if (Test-Path -LiteralPath $launcher) {
+        try {
+            $process = Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", $launcher) `
+                -WorkingDirectory $installRoot -WindowStyle Hidden -PassThru -ErrorAction Stop
+            Write-UpdateLog ("restart launched via launch_assistant.vbs pid=" + $process.Id)
+            return [int]$process.Id
+        } catch {
+            Write-UpdateLog "launcher start failed: $($_.Exception.Message)"
+        }
     }
-} else {
+    foreach ($name in @("start_assistant.bat", "启动助手.bat")) {
+        $candidate = Join-Path $installRoot $name
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
+            $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$candidate`"") `
+                -WorkingDirectory $installRoot -WindowStyle Hidden -PassThru -ErrorAction Stop
+            Write-UpdateLog ("restart launched via " + $name + " pid=" + $process.Id)
+            return [int]$process.Id
+        } catch {
+            Write-UpdateLog "$name start failed: $($_.Exception.Message)"
+        }
+    }
+    return 0
+}
+
+function Test-AssistantAlive([string]$installRoot, [int]$startedPid, [int]$seconds = 8) {
+    # The old check scanned process NAMES once after 8 s and reported a false
+    # negative even while the operator's own instance was alive (21:57:00 log:
+    # "no MoonEclipse process" while pid 19496 had just started a helper).  Judge
+    # by the process this helper created, and accept ANY assistant process that
+    # started after the helper did.
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    do {
+        if ($startedPid -gt 0) {
+            $process = Get-Process -Id $startedPid -ErrorAction SilentlyContinue
+            if ($process) { return $true }
+        }
+        foreach ($name in @("MoonEclipse", "TodoHelper", "MapleAssistant")) {
+            $alive = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+            if ($alive.Count -gt 0) { return $true }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+$startedPid = Start-Assistant $root
+if ($startedPid -eq 0) {
     Write-UpdateLog "FAILED: no launcher could be started"
     Show-OperatorMessage ("MoonEclipse was not restarted: no usable launcher was found in " + $root + "." + [Environment]::NewLine +
         "Start MoonEclipse.exe from that folder and send update-helper.log to the developer.")
+} elseif (-not (Test-AssistantAlive $root $startedPid 8)) {
+    # The single-instance mutex or a startup failure can kill the fresh instance
+    # within a second, which used to be the end of it.  Retry through the same
+    # launcher chain once, then judge again.
+    Write-UpdateLog "WARNING: the restarted instance did not stay alive; retrying through the launcher once"
+    Start-Sleep -Seconds 1
+    $retryPid = Start-Assistant $root
+    if (Test-AssistantAlive $root $retryPid 10) {
+        Write-UpdateLog "restart confirmed after retry: pid=$retryPid"
+    } else {
+        Write-UpdateLog ("WARNING: no MoonEclipse process after the retry (UAC declined, or the new install cannot start); " +
+            "start it by hand with 启动助手.bat")
+        Show-OperatorMessage ("MoonEclipse was not restarted automatically." + [Environment]::NewLine +
+            "Start it with 启动助手.bat and send update-helper.log to the developer.")
+    }
+} else {
+    Write-UpdateLog "restart confirmed: pid=$startedPid"
 }
 if ($installFailure) {
     Show-OperatorMessage ("The update was NOT installed; the previous version is running again." + [Environment]::NewLine +

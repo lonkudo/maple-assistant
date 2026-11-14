@@ -436,6 +436,8 @@ The resolution order is: the separate inner-border detector's measurement (inclu
 
 Recorded points contain minimap-relative X/Y values. Layer recognition uses recorded Y anchors and asymmetric layer bands: the top of a layer is more tolerant than its confirmed base. World-Y tracking provides continuity between frames and is re-anchored only by explicit recovery logic, not by ordinary movement such as stepping onto a bench. A recorded `rope_pos` is a physical landmark: its normalised X/Y is passed through unchanged for the climb target. Unlike adaptable endpoints, it is never reprojected through a later canvas or diamond measurement, because that measurement can jitter and turn a correctly recorded rope into an unreachable air target.
 
+**The marker is quantised to whole minimap pixels.** The yellow diamond is drawn at whole pixels of the measured canvas, so a normalised X can only take values one **column** apart — `1 / analysis_width` (0.007692 on the operator's 130 px canvas, 0.006849 on the earlier 146 px one) — and Y one **row** (`1 / analysis_height`: 0.008772 at 114 px, 0.007143 at 140 px). Any rule that asks "did it move" finer than a column or a row is measuring the drawing, not the character: a 站桩 resting window whose near side was 0.0075 could never accept the 0.007692 column next to the anchor, and an X-stall epsilon of 0.003 (0.39 of a column) "proved" a stall on a marker that had advanced a whole one. `_layer_marker_row()` and `MovementWorker._stationary_marker_column()` therefore read the row and the column from the recorded `coordinate_v2.recorded_layout` of the layer in question, with the historical constants (`STATIONARY_MARKER_ROW_REFERENCE` 0.008772, `STATIONARY_ATTACK_FACING_ZONE_SHIFT` 0.0075) only as fallbacks, and every 站桩 window, turn point and stall epsilon is built from those two values.
+
 Each layer may also own X-sorted, immutable directional jump points. A point records X, Y, and either left or right travel direction. During a horizontal leg, the direction must match the leg. During an active rope climb, either directional record may be selected if the marker matches its X/Y window: the recorded direction is only a preference there (it breaks a tie when a 左跳 and a 右跳 sit at the same height), because a climb has no horizontal leg to compare against. Gating a rope point on the direction the character happened to *walk in* to the rope made a point recorded as a right jump invisible during a return climb that approached from the right — the rope jump point that never fired. The matching policy is intentionally asymmetric: X is ±0.010, while Y is ±0.020 to accommodate vertical rope movement. A matched point is marked passed only after the dedicated jump worker accepts it.
 
 `PatrolController` also stores global X-sorted split points and layer-owned flower and skill
@@ -466,6 +468,7 @@ Patrol has these core rules:
 - The assistant can start on any layer. It either patrols that layer or follows the recorded route back into range.
 - Crossing a recorded endpoint advances the route phase only after the intended direction reaches or passes its target.
 - A return drop ends on landing evidence read from the marker, never on the world-Y tracker: the marker's own recorded band, or — when the landing is away from the recorded row and therefore matches no band — the at/below-bottom-floor and bounded nearest-floor answers ordinary patrol already uses. Those answers are computed over **every recorded floor** (`_landing_candidate_layers()`), not only the patrol range: with a single-floor range the floor a descent is aimed at is otherwise not even a candidate. Both relaxed answers require an Alt+Down chord to have really moved the marker down by at least `RECONNECT_DROP_Y_PROGRESS` (0.015) and the reading to hold for two consecutive settled frames, so a character falling *through* a floor is never read as landed. The world-Y tracker is excluded here because at a fresh start above the route its origin is anchored to the route's top floor while the character is still above it.
+- The world-Y tracker is guarded against its own drift (v1.3.35). The two shift estimates (against the stored reference and against the previous frame) must agree within `ESTIMATOR_AGREEMENT_DIAMONDS = 0.35` diamond before one may replace the other — the previous 1.50 / 0.75 allowed a silent switch more than two floors apart. `reanchor_world_y()` refuses a correction larger than `WORLD_REANCHOR_MAX_FLOOR_FRACTION` (one floor) and logs the refusal, because such a correction means the floor belief is wrong and writing it puts the coordinate outside every recorded band. `_world_drift_check()` re-anchors a cruising drift (strict, so refused when a floor or more) at most `WORLD_DRIFT_MAX_REANCHORS` (2) times per `WORLD_DRIFT_WINDOW_SECONDS` (20 s) and then marks the origin untrusted instead of trusting a belief. Evidence: the 11:24 log re-anchored +1.647 and then −1.602 while the character stood still at its 桩, after which every floor read unresolved and the unresolved-floor recovery started pressing Alt+Down.
 - A marker that matches **no recorded floor at all** is an unresolved floor, and the worker changes layer deliberately instead of walking it (`_unresolved_floor_drop_decision()`). It arms after four settled frames, presses Alt+Down, and after two chords without downward progress walks to the nearer outer side (X > 0.5 → left, X < 0.5 → right) for 5 s, then the opposite side, resuming the chords whenever a walk produces a descent; it stops after 3 edge cycles or 12 chords. Placement matters: the check runs after `route-complete` and before `stationary-attack`, so it preempts the anchor/patrol walking an unresolved reading would otherwise produce. It is gated on real vertical owners only — `_return_mode`, `_descending_to_first`, `_climb_state.up_held`, a jump-point Up claim, the reconnect drop recovery (and only while its `drop-to-route` return is running), a pickup leg, and a pending post-reconnect route check — and `_unresolved_drop_blocker()` names the owner in the log. `_climb_state.phase` is deliberately *not* a gate: a completed rope attempt leaves the phase non-idle after Up was released, and treating that bookkeeping as a climb kept the recovery from ever running.
 - Vertical ownership claims are dropped together with the physical key. `_forget_up_claims()` clears `_climb_state.up_held` and the whole jump-point session, and `_release_stuck_keys()` calls it immediately after its forced key-ups — the Start Patrol, confirmed-fall and global `INPUT RESET` paths all pass through there. `_begin_jump_point_pass()` refuses to inherit a claim from the previous pass, and `_jump_point_session_expired()` releases a jump-point claim that produced no landing, no handoff and no rising marker after `JUMP_POINT_SESSION_MAX_SECONDS` (3 s). A claim that outlives its key is what replaced every later rope climb with `action=wait (recorded directional jump point owns Up; waiting for landing)`.
 - Rope jumps have no patrol-start grace (v1.2.280). Standing inside the rope band means the mount jump is the wanted action; the old three-second "do not jump onto the rope the character happens to start next to" hold cost three seconds of every Start Patrol at a rope and left the attack blocked for the same window. The stair-jump stall detector keeps its own start grace, because a character that has not moved yet is not one stuck at a stair.
@@ -492,12 +495,15 @@ endpoint gate a long patrol pause.
 Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
 
 Self-rescue uses a private `MovementWorker` ownership gate rather than the
-shared `PatrolController`. A suspected stall is first verified after 25
-near-unchanged captures (about 5.0 seconds at 5 FPS): attacks are blocked for
-2.0 seconds while the rescue worker performs a 700 ms Right nudge, waits
-200 ms for a fresh marker, then performs a 700 ms Left nudge and another
-200 ms marker settle. A marker X displacement of at least 0.006 rejects the
-rescue; no drop or route restart is allowed. The maximum probe is 1.8 seconds.
+shared `PatrolController`. A suspected stall is verified after
+`rescue_stuck_frames` near-unchanged captures (the shipped 10 frames ≈ 2.0 s at
+5 FPS, see the stall rescue section): attacks are blocked for
+`rescue_probe_attack_block_seconds` (2.0 s) while the rescue worker presses Right
+for two sampled frames, waits for a fresh marker, then Left for two sampled frames
+(`RESCUE_STALL_PROBE_FRAMES = 2`, `RESCUE_STALL_PROBE_FRAME_SECONDS = 0.20`). A
+marker X displacement of at least 0.006 rejects the rescue; no drop or route
+restart is allowed. The probe is bounded to 1.8 seconds, and a rejected probe
+leaves the detector quiet for `RESCUE_PROBE_BACKOFF_SECONDS = 15`.
 
 While this private gate is active, the main movement loop continues to consume
 captures and publish `last_observation` for the probe, but skips ordinary
@@ -515,6 +521,79 @@ attached. The movement worker releases the stale Up claim and performs one
 `Alt+Left` persistent climb jump, then resumes normal attachment verification.
 This is deliberately earlier than the world-Y stall fallback and is suppressed
 at rope-top arrival, where a stationary marker is normal.
+
+### Stand-still attack and its recovery (v1.3.27 – v1.3.35)
+
+The 站桩 anchor is temporary: `_stationary_attack_anchor` is captured at a manual
+patrol start (and again when a dual post changes), so the recovery window is local
+to that anchor rather than to a recorded layer.
+
+**The X side owns position and facing.** `_stationary_anchor_x_accepted()` is the
+single resting window: ±`STATIONARY_ATTACK_X_TOLERANCE` (0.015) shifted toward
+the selected 朝向 by `STATIONARY_ATTACK_FACING_ZONE_SHIFT` (0.0075), with each side
+forced to be at least one marker column wide. Corrections always target the exact
+anchor, and `_stationary_facing_turn_x()` snaps the opposite-side turn point to at
+least 1.05 columns from it, so a turn point can never sit between two columns and
+be unreachable. **范围桩** widens the half-window to `STATIONARY_ATTACK_BLUR_ZONE`
+(0.03) and lets a leg that genuinely needs a walk draw one offset goal within
+±`STATIONARY_ATTACK_BLUR_ZONE × STATIONARY_ATTACK_BLUR_TARGET_JITTER` (0.03) of
+the anchor, kept until the marker is accepted; the window's centre stays the
+anchor, because centring it on the offset goal made the settled verdict random
+from frame to frame (the 14:16 log drew 15 targets in 4 s while the marker sat
+still).
+
+**The Y side is a bounded episode.** With X settled,
+`_stationary_y_recovery_decision()` compares the anchor row with the marker row: a
+gap within `max(STATIONARY_ATTACK_Y_TOLERANCE, STATIONARY_Y_EPISODE_MIN_ROWS rows)`
+is "back on the row" and resets the episode; anything larger on the anchor's own
+layer is handled by `_stationary_y_motion_decision()`. That rule sends the chord
+that points AT the anchor row (minimap Y grows downwards, so `gap_y > 0` means the
+桩 is BELOW the marker and earns Alt+Down, `gap_y < 0` means it is ABOVE and earns
+Alt), and it refuses Alt+Down when the gap is under
+`STATIONARY_Y_DROP_MIN_ROWS` (6 rows): one to five rows below is the same
+platform, and pressing Alt+Down there drops straight through it (the 10:13 log
+turned a 3-row gap into a 14-row fall onto layer1). A motion is judged by how much
+of the gap it closed — fewer than `STATIONARY_Y_PROGRESS_MIN_ROWS` (2 rows) counts
+as "still on a rope", and after `STATIONARY_Y_NO_PROGRESS_MAX` (2) of those
+`_stationary_rope_rescue_decision()` leaves the rope with one lateral direction+Alt
+chord, at most `STATIONARY_Y_ROPE_RESCUE_MAX` (3), alternating sides and paced 1 s
+apart. The episode is capped at `STATIONARY_Y_MOTION_MAX_ATTEMPTS` (6) motions;
+once it is spent the character attacks from where it stands until the marker is
+back on its row.
+
+**Walking is not always possible, and then the frame is handed over.**
+`_stationary_attack_decision()` counts queued corrections that leave the marker on
+the same column (the epsilon is one column). `STATIONARY_X_STALL_MIN_STEPS` (3) of
+them open an `STATIONARY_X_STALL_HANDOVER_SECONDS` (8 s) window during which
+`_stationary_stuck_handover_decision()` lets the 桩 Y rule own the frame — the only
+thing a character on a rope can answer — and, once that episode is spent too,
+`_stationary_stuck_quiet_decision()` pauses `STATIONARY_X_STALL_QUIET_SECONDS`
+(15 s) before one fresh bounded attempt, instead of correcting and attacking on
+one column for ever (the 09:51 log) or standing still for good. Inside
+`STATIONARY_STUCK_RESCUE_MIN_COLUMNS` (3 columns) of the anchor the hand-over never
+earns the lateral rescue jump: a vertical gap there is a row detail while the X
+offset is quantisation, and the 17:49 log shows what the jump did to a character
+standing 0.0077 from its anchor (`y 0.536458 -> 0.463542`, which restarted the
+whole return churn).
+
+**The attack gate is the same window.** `_stationary_off_anchor_exclusive()`
+decides whether the shared `stationary_recovery_active` event is raised, and that
+event is one input of `_AnyEvent action_motion_active` (beside `climbing_active`
+and `stair_jump_active`), which gates `AttackWorker`, `MotionArbiter` and
+`SmallStepWorker`. The gate therefore must use `_stationary_anchor_x_accepted()`:
+a symmetric `STATIONARY_ATTACK_FINAL_APPROACH_X_RANGE` (0.030) is 0.0075 wider
+than the acceptance window on the facing-far side, and in that band the decision
+printed `attack [steady]` while every beat was skipped as
+`movement recovery/action input is active` (the 16:22 log).
+
+**延时回桩 is a movement-only pause.** It is armed by the 定时巡逻 circuit's return
+(`_finish_return()` / `_begin_stationary_timed_patrol_return()`) and by
+`_stationary_attack_decision()` for an ordinary knockback, for one random
+`STATIONARY_DELAYED_RETURN_MIN_SECONDS` – `..._MAX_SECONDS` (1.0–2.0 s). It holds
+no input event: `_stationary_delayed_return_pause_active()` keeps the frame out of
+`_stationary_off_anchor_exclusive()`, so the fixed cadence, the buff arbiter,
+potions and 小碎步 keep running during it. Raising the shared motion event for it
+stopped all of them for the whole delay.
 
 ### Input, focus, and motion arbitration
 
@@ -676,7 +755,7 @@ point and a multi-point circuit moves vertically between distinct flower Ys. The
 routine starts only after attachment is confirmed, so a failed rope jump cannot start its timer or
 simulate a completed flower circuit.
 
-In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer. A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
+In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer (the window, facing shift, 范围桩 option and hand-over rules are in the stand-still attack section above). A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
 
 That facing tap is a 30 ms turn, deliberately as short as the tiny anchor step: it exists to turn the character, and a longer hold walks it out of the anchor band, after which the correction walks it back, turns it again and re-arms the facing — the face/walk twitch.
 
@@ -828,7 +907,7 @@ A diagnostic region is converted from captured-pixel coordinates to screen coord
 
 Each recorded layer row carries an axis band whose point menu (添加最左 / 添加绳索 / 添加最右 / 添加左跳 / 添加右跳) opens only on a **right click**. Left-clicking never opens the menu; it remains reserved for normal selection behavior. The menu itself is refused while patrol runs, because recording is locked then.
 
-One optional control deliberately uses its own unit: **定时巡逻** is a stand-still-mode timer in **minutes** (`每 … m`, 1.0m to 30.0m). The UI converts before publishing and after loading, while the backwards-compatible `stationary_pickup_interval_seconds` configuration and movement worker continue to use seconds. When it fires, `MovementWorker` temporarily borrows the validated full patrol route, limits each layer to one pass, and returns through the existing route recovery to the anchor layer. With `stationary_delayed_return_enabled`, reaching that return layer arms one `1.0–3.0 s` randomized movement-only pause before the final return; no climb/input event is held during that pause, so attack, buffs and HP/MP workers continue independently. The timed circuit owns movement only while active and sends no pickup key, so the ordinary stationary attack, dual-post choice, and all normal patrol modes remain independent.
+One optional control deliberately uses its own unit: **定时巡逻** is a stand-still-mode timer in **minutes** (`每 … m`, 1.0m to 30.0m). The UI converts before publishing and after loading, while the backwards-compatible `stationary_pickup_interval_seconds` configuration and movement worker continue to use seconds. When it fires, `MovementWorker` temporarily borrows the validated full patrol route, limits each layer to one pass, and returns through the existing route recovery to the anchor layer. With `stationary_delayed_return_enabled`, reaching that return layer arms one `1.0–2.0 s` randomized movement-only pause before the final return — and the same pause answers an ordinary knockback return in 站桩攻击. No climb/input event is held during it and `_stationary_delayed_return_pause_active()` keeps it out of `_stationary_off_anchor_exclusive()`, so attack, buffs, potions and 小碎步 continue independently. The timed circuit owns movement only while active and sends no pickup key, so the ordinary stationary attack, dual-post choice, and all normal patrol modes remain independent.
 
 The other-player 多等 delay is the mirror image of that rule: it is a **seconds** control (its validator accepts 0–1200 and `_normalized_player_channel_wait_seconds()` clamps to the same range), published as `player_channel_wait_seconds` and consumed by the movement worker in real seconds. A configuration written before the seconds UI stored whole minutes, so loading migrates it by ×60 rather than reading the old number as seconds — a stored five meant five minutes, and reading it as five seconds would have turned the operator's hand-over delay into a no-op. The field commits on blur and on an outside click, because clicking a label or a panel does not move Tk focus, and its hint text is rebuilt from the displayed value so the row never explains a different number than it shows.
 
@@ -976,6 +1055,19 @@ uses `/api/v1/activate` rather than the preview/confirm pair because the install
 before any heartbeat could re-anchor anything, and the tolerant device check
 (`binding_matches`) makes it accept a restored PC.
 
+**A brand-new PC waits for its own signals (v1.3.35).** `warm_device_identity(8.0)`
+re-reads the hardware signals until two of the three are available (MachineGuid,
+firmware UUID, motherboard serial) — a readiness wait that sends nothing to the server —
+and only then does the single activation attempt run. On a fresh machine the two CIM
+reads are PowerShell calls with a 4 s budget while the WMI providers are still starting
+and Defender is scanning the freshly copied package, so the first read often returned
+nothing and the install stopped at its very first step with `设备未就绪，稍后重试`. For
+the same reason a `device_not_ready` verdict no longer refuses the write: the local
+check needs those same signals, so its failure is not evidence against the document the
+server has just signed for the composite this process proved. The installer logs
+`local device check postponed` and writes the entitlement; the desktop re-verifies it on
+first start, where its own readiness schedule covers the same window.
+
 ### In-application update and restart (v1.2.302)
 
 The helper that installs an update lives in the INSTALL ROOT, so it belongs to the
@@ -1000,6 +1092,42 @@ close that gap:
    minutes, the launcher choice and the new PID are logged, and the copy skips
    `user_config.json` / `auth.json` / `cim_identity.dat` **by name** so a package
    template can never replace the live recording or the entitlement.
+
+**The helper now restarts into a clean field (v1.3.35).** Two field failures drove
+this rewrite: the copy aborted on `文件"E:\辅助\endpoints_protected.pyd"正由另一进程使用`
+while a second instance had the packaged files mapped, and after a restart the new
+copy exited **silently** because that instance still held
+`Local\TodoHelper.Singleton.v1` (the mutex guard makes a duplicate exit with code 0,
+with nothing on screen). The helper therefore:
+
+- enumerates every assistant instance, not just the one that asked:
+  `Get-RunningAssistantIds()` scans the `MoonEclipse` / `TodoHelper` /
+  `MapleAssistant` process names plus the `pythonw.exe`/`python.exe` command lines
+  that run `startup_probe.py` under the install root (CIM, because a
+  `Get-Process` object has no command line);
+- waits for the calling PID with the two-minute budget, then
+  `Stop-RunningAssistants()` terminates the rest and `Wait-ForNoAssistants()`
+  allows 10 s for the field to clear, logging `stopped other assistant instance(s): …`
+  and warning (instead of failing silently) when one survives;
+- retries a single locked file for 20 s in `Copy-Package()` before giving up, so a
+  slow unmap cannot leave the package half applied;
+- starts through `Start-Assistant()` with `-PassThru` and records the PID of the
+  process it actually created, then judges that PID in `Test-AssistantAlive()`
+  instead of scanning names once after 8 s (that scan reported
+  `no MoonEclipse process` at 21:57 while pid 19496 was alive);
+- retries the launch through the same chain once when the first instance dies, and
+  only then reports a failure — through `Show-OperatorMessage()`, which logs the
+  sentence and shows a WScript `Popup` with a 20 s timeout, because a blocking
+  `MessageBox` from a `CREATE_NO_WINDOW` helper stayed invisible behind the game;
+- logs `restart confirmed: pid=…` / `restart confirmed after retry: pid=…`, which
+  is the line to look for in `update-helper.log`.
+
+One deployment detail is deliberate: a **package update** runs the helper extracted
+from the package being installed (`update_core.extract_package_helper`, rule 2
+above), while the 重启 button's plain restart runs the copy already in the install
+root.  This rewrite therefore applies to every update that carries it, and to a
+plain restart only after such an update has been installed — copy
+`todohelper_update.ps1` into the install root by hand to fix a machine immediately.
 
 ### Server-managed release link (v1.2.292)
 
@@ -1093,7 +1221,7 @@ when it recorded an up jump point:
 - The climbing path keeps its own rule: a point already used in this pass is not
   re-fired from the rope it just grabbed.
 
-### Stall rescue (v1.2.290, thresholds v1.3.16)
+### Stall rescue (v1.2.290, thresholds v1.3.16, timer retired v1.3.35)
 
 `_rescue_stuck_check` measures progress from a **fixed anchor** (not from the previous
 frame, so slow walking is not a stall) and the axis it uses depends on the stage, because
@@ -1135,6 +1263,15 @@ probe also fires for a long attack animation, a buff or a knockback; that is
 accepted on purpose, since the probe aborts and only costs a pause — and after an
 aborted probe the detector stays quiet for `RESCUE_PROBE_BACKOFF_SECONDS = 15`, so a
 stationary fight cannot cost a probe (and an attack block) every two seconds.
+
+**The timer is retired (v1.3.35).** A scheduled sweep over
+`rescue_check_interval_seconds` no longer proposes a rescue (operator, 2026-08-15:
+"retire this feature"): it could block the attacks and walk a character that the two
+immediate detections above had already handled, or that had recovered by itself minutes
+earlier. That branch now only clears the bookkeeping (`_rescue_stuck_frames`,
+`_rescue_max_stuck`, `_rescue_off_route_*`) so the counters cannot describe a run that is
+minutes old; every confirmed stall still goes through the same probe and the same
+climb/jump recovery.
 
 ### Floor resolution (v1.2.290)
 
@@ -1419,6 +1556,36 @@ mapped through the crop, and a resize to 745×496 does not change that because
   Its reply callback only queues the additive usage document; `UiWorker` consumes the
   latest reply on the Tk thread and repaints the header, never touching widgets from
   the network thread.
+* start policy (v1.3.35): selecting 本地测谎 arms the supervisor, which waits up to
+  `CARD_REPLY_WAIT_SECONDS = 30` for a validated reply **of this session** to deliver
+  the CT card before it launches anything (panel: `本地测谎服务: 等待授权信息`). The
+  reply path `note_online_card()` re-enters `supervisor_set_active()`, so the arriving
+  card starts the service immediately; `apply_online_card()` calls `note_online_card()`
+  before every early return, because a config that already carried the same card made
+  the later call a no-op and the panel sat on 等待授权信息 until the radio was toggled.
+  If no reply arrives, a daemon re-check (`_schedule_card_wait_expiry`) starts the
+  service with the card already in the config and logs it, so an offline install still
+  works.
+* start budget and retries (v1.3.35): `START_WAIT_SECONDS = 90` covers the first start
+  after an update (339 MB of vendor files being scanned, card validation, WS
+  handshake); a failed attempt retries after `START_RETRY_FAST_SECONDS = 3` — the
+  vendor's own start is a coin flip over its hard-coded WS candidate list, so a
+  transient failure is expected — and `MAX_AUTO_START_ATTEMPTS = 8` attempts later the
+  supervisor gives up and leaves `启动失败` instead of looping `启动中`. The attempt
+  counter and the card wait are per-selection state and reset on a new selection, a new
+  card, or a service that answers. A launcher-script exit is not a failure (WScript may
+  hand off while the vendor process still boots); when the vendor process itself is
+  gone, `VENDOR_GONE_GRACE_SECONDS = 6` later the start fails at once and
+  `_vendor_log_reason()` quotes the vendor's own last `[ERROR]`/`[WARNING]` line from
+  `data\logs\client.log`. A new launch clears the `card_rejected` latch, so a staged
+  retry is not reported as a permanent refusal.
+* `normalize_roi_track_servers()` (v1.3.35) trims the vendor's `roi_track_servers` pool
+  in both `data\build_profile.json` and `_internal\CT\data\build_profile.json` to the
+  live deployment (`_live_endpoint_host()`), because the vendor's startup gate samples
+  that pool, probes the WS handshake of each sampled endpoint and aborts the whole start
+  with 坐标云启动握手失败 when they all fail. The shipped pool listed the retired
+  `221.10.121.69:44444` beside the live `117.50.223.113:8888`, so half of every sample
+  was dead. `package_local_service.ps1` applies the same trim at build time.
 
 `licensing._with_server_device()` is the single entry point for server-driven state: it
 stores `auto_lie.secret_key`, forwards the device document's `ct_card` to

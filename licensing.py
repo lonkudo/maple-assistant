@@ -567,6 +567,45 @@ def _cim_value_with_one_retry(class_name: str, property_name: str, signal_name: 
     return retry
 
 
+def warm_device_identity(seconds: float = 8.0, *, poll_seconds: float = 1.0) -> bool:
+    """Wait until at least two device signals are readable, up to *seconds*.
+
+    ``device_identity_for_request`` needs two of the three signals (MachineGuid,
+    firmware UUID, motherboard serial).  The two CIM reads are PowerShell calls
+    with a 4 s budget, which is generous for a warm machine and NOT generous for
+    the customer's first action on a brand-new PC: WMI providers are still coming
+    up and Defender is scanning the freshly copied package, so the first read
+    often returns nothing and every attempt then reports 设备未就绪.
+
+    This is a READINESS wait, not a retry of a request: it only re-reads the
+    hardware signals, logs each attempt, and returns False when the budget ends -
+    the caller then tells the operator to retry later.  The desktop's heartbeat
+    worker has its own readiness schedule; this exists for the installer, whose
+    single attempt is the customer's first impression.
+    """
+
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    attempt = 0
+    while True:
+        attempt += 1
+        components = machine_fingerprint_components(force_refresh=True)
+        if len(components) >= 2:
+            if attempt > 1:
+                SERVER_LOG.info(
+                    "device identity ready after %d read(s) (%d signal(s))",
+                    attempt, len(components),
+                )
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            SERVER_LOG.warning(
+                "device identity still incomplete after %d read(s) (%d signal(s)); "
+                "giving up - retry later", attempt, len(components),
+            )
+            return False
+        time.sleep(min(max(0.1, poll_seconds), remaining))
+
+
 def machine_fingerprint_components(*, force_refresh: bool = False) -> dict[str, str]:
     """Return hashed hardware signals suitable for a signed device binding."""
 
@@ -1609,6 +1648,7 @@ __all__ = [
     "ActivationTransferPreview", "activate", "activation_code",
     "activate_via_server", "preview_activation_transfer_via_server", "confirm_activation_transfer_via_server", "device_request_code", "document_from_activation", "machine_binding_from_request",
     "device_identity_for_request", "machine_fingerprint_components", "machine_fingerprint_hash",
+    "warm_device_identity",
     "has_sealed_fingerprint", "remember_boot_identity", "verify_document",
     "license_path", "public_key_path", "revoke_license", "runtime_root", "verify_license",
     "report_lie_event_via_server", "set_device_memo_via_server", "unbind_device_via_server", "validate_via_server",

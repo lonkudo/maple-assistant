@@ -2769,7 +2769,7 @@ class UiWorker(threading.Thread):
             self._stationary_delayed_return_controls = [delayed_return_button]
             delayed_return_hint = HoverTooltip(
                 delayed_return_button,
-                "等待1~3 秒再回桩点",
+                "等待1~2 秒再回桩点",
             )
             delayed_return_hint.set_enabled(True)
             self._bind_key_tooltips.append(delayed_return_hint)
@@ -2814,7 +2814,7 @@ class UiWorker(threading.Thread):
             self._random_rest_hint = random_rest_hint
             self._bind_key_tooltips.append(random_rest_hint)
 
-            # 模糊桩 shares this row too, directly after 随机休息.  Unlike 随机休息
+            # 范围桩 shares this row immediately after 延时回桩.  Unlike 随机休息
             # it only means something on a 桩, so its own gate is 站桩攻击 /
             # 双桩模式 (the row is greyed, never hidden, elsewhere).
             self._blurred_anchor_var = tk.BooleanVar(value=False)
@@ -2833,6 +2833,16 @@ class UiWorker(threading.Thread):
             blurred_anchor_hint.set_enabled(True)
             self._blurred_anchor_hint = blurred_anchor_hint
             self._bind_key_tooltips.append(blurred_anchor_hint)
+
+            # Keep all four optional return modifiers on one stable row.  Their
+            # construction order follows their dependencies, but their visual
+            # order is intentionally: 延时回桩 → 范围桩 → 跳反打 → 随机休息.
+            jump_counterattack_button.pack_forget()
+            self._random_rest_check.pack_forget()
+            self._blurred_anchor_check.pack_forget()
+            self._blurred_anchor_check.pack(side="left", padx=(8, 0))
+            jump_counterattack_button.pack(side="left", padx=(8, 0))
+            self._random_rest_check.pack(side="left", padx=(8, 0))
 
             step_row = ttk.Frame(stationary_options_row)
             self._small_step_options_row = step_row
@@ -7269,6 +7279,37 @@ class UiWorker(threading.Thread):
             return
         if self._api_test_busy():
             return
+        # A local drill may only start on a service that is LISTENING.  等待授权信息,
+        # 启动中 and 启动失败 are all "not ready", and a drill must never run (or be
+        # silently queued) on a backend that cannot answer: the operator is told to
+        # retry instead.  The 16:02 field log shows the previous behaviour - a test
+        # pressed while the panel said 启动失败 still opened the video.
+        if self._auto_lie_backend_is_local():
+            try:
+                import local_lie_service
+
+                state = str(local_lie_service.hint_state())
+            except Exception:  # noqa: BLE001 - retain normal test flow on import failure
+                state = "up"
+            if state == "no_card":
+                message = "本地测谎未开通"
+            elif state != "up":
+                message = "本地测谎服务未就绪，请启动后重试"
+            else:
+                message = ""
+            if message:
+                self._set_api_test_status(message)
+                LOG.info("试跑: refused, 本地测谎 hint_state=%s", state)
+                try:
+                    from tkinter import messagebox
+
+                    messagebox.showinfo(
+                        "测试本地测谎", message,
+                        parent=getattr(self, "_root", None),
+                    )
+                except Exception:  # noqa: BLE001 - status line is the fallback
+                    LOG.debug("local-lie readiness notice could not be shown", exc_info=True)
+                return
         video = self._ask_api_test_video()
         if video is None:
             return
@@ -12949,46 +12990,38 @@ class UiWorker(threading.Thread):
     # Kept as one named value because the operator has been explicit about it twice -
     # "grey it rather than switch me to 关闭" and then "still selectable, fix it".
     LOCAL_LIE_GREYED_STATE = "disabled"
+    # Every service sentence this line may have carried, old wording included, as
+    # one trailing run: "本地测谎: 启动中", "本地测谎服务: 正在启动…" (pre-fix builds),
+    # "本地测谎未开通", and any stack of them.  Matching the whole tail instead of
+    # an enumerated list of payloads is what keeps a leftover from an older build
+    # from surviving next to the new sentence.
+    LOCAL_LIE_HINT_SUFFIX = re.compile(
+        r"(?:\s*(?:本地测谎(?:服务)?[:：][^·\n]*|本地测谎未开通))+$"
+    )
 
     def _dingtalk_note_text(self) -> str:
-        """The ONE short 钉钉 state appended to the panel hint.
-
-        How to configure it lives in the panel tooltips, not here: repeating
-        "掉线、测谎、循环…" in this line as well made the same sentence appear
-        twice on screen.
-        """
+        """Return a one-shot 钉钉 change/result note, never startup state."""
 
         transient = str(getattr(self, "_dingtalk_note", "") or "")
         if transient:
-            # A test result is shown exactly once; the next tick reports the
-            # notifier's own state again.
+            # Configuration and test-send feedback stays visible until the next
+            # regular refresh.  Do not replace it with an idle 钉钉 status: the
+            # panel hint is reserved for active work, not startup clutter.
             self._dingtalk_note = ""
             return transient
-        notifier = getattr(self, "dingtalk_notifier", None)
-        status_text = getattr(notifier, "status_text", None)
-        if callable(status_text):
-            try:
-                state = str(status_text())
-            except Exception:  # noqa: BLE001 - hint only
-                state = ""
-            if state:
-                return f"钉钉消息: {state}"
-        if not getattr(self, "_dingtalk_webhook", ""):
-            return "钉钉消息: 未设置"
-        enabled = False
-        variable = getattr(self, "_telegram_enabled_var", None)
-        try:
-            enabled = bool(variable.get()) if variable is not None else False
-        except Exception:  # noqa: BLE001
-            enabled = False
-        return "钉钉消息: 已开启" if enabled else "钉钉消息: 已设置，未开启"
+        return ""
 
     def _refresh_panel_hints(self) -> None:
         """Write every 附加功能 status onto the ONE shared hint line.
 
-        Order is fixed (钉钉 first, then 定时下机) so the line never reorders
-        itself, and any previous notes are stripped before the new ones are
-        appended - no stacked, half-stale sentences.
+        Order is fixed (钉钉 first, then 定时下机, then 本地测谎) so the line never
+        reorders itself.  The BASE text belongs to whoever last wrote that label
+        (录制的引导句, 巡逻已停止。, …) and the notes are appended to it; the base is
+        remembered here, so a transient note (a one-off 钉钉 message) can never be
+        glued into the base and grow the line on later refreshes - which is what
+        pushed the text past the label's 40 px slot (the operator's "overflow
+        hint") and, together with the old sentence-splitting, printed the 本地测谎
+        state twice.
         """
 
         label = getattr(self, "_control_status", None)
@@ -12998,7 +13031,19 @@ class UiWorker(threading.Thread):
             current = str(label.cget("text") or "")
         except Exception:  # noqa: BLE001 - hint only
             return
-        base = current.split(self.DINGTALK_NOTE_SEP)[0].rstrip(" ·;；")
+        painted = getattr(self, "_panel_hint_painted", None)
+        if painted is not None and current == painted:
+            # Nothing else touched the label since our own last paint, so the
+            # base we recorded is authoritative.
+            base = str(getattr(self, "_panel_hint_base", "") or "")
+        else:
+            # Someone else wrote it (recording/licence messages): adopt that text
+            # as the new base, minus any service sentence and separator noise.
+            base = current
+        base = self.LOCAL_LIE_HINT_SUFFIX.sub("", base)
+        # A note that also appears in the middle (a consumed transient, or an
+        # older build's wording) must not survive inside the base either.
+        base = base.strip(" ·;；")
         notes = []
         dingtalk_note = self._dingtalk_note_text()
         if dingtalk_note:
@@ -13007,7 +13052,8 @@ class UiWorker(threading.Thread):
         if timed_note:
             notes.append(timed_note)
         # 本地测谎 service state (started with the app, stopped with it): the
-        # operator asked for this hint on the 图层校准与巡逻 panel.
+        # operator asked for this hint on the 图层校准与巡逻 panel.  ONE sentence,
+        # replaced as the state changes - never appended twice.
         service_note = self._local_lie_service_note()
         if service_note:
             notes.append(service_note)
@@ -13022,12 +13068,20 @@ class UiWorker(threading.Thread):
         self.last_dingtalk_status = dingtalk_note
         self.last_timed_logout_status = timed_note
         self._local_lie_service_hint_shown = service_note
-        text = self.DINGTALK_NOTE_SEP.join([base, *notes]) if base else \
-            self.DINGTALK_NOTE_SEP.join(notes)
+        # The first-panel guidance already ends in Chinese punctuation.  Joining
+        # its appended service state with " · " left a dangling-looking dot at
+        # the wrap boundary; reserve that separator for note-to-note joins.
+        text = (
+            f"{base} {self.DINGTALK_NOTE_SEP.join(notes)}"
+            if base and notes else (base or self.DINGTALK_NOTE_SEP.join(notes))
+        )
         try:
             label.configure(text=text)
         except Exception:  # noqa: BLE001 - a hint is cosmetic
             LOG.debug("面板提示: could not be painted", exc_info=True)
+            return
+        self._panel_hint_base = base
+        self._panel_hint_painted = text
 
     def _local_lie_service_note(self) -> str:
         """The 本地测谎 service sentence for the panel hint, or ""."""

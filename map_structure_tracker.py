@@ -48,6 +48,17 @@ from minimap_detector import MinimapDetection
 
 LOG = logging.getLogger(__name__)
 
+# The two independent shift estimates (against the stored reference and against
+# the previous frame) must agree to within a fraction of ONE floor before one may
+# replace the other.  Their unit is the yellow diamond, and on the operator's map
+# one diamond is about one world unit while his floors are 0.676 apart
+# (layer1 world 5.416667, layer2 world 4.741090).  The previous 1.50 / 0.75
+# thresholds therefore allowed a silent switch between estimates MORE THAN TWO
+# FLOORS apart: his 11:24 log re-anchored +1.647 and then -1.602 while the
+# character stood still at its 桩, which then made every floor reading
+# unresolvable and drove the unresolved-floor Alt+Down recovery.
+ESTIMATOR_AGREEMENT_DIAMONDS = 0.35
+
 
 @dataclass(frozen=True)
 class MapTrackingResult:
@@ -180,8 +191,10 @@ class MapStructureTracker:
                         not reference_valid
                         or incremental_response >= reference_response + 0.05
                         or (
-                            abs(reference_offset - self._previous_offset) > 1.50
-                            and abs(incremental_offset - self._previous_offset) < 0.75
+                            abs(reference_offset - self._previous_offset)
+                            > ESTIMATOR_AGREEMENT_DIAMONDS
+                            and abs(incremental_offset - self._previous_offset)
+                            < ESTIMATOR_AGREEMENT_DIAMONDS
                         )
                     )
                 )
@@ -249,16 +262,37 @@ class MapStructureTracker:
             self._last_sequence = -1
             self._last_result = None
 
-    def reanchor_world_y(self, anchor_world_y: float) -> None:
-        """Adjust only the world origin while preserving frame continuity."""
+    def reanchor_world_y(
+        self, anchor_world_y: float, *, max_correction: Optional[float] = None,
+    ) -> bool:
+        """Adjust only the world origin while preserving frame continuity.
+
+        ``max_correction`` bounds how far one re-anchor may move the origin.  A
+        correction larger than one floor means the FLOOR BELIEF is wrong, not the
+        tracker: writing it would destroy a correct reading and leave the world
+        coordinate outside every recorded band (log 11:24: re-anchored to 4.245660
+        and 3.648622 while the character stood still - both outside layer2's
+        ``[4.437, 5.045]``).  Such a correction is refused and reported as False so
+        the caller can fall back to the marker.
+        """
 
         with self._lock:
             anchor = float(anchor_world_y)
             if (self._last_result is None
                     or self._last_result.world_y_diamonds is None):
                 self._pending_anchor_world_y = anchor
-                return
+                return True
             correction = anchor - self._last_result.world_y_diamonds
+            if (max_correction is not None
+                    and abs(correction) > float(max_correction) + 1e-9):
+                LOG.warning(
+                    "MAP TRACKING world Y re-anchor REFUSED: %.6f -> %.6f "
+                    "needs a %+.3f correction, more than the %.3f one floor "
+                    "allows; the floor belief is suspect, keeping the tracker",
+                    self._last_result.world_y_diamonds, anchor, correction,
+                    float(max_correction),
+                )
+                return False
             self._world_bias += correction
             self._pending_anchor_world_y = None
             self._last_result = replace(
@@ -274,6 +308,7 @@ class MapStructureTracker:
                 anchor,
                 correction,
             )
+            return True
 
     def _marker_height_normalized(
         self,

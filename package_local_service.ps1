@@ -157,6 +157,53 @@ if ($configChanged) {
     Write-Host "local lie service: bundled ct_login_config.json already carries no partner card"
 }
 
+# The vendor's coordinate-cloud startup gate samples `roi_track_servers` from
+# data\build_profile.json and ABORTS the start ("坐标云启动握手失败，同行服务未启动")
+# when every sampled WS handshake fails.  The shipped profile lists TWO hosts:
+# 221.10.121.69:44444 (retired - the operator: "this server is stopped, we
+# shouldn't use it") and 117.50.223.113:8888 (live).  A pool with a dead half made
+# the first launch of 本地测谎 a coin flip on the one live host, and it also sent
+# each start's first handshake to a server that no longer exists.  The packaged
+# profile keeps only the live deployment; the desktop applies the same repair at
+# runtime (local_lie_service.normalize_roi_track_servers), so existing installs
+# are fixed too.  Ports and labels of the surviving entry are untouched.
+$liveHost = "117.50.223.113"
+foreach ($profileRelative in @("data\build_profile.json",
+                               "_internal\CT\data\build_profile.json")) {
+    $profile = Join-Path $target $profileRelative
+    if (-not (Test-Path -LiteralPath $profile -PathType Leaf)) {
+        continue
+    }
+    try {
+        $profileBytes = [System.IO.File]::ReadAllBytes($profile)
+        try {
+            $profileText = $strictUtf8.GetString($profileBytes)
+        } catch {
+            $profileText = [System.Text.Encoding]::Default.GetString($profileBytes)
+        }
+        $profileDoc = $profileText | ConvertFrom-Json
+    } catch {
+        throw "local lie service: $profileRelative is not valid JSON: $($_.Exception.Message)"
+    }
+    if ($profileDoc.PSObject.Properties.Name -contains "roi_track_servers") {
+        $pool = @($profileDoc.roi_track_servers)
+        $kept = @($pool | Where-Object { $null -ne $_ -and [string]$_.host -eq $liveHost })
+        if ($kept.Count -eq 0) {
+            $kept = @([pscustomobject]@{
+                host = $liveHost; ws_ports = @(8888); label = "华北"; region = "cn" })
+        }
+        if ($kept.Count -ne $pool.Count) {
+            $profileDoc.roi_track_servers = $kept
+            [System.IO.File]::WriteAllText(
+                $profile, ($profileDoc | ConvertTo-Json -Depth 8),
+                (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "local lie service: bundled $profileRelative roi_track_servers limited to $liveHost (retired hosts dropped)" -ForegroundColor Cyan
+        } else {
+            Write-Host "local lie service: bundled $profileRelative roi_track_servers already limited to $liveHost"
+        }
+    }
+}
+
 $mb = [math]::Round($bytes / 1MB, 1)
 if ($script:skippedTopLevelTxt -gt 0) {
     Write-Host "local lie service: $($script:skippedTopLevelTxt) vendor document(s) left out of the package (top-level .txt)" -ForegroundColor Cyan

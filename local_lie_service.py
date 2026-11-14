@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -38,13 +39,44 @@ BINARY_PATTERNS = (
 )
 # Readiness: licence validation + WS handshake happen before 8765 listens, which
 # takes ~20s cold, so the startup wait is generous but never blocks the UI.
-START_WAIT_SECONDS = 45.0
+# First launch after an update can unpack/scan the 339 MB service, validate the
+# card and finish its WS handshake before 8765 exists.  This runs only in the
+# background supervisor; 90 s keeps that genuine startup as 启动中 rather than
+# reporting a false failure.
+START_WAIT_SECONDS = 90.0
 PROBE_INTERVAL_SECONDS = 0.5
+# The vendor's own startup gate: it validates the monthly card, then locks its
+# built-in "221+117" WS candidate list, randomly probes two of those ports and
+# ABORTS the start when both handshakes fail ("坐标云启动握手失败，同行服务未启动").
+# One of those candidates (221.10.121.69:44444) is a retired deployment and 8888
+# can answer the HTTP router with 404, so a single attempt is a coin flip - the
+# 16:02 field log shows attempts 1 and 2 dying that way and attempt 3 succeeding.
+# Two consequences are handled here:
+#   * a start attempt whose vendor process has already exited is reported as a
+#     failure at once (not after the full 90 s budget), quoting the vendor's own
+#     reason from data\logs\client.log, and
+#   * the supervisor retries that coin flip a bounded number of times and then
+#     leaves the panel on 启动失败 instead of looping in 启动中 for ever.
+VENDOR_GONE_GRACE_SECONDS = 6.0
+MAX_AUTO_START_ATTEMPTS = 8
+# Retry gap after a start attempt that FAILED (the vendor aborted or its process
+# exited).  The probe the vendor runs costs ~2-4 s, so a short gap turns the coin
+# flip into a success within ~10-20 s instead of the 10 s supervisor cadence plus
+# a 90 s budget per attempt.  A healthy-but-slow boot still uses
+# ``SUPERVISE_INTERVAL_SECONDS`` because it never reaches this path.
+START_RETRY_FAST_SECONDS = 3.0
 # Pre-start supervision: how often the supervisor re-checks that 8765 answers.
 SUPERVISE_INTERVAL_SECONDS = 10.0
 # Startup supervision: a first launch can exit while the licence/WS are being
 # provisioned, so a service that is not listening is retried after this delay.
 RETRY_BACKOFF_SECONDS = 20.0
+# 本地测谎 must not start on information older than the current session: the card
+# in the vendor config may be a leftover.  The operator's rule (2026-11-13): wait
+# for a complete licence heartbeat, take the card from the reply, then start.  A
+# validated reply arms the service immediately; if none arrives within this
+# window the card already in the service config is used anyway (an offline start
+# must still work) and the log says so.
+CARD_REPLY_WAIT_SECONDS = 30.0
 # A service process from the previous app run can still hold 8765 for a moment
 # while it shuts down.  The start waits this long for it to answer or exit instead
 # of launching a second instance that the vendor binary would refuse.
@@ -107,6 +139,58 @@ def _probe() -> tuple[bool, str]:
 
 def is_running() -> bool:
     return _probe()[0]
+
+
+def _vendor_log_reason(root: Path) -> str:
+    """The vendor service's own last failure line, made panel-ready, or "".
+
+    The vendor aborts a start for reasons only its log knows (a rejected monthly
+    card, a coordinate-cloud handshake that failed on both probed ports).  Reading
+    that line is what lets the panel say WHY instead of a bare timeout - the 16:02
+    field log failed with "坐标云启动握手失败" while our side could only see "8765
+    did not answer".
+    """
+
+    path = Path(root) / "data" / "logs" / "client.log"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 65536), os.SEEK_SET)
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    reason = ""
+    for line in tail.splitlines():
+        if "[ERROR]" in line or "[CRITICAL]" in line:
+            reason = line
+    if not reason:
+        for line in tail.splitlines():
+            if "[WARNING]" in line:
+                reason = line
+    if not reason:
+        return ""
+    # Drop "[timestamp] [LEVEL] logger:" and keep the message.
+    for marker in ("[ERROR] ", "[CRITICAL] ", "[WARNING] "):
+        index = reason.find(marker)
+        if index >= 0:
+            reason = reason[index + len(marker):]
+            break
+    if ":" in reason:
+        head, _sep, rest = reason.partition(":")
+        if head and " " not in head and len(head) < 48:
+            reason = rest.strip()
+    reason = " ".join(str(reason).split())
+    return reason[:160]
+
+
+def _log_vendor_reason(root: Path, prefix: str) -> str:
+    """Log the vendor's reason once and return it ("" when the log is silent)."""
+
+    reason = _vendor_log_reason(root)
+    if reason:
+        LOG.warning("%s: %s", prefix, reason)
+    return reason
 
 
 def _service_pids(root: Path) -> list[int]:
@@ -281,15 +365,19 @@ def ensure_started(
             _state.update(
                 state="starting",
                 note="本地测谎服务正在启动（等待上一次启动完成）",
-                root=str(root), started_by_app=True,
+                root=str(root), started_by_app=True, card_rejected=False,
             )
             LOG.info(
                 "local lie service: launcher pid=%s is still booting; not starting "
                 "a second instance", booting_pid,
             )
             return False, str(_state["note"])
+        # A new launch is a new validation attempt.  A previous timeout or
+        # wrapper hand-off must not keep the panel at 启动失败 while this attempt
+        # is genuinely booting; a real new failure latches the flag again below.
         _state.update(state="starting", note="正在启动本地测谎服务…",
-                      root=str(root), started_by_app=True, pids=[])
+                      root=str(root), started_by_app=True, pids=[],
+                      card_rejected=False)
     LOG.info("local lie service: starting %s", root)
     # A service process left over from the previous app run (a slow shutdown, or the
     # instance the update replaced) still holds 8765 for a moment.  Launching on top
@@ -332,6 +420,15 @@ def ensure_started(
         normalize_auth_server(root)
     except Exception:  # noqa: BLE001 - a repair must never block the start
         LOG.debug("local lie service: auth URL normalization failed", exc_info=True)
+    # The vendor's coordinate-cloud startup gate samples ``roi_track_servers`` from
+    # data/build_profile.json and ABORTS the start when every sampled WS handshake
+    # fails.  That list still contains the retired 221.10.121.69:44444 deployment,
+    # so half of every pool is dead and the first launch is a coin flip on the one
+    # live host (16:02/16:04 field log).  Keep only the live deployment.
+    try:
+        normalize_roi_track_servers(root)
+    except Exception:  # noqa: BLE001 - a repair must never block the start
+        LOG.debug("local lie service: ROI-track server list repair failed", exc_info=True)
     # The updated package ships its template (placeholder) WS key; a start with that
     # text in the config fails the handshake and 8765 never listens, so it is
     # normalized to the package's own key first - whatever put the card there.
@@ -370,6 +467,14 @@ def ensure_started(
                 _state["card_rejected"] = True
         return False, str(_state["note"])
     _record_launch(process)
+    # ``启动_后台.vbs`` / ``launch_background.vbs`` is only a hand-off wrapper:
+    # WScript may exit successfully while the vendor executable is still
+    # unpacking, validating its card and opening 8765.  Its exit is therefore
+    # not evidence that the service failed.  A direct executable remains a
+    # real process failure and is still reported immediately below.
+    launched_via_script = any((root / name).is_file() for name in LAUNCHER_NAMES)
+    wrapper_exit_logged = False
+    vendor_gone_since: Optional[float] = None
     deadline = time.monotonic() + max(1.0, float(wait_seconds))
     while time.monotonic() < deadline:
         time.sleep(PROBE_INTERVAL_SECONDS)
@@ -382,7 +487,7 @@ def ensure_started(
                               started_by_app=True, card_rejected=False)
             LOG.info("local lie service: started (pid=%s, %s)", pids, note)
             return True, note
-        if process.poll() is not None:
+        if process.poll() is not None and not launched_via_script:
             # The launcher itself exited and 8765 never opened: the service
             # refused to start (licence/WS validation, or a port already taken by
             # a leftover instance).  That IS a failure, and it is reported with
@@ -403,6 +508,36 @@ def ensure_started(
                 code,
             )
             return False, str(_state["note"])
+        if process.poll() is not None and launched_via_script and not wrapper_exit_logged:
+            wrapper_exit_logged = True
+            LOG.info(
+                "local lie service: launcher script finished; the vendor service now "
+                "owns the start (waiting for it to open 8765)"
+            )
+        if process.poll() is not None and launched_via_script:
+            # The wrapper handed off, but the vendor process it started is the
+            # thing that must open 8765.  When it is gone too, the start has
+            # already failed and waiting the rest of the 90 s budget only keeps
+            # the panel at 启动中 (the 16:02 field log: the vendor died 4 s into
+            # the handshake and the panel stayed "启动中" for 90 s per attempt).
+            vendor_alive = bool(_service_pids(root))
+            if vendor_alive:
+                vendor_gone_since = None
+            else:
+                now = time.monotonic()
+                if vendor_gone_since is None:
+                    vendor_gone_since = now
+                elif now - vendor_gone_since >= VENDOR_GONE_GRACE_SECONDS:
+                    _clear_launch()
+                    reason = _log_vendor_reason(
+                        root, "local lie service: the service process exited during "
+                              "startup",
+                    )
+                    note = "本地测谎服务启动失败（服务进程已退出"
+                    note += f"：{reason}）" if reason else "）"
+                    with _lock:
+                        _state.update(state="failed", note=note)
+                    return False, note
     # Still booting.  A first start after a package update has to unpack/validate a
     # 339 MB vendor folder that Windows Defender is scanning at the same time, and
     # the service validates its monthly card and does a WS handshake before it
@@ -422,6 +557,8 @@ def ensure_started(
             wait_seconds, process.pid,
         )
         return False, str(_state["note"])
+    # The full startup budget elapsed and 8765 still did not answer.  This is a
+    # real failure whether the launcher was a script or the executable itself.
     # The licence server gave us a CT card and the service still refuses to listen:
     # its own log shows 启动月卡验票失败 for an unactivated card.
     rejected = has_online_card()          # read outside the lock (see _lock)
@@ -443,9 +580,68 @@ _supervisor_stop = threading.Event()
 # AND a CT_ card exists - it is never started blindly at launch.
 _desired_active = False
 _desired_root: Optional[Path] = None
+# Consecutive launch attempts the supervisor has spent since the selection was
+# (re)applied or the service last answered.  See MAX_AUTO_START_ATTEMPTS.
+_start_attempts = 0
+# When the 本地测谎 selection was applied, so the first start can wait for the
+# licence heartbeat instead of launching on the card an old session left behind
+# (CARD_REPLY_WAIT_SECONDS).
+_selected_at = 0.0
+
+
+def _card_from_reply() -> str:
+    """The CT card THIS session's licence reply delivered, or ""."""
+
+    with _lock:
+        if _state.get("card_denied"):
+            return ""
+        return str(_state.get("online_card") or "").strip()
+
+
+_heartbeat_wait_logged = False
+_card_wait_thread: Optional[threading.Thread] = None
+
+
+def _schedule_card_wait_expiry(root: Path, seconds: float) -> None:
+    """Re-check the selection once the heartbeat wait window has elapsed.
+
+    Without this the "wait for a complete heartbeat, then start" rule would leave
+    the service off for ever on a machine whose licence request never answers:
+    nothing else calls ``supervisor_set_active`` on a timer.  The thread is a
+    daemon and does nothing when the selection left 本地测谎 or a reply arrived.
+    """
+
+    global _card_wait_thread
+    with _lock:
+        if _card_wait_thread is not None and _card_wait_thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=_card_wait_expiry_job, args=(root, float(seconds)),
+            name="local-lie-card-wait", daemon=True,
+        )
+        _card_wait_thread = thread
+    thread.start()
+
+
+def _card_wait_expiry_job(root: Path, seconds: float) -> None:
+    if _supervisor_stop.wait(max(0.1, seconds)):
+        return
+    with _lock:
+        desired = _desired_active
+    if not desired:
+        return
+    if _card_from_reply():
+        # A reply arrived meanwhile; it has already started the service.
+        return
+    LOG.info(
+        "local lie service: the heartbeat did not deliver a CT card in time; "
+        "re-evaluating the start with the card already in the service config"
+    )
+    supervisor_set_active(True, root)
 
 
 def _supervisor_job(root, interval: float) -> None:
+    global _start_attempts
     first = True
     while not _supervisor_stop.is_set():
         try:
@@ -455,13 +651,59 @@ def _supervisor_job(root, interval: float) -> None:
                 else:
                     LOG.info("local lie service: 8765 stopped answering; "
                              "pre-starting it again")
-                ensure_started(root)
+                with _lock:
+                    attempts = int(_start_attempts or 0)
+                if attempts >= MAX_AUTO_START_ATTEMPTS:
+                    # The vendor's start is a coin flip over its own WS candidate
+                    # list; retrying it for ever is what left the panel reading
+                    # 启动中 (each attempt waited the full budget).  Stop here and
+                    # leave the honest failed state; a new selection, 激活测谎 or a
+                    # restart resets the counter.
+                    if not getattr(_supervisor_job, "_gave_up_logged", False):
+                        _supervisor_job._gave_up_logged = True  # type: ignore[attr-defined]
+                        LOG.warning(
+                            "local lie service: %d start attempts failed; giving up "
+                            "until 本地测谎 is reselected (the service's own reason is "
+                            "in data\\logs\\client.log)", attempts,
+                        )
+                    return
+                _supervisor_job._gave_up_logged = False  # type: ignore[attr-defined]
+                with _lock:
+                    _start_attempts = attempts + 1
+                attempt_number = attempts + 1
+                ok, note = ensure_started(root)
+                if not ok and not _supervisor_stop.is_set():
+                    # The vendor's start is a coin flip over its own hard-coded
+                    # WS candidate pool (221.10.121.69:44444 is a retired
+                    # deployment, so everything hinges on 117.50.223.113:8888
+                    # answering the WS handshake instead of its HTTP router).  A
+                    # failure is therefore expected to be transient: retry after a
+                    # short pause, and keep the panel on 启动中 while attempts
+                    # remain instead of flickering to 启动失败 and back.
+                    if attempt_number < MAX_AUTO_START_ATTEMPTS:
+                        with _lock:
+                            _state.update(
+                                state="starting",
+                                note=(f"启动未成功，正在重试（第 {attempt_number}/"
+                                      f"{MAX_AUTO_START_ATTEMPTS} 次）：{note}"),
+                            )
+                        LOG.warning(
+                            "local lie service: attempt %d/%d did not come up (%s); "
+                            "retrying in %.0fs", attempt_number,
+                            MAX_AUTO_START_ATTEMPTS, note, START_RETRY_FAST_SECONDS,
+                        )
+                        if _supervisor_stop.wait(START_RETRY_FAST_SECONDS):
+                            return
+                        first = False
+                        continue
             else:
                 # The service answers, so it is up - a rejection latched by an
                 # earlier attempt must not keep the panel at 本地测谎启动失败.
                 # ``ensure_started`` is deliberately not called here (nothing to
                 # start), which is exactly why the latch has to be cleared here.
                 note_service_answering()
+                with _lock:
+                    _start_attempts = 0
         except Exception:  # noqa: BLE001 - supervision never dies
             LOG.warning("local lie service: supervisor start failed", exc_info=True)
         first = False
@@ -606,27 +848,82 @@ def supervisor_set_active(active: bool, app_root=None) -> None:
     nothing to activate, so the service stays off and the panel says so.
     """
 
-    global _supervisor_thread, _desired_active, _desired_root
+    global _supervisor_thread, _desired_active, _desired_root, _start_attempts
+    global _selected_at
     if not active:
         _supervisor_stop.set()
         with _lock:
             _supervisor_thread = None
             _desired_active = False
             _state["card_rejected"] = False
+            _start_attempts = 0
+            _selected_at = 0.0
         stop_started_service()
         LOG.info("local lie service: pre-start disabled (selection left 本地测谎)")
         return
     root = Path(app_root) if app_root is not None else install_root()
     with _lock:
+        newly_selected = not _desired_active
         _desired_active = True
         _desired_root = root
         running = _supervisor_thread is not None and _supervisor_thread.is_alive()
+        if newly_selected:
+            # A new selection is a new start budget: the attempt counter and the
+            # heartbeat wait both restart here.
+            _start_attempts = 0
+            _selected_at = time.monotonic()
+        selected_at = float(_selected_at or 0.0)
     if not has_online_card():
         LOG.info(
             "local lie service: 本地测谎 selected, but the licence server has not "
             "delivered a CT card yet - the service is not started until it does"
         )
         return
+    # Operator's rule (2026-11-13): wait for a complete heartbeat, take the card
+    # from THAT reply, then start.  A CT_ card sitting in the vendor config may be
+    # a leftover from an earlier session, and starting on it is what produced the
+    # 16:02 start attempts that had to be repeated.  ``note_online_card`` calls
+    # back into this function the moment a validated reply delivers the card, so
+    # the wait costs nothing in the normal case; if no reply arrives at all the
+    # config card is still used, so an offline install keeps working.
+    if not _card_from_reply():
+        waited = time.monotonic() - selected_at if selected_at else 0.0
+        if waited < CARD_REPLY_WAIT_SECONDS:
+            global _heartbeat_wait_logged
+            if not _heartbeat_wait_logged:
+                _heartbeat_wait_logged = True
+                LOG.info(
+                    "local lie service: 本地测谎 selected; waiting up to %.0fs for "
+                    "the licence heartbeat to deliver the CT card before starting",
+                    CARD_REPLY_WAIT_SECONDS,
+                )
+            # The panel says 本地测谎服务: 等待授权信息 while this gate holds: nothing
+            # is launched on a card from an older session.
+            with _lock:
+                if str(_state.get("state") or "idle") not in ("running", "external"):
+                    _state.update(
+                        state="waiting", note="等待授权信息（许可证心跳）",
+                        root=str(root), started_by_app=False,
+                    )
+            _schedule_card_wait_expiry(root, CARD_REPLY_WAIT_SECONDS - waited + 1.0)
+            return
+        LOG.warning(
+            "local lie service: no licence reply delivered a CT card within %.0fs; "
+            "starting with the card already in the service config",
+            CARD_REPLY_WAIT_SECONDS,
+        )
+    _heartbeat_wait_logged = False
+    # The panel must show 本地测谎: 启动中 the moment the radio is clicked, not one
+    # supervisor iteration later: the state is set here, on the caller's thread,
+    # and ``ensure_started`` then only moves it on to running or failed.  A
+    # service that is already answering keeps its up state.
+    with _lock:
+        already_up = str(_state.get("state") or "idle") in ("running", "external")
+        if not already_up:
+            _state.update(
+                state="starting", note="正在启动本地测谎服务…",
+                root=str(root), started_by_app=True,
+            )
     if running:
         return
     _start_supervisor_thread(root)
@@ -647,8 +944,18 @@ def _start_supervisor_thread(root: Path) -> None:
 
 
 def note_online_card(card: str) -> None:
-    """Record the CT card from the licence reply and pre-start if it is wanted."""
+    """Record the CT card from the licence reply and pre-start if it is wanted.
 
+    This is the moment the operator asked for: a *validated* reply has delivered
+    the card, so the service may be started.  The call goes through
+    ``supervisor_set_active`` (not the thread starter directly) so the whole gate
+    applies - the "wait for the heartbeat" branch is satisfied by definition here,
+    a previously exhausted start budget is reset, and the panel state is set on
+    this thread.  This is what re-arms the service after ``MAX_AUTO_START_ATTEMPTS``
+    gave up.
+    """
+
+    global _start_attempts, _selected_at
     text = str(card or "").strip()
     with _lock:
         if text:
@@ -660,11 +967,16 @@ def note_online_card(card: str) -> None:
         _state["card_checked"] = True
         desired = _desired_active
         root = _desired_root
+        if text:
+            # Fresh information: a new start budget, and the heartbeat wait is
+            # over for this selection.
+            _start_attempts = 0
+            _selected_at = time.monotonic()
     if not text:
         return
     if desired:
         LOG.info("local lie service: the CT card arrived; pre-starting the service")
-        _start_supervisor_thread(root or install_root())
+        supervisor_set_active(True, root or install_root())
 
 
 def stop_supervisor() -> None:
@@ -871,6 +1183,99 @@ def _package_ws_key_or_empty(app_root: Path | str, settings: dict) -> str:
     if not _looks_like_placeholder(current):
         return current
     return _build_profile_ws_key(app_root)
+
+
+def normalize_roi_track_servers(app_root: Path | str) -> bool:
+    """Drop retired deployments from the vendor's ROI-track candidate pool.
+
+    ``build_profile.json`` ships::
+
+        "roi_track_servers": [
+            {"host": "221.10.121.69", "ws_ports": [44444], "label": "四川"},
+            {"host": "117.50.223.113", "ws_ports": [8888],  "label": "华北"}
+        ]
+
+    The vendor's partner startup gate samples that pool, probes the WS handshake
+    of each sampled endpoint and ABORTS the whole start with
+    "坐标云启动握手失败，同行服务未启动" when they all fail.  ``221.10.121.69`` has
+    been retired (the operator: "this server is stopped, we shouldn't use it"), so
+    every start wasted one handshake on a dead host and depended entirely on
+    ``117.50.223.113:8888`` answering — the "always fails once or twice" symptom.
+
+    The document exists TWICE in the package: ``data\\build_profile.json`` and the
+    frozen application's own ``_internal\\CT\\data\\build_profile.json``.  Both are
+    trimmed (the vendor resolves ``CT/data/...`` inside its bundle), keeping only
+    entries for the live deployment (the compiled endpoint table is the authority)
+    and leaving their ports and labels untouched.  Returns True when any changed.
+    """
+
+    live = _live_endpoint_host()
+    if not live:
+        return False
+    folder = Path(app_root) / SERVICE_FOLDER
+    changed = False
+    for relative in (
+        Path("data") / "build_profile.json",
+        Path("_internal") / "CT" / "data" / "build_profile.json",
+    ):
+        changed = _trim_roi_track_pool(folder / relative, live) or changed
+    return changed
+
+
+def _trim_roi_track_pool(path: Path, live: str) -> bool:
+    """Keep only *live* in one ``build_profile.json``'s ROI-track pool."""
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        profile = json.loads(raw)
+    except ValueError:
+        LOG.warning(
+            "local lie service: %s is not valid JSON; the ROI-track pool is left "
+            "untouched", path,
+        )
+        return False
+    if not isinstance(profile, dict):
+        return False
+    pool = profile.get("roi_track_servers")
+    if not isinstance(pool, list) or not pool:
+        return False
+    kept = [
+        entry for entry in pool
+        if isinstance(entry, dict) and str(entry.get("host") or "").strip() == live
+    ]
+    dropped = [
+        str(entry.get("host") or "?") for entry in pool
+        if isinstance(entry, dict) and str(entry.get("host") or "").strip() != live
+    ]
+    if not kept:
+        # Nothing for the live deployment: add it rather than leaving the pool empty
+        # (an empty pool makes the vendor's gate fail every time).
+        kept = [{"host": live, "ws_ports": [8888], "label": "华北", "region": "cn"}]
+    if not dropped and len(kept) == len(pool):
+        return False
+    profile["roi_track_servers"] = kept
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False,
+        ) as handle:
+            json.dump(profile, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        os.replace(temporary, path)
+    except OSError:
+        LOG.warning(
+            "local lie service: could not rewrite %s; the retired ROI-track host "
+            "may still be probed at startup", path, exc_info=True,
+        )
+        return False
+    LOG.warning(
+        "local lie service: ROI-track pool limited to the live deployment %s in %s "
+        "(dropped retired %s)", live, path.name, ", ".join(dropped) or "none",
+    )
+    return True
 
 
 def normalize_placeholder_ws_key(app_root: Path | str) -> bool:
@@ -1312,9 +1717,21 @@ def apply_online_card(card_code: str) -> bool:
     with _lock:
         _state["online_card"] = card
         _state["card_checked"] = True
+    # ARMS THE START GATE, and it must happen before every early ``return False``
+    # below.  When the vendor config already carries this very card, the write
+    # below is a no-op and this function used to return without ever telling the
+    # supervisor that the reply had arrived - so the panel sat on 等待授权信息 for
+    # ever and the service only started when the radio was toggled (16:19 field
+    # log: "i have to switch to 云端测谎 and switch back").
+    note_online_card(card)
     root = install_root()
     path = service_credentials_path(root)
     if path is None or not path.is_file():
+        LOG.info(
+            "local lie service: the CT card is known from the licence reply, but the "
+            "service credentials file is missing (%s); the service starts with the "
+            "card already in its config", path,
+        )
         return False
     settings = _load_service_settings(path, what="the service credentials")
     if settings is None:
@@ -1336,32 +1753,28 @@ def apply_online_card(card_code: str) -> bool:
             "key (%s)", _mask(own),
         )
     if not changed:
-        with _lock:
-            _state["online_card"] = card
-            _state["card_checked"] = True
+        # Nothing to rewrite: the file this install already uses matches the reply,
+        # and ``note_online_card`` above has already armed the start.
         return False
     try:
         _write_service_settings(path, settings)
     except OSError as exc:
         LOG.warning("local lie service: the online card could not be written (%s)", exc)
         return False
-    with _lock:
-        _state["online_card"] = card
-        _state["card_checked"] = True
     LOG.info(
         "local lie service: CT card from the activation server written to %s (%s)",
         path, _mask(card),
     )
-    # The card is the gate for pre-starting: now that it exists, a 本地测谎
-    # selection may start the service (no blind start without it).
-    note_online_card(card)
+    # The card on disk changed, so a service this app started must pick it up.
+    # The restart is handed to the supervisor (armed above) instead of blocking
+    # this heartbeat thread on a 90 s ``ensure_started``.
     with _lock:
         started_by_app = bool(_state.get("started_by_app"))
     if started_by_app and not _busy():
         LOG.info("local lie service: restarting so the online card takes effect")
         stop_started_service()
         reset_for_tests()
-        ensure_started(root)
+        supervisor_set_active(True, root)
     return True
 
 
@@ -1471,68 +1884,76 @@ def activate(
 
 
 def hint_state() -> str:
-    """Which hint_text() branch applies right now: off/no_card/starting/up/failed."""
+    """Which hint_text() branch applies right now.
 
-    with _lock:
-        state = str(_state.get("state") or "idle")
-        rejected = bool(_state.get("card_rejected"))
-        desired = _desired_active
-    if not desired:
-        return "off"
-    if not has_online_card():
-        return "no_card"
-    if state in ("running", "external"):
-        # A service that answers is up.  The latch explains a service that will
-        # NOT come up; letting it win here is what kept the panel at
-        # 本地测谎启动失败 while the service was serving passes.
-        return "up"
-    if rejected:
-        return "failed"
-    if state == "starting":
-        return "starting"
-    if state in ("idle", "missing"):
-        return "off"
-    return "failed"
-
-def hint_text() -> str:
-    """One short sentence for the 图层校准与巡逻 hint line, or "".
-
-    The wording is the operator's:
-      * 本地测谎 selected without a CT_ card from the licence reply
-            -> 本地测谎未开通
-      * a card arrived but the service would not come up / validate it
-            -> 本地测谎服务: 本地测谎启动失败
-      * service answering /v1/health
-            -> 本地测谎服务: 已启动
-      * selection 关闭 or 云端测谎 (or nothing to say)
-            -> no hint at all
+    ``off`` / ``no_card`` / ``waiting`` / ``starting`` / ``up`` / ``failed``.
+    ``waiting`` is the operator's 等待授权信息 stage: 本地测谎 is selected and a CT
+    card exists somewhere, but no *validated reply of this session* has delivered
+    it yet, so nothing may be started (2026-11-13 rule: wait for the heartbeat,
+    start on its card).
     """
 
     with _lock:
         state = str(_state.get("state") or "idle")
         rejected = bool(_state.get("card_rejected"))
         desired = _desired_active
-    if desired and not has_online_card():
-        # The operator's short form.  The reason and the greyed state live on the
-        # radio (label 本地测谎（未开通）) and in its tooltip; repeating them here made
-        # the panel line carry the same fact twice.
-        return "本地测谎未开通"
-    if not desired and state not in ("running", "external", "starting"):
-        return ""
-    # Answering beats a stale rejection (see hint_state): a launched service that
-    # validates its card and listens is proof the card was NOT rejected.
+        denied = bool(_state.get("card_denied"))
+    if not desired:
+        return "off"
     if state in ("running", "external"):
-        return "本地测谎服务: 已启动"
+        # A service that answers is up.  The latch explains a service that will
+        # NOT come up; letting it win here is what kept the panel at 启动失败 while
+        # the service was serving passes.
+        return "up"
+    if denied or not has_online_card():
+        return "no_card"
     if rejected:
-        return "本地测谎服务: 本地测谎启动失败"
+        return "failed"
     if state == "starting":
-        return "本地测谎服务: 正在启动…"
-    if state in ("idle", "missing"):
+        return "starting"
+    if state == "waiting":
+        # Once a validated reply has delivered the card the waiting stage is over,
+        # even if the launch has not begun yet: the panel must not keep saying
+        # 等待授权信息 while the authorisation is already in hand (16:19 field log).
+        return "waiting" if not _card_from_reply() else "starting"
+    if state == "missing":
+        # No service folder beside this build: that is not "waiting for the
+        # licence", nothing will ever arrive to start it.
+        return "failed"
+    if state == "idle":
+        return "waiting" if not _card_from_reply() else "off"
+    return "failed"
+
+def hint_text() -> str:
+    """One short sentence for the 图层校准与巡逻 hint line, or "".
+
+    The operator's set (2026-11-13) is exactly these four service sentences:
+      * 本地测谎服务: 等待授权信息 - selected, waiting for a validated licence
+        reply to deliver the CT card
+      * 本地测谎服务: 启动中       - a launch is in flight
+      * 本地测谎服务: 启动失败     - the service refused, died, or gave up
+      * 本地测谎服务: 启动成功     - /v1/health answers
+    Plus 本地测谎未开通 when this activation code carries no CT card at all (that is
+    an access fact, not a service state: the radio is labelled 本地测谎（未开通）),
+    and nothing at all for 关闭 / 云端测谎.
+    """
+
+    state = hint_state()
+    if state == "off":
         return ""
-    return "本地测谎服务: 本地测谎启动失败"
+    if state == "no_card":
+        return "本地测谎未开通"
+    if state == "up":
+        return "本地测谎服务: 启动成功"
+    if state == "starting":
+        return "本地测谎服务: 启动中"
+    if state == "waiting":
+        return "本地测谎服务: 等待授权信息"
+    return "本地测谎服务: 启动失败"
 
 def reset_for_tests() -> None:
-    global _launch_process
+    global _launch_process, _start_attempts, _selected_at, _heartbeat_wait_logged
+    global _card_wait_thread
     with _lock:
         _state.update(state="idle", note="", root="", started_by_app=False, pids=[],
                       card_rejected=False, card_denied=False)
@@ -1540,6 +1961,11 @@ def reset_for_tests() -> None:
         # it as well: otherwise a later start sees "a launcher is still booting"
         # and refuses to start the service at all.
         _launch_process = None
+        # The start budget and the heartbeat wait are per-selection state.
+        _start_attempts = 0
+        _selected_at = 0.0
+        _card_wait_thread = None
+    _heartbeat_wait_logged = False
 
 
 __all__ = [
