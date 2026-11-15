@@ -5824,6 +5824,13 @@ class MovementWorker(threading.Thread):
         self._drop_rope_escape_last_position: Optional[Point] = None
         self._drop_rope_escape_tiny_rise_frames = 0
         self._drop_rope_escape_deadline = float("-inf")
+        self._drop_rope_escape_source = ""
+        # A post-reconnect drop edge owns Direction+Down as one input chord.
+        # It deliberately does not use the ordinary walk-hold manager: that
+        # manager may release a direction early for an attack, while this
+        # recovery must keep Down with its direction until drop/rope evidence.
+        self._reconnect_drop_edge_input_direction: Optional[str] = None
+        self._reconnect_drop_edge_input_until = float("-inf")
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
         # StatusWorker reports a confirmed HP decrease with the shared capture
@@ -7584,21 +7591,98 @@ class MovementWorker(threading.Thread):
             )
         if sent:
             player = getattr(getattr(self, "last_observation", None), "player", None)
-            self._drop_rope_escape_armed = player is not None
-            self._drop_rope_escape_last_position = (
-                Point(float(player.x), float(player.y)) if player is not None else None
-            )
-            self._drop_rope_escape_tiny_rise_frames = 0
-            self._drop_rope_escape_deadline = (
-                time.monotonic() + DROP_ROPE_ESCAPE_WINDOW_SECONDS
+            self._arm_drop_rope_escape_watch(
+                player,
+                window_seconds=DROP_ROPE_ESCAPE_WINDOW_SECONDS,
+                source="Alt+Down",
             )
         return sent
+
+    def _arm_drop_rope_escape_watch(
+        self,
+        player: Optional[Point],
+        *,
+        window_seconds: float,
+        source: str,
+    ) -> None:
+        """Watch one downward-input phase for the narrow rope-attach signature."""
+
+        self._drop_rope_escape_armed = player is not None
+        self._drop_rope_escape_last_position = (
+            Point(float(player.x), float(player.y)) if player is not None else None
+        )
+        self._drop_rope_escape_tiny_rise_frames = 0
+        self._drop_rope_escape_deadline = time.monotonic() + max(0.0, window_seconds)
+        self._drop_rope_escape_source = str(source)
 
     def _clear_drop_rope_escape_watch(self) -> None:
         self._drop_rope_escape_armed = False
         self._drop_rope_escape_last_position = None
         self._drop_rope_escape_tiny_rise_frames = 0
         self._drop_rope_escape_deadline = float("-inf")
+        self._drop_rope_escape_source = ""
+
+    def _release_reconnect_drop_edge_input(self, *, reason: str = "") -> None:
+        """Release the dedicated Direction+Down edge chord, if this worker owns it."""
+
+        direction = self._reconnect_drop_edge_input_direction
+        if direction is None:
+            return
+        key_up = getattr(self.key_sender, "key_up", None)
+        with self._direction_lock:
+            if callable(key_up):
+                key_up("down")
+                key_up(direction)
+        self._reconnect_drop_edge_input_direction = None
+        self._reconnect_drop_edge_input_until = float("-inf")
+        if reason:
+            LOG.info("RECONNECT DROP RECOVERY: released %s+down (%s)", direction, reason)
+
+    def _service_reconnect_drop_edge_input(self, now: float) -> None:
+        if (self._reconnect_drop_edge_input_direction is not None
+                and now >= self._reconnect_drop_edge_input_until):
+            self._release_reconnect_drop_edge_input(reason="edge hold elapsed")
+
+    def _start_reconnect_drop_edge_hold(
+        self, direction: str, duration: float, player: Optional[Point],
+    ) -> bool:
+        """Hold Direction+Down together while seeking a reconnect drop edge."""
+
+        now = time.monotonic()
+        if (self._reconnect_drop_edge_input_direction == direction
+                and now < self._reconnect_drop_edge_input_until):
+            return True
+        self._release_reconnect_drop_edge_input(reason="changing edge")
+        if not _sender_is_safe(self.key_sender):
+            LOG.warning("RECONNECT DROP RECOVERY: edge input suppressed; game window is not ready")
+            return False
+        key_down_chord = getattr(self.key_sender, "key_down_chord", None)
+        key_down = getattr(self.key_sender, "key_down", None)
+        direction_claimed = down_claimed = False
+        with self._direction_lock:
+            if callable(key_down_chord):
+                claimed = key_down_chord(direction, "down")
+                direction_claimed = down_claimed = claimed is not False
+            elif callable(key_down):
+                direction_claimed = key_down(direction) is not False
+                down_claimed = key_down("down") is not False
+        if not (direction_claimed and down_claimed):
+            if direction_claimed or down_claimed:
+                self._reconnect_drop_edge_input_direction = direction
+                self._release_reconnect_drop_edge_input(reason="partial edge chord")
+            return False
+        self._reconnect_drop_edge_input_direction = direction
+        self._reconnect_drop_edge_input_until = now + max(0.05, float(duration))
+        self._arm_drop_rope_escape_watch(
+            player,
+            window_seconds=max(0.05, float(duration)),
+            source=f"{direction}+Down edge hold",
+        )
+        LOG.warning(
+            "RECONNECT DROP RECOVERY: holding %s+Down together for %.1fs",
+            direction, duration,
+        )
+        return True
 
     def _escape_accidental_rope_after_drop(
         self, observation: MinimapObservation
@@ -7647,7 +7731,23 @@ class MovementWorker(threading.Thread):
         # jump right.  Key-down is a real SendInput chord so neither key is
         # delayed behind the other.
         direction = "left" if current.x <= 0.5 else "right"
+        source = self._drop_rope_escape_source or "drop input"
+        edge_hold_owned = self._reconnect_drop_edge_input_direction is not None
         self._clear_drop_rope_escape_watch()
+        # The edge phase owns Down as well as the walk direction.  Both must be
+        # up before the Alt+side chord, otherwise Maple can retain Down and turn
+        # the rope escape into another slide.
+        self._release_reconnect_drop_edge_input(reason="rope attachment confirmed")
+        if edge_hold_owned:
+            # The rope jump is a new recovery action.  Do not immediately
+            # restart the expired edge search on the next capture; allow its
+            # descent evidence to be assessed as a fresh Alt+Down episode.
+            self._reconnect_drop_edge_phase = None
+            self._reconnect_drop_edge_second_pass = False
+            self._reconnect_drop_edge_start_y = None
+            self._reconnect_drop_chords = 0
+            self._reconnect_drop_stalled_attempts = 0
+            self._reconnect_drop_best_y = None
         if not _sender_is_safe(self.key_sender):
             LOG.warning(
                 "DROP ROPE ESCAPE suppressed: target window is not safely selected"
@@ -7670,8 +7770,9 @@ class MovementWorker(threading.Thread):
                 return False
             time.sleep(max(0.025, self.drop_chord_hold_seconds))
             LOG.warning(
-                "DROP ROPE ESCAPE: Alt+Down attached to rope; tiny Y rise "
+                "DROP ROPE ESCAPE: %s attached to rope; tiny Y rise "
                 "confirmed %d/%d (last dY=%+.6f dX=%+.6f), sent Alt+%s at X=%.6f",
+                source,
                 DROP_ROPE_ESCAPE_FRAMES,
                 DROP_ROPE_ESCAPE_FRAMES,
                 delta_y,
@@ -14002,6 +14103,8 @@ class MovementWorker(threading.Thread):
 
         if self._reconnect_drop_walk_abandoned:
             return
+        self._release_reconnect_drop_edge_input(reason="edge recovery abandoned")
+        self._clear_drop_rope_escape_watch()
         self._reconnect_drop_walk_abandoned = True
         LOG.warning(
             "RECONNECT DROP RECOVERY: abandoning the edge-walk recovery (%s); the "
@@ -14426,7 +14529,9 @@ class MovementWorker(threading.Thread):
         if phase is not None and not RECONNECT_DROP_EDGE_WALK_ENABLED:
             # A walk left over from a previous decision is dropped instead of being
             # held: the recovery must never move sideways (operator's rule).
-            LOG.info("RECONNECT DROP RECOVERY: dropping the %s edge walk", phase)
+            LOG.info("RECONNECT DROP RECOVERY: dropping the %s edge hold", phase)
+            self._release_reconnect_drop_edge_input(reason="edge recovery disabled")
+            self._clear_drop_rope_escape_watch()
             self._reconnect_drop_edge_phase = None
             self._reconnect_drop_edge_second_pass = False
             self._reconnect_drop_edge_start_y = None
@@ -14453,6 +14558,8 @@ class MovementWorker(threading.Thread):
                 self._reconnect_drop_edge_phase = None
                 self._reconnect_drop_edge_second_pass = False
                 self._reconnect_drop_edge_start_y = None
+                self._release_reconnect_drop_edge_input(reason="downward progress confirmed")
+                self._clear_drop_rope_escape_watch()
                 return None
             if now < self._reconnect_drop_edge_started_at + RECONNECT_DROP_EDGE_HOLD_SECONDS:
                 remaining = (
@@ -14460,8 +14567,8 @@ class MovementWorker(threading.Thread):
                     + RECONNECT_DROP_EDGE_HOLD_SECONDS - now
                 )
                 return MovementDecision(
-                    phase,
-                    f"reconnect drop recovery: holding {phase} to find a drop edge",
+                    f"drop_edge_{phase}_down",
+                    f"reconnect drop recovery: holding {phase}+Down to find a drop edge",
                     max(0.05, remaining),
                 )
             next_phase = "left" if phase == "right" else "right"
@@ -14471,14 +14578,14 @@ class MovementWorker(threading.Thread):
                 self._reconnect_drop_edge_started_at = now
                 self._reconnect_drop_edge_start_y = current_y
                 LOG.warning(
-                    "RECONNECT DROP RECOVERY: %s edge found no descent; "
-                    "holding %s for %.1fs",
+                    "RECONNECT DROP RECOVERY: %s+Down edge found no descent; "
+                    "holding %s+Down for %.1fs",
                     phase, next_phase,
                     RECONNECT_DROP_EDGE_HOLD_SECONDS,
                 )
                 return MovementDecision(
-                    next_phase,
-                    f"reconnect drop recovery: {phase} edge did not descend; seeking {next_phase} edge",
+                    f"drop_edge_{next_phase}_down",
+                    f"reconnect drop recovery: {phase}+Down did not descend; seeking {next_phase}+Down edge",
                     RECONNECT_DROP_EDGE_HOLD_SECONDS,
                 )
             self._reconnect_drop_edge_cycles += 1
@@ -14500,6 +14607,8 @@ class MovementWorker(threading.Thread):
             self._reconnect_drop_edge_phase = None
             self._reconnect_drop_edge_second_pass = False
             self._reconnect_drop_edge_start_y = None
+            self._release_reconnect_drop_edge_input(reason="edge pair completed")
+            self._clear_drop_rope_escape_watch()
             return None
 
         # Assessment is by CHORD COUNT, not by a timer.  The old gate required
@@ -14543,14 +14652,14 @@ class MovementWorker(threading.Thread):
         self._reconnect_drop_edge_start_y = current_y
         LOG.warning(
             "RECONNECT DROP RECOVERY: %d Alt+Down attempts stalled (best Y %.6f, "
-            "marker X=%.6f); walking %s first for %.1fs",
+            "marker X=%.6f); holding %s+Down first for %.1fs",
             RECONNECT_DROP_STALLED_ATTEMPTS,
             best_y, float(player.x), first_phase,
             RECONNECT_DROP_EDGE_HOLD_SECONDS,
         )
         return MovementDecision(
-            first_phase,
-            f"reconnect drop recovery: Alt+Down stalled; seeking {first_phase} drop edge",
+            f"drop_edge_{first_phase}_down",
+            f"reconnect drop recovery: Alt+Down stalled; seeking {first_phase}+Down edge",
             RECONNECT_DROP_EDGE_HOLD_SECONDS,
         )
 
@@ -14563,6 +14672,8 @@ class MovementWorker(threading.Thread):
         first decision frame walked.  Every descent starts from zero.
         """
 
+        self._release_reconnect_drop_edge_input(reason=reason or "drop bookkeeping reset")
+        self._clear_drop_rope_escape_watch()
         self._reconnect_drop_chords = 0
         self._reconnect_drop_stalled_attempts = 0
         self._reconnect_drop_best_y = None
@@ -18910,6 +19021,10 @@ class MovementWorker(threading.Thread):
                 detected_layer_name = self._resync_route_layer(observation)
                 self._confirmed_attack_layer = detected_layer_name
                 self._log_detected_layer(detected_layer_name, observation)
+                # The reconnect edge recovery owns a persistent Direction+Down
+                # chord for its full 5.0-second phase.  Its expiry is serviced
+                # independently of the ordinary movement cooldown.
+                self._service_reconnect_drop_edge_input(time.monotonic())
                 # A just-issued Alt+Down can occasionally grab a rope.  Give
                 # that narrowly-defined escape priority over ordinary route
                 # planning for this frame; otherwise the planner could add a
@@ -18937,6 +19052,16 @@ class MovementWorker(threading.Thread):
                 route_target_x = self._stabilize_rope_target(
                     route_target_x, route_is_rope, route_label
                 )
+                if (self._reconnect_drop_edge_input_direction is not None
+                        and route_label != "drop-to-route"):
+                    # This chord belongs only to the post-reconnect descent.
+                    # A newly resolved floor, a rope route, or a normal patrol
+                    # route must take the keys back immediately rather than
+                    # waiting for the old five-second edge timer to expire.
+                    self._release_reconnect_drop_edge_input(
+                        reason=f"route changed to {route_label}"
+                    )
+                    self._clear_drop_rope_escape_watch()
                 if ((not self.stationary_attack_enabled
                         or self._stationary_timed_patrol_active)
                         and self._advance_route_endpoint(observation, route_target_x)):
@@ -19836,6 +19961,11 @@ class MovementWorker(threading.Thread):
                 # walk hold, must not hold Up, and must never enter the
                 # rope/stair-jump recovery.
                 is_jump_up = bool(decision.key == "jump_point_up")
+                is_reconnect_drop_edge = bool(
+                    decision.key in (
+                        "drop_edge_left_down", "drop_edge_right_down",
+                    )
+                )
                 if decision.key not in ("left", "right") and not is_stair_jump and not is_jump_point:
                     self._release_walk_hold()
                 # A recorded jump point is a narrow, one-frame positional
@@ -19869,7 +19999,18 @@ class MovementWorker(threading.Thread):
                             )
                             continue
                         self._pickup_z_force_after = 0.0
-                    if decision.key == "drop":
+                    if is_reconnect_drop_edge:
+                        edge_direction = (
+                            "left" if decision.key == "drop_edge_left_down"
+                            else "right"
+                        )
+                        if not self._start_reconnect_drop_edge_hold(
+                                edge_direction,
+                                decision.duration,
+                                observation.player,
+                        ):
+                            continue
+                    elif decision.key == "drop":
                         # Failure-driven retry: the old fixed
                         # ``drop_retry_seconds`` wait made every missed chord
                         # cost 1.5 s.  Wait only while the previous attempt
@@ -20158,6 +20299,8 @@ class MovementWorker(threading.Thread):
                 except (AttributeError, ValueError):
                     pass
         self._release_climb_up()
+        self._release_reconnect_drop_edge_input(reason="movement worker stopped")
+        self._clear_drop_rope_escape_watch()
         self._release_walk_hold()
         if self.climbing_active_event is not None:
             self.climbing_active_event.clear()
