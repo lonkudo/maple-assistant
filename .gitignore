@@ -88,3 +88,11 @@ activation_service/
 # Machine-local debug switch (0 = debug, 1 = produce). Never shipped:
 # build_release.ps1 excludes it, and a missing file means produce mode.
 mode.txt
+
+# 版本: the operator's own library of downloaded packages (one ZIP per version,
+# up to ~260 MB each) and the staging folder an install is handed through.  Both
+# are runtime data of THIS installation - on a developer machine the install root
+# is this repository, so without these the whole library would be committed.
+版本/
+update/
+

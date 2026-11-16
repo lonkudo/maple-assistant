@@ -69,7 +69,8 @@ CONFIG_ROOTS = (_exe_root, HERE)
 # update icon cannot drift apart; this file only owns the window and the install.
 try:  # noqa: WPS229 - the installer must start even without the helper
     from update_core import (
-        ReleaseInfo, UpdateCoreError, archive_version, download_package,
+        ReleaseInfo, ReleaseList, UpdateCoreError, VERSION_LIBRARY_DIRECTORY,
+    archive_version, download_package, parse_release_list, verify_archive,
         parse_release,
     )
 except Exception:  # pragma: no cover - reported when a download is attempted
@@ -661,8 +662,14 @@ def _is_previous_install(root: Path) -> bool:
     return False
 
 
-def _activate(code: str) -> tuple[str, Any]:
-    """Validate this copy against the activation server; return its release.
+def _activate(code: str) -> tuple[str, Any, Any]:
+    """Validate this copy against the activation server.
+
+    Returns ``(session_token, release, versions)``.  ``versions`` is the
+    offered-version list (``update_core.ReleaseList``) the session reply now
+    carries - the operator offers several versions at once, so the installer
+    asks which one instead of always taking the newest.  It is ``None`` on an
+    older server, and the caller then falls back to ``release``.
 
     Returns ``(session_token, release)``.  The token is only meaningful when the
     operator still publishes a server-side manifest, so it may be empty: the
@@ -705,13 +712,19 @@ def _activate(code: str) -> tuple[str, Any]:
             # A legacy publish still names the version; the link then comes from
             # the manifest's mirrors through ``_share_sources``.
             release = ReleaseInfo(version=str(manifest["version"]))
+    versions = parse_release_list(answer or {}) if parse_release_list else None
+    if versions is not None and not versions.entries and release is not None:
+        # An older server sends one record and no list: offer exactly that, so
+        # the window always has something to show.
+        versions = ReleaseList(entries=(release,), latest=release.version)
     if token or release is not None:
         logging.info(
-            "installer: activation ok, session=%s release=%s",
+            "installer: activation ok, session=%s release=%s offered=%s",
             "yes" if token else "no",
             getattr(release, "version", "") or "none",
+            len(getattr(versions, "entries", ()) or ()),
         )
-        return token, release
+        return token, release, versions
     raise RuntimeError("授权失败：服务器未返回下载信息。")
 
 
@@ -1315,6 +1328,8 @@ def _fetch_package(
     on_total: Any = None,
     on_stage: Any = None,
     on_files: Any = None,
+    archive_name: str = "package.zip",
+    keep_archive: bool = False,
 ) -> tuple[list[tuple[dict[str, Any], Path]], str, bool]:
     """Download the release archive into ``update_dir`` and unpack it into the root.
 
@@ -1359,7 +1374,7 @@ def _fetch_package(
         archive = download_package(
             location, update_dir,
             on_bytes=on_bytes, on_total=on_total, on_stage=on_stage,
-            filename="package.zip",
+            filename=archive_name,
         )
     except UpdateCoreError as exc:
         raise RuntimeError(str(exc)) from exc
@@ -1367,9 +1382,12 @@ def _fetch_package(
     version = _archive_version(archive)
     if not version:
         raise RuntimeError("安装包里没有 VERSION 文件，无法确认版本。")
-    if location.version and _version_tuple(location.version) > _version_tuple(version):
+    if location.version and _version_tuple(location.version) != _version_tuple(version):
+        # The version the operator PICKED is the authority now; a mismatch
+        # means the link served a different package.  Comparing with ">="
+        # instead would refuse the deliberate downgrade this window offers.
         raise RuntimeError(
-            f"下载到的安装包是 {version}，低于服务器公布的 {location.version}。"
+            f"下载到的安装包是 {version}，与所选版本 {location.version} 不一致。"
         )
     # A running assistant holds endpoints_protected.pyd, its .py modules and its
     # own executable open.  Unpacking the archive over that folder fails with
@@ -1417,7 +1435,8 @@ def _fetch_package(
     workers = max(1, min(MAX_DOWNLOAD_WORKERS, len(members)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         entries = list(pool.map(describe, members))
-    archive.unlink(missing_ok=True)
+    if not keep_archive:
+        archive.unlink(missing_ok=True)
     return entries, version, False
 
 
@@ -1517,6 +1536,16 @@ class InstallerWindow:
         # worker blocks on this event while the operator answers in the window.
         self._transfer_event: threading.Event | None = None
         self._transfer_answer: bool | None = None
+        # The version step: what the server offers (``ReleaseList``), which row
+        # is selected, and the code/root the install will need afterwards.
+        self._versions: Any = None
+        self._version_choice = tk.IntVar(value=0)
+        self._version_rows: list[dict[str, Any]] = []
+        self._pending_code = ""
+        self._pending_root: Path | None = None
+        self._transfer_note = ""
+        # The VERSION already in the chosen folder, shown as (已安装).
+        self._installed_version_text = ""
         self.progress_value = 0.0
         # 0 = "the total is not known yet".  It is filled by the share's own
         # size report (``scale``) before the first byte, so the status line can
@@ -1547,6 +1576,13 @@ class InstallerWindow:
         self.progress.grid(row=3, column=1, columnspan=2, pady=(18, 0), sticky="ew")
         self.status = ttk.Label(outer, text="准备就绪")
         self.status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        # 选择版本: one row per version the operator offers.  Kept out of the
+        # grid until the activation reply says what is available, so the
+        # window does not grow an empty box on a server that still serves one
+        # record.
+        self.versions_panel = ttk.Frame(outer)
+        self.versions_panel.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.versions_panel.columnconfigure(0, weight=1)
         self.install = ttk.Button(outer, text="开始安装 / 更新", command=self._start)
         self.install.grid(row=5, column=2, sticky="e", pady=(16, 0))
         self._paint_eclipse(0.0)
@@ -1658,19 +1694,27 @@ class InstallerWindow:
                 return
         self.running = True
         self.install.state(["disabled"])
-        self.status.configure(text="正在验证授权码…")
+        self.status.configure(
+            text="正在验证授权码并获取可安装版本…"
+        )
+        self._pending_code = code
+        self._pending_root = root
+        self._build_version_panel(clear=True)
         threading.Thread(
-            target=self._install_worker, args=(code, root),
-            name="installer-download", daemon=True,
+            target=self._prepare_worker, args=(code, root),
+            name="installer-prepare", daemon=True,
         ).start()
 
-    def _install_worker(self, code: str, root: Path) -> None:
+    def _prepare_worker(self, code: str, root: Path) -> None:
+        """Worker: authenticate, then hand the offered versions to the window.
+
+        Nothing is downloaded here: the operator picks a version first, and only
+        that package is fetched.  The activation-transfer flow stays exactly where
+        it was - it is part of authenticating, not of choosing.
+        """
+
         transfer_note = ""
         try:
-            # The device fingerprint is this installer's very first dependency, and
-            # on a brand-new PC the WMI providers behind it may still be starting.
-            # Wait briefly for the signals (read-only, nothing is sent to the
-            # server) instead of stopping the install on the first cold read.
             try:
                 device_ready = bool(warm_device_identity(DEVICE_READY_WAIT_SECONDS))
             except Exception:  # noqa: BLE001 - a readiness check never fails an install
@@ -1683,69 +1727,210 @@ class InstallerWindow:
                 )
                 self.events.put(("hint", DEVICE_NOT_READY_HINT))
                 return
-            # Authentication first: an invalid code stops before any download.
-            # The reply also carries the newest 更新链接 record, which is where
-            # this installer learns the download address at all.
             try:
-                _token, release = _activate(code)
+                _token, release, versions = _activate(code)
             except DeviceNotReadyError:
-                # Not a retry: the operator wants the customer told to run it
-                # again, not a window that silently waits on CIM/WMI.
                 logging.warning("installer: device fingerprint not ready")
                 self.events.put(("hint", DEVICE_NOT_READY_HINT))
                 return
             except ActivationBoundElsewhereError as exc:
-                # Same two-phase order as the desktop's 更换授权: the server's
-                # preview names the current device, the operator confirms, and
-                # only the confirmation moves the binding.
                 logging.warning("installer: code bound elsewhere (%s)", exc)
                 transferred, note = self._offer_activation_transfer(code)
                 if not transferred:
-                    # Nothing was installed: a hint, not an "安装失败" report.
                     self.events.put(("hint", note))
                     return
                 transfer_note = note
-                _token, release = _activate(code)
+                _token, release, versions = _activate(code)
+            if versions is None or not getattr(versions, "entries", ()):
+                self.events.put((
+                    "hint",
+                    "服务器当前没有开放的版本，无法安装。\n"
+                    "请在管理端把要提供的版本开关打开后重试。",
+                ))
+                return
+            installed = ""
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                installed = _installed_version(root.resolve())
+            except Exception:  # noqa: BLE001 - an unreadable VERSION means "none"
+                logging.exception("installer: installed version could not be read")
+            self._installed_version_text = installed
+            self._transfer_note = transfer_note
+            self.events.put(("versions", (versions, installed)))
+        except Exception as exc:  # noqa: BLE001 - reported in the window
+            logging.exception("installer: preparing the version list failed")
+            self.events.put(("error", str(exc)))
+
+    def _build_version_panel(self, *, clear: bool = False) -> None:
+        """Render (or clear) the 选择版本 area above the progress row."""
+
+        panel = getattr(self, "versions_panel", None)
+        if clear:
+            if panel is not None:
+                for child in panel.winfo_children():
+                    child.destroy()
+                self._version_rows = []
+                self._versions = None
+            return
+        if panel is None:
+            return
+        for child in panel.winfo_children():
+            child.destroy()
+        self._version_rows = []
+        versions = self._versions
+        if versions is None or not getattr(versions, "entries", ()):
+            return
+        installed = getattr(self, "_installed_version_text", "")
+        for index, entry in enumerate(versions.entries):
+            row = ttk.Frame(panel)
+            row.grid(row=index, column=0, sticky="ew", pady=(0, 2))
+            row.columnconfigure(2, weight=1)
+            markers: list[str] = []
+            if versions.is_latest(entry.version):
+                markers.append("(最新)")
+            if installed and entry.version == installed:
+                markers.append("(已安装)")
+            ttk.Radiobutton(
+                row, variable=self._version_choice, value=index, text="",
+            ).grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                row, text=f"v{entry.version} " + " ".join(markers),
+                width=24, anchor="w",
+            ).grid(row=0, column=1, sticky="w")
+            summary = entry.summary() or "（无更新说明）"
+            if len(summary) > 40:
+                summary = summary[:39] + "…"
+            ttk.Label(row, text=summary, anchor="w").grid(
+                row=0, column=2, sticky="ew", padx=(8, 8),
+            )
+            ttk.Button(
+                row, text="安装此版本",
+                command=lambda entry=entry: self._choose_version(entry, "install"),
+            ).grid(row=0, column=3, sticky="e")
+            ttk.Button(
+                row, text="仅下载保存",
+                command=lambda entry=entry: self._choose_version(entry, "download"),
+            ).grid(row=0, column=4, sticky="e", padx=(6, 0))
+            self._version_rows.append({"entry": entry, "row": row})
+        # The newest offered version is the default choice.
+        try:
+            latest_index = next(
+                index for index, entry in enumerate(versions.entries)
+                if versions.is_latest(entry.version)
+            )
+        except StopIteration:
+            latest_index = 0
+        self._version_choice.set(latest_index)
+        selected = versions.entries[latest_index]
+        self._status_hint(
+            f"当前已安装 {installed or '（无）'}，请选择要安装的版本"
+            f"（默认 v{selected.version}）。"
+        )
+
+    def _choose_version(self, entry: Any, mode: str) -> None:
+        """Start the install or the download for one chosen version."""
+
+        if self.running:
+            return
+        root = self._pending_root
+        if root is None:
+            return
+        installed = getattr(self, "_installed_version_text", "")
+        if mode == "install" and installed and entry.version != installed:
+            if _version_tuple(entry.version) < _version_tuple(installed):
+                if not messagebox.askyesno(
+                    "安装旧版本",
+                    f"v{entry.version} 比当前安装的 v{installed} 旧。\n\n"
+                    "这是降级安装；设置文件不会被回退，安装后由旧版本读取。\n"
+                    "确定要继续吗？",
+                    parent=self.root,
+                ):
+                    return
+        self.running = True
+        self.install.state(["disabled"])
+        self._stage_text = (
+            f"正在下载 v{entry.version}…" if mode == "install"
+            else f"正在下载 v{entry.version}（仅保存）…"
+        )
+        self.status.configure(text=self._stage_text)
+        threading.Thread(
+            target=self._install_worker, args=(self._pending_code, root, entry, mode),
+            name="installer-download", daemon=True,
+        ).start()
+
+    def _status_hint(self, text: str) -> None:
+        self.status.configure(text=text)
+
+    def _install_worker(
+        self, code: str, root: Path, entry: Any = None, mode: str = "install",
+    ) -> None:
+        transfer_note = getattr(self, "_transfer_note", "")
+        try:
+            if entry is None:
+                raise RuntimeError("没有选择版本，安装未开始。")
             root = root.resolve()
             root.mkdir(parents=True, exist_ok=True)
-            # An older layout keeps 助手配置 elsewhere (inside app\, or the
-            # shared parent folder a ZIP-extracted app fell back to).  Adopt it
-            # into the selected root before anything else.
+            # An older layout keeps 助手配置 elsewhere (inside app\, or the shared
+            # parent folder a ZIP-extracted app fell back to).  Adopt it into the
+            # selected root before anything else.
             _migrate_legacy_install(root)
             installed_version = _installed_version(root)
-
+            self._installed_version_text = installed_version
+            # Every package the operator takes lands in <root>\版本 and is KEPT
+            # there: 仅下载保存 exists precisely because the file is worth having,
+            # and an install must not consume the copy the operator may want again.
+            library = root / VERSION_LIBRARY_DIRECTORY
+            try:
+                library.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise RuntimeError(f"无法创建版本目录：{exc}") from exc
+            shares = _share_sources({}, entry)
+            if not shares:
+                raise RuntimeError(
+                    "服务器没有提供该版本的下载地址；"
+                    "请稍后重试，或在 installer_mirrors.json 中手动配置。"
+                )
+            archive_name = f"MoonEclipse-{entry.version}.zip"
+            if mode == "download":
+                self.events.put(("plan", (1, 1)))
+                archive = download_package(
+                    ReleaseInfo(
+                        version=entry.version, info=entry.info,
+                        link=shares[0], extra_links=tuple(shares[1:]),
+                    ),
+                    library,
+                    on_bytes=lambda position: self.events.put(("bytes", int(position))),
+                    on_total=lambda size: self.events.put(("scale", int(size))),
+                    on_stage=lambda line: self.events.put(("stage", str(line))),
+                    filename=archive_name,
+                )
+                verify_archive(archive, entry)
+                logging.info(
+                    "installer: v%s saved to %s (download only)",
+                    entry.version, archive,
+                )
+                self.events.put(("downloaded", (entry.version, archive)))
+                return
             self.events.put(("plan", (1, 1)))
-            update_dir = root / "update"
-            update_dir.mkdir(parents=True, exist_ok=True)
-
-            # The netdisk package is complete: download it and extract it over
-            # the folder.  No local manifest, no per-file diff - user data
-            # (助手配置) is preserved by _extract_bundle.
+            # The netdisk package is complete: download it and extract it over the
+            # folder.  No local manifest, no per-file diff - user data (助手配置) is
+            # preserved by _extract_bundle, and the archive stays in 版本.
             entries, version, _skipped = _fetch_package(
-                update_dir, root, release,
+                library, root, entry,
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
                 # Five arguments, not three: the extraction phase reports the
                 # package bytes it has unpacked as well (that is what makes the
                 # status line say "12.3/175.4 MB" instead of a bare file counter).
-                # A three-parameter lambda here raised
-                # "installer_worker.<locals>.<lambda>() takes 3 positional
-                # arguments but 5 were given" and aborted the whole install.
                 on_files=lambda phase, done, total, done_bytes=0, total_bytes=0:
                     self.events.put(("files", (
                         str(phase), int(done), int(total),
                         int(done_bytes), int(total_bytes),
                     ))),
+                archive_name=archive_name,
+                keep_archive=True,
             )
-
-            if (installed_version and version
-                    and _version_tuple(version) < _version_tuple(installed_version)):
-                raise RuntimeError(
-                    f"安装包版本 {version} 低于已安装的 {installed_version}，已停止："
-                    f"请确认下载地址是否为最新版本。"
-                )
-
             installed = len(entries)
             self.events.put(("stage", f"正在完成安装（{installed} 个文件）…"))
 
@@ -1956,6 +2141,29 @@ class InstallerWindow:
                         str(value)
                     )
                     event.set()
+                elif kind == "versions":
+                    versions, installed = value
+                    self._versions = versions
+                    self._installed_version_text = installed
+                    self.running = False
+                    self.install.state(["!disabled"])
+                    self._build_version_panel()
+                    logging.info(
+                        "installer: %d version(s) offered, installed=%s",
+                        len(getattr(versions, "entries", ()) or ()),
+                        installed or "none",
+                    )
+                elif kind == "downloaded":
+                    version, archive = value
+                    self.running = False
+                    self.install.state(["!disabled"])
+                    self._set_progress(1.0)
+                    self.status.configure(text=f"已保存：{archive}")
+                    messagebox.showinfo(
+                        "下载完成",
+                        f"v{version} 已保存到\n{archive}\n\n没有安装。",
+                        parent=self.root,
+                    )
                 elif kind == "hint":
                     # A plain hint, not a failure: the install has not started.
                     self.running = False

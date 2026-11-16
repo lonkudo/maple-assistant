@@ -88,6 +88,106 @@ class ReleaseInfo:
         return ""
 
 
+# The versions the operator offers form a LIST now, not one record: the desktop
+# shows them in a window and the installer asks which one to install, and both
+# may go backwards as well as forwards.
+@dataclass(frozen=True)
+class ReleaseList:
+    """Every version the operator currently offers, newest first."""
+
+    entries: tuple[ReleaseInfo, ...] = ()
+    # ``latest`` is the highest OFFERED version (not necessarily installed).
+    latest: str = ""
+    # ``current`` is the console's 当前发布 record; informational only.
+    current: str = ""
+
+    def find(self, version: str) -> Optional[ReleaseInfo]:
+        for entry in self.entries:
+            if entry.version == version:
+                return entry
+        return None
+
+    def is_latest(self, version: str) -> bool:
+        return bool(self.latest) and version == self.latest
+
+    def version_keys(self) -> tuple[str, ...]:
+        return tuple(entry.version for entry in self.entries)
+
+
+def parse_release_list(value: Any) -> Optional[ReleaseList]:
+    """Build a :class:`ReleaseList` from the server's JSON, or ``None``.
+
+    Rows without a download location are dropped (they cannot be acted on) and a
+    repeated version keeps its first occurrence: the server sends the list newest
+    first, and a duplicate would otherwise appear twice in the window.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("updates")
+    if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes, dict)):
+        return None
+    entries: list[ReleaseInfo] = []
+    seen: set[str] = set()
+    for item in raw:
+        entry = parse_release(item)
+        if entry is None or entry.version in seen:
+            continue
+        seen.add(entry.version)
+        entries.append(entry)
+    entries.sort(key=lambda item: version_key(item.version), reverse=True)
+    if not entries:
+        # "Nothing is offered right now" and "the call failed" are different
+        # answers; an empty list is a real, renderable answer.
+        return ReleaseList(entries=(), latest="", current=str(value.get("current") or ""))
+    latest = str(value.get("latest") or "").strip()
+    if not latest or version_key(latest) not in {version_key(e.version) for e in entries}:
+        latest = entries[0].version
+    return ReleaseList(
+        entries=tuple(entries),
+        latest=latest,
+        current=str(value.get("current") or ""),
+    )
+
+
+def fetch_release_list(root: Optional[Path] = None) -> Optional[ReleaseList]:
+    """Ask the pinned activation server which versions it currently offers.
+
+    Returns ``None`` - never raises - without a local entitlement, when the
+    server cannot be reached, or on a malformed answer: the caller shows that as
+    "无法获取可更新版本" instead of an exception.
+    """
+
+    try:
+        local = licensing.verify_license(root)
+    except Exception:  # noqa: BLE001 - a broken local document is not a crash
+        LOG.warning("release list: the local license could not be verified", exc_info=True)
+        return None
+    if not local.valid or not local.license_id:
+        LOG.info("release list: no valid local license (%s)", local.code)
+        return None
+    try:
+        payload = {
+            "fingerprint": licensing.machine_fingerprint_hash(),
+            "license_id": local.license_id,
+        }
+        answer = post_json(
+            licensing.ACTIVATION_SERVER_ENDPOINT,
+            "/api/v1/update/list",
+            payload,
+            licensing.runtime_root() / licensing.ACTIVATION_SERVER_PIN_FILE,
+            timeout=RELEASE_INFO_TIMEOUT,
+            logger=LOG,
+        )
+    except PinnedTlsResponseError as exc:
+        LOG.warning("release list rejected status=%s code=%s", exc.status, exc.code)
+        return None
+    except (PinnedTlsError, ValueError, KeyError, OSError) as exc:
+        LOG.warning("release list unavailable category=%s", type(exc).__name__)
+        return None
+    return parse_release_list(answer or {})
+
+
 def announced_version(value: Any) -> Optional[str]:
     """The version a heartbeat announced, or ``None``.
 
@@ -433,6 +533,99 @@ def apply_staged_update(root: Path, archive: Path) -> None:
     )
 
 
+# --------------------------------------------------------------- 版本 library
+# Every package the operator downloaded, one ZIP per version, in a folder the
+# operator can see and keep.  Two rules make this different from the ``update``
+# staging folder: nothing prunes it, and an install never consumes the file the
+# user chose - ``install_from_library`` hands the supervisor a COPY, because the
+# supervisor deletes whatever archive it installed.
+VERSION_LIBRARY_DIRECTORY = "版本"
+
+
+def library_dir(root: Path) -> Path:
+    """The ``版本`` folder of one installation (created on demand)."""
+
+    return Path(root) / VERSION_LIBRARY_DIRECTORY
+
+
+def library_archive(root: Path, version: str) -> Path:
+    """Where version *version*'s package lives in the library."""
+
+    safe = parse_version(version) if version else version
+    return library_dir(root) / f"{ARCHIVE_PREFIX}-{safe}{ARCHIVE_SUFFIX}"
+
+
+def library_archive_is_valid(root: Path, release: ReleaseInfo) -> bool:
+    """Whether the library already holds a verified package for *release*."""
+
+    archive = library_archive(root, release.version)
+    if not archive.is_file():
+        return False
+    try:
+        verify_archive(archive, release)
+        return True
+    except UpdateCoreError:
+        return False
+
+
+def download_to_library(
+    root: Path,
+    release: ReleaseInfo,
+    *,
+    on_bytes: Optional[Callable[[int], None]] = None,
+    on_total: Optional[Callable[[int], None]] = None,
+    on_stage: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """Download *release* into ``<root>\\版本`` and verify it; return its path.
+
+    The honest name is used (``MoonEclipse-1.3.49.zip``) instead of the staging
+    folder's ``package.zip``: this file is meant to be recognised, re-used and
+    kept by the operator.
+    """
+
+    destination = library_dir(root)
+    name = library_archive(root, release.version).name
+    return download_package(
+        release, destination,
+        on_bytes=on_bytes, on_total=on_total, on_stage=on_stage,
+        filename=name,
+    )
+
+
+def install_from_library(root: Path, archive: Path) -> Path:
+    """Install a library ZIP without consuming it.
+
+    ``Todohelper`` deletes the archive it installed ("consume"), so the chosen
+    file is copied into the ``update`` staging folder and THAT copy is handed over.
+    The library keeps its own file, which is the whole point of 仅下载.
+    """
+
+    root = Path(root)
+    archive = Path(archive)
+    if not archive.is_file():
+        raise UpdateCoreError(f"安装包已不存在：{archive.name}")
+    staging = root / UPDATE_DIRECTORY
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise UpdateCoreError(f"无法创建更新目录：{exc}") from exc
+    copy = staging / archive.name
+    try:
+        shutil.copy2(archive, copy)
+    except OSError as exc:
+        raise UpdateCoreError(f"无法准备安装包：{exc}") from exc
+    try:
+        verify_archive(copy, ReleaseInfo(version=archive_version(copy)))
+        apply_staged_update(root, copy)
+    except Exception:
+        try:
+            copy.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return copy
+
+
 def clear_staged_updates(root: Path, keep: Optional[Path] = None) -> None:
     """Delete leftover archives in the update folder after a successful update."""
 
@@ -550,11 +743,14 @@ def _host(link: str) -> str:
 
 __all__ = [
     "ARCHIVE_ENTRY_POINTS", "ARCHIVE_PREFIX", "HELPER_NAME", "NOTICE_FILE",
-    "ReleaseInfo", "UPDATE_DIRECTORY", "UpdateCoreError", "announced_version",
+    "ReleaseInfo", "ReleaseList", "UPDATE_DIRECTORY", "UpdateCoreError",
+    "VERSION_LIBRARY_DIRECTORY", "announced_version",
     "apply_staged_update", "archive_entry_point", "archive_version",
     "clear_notice", "clear_staged_updates",
-    "download_package", "extract_package_helper", "fetch_release_info",
-    "is_newer", "notice_path",
-    "parse_release", "read_notice", "stage_update", "verify_archive",
-    "verify_archive_layout", "write_notice",
+    "download_package", "download_to_library", "extract_package_helper",
+    "fetch_release_info", "fetch_release_list", "install_from_library",
+    "is_newer", "library_archive", "library_archive_is_valid", "library_dir",
+    "notice_path",
+    "parse_release", "parse_release_list", "read_notice", "stage_update",
+    "verify_archive", "verify_archive_layout", "write_notice",
 ]

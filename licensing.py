@@ -271,6 +271,12 @@ class LicenseStatus:
     # pulls the message body on a later tick.  ``None`` means nothing is
     # published or the server is older than this feature.
     server_notice: Optional[dict[str, Any]] = None
+    # How many versions the server currently OFFERS (``update_count``).  The
+    # announced version is the highest of them, so a client that already runs
+    # the newest build sees "not newer" and would hide the icon even though
+    # older versions are on offer for a rollback.  ``None`` means the server
+    # said nothing (an older server or an unreachable one).
+    server_update_count: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1573,6 +1579,17 @@ def _heartbeat_via_server(
     notice = answer.get("user_notice") if isinstance(answer, dict) else None
     if isinstance(notice, dict) and notice.get("seq") is not None:
         persisted = replace(persisted, server_notice=notice)
+    # 版本列表: the count says how many versions are on offer, which is what
+    # keeps the 更新 window reachable when none of them is newer than this
+    # build (a rollback-only offer).  Never let it affect the verdict.
+    offered = answer.get("update_count") if isinstance(answer, dict) else None
+    if offered is not None:
+        try:
+            persisted = replace(
+                persisted, server_update_count=max(0, int(offered))
+            )
+        except (TypeError, ValueError):
+            SERVER_LOG.warning("license heartbeat: update_count is not a number")
     if persisted.valid:
         _save_sealed_fingerprint(fingerprint, persisted.license_id, root)
         SERVER_LOG.info("license heartbeat accepted license_id=%s", persisted.license_id)

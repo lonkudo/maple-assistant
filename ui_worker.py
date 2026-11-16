@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import collections
 from contextlib import contextmanager
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -52,10 +55,11 @@ from reconnect_worker import (
 )
 from timer_state import load_timer_state, save_timer_state, timer_state_path
 from versioning import read_version, version_label
+import update_core
 from update_core import (
     ReleaseInfo, UpdateCoreError, announced_version, apply_staged_update,
-    clear_staged_updates, fetch_release_info, is_newer, read_notice,
-    stage_update, write_notice,
+    clear_staged_updates, fetch_release_info, fetch_release_list, is_newer,
+    read_notice, stage_update, write_notice,
 )
 from update_manager import (
     MAP_RECORDING_FILE_NAME,
@@ -264,6 +268,15 @@ UPDATE_ICON_INK_GREEN = "#ffffff"
 UPDATE_ICON_BUSY = "#2f6fd0"
 # Tooltip line budget: enough for the version, a few note lines and the hint.
 UPDATE_NOTICE_TOOLTIP_LINES = 8
+# 更新窗口 (the version list).  Wide enough for three marker words next to a
+# version, a one-line note preview and both buttons; the body scrolls when the
+# operator offers many versions (the server caps the list at 50).
+UPDATE_CENTER_WIDTH = 900
+UPDATE_CENTER_HEIGHT = 470
+UPDATE_CENTER_MIN_WIDTH = 640
+UPDATE_CENTER_MIN_HEIGHT = 260
+# Characters of the notes shown inline before the tooltip takes over.
+UPDATE_CENTER_SUMMARY_CHARS = 46
 # 用户提示 (the operator's own message) has its own caption icon: a triangle with
 # an exclamation mark, drawn in the notice's level colour.  Two statuses only -
 # 普通 is grey so it reads as information, 紧急 is red so it cannot be missed - and
@@ -4591,7 +4604,13 @@ class UiWorker(threading.Thread):
         notice = self._release_notice
         if not isinstance(notice, dict) or not notice.get("version"):
             return f"已是最新版本 v{self._local_version()}"
-        lines = [f"发现新版本 v{notice['version']}"]
+        offered = self._offered_version_count()
+        headline = f"发现新版本 v{notice['version']}"
+        if offered > 1:
+            # The window lists every open version, downgrades included; saying
+            # how many exist is the only reason to mention the count here.
+            headline += f"（共 {offered} 个可安装版本）"
+        lines = [headline]
         info_lines = [
             line.strip() for line in str(notice.get("info") or "").splitlines()
             if line.strip()
@@ -4600,8 +4619,21 @@ class UiWorker(threading.Thread):
             lines.extend(info_lines[:UPDATE_NOTICE_TOOLTIP_LINES])
             if len(info_lines) > UPDATE_NOTICE_TOOLTIP_LINES:
                 lines.append("…")
-        lines.append("点击立即更新")
+        lines.append("点击查看可安装版本")
         return "\n".join(lines)
+
+    def _offered_version_count(self) -> int:
+        """How many versions the last heartbeat said are on offer (0 = unknown).
+
+        Used only to enrich the hint: it never decides whether the arrow is lit,
+        because the arrow means "a newer version exists".
+        """
+
+        status = getattr(self, "_license_status", None)
+        try:
+            return max(0, int(getattr(status, "server_update_count", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _refresh_release_tooltip(self) -> None:
         tooltip = getattr(self, "_release_button_tooltip", None)
@@ -4615,6 +4647,8 @@ class UiWorker(threading.Thread):
         if canvas is None:
             return
         notice = self._release_notice
+        # The arrow means "a NEWER version exists", nothing else: a list that
+        # only offers rollbacks leaves it grey (operator rule, 2026-11-16).
         if self._release_download_in_flight:
             ink = UPDATE_ICON_BUSY
         elif isinstance(notice, dict) and notice.get("version"):
@@ -4678,7 +4712,8 @@ class UiWorker(threading.Thread):
         if not version:
             return
         if not is_newer(version, self._local_version()):
-            # The server is at or behind this build: any stored notice is stale.
+            # The server is at or behind this build: any stored notice is stale,
+            # and a rollback-only list must leave the arrow grey.
             if self._release_notice is not None:
                 self._put_release_state("clear", version)
             return
@@ -4911,7 +4946,13 @@ class UiWorker(threading.Thread):
                 LOG.debug("更新提示：状态队列已满，丢弃 %s", action)
 
     def _drain_release_states(self) -> None:
-        """Apply worker results for the update icon on Tk's thread."""
+        """Apply worker results for the update icon on Tk's thread.
+
+        Only two actions reach this queue now: the heartbeat announcing a version
+        (and therefore the icon) and the server withdrawing it.  Downloads and
+        installs happen from the 更新 window, which owns its own queue - a per-row
+        progress line must not repaint the caption.
+        """
 
         while True:
             try:
@@ -4926,129 +4967,513 @@ class UiWorker(threading.Thread):
                 except Exception:  # noqa: BLE001 - the icon state matters more
                     LOG.warning("更新提示：删除本地缓存失败", exc_info=True)
                 self._apply_release_notice(None)
-            elif action == "progress":
-                self._set_release_progress(str(payload))
-            elif action == "failed":
-                self._release_download_in_flight = False
-                self._paint_release_icon()
-                self._set_release_progress("")
-                LOG.warning("更新失败：%s", payload)
-                self._show_release_message("更新失败", str(payload), error=True)
-            elif action == "staged":
-                self._release_download_in_flight = False
-                self._set_release_progress("")
-                LOG.info("更新已安排：v%s 将在助手退出后安装并重启。", (self._release_notice or {}).get("version"))
-                self._close_for_restart()
 
-    def _start_release_update(self) -> None:
-        """The update icon's click: download the announced release and install it."""
+    # --- 更新窗口 (version list) ---------------------------------------------
+    def _open_update_center(self) -> None:
+        """The caption arrow's click: show every version the operator offers.
 
-        notice = self._release_notice
-        local = self._local_version()
-        if not isinstance(notice, dict) or not notice.get("version"):
-            self._show_release_message(
-                "已是最新版本", f"当前运行的是 v{local}，服务器没有更新版本。",
-            )
-            return
-        if self._release_download_in_flight:
-            LOG.info("更新：下载已在进行中，忽略本次点击。")
-            return
-        version = str(notice["version"])
-        from tkinter import messagebox
+        One window, one request per opening (the operator asked for no hot
+        refresh): the list is fetched when the window opens and never polled
+        behind their back.
+        """
 
-        if not messagebox.askyesno(
-            "安装更新",
-            f"下载并安装 v{version}？\n\n安装时助手会关闭，装完自动重启，"
-            "你的设置都会保留。",
-            parent=getattr(self, "_root", None),
-        ):
+        existing = getattr(self, "_update_center_window", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except Exception:  # noqa: BLE001 - a half-destroyed window is gone
+                self._update_center_window = None
+        root = getattr(self, "_root", None)
+        if root is None:
             return
-        release = ReleaseInfo(
-            version=version,
-            info=str(notice.get("info") or ""),
-            link=str(notice.get("link") or ""),
-            extra_links=tuple(str(item) for item in (notice.get("extra_links") or [])),
+        import tkinter as tk
+        ttk = self._ttk
+        win = tk.Toplevel(root)
+        win.title("更新 · 选择版本")
+        win.transient(root)
+        win.configure(bg="#ffffff")
+        win.geometry(f"{UPDATE_CENTER_WIDTH}x{UPDATE_CENTER_HEIGHT}")
+        win.minsize(UPDATE_CENTER_MIN_WIDTH, UPDATE_CENTER_MIN_HEIGHT)
+        win.protocol("WM_DELETE_WINDOW", self._close_update_center)
+        self._update_center_window = win
+        self._update_center_rows = {}
+        self._update_center_listing = None
+        self._update_center_busy = None
+
+        self._update_center_header = ttk.Label(
+            win, text=f"当前版本 v{self._local_version()}　正在获取可更新版本…",
+            anchor="w", padding=(12, 8),
         )
-        self._release_download_in_flight = True
-        self._paint_release_icon()
-        self._set_release_progress("正在准备更新…")
+        self._update_center_header.pack(fill="x")
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12)
+        self._update_center_canvas = tk.Canvas(
+            body, highlightthickness=0, bg="#ffffff", height=240,
+        )
+        scrollbar = ttk.Scrollbar(body, orient="vertical",
+                                  command=self._update_center_canvas.yview)
+        self._update_center_canvas.configure(yscrollcommand=scrollbar.set)
+        self._update_center_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        inner = ttk.Frame(self._update_center_canvas)
+        self._update_center_canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>",
+            lambda _event: self._update_center_canvas.configure(
+                scrollregion=self._update_center_canvas.bbox("all")
+            ),
+        )
+        self._update_center_canvas.bind(
+            "<Configure>",
+            lambda event: self._update_center_canvas.itemconfigure(
+                self._update_center_canvas.find_all()[0], width=event.width
+            ),
+        )
+        self._update_center_body = inner
+
+        footer = ttk.Frame(win, padding=(12, 8))
+        footer.pack(fill="x", side="bottom")
+        library = update_core.library_dir(self._install_root())
+        ttk.Label(
+            footer, text=f"下载目录：{library}", anchor="w",
+        ).pack(side="left")
+        ttk.Button(
+            footer, text="打开文件夹",
+            command=lambda: self._open_path_in_explorer(library),
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            footer, text="关闭", command=self._close_update_center,
+        ).pack(side="right")
+        win.bind("<Escape>", lambda _event: self._close_update_center())
         threading.Thread(
-            target=self._release_download_job, args=(release,),
-            name="release-download", daemon=True,
+            target=self._update_center_fetch_job, name="update-list",
+            daemon=True,
         ).start()
 
-    def _release_download_job(self, release: ReleaseInfo) -> None:
-        """Worker: download, verify, then hand the archive to the restart helper."""
+    def _open_path_in_explorer(self, path: Path) -> None:
+        """Reveal a folder without blocking Tk on the shell call."""
 
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            LOG.debug("更新窗口：无法创建下载目录 %s", path, exc_info=True)
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(path))  # noqa: S606 - the operator asked for it
+            else:
+                subprocess.Popen(["explorer", str(path)])
+        except Exception:  # noqa: BLE001 - opening a folder is a convenience
+            LOG.debug("更新窗口：无法打开目录 %s", path, exc_info=True)
+
+    def _update_center_fetch_job(self) -> None:
+        """Worker: one list request, handed to Tk through the window's queue."""
+
+        try:
+            listing = fetch_release_list()
+        except Exception:  # noqa: BLE001 - never kill the window over a request
+            LOG.warning("更新窗口：获取版本列表失败", exc_info=True)
+            listing = None
+        self._put_update_center_state("list", "", listing)
+
+    def _put_update_center_state(self, kind: str, version: str, payload: Any) -> None:
+        """Queue one window event; a full queue drops the least important one."""
+
+        queue_ref = getattr(self, "_update_center_states", None)
+        if queue_ref is None:
+            queue_ref = queue.Queue(maxsize=64)
+            self._update_center_states = queue_ref
+        try:
+            queue_ref.put_nowait((kind, version, payload))
+        except queue.Full:
+            try:
+                queue_ref.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                queue_ref.put_nowait((kind, version, payload))
+            except queue.Full:
+                LOG.debug("更新窗口：状态队列已满，丢弃 %s", kind)
+
+    def _drain_update_center_states(self) -> None:
+        """Tk tick: render the list, per-row progress and outcomes."""
+
+        queue_ref = getattr(self, "_update_center_states", None)
+        if queue_ref is None:
+            return
+        while True:
+            try:
+                kind, version, payload = queue_ref.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "list":
+                self._render_update_center(payload)
+            elif kind == "progress":
+                self._set_update_center_row_status(version, str(payload))
+                self._set_release_progress(f"v{version} · {payload}")
+            elif kind == "downloaded":
+                self._update_center_busy = None
+                self._release_download_in_flight = False
+                self._set_release_progress("")
+                self._paint_release_icon()
+                self._set_update_center_row_status(
+                    version, f"已下载：{Path(payload).name}"
+                )
+                self._mark_update_center_downloaded(version)
+                self._show_release_message(
+                    "下载完成", f"v{version} 已保存到\n{payload}\n\n没有安装。",
+                )
+            elif kind == "installed":
+                self._update_center_busy = None
+                self._set_update_center_row_status(version, "正在重启安装…")
+                LOG.info("更新窗口：v%s 已交给重启助手安装。", version)
+                self._close_for_restart()
+            elif kind == "failed":
+                self._update_center_busy = None
+                self._release_download_in_flight = False
+                self._set_release_progress("")
+                self._paint_release_icon()
+                self._set_update_center_row_status(version, "失败")
+                LOG.warning("更新窗口：v%s 失败：%s", version, payload)
+                self._show_release_message("更新失败", str(payload), error=True)
+                self._refresh_update_center_buttons()
+
+    def _render_update_center(self, listing: Any) -> None:
+        """Build one row per offered version (newest first)."""
+
+        window = getattr(self, "_update_center_window", None)
+        body = getattr(self, "_update_center_body", None)
+        if window is None or body is None:
+            return
+        try:
+            for child in body.winfo_children():
+                child.destroy()
+        except Exception:  # noqa: BLE001 - a rebuild must not stop the window
+            LOG.debug("更新窗口：清理旧行失败", exc_info=True)
+        self._update_center_rows = {}
+        local = self._local_version()
+        if listing is None:
+            self._update_center_header.configure(
+                text=f"当前版本 v{local}　无法获取可更新版本，请检查网络或授权后重试。"
+            )
+            return
+        if not listing.entries:
+            self._update_center_header.configure(
+                text=f"当前版本 v{local}　服务器当前没有开放的版本。"
+            )
+            return
+        self._update_center_listing = listing
         root = self._install_root()
-        meter = {"position": 0, "total": 0}
+        downloaded = 0
+        for entry in listing.entries:
+            if update_core.library_archive_is_valid(root, entry):
+                downloaded += 1
+        self._update_center_header.configure(
+            text=(f"当前版本 v{local}　可更新版本 {len(listing.entries)} 个"
+                  + (f"（已下载 {downloaded} 个）" if downloaded else ""))
+        )
+        for entry in listing.entries:
+            self._build_update_center_row(body, entry, listing, local, root)
+        self._refresh_update_center_buttons()
 
-        if not release.links():
-            # The heartbeat only announced a version and the detail request has
-            # not produced a link (yet): fetch it now rather than downloading
-            # from nowhere.
-            self._put_release_state("progress", "正在获取下载链接…")
-            fetched = fetch_release_info()
-            if fetched is None or fetched.version != release.version:
-                self._put_release_state(
-                    "failed",
-                    f"无法获取 v{release.version} 的下载链接，请稍后重试；"
-                    "也可以稍后再点一次更新图标。",
+    def _build_update_center_row(
+        self, parent: Any, entry: "ReleaseInfo", listing: Any,
+        local: str, root: Path,
+    ) -> None:
+        """One version row: markers, notes preview, two actions, status."""
+
+        import tkinter as tk  # noqa: F401 - keep parity with run()
+        ttk = self._ttk
+        row = ttk.Frame(parent, padding=(2, 6))
+        row.pack(fill="x", pady=(0, 2))
+        markers = []
+        if listing.is_latest(entry.version):
+            markers.append("(最新)")
+        if entry.version == local:
+            markers.append("(当前运行)")
+        already = update_core.library_archive_is_valid(root, entry)
+        if already:
+            markers.append("(已下载)")
+        version_text = f"v{entry.version} " + " ".join(markers)
+        version_cell = ttk.Label(row, text=version_text.strip(), width=26, anchor="w")
+        version_cell.pack(side="left")
+        summary = entry.summary() or "（无更新说明）"
+        if len(summary) > UPDATE_CENTER_SUMMARY_CHARS:
+            summary = summary[: UPDATE_CENTER_SUMMARY_CHARS - 1] + "…"
+        notes_cell = ttk.Label(row, text=summary, anchor="w")
+        notes_cell.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        download_button = ttk.Button(
+            row, text="已下载" if already else "仅下载",
+            state="disabled" if already else "normal",
+            command=lambda version=entry.version: self._update_center_action(
+                version, install=False
+            ),
+        )
+        download_button.pack(side="right", padx=(4, 0))
+        install_button = ttk.Button(
+            row, text="下载并安装",
+            command=lambda version=entry.version: self._update_center_action(
+                version, install=True
+            ),
+        )
+        install_button.pack(side="right")
+        status = ttk.Label(row, text="", width=20, anchor="w")
+        status.pack(side="right", padx=(8, 8))
+        hint = self._release_tooltip_text_for(entry)
+        for widget in (version_cell, notes_cell):
+            tooltip = HoverTooltip(widget, hint)
+            tooltip.set_enabled(True)
+            self._bind_key_tooltips.append(tooltip)
+            widget.bind(
+                "<Button-1>",
+                lambda _event, entry=entry: self._show_release_message(
+                    f"v{entry.version} 更新说明",
+                    entry.info or "（没有更新说明）",
+                ),
+            )
+        self._update_center_rows[entry.version] = {
+            "row": row,
+            "status": status,
+            "download": download_button,
+            "install": install_button,
+        }
+
+    @staticmethod
+    def _release_tooltip_text_for(entry: "ReleaseInfo") -> str:
+        """Hover hint: the notes, truncated, plus what a click does."""
+
+        lines = [f"v{entry.version}"]
+        body = [line.strip() for line in str(entry.info or "").splitlines() if line.strip()]
+        if not body:
+            lines.append("（没有更新说明）")
+        else:
+            lines.extend(body[:UPDATE_NOTICE_TOOLTIP_LINES])
+            if len(body) > UPDATE_NOTICE_TOOLTIP_LINES:
+                lines.append("…")
+            lines.append("点击查看完整说明")
+        return "\n".join(lines)
+
+    def _set_update_center_row_status(self, version: str, text: str) -> None:
+        row = (getattr(self, "_update_center_rows", {}) or {}).get(version)
+        if not row:
+            return
+        try:
+            row["status"].configure(text=text)
+        except Exception:  # noqa: BLE001 - a status label is cosmetic
+            LOG.debug("更新窗口：状态标签更新失败", exc_info=True)
+
+    def _mark_update_center_downloaded(self, version: str) -> None:
+        row = (getattr(self, "_update_center_rows", {}) or {}).get(version)
+        if not row:
+            return
+        try:
+            row["download"].configure(text="已下载", state="disabled")
+            entry = (self._update_center_listing.find(version)
+                     if self._update_center_listing else None)
+            if entry is not None:
+                # The version cell gains the (已下载) marker without a rebuild.
+                for child in row["row"].winfo_children():
+                    if isinstance(child, ttk.Label) and child.cget("width") == 26:
+                        text = str(child.cget("text") or "")
+                        if "(已下载)" not in text:
+                            child.configure(text=f"{text} (已下载)")
+                        break
+        except Exception:  # noqa: BLE001
+            LOG.debug("更新窗口：下载标记失败", exc_info=True)
+
+    def _refresh_update_center_buttons(self) -> None:
+        """Enable/disable rows from the window's single-download rule."""
+
+        busy = getattr(self, "_update_center_busy", None)
+        local = self._local_version()
+        for version, row in (getattr(self, "_update_center_rows", {}) or {}).items():
+            try:
+                install_state = "disabled" if (busy or version == local) else "normal"
+                if busy and busy != version:
+                    download_state = "disabled"
+                else:
+                    download_state = row["download"].cget("state")
+                    if str(row["download"].cget("text")) == "已下载":
+                        download_state = "disabled"
+                    elif not busy:
+                        download_state = "normal"
+                row["install"].configure(state=install_state)
+                row["download"].configure(state=download_state)
+            except Exception:  # noqa: BLE001
+                LOG.debug("更新窗口：按钮状态更新失败", exc_info=True)
+
+    def _update_center_action(self, version: str, install: bool) -> None:
+        """Confirm, then hand the work to one background thread."""
+
+        listing = getattr(self, "_update_center_listing", None)
+        entry = listing.find(version) if listing is not None else None
+        if entry is None:
+            return
+        if self._update_center_busy:
+            LOG.info("更新窗口：已有任务在进行中，忽略 v%s 的点击", version)
+            return
+        local = self._local_version()
+        from tkinter import messagebox
+
+        downgrade = bool(local) and update_core.version_key(version) < update_core.version_key(local)
+        if install:
+            if version == local:
+                self._show_release_message(
+                    "已安装", f"当前已经是 v{local}，无需重复安装。",
                 )
                 return
-            release = fetched
+            if downgrade:
+                prompt = (
+                    f"v{version} 比当前运行的 v{local} 旧。\n\n"
+                    "安装旧版本不会回退你的设置；安装前会把当前配置备份到 版本 文件夹。\n"
+                    "安装时助手会关闭，装完自动重启。\n\n继续安装 v" + version + "？"
+                )
+            else:
+                prompt = (
+                    f"下载并安装 v{version}？\n\n"
+                    "安装时助手会关闭，装完自动重启，你的设置都会保留。"
+                )
+            if not messagebox.askyesno(
+                "安装版本", prompt, parent=getattr(self, "_update_center_window", None)
+                or getattr(self, "_root", None),
+            ):
+                return
+        self._update_center_busy = version
+        # The caption shows the busy colour and the version: the window may be
+        # behind the game while this runs.
+        self._release_download_in_flight = True
+        self._paint_release_icon()
+        self._set_release_progress(f"准备 v{version}…")
+        self._refresh_update_center_buttons()
+        self._set_update_center_row_status(version, "准备中…")
+        threading.Thread(
+            target=self._update_center_job, args=(entry, install),
+            name="update-center", daemon=True,
+        ).start()
+
+    def _update_center_job(self, entry: "ReleaseInfo", install: bool) -> None:
+        """Worker: download into 版本 (or reuse it), then optionally install."""
+
+        version = entry.version
+        root = self._install_root()
+        meter = {"position": 0, "total": 0}
 
         def on_total(total: int) -> None:
             meter["position"] = 0
             meter["total"] = max(0, int(total))
-            # The total is known before the first byte arrives: say so at once
-            # (``0.0/175.4 MB``), so the caption never looks like a bare counter.
-            self._put_release_state(
-                "progress", download_progress_text(0, meter["total"])
+            self._put_update_center_state(
+                "progress", version, download_progress_text(0, meter["total"])
             )
 
         def on_bytes(position: int) -> None:
             meter["position"] = position
-            self._put_release_state(
-                "progress", download_progress_text(position, meter["total"])
+            self._put_update_center_state(
+                "progress", version, download_progress_text(position, meter["total"])
             )
 
         def on_stage(text_value: str) -> None:
-            self._put_release_state("progress", str(text_value))
+            self._put_update_center_state("progress", version, str(text_value))
 
         try:
-            archive = stage_update(
-                root, release, on_bytes=on_bytes, on_total=on_total, on_stage=on_stage,
-            )
-        except UpdateCoreError as exc:
-            self._put_release_state("failed", str(exc))
+            if update_core.library_archive_is_valid(root, entry):
+                archive = update_core.library_archive(root, version)
+                self._put_update_center_state(
+                    "progress", version, f"使用已下载的 {archive.name}"
+                )
+            else:
+                self._put_update_center_state("progress", version, "正在下载…")
+                archive = update_core.download_to_library(
+                    root, entry, on_bytes=on_bytes, on_total=on_total,
+                    on_stage=on_stage,
+                )
+        except update_core.UpdateCoreError as exc:
+            self._put_update_center_state("failed", version, str(exc))
             return
         except Exception:  # noqa: BLE001 - report, never crash the UI
-            LOG.exception("更新失败：下载安装包时发生未预期错误")
-            self._put_release_state("failed", "下载更新时发生未预期错误，请稍后重试。")
+            LOG.exception("更新窗口：下载 v%s 时发生未预期错误", version)
+            self._put_update_center_state(
+                "failed", version, "下载版本包时发生未预期错误，请稍后重试。"
+            )
             return
+        if not install:
+            self._put_update_center_state("downloaded", version, str(archive))
+            return
+        local = self._local_version()
+        if update_core.version_key(version) < update_core.version_key(local):
+            backup = self._backup_config_before_install(root, version, local)
+            if backup is not None:
+                self._put_update_center_state(
+                    "progress", version, f"已备份配置：{backup.name}"
+                )
+        self._put_update_center_state("progress", version, "正在安排安装…")
         try:
-            size = archive.stat().st_size
-        except OSError:
-            size = 0
-        self._put_release_state(
-            "progress",
-            f"正在校验安装包…（{size / 1048576:.1f} MB）" if size else "正在校验安装包…",
-        )
-        try:
-            apply_staged_update(root, archive)
-        except (UpdateError, UpdateCoreError) as exc:
-            # A package this installation cannot apply (wrong release kind,
-            # missing VERSION) must be reported HERE: the helper installs after
-            # the application exits, so a mismatch discovered there left the
-            # operator with nothing running.
-            self._put_release_state("failed", str(exc))
+            update_core.install_from_library(root, archive)
+        except (UpdateError, update_core.UpdateCoreError) as exc:
+            self._put_update_center_state("failed", version, str(exc))
             return
         except Exception:  # noqa: BLE001
-            LOG.exception("更新失败：安排安装时发生未预期错误")
-            self._put_release_state("failed", "无法安排安装，请稍后重试。")
+            LOG.exception("更新窗口：安排安装 v%s 时发生未预期错误", version)
+            self._put_update_center_state("failed", version, "无法安排安装，请稍后重试。")
             return
-        self._put_release_state("staged", str(archive))
+        self._put_update_center_state("installed", version, str(archive))
+
+    def _backup_config_before_install(
+        self, root: Path, target: str, running: str,
+    ) -> Optional[Path]:
+        """Keep the settings document safe before a downgrade.
+
+        An update never touches ``user_config.json``, so a downgrade leaves a
+        settings file written by a NEWER build in place.  That is the honest
+        behaviour (settings must not vanish) but it can confuse the older build,
+        so the exact file is kept in the 版本 folder first.
+        """
+
+        source = root / "user_config.json"
+        if not source.is_file():
+            return None
+        destination = (
+            update_core.library_dir(root)
+            / f"user_config-{running or 'unknown'}-before-{target}.json"
+        )
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            LOG.info("更新窗口：降级前已备份配置 -> %s", destination)
+            return destination
+        except OSError:
+            LOG.warning("更新窗口：降级前备份配置失败", exc_info=True)
+            return None
+
+    def _close_update_center(self) -> None:
+        window = getattr(self, "_update_center_window", None)
+        self._update_center_window = None
+        self._update_center_rows = {}
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:  # noqa: BLE001 - closing is best effort
+                LOG.debug("更新窗口：关闭失败", exc_info=True)
+
+    def _start_release_update(self) -> None:
+        """The caption arrow's click: open the 更新 window.
+
+        It used to download and install the single announced version on one
+        click.  The operator now decides which version to take, may go backwards,
+        and may only want the file, so the click opens the list instead of
+        starting a download nobody asked for.
+        """
+
+        try:
+            self._open_update_center()
+        except Exception:  # noqa: BLE001 - a window must never break the caption
+            LOG.exception("更新窗口：无法打开")
+            self._show_release_message(
+                "更新", "无法打开更新窗口，请稍后重试。", error=True,
+            )
 
     def _show_release_message(self, title: str, text: str, *, error: bool = False) -> None:
         """One message box for the update icon, never blocking a worker thread."""
@@ -5608,6 +6033,9 @@ class UiWorker(threading.Thread):
             # dispatch: an armed live pass never waits for cosmetic/status
             # work or configuration I/O.
             self._drain_license_heartbeat_results,
+            # 更新窗口: the list request and every per-row progress line land
+            # here; it returns immediately while the window is closed.
+            self._drain_update_center_states,
             # 用户提示: repaint the caption triangle from whatever the last
             # heartbeat announced and whatever the fetch returned.  It runs right
             # after the heartbeat drain so the icon appears on the same tick the
