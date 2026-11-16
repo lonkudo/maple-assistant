@@ -16,7 +16,6 @@ from ui_worker import (
     patrol_button_states,
     record_button_is_locked,
     recorded_coordinate_text,
-    machine_name_button_text,
     normalize_quick_messages,
     quick_message_preview,
     rope_unavailable_hint,
@@ -197,10 +196,6 @@ class RandomGapStepButtonTests(unittest.TestCase):
 class UiLogHandlerTests(unittest.TestCase):
     def test_yolo_panel_is_temporarily_hidden_behind_restore_flag(self) -> None:
         self.assertFalse(UiWorker._SHOW_YOLO_PANEL)
-
-    def test_machine_name_button_uses_edit_hint_only_when_empty(self) -> None:
-        self.assertEqual(machine_name_button_text(""), "修改名称")
-        self.assertEqual(machine_name_button_text("  电脑A  "), "电脑A")
 
     def test_quick_messages_are_normalized_and_bounded(self) -> None:
         self.assertEqual(

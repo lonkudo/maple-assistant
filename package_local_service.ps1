@@ -157,16 +157,18 @@ if ($configChanged) {
     Write-Host "local lie service: bundled ct_login_config.json already carries no partner card"
 }
 
-# The vendor's coordinate-cloud startup gate samples `roi_track_servers` from
-# data\build_profile.json and ABORTS the start ("坐标云启动握手失败，同行服务未启动")
-# when every sampled WS handshake fails.  The shipped profile lists TWO hosts:
-# 221.10.121.69:44444 (retired - the operator: "this server is stopped, we
-# shouldn't use it") and 117.50.223.113:8888 (live).  A pool with a dead half made
-# the first launch of 本地测谎 a coin flip on the one live host, and it also sent
-# each start's first handshake to a server that no longer exists.  The packaged
-# profile keeps only the live deployment; the desktop applies the same repair at
-# runtime (local_lie_service.normalize_roi_track_servers), so existing installs
-# are fixed too.  Ports and labels of the surviving entry are untouched.
+# The shipped profile lists TWO ROI-track hosts: 221.10.121.69:44444 (retired -
+# the operator: "this server is stopped, we shouldn't use it") and
+# 117.50.223.113:8888 (live).  The packaged profile keeps only the live
+# deployment; the desktop applies the same repair at runtime
+# (local_lie_service.normalize_roi_track_servers), so existing installs are fixed
+# too.  Ports and labels of the surviving entry are untouched.
+#
+# NOTE: this does NOT change the vendor's startup gate.  That gate probes a
+# candidate list compiled into the vendor binary (its log still says
+# "锁定 221+117 共 2 WS 口" with both profile copies trimmed), so a start still
+# depends on 117.50.223.113:8888 answering.  The trim only keeps the DECLARED
+# deployment consistent for the runtime WS client that reads this file.
 $liveHost = "117.50.223.113"
 foreach ($profileRelative in @("data\build_profile.json",
                                "_internal\CT\data\build_profile.json")) {

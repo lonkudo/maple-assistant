@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import logging
+from pathlib import Path
 import queue
 import threading
 import time
@@ -28,6 +29,14 @@ from urllib.parse import urlsplit
 
 
 LOG = logging.getLogger(__name__)
+
+# Every push is also appended to this file in the install root.  assistant.log is
+# wiped at each start, so without a durable line the only evidence of "the group
+# got a 掉线警报 at 09:52 while no such machine was running" disappears with the
+# next launch.  Each line names the device, the event, the result and the install
+# path, so a message in the group can be traced back to the machine that sent it.
+AUDIT_LOG_NAME = "dingtalk_sent.log"
+AUDIT_MAX_BYTES = 256_000
 
 # DingTalk 自定义机器人 keyword security: every message must contain this word.
 DINGTALK_KEYWORD = "MoonEclipse"
@@ -72,6 +81,31 @@ def normalize_webhook(value: Any) -> str:
     if not text.lower().startswith(_WEBHOOK_PREFIXES):
         return ""
     return text
+
+
+def audit_log_path() -> Path:
+    """Where the durable push audit lives (the install root, not work/)."""
+
+    try:
+        from runtime_paths import application_root
+
+        return Path(application_root(__file__)) / AUDIT_LOG_NAME
+    except Exception:  # noqa: BLE001 - the audit must never break delivery
+        return Path(__file__).resolve().parent / AUDIT_LOG_NAME
+
+
+def _write_audit(line: str) -> None:
+    """Append one audit line, capped so an unattended machine cannot fill a disk."""
+
+    path = audit_log_path()
+    try:
+        if path.exists() and path.stat().st_size > AUDIT_MAX_BYTES:
+            kept = path.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+            path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line.rstrip("\n") + "\n")
+    except OSError:
+        LOG.warning("钉钉提醒: audit line could not be written to %s", path)
 
 
 def format_dingtalk_message(
@@ -440,6 +474,10 @@ class DingTalkNotifier(threading.Thread):
         if kind == "event" and self._coalesce(label):
             LOG.info("钉钉提醒: %s already sent within %.0fs; skipped",
                      label, EVENT_COALESCE_SECONDS)
+            _write_audit(
+                f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{machine_name or '未命名设备'}"
+                f"\t{label}\tskipped (coalesced)"
+            )
             return
         text = format_dingtalk_message(machine_name, label)
         try:
@@ -449,16 +487,28 @@ class DingTalkNotifier(threading.Thread):
                 self._last_event = label
                 self._status = f"失败 - {str(error)[:40]}"
             LOG.warning("钉钉提醒: %s could not be delivered - %s", label, error)
+            _write_audit(
+                f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{machine_name or '未命名设备'}"
+                f"\t{label}\tfailed: {str(error)[:80]}"
+            )
             return
         except Exception as error:  # noqa: BLE001 - optional alert channel
             with self._lock:
                 self._status = f"失败 - {str(error)[:40]}"
             LOG.exception("钉钉提醒: unexpected failure")
+            _write_audit(
+                f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{machine_name or '未命名设备'}"
+                f"\t{label}\tfailed: {str(error)[:80]}"
+            )
             return
         with self._lock:
             self._last_event = label
             self._status = f"已发送({label})"
         LOG.info("钉钉提醒: delivered %s", label)
+        _write_audit(
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{machine_name or '未命名设备'}"
+            f"\t{label}\tdelivered"
+        )
 
     # ----------------------------------------------------------------- thread
     def run(self) -> None:

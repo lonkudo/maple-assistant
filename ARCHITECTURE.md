@@ -1581,11 +1581,14 @@ mapped through the crop, and a resize to 745×496 does not change that because
   retry is not reported as a permanent refusal.
 * `normalize_roi_track_servers()` (v1.3.35) trims the vendor's `roi_track_servers` pool
   in both `data\build_profile.json` and `_internal\CT\data\build_profile.json` to the
-  live deployment (`_live_endpoint_host()`), because the vendor's startup gate samples
-  that pool, probes the WS handshake of each sampled endpoint and aborts the whole start
-  with 坐标云启动握手失败 when they all fail. The shipped pool listed the retired
-  `221.10.121.69:44444` beside the live `117.50.223.113:8888`, so half of every sample
-  was dead. `package_local_service.ps1` applies the same trim at build time.
+  live deployment (`_live_endpoint_host()`): the shipped pool listed the retired
+  `221.10.121.69:44444` beside the live `117.50.223.113:8888`, and nothing should point
+  at a host that no longer exists. `package_local_service.ps1` applies the same trim at
+  build time. It does **not** change the vendor's startup gate: that gate probes a
+  candidate list compiled into the vendor binary (with both profile copies trimmed its
+  log still says `锁定 221+117 共 2 WS 口`), so a start still depends on
+  `117.50.223.113:8888` completing the WS handshake. Only the vendor or the deployment
+  can change what the gate probes.
 
 `licensing._with_server_device()` is the single entry point for server-driven state: it
 stores `auto_lie.secret_key`, forwards the device document's `ct_card` to

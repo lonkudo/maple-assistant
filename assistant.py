@@ -25,6 +25,7 @@ from auto_lie_secret import CredentialRedactionFilter, get_server_secret
 from async_log_writer import AsyncBatchLogWriter
 from crash_reporter import record_exception
 from versioning import version_label
+import run_mode
 
 
 class CompactThreadFormatter(logging.Formatter):
@@ -248,6 +249,28 @@ def _start_live_input(
     if not key_sender.is_game_foreground():
         raise OSError("游戏窗口未能切换到前台")
     logging.info("START PATROL: game window verified foreground")
+    # UIPI: Windows silently discards injected keys when the game runs at a
+    # higher integrity level than this process.  The symptom is exactly the
+    # 2026-11-16 field report - a normal-looking attack beat, no attack in the
+    # game - and it appears when the assistant was restarted by something that
+    # does not ask for elevation (the update helper, an installer, or a direct
+    # exe start).  Report it here, before any worker starts.
+    try:
+        import integrity_guard
+
+        blocker = integrity_guard.injection_blocker(
+            getattr(key_sender, "window_handle", None)
+            or getattr(key_sender, "hwnd", None)
+        )
+        if blocker:
+            logging.warning("KEY INJECTION BLOCKED: %s", blocker)
+        else:
+            logging.info(
+                "PROCESS INTEGRITY: %s; the game window can receive injected keys",
+                integrity_guard.startup_note(),
+            )
+    except Exception:  # noqa: BLE001 - a diagnostic must never block a run
+        logging.debug("integrity check skipped", exc_info=True)
     veto_text = veto_reason or "patrol input is owned elsewhere"
     if veto_event is not None and veto_event.is_set():
         logging.warning(
@@ -376,6 +399,7 @@ def _recording_log_header(
         "# ===== MoonEclipse log =====\n"
         f"# started  {stamp}\n"
         f"# version  {version}\n"
+        f"# mode     {run_mode.describe()}\n"
         f"# exe      {application_root(__file__)}\n"
         f"# config   {config_path}\n"
         "# ===== recording (user_config.json :: recording) =====\n"
@@ -563,6 +587,7 @@ def main() -> int:
             "# ===== MoonEclipse log =====\n"
             f"# started  {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"# version  {version_label()}\n"
+            f"# mode     {run_mode.describe()}\n"
             f"# exe      {application_root(__file__)}\n"
             f"# config   {config_store.user_path}\n"
             f"# ===== recording snapshot ({reason} "
@@ -595,6 +620,10 @@ def main() -> int:
     trace_log_handler.addFilter(credential_filter)
     root_logger.addHandler(trace_log_handler)
     trace_log_writer.start()
+    # mode.txt (0 = debug / 1 = produce) is machine-local and never shipped; it
+    # is announced once HERE, after the file handler exists, so the record lands
+    # in assistant.log as well as on the header's "# mode" line.
+    run_mode.log_run_mode()
 
     # The licensing/server boundary gets its own compact, safe-to-share trace.
     # It deliberately records no activation code, fingerprint, token, or secret.
@@ -733,8 +762,13 @@ def main() -> int:
     from lie_detector_worker import LieDetectorWorker
     from lie_screenshot_recorder import LieScreenshotRecorder
     from screen_blinker import ScreenBlinker
-    from telegram_notifier import TelegramNotifier
+    # 消息推送 is 钉钉 only now: the operator stopped using Telegram ("we don't
+    # use telegram now"), so the notifier is deliberately not created and no
+    # Telegram settings are applied.  The module stays in the repository (and its
+    # saved token/chat keys stay in user_config.json) so this is a one-line
+    # restore if the channel is ever wanted again.
     from dingtalk_notifier import DingTalkNotifier
+    from abnormal_notifier import AbnormalNotifier
     from focus_worker import FocusWorker
     from minimap_detector import (
         MinimapDetector,
@@ -1349,6 +1383,13 @@ def main() -> int:
             detection.window_size[1],
             detection.confidence,
         )
+        # This run may intentionally start with a different map border than
+        # the recording. From here on, only a later live border change is an
+        # abnormal map-change event.
+        movement_worker.begin_minimap_border_watch()
+        # 非正常运行 is run-scoped as well: a run that starts on a map whose layer is
+        # not recorded is measured from THIS run, not from an earlier one.
+        movement_worker.begin_map_stuck_watch()
         # Keep the stationary-start visual diagnosis identical to a normal
         # patrol start: minimap, marker-analysis and HP/MP regions all show
         # their actual current capture geometry.
@@ -2567,17 +2608,28 @@ def main() -> int:
             frame.image.size[0], frame.image.size[1],
         )
     screen_blinker = ScreenBlinker(stop_event, enabled=False)
-    telegram_notifier = TelegramNotifier(stop_event)
     # 钉钉提醒: the operator's group-robot webhook, armed by the 消息 selection.
     # One alert helper fans the key events (掉线 / 测谎 / 循环) out to every
     # enabled channel, so no worker has to know how many channels exist.
+    # Telegram is retired: it is not constructed, so no send is attempted and the
+    # log no longer reports "Telegram notify failed: BOT token 未配置" for events
+    # the operator never wanted on that channel.
+    telegram_notifier = None
     dingtalk_notifier = DingTalkNotifier(stop_event)
 
     def _message_alert(event_type: str) -> None:
         """Publish one key event to the optional message channels."""
 
-        telegram_notifier.notify(event_type)
         dingtalk_notifier.notify(event_type)
+
+    # This is intentionally not connected to an event producer yet.  Each
+    # abnormal condition will opt in explicitly and provide its own type.
+    abnormal_notifier = AbnormalNotifier(
+        stop_event,
+        sound_path=Path(__file__).resolve().parent / "sound" / "dingdong.mp3",
+        flash_callback=screen_blinker.request_blink,
+        message_callback=_message_alert,
+    )
 
     # Passive diagnostic recorder: it writes only the existing shared frames;
     # it must never create a second GDI/window-capture loop beside auto-lie.
@@ -2838,6 +2890,7 @@ def main() -> int:
             # sent to the client.
             jump_up_chord=str(calibration.get("jump_up_chord", "alt")),
             minimap_detector=minimap_detector,
+            abnormal_notifier=abnormal_notifier,
             patrol_controller=patrol_controller,
             diamond_size_tracker=movement_diamond_tracker,
             structure_tracker=structure_tracker,
@@ -2940,6 +2993,102 @@ def main() -> int:
     )
     motion_arbiter.set_micro_step_callback(movement_worker.perform_micro_step)
     movement_worker.set_attack_slot(attack_slot)
+
+    # One abnormal stop per run is enough; a second detector must not start a
+    # second logoff while the first is still in flight.
+    abnormal_stop_gate = threading.Lock()
+    abnormal_stop_done = {"value": False}
+
+    def stop_for_abnormal(event_type: str) -> None:
+        """The exception boundary: log the character OFF（下机）and stop everything.
+
+        This deliberately reuses the 定时下机 procedure instead of inventing a
+        second one: the character leaves the game and STAYS off - no reconnect,
+        no relaunch - and every automation owner is stood down, not only
+        movement and combat:
+
+        * 自动重连 is disarmed BEFORE the logoff, because the logoff itself
+          creates a disconnect and that disconnect must not start a reconnect;
+        * 循环 (countdown) and 自动测谎/测谎检测 are switched off;
+        * the patrol gate, the motion arbiter, stair jumps and every held key are
+          dropped through ``disarm_patrol_runtime`` (the same path Stop Patrol
+          uses), and the attack cadence plus an in-flight charge are stopped;
+        * ``AutoRestartWorker.trigger_logoff`` performs the same offline half as
+          定时下机 (optional 下线消息, then Esc / Up / Enter / Enter) and stops
+          there.
+
+        It runs on its own daemon thread: the detectors that raise abnormal
+        events run inside the movement frame loop, and this sequence waits on the
+        keyboard ledger and the logoff.  The app window stays open so the operator
+        sees the alert; nothing restarts the run by itself.
+        """
+
+        # The header is logged before the gate so the FIRST event always names
+        # itself; the daemon thread below may start after a second detector has
+        # already been ignored.
+        logging.warning(
+            "ABNORMAL STOP: event=%s - logging off and stopping all automation",
+            event_type,
+        )
+        with abnormal_stop_gate:
+            if abnormal_stop_done["value"]:
+                logging.info(
+                    "ABNORMAL STOP: already handled once; ignoring event=%s", event_type,
+                )
+                return
+            abnormal_stop_done["value"] = True
+
+        def job() -> None:
+            started_at = time.monotonic()
+            try:
+                reconnect_worker.set_enabled(False)
+                countdown_worker.set_enabled(False)
+                lie_detector_worker.set_enabled(False)
+            except Exception:
+                logging.exception("ABNORMAL STOP: disarming a background worker failed")
+            try:
+                patrol_controller.set_enabled(False)
+                disarm_patrol_runtime()
+            except Exception:
+                logging.exception("ABNORMAL STOP: patrol teardown failed")
+            try:
+                attack_worker.stop_for_abnormal(event_type)
+            except Exception:
+                logging.exception("ABNORMAL STOP: attack stop failed")
+            try:
+                movement_worker.stop_for_abnormal(event_type)
+            except Exception:
+                logging.exception("ABNORMAL STOP: movement stop failed")
+            # 下机: the same offline half 定时下机 performs (optional 下线消息, then
+            # Esc / Up / Enter / Enter) and nothing after it - no reconnect and no
+            # relaunch, so the character leaves the game and STAYS off.  自动重连
+            # was already disarmed above, because this logoff creates exactly the
+            # kind of disconnect a reconnect would otherwise pick up.
+            # (This block was temporarily commented out on 2026-11-15 to test the
+            # alert + worker stop alone; the operator has asked for it back.)
+            try:
+                triggered = bool(auto_restart_worker.trigger_logoff())
+            except Exception:
+                logging.exception("ABNORMAL STOP: logoff could not be triggered")
+                triggered = False
+            elapsed = time.monotonic() - started_at
+            if triggered:
+                logging.warning(
+                    "ABNORMAL STOP: 下机 requested (event=%s); no auto reconnect, "
+                    "automation stays stopped (%.0fms)",
+                    event_type, elapsed * 1000.0,
+                )
+            else:
+                logging.warning(
+                    "ABNORMAL STOP: automation stopped, 下机 NOT triggered "
+                    "(event=%s, %.0fms)", event_type, elapsed * 1000.0,
+                )
+
+        threading.Thread(
+            target=job, name="abnormal-stop", daemon=True,
+        ).start()
+
+    abnormal_notifier.set_event_callback(stop_for_abnormal)
     jump_counterattack_hook = getattr(
         atomic_motion_runner, "set_jump_counterattack_executor", None,
     )
@@ -3108,7 +3257,6 @@ def main() -> int:
         countdown_worker,
         lie_detector_worker,
         parked_watch,
-        telegram_notifier,
         dingtalk_notifier,
         focus_worker,
     ]
@@ -3145,8 +3293,11 @@ def main() -> int:
             countdown_worker=countdown_worker,
             lie_detector_worker=lie_detector_worker,
             screen_blinker=screen_blinker,
-            telegram_notifier=telegram_notifier,
+            # Telegram is retired: the notifier is not passed, so none of its
+            # saved settings are applied and no send is ever attempted.
+            telegram_notifier=None,
             dingtalk_notifier=dingtalk_notifier,
+            abnormal_notifier=abnormal_notifier,
             on_patrol_start=start_patrol_input,
             # 自动重连 brought the character back into the game: prepare the map session again (layer
             # detection) and resume the patrol without the operator pressing 开始巡逻.

@@ -520,6 +520,146 @@ def validate_user_config_import(source: Path, destination: Optional[Path] = None
     return source
 
 
+# 地图 exchange: ONLY the `recording` section of user_config.json travels, so a
+# map recording can be shared between machines/characters without touching any
+# other saved setting (药水/增益, 自动重连, 提醒, YOLO, 死花, …).  The operator's
+# fixed file name keeps the flow one-click: 导出地图 always writes this name and
+# 导入地图 opens the same folder.
+MAP_RECORDING_FILE_NAME = "新.地图.json"
+MAP_RECORDING_FORMAT = "mooneclipse-map"
+MAP_RECORDING_FORMAT_VERSION = 1
+
+
+def map_recording_path(user_config: Path) -> Path:
+    """The fixed 地图 file beside the shareable user configuration."""
+
+    directory = Path(user_config).resolve().parent
+    if directory.name != "助手配置":
+        directory = directory / "助手配置"
+    return directory / MAP_RECORDING_FILE_NAME
+
+
+def export_map_recording(user_config: Path) -> Path:
+    """Write ONLY the ``recording`` section to ``助手配置\\新.地图.json``.
+
+    Everything else in user_config.json stays where it is, and the exported
+    document deliberately carries no activation, licence, hardware or alert
+    data - it is a map recording, nothing more.
+    """
+
+    source = Path(user_config).resolve()
+    if not source.is_file():
+        raise UpdateError("当前运行目录找不到 user_config.json，无法导出地图。")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise UpdateError(f"导出地图失败：无法读取当前配置 - {exc}") from exc
+    recording = payload.get("recording") if isinstance(payload, dict) else None
+    if not isinstance(recording, dict) or not recording:
+        raise UpdateError("导出地图失败：当前配置里没有巡逻录制。")
+    document = {
+        "format": MAP_RECORDING_FORMAT,
+        "format_version": MAP_RECORDING_FORMAT_VERSION,
+        "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "map_name": str(recording.get("map_name", "") or ""),
+        "recording": recording,
+    }
+    target = map_recording_path(source)
+    temporary = target.with_name(
+        f".{target.name}.{os.getpid()}.{threading.get_ident()}.exporting"
+    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise UpdateError(f"导出地图失败: {exc}") from exc
+    return target
+
+
+def read_map_recording(source: Path) -> dict:
+    """Return ONLY the recording section of a 地图 file (or of a user config).
+
+    Both documents are accepted: the 地图 file written by
+    :func:`export_map_recording` (``{"format": …, "recording": …}``) and any
+    regular saved configuration (``{"recording": …, "drug": …}``), so an
+    existing 助手配置 export can be reused as a map source.  Everything except
+    ``recording`` is ignored - that is what keeps an import from changing other
+    settings.
+    """
+
+    path = Path(source).resolve()
+    if not path.is_file():
+        raise UpdateError("找不到要导入的地图文件。")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise UpdateError(f"地图文件不是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise UpdateError("地图文件格式错误：根内容必须是 JSON 对象。")
+    recording = payload.get("recording")
+    if not isinstance(recording, dict) or not recording:
+        raise UpdateError("地图文件里没有 recording（巡逻录制）。")
+    return recording
+
+
+def import_map_recording(source: Path, destination: Path) -> dict:
+    """Replace ONLY the live user_config.json ``recording`` section.
+
+    Every other key of the live document - including the version marker, the
+    drug/buff plan, the alert settings and the minimap calibration - is copied
+    through byte-for-byte as parsed JSON, so importing a map cannot reset the
+    operator's other settings.  The file is written through a temporary copy and
+    renamed, so a failure never leaves a half-written configuration.
+    """
+
+    recording = read_map_recording(source)
+    destination = Path(destination).resolve()
+    if not destination.is_file():
+        raise UpdateError("找不到当前 user_config.json，无法导入地图。")
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise UpdateError(f"导入地图失败：无法读取当前配置 - {exc}") from exc
+    if not isinstance(payload, dict):
+        raise UpdateError("导入地图失败：当前 user_config.json 格式错误。")
+    payload["recording"] = recording
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.mapimport"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        last_error: Optional[PermissionError] = None
+        for attempt in range(_CONFIG_IMPORT_REPLACE_ATTEMPTS):
+            try:
+                temporary.replace(destination)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                if attempt + 1 < _CONFIG_IMPORT_REPLACE_ATTEMPTS:
+                    time.sleep(_CONFIG_IMPORT_REPLACE_RETRY_SECONDS)
+        if last_error is not None:
+            raise last_error
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise UpdateError(f"导入地图失败: {exc}") from exc
+    return recording
+
+
 def _persistent_helper(install_root: Path, helper: Optional[Path] = None) -> Path:
     candidate = (Path(helper) if helper is not None
                  else Path(install_root).resolve() / "todohelper_update.ps1")
@@ -596,8 +736,10 @@ def schedule_package_update(
 
 __all__ = [
     "DesktopUpdate", "UpdateError", "UpdateResult", "apply_desktop_update",
-    "desktop_roots", "export_user_config", "find_newer_desktop_update",
-    "import_user_config", "remove_consumed_update_package", "restore_user_config_bytes",
-    "schedule_config_import_restart", "schedule_hidden_restart",
-    "schedule_package_update", "validate_user_config_import",
+    "desktop_roots", "export_map_recording", "export_user_config",
+    "find_newer_desktop_update", "import_map_recording", "import_user_config",
+    "map_recording_path", "read_map_recording", "remove_consumed_update_package",
+    "restore_user_config_bytes", "schedule_config_import_restart",
+    "schedule_hidden_restart", "schedule_package_update",
+    "validate_user_config_import",
 ]

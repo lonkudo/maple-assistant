@@ -68,7 +68,11 @@ $rootFiles = Get-ChildItem $root -File | Where-Object {
                    # 源码版不随包发布，否则 IP/端口 会以明文出现在用户目录里。
                    "endpoints_protected.py",
                    # 厂商参考样例（不是运行时文件）会明文打印部署地址。
-                   "ct_lie3_remote_workflow_sample.py")
+                   "ct_lie3_remote_workflow_sample.py",
+                   # mode.txt 是本机调试开关（0 = 调试 / 1 = 正式）。发布包绝不携带：
+                   # 文件缺失时 run_mode 一律按正式模式运行，所以用户机上不会有
+                   # 加速的最小间隔（例如 重置花 10 秒）。
+                   "mode.txt")
 }
 foreach ($f in $rootFiles) { Copy-Item $f.FullName $out }
 # The live endpoint table ships COMPILED: Nuitka --module produces a .pyd, so the

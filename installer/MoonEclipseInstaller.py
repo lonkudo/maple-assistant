@@ -1521,8 +1521,17 @@ class InstallerWindow:
                 on_bytes=lambda position: self.events.put(("bytes", int(position))),
                 on_total=lambda size: self.events.put(("scale", int(size))),
                 on_stage=lambda line: self.events.put(("stage", str(line))),
-                on_files=lambda phase, done, total:
-                    self.events.put(("files", (str(phase), int(done), int(total)))),
+                # Five arguments, not three: the extraction phase reports the
+                # package bytes it has unpacked as well (that is what makes the
+                # status line say "12.3/175.4 MB" instead of a bare file counter).
+                # A three-parameter lambda here raised
+                # "installer_worker.<locals>.<lambda>() takes 3 positional
+                # arguments but 5 were given" and aborted the whole install.
+                on_files=lambda phase, done, total, done_bytes=0, total_bytes=0:
+                    self.events.put(("files", (
+                        str(phase), int(done), int(total),
+                        int(done_bytes), int(total_bytes),
+                    ))),
             )
 
             if (installed_version and version

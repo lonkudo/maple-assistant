@@ -21,7 +21,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Iterable, Optional, Protocol
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 import numpy as np
 from PIL import Image
@@ -42,10 +42,54 @@ from channel_routing import (
     plan_channel_route,
 )
 from config_store import config_section_file
+import run_mode
 from game_chat import send_game_chat_message
 
 
 LOG = logging.getLogger(__name__)
+
+# The live minimap detector already holds an OpenCV geometry change until it
+# has stabilized. These two additional samples distinguish a confirmed map
+# border from the last small contour jitter at the hand-off boundary.  The
+# confirmation window is 20 frames (~4 s at 5 FPS), the operator's value: a map
+# switch is a persistent change, so the alert may wait a little longer rather
+# than fire on a momentarily mis-measured border.
+MAP_CHANGE_BORDER_TOLERANCE_PX = 6
+MAP_CHANGE_CONFIRM_FRAMES = 20
+MAP_CHANGE_BASELINE_FRAMES = 10
+# Only a LIVE measurement may seed a run's map-border baseline.  "opencv-recording"
+# is the SAVED geometry - exactly what a run started on a different map must not
+# compare against - "opencv-held" is the previous session's kept box, and
+# "opencv-client-edge-canvas" reports the map panel AS the window, which is a
+# different regime rather than a different map.  Only the fully measured pass is
+# comparable with itself.
+MAP_CHANGE_LIVE_SOURCES = ("opencv",)
+# The minimap geometry needs a moment to settle after Start Patrol.  The startup
+# probe's box can differ from the live detector's own steady measurement by MORE
+# than a map ever would - field log 20:52: baseline accepted at 20:52:31 with
+# canvas=(2,62,147,199), while the settled live canvas was (3,67,146,190), 14 px
+# shorter, and the window box never moved at all - so no baseline may be taken
+# during that settle window, and it needs more than a couple of agreeing frames.
+MAP_CHANGE_SETTLE_SECONDS = 5.0
+
+# 非正常运行 ("the run cannot continue"): the marker reads NO recorded floor.
+# The streak is deliberately long before it is even logged, and the ALERT is
+# reserved for a run that cannot recover: the recoveries that bring the character
+# back legitimately take longer than the first window (one edge walk of the
+# unresolved-floor recovery is UNRESOLVED_EDGE_HOLD_SECONDS = 25 frames and a full
+# chord cycle is ~60 frames).  So the first window only writes a log line, and the
+# delivered alert - which also owns the movement/attack safety stop - waits for the
+# recovery to give up (or for the reading to never resolve at all).
+MAP_STUCK_NOTICE_FRAMES = 40
+MAP_STUCK_STOP_FRAMES = 120
+# Consecutive means CONSECUTIVE: a frame stream interrupted for longer than this
+# (an attack pivot, a self-rescue probe, a focus dip) starts a fresh streak
+# instead of pretending the paused gap was "unresolved for ever".
+MAP_STUCK_MAX_GAP_SECONDS = 1.0
+# The delivered type the operator sees (异常警报（类型：非正常运行…）).  One
+# constant, because this label is user-facing text and it is also what the log
+# and the field report quote.
+MAP_STUCK_EVENT_TYPE = "非正常运行"
 
 OTHER_PLAYER_INITIAL_PAUSE_SECONDS = 180.0
 # The request occurs inside one total three-minute presence window: 30--60
@@ -136,19 +180,26 @@ MOVEMENT_STATUS_STEADY_LOG_SECONDS = 3.0
 MOVEMENT_STATUS_POSITION_LOG_DELTA = 0.003
 
 # 死花模式: flower points sit on one rope.  Their X is the recorded rope X;
-# a pair of distinct Y positions makes an Up/Down loop.  The tolerance is a
-# little wider than one minimap marker row, while still keeping adjacent rope
-# stops separate. 补药's configured interval drives the transition between
-# flower points; the route never invents a separate dwell timer.
+# a pair of distinct Y positions makes an Up/Down loop.  补药's configured
+# interval drives the transition between flower points; the route never invents
+# a separate dwell timer.
+#
+# The Y band is the ARRIVAL acceptance used by "flower-reached".  On the current
+# 138x142 canvas one marker row is 1/142 = 0.007042, so 0.010 is about 1.4 rows:
+# on-row and one-row-off are accepted, and the two-row stop that looked too
+# generous in the field frame at 22:59:38 (y_gap=-0.014084, which the old 0.018
+# accepted) is not.  It stays above one row on purpose: the climb steps 1-3 rows
+# per frame at 5 FPS, and a band at or below a single row cannot absorb one
+# quantised read while the character settles.
 DEAD_FLOWER_X_TOLERANCE = 0.018
-DEAD_FLOWER_Y_TOLERANCE = 0.018
+DEAD_FLOWER_Y_TOLERANCE = 0.010
 DEAD_FLOWER_WALK_HOLD_SECONDS = 0.20
 DEAD_FLOWER_DROP_PROGRESS_Y = 0.018
 DEAD_FLOWER_DROP_MAX_ATTEMPTS = 3
-# Two flower points can be only 0.035 Y apart, so their 0.018-Y acceptance
-# bands can overlap by one quantised marker row.  After a Buff changes the
-# target, demand one real 0.003-Y movement in the requested direction before
-# the next point may be considered reached.
+# Two flower points can be only 0.035 Y apart, so their 0.010-Y bands still
+# overlap (0.035 is 5 rows; the accepted window around one point is 0.020 wide).
+# After a Buff changes the target, demand one real 0.003-Y movement in the
+# requested direction before the next point may be considered reached.
 DEAD_FLOWER_NEXT_POINT_PROGRESS_Y = 0.003
 
 
@@ -1361,6 +1412,14 @@ DROP_ROPE_ESCAPE_MAX_Y_STEP = 0.012
 DROP_ROPE_ESCAPE_MAX_X_DRIFT = 0.004
 DROP_ROPE_ESCAPE_FRAMES = 2
 DROP_ROPE_ESCAPE_WINDOW_SECONDS = 1.2
+# During the intentional Direction+Down edge search the character first walks
+# sideways, then locks onto a rope and descends.  At 5 FPS that rope descent
+# can advance roughly two minimap rows (about 0.021 Y) in one sample.  This
+# wider limit applies only after real horizontal edge progress was observed;
+# the ordinary Alt+Down watch remains strict so a vertical fall is not called a
+# rope attachment.
+DROP_ROPE_ESCAPE_EDGE_MAX_Y_STEP = 0.025
+DROP_ROPE_ESCAPE_EDGE_DIRECTION_PROGRESS_MIN_X = 0.002
 
 
 def _layer_y_distance(layer: Any, player_y: float) -> Optional[float]:
@@ -4327,6 +4386,17 @@ class MovementWorker(threading.Thread):
         while not self.stop_event.is_set():
             time.sleep(0.02)
             try:
+                if self._abnormal_release_pending is not None:
+                    # The abnormal stop was requested by a detector running ON
+                    # THE MOVEMENT THREAD (the map-border / 非正常运行 watchers live
+                    # in the frame loop), and releasing keys re-enters this
+                    # worker's locks (``_direction_lock``/``_hold_lock``) and the
+                    # keyboard ledger.  The release therefore happens here, on
+                    # the thread that already owns those locks, instead of from
+                    # inside the frame loop.
+                    event_type = self._abnormal_release_pending
+                    self._abnormal_release_pending = None
+                    self._release_abnormal_input(event_type)
                 if self._patrol_abort_event.is_set():
                     # The sender's lifecycle scrub owns the real key-up.  Do
                     # not let this asynchronous manager emit a second, late
@@ -4885,6 +4955,7 @@ class MovementWorker(threading.Thread):
         drop_retry_seconds: float = 1.0,
         jump_up_chord: str = JUMP_UP_DEFAULT_CHORD,
         minimap_detector: Any = None,
+        abnormal_notifier: Any = None,
         patrol_controller: Any = None,
         diamond_size_tracker: Optional[DiamondSizeTracker] = None,
         structure_tracker: Any = None,
@@ -5183,6 +5254,28 @@ class MovementWorker(threading.Thread):
         self._jump_up_chord_keys = _parse_jump_up_chord(jump_up_chord)
         self._jump_up_chord_label = "+".join(self._jump_up_chord_keys)
         self.minimap_detector = minimap_detector
+        # Each Start Patrol accepts its own stable live OpenCV border. The
+        # saved recording can legitimately have another border after a map
+        # change between runs, so it is never the abnormal-event baseline.
+        self._map_border_watch_active = False
+        self._map_border_watch_started_at = 0.0
+        self._map_border_baseline: Any = None
+        self._map_border_candidate: Any = None
+        self._map_border_candidate_frames = 0
+        self._map_border_mismatch_frames = 0
+        self._map_border_alerted = False
+        # 非正常运行 is run-scoped as well: one log line while the recoveries still
+        # run, and the single delivered alert once they are spent.
+        self._map_stuck_watch_active = False
+        self._map_stuck_frames = 0
+        self._map_stuck_last_y: Optional[float] = None
+        self._map_stuck_last_at = 0.0
+        self._map_stuck_noted = False
+        self._map_stuck_stopped = False
+        # Set by stop_for_abnormal(); serviced by _hold_manager so the release
+        # never runs on the movement frame thread.
+        self._abnormal_release_pending: Optional[str] = None
+        self.abnormal_notifier = abnormal_notifier
         self.patrol_controller = patrol_controller
         self.diamond_size_tracker = diamond_size_tracker
         self.structure_tracker = structure_tracker
@@ -5825,12 +5918,15 @@ class MovementWorker(threading.Thread):
         self._drop_rope_escape_tiny_rise_frames = 0
         self._drop_rope_escape_deadline = float("-inf")
         self._drop_rope_escape_source = ""
+        self._drop_rope_escape_expected_direction: Optional[str] = None
+        self._drop_rope_escape_saw_direction_progress = False
         # A post-reconnect drop edge owns Direction+Down as one input chord.
         # It deliberately does not use the ordinary walk-hold manager: that
         # manager may release a direction early for an attack, while this
         # recovery must keep Down with its direction until drop/rope evidence.
         self._reconnect_drop_edge_input_direction: Optional[str] = None
         self._reconnect_drop_edge_input_until = float("-inf")
+        self._reconnect_drop_edge_input_source = ""
         self.last_observation: Optional[MinimapObservation] = None
         self.last_decision: Optional[MovementDecision] = None
         # StatusWorker reports a confirmed HP decrease with the shared capture
@@ -6083,6 +6179,11 @@ class MovementWorker(threading.Thread):
         """
 
         self._patrol_abort_event.set()
+        # Stop Patrol ends the run-scoped map-border watch as well: its baseline
+        # belongs to the patrol that just stopped, so a map change made while
+        # standing still afterwards is not an abnormal patrol event.
+        self.end_minimap_border_watch(reason="patrol stopped")
+        self.end_map_stuck_watch(reason="patrol stopped")
         # Stop Patrol is the operator's own stop.  A 有人自动换线 workflow that
         # disabled patrol earlier must not switch it back on when it finishes.
         with self._other_player_settings_lock:
@@ -6819,46 +6920,55 @@ class MovementWorker(threading.Thread):
         # first; the next patrol leg will re-arm legitimate points.
         if self._fall_frames > 0 or self._fall_pending:
             return None
-        # A climb that owns Up must not be disturbed by a recorded point.  The
-        # 18:02 field log: the layer1 -> layer2 return climb arrived on layer2
-        # (marker 0.741228, "RETURN CLIMB arrival confirmation: layer2 1/2") and
-        # layer2's recorded right jump point at (0.555147, 0.750000) fired from
-        # that same row - the climb's own arrival row.  Firing it discarded the
-        # climb state ("cancelled ordinary rope recovery"), the lateral Alt moved
-        # the marker 0.0074 off the rope X, the retry jumped Alt+left off the
-        # rope and the character fell back to layer1 (0.785088, "CLIMB grab
-        # failed: marker fell back"), so the layer never resolved.  Standing on
-        # that point afterwards the reusable dwell trigger fired it three more
-        # times, and every fire handed Up to a climb that defers the horizontal
-        # walk, so the rope was never reached.
+        # A climb that owns Up must not be disturbed by a recorded FLOOR point.
+        # The 18:02 field log: the layer1 -> layer2 return climb ARRIVED on layer2
+        # (marker 0.741228, "RETURN CLIMB arrival confirmation") and a recorded
+        # right jump point at (0.555147, 0.750000) fired from that same row.
+        # Firing it discarded the climb state ("cancelled ordinary rope
+        # recovery"), the lateral Alt moved the marker off the rope X, and the
+        # character fell back to layer1.
         #
-        # The gate is deliberately limited to the frames a climb owns Up: while
-        # a return only WALKS toward its rope target, a recorded point is exactly
-        # what the floor needs.  The 18:08 log shows why - the return settled on
-        # layer2, re-locked the rope to x=0.650735 and walked right, but the
-        # marker froze at x=0.562500 y=0.750000 ("ROPE approach walk frozen far
-        # from rope; re-arming right" twice, never moving) because getting from
-        # layer2's left end onto its plateau needs the recorded Alt+right hop.
-        # Suppressing points for the whole return turned that hop off and the
-        # character sat on the point until patrol was stopped.
-        if (self._return_mode == "climb-to-route"
-                and (self._climb_state.up_held
-                     or self._climb_state.phase != "idle")):
-            if not self._jump_point_return_suppression_logged:
-                self._jump_point_return_suppression_logged = True
-                LOG.info(
-                    "JUMP POINT: recorded points are not consulted while a "
-                    "climb owns Up; the climb keeps its own rope target"
-                )
-            # Drop the entry/dwell bookkeeping for the same reason the
-            # missing-marker branch does: the frames spent inside a box during
-            # the climb must not count as "standing on the point", otherwise the
-            # first frame after the climb ends fires it on a stale dwell.
-            self._jump_point_inside_tokens.clear()
-            self._jump_point_dwell_frames.clear()
-            self._jump_point_dwell_last_x.clear()
-            return None
-        self._jump_point_return_suppression_logged = False
+        # But points recorded ON a rope are deliberate rope-exit hops and must
+        # fire WHILE ascending - including on a SECOND rope: the log of 21:09
+        # shows the character jumping from the first rope (x=0.604895) onto the
+        # second one, and layer2[3] (x=0.632867) was then skipped because the
+        # return climb's held rope target was still the FIRST rope's X.  So:
+        #   * just-landed (the arrival confirmation window) suppresses points -
+        #     that is the 18:02 protection;
+        #   * while attached and ascending the rope reference is the marker's own
+        #     column, which is by definition the rope the character hangs on;
+        #   * otherwise (walking toward the rope) the held rope target applies.
+        climb_owns_up = bool(
+            self._return_mode == "climb-to-route"
+            and (self._climb_state.up_held or self._climb_state.phase != "idle")
+        )
+        arrival_pending = bool(
+            self._climb_arrival_at is not None
+            and (time.monotonic() - float(self._climb_arrival_at))
+            <= self.stair_jump_climb_arrival_grace_seconds
+        )
+        rope_reference: Optional[float] = None
+        if climb_owns_up:
+            if arrival_pending:
+                if not self._jump_point_return_suppression_logged:
+                    self._jump_point_return_suppression_logged = True
+                    LOG.info(
+                        "JUMP POINT: the climb just landed (arrival confirmation); "
+                        "recorded points are not consulted until it settles"
+                    )
+                self._jump_point_inside_tokens.clear()
+                self._jump_point_dwell_frames.clear()
+                self._jump_point_dwell_last_x.clear()
+                return None
+            if self._climb_state.phase == "climbing-up":
+                rope_reference = float(player.x)
+            elif self._held_rope_target is not None:
+                try:
+                    rope_reference = float(self._held_rope_target[1])
+                except (IndexError, TypeError, ValueError):
+                    rope_reference = None
+        if not climb_owns_up:
+            self._jump_point_return_suppression_logged = False
         if travel_direction not in ("left", "right", "up"):
             travel_direction = (
                 plan.decision.key
@@ -6906,6 +7016,24 @@ class MovementWorker(threading.Thread):
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
+                if climb_owns_up and matched:
+                    # Only a point on the rope being climbed may fire while a
+                    # climb owns Up (see the 18:02 note above).
+                    on_rope = (
+                        rope_reference is not None
+                        and abs(point_x - rope_reference) <= JUMP_POINT_X_TOLERANCE
+                    )
+                    if not on_rope:
+                        if not self._jump_point_return_suppression_logged:
+                            self._jump_point_return_suppression_logged = True
+                            LOG.info(
+                                "JUMP POINT: %s[%d] %s point at x=%.6f is not on the "
+                                "climbing rope (rope x=%s); the climb keeps its own target",
+                                point_layer, index, direction, point_x,
+                                "unknown" if rope_reference is None
+                                else f"{rope_reference:.6f}",
+                            )
+                        continue
                 if matched:
                     matches.append(
                         ((point_layer, index), point_layer, direction, point_x)
@@ -7604,6 +7732,7 @@ class MovementWorker(threading.Thread):
         *,
         window_seconds: float,
         source: str,
+        expected_direction: Optional[str] = None,
     ) -> None:
         """Watch one downward-input phase for the narrow rope-attach signature."""
 
@@ -7614,6 +7743,10 @@ class MovementWorker(threading.Thread):
         self._drop_rope_escape_tiny_rise_frames = 0
         self._drop_rope_escape_deadline = time.monotonic() + max(0.0, window_seconds)
         self._drop_rope_escape_source = str(source)
+        self._drop_rope_escape_expected_direction = (
+            expected_direction if expected_direction in ("left", "right") else None
+        )
+        self._drop_rope_escape_saw_direction_progress = False
 
     def _clear_drop_rope_escape_watch(self) -> None:
         self._drop_rope_escape_armed = False
@@ -7621,11 +7754,14 @@ class MovementWorker(threading.Thread):
         self._drop_rope_escape_tiny_rise_frames = 0
         self._drop_rope_escape_deadline = float("-inf")
         self._drop_rope_escape_source = ""
+        self._drop_rope_escape_expected_direction = None
+        self._drop_rope_escape_saw_direction_progress = False
 
     def _release_reconnect_drop_edge_input(self, *, reason: str = "") -> None:
         """Release the dedicated Direction+Down edge chord, if this worker owns it."""
 
         direction = self._reconnect_drop_edge_input_direction
+        source = self._reconnect_drop_edge_input_source
         if direction is None:
             return
         key_up = getattr(self.key_sender, "key_up", None)
@@ -7635,6 +7771,9 @@ class MovementWorker(threading.Thread):
                 key_up(direction)
         self._reconnect_drop_edge_input_direction = None
         self._reconnect_drop_edge_input_until = float("-inf")
+        self._reconnect_drop_edge_input_source = ""
+        if source == "unresolved" and self.dropping_active_event is not None:
+            self.dropping_active_event.clear()
         if reason:
             LOG.info("RECONNECT DROP RECOVERY: released %s+down (%s)", direction, reason)
 
@@ -7644,12 +7783,18 @@ class MovementWorker(threading.Thread):
             self._release_reconnect_drop_edge_input(reason="edge hold elapsed")
 
     def _start_reconnect_drop_edge_hold(
-        self, direction: str, duration: float, player: Optional[Point],
+        self,
+        direction: str,
+        duration: float,
+        player: Optional[Point],
+        *,
+        source: str,
     ) -> bool:
         """Hold Direction+Down together while seeking a reconnect drop edge."""
 
         now = time.monotonic()
         if (self._reconnect_drop_edge_input_direction == direction
+                and self._reconnect_drop_edge_input_source == source
                 and now < self._reconnect_drop_edge_input_until):
             return True
         self._release_reconnect_drop_edge_input(reason="changing edge")
@@ -7673,14 +7818,20 @@ class MovementWorker(threading.Thread):
             return False
         self._reconnect_drop_edge_input_direction = direction
         self._reconnect_drop_edge_input_until = now + max(0.05, float(duration))
+        self._reconnect_drop_edge_input_source = str(source)
+        if source == "unresolved" and self.dropping_active_event is not None:
+            # This is an active descent recovery, not ordinary horizontal
+            # patrol.  Keep attacks from inserting a key into Direction+Down.
+            self.dropping_active_event.set()
         self._arm_drop_rope_escape_watch(
             player,
             window_seconds=max(0.05, float(duration)),
-            source=f"{direction}+Down edge hold",
+            source=f"{source}: {direction}+Down edge hold",
+            expected_direction=direction,
         )
         LOG.warning(
-            "RECONNECT DROP RECOVERY: holding %s+Down together for %.1fs",
-            direction, duration,
+            "DROP EDGE RECOVERY (%s): holding %s+Down together for %.1fs",
+            source, direction, duration,
         )
         return True
 
@@ -7710,15 +7861,28 @@ class MovementWorker(threading.Thread):
             return False
         delta_y = current.y - previous.y
         delta_x = current.x - previous.x
+        expected_direction = self._drop_rope_escape_expected_direction
+        if ((expected_direction == "right"
+             and delta_x >= DROP_ROPE_ESCAPE_EDGE_DIRECTION_PROGRESS_MIN_X)
+                or (expected_direction == "left"
+                    and delta_x <= -DROP_ROPE_ESCAPE_EDGE_DIRECTION_PROGRESS_MIN_X)):
+            self._drop_rope_escape_saw_direction_progress = True
+        max_y_step = (
+            DROP_ROPE_ESCAPE_EDGE_MAX_Y_STEP
+            if expected_direction is not None
+            else DROP_ROPE_ESCAPE_MAX_Y_STEP
+        )
         tiny_rope_progress = bool(
-            DROP_ROPE_ESCAPE_MIN_Y_STEP <= delta_y <= DROP_ROPE_ESCAPE_MAX_Y_STEP
+            DROP_ROPE_ESCAPE_MIN_Y_STEP <= delta_y <= max_y_step
             and abs(delta_x) <= DROP_ROPE_ESCAPE_MAX_X_DRIFT
+            and (expected_direction is None
+                 or self._drop_rope_escape_saw_direction_progress)
         )
         self._drop_rope_escape_last_position = current
         if not tiny_rope_progress:
             # A material downward movement is normal drop evidence.  Do not
             # leave a stale watch armed for a later, unrelated rope approach.
-            if delta_y > DROP_ROPE_ESCAPE_MAX_Y_STEP:
+            if delta_y > max_y_step:
                 self._clear_drop_rope_escape_watch()
             else:
                 self._drop_rope_escape_tiny_rise_frames = 0
@@ -7733,12 +7897,13 @@ class MovementWorker(threading.Thread):
         direction = "left" if current.x <= 0.5 else "right"
         source = self._drop_rope_escape_source or "drop input"
         edge_hold_owned = self._reconnect_drop_edge_input_direction is not None
+        edge_hold_source = self._reconnect_drop_edge_input_source
         self._clear_drop_rope_escape_watch()
         # The edge phase owns Down as well as the walk direction.  Both must be
         # up before the Alt+side chord, otherwise Maple can retain Down and turn
         # the rope escape into another slide.
         self._release_reconnect_drop_edge_input(reason="rope attachment confirmed")
-        if edge_hold_owned:
+        if edge_hold_owned and edge_hold_source == "route":
             # The rope jump is a new recovery action.  Do not immediately
             # restart the expired edge search on the next capture; allow its
             # descent evidence to be assessed as a fresh Alt+Down episode.
@@ -7748,6 +7913,13 @@ class MovementWorker(threading.Thread):
             self._reconnect_drop_chords = 0
             self._reconnect_drop_stalled_attempts = 0
             self._reconnect_drop_best_y = None
+        elif edge_hold_owned and edge_hold_source == "unresolved":
+            self._unresolved_edge_phase = None
+            self._unresolved_edge_second_pass = False
+            self._unresolved_edge_start_y = None
+            self._unresolved_drop_stalls = 0
+            self._unresolved_drop_attempt_y = None
+            self._unresolved_drop_attempt_at = None
         if not _sender_is_safe(self.key_sender):
             LOG.warning(
                 "DROP ROPE ESCAPE suppressed: target window is not safely selected"
@@ -10666,8 +10838,13 @@ class MovementWorker(threading.Thread):
         """
 
         self.dead_flower_ground_enabled = bool(enabled)
+        # mode.txt = 0 (debug) unlocks the documented 10s end of the interval so
+        # the circuit can be watched repeatedly; produce mode is unchanged and
+        # the 10s floor is the worker's own STATIONARY_PICKUP_MIN_INTERVAL_SECONDS.
+        debug_mode = run_mode.debug_enabled()
+        minimum_seconds = STATIONARY_PICKUP_MIN_INTERVAL_SECONDS
         self.dead_flower_ground_interval_seconds = max(
-            STATIONARY_PICKUP_MIN_INTERVAL_SECONDS, float(interval_seconds),
+            minimum_seconds, float(interval_seconds),
         )
         self.dead_flower_ground_jitter_seconds = max(0.0, float(jitter_seconds))
         with self._dead_flower_state_lock:
@@ -10678,10 +10855,13 @@ class MovementWorker(threading.Thread):
         if not self.dead_flower_ground_enabled:
             self._dead_flower_phase = "flower"
         LOG.info(
-            "dead flower 重置花 %s interval=%.1fm random_gap=%.1fs",
+            "dead flower 重置花 %s interval=%.1fm (%.1fs) random_gap=%.1fs%s",
             "enabled" if self.dead_flower_ground_enabled else "disabled",
             self.dead_flower_ground_interval_seconds / 60.0,
+            self.dead_flower_ground_interval_seconds,
             self.dead_flower_ground_jitter_seconds,
+            f" [mode.txt=0 调试模式: 最小 {minimum_seconds:.0f}s]"
+            if debug_mode else "",
         )
 
     def _dead_flower_ground_delay(self) -> float:
@@ -14125,6 +14305,11 @@ class MovementWorker(threading.Thread):
     def _reset_unresolved_drop_recovery(self) -> None:
         """Forget the unresolved-floor drop recovery (floor known, or gated off)."""
 
+        if self._reconnect_drop_edge_input_source == "unresolved":
+            self._release_reconnect_drop_edge_input(
+                reason="unresolved floor recovery reset"
+            )
+            self._clear_drop_rope_escape_watch()
         self._unresolved_floor_settled_frames = 0
         self._unresolved_floor_last_y = None
         self._unresolved_drop_attempts = 0
@@ -14181,6 +14366,11 @@ class MovementWorker(threading.Thread):
         band_floor = detect_layer_by_y(y, layers) if layers else None
         if (support_floor is not None or band_floor is not None
                 or self._marker_near_recorded_floor(y, layers)):
+            if self._unresolved_edge_phase is not None:
+                self._release_reconnect_drop_edge_input(
+                    reason="unresolved floor resolved"
+                )
+                self._clear_drop_rope_escape_watch()
             if self._unresolved_drop_attempts:
                 LOG.info(
                     "UNRESOLVED FLOOR: the marker resolved as %s after %d "
@@ -14220,15 +14410,28 @@ class MovementWorker(threading.Thread):
                 self._unresolved_edge_second_pass = False
                 self._unresolved_edge_start_y = None
                 self._unresolved_drop_stalls = 0
+                self._release_reconnect_drop_edge_input(
+                    reason="unresolved floor descent confirmed"
+                )
+                self._clear_drop_rope_escape_watch()
                 return self._unresolved_drop_chord(observation, now)
             if now < self._unresolved_edge_started_at + UNRESOLVED_EDGE_HOLD_SECONDS:
                 remaining = (
                     self._unresolved_edge_started_at
                     + UNRESOLVED_EDGE_HOLD_SECONDS - now
                 )
+                # A PLAIN walk decision, not the ``drop_edge_*`` chord.  The
+                # chord holds Direction+Down for its whole phase through
+                # ``_start_reconnect_drop_edge_hold``, which nothing in the
+                # ordinary walk arbitration can shorten - in 1.3.40 that dragged
+                # the character all the way to the right edge of the map the
+                # moment patrol or 站桩 started, because this recovery runs on the
+                # first unresolved frames.  1.3.34 walked here and the walk was
+                # re-decided every frame; the chord stays reserved for the
+                # route/reconnect drop-to-route descent it was written for.
                 return MovementDecision(
                     phase,
-                    f"unresolved floor; holding {phase} to find a layer-changing "
+                    f"unresolved floor; walking {phase} to find a layer-changing "
                     "drop edge",
                     max(0.05, remaining),
                 )
@@ -14239,14 +14442,16 @@ class MovementWorker(threading.Thread):
                 self._unresolved_edge_started_at = now
                 self._unresolved_edge_start_y = y
                 LOG.warning(
-                    "UNRESOLVED FLOOR: %s edge found no descent; holding %s for "
+                    "UNRESOLVED FLOOR: %s edge found no descent; walking %s for "
                     "%.1fs",
                     phase, next_phase, UNRESOLVED_EDGE_HOLD_SECONDS,
                 )
+                # Plain walk again (see the note above): a Direction+Down chord
+                # here walked the character to the map edge in 1.3.40.
                 return MovementDecision(
                     next_phase,
                     f"unresolved floor: {phase} edge did not descend; seeking "
-                    f"{next_phase} edge",
+                    f"the {next_phase} edge",
                     UNRESOLVED_EDGE_HOLD_SECONDS,
                 )
             self._unresolved_edge_cycles += 1
@@ -14265,6 +14470,10 @@ class MovementWorker(threading.Thread):
             self._unresolved_edge_second_pass = False
             self._unresolved_edge_start_y = None
             self._unresolved_drop_stalls = 0
+            self._release_reconnect_drop_edge_input(
+                reason="unresolved edge pair completed"
+            )
+            self._clear_drop_rope_escape_watch()
             return self._unresolved_drop_chord(observation, now)
 
         # Phase 1: Alt+Down, assessed once per chord.
@@ -14445,15 +14654,19 @@ class MovementWorker(threading.Thread):
         self._unresolved_drop_stalls = 0
         LOG.warning(
             "UNRESOLVED FLOOR: %d Alt+Down attempts made no downward progress; "
-            "marker X=%.6f; holding %s first for %.1fs",
+            "marker X=%.6f; walking %s first for %.1fs",
             UNRESOLVED_DROP_STALLED_ATTEMPTS,
             float(player.x),
             first_phase,
             UNRESOLVED_EDGE_HOLD_SECONDS,
         )
+        # Plain walk, never the ``drop_edge_*`` chord: the chord's un-interruptible
+        # Direction+Down phase is what ran the character to the right edge of the
+        # map at Start Patrol / 站桩 start in 1.3.40 (1.3.34 walked here and was
+        # fine).  The chord stays for the route/reconnect drop-to-route descent.
         return MovementDecision(
             first_phase,
-            f"unresolved floor: Alt+Down stalled; seeking a {first_phase} drop edge",
+            f"unresolved floor: Alt+Down stalled; seeking the {first_phase} edge",
             UNRESOLVED_EDGE_HOLD_SECONDS,
         )
 
@@ -14468,6 +14681,10 @@ class MovementWorker(threading.Thread):
                 "recovery keeps watching",
                 reason,
             )
+        self._release_reconnect_drop_edge_input(
+            reason="unresolved floor recovery abandoned"
+        )
+        self._clear_drop_rope_escape_watch()
         self._unresolved_drop_attempts = 0
         self._unresolved_drop_stalls = 0
         self._unresolved_drop_attempt_y = None
@@ -14672,8 +14889,15 @@ class MovementWorker(threading.Thread):
         first decision frame walked.  Every descent starts from zero.
         """
 
-        self._release_reconnect_drop_edge_input(reason=reason or "drop bookkeeping reset")
-        self._clear_drop_rope_escape_watch()
+        # This reset belongs to the planned ``drop-to-route`` state.  The
+        # unresolved-floor recovery has its own Direction+Down edge chord and
+        # must not be cancelled once per capture merely because a normal route
+        # label is still present behind the unresolved marker.
+        if self._reconnect_drop_edge_input_source == "route":
+            self._release_reconnect_drop_edge_input(
+                reason=reason or "drop bookkeeping reset"
+            )
+            self._clear_drop_rope_escape_watch()
         self._reconnect_drop_chords = 0
         self._reconnect_drop_stalled_attempts = 0
         self._reconnect_drop_best_y = None
@@ -18712,6 +18936,407 @@ class MovementWorker(threading.Thread):
              if observation.world_y_diamonds is not None else "n/a"),
         )
 
+    def stop_for_abnormal(self, event_type: str) -> None:
+        """Stop patrol movement without standing down unrelated workers.
+
+        Only state is changed on the caller's thread.  The key release is handed
+        to ``_hold_manager`` (``_abnormal_release_pending``) because the detectors
+        that raise abnormal events run inside the movement frame loop, and
+        releasing keys takes this worker's direction/hold locks plus the keyboard
+        ledger - doing that from inside the loop would re-enter the worker it is
+        stopping.
+        """
+
+        self.patrol_enabled = False
+        controller = self.patrol_controller
+        if controller is not None:
+            try:
+                controller.set_enabled(False)
+            except Exception:
+                LOG.warning("abnormal movement stop could not disable patrol", exc_info=True)
+        # The run this watch belongs to is over; a later map change is no longer
+        # evidence about a patrol that has already stopped.
+        self.end_minimap_border_watch(reason=f"abnormal event: {event_type}")
+        self.end_map_stuck_watch(reason=f"abnormal event: {event_type}")
+        # Stop local movement work immediately (no locks, no input): a refused
+        # walk this frame must not start a new decision.
+        self.disarm_patrol_input()
+        self._abnormal_release_pending = str(event_type or "未分类")
+        LOG.warning("MOVEMENT STOPPED: abnormal event=%s", event_type)
+
+    def _release_abnormal_input(self, event_type: str) -> None:
+        """Release the movement-owned keys of an abnormal stop (hold-manager thread)."""
+
+        self._release_walk_hold()
+        self._release_climb_up()
+        self._release_reconnect_drop_edge_input(reason="abnormal event")
+        self._clear_drop_rope_escape_watch()
+        force_key_up = getattr(self.key_sender, "force_key_up", None)
+        if callable(force_key_up):
+            for key in ("left", "right", "up", "down"):
+                try:
+                    force_key_up(key, reason=f"abnormal event: {event_type}")
+                except Exception:
+                    LOG.debug("abnormal movement stop could release %s", key,
+                              exc_info=True)
+        LOG.info("MOVEMENT STOPPED: movement keys released (abnormal event=%s)",
+                 event_type)
+
+    def begin_minimap_border_watch(self) -> None:
+        """Start a new run-scoped map-border watch.
+
+        A new patrol may intentionally start on another map, whose minimap
+        geometry need not match the recording.  The first stable *live* OpenCV
+        border therefore becomes this run's baseline; only later changes are
+        abnormal.
+        """
+
+        self._map_border_watch_active = True
+        self._map_border_watch_started_at = time.monotonic()
+        self._map_border_baseline = None
+        self._map_border_candidate = None
+        self._map_border_candidate_frames = 0
+        self._map_border_mismatch_frames = 0
+        self._map_border_alerted = False
+
+    def end_minimap_border_watch(self, *, reason: str = "") -> None:
+        """Close the run-scoped map-border watch.
+
+        The watch belongs to one patrol run, so Stop Patrol (or the abnormal stop
+        that ends the run) closes it: without this a map change made while the
+        operator is standing still - after the patrol was stopped - still raised
+        地图变更 and tried to stop workers that were already stopped.
+        """
+
+        if not self._map_border_watch_active:
+            return
+        self._map_border_watch_active = False
+        self._map_border_watch_started_at = 0.0
+        self._map_border_baseline = None
+        self._map_border_candidate = None
+        self._map_border_candidate_frames = 0
+        self._map_border_mismatch_frames = 0
+        self._map_border_alerted = False
+        if reason:
+            LOG.info("MAP BORDER WATCH: closed (%s)", reason)
+
+    @staticmethod
+    def _minimap_boxes_match(live: Any, recorded: Any) -> bool:
+        """Whether the two measurements describe the same minimap panel.
+
+        A real map change alters the minimap PANEL: both the outer widget and the
+        inner canvas change size together.  A change of only ONE of them is a
+        measurement regime flip, not a map change - the two field logs of
+        2026-11-15 show both directions:
+
+          20:43  baseline window=(3,67,146,190) canvas=(3,67,146,190)
+                 live     window=(0,2,149,208) canvas=(3,67,146,190)   (window only)
+          20:52  baseline window=(3,67,146,190) canvas=(2,62,147,199)
+                 live     window=(3,67,146,190) canvas=(3,67,146,190)   (canvas only)
+
+        Neither was a map change, so the verdict requires BOTH sizes to disagree;
+        a client that is merely repositioned changes neither size.
+        """
+
+        differs = {}
+        for field in ("window_box", "canvas_box"):
+            live_box = getattr(live, field, None)
+            recorded_box = getattr(recorded, field, None)
+            if not (isinstance(live_box, tuple) and isinstance(recorded_box, tuple)
+                    and len(live_box) == 4 and len(recorded_box) == 4):
+                return True  # incomplete geometry is not map-change evidence
+            try:
+                live_size = (int(live_box[2]) - int(live_box[0]),
+                             int(live_box[3]) - int(live_box[1]))
+                recorded_size = (int(recorded_box[2]) - int(recorded_box[0]),
+                                 int(recorded_box[3]) - int(recorded_box[1]))
+            except (TypeError, ValueError):
+                return True
+            if any(size <= 0 for size in live_size + recorded_size):
+                return True
+            differs[field] = any(
+                abs(actual - expected) > MAP_CHANGE_BORDER_TOLERANCE_PX
+                for actual, expected in zip(live_size, recorded_size)
+            )
+        return not (differs["window_box"] and differs["canvas_box"])
+
+    def _observe_run_minimap_border(
+        self, live_detection: Any,
+    ) -> None:
+        """Accept this run's live baseline, then detect later map changes."""
+
+        if not self._map_border_watch_active or live_detection is None:
+            return
+        # A fallback search crop is deliberately not minimap geometry. Nor is
+        # ``opencv-held`` a new measurement: it can simply be the saved
+        # recording geometry held while the first real contour is arriving.
+        # ``opencv-recording`` IS the saved recording, so it can never become
+        # this run's baseline either (see MAP_CHANGE_LIVE_SOURCES).
+        source = str(getattr(live_detection, "source", ""))
+        if source not in MAP_CHANGE_LIVE_SOURCES:
+            return
+        # The geometry is still settling right after Start Patrol (the startup
+        # probe's box differs from the live detector's steady measurement by more
+        # than a map change would); nothing may become the baseline during it.
+        if (time.monotonic() - self._map_border_watch_started_at
+                < MAP_CHANGE_SETTLE_SECONDS):
+            self._map_border_candidate = None
+            self._map_border_candidate_frames = 0
+            return
+        baseline = self._map_border_baseline
+        if baseline is None:
+            candidate = self._map_border_candidate
+            if candidate is not None and self._minimap_boxes_match(
+                    live_detection, candidate):
+                self._map_border_candidate_frames += 1
+            else:
+                self._map_border_candidate = live_detection
+                self._map_border_candidate_frames = 1
+            if self._map_border_candidate_frames < MAP_CHANGE_BASELINE_FRAMES:
+                return
+            self._map_border_baseline = self._map_border_candidate
+            self._map_border_candidate = None
+            LOG.info(
+                "MAP BORDER WATCH: baseline accepted after %d frames | "
+                "window=%s canvas=%s",
+                MAP_CHANGE_BASELINE_FRAMES,
+                getattr(self._map_border_baseline, "window_box", None),
+                getattr(self._map_border_baseline, "canvas_box", None),
+            )
+            return
+
+        if self._minimap_boxes_match(live_detection, baseline):
+            self._map_border_mismatch_frames = 0
+            return
+
+        self._map_border_mismatch_frames += 1
+        if (self._map_border_alerted
+                or self._map_border_mismatch_frames
+                < MAP_CHANGE_CONFIRM_FRAMES):
+            return
+        self._map_border_alerted = True
+        LOG.warning(
+            "MAP CHANGE: live OpenCV border differs from this run's baseline "
+            "for %d frames | baseline window=%s canvas=%s | live window=%s canvas=%s",
+            self._map_border_mismatch_frames,
+            getattr(baseline, "window_box", None), getattr(baseline, "canvas_box", None),
+            getattr(live_detection, "window_box", None),
+            getattr(live_detection, "canvas_box", None),
+        )
+        notifier = self.abnormal_notifier
+        notify = getattr(notifier, "notify", None)
+        if callable(notify):
+            try:
+                notify("地图变更")
+            except Exception:
+                LOG.warning("MAP CHANGE abnormal notification failed", exc_info=True)
+
+    def begin_map_stuck_watch(self) -> None:
+        """Start the 非正常运行 watch for this run.
+
+        Armed beside the map-border watch at every run start (manual Start
+        Patrol, 死花 start, automatic reconnect resume), so the streak never
+        spans two runs.
+        """
+
+        self._map_stuck_watch_active = True
+        self._map_stuck_frames = 0
+        self._map_stuck_last_y = None
+        self._map_stuck_last_at = 0.0
+        self._map_stuck_noted = False
+        self._map_stuck_stopped = False
+
+    def end_map_stuck_watch(self, *, reason: str = "") -> None:
+        """Close the 非正常运行 watch (Stop Patrol or the abnormal stop that ends a run)."""
+
+        was_active = self._map_stuck_watch_active
+        self._map_stuck_watch_active = False
+        self._map_stuck_frames = 0
+        self._map_stuck_last_y = None
+        self._map_stuck_last_at = 0.0
+        if was_active and reason:
+            LOG.info("MAP STUCK WATCH: closed (%s)", reason)
+
+    def _map_stuck_blocker(self) -> Optional[str]:
+        """The owner that makes this frame's reading irrelevant, or None.
+
+        Deliberately side-effect free (unlike ``_unresolved_drop_blocker``, which
+        prunes stale reconnect bookkeeping): a read-only observer must not change
+        the recovery's state.  Everything listed here legitimately passes through
+        rows with no recorded floor, or stands still on purpose.
+        """
+
+        if not self.patrol_enabled:
+            return "patrol is not enabled"
+        # 死花/重置花 is exempt, unlike 站桩: its whole loop deliberately parks the
+        # marker ON a rope at a recorded flower point, which is by definition
+        # between two floors, so "no recorded floor" is the normal state and never
+        # evidence of a stuck map.  Field log 21:20 (死花 mode, 重置花 armed): the
+        # character sat at flower point 1/1 (0.604895, 0.711382) with the marker at
+        # y=0.719512, 0.0732 above layer1, and 40 frames of that fired a bogus
+        # "非正常运行（恢复中）" alert 8 s after the loop started.  The session owns
+        # its own recovery anyway (entry rope recovery cycles plus the 重置花
+        # ground circuit).
+        if self.dead_flower_mode:
+            return "a 死花 session owns movement (a flower point is not a floor)"
+        # 站桩/双桩 are deliberately NOT exempt here.  The standing modes block the
+        # unresolved-floor recovery (the temporary anchor must own the frame), so
+        # a 站桩 character that dropped off its anchor layer with no route back has
+        # NOTHING that will ever try - which is precisely what 非正常运行 is for (field
+        # log 20:57: "unresolved floor; waiting for the Alt+Down layer change" was
+        # deferred forever while the marker stood on an unrecorded floor).  A
+        # 站桩 character standing ON its anchor still resolves: the anchor is
+        # registered as a runtime layer supporter, and a map with no recording at
+        # all yields no layers, so the reading is "not evidence" (no alert).
+        if self._return_mode is not None:
+            return f"the {self._return_mode} return owns the layer"
+        if self._descending_to_first:
+            return "the planned descent to the first layer owns the layer"
+        if self._fall_pending:
+            return "a fall is being tracked"
+        if self._climb_state.up_held or self._climb_state.phase != "idle":
+            return "an attached climb owns the layer"
+        if self._jump_point_up_held:
+            return "a recorded jump point holds Up"
+        if self._reconnect_drop_recovery_armed:
+            return "the reconnect drop recovery owns the layer"
+        if self._stationary_pickup_phase is not None:
+            return "a stationary pickup leg is running"
+        if self._route_check_pending:
+            return "the post-reconnect route check is deciding"
+        if self._rescue_active:
+            return "the self-rescue probe owns movement"
+        if self._rest_remaining() > 0:
+            # 随机休息 stands still on purpose for 3-15 s; it is not a stuck map.
+            return "a scheduled rest is running"
+        return None
+
+    def _unresolved_layer_reading(
+        self, observation: Any,
+    ) -> Optional[bool]:
+        """True = no recorded floor, False = resolved, None = not evidence.
+
+        Uses the recovery's own verdict (support point / band / nearest-floor
+        alias) so the alert can never disagree with the recovery, and returns
+        None when the map simply has no recording - a layer-free 站桩 run is
+        supposed to read "no floor" and must never alarm.
+        """
+
+        if observation is None or getattr(observation, "player", None) is None:
+            return None
+        layers = self._landing_candidate_layers()
+        if not layers:
+            return None
+        y = float(observation.player.y)
+        if detect_layer_by_support_point(y, layers) is not None:
+            return False
+        if detect_layer_by_y(y, layers) is not None:
+            return False
+        if self._marker_near_recorded_floor(y, layers):
+            # Between two bands but within the nearest-floor allowance: an alias,
+            # not a foreign floor.
+            return False
+        return True
+
+    def _observe_unresolved_layer(self, observation: Any) -> None:
+        """Count consecutive frames with no recorded floor; report ONLY the verdict.
+
+        The operator's rule: 只报无法恢复的情况.  A recovery that is still working
+        is never announced - field log 21:20 delivered "非正常运行（恢复中）" for a
+        character that was merely parked on a rope, and an early message is worse
+        than none because it trains the operator to ignore the alert.  So the
+        first window (``MAP_STUCK_NOTICE_FRAMES``) leaves a LOG-ONLY line, and the
+        delivered alert waits for a run that has actually failed:
+
+          * the unresolved-floor recovery gave up,
+          * the mode has no recovery at all (站桩 without 定时巡逻), or
+          * ``MAP_STUCK_STOP_FRAMES`` passed with the marker still off every floor.
+
+        That single delivery also owns the movement/attack safety stop.
+        """
+
+        if not self._map_stuck_watch_active or self._map_stuck_stopped:
+            return
+        now = time.monotonic()
+        blocked = self._map_stuck_blocker()
+        reading = None if blocked is not None else self._unresolved_layer_reading(observation)
+        if reading is not True:
+            self._map_stuck_frames = 0
+            self._map_stuck_last_y = None
+            self._map_stuck_last_at = now
+            return
+        y = float(observation.player.y)
+        last_y = self._map_stuck_last_y
+        if (self._map_stuck_last_at
+                and now - self._map_stuck_last_at > MAP_STUCK_MAX_GAP_SECONDS):
+            self._map_stuck_frames = 0
+        self._map_stuck_last_at = now
+        self._map_stuck_last_y = y
+        if last_y is not None and abs(y - last_y) >= RECONNECT_DROP_Y_PROGRESS:
+            # The marker moved between floors: the character is descending or
+            # climbing through unrecorded rows, not stuck on the map.
+            self._map_stuck_frames = 0
+        self._map_stuck_frames += 1
+        frames = self._map_stuck_frames
+        if frames < MAP_STUCK_NOTICE_FRAMES:
+            return
+        # 站桩/双桩 block the unresolved-floor recovery (the temporary anchor owns
+        # the frame), so in those modes NOTHING will ever try to recover.
+        nothing_to_try = bool(
+            self.stationary_attack_enabled
+            and not self._stationary_timed_patrol_active
+        )
+        gave_up = bool(getattr(self, "_unresolved_drop_gave_up", False))
+        if not self._map_stuck_noted:
+            self._map_stuck_noted = True
+            if not nothing_to_try:
+                # Log only: the operator asked to hear about this only when it
+                # cannot recover, but a stuck map must still be findable in the
+                # log while the recovery is still trying.
+                LOG.info(
+                    "MAP STUCK: %d consecutive frames without a recorded floor | "
+                    "marker y=%.6f | nearest floor %s; recovery is still running, "
+                    "no alert until it fails",
+                    frames, y, self._nearest_floor_label(y),
+                )
+        if not (gave_up or nothing_to_try or frames >= MAP_STUCK_STOP_FRAMES):
+            return
+        self._map_stuck_stopped = True
+        self.end_map_stuck_watch()
+        stage = ("已放弃恢复" if gave_up
+                 else "无法恢复" if nothing_to_try
+                 else "长时间未恢复")
+        LOG.warning(
+            "MAP STUCK VERDICT: no recorded floor for %d frames | marker "
+            "y=%.6f | nearest floor %s | %s",
+            frames, y, self._nearest_floor_label(y),
+            "no recovery is possible in this mode" if nothing_to_try
+            else ("recovery gave up" if gave_up else "recovery still running"),
+        )
+        notifier = self.abnormal_notifier
+        notify = getattr(notifier, "notify", None)
+        if callable(notify):
+            try:
+                notify(MAP_STUCK_EVENT_TYPE, stop=True, stage=stage)
+            except Exception:
+                LOG.warning("MAP STUCK verdict notification failed", exc_info=True)
+
+    def _nearest_floor_label(self, marker_y: float) -> str:
+        """The closest recorded floor and its distance, for the 非正常运行 log line."""
+
+        best_name = ""
+        best_distance = None
+        layers = self._landing_candidate_layers()
+        for name, layer in layers.items():
+            distance = _layer_y_distance(layer, marker_y)
+            if distance is None:
+                continue
+            if best_distance is None or distance < best_distance:
+                best_name, best_distance = name, distance
+        if best_distance is None:
+            return "none recorded"
+        return f"{best_name} ({best_distance:.4f} away)"
+
     def run(self) -> None:
         LOG.info("movement worker started (%s)", "DRY-RUN" if getattr(self.key_sender, "dry_run", True) else "LIVE")
         # 独立 hold 管理线程：主循环处理帧时方向键由它按/松。
@@ -18818,6 +19443,7 @@ class MovementWorker(threading.Thread):
                 minimap_detection = None
                 if self.minimap_detector is not None:
                     minimap_detection = self.minimap_detector.detect(frame.image)
+                    self._observe_run_minimap_border(minimap_detection)
                     minimap_region = minimap_detection.normalized_analysis_box(
                         frame.image.size
                     )
@@ -18904,6 +19530,10 @@ class MovementWorker(threading.Thread):
                                 dispatched.x, dispatched.y, dispatched.confidence,
                             )
                             self._dispatched_position_logged = time.monotonic()
+                # 非正常运行: count this frame's layer verdict (read-only observer).
+                # Placed after the marker overrides above so it sees the same
+                # position the rest of the frame uses.
+                self._observe_unresolved_layer(observation)
                 # Self-rescue owns movement input while it verifies (or
                 # recovers) a genuine stall.  Keep consuming capture frames
                 # and refresh ``last_observation`` for its right/left probe,
@@ -19053,6 +19683,7 @@ class MovementWorker(threading.Thread):
                     route_target_x, route_is_rope, route_label
                 )
                 if (self._reconnect_drop_edge_input_direction is not None
+                        and self._reconnect_drop_edge_input_source == "route"
                         and route_label != "drop-to-route"):
                     # This chord belongs only to the post-reconnect descent.
                     # A newly resolved floor, a rope route, or a normal patrol
@@ -19133,7 +19764,8 @@ class MovementWorker(threading.Thread):
                         self._reanchor_tracker_to_current_layer(observation)
                         route_target_x, route_is_rope, route_label = self._route_target(observation)
                 elif (self.dropping_active_event is not None
-                        and self.dropping_active_event.is_set()):
+                        and self.dropping_active_event.is_set()
+                        and self._reconnect_drop_edge_input_source != "unresolved"):
                     # Belt-and-braces: no drop in progress any more - the
                     # dropping flag must not linger (it blocks the attack).
                     self.dropping_active_event.clear()
@@ -20008,6 +20640,11 @@ class MovementWorker(threading.Thread):
                                 edge_direction,
                                 decision.duration,
                                 observation.player,
+                                source=(
+                                    "unresolved"
+                                    if decision.reason.startswith("unresolved floor")
+                                    else "route"
+                                ),
                         ):
                             continue
                     elif decision.key == "drop":

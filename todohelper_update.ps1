@@ -339,11 +339,53 @@ if ($ConfigSource) {
 # instance, and closing it terminates the assistant ("I closed the cmd window
 # and the application closed").  The shipped launcher chain hides it, so the
 # helper's own start must hide it too.
+function Test-HelperElevated {
+    # Windows refuses injected input across an integrity boundary (UIPI): a
+    # medium-integrity assistant cannot type into an elevated game, and the only
+    # symptom in the log is a perfectly normal attack beat with no attack in the
+    # game (field report 2026-11-16: "the restarted instance right after the
+    # update does not attack in either mode").  The launcher asks Windows for
+    # "runas" for exactly this reason; this helper inherits whatever level the
+    # assistant had, and it must not quietly lower that level when it restarts.
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
 function Start-Assistant([string]$installRoot) {
-    # Returns the pid of the instance that was started (0 when unknown).  The
-    # packaged executable is tried first, then the launcher chain the operator
-    # uses himself (启动助手.bat -> launch_assistant.vbs, which asks for
-    # elevation), then the batch file directly.
+    # Returns the pid of the instance that was started (0 when unknown).
+    #
+    # ORDER MATTERS and depends on this helper's own rights:
+    #   * elevated helper -> start the packaged executable directly.  It inherits
+    #     the elevated level, so no UAC prompt interrupts an automatic restart.
+    #   * NOT elevated     -> start the operator's launcher first, because only
+    #     that chain asks Windows for elevation (ShellExecute "runas").  A direct
+    #     start here produced a medium-integrity assistant that could not inject
+    #     keys into an elevated game - the 2026-11-16 "no attack after the
+    #     update" report.
+    # Then the packaged executable, then the batch file, as fallbacks.
+    $elevated = Test-HelperElevated
+    Write-UpdateLog ("restart: helper elevated=" + $elevated)
+    if (-not $elevated) {
+        # Ask Windows for the same level the operator's 启动助手.bat gets.  A
+        # direct Start-Process here would produce a medium-integrity assistant
+        # that cannot inject keys into an elevated game.
+        $launcherFirst = Join-Path $installRoot "launch_assistant.vbs"
+        if (Test-Path -LiteralPath $launcherFirst) {
+            try {
+                $process = Start-Process -FilePath "wscript.exe" -ArgumentList @("//nologo", $launcherFirst) `
+                    -WorkingDirectory $installRoot -WindowStyle Hidden -PassThru -ErrorAction Stop
+                Write-UpdateLog ("restart launched via launch_assistant.vbs (elevation requested) pid=" + $process.Id)
+                return [int]$process.Id
+            } catch {
+                Write-UpdateLog "launcher (elevation) start failed: $($_.Exception.Message)"
+            }
+        }
+    }
     foreach ($name in @("MoonEclipse.exe", "TodoHelper.exe", "MapleAssistant.exe")) {
         $candidate = Join-Path $installRoot $name
         if (-not (Test-Path -LiteralPath $candidate)) { continue }
@@ -366,6 +408,9 @@ function Start-Assistant([string]$installRoot) {
         } catch {
             Write-UpdateLog "launcher start failed: $($_.Exception.Message)"
         }
+    }
+    if (-not (Test-HelperElevated)) {
+        Write-UpdateLog "WARNING: this helper is NOT elevated and the launcher chain is missing; the restarted assistant may be unable to inject keys into an elevated game (start it with 启动助手.bat)"
     }
     foreach ($name in @("start_assistant.bat", "启动助手.bat")) {
         $candidate = Join-Path $installRoot $name

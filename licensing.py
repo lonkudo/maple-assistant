@@ -1079,8 +1079,15 @@ def _with_server_device(
         tx_key = str(auto_lie.get("tx_key") or "").strip()
     if isinstance(auto_lie, dict):
         secret = str(auto_lie.get("secret_key") or "").strip()
-        set_server_secret(secret)
-        if secret:
+        # ``tx_key`` is the SAME credential under the other name a server
+        # generation uses, so the memory copy must hold it when ``secret_key`` is
+        # absent.  Storing only ``secret_key`` left this session without any key,
+        # and the local service then launched with the constant baked into its
+        # package - which the tracking server refuses with
+        # ``unknown_or_deleted_product_key`` (2026-11-16 12:22 field log: the CT
+        # card validated, the handshake was rejected, every retry identical).
+        set_server_secret(secret or tx_key)
+        if secret or tx_key:
             AUTO_LIE_LOG.info("auto-lie credential refreshed from server reply")
             # 本地测谎 uses the same coordinate-cloud key: hand the server's answer
             # to the local service so it is not limited to the key baked into its
@@ -1096,7 +1103,8 @@ def _with_server_device(
                 )
         else:
             AUTO_LIE_LOG.warning(
-                "auto-lie credential withheld by the server (empty auto_lie.secret_key)"
+                "auto-lie credential withheld by the server (empty auto_lie.secret_key "
+                "and no tx_key); the local service stays unlaunched until one arrives"
             )
     else:
         # Silence is not a verdict (see the docstring): the credential stays.

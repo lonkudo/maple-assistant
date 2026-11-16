@@ -323,6 +323,8 @@ try {
         # The endpoint table is compiled INTO this executable; the .pyd belongs to
         # the source layout only, so a mirrored copy would be dead weight.
         if ($_.Name -like "endpoints_protected*.pyd") { return }
+        # 本机调试开关（0 = 调试 / 1 = 正式）绝不随包：缺失时 run_mode 按正式模式运行。
+        if ($_.Name -eq "mode.txt") { return }
         $relative = $_.FullName.Substring($stage.Length + 1)
         if ($excluded -contains $relative.Split('\')[0]) { return }
         $target = Join-Path $dataRoot $relative

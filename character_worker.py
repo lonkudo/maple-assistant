@@ -294,11 +294,14 @@ class CharacterWorker(Thread):
                 if login_visible:
                     self._disconnect_alerted = True
                     should_alert = True
-                else:
-                    # Keep the missing-marker candidate alive.  A minimap-less
-                    # zone simply receives another colour check one second
-                    # later; reconnect cannot start unless that check passes.
-                    self._disconnect_alerted = False
+                # A failed login-page check must NOT clear the episode latch: the
+                # marker is still absent, and re-arming it here made the alert fire
+                # again every time that colour check flipped back to true.  The
+                # group then received repeated 掉线警报 for one disconnection
+                # (coalesced to at most one per 10 s, so it looked like a stream of
+                # unrelated alarms).  The latch is cleared only when the marker
+                # comes back (the detected branch above) or when the operator
+                # toggles the alert off/on.
             if not login_visible:
                 LOG.info(
                     "DISCONNECT WATCH: %d missing-marker samples (%.1fs), but the login page is "

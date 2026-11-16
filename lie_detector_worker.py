@@ -33,6 +33,16 @@ LIE_SQUARE_COLOR = (201, 206, 208)  # #c9ced0
 # the exact color still match.
 LIE_COLOR_TOLERANCE = 10
 REFERENCE_LIE_SQUARE_SIZE = (76, 76)
+# A single matching scan is NOT a lie event.  The detector matches one 76x76
+# block within +-10 per channel of #c9ced0, and a foreign window, a HUD repaint
+# or a transitional frame can satisfy that for one frame - which pushed
+# "测谎警报" to 钉钉 with no lie on screen (field report 2026-11-15 23:02:36:
+# "MoonEclipse 小鳄鱼 测谎警报" for an event that never happened).  A real lie
+# window stays up for seconds, so demanding two consecutive scans (0.2s at the
+# 5 FPS feed) costs nothing and removes the single-frame false alarm.  The raw
+# square event is still forwarded on its FIRST frame, so the diagnostic recorder
+# and the auto-pass workflow see the sighting immediately.
+LIE_ALERT_CONFIRM_SCANS = 2
 
 
 def scaled_lie_square_size(width: int, height: int) -> tuple[int, int]:
@@ -140,6 +150,10 @@ class LieDetectorWorker(threading.Thread):
             time.monotonic() + self.scan_interval if enabled else None
         )
         self._alerted_for_current_event = False
+        # Consecutive scans that matched the square; the ALERT waits for
+        # LIE_ALERT_CONFIRM_SCANS.  Cleared by any scan with no match, so it can
+        # never carry across two separate events.
+        self._match_scans = 0
         # Rate limit for the "almost #c9ced0" diagnostic (see _log_near_miss).
         self._last_near_miss_log = 0.0
 
@@ -158,6 +172,7 @@ class LieDetectorWorker(threading.Thread):
                 now + self.scan_interval if self._enabled else None
             )
             self._alerted_for_current_event = False
+            self._match_scans = 0
         LOG.info("lie detector alert %s", "enabled" if enabled else "disabled")
 
     def set_sound_enabled(self, enabled: bool) -> None:
@@ -230,15 +245,30 @@ class LieDetectorWorker(threading.Thread):
         match: Optional[tuple[int, int, int, int]],
         frame: Any = None,
     ) -> None:
+        """Forward the raw square event, but alert only once it is confirmed.
+
+        One matching scan is not a lie: see ``LIE_ALERT_CONFIRM_SCANS``.  The
+        callbacks still receive the sighting on its first frame (the recorder
+        wants the earliest frame, and the auto-pass workflow has its own
+        confirmation), while the 声音 / 闪烁 / 消息 alarm waits for the square to
+        still be there on the next scan.
+        """
+
         should_alert = False
+        confirmed = 0
         with self._lock:
             if not self._enabled:
                 return
             if match is None:
                 self._alerted_for_current_event = False
-            elif not self._alerted_for_current_event:
-                self._alerted_for_current_event = True
-                should_alert = True
+                self._match_scans = 0
+            else:
+                self._match_scans += 1
+                confirmed = self._match_scans
+                if (confirmed >= LIE_ALERT_CONFIRM_SCANS
+                        and not self._alerted_for_current_event):
+                    self._alerted_for_current_event = True
+                    should_alert = True
             callbacks = list(self._lie_seen_callbacks)
         # Every listener runs isolated: one broken consumer (or a slow
         # recorder) must never break the alert loop or other listeners.
@@ -260,8 +290,8 @@ class LieDetectorWorker(threading.Thread):
         if should_alert:
             LOG.warning(
                 "LIE DETECTOR ALERT: #c9ced0 block detected at "
-                "x=%d y=%d size=%dx%d; triggering reminders",
-                *match,
+                "x=%d y=%d size=%dx%d for %d consecutive scans; triggering reminders",
+                *match, confirmed,
             )
             threading.Thread(
                 target=self._play_alert,

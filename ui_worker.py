@@ -58,13 +58,16 @@ from update_core import (
     stage_update, write_notice,
 )
 from update_manager import (
-    UpdateError, desktop_roots, export_user_config, import_user_config,
+    MAP_RECORDING_FILE_NAME,
+    UpdateError, desktop_roots, export_map_recording, export_user_config,
+    import_map_recording, import_user_config,
     find_newer_desktop_update,
     restore_user_config_bytes,
     schedule_hidden_restart,
     schedule_package_update,
 )
 from runtime_paths import application_root, package_format
+import run_mode
 from dingtalk_notifier import (
     format_dingtalk_message, normalize_webhook as normalize_dingtalk_webhook,
     send_in_background as send_dingtalk_in_background,
@@ -690,6 +693,10 @@ LOG_RUN_START = "巡逻已开始"
 LOG_RUN_STOP = "巡逻已停止"
 LOG_CONFIG_IMPORT = "配置导入"
 LOG_CONFIG_EXPORT = "配置导出"
+# 导入/导出地图 moves ONLY the patrol recording; the wording is separate so the
+# log and the status line never suggest that a full settings import happened.
+LOG_MAP_IMPORT = "地图导入"
+LOG_MAP_EXPORT = "地图导出"
 
 
 def _make_log_icon(kind: str, master: Any) -> ImageTk.PhotoImage:
@@ -1037,14 +1044,6 @@ def recorded_coordinate_text(x: float, y: float) -> str:
     return f"({float(x):.4f}, {float(y):.4f})"
 
 
-def machine_name_button_text(name: str) -> str:
-    """Keep the compact device-name editor's action label stable."""
-
-    # The actual device name can contain arbitrary operator text.  Keep this
-    # narrow settings-row action label fixed instead of exposing it there.
-    return "设备名称"
-
-
 def normalize_quick_messages(value: Any, limit: int = 20) -> list[str]:
     """Keep only bounded, non-empty quick-message strings."""
 
@@ -1114,6 +1113,7 @@ class NumericValueRangeControl:
         extra_width_px: int = 0,
         before_change: Optional[Callable[[], None]] = None,
         on_change: Optional[Callable[[], None]] = None,
+        formatter: Optional[Callable[[float | int], str]] = None,
     ) -> None:
         self.range_mode = bool(range_mode)
         self._tk = tk_module
@@ -1123,6 +1123,10 @@ class NumericValueRangeControl:
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         self.unit = str(unit)
+        # Optional display override: it returns the COMPLETE cell text (unit
+        # included), which lets a control whose value is stored in minutes show
+        # "10s" for a sub-minute value.  ``unit`` is ignored when it is set.
+        self.formatter = formatter
         self.before_change = before_change
         self.on_change = on_change
         self.selected_side: Optional[str] = None
@@ -1244,6 +1248,11 @@ class NumericValueRangeControl:
         return round(float(number), 6)
 
     def _display(self, value: float | int) -> str:
+        if self.formatter is not None:
+            try:
+                return str(self.formatter(value))
+            except Exception:
+                LOG.exception("numeric value formatter failed; falling back to the unit")
         if self.value_type is int:
             text = str(int(value))
         else:
@@ -1408,6 +1417,11 @@ class UiWorker(threading.Thread):
     _STATIONARY_PICKUP_INTERVAL_MIN_MINUTES = 10.0 / 60.0
     _STATIONARY_PICKUP_INTERVAL_MAX_MINUTES = 30.0
     _STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES = 15.0
+    # mode.txt = 0 (debug) unlocks the documented 10s end of that range so the
+    # 重置花 circuit can be watched end to end in seconds; the wheel then steps
+    # one second and sub-minute values are drawn as "10s".  Produce mode keeps
+    # the 1m floor and 0.1m steps.
+    _STATIONARY_PICKUP_DEBUG_STEP_MINUTES = 1.0 / 60.0
     _DUAL_STATIONARY_SWITCH_MIN_MINUTES = 1.0
     _DUAL_STATIONARY_SWITCH_MAX_MINUTES = 30.0
     _DUAL_STATIONARY_SWITCH_DEFAULT_MINUTES = 15.0
@@ -1466,6 +1480,7 @@ class UiWorker(threading.Thread):
         screen_blinker: Any = None,
         telegram_notifier: Any = None,
         dingtalk_notifier: Any = None,
+        abnormal_notifier: Any = None,
         on_patrol_start: Optional[Callable[[], None]] = None,
         on_patrol_restart: Optional[Callable[[], None]] = None,
         on_patrol_stop: Optional[Callable[[], None]] = None,
@@ -1638,15 +1653,16 @@ class UiWorker(threading.Thread):
         self.lie_detector_worker = lie_detector_worker
         # Shared visual counterpart to every optional beep alert.
         self.screen_blinker = screen_blinker
-        # Optional Telegram delivery runs in its own worker; UI calls only
-        # non-blocking configuration/queue methods.
+        # Telegram is retired ("we don't use telegram now"): the parameter is kept
+        # only so an older caller cannot break, and nothing configures or reads it.
         self.telegram_notifier = telegram_notifier
-        # 钉钉提醒: same contract as the Telegram notifier - the UI only writes
-        # the webhook / switch and reads a status line, the worker owns the
-        # network.  Armed by the same 消息 selection as the other channels.
+        # 钉钉提醒: the only message channel.  The UI only writes the webhook /
+        # switch and reads a status line, the worker owns the network.  Armed by
+        # the same 消息 selection as the other channels.
         self.dingtalk_notifier = dingtalk_notifier
-        self._telegram_bot_token = ""
-        self._telegram_chat_id = ""
+        # Future abnormal points use this single master gate and the existing
+        # 声音 / 闪烁 / 消息 output selections.
+        self.abnormal_notifier = abnormal_notifier
         self._quick_messages: list[str] = []
         self._quick_edit_entry: Any = None
         self._quick_edit_index: Optional[int] = None
@@ -2742,19 +2758,30 @@ class UiWorker(threading.Thread):
             pickup_enabled.pack(side="left", padx=(0, 4))
             self._stationary_pickup_enabled_button = pickup_enabled
             ttk.Label(pickup_row, text="每").pack(side="left", padx=(0, 2))
+            # mode.txt = 0 (debug) may test the same circuit much faster: the
+            # minimum drops from 1m to 10s and the wheel steps one second, so
+            # 10s..59s is reachable and is displayed in seconds.  Produce mode
+            # (mode.txt = 1, or no mode.txt at all) keeps 1m / 0.1m steps.
+            pickup_debug = self._pickup_debug_mode()
             self._stationary_pickup_control = NumericValueRangeControl(
                 pickup_row,
                 tk_module=tk, ttk_module=ttk,
                 minimum=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES,
                 maximum=self._STATIONARY_PICKUP_INTERVAL_DEFAULT_MINUTES,
-                range_mode=True, value_type=float, step=0.1,
-                lower_bound=1.0, upper_bound=30.0, unit="m",
+                range_mode=True, value_type=float,
+                step=(self._STATIONARY_PICKUP_DEBUG_STEP_MINUTES if pickup_debug
+                      else 0.1),
+                lower_bound=(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES
+                             if pickup_debug else 1.0),
+                upper_bound=30.0, unit="m",
                 value_width=5,
                 # Keep the full second value inside the pickup component so
                 # it cannot paint underneath the following 小碎步 checkbox.
                 extra_width_px=24,
                 before_change=lambda: self._undo_capture_callback("定时巡逻间隔"),
                 on_change=self._fixed_on_change,
+                formatter=(self._format_stationary_pickup_interval
+                           if pickup_debug else None),
             )
             self._stationary_pickup_interval_var = self._stationary_pickup_control.minimum_var
             self._stationary_pickup_max_minutes_var = self._stationary_pickup_control.maximum_var
@@ -3301,6 +3328,22 @@ class UiWorker(threading.Thread):
                 command=self._on_lie_alert_change,
             ).pack(side="left", padx=(0, 6))
 
+            self._abnormal_alert_var = tk.BooleanVar(value=False)
+            abnormal_check = ttk.Checkbutton(
+                alarm_row,
+                text="异常",
+                variable=self._abnormal_alert_var,
+                command=self._shutdown_on_change,
+            )
+            abnormal_check.pack(side="left", padx=(0, 6))
+            abnormal_hint = HoverTooltip(
+                abnormal_check,
+                "异常时通过已选的声音、闪烁、消息方式提醒"
+                "（例如 非正常运行：只在无法恢复时提醒）",
+            )
+            abnormal_hint.set_enabled(True)
+            self._bind_key_tooltips.append(abnormal_hint)
+
             self._countdown_enabled_var = tk.BooleanVar(value=False)
             self._countdown_check = ttk.Checkbutton(
                 alarm_row, text="循环",
@@ -3446,48 +3489,13 @@ class UiWorker(threading.Thread):
             self._refresh_dingtalk_button()
             self._refresh_dingtalk_name_button()
             self._apply_dingtalk_settings()
-            self._apply_dingtalk_settings()
-            telegram_row = ttk.Frame(extra_panel)
-            # 消息推送配置 is intentionally hidden for now.  Keep its widgets
-            # instantiated so existing saved settings and notifier callbacks
-            # remain valid when this surface is restored.
-            self._telegram_machine_row = telegram_row
-            telegram_label = ttk.Label(telegram_row, text="消息推送配置")
-            telegram_label.pack(side="left")
+            # Telegram is retired ("we don't use telegram now"): its hidden
+            # 消息推送配置 row (BOT token, its own device-name button and status
+            # label) is gone, and the backend notifier is not created at all.
+            # The stored 设备名称 is still kept - the 钉钉 payload and the
+            # Telegram one always shared it - so this variable remains the single
+            # device name the panel edits through the 设备名 button above.
             self._telegram_machine_var = tk.StringVar(value="")
-            self._telegram_machine_button = ttk.Button(
-                telegram_row,
-                text="设备名称",
-                width=14,
-                command=self._edit_machine_name,
-            )
-            self._telegram_machine_button.pack(side="left", padx=(4, 8))
-            self._telegram_token_button = ttk.Button(
-                telegram_row, text="设置BOT token",
-                command=self._telegram_change_token,
-            )
-            self._telegram_token_button.pack(side="left")
-            telegram_setup_hint = (
-                "配置bot需要开启网络代理，需要获取telegram bot key，"
-                "具体查看右上角教程，学习如何配置"
-            )
-            for widget in (
-                telegram_label,
-                self._telegram_machine_button,
-                self._telegram_token_button,
-            ):
-                tooltip = HoverTooltip(widget, telegram_setup_hint)
-                tooltip.set_enabled(True)
-                self._bind_key_tooltips.append(tooltip)
-            self._telegram_status = ttk.Label(
-                extra_panel,
-                text="",
-                justify="left",
-                wraplength=440,
-            )
-            # Keep the status widget as an internal sink for notifier updates,
-            # but do not show explanatory hints in the Additional Functions
-            # panel.  Operational failures remain in the running log.
 
             # 自动重连: a selection plus its two settings (which world, which channel).
             # 掉线 (the character detector's event) is only the FIRST sign; the worker
@@ -3914,21 +3922,73 @@ class UiWorker(threading.Thread):
             running_log_hint = HoverTooltip(self._copy_log_button, "运行日志")
             running_log_hint.set_enabled(True)
             self._bind_key_tooltips.append(running_log_hint)
-            self._import_config_button = ttk.Button(
-                log_actions, text="导入配置",
-                command=self._import_user_config,
-                takefocus=False,
+            # 导入配置 / 导出配置 / 导入地图 / 导出地图 share one compact style:
+            # default ttk padding made four CJK labels read as a wide strip, and
+            # the map pair belongs directly beside the configuration pair (an
+            # export/import of ONE map recording, not of the whole settings file).
+            #
+            # PADDING ONLY, then a fixed 65 px cell (operator's rule: restore the
+            # font/size, reduce the padding, then make the width 65 px).  The font
+            # stays the theme's; ``-width`` is in CHARACTERS (7 px each on this
+            # theme, so 8 -> 64 px and 9 -> 71 px - no exact 65), so each button
+            # is packed into a fixed-size holder instead.  The cell leaves
+            # 65 - 8 = 57 px for a 48 px label, so nothing is clipped.
+            self._TOOL_BUTTON_WIDTH_PX = 65
+            self._TOOL_BUTTON_HEIGHT_PX = 25
+            compact_style = ttk.Style(root)
+            compact_style.configure("CompactTool.TButton", padding=(0, 0))
+
+            def _tool_slot(parent: Any) -> tuple[Any, Any]:
+                """One fixed 65 px cell plus the button that fills it."""
+
+                holder = ttk.Frame(
+                    parent,
+                    width=self._TOOL_BUTTON_WIDTH_PX,
+                    height=self._TOOL_BUTTON_HEIGHT_PX,
+                )
+                holder.pack_propagate(False)
+                button = ttk.Button(holder, style="CompactTool.TButton", takefocus=False)
+                button.pack(fill="both", expand=True)
+                return holder, button
+
+            self._import_config_slot, self._import_config_button = _tool_slot(log_actions)
+            self._import_config_button.configure(
+                text="导入配置", command=self._import_user_config,
             )
             import_config_hint = HoverTooltip(
                 self._import_config_button, "导入后会刷新当前助手并停止巡逻"
             )
             import_config_hint.set_enabled(True)
             self._bind_key_tooltips.append(import_config_hint)
-            self._export_config_button = ttk.Button(
-                log_actions, text="导出配置",
-                command=self._export_user_config,
-                takefocus=False,
+            self._export_config_slot, self._export_config_button = _tool_slot(log_actions)
+            self._export_config_button.configure(
+                text="导出配置", command=self._export_user_config,
             )
+            export_config_hint = HoverTooltip(
+                self._export_config_button, "导出全部设置到 助手配置\\新配置.json"
+            )
+            export_config_hint.set_enabled(True)
+            self._bind_key_tooltips.append(export_config_hint)
+            self._import_map_slot, self._import_map_button = _tool_slot(log_actions)
+            self._import_map_button.configure(
+                text="导入地图", command=self._import_map_recording,
+            )
+            import_map_hint = HoverTooltip(
+                self._import_map_button,
+                "只导入地图录制（地图/图层/绳索/跳点），不改其它设置；导入后停止巡逻",
+            )
+            import_map_hint.set_enabled(True)
+            self._bind_key_tooltips.append(import_map_hint)
+            self._export_map_slot, self._export_map_button = _tool_slot(log_actions)
+            self._export_map_button.configure(
+                text="导出地图", command=self._export_map_recording,
+            )
+            export_map_hint = HoverTooltip(
+                self._export_map_button,
+                "只导出地图录制到 助手配置\\新.地图.json，不含其它设置",
+            )
+            export_map_hint.set_enabled(True)
+            self._bind_key_tooltips.append(export_map_hint)
             self._copy_log_button.pack(side="left", padx=(0, 3))
             self._log_server_photo = _make_log_icon("server", root)
             self._copy_server_log_button = ttk.Button(
@@ -3952,8 +4012,12 @@ class UiWorker(threading.Thread):
             auto_lie_log_hint.set_enabled(True)
             self._bind_key_tooltips.append(auto_lie_log_hint)
             self._copy_auto_lie_log_button.pack(side="left", padx=(0, 3))
-            self._import_config_button.pack(side="left", padx=(0, 3))
-            self._export_config_button.pack(side="left")
+            # Four fixed 65 px cells with a one-pixel gap; the labels carry their
+            # own glyph spacing, so anything wider reads as a gap.
+            self._import_config_slot.pack(side="left", padx=(0, 1))
+            self._export_config_slot.pack(side="left", padx=(0, 1))
+            self._import_map_slot.pack(side="left", padx=(0, 1))
+            self._export_map_slot.pack(side="left")
             self._log_display_lines: list[str] = []
             self._log_label = ttk.Label(
                 log_panel,
@@ -5290,7 +5354,6 @@ class UiWorker(threading.Thread):
             self._sync_patrol_ui_state,
             self._refresh_shutdown_status,
             self._refresh_countdown_status,
-            self._refresh_telegram_status,
             self._drain_dingtalk_results,
             self._refresh_panel_hints,
             self._tick_timed_logout,
@@ -6326,12 +6389,14 @@ class UiWorker(threading.Thread):
                 self._api_auto_lie_backend_var.set(AUTOLIE_BACKEND_OFF)
             self._api_auto_lie_session_armed = False
             self._api_auto_lie_quota_locked = True
-            # The credential goes with the balance: the server withholds it at
-            # the same moment (an empty auto_lie.secret_key), so keeping the RAM
-            # copy would just let a window keep asking for a pass it can no
-            # longer pay for.  A later positive balance re-arms it from the
-            # server's next reply.
-            clear_server_secret()
+            # The credential stays in memory.  The server no longer ties it to the
+            # 云端测谎 balance (2026-11-16 rule: "loose this limit and send to
+            # all"), because the SAME key authenticates the local 测谎 service's
+            # tracking handshake - dropping it here left a machine whose remote
+            # balance reached 0 unable to start its local service, which then
+            # fell back to the vendor package's refused constant.  Only the
+            # SELECTION is gated by the balance now; a pass that would spend a
+            # pass the account no longer has is still refused server-side.
             if check is not None:
                 try:
                     check.state(["disabled"])
@@ -6730,7 +6795,6 @@ class UiWorker(threading.Thread):
                 LOG.debug("license lock could not stop countdown", exc_info=True)
         for worker, method in (
             (getattr(self, "screen_blinker", None), "set_enabled"),
-            (getattr(self, "telegram_notifier", None), "set_enabled"),
         ):
             callback = getattr(worker, method, None)
             if callable(callback):
@@ -7319,6 +7383,13 @@ class UiWorker(threading.Thread):
                 message = "本地测谎启动中，请稍后再试"
             elif state != "up":
                 message = "本地测谎服务未就绪，请启动后重试"
+                if state == "failed":
+                    try:
+                        detail = str(local_lie_service.failure_reason() or "")
+                    except Exception:  # noqa: BLE001 - the plain sentence stands
+                        detail = ""
+                    if detail:
+                        message = f"本地测谎服务未就绪（{detail}），请稍后重试"
             else:
                 message = ""
             if message:
@@ -9928,12 +9999,17 @@ class UiWorker(threading.Thread):
         # Rebuild in the same left-to-right order used when the panel is
         # created.  ``pack_forget`` drops the original side option, which
         # previously made these controls reappear right-aligned after a run.
+        # The four tool buttons live inside fixed 65 px holders, so the HOLDER is
+        # what gets hidden - hiding the button alone would leave an empty cell -
+        # and all four are listed, including the 地图 pair.
         buttons = (
             (self._copy_log_button, (0, 3)),
             (getattr(self, "_copy_server_log_button", None), (0, 3)),
             (getattr(self, "_copy_auto_lie_log_button", None), (0, 3)),
-            (getattr(self, "_import_config_button", None), (0, 3)),
-            (getattr(self, "_export_config_button", None), (0, 0)),
+            (getattr(self, "_import_config_slot", None), (0, 1)),
+            (getattr(self, "_export_config_slot", None), (0, 1)),
+            (getattr(self, "_import_map_slot", None), (0, 1)),
+            (getattr(self, "_export_map_slot", None), (0, 0)),
         )
         for button, padding in buttons:
             if button is None:
@@ -10343,6 +10419,183 @@ class UiWorker(threading.Thread):
             LOG.warning("%s失败：%s", LOG_CONFIG_EXPORT, exc)
             return
         LOG.info("%s成功：已导出到 %s", LOG_CONFIG_EXPORT, target)
+
+    def _export_map_recording(self) -> None:
+        """Export ONLY this run's map recording to ``助手配置\\新.地图.json``.
+
+        The operator's rule: 导入/导出地图 moves the recording (map name, layers,
+        endpoints, ropes, jump/flower points, route order) and nothing else, so a
+        map can be swapped without disturbing the drug plan, the reconnect
+        settings, the reminders or the minimap calibration.
+        """
+
+        if not self.user_config_path:
+            LOG.warning("%s失败：当前用户配置路径不可用", LOG_MAP_EXPORT)
+            return
+        try:
+            # Every recording edit already persists through the controller, so
+            # the on-disk section is current; the export only has to copy it.
+            controller = self.patrol_controller
+            target = export_map_recording(Path(self.user_config_path))
+        except UpdateError as exc:
+            LOG.warning("%s失败：%s", LOG_MAP_EXPORT, exc)
+            self._set_control_status_safely(f"导出地图失败：{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - a file action must not crash the UI
+            LOG.exception("%s失败", LOG_MAP_EXPORT)
+            self._set_control_status_safely(f"导出地图失败：{exc}")
+            return
+        LOG.info("%s成功：已导出到 %s", LOG_MAP_EXPORT, target)
+        map_name = ""
+        try:
+            map_name = str(controller.map_name() if controller is not None else "")
+        except Exception:
+            map_name = ""
+        self._set_control_status_safely(
+            f"地图已导出：{target.name}"
+            + (f"（{map_name}）" if map_name else "")
+        )
+
+    def _import_map_recording(self) -> None:
+        """Import ONLY a map recording from a chosen file, leaving every other setting."""
+
+        if not self.user_config_path:
+            LOG.warning("%s失败：当前用户配置路径不可用", LOG_MAP_IMPORT)
+            return
+        try:
+            from tkinter import filedialog
+
+            config_folder = Path(self.user_config_path).parent
+            if config_folder.name != "助手配置":
+                config_folder = config_folder / "助手配置"
+            config_folder.mkdir(parents=True, exist_ok=True)
+            source = filedialog.askopenfilename(
+                parent=self._root,
+                title="导入地图录制",
+                initialdir=str(config_folder),
+                initialfile=MAP_RECORDING_FILE_NAME,
+                filetypes=(("地图 JSON", "*.json"), ("所有文件", "*.*")),
+            )
+        except Exception:
+            LOG.exception("%s失败：无法打开文件选择窗口", LOG_MAP_IMPORT)
+            return
+        if not source:
+            LOG.info("%s已取消", LOG_MAP_IMPORT)
+            return
+        if bool(getattr(self, "_map_import_in_progress", False)):
+            LOG.info("%s已在导入中", LOG_MAP_IMPORT)
+            return
+        self._map_import_in_progress = True
+        self._set_control_status_safely("↻ 正在导入地图…")
+        # The route is consumed by the movement worker, so the same rule as a
+        # full configuration import applies: stop first, then replace.
+        try:
+            self._undo_capture("导入地图")
+        except Exception:
+            LOG.debug("map import undo snapshot skipped", exc_info=True)
+        self._stop_patrol()
+        destination = Path(self.user_config_path)
+
+        def replace_then_apply() -> None:
+            self._patrol_stop_cleanup_done.wait(timeout=5.0)
+            try:
+                original_content: Optional[bytes] = destination.read_bytes()
+            except OSError:
+                original_content = None
+            try:
+                recording = import_map_recording(Path(source), destination)
+                error: Optional[Exception] = None
+            except Exception as exc:  # noqa: BLE001 - reported on the status line
+                recording = {}
+                error = exc
+            root_widget = getattr(self, "_root", None)
+            if root_widget is None:
+                return
+
+            def finish() -> None:
+                self._map_import_in_progress = False
+                if error is not None:
+                    LOG.warning("%s失败：%s", LOG_MAP_IMPORT, error)
+                    self._set_control_status_safely(f"导入地图失败：{error}")
+                    return
+                try:
+                    self._apply_imported_recording()
+                except Exception as exc:  # noqa: BLE001 - restore and report
+                    LOG.exception("%s刷新失败", LOG_MAP_IMPORT)
+                    if original_content is not None:
+                        try:
+                            restore_user_config_bytes(destination, original_content)
+                            self._apply_imported_recording()
+                        except Exception:
+                            LOG.exception("%s回滚失败", LOG_MAP_IMPORT)
+                            self._set_control_status_safely(
+                                "导入地图失败，且无法恢复原录制；请重新导入或重启助手。"
+                            )
+                            return
+                    self._set_control_status_safely(
+                        f"导入地图失败，已恢复原录制：{exc}"
+                    )
+                    return
+                map_name = str(recording.get("map_name", "") or "")
+                LOG.info(
+                    "%s成功：已导入 %s%s；其它设置未改动",
+                    LOG_MAP_IMPORT, source,
+                    f"（{map_name}）" if map_name else "",
+                )
+                self._set_control_status_safely(
+                    f"地图已导入：{Path(source).name}"
+                    + (f"（{map_name}）" if map_name else "")
+                    + "；巡逻保持停止。"
+                )
+
+            try:
+                root_widget.after(0, finish)
+            except Exception:
+                LOG.debug("map import callback skipped", exc_info=True)
+
+        threading.Thread(
+            target=replace_then_apply, name="map-import", daemon=True,
+        ).start()
+
+    def _apply_imported_recording(self) -> None:
+        """Adopt the on-disk recording after a 地图 import (recording only).
+
+        Deliberately narrower than ``_reload_imported_user_config``: that one
+        re-reads every panel's section, which would also re-apply settings the
+        operator has not imported.  A map import must leave the drug plan, the
+        alerts, YOLO and the minimap calibration exactly as they are.
+        """
+
+        controller = self.patrol_controller
+        if controller is not None:
+            previous_layer = ""
+            try:
+                previous_layer = str(controller.selected_layer())
+            except Exception:
+                previous_layer = ""
+            controller.reload_recording()
+            if previous_layer:
+                try:
+                    controller.select_layer(previous_layer)
+                except (ValueError, KeyError):
+                    LOG.info(
+                        "map import: layer %s is gone in the imported recording",
+                        previous_layer,
+                    )
+            try:
+                self.configured_map_name = controller.map_name()
+            except Exception:
+                LOG.debug("map import: map name could not be read", exc_info=True)
+        self._patrol_controls_render_key = None
+        self._refresh_patrol_controls()
+
+    def _set_control_status_safely(self, text: str) -> None:
+        """Write the status line without ever raising from a file action."""
+
+        try:
+            self._control_status.configure(text=text)
+        except Exception:
+            LOG.debug("status line update skipped: %s", text, exc_info=True)
 
     def _render(self, snapshot: DebugSnapshot) -> None:
         detection = snapshot.detection
@@ -11601,9 +11854,14 @@ class UiWorker(threading.Thread):
         """Apply an absolute random-delay ceiling, clamped and rounded."""
 
         base = self._fixed_random_gap_seconds() if value is None else value
-        self._fixed_random_gap_var.set(round(
-            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 2
-        ))
+        # Guarded: the reading above already treats a missing variable as the
+        # default, so the setter must not be the one place that assumes it exists
+        # (writing it unguarded was a latent AttributeError).
+        var = getattr(self, "_fixed_random_gap_var", None)
+        if var is not None:
+            var.set(round(
+                max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 2
+            ))
         self._fixed_on_change()
 
     def _fixed_adjust_random_gap(self, delta: float) -> None:
@@ -11629,9 +11887,11 @@ class UiWorker(threading.Thread):
         """Apply an absolute random-jump delay ceiling, clamped and rounded."""
 
         base = self._random_jump_gap_seconds() if value is None else value
-        self._random_jump_gap_var.set(round(
-            max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
-        ))
+        var = getattr(self, "_random_jump_gap_var", None)
+        if var is not None:
+            var.set(round(
+                max(0.0, min(self._FIXED_RANDOM_GAP_MAX, float(base))), 1
+            ))
         self._fixed_on_change()
 
     def _random_jump_adjust_gap(self, delta: float) -> None:
@@ -11681,6 +11941,16 @@ class UiWorker(threading.Thread):
 
         minimum, _maximum = self._stationary_pickup_range_minutes()
         return minimum
+
+    @staticmethod
+    def _pickup_debug_mode() -> bool:
+        """True when mode.txt selects debug (0), unlocking the 10s end."""
+
+        try:
+            return run_mode.debug_enabled()
+        except Exception:
+            LOG.exception("mode.txt could not be read; assuming produce mode")
+            return False
 
     def _stationary_pickup_range_minutes(self) -> tuple[float, float]:
         control = getattr(self, "_stationary_pickup_control", None)
@@ -12843,14 +13113,21 @@ class UiWorker(threading.Thread):
             )
         if hasattr(self, "_lie_alert_var"):
             data["lie_alert_enabled"] = bool(self._lie_alert_var.get())
+        if hasattr(self, "_abnormal_alert_var"):
+            data["abnormal_alert_enabled"] = bool(
+                self._abnormal_alert_var.get()
+            )
         if hasattr(self, "_sound_alert_var"):
             data["sound_alert_enabled"] = bool(self._sound_alert_var.get())
         if hasattr(self, "_screen_blink_var"):
             data["screen_blink_enabled"] = bool(self._screen_blink_var.get())
         if hasattr(self, "_telegram_enabled_var"):
+            # `telegram_enabled` is the 消息 master switch and
+            # `telegram_machine_name` is the 设备名 carried by every 钉钉 push.
+            # Telegram's BOT token / chat ID are not written any more: the channel
+            # is retired, and writing empty strings would also erase values a
+            # restored build may still want.
             data["telegram_enabled"] = bool(self._telegram_enabled_var.get())
-            data["telegram_bot_token"] = self._telegram_bot_token
-            data["telegram_chat_id"] = self._telegram_chat_id
             data["telegram_machine_name"] = self._telegram_machine_var.get().strip()
         if hasattr(self, "_quick_messages"):
             data["quick_messages"] = list(self._quick_messages)
@@ -13020,10 +13297,11 @@ class UiWorker(threading.Thread):
     # "grey it rather than switch me to 关闭" and then "still selectable, fix it".
     LOCAL_LIE_GREYED_STATE = "disabled"
     # Every service sentence this line may have carried, old wording included, as
-    # one trailing run: "本地测谎: 启动中", "本地测谎服务: 正在启动…" (pre-fix builds),
-    # "本地测谎未开通", and any stack of them.  Matching the whole tail instead of
-    # an enumerated list of payloads is what keeps a leftover from an older build
-    # from surviving next to the new sentence.
+    # one trailing run: "本地测谎服务：正在启动，还未成功", "本地测谎: 启动中",
+    # "本地测谎服务: 正在启动…" (pre-fix builds), "本地测谎未开通", and any stack of
+    # them.  Matching the whole tail instead of an enumerated list of payloads is
+    # what keeps a leftover from an older build from surviving next to the new
+    # sentence.
     LOCAL_LIE_HINT_SUFFIX = re.compile(
         r"(?:\s*(?:本地测谎(?:服务)?[:：][^·\n]*|本地测谎未开通))+$"
     )
@@ -13499,7 +13777,7 @@ class UiWorker(threading.Thread):
     def _edit_dingtalk_name(self) -> None:
         """Ask for the device name shown in every 钉钉 message.
 
-        It reuses the same stored 设备名称 the Telegram alert reads, so one name
+        It reuses the same stored 设备名称 every 钉钉 push carries, so one name
         describes this machine on every channel; an empty answer clears it.
         """
 
@@ -13583,6 +13861,7 @@ class UiWorker(threading.Thread):
                 "player_check_enabled": False,
                 "disconnect_alert_enabled": False,
                 "lie_alert_enabled": False,
+                "abnormal_alert_enabled": False,
                 "auto_lie_api_enabled": False,
                 "auto_reconnect_enabled": False,
                 "auto_restart_enabled": False,
@@ -13688,23 +13967,23 @@ class UiWorker(threading.Thread):
             getattr(self, "countdown_worker", None),
             character,
             lie_detector,
+            getattr(self, "abnormal_notifier", None),
         ):
             setter = getattr(alert_worker, "set_sound_enabled", None)
             if setter is not None:
                 setter(sound_enabled)
+        abnormal_notifier = getattr(self, "abnormal_notifier", None)
+        if abnormal_notifier is not None:
+            setter = getattr(abnormal_notifier, "set_enabled", None)
+            if setter is not None:
+                setter(bool(data.get("abnormal_alert_enabled", False)))
         blinker = getattr(self, "screen_blinker", None)
         if blinker is not None:
             setter = getattr(blinker, "set_enabled", None)
             if setter is not None:
                 setter(bool(data.get("screen_blink_enabled", False)))
-        notifier = getattr(self, "telegram_notifier", None)
-        if notifier is not None:
-            notifier.configure(
-                str(data.get("telegram_bot_token", "")),
-                str(data.get("telegram_chat_id", "")),
-                str(data.get("telegram_machine_name", "")),
-            )
-            notifier.set_enabled(bool(data.get("telegram_enabled", False)))
+        # Telegram is retired: no notifier exists, so nothing to configure.  The
+        # 消息 master switch below still arms the 钉钉 channel.
         # 钉钉提醒: the webhook and the 消息 switch travel with the same section,
         # so a restored configuration arms the push without touching the panel.
         dingtalk = getattr(self, "dingtalk_notifier", None)
@@ -13755,35 +14034,6 @@ class UiWorker(threading.Thread):
                     )
                 except Exception:
                     pass
-
-    def _edit_machine_name(self) -> None:
-        """Set or clear the Telegram device name from an explicit click."""
-
-        try:
-            from tkinter import simpledialog
-
-            name = simpledialog.askstring(
-                "设备名称",
-                "设置消息推送显示的设备名称；留空则清除设置。",
-                initialvalue=self._telegram_machine_var.get(),
-                parent=self._root,
-            )
-        except Exception as exc:
-            self._configure_text_if_changed(
-                self._telegram_status,
-                "telegram_status",
-                f"消息提醒: 无法打开设备名称输入框 - {exc}",
-            )
-            return
-        if name is None:
-            return
-        self._telegram_machine_var.set(name.strip()[:100])
-        self._configure_text_if_changed(
-            self._telegram_machine_button,
-            "telegram_machine_button",
-            machine_name_button_text(self._telegram_machine_var.get()),
-        )
-        self._shutdown_on_change()
 
     def _render_quick_messages(self, edit_index: Optional[int] = None) -> None:
         frame = getattr(self, "_quick_messages_frame", None)
@@ -14058,80 +14308,11 @@ class UiWorker(threading.Thread):
         except Exception:
             LOG.debug("window content refit failed", exc_info=True)
 
-    def _telegram_change_token(self) -> None:
-        """Edit the token with the same set/clear semantics as event messages."""
-
-        try:
-            from tkinter import simpledialog
-
-            token = simpledialog.askstring(
-                "设置BOT token",
-                "粘贴 Telegram BOT token；留空则清除设置。",
-                parent=self._root,
-                show="*",
-            )
-        except Exception as exc:
-            self._configure_text_if_changed(
-                self._telegram_status,
-                "telegram_status",
-                f"消息提醒: 无法打开 token 输入框 - {exc}",
-            )
-            return
-        if token is None:
-            return
-        self._telegram_bot_token = token.strip()
-        self._telegram_chat_id = ""
-        self._configure_text_if_changed(
-            self._telegram_status,
-            "telegram_status",
-            "消息提醒: 正在验证 BOT 配置...",
-        )
-        self._refresh_telegram_token_button()
-        self._shutdown_on_change()
-
-    def _refresh_telegram_token_button(self) -> None:
-        """Use the same configured-state affordance as 求让消息 / 重连消息."""
-
-        button = getattr(self, "_telegram_token_button", None)
-        if button is None:
-            return
-        try:
-            self._configure_text_if_changed(
-                button,
-                "telegram_token_button",
-                "已设置" if self._telegram_bot_token.strip() else "设置BOT token",
-            )
-        except Exception:
-            LOG.debug("Telegram token button refresh failed", exc_info=True)
-
-    def _refresh_telegram_status(self) -> None:
-        """Show notifier health and persist an auto-discovered chat ID."""
-
-        if not hasattr(self, "_telegram_status"):
-            return
-        notifier = getattr(self, "telegram_notifier", None)
-        if notifier is None:
-            self._configure_text_if_changed(
-                self._telegram_status, "telegram_status", "消息提醒: 工作线程未接入。"
-            )
-            return
-        try:
-            snapshot = notifier.snapshot()
-            self._configure_text_if_changed(
-                self._telegram_status, "telegram_status", str(snapshot["status"])
-            )
-            discovered = str(snapshot.get("chat_id", "")).strip()
-            if discovered and discovered != self._telegram_chat_id:
-                self._telegram_chat_id = discovered
-                self._shutdown_save_settings(self._shutdown_collect_data())
-            self._refresh_telegram_token_button()
-        except Exception as exc:
-            # Status display itself must be non-fatal too.
-            self._configure_text_if_changed(
-                self._telegram_status,
-                "telegram_status",
-                f"消息提醒: 状态读取失败 - {exc}",
-            )
+    # Telegram is retired ("we don't use telegram now"): its hidden settings row,
+    # its BOT-token dialog, its device-name button and its status poll are all
+    # removed here, and assistant.py no longer constructs the notifier.  The
+    # stored 设备名称 remains (钉钉 uses the same value), and `telegram_enabled`
+    # remains the saved 消息 master switch for the push channels.
 
     # Human-readable key labels for the help dialog (mirrors hotkey.json
     # KEY_VK spellings used by HotkeyWorker).
@@ -14660,6 +14841,10 @@ class UiWorker(threading.Thread):
                 self, "_lie_alert_var"
             ):
                 self._lie_alert_var.set(bool(data["lie_alert_enabled"]))
+            if hasattr(self, "_abnormal_alert_var"):
+                self._abnormal_alert_var.set(bool(
+                    data.get("abnormal_alert_enabled", False)
+                ))
             # Restore the dependent selection as an armed session state too.
             # Previously the checkbox could render as selected from config
             # while _api_auto_lie_session_armed stayed False, so every real
@@ -14766,24 +14951,17 @@ class UiWorker(threading.Thread):
             ):
                 self._screen_blink_var.set(bool(data["screen_blink_enabled"]))
             if hasattr(self, "_telegram_enabled_var"):
+                # `telegram_enabled` is the 消息 master switch (the 消息 checkbox)
+                # and `telegram_machine_name` is the 设备名 in every 钉钉 push.
+                # The BOT token / chat ID keys are Telegram-only and are no longer
+                # read or written; Telegram is retired.
                 self._telegram_enabled_var.set(bool(
                     data.get("telegram_enabled", False)
                 ))
-                self._telegram_bot_token = str(
-                    data.get("telegram_bot_token", "")
-                ).strip()
-                self._telegram_chat_id = str(
-                    data.get("telegram_chat_id", "")
-                ).strip()
                 self._telegram_machine_var.set(str(
                     data.get("telegram_machine_name", "")
                 ))
-                self._configure_text_if_changed(
-                    self._telegram_machine_button,
-                    "telegram_machine_button",
-                    machine_name_button_text(self._telegram_machine_var.get()),
-                )
-                self._refresh_telegram_token_button()
+                self._refresh_dingtalk_name_button()
             if hasattr(self, "_quick_messages"):
                 self._quick_messages = normalize_quick_messages(
                     data.get("quick_messages", [])

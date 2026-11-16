@@ -85,3 +85,6 @@ CT_Lie3_KR_partner_api_DML/
 
 # The activation service is its own repository (see its own .git).
 activation_service/
+# Machine-local debug switch (0 = debug, 1 = produce). Never shipped:
+# build_release.ps1 excludes it, and a missing file means produce mode.
+mode.txt

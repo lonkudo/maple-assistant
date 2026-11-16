@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -48,15 +49,20 @@ PROBE_INTERVAL_SECONDS = 0.5
 # The vendor's own startup gate: it validates the monthly card, then locks its
 # built-in "221+117" WS candidate list, randomly probes two of those ports and
 # ABORTS the start when both handshakes fail ("坐标云启动握手失败，同行服务未启动").
-# One of those candidates (221.10.121.69:44444) is a retired deployment and 8888
-# can answer the HTTP router with 404, so a single attempt is a coin flip - the
-# 16:02 field log shows attempts 1 and 2 dying that way and attempt 3 succeeding.
-# Two consequences are handled here:
+# That list is compiled into the vendor binary (the trimmed build_profile.json does
+# NOT change it - its log still says "锁定 221+117 共 2 WS 口"), so one candidate,
+# 221.10.121.69:44444, is a retired deployment that always times out, and the whole
+# start depends on 117.50.223.113:8888 finishing the WS handshake.  While that
+# deployment does not answer, EVERY attempt fails the same way, which is what the
+# 2026-11-15 field log shows (8 attempts in 2.5 minutes, all "坐标云启动握手失败").
+# Three consequences are handled here:
 #   * a start attempt whose vendor process has already exited is reported as a
 #     failure at once (not after the full 90 s budget), quoting the vendor's own
-#     reason from data\logs\client.log, and
-#   * the supervisor retries that coin flip a bounded number of times and then
-#     leaves the panel on 启动失败 instead of looping in 启动中 for ever.
+#     reason from data\logs\client.log;
+#   * a launch that is still BOOTING is never counted as a failed attempt;
+#   * after the budget the panel says 启动失败 WITH that reason and the supervisor
+#     keeps watching at a slow cadence, so a deployment that recovers is picked up
+#     without toggling the radio.
 VENDOR_GONE_GRACE_SECONDS = 6.0
 MAX_AUTO_START_ATTEMPTS = 8
 # Retry gap after a start attempt that FAILED (the vendor aborted or its process
@@ -65,6 +71,10 @@ MAX_AUTO_START_ATTEMPTS = 8
 # a 90 s budget per attempt.  A healthy-but-slow boot still uses
 # ``SUPERVISE_INTERVAL_SECONDS`` because it never reaches this path.
 START_RETRY_FAST_SECONDS = 3.0
+# Cadence once the attempt budget is spent: the supervisor keeps probing (and
+# retrying) instead of quitting, because a deployment-side gate failure is a
+# temporary state of the SERVER, not a reason to require a radio toggle.
+SLOW_RETRY_SECONDS = 60.0
 # Pre-start supervision: how often the supervisor re-checks that 8765 answers.
 SUPERVISE_INTERVAL_SECONDS = 10.0
 # Startup supervision: a first launch can exit while the licence/WS are being
@@ -161,9 +171,18 @@ def _vendor_log_reason(root: Path) -> str:
     except OSError:
         return ""
     reason = ""
+    # The SUMMARY line (the vendor's own [ERROR] "坐标云启动握手失败 … 原因：
+    # RoiTrackSvc 全部 2 个端点握手失败: timed out") hides the only actionable
+    # detail: the per-endpoint [WARNING] from roitrack.ws_client says WHY, e.g.
+    # ``handshake 失败: {'type': 'auth_denied', 'message': 'quota_exceeded', …}``.
+    # Prefer that line when the tail has one - it is the newest specific failure.
     for line in tail.splitlines():
-        if "[ERROR]" in line or "[CRITICAL]" in line:
+        if "handshake 失败" in line or "auth_denied" in line:
             reason = line
+    if not reason:
+        for line in tail.splitlines():
+            if "[ERROR]" in line or "[CRITICAL]" in line:
+                reason = line
     if not reason:
         for line in tail.splitlines():
             if "[WARNING]" in line:
@@ -181,7 +200,153 @@ def _vendor_log_reason(root: Path) -> str:
         if head and " " not in head and len(head) < 48:
             reason = rest.strip()
     reason = " ".join(str(reason).split())
-    return reason[:160]
+    # The vendor appends its whole diagnosis on one line, separated by " | "
+    # ("原因：… | | 开发调试可设 CT_PARTNER_WS_STARTUP_OPTIONAL=1 …").  Everything
+    # after the first separator is advice for an integrator, not this machine's
+    # state, and quoting it made every supervisor line 300 characters long.
+    reason = reason.split(" |")[0].strip()
+    return reason[:120]
+
+
+def _rotate_rejected_product_key(app_root: Path | str, reason: str) -> bool:
+    """Swap the local WS key after the tracking server REJECTED the current one.
+
+    ``handshake 失败: {'type': 'auth_denied', 'message':
+    'unknown_or_deleted_product_key'}`` is an auth verdict about the KEY itself,
+    not a timeout and not a stale instance: the key in
+    ``data/ct_login_config.json`` is unknown to the tracking server (a revoked
+    packaged constant, or a partner key that was deleted/re-issued).  Retrying it
+    can never succeed, and killing and restarting the vendor service only repeats
+    the same denial - so the config is rotated to the one alternative this
+    machine has: the package's own key, or the key the licence heartbeat
+    delivered, whichever is not the rejected one.
+
+    Rotated at most ONCE per app session, so a machine where both keys are
+    rejected cannot ping-pong between them: after that the failure is reported
+    with its real reason.
+    """
+
+    global _product_key_rotated
+    text = str(reason or "").casefold()
+    if ("unknown_or_deleted_product_key" not in text
+            and "invalid_product_key" not in text):
+        return False
+    if _product_key_rotated:
+        return False
+    path = service_credentials_path(app_root)
+    if path is None or not path.is_file():
+        return False
+    settings = _load_service_settings(path, what="the service credentials")
+    if settings is None:
+        return False
+    current = normalise_credential(settings.get("lie_product_key"))
+    candidates: list[str] = []
+    # The heartbeat key FIRST: it is the credential the tracking server was just
+    # measured to accept (auth=True, quota_left=100), while the constant this
+    # package ships is answered with ``unknown_or_deleted_product_key``.
+    try:
+        from auto_lie_secret import get_server_secret
+
+        heartbeat_key = str(get_server_secret() or "").strip()
+    except Exception:  # noqa: BLE001 - the heartbeat key is optional here
+        heartbeat_key = ""
+    if heartbeat_key:
+        candidates.append(heartbeat_key)
+    package_key = _build_profile_ws_key(app_root)
+    if package_key:
+        candidates.append(package_key)
+    replacement = next(
+        (candidate for candidate in candidates
+         if candidate and candidate.casefold() != current.casefold()),
+        "",
+    )
+    if not replacement:
+        LOG.warning(
+            "local lie service: the tracking server rejected the WS product key "
+            "(%s) and this machine has no different key to try; the card/keys must "
+            "be re-issued by the partner server", _mask(current) or "none",
+        )
+        return False
+    settings["lie_product_key"] = replacement
+    try:
+        _write_service_settings(path, settings)
+    except OSError as exc:
+        LOG.warning("local lie service: the rejected WS key could not be replaced (%s)", exc)
+        return False
+    _product_key_rotated = True
+    LOG.warning(
+        "local lie service: the tracking server rejected the WS product key (%s: "
+        "unknown_or_deleted_product_key); switched the local service to %s and "
+        "will retry the handshake",
+        _mask(current) or "none", _mask(replacement),
+    )
+    return True
+
+
+def _short_reason(text: str, limit: int = 24) -> str:
+    """The first useful clause of a failure text, short enough for the panel.
+
+    ``本地测谎服务启动失败（服务进程已退出：坐标云启动握手失败，同行服务未启动（与
+    GUI 首次自动握手一致…`` reduces to ``坐标云启动握手失败`` - the one fact the
+    operator needs on the hint line.
+
+    The vendor's own messages are mapped to a short label FIRST, because its
+    handshake denial carries the only actionable fact in an English dict:
+    ``handshake 失败: {'type': 'auth_denied', 'message': 'quota_exceeded', …}``
+    must read 坐标云额度不足, not a truncated dict.
+    """
+
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    known = (
+        ("quota_exceeded", "坐标云额度不足"),
+        ("auth_denied", "坐标云拒绝授权"),
+        ("no_valid_license", "月卡验票失败"),
+        ("activate_failed", "月卡验票失败"),
+        ("license_superseded", "月卡被其他终端占用"),
+        ("winerror 10053", "坐标云连接被重置"),
+        ("winerror 10054", "坐标云连接被重置"),
+        ("强迫关闭", "坐标云连接被重置"),
+        ("连接超时", "坐标云端点超时"),
+        ("timed out", "坐标云端点超时"),
+        ("connection timed out", "坐标云端点超时"),
+        ("坐标云启动握手失败", "坐标云启动握手失败"),
+    )
+    for needle, label in known:
+        if needle in lowered:
+            return label
+    for marker in ("原因：", "原因:", "退出：", "退出:", "失败：", "失败:"):
+        index = cleaned.find(marker)
+        if index >= 0:
+            cleaned = cleaned[index + len(marker):]
+            break
+    else:
+        for opening, closing in (("（", "）"), ("(", ")")):
+            start = cleaned.find(opening)
+            end = cleaned.find(closing, start + 1) if start >= 0 else -1
+            if 0 <= start < end:
+                inside = cleaned[start + 1:end].strip(" ：:")
+                if inside:
+                    cleaned = inside
+                    break
+    for stop in (" |", "；", ";", "，", ",", "。", "（", "(", "）", ")"):
+        index = cleaned.find(stop)
+        if 0 < index:
+            cleaned = cleaned[:index]
+            break
+    return cleaned.strip(" ：:。…")[:limit]
+
+
+def failure_reason(limit: int = 24) -> str:
+    """Short, panel-ready reason for the last failed start ("" when none)."""
+
+    with _lock:
+        if str(_state.get("state") or "") != "failed":
+            return ""
+        note = str(_state.get("note") or "")
+    return _short_reason(note, limit)
 
 
 def _log_vendor_reason(root: Path, prefix: str) -> str:
@@ -273,6 +438,145 @@ def _pids_by_name(image: str) -> list[int]:
     return pids
 
 
+def scrub_service_credentials(app_root: Path | str) -> bool:
+    """Remove the plaintext CT card and WS key once the service has read them.
+
+    The vendor reads ``data/ct_login_config.json`` (card + product key) at
+    startup, so the two credentials only have to exist for the few seconds
+    between the write and the moment 8765 answers.  Keeping them afterwards left
+    a stale key on disk that made the NEXT start fail (the field state
+    ``"partition_license_code": "CT_IN-…", "lie_product_key": "LIE-PLANET-001"``)
+    and it kept live credentials in plain text where anyone could read them.
+
+    So: every launch rewrites both fields from the in-memory credentials the
+    licence heartbeat delivered, and every outcome blanks them again.  Everything
+    else in the document (authorization URL, backend switches, VM flags, the
+    ``lie3_*`` tuning) is left exactly as the package shipped it.
+
+    Returns True when the file changed.
+    """
+
+    root = find_service_root(app_root)
+    if root is None:
+        return False
+    path = service_credentials_path(app_root)
+    if path is None or not path.is_file():
+        return False
+    settings = _read_service_settings(path)
+    if not isinstance(settings, dict):
+        return False
+    card = normalise_credential(settings.get("partner_license_code"))
+    key = normalise_credential(settings.get("lie_product_key"))
+    if not card and not key:
+        return False                  # already clean
+    settings["partner_license_code"] = ""
+    settings["lie_product_key"] = ""
+    try:
+        _write_service_settings(path, settings)
+    except OSError as exc:
+        LOG.warning("local lie service: credentials could not be scrubbed (%s)", exc)
+        return False
+    LOG.info(
+        "local lie service: removed the plaintext credentials from %s after the "
+        "service read them (card=%s, key=%s); the next launch rewrites them from "
+        "memory", path.name, _mask(card) or "none", _mask(key) or "none",
+    )
+    return True
+
+
+def rewrite_service_credentials_from_memory(app_root: Path | str) -> bool:
+    """Write the card and the WS key from this session's memory, just before a launch.
+
+    The config is scrubbed again as soon as the service has read it, so every
+    launch starts from two empty fields: this is the one place that puts the live
+    values back - the CT card the licence reply delivered plus the WS key the
+    heartbeat delivered - and nothing is ever taken from what a previous run left
+    on disk.
+
+    Returns True when the file changed.
+    """
+
+    with _lock:
+        card = normalise_credential(_state.get("online_card"))
+        denied = bool(_state.get("card_denied"))
+    try:
+        from auto_lie_secret import get_server_secret
+
+        key = normalise_credential(get_server_secret())
+    except Exception:  # noqa: BLE001 - the key is optional
+        key = ""
+    if denied:
+        card = ""
+    path = service_credentials_path(app_root)
+    settings = _read_service_settings(path) if path is not None else None
+    if not isinstance(settings, dict):
+        return False
+    stored_card = normalise_credential(settings.get("partner_license_code"))
+    stored_key = normalise_credential(settings.get("lie_product_key"))
+    need_card = bool(card) and stored_card != card
+    need_key = bool(key) and stored_key != key
+    # MEMORY IS ALWAYS THE NEWEST: a value that exists only on disk is stale by
+    # definition (an earlier run's card/constant/key) and must never be used, so
+    # it is removed rather than kept.
+    stale_card = bool(stored_card) and not card
+    stale_key = bool(stored_key) and not key
+    if not (need_card or need_key or stale_card or stale_key):
+        return False
+    if stale_card or stale_key:
+        settings["partner_license_code"] = card
+        settings["lie_product_key"] = key
+        try:
+            _write_service_settings(path, settings)
+        except OSError as exc:
+            LOG.warning("local lie service: stale credentials could not be removed (%s)", exc)
+            return False
+        LOG.info(
+            "local lie service: removed stale on-disk credentials that this session "
+            "does not hold (card=%s, key=%s); memory is the authority",
+            _mask(stored_card) or "none", _mask(stored_key) or "none",
+        )
+        return True
+    if need_card:
+        # write_credentials also pins the auth URL and syncs the vendor's own
+        # remembered code; it writes the key too when the field is writable.
+        try:
+            write_credentials(app_root, card, key if need_key else "")
+        except LocalLieServiceError as exc:
+            LOG.warning("local lie service: the CT card could not be restored (%s)", exc)
+            if not need_key:
+                return False
+        return True
+    # Only the key is missing (the card is already in place).
+    settings["lie_product_key"] = key
+    try:
+        _write_service_settings(path, settings)
+    except OSError as exc:
+        LOG.warning("local lie service: the WS key could not be restored (%s)", exc)
+        return False
+    LOG.info(
+        "local lie service: rewrote the WS key from memory before the start (%s)",
+        _mask(key),
+    )
+    return True
+
+
+def _credentials_rewritable_from_memory() -> bool:
+    """Whether this session holds credentials it can rewrite before a launch."""
+
+    try:
+        with _lock:
+            card = str(_state.get("online_card") or "").strip()
+    except Exception:  # noqa: BLE001
+        card = ""
+    try:
+        from auto_lie_secret import get_server_secret
+
+        key = str(get_server_secret() or "").strip()
+    except Exception:  # noqa: BLE001
+        key = ""
+    return bool(card or key)
+
+
 def _launch(root: Path) -> Optional[subprocess.Popen]:
     """Start the packaged service hidden (WSH window style 0)."""
 
@@ -304,6 +608,16 @@ def _launch(root: Path) -> Optional[subprocess.Popen]:
 # instead of guessed: a service that is still booting must not be reported as a
 # rejection, and a second launcher must not be spawned on top of it.
 _launch_process: Optional[subprocess.Popen] = None
+# Whether the LAST ``ensure_started`` call ended with a launch that is still
+# coming up (a launch in flight, not a failure).  The supervisor consults this so
+# a slow boot never consumes the attempt budget; without it eight quick
+# "still booting" returns made the supervisor give up on a service that was in
+# fact about to listen.
+_last_attempt_booting = False
+# One key rotation per app session: after the tracking server rejected the WS
+# product key and the alternative was refused as well, swapping the two back and
+# forth would only hide the real cause (see ``_rotate_rejected_product_key``).
+_product_key_rotated = False
 
 
 def _record_launch(process: subprocess.Popen) -> None:
@@ -338,8 +652,16 @@ def _launch_still_booting() -> Optional[int]:
 def ensure_started(
     app_root: Path | str, *, wait_seconds: float = START_WAIT_SECONDS,
 ) -> tuple[bool, str]:
-    """Start the service when it is not already listening; never raises."""
+    """Start the service when it is not already listening; never raises.
 
+    A ``False`` return means two different things, and ``_last_attempt_booting``
+    separates them: a launch that is still COMING UP (keep waiting, it is not a
+    failure) versus an attempt that really did not start (the vendor refused or
+    died, its own log says why).
+    """
+
+    global _last_attempt_booting
+    _last_attempt_booting = False
     root = find_service_root(app_root)
     with _lock:
         if root is None:
@@ -353,6 +675,14 @@ def ensure_started(
             _state.update(state="external", note=note, root=str(root),
                           started_by_app=False, pids=[], card_rejected=False)
             LOG.info("local lie service: already running (%s)", note)
+            # The running instance already read its config at startup, so the
+            # plaintext copy is no longer needed - blank it unconditionally: no
+            # credential stays on disk, not even a stale one this session does not
+            # hold (memory is the only authority).
+            try:
+                scrub_service_credentials(app_root)
+            except Exception:  # noqa: BLE001 - a scrub must never block a start
+                LOG.debug("local lie service: credential scrub failed", exc_info=True)
             return True, note
         booting_pid = _launch_still_booting()
         if booting_pid is not None:
@@ -371,6 +701,7 @@ def ensure_started(
                 "local lie service: launcher pid=%s is still booting; not starting "
                 "a second instance", booting_pid,
             )
+            _last_attempt_booting = True
             return False, str(_state["note"])
         # A new launch is a new validation attempt.  A previous timeout or
         # wrapper hand-off must not keep the panel at 启动失败 while this attempt
@@ -440,22 +771,41 @@ def ensure_started(
     # the licence reply already delivered one earlier in this session.  Put it back
     # before launching, or the service refuses to listen (no_valid_license) and the
     # panel keeps 本地测谎 enabled for a backend that cannot serve a pass.
+    # Every launch rewrites the two credentials from memory: the config is
+    # scrubbed as soon as the service has read it (see scrub_service_credentials),
+    # so whatever an earlier run left there - a stale key, a foreign card, the
+    # package's own dead constant - is never what the vendor reads.
     try:
-        with _lock:
-            memory_card = str(_state.get("online_card") or "").strip()
-        with _lock:
-            denied = bool(_state.get("card_denied"))
-        if memory_card and not denied and config_card(root) != memory_card:
-            write_credentials(root, memory_card)
+        if rewrite_service_credentials_from_memory(app_root):
             LOG.info(
-                "local lie service: the service config had lost its CT card (%s); "
-                "rewrote it before starting",
-                _mask(memory_card),
+                "local lie service: card and WS key rewritten from memory before the "
+                "start; they are removed again once 8765 answers",
             )
     except LocalLieServiceError as exc:
         LOG.warning("local lie service: the CT card could not be restored (%s)", exc)
     except Exception:  # noqa: BLE001 - a repair must never block the start
-        LOG.debug("local lie service: CT card restore failed", exc_info=True)
+        LOG.debug("local lie service: credential rewrite failed", exc_info=True)
+    # Do not hand the vendor a file without a usable key.  It would fall back to
+    # the constant in its package, which the tracking server refuses, and the
+    # attempt would burn a start cycle on a guaranteed failure (the 12:22 field
+    # log: card validated, handshake denied, every retry identical).  Wait for
+    # the licence heartbeat's key instead.
+    if not _config_has_usable_key(app_root):
+        with _lock:
+            # Its own state: the panel sentence must say it is still verifying and
+            # has not started, not that a launch is in flight.
+            _state.update(
+                state="verifying",
+                note="本地测谎服务：正在校验，还未启动",
+            )
+        LOG.warning(
+            "local lie service: the config has no usable WS key yet (card=%s); not "
+            "launching the vendor, because it would fall back to the package's own "
+            "refused constant - waiting for the licence heartbeat",
+            _mask(normalise_credential(_state.get("online_card"))) or "none",
+        )
+        _last_attempt_booting = True
+        return False, str(_state["note"])
     process = _launch(root)
     if process is None:
         rejected = has_online_card()      # read outside the lock (see _lock)
@@ -465,14 +815,20 @@ def ensure_started(
                 # A card WAS delivered, yet the service cannot come up: on this
                 # machine that means the card did not validate.
                 _state["card_rejected"] = True
+        _scrub_after_attempt(app_root)
         return False, str(_state["note"])
     _record_launch(process)
     # ``启动_后台.vbs`` / ``launch_background.vbs`` is only a hand-off wrapper:
     # WScript may exit successfully while the vendor executable is still
     # unpacking, validating its card and opening 8765.  Its exit is therefore
     # not evidence that the service failed.  A direct executable remains a
-    # real process failure and is still reported immediately below.
-    launched_via_script = any((root / name).is_file() for name in LAUNCHER_NAMES)
+    # real process failure and is still reported immediately below.  Which one
+    # this attempt used is decided by the process that was actually created, not
+    # by the files that happen to exist in the folder.
+    launched_via_script = bool(
+        getattr(process, "args", None)
+        and "wscript" in str(process.args[0]).lower()
+    )
     wrapper_exit_logged = False
     vendor_gone_since: Optional[float] = None
     deadline = time.monotonic() + max(1.0, float(wait_seconds))
@@ -486,6 +842,12 @@ def ensure_started(
                 _state.update(state="running", note=note, pids=pids,
                               started_by_app=True, card_rejected=False)
             LOG.info("local lie service: started (pid=%s, %s)", pids, note)
+            # 8765 answers, so the vendor has read card + key: blank them again,
+            # unconditionally (no credential stays in the file).
+            try:
+                scrub_service_credentials(app_root)
+            except Exception:  # noqa: BLE001 - a scrub must never block a start
+                LOG.debug("local lie service: credential scrub failed", exc_info=True)
             return True, note
         if process.poll() is not None and not launched_via_script:
             # The launcher itself exited and 8765 never opened: the service
@@ -507,6 +869,7 @@ def ensure_started(
                 "answered; see data\\logs\\client.log in the service folder",
                 code,
             )
+            _scrub_after_attempt(app_root)
             return False, str(_state["note"])
         if process.poll() is not None and launched_via_script and not wrapper_exit_logged:
             wrapper_exit_logged = True
@@ -537,6 +900,7 @@ def ensure_started(
                     note += f"：{reason}）" if reason else "）"
                     with _lock:
                         _state.update(state="failed", note=note)
+                    _scrub_after_attempt(app_root)
                     return False, note
     # Still booting.  A first start after a package update has to unpack/validate a
     # 339 MB vendor folder that Windows Defender is scanning at the same time, and
@@ -556,6 +920,7 @@ def ensure_started(
             "waiting instead of reporting a failure",
             wait_seconds, process.pid,
         )
+        _last_attempt_booting = True
         return False, str(_state["note"])
     # The full startup budget elapsed and 8765 still did not answer.  This is a
     # real failure whether the launcher was a script or the executable itself.
@@ -569,7 +934,46 @@ def ensure_started(
             _state["card_rejected"] = True
     LOG.warning("local lie service: still not answering after %.0fs",
                 wait_seconds)
+    _scrub_after_attempt(app_root)
     return False, str(_state["note"])
+
+
+def _config_has_usable_key(app_root: Path | str) -> bool:
+    """Whether the file now carries a WS key the tracking server will accept.
+
+    A launch is only worth making when this is true: the vendor falls back to the
+    constant baked into its package when the field is empty, and that constant is
+    answered with ``unknown_or_deleted_product_key`` - a guaranteed failure that
+    also looks like "the card is fine but the handshake is denied" in its log
+    (2026-11-16 12:22 field log).
+    """
+
+    path = service_credentials_path(app_root)
+    if path is None or not path.is_file():
+        return False
+    settings = _read_service_settings(path)
+    if not isinstance(settings, dict):
+        return False
+    key = normalise_credential(settings.get("lie_product_key"))
+    if not key or _looks_like_placeholder(key) or credential_has_cjk(key):
+        return False
+    package_key = _build_profile_ws_key(app_root)
+    if package_key and key.casefold() == package_key.casefold():
+        return False              # the dead shipped constant
+    return True
+
+
+def _scrub_after_attempt(app_root: Path | str) -> None:
+    """Blank the plaintext credentials after a start attempt ended (any outcome).
+
+    Never raises: the scrub is housekeeping, and a failed start must still be
+    reported with its own reason.
+    """
+
+    try:
+        scrub_service_credentials(app_root)
+    except Exception:  # noqa: BLE001 - housekeeping only
+        LOG.debug("local lie service: credential scrub failed", exc_info=True)
 
 
 _supervisor_thread = None
@@ -641,62 +1045,36 @@ def _card_wait_expiry_job(root: Path, seconds: float) -> None:
 
 
 def _supervisor_job(root, interval: float) -> None:
+    """Keep 本地测谎 running while the selection wants it.
+
+    The vendor's own start is a GATE over its compiled coordinate-cloud WS
+    candidates (see ``VENDOR_GONE_GRACE_SECONDS``): while the deployment's WS
+    service does not answer, EVERY attempt fails the same way, which is the
+    2026-11-15 field log (8 attempts in 2.5 minutes, all 坐标云启动握手失败).  Four
+    rules keep that honest and recoverable:
+
+      * a launch that is still BOOTING is never counted as a failed attempt
+        (eight quick "still booting" returns used to spend the whole budget on a
+        service that was about to listen),
+      * a real failure retries every ``START_RETRY_FAST_SECONDS`` while the
+        attempt budget lasts,
+      * when the budget is spent the panel flips to 启动失败 WITH the vendor's own
+        reason, and the supervisor keeps watching and retrying every
+        ``SLOW_RETRY_SECONDS`` - it never quits, so a deployment that recovers is
+        adopted and the panel turns 启动成功 without a radio toggle (the previous
+        version returned from this thread and required reselecting 本地测谎),
+      * a service that answers resets the budget and clears the rejection latch.
+    """
+
     global _start_attempts
-    first = True
+    gave_up_logged = False
+    # Once the budget has been spent the panel keeps saying 启动失败 during later
+    # retry batches (a genuine boot still paints 启动中 through ensure_started), so
+    # the sentence stops flickering between 启动中 and 启动失败 every few minutes.
+    gave_up_once = False
     while not _supervisor_stop.is_set():
         try:
-            if not is_running():
-                if first:
-                    LOG.info("local lie service: pre-starting with the app (%s)", root)
-                else:
-                    LOG.info("local lie service: 8765 stopped answering; "
-                             "pre-starting it again")
-                with _lock:
-                    attempts = int(_start_attempts or 0)
-                if attempts >= MAX_AUTO_START_ATTEMPTS:
-                    # The vendor's start is a coin flip over its own WS candidate
-                    # list; retrying it for ever is what left the panel reading
-                    # 启动中 (each attempt waited the full budget).  Stop here and
-                    # leave the honest failed state; a new selection, 激活测谎 or a
-                    # restart resets the counter.
-                    if not getattr(_supervisor_job, "_gave_up_logged", False):
-                        _supervisor_job._gave_up_logged = True  # type: ignore[attr-defined]
-                        LOG.warning(
-                            "local lie service: %d start attempts failed; giving up "
-                            "until 本地测谎 is reselected (the service's own reason is "
-                            "in data\\logs\\client.log)", attempts,
-                        )
-                    return
-                _supervisor_job._gave_up_logged = False  # type: ignore[attr-defined]
-                with _lock:
-                    _start_attempts = attempts + 1
-                attempt_number = attempts + 1
-                ok, note = ensure_started(root)
-                if not ok and not _supervisor_stop.is_set():
-                    # The vendor's start is a coin flip over its own hard-coded
-                    # WS candidate pool (221.10.121.69:44444 is a retired
-                    # deployment, so everything hinges on 117.50.223.113:8888
-                    # answering the WS handshake instead of its HTTP router).  A
-                    # failure is therefore expected to be transient: retry after a
-                    # short pause, and keep the panel on 启动中 while attempts
-                    # remain instead of flickering to 启动失败 and back.
-                    if attempt_number < MAX_AUTO_START_ATTEMPTS:
-                        with _lock:
-                            _state.update(
-                                state="starting",
-                                note=(f"启动未成功，正在重试（第 {attempt_number}/"
-                                      f"{MAX_AUTO_START_ATTEMPTS} 次）：{note}"),
-                            )
-                        LOG.warning(
-                            "local lie service: attempt %d/%d did not come up (%s); "
-                            "retrying in %.0fs", attempt_number,
-                            MAX_AUTO_START_ATTEMPTS, note, START_RETRY_FAST_SECONDS,
-                        )
-                        if _supervisor_stop.wait(START_RETRY_FAST_SECONDS):
-                            return
-                        first = False
-                        continue
-            else:
+            if is_running():
                 # The service answers, so it is up - a rejection latched by an
                 # earlier attempt must not keep the panel at 本地测谎启动失败.
                 # ``ensure_started`` is deliberately not called here (nothing to
@@ -704,9 +1082,92 @@ def _supervisor_job(root, interval: float) -> None:
                 note_service_answering()
                 with _lock:
                     _start_attempts = 0
+                gave_up_logged = False
+                gave_up_once = False
+            else:
+                with _lock:
+                    attempts = int(_start_attempts or 0)
+                if attempts >= MAX_AUTO_START_ATTEMPTS:
+                    if not gave_up_logged:
+                        gave_up_logged = True
+                        gave_up_once = True
+                        reason = _log_vendor_reason(
+                            root,
+                            f"local lie service: {attempts} attempt(s) failed",
+                        )
+                        note = "本地测谎服务启动失败"
+                        note += f"（{reason}）" if reason else "（见 data\\logs\\client.log）"
+                        with _lock:
+                            _state.update(state="failed", note=note)
+                        LOG.warning(
+                            "local lie service: %d attempt(s) failed; keeping watch "
+                            "and retrying every %.0fs", attempts, SLOW_RETRY_SECONDS,
+                        )
+                    if _supervisor_stop.wait(SLOW_RETRY_SECONDS):
+                        return
+                    with _lock:
+                        _start_attempts = 0
+                    gave_up_logged = False
+                    continue
+                ok, note = ensure_started(root)
+                if not ok and not _supervisor_stop.is_set():
+                    if _last_attempt_booting:
+                        # A launch is still coming up.  That is not a failure and
+                        # must not consume the attempt budget; the next probe
+                        # decides whether it listened.
+                        LOG.info(
+                            "local lie service: the start is still booting (%s); "
+                            "waiting for it", note,
+                        )
+                    else:
+                        with _lock:
+                            _start_attempts = attempts + 1
+                        attempt_number = attempts + 1
+                        reason = _log_vendor_reason(
+                            root,
+                            f"local lie service: attempt {attempt_number}/"
+                            f"{MAX_AUTO_START_ATTEMPTS} failed",
+                        )
+                        # An auth verdict about the PRODUCT KEY cannot be retried
+                        # into success, and restarting the vendor only repeats it.
+                        # Swap to the machine's other key once, then retry.
+                        _rotate_rejected_product_key(root, reason)
+                        short = _short_reason(reason or str(note))
+                        if attempt_number >= MAX_AUTO_START_ATTEMPTS:
+                            # Budget spent: state the failure NOW, with the reason,
+                            # instead of leaving the panel on 启动中 for ever (the
+                            # 09:01 field log ended exactly like that).
+                            gave_up_once = True
+                            note_text = "本地测谎服务启动失败"
+                            note_text += f"（{short}）" if short else "（见 data\\logs\\client.log）"
+                            with _lock:
+                                _state.update(state="failed", note=note_text)
+                        elif gave_up_once:
+                            # A later retry batch: keep the honest failed state and
+                            # only refresh the counter.
+                            with _lock:
+                                note_text = "本地测谎服务启动失败"
+                                note_text += f"（{short}）" if short else ""
+                                _state.update(state="failed", note=note_text)
+                        else:
+                            with _lock:
+                                _state.update(
+                                    state="starting",
+                                    note=("启动未成功（第 %d/%d 次），正在重试%s" % (
+                                        attempt_number, MAX_AUTO_START_ATTEMPTS,
+                                        f"：{short}" if short else "…",
+                                    )),
+                                )
+                        LOG.warning(
+                            "local lie service: attempt %d/%d did not come up (%s); "
+                            "retrying in %.0fs", attempt_number,
+                            MAX_AUTO_START_ATTEMPTS, note, START_RETRY_FAST_SECONDS,
+                        )
+                        if _supervisor_stop.wait(START_RETRY_FAST_SECONDS):
+                            return
+                        continue
         except Exception:  # noqa: BLE001 - supervision never dies
             LOG.warning("local lie service: supervisor start failed", exc_info=True)
-        first = False
         _supervisor_stop.wait(interval)
 
 
@@ -755,7 +1216,7 @@ def config_card(app_root: Path | str | None = None) -> str:
     settings = _read_service_settings(path)
     if not isinstance(settings, dict):
         return ""
-    card = str(settings.get("partner_license_code") or "").strip()
+    card = normalise_credential(settings.get("partner_license_code"))
     return card if card.upper().startswith("CT_") else ""
 
 
@@ -913,10 +1374,10 @@ def supervisor_set_active(active: bool, app_root=None) -> None:
             CARD_REPLY_WAIT_SECONDS,
         )
     _heartbeat_wait_logged = False
-    # The panel must show 本地测谎: 启动中 the moment the radio is clicked, not one
-    # supervisor iteration later: the state is set here, on the caller's thread,
-    # and ``ensure_started`` then only moves it on to running or failed.  A
-    # service that is already answering keeps its up state.
+    # The panel must show 本地测谎服务：正在启动，还未成功 the moment the radio is
+    # clicked, not one supervisor iteration later: the state is set here, on the
+    # caller's thread, and ``ensure_started`` then only moves it on to running or
+    # failed.  A service that is already answering keeps its up state.
     with _lock:
         already_up = str(_state.get("state") or "idle") in ("running", "external")
         if not already_up:
@@ -926,6 +1387,13 @@ def supervisor_set_active(active: bool, app_root=None) -> None:
             )
     if running:
         return
+    # A FRESH supervisor is a fresh start budget.  Without this reset the old
+    # counter survived the previous thread, so a supervisor that had exhausted its
+    # eight attempts made every later start give up immediately - the field
+    # workaround was "switch to 云端测谎 and switch back".
+    with _lock:
+        _start_attempts = 0
+        _selected_at = time.monotonic()
     _start_supervisor_thread(root)
 
 
@@ -1103,12 +1571,43 @@ def _mask(secret: str) -> str:
 _SERVICE_CONFIG_ENCODINGS = ("utf-8-sig", "utf-8", "gbk", "cp936", "latin-1")
 # A value that is still the vendor's template cannot be used as a credential.
 _PLACEHOLDER_HINTS = ("你的", "填", "your", "xxxx", "change", "todo")
+# Characters a CJK keyboard/IME can silently inject into a pasted credential:
+# zero-width joiners/spaces and a BOM, which make the value compare unequal even
+# though it looks identical on screen.
+_INVISIBLE_CHARACTERS = dict.fromkeys(
+    map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00a0"), None
+)
+
+
+def normalise_credential(value: object) -> str:
+    """Normalise a pasted CT card / product key to the ASCII the server expects.
+
+    A credential typed through a Chinese IME can arrive with FULL-WIDTH forms -
+    a full-width hyphen ``－`` (U+FF0D) instead of ``-``, full-width letters and
+    digits, and an ideographic space - and then the tracking server answers
+    ``unknown_or_deleted_product_key`` for a value that looks correct on screen.
+    NFKC folds every full-width form back to ASCII, and invisible characters are
+    dropped, so such a value becomes usable instead of silently failing.
+    """
+
+    text = str(value or "").translate(_INVISIBLE_CHARACTERS)
+    text = unicodedata.normalize("NFKC", text)
+    return "".join(
+        character for character in text
+        if not character.isspace() and character.isprintable()
+    )
+
+
+def credential_has_cjk(value: object) -> bool:
+    """Whether a normalised credential still contains a non-ASCII character."""
+
+    return any(ord(character) > 0x7F for character in normalise_credential(value))
 
 
 def _looks_like_placeholder(value: object) -> bool:
     """Whether a config value is still the vendor's template text."""
 
-    text = str(value or "").strip()
+    text = normalise_credential(value)
     if not text:
         return True
     lowered = text.casefold()
@@ -1170,23 +1669,21 @@ def _load_service_settings(path: Path, *, what: str) -> Optional[dict]:
 
 
 def _package_ws_key_or_empty(app_root: Path | str, settings: dict) -> str:
-    """A usable WS key for the file: the real one it has, else the package's own.
+    """The key this file can handshake with today ("" when it has none).
 
-    The updated package ships the *placeholder* ``LIE-你的坐标云密钥`` where a key
-    belongs.  Sending that to the coordinate cloud fails the startup handshake
-    (``handshake_failed``) and 8765 never listens, so a placeholder is replaced
-    with the package's own ``build_profile.json`` key - the same key the service
-    would have used had the field been empty.
+    DELIBERATELY returns only the field's own value: the constant this package
+    ships (``LIE-PLANET-001``) is refused by the tracking server with
+    ``unknown_or_deleted_product_key`` (measured 2026-11-16), so it is not a
+    usable substitute for a placeholder.  Kept for callers that want to know
+    whether the config has a key at all.
     """
 
-    current = str(settings.get("lie_product_key") or "").strip()
-    if not _looks_like_placeholder(current):
-        return current
-    return _build_profile_ws_key(app_root)
+    current = normalise_credential(settings.get("lie_product_key"))
+    return "" if _looks_like_placeholder(current) else current
 
 
 def normalize_roi_track_servers(app_root: Path | str) -> bool:
-    """Drop retired deployments from the vendor's ROI-track candidate pool.
+    """Keep only live deployments in the profile's ROI-track pool.
 
     ``build_profile.json`` ships::
 
@@ -1195,18 +1692,23 @@ def normalize_roi_track_servers(app_root: Path | str) -> bool:
             {"host": "117.50.223.113", "ws_ports": [8888],  "label": "华北"}
         ]
 
-    The vendor's partner startup gate samples that pool, probes the WS handshake
-    of each sampled endpoint and ABORTS the whole start with
-    "坐标云启动握手失败，同行服务未启动" when they all fail.  ``221.10.121.69`` has
-    been retired (the operator: "this server is stopped, we shouldn't use it"), so
-    every start wasted one handshake on a dead host and depended entirely on
-    ``117.50.223.113:8888`` answering — the "always fails once or twice" symptom.
+    ``221.10.121.69`` has been retired (the operator: "this server is stopped, we
+    shouldn't use it"), so every start wasted a handshake on a dead host.
+
+    **This repair does NOT change the vendor's startup gate.**  That gate works on a
+    candidate list COMPILED into the vendor binary: its own log says
+    ``锁定 221+117 共 2 WS 口`` even though both copies of this file list only the
+    live host, so a start still probes the retired endpoint and still depends on
+    ``117.50.223.113:8888`` answering.  Only the vendor (or the deployment) can
+    change that list.  What this function keeps is the *declared* deployment: the
+    runtime WS client that does read the profile must not be pointed at a host that
+    no longer exists.
 
     The document exists TWICE in the package: ``data\\build_profile.json`` and the
     frozen application's own ``_internal\\CT\\data\\build_profile.json``.  Both are
     trimmed (the vendor resolves ``CT/data/...`` inside its bundle), keeping only
-    entries for the live deployment (the compiled endpoint table is the authority)
-    and leaving their ports and labels untouched.  Returns True when any changed.
+    entries for the live deployment and leaving their ports and labels untouched.
+    Returns True when any changed.
     """
 
     live = _live_endpoint_host()
@@ -1279,12 +1781,24 @@ def _trim_roi_track_pool(path: Path, live: str) -> bool:
 
 
 def normalize_placeholder_ws_key(app_root: Path | str) -> bool:
-    """Replace a template WS key with the package's own, before the service starts.
+    """Give the service a WS key that the tracking server still accepts.
 
-    Called on the way into every start: the operator may put the CT_IN code in
-    ``data/ct_login_config.json`` by hand (the vendor's documented way) without a
-    licence reply ever arriving, and the shipped placeholder key would then fail
-    the startup handshake.  Returns True when the file changed.
+    Called on the way into every start, before the vendor process is launched, so
+    the FIRST handshake already uses a live key instead of failing once and
+    retrying.  Two cases need it:
+
+    * a template/empty ``lie_product_key`` (the operator pasted the CT_IN card by
+      hand, following the vendor doc, and no licence reply has arrived yet);
+    * the CONSTANT this package ships (``LIE-PLANET-001``).  Measured live on
+      2026-11-16 against ws://117.50.223.113:8888: the delivered heartbeat key
+      answers ``auth=True quota_left=100``, while that constant is refused with
+      ``unknown_or_deleted_product_key``.  It is therefore NOT a usable fallback
+      and is only written when the heartbeat has delivered nothing at all (a
+      machine that has never had a licence reply cannot do better).
+
+    Any other real key is left alone - it may be the partner-issued key.
+
+    Returns True when the file changed.
     """
 
     path = service_credentials_path(app_root)
@@ -1293,10 +1807,53 @@ def normalize_placeholder_ws_key(app_root: Path | str) -> bool:
     settings = _read_service_settings(path)
     if settings is None:
         return False
-    current = str(settings.get("lie_product_key") or "").strip()
-    if not _looks_like_placeholder(current):
+    raw_current = str(settings.get("lie_product_key") or "")
+    current = normalise_credential(raw_current)
+    package_key = _build_profile_ws_key(app_root)
+    placeholder = _looks_like_placeholder(current)
+    shipped_constant = bool(
+        package_key and current and current.casefold() == package_key.casefold()
+    )
+    # A key that still contains a Chinese character can never authenticate: the
+    # server answers unknown_or_deleted_product_key for it, exactly like a
+    # revoked constant.
+    unusable = credential_has_cjk(current)
+    if not placeholder and not shipped_constant and not unusable:
+        # A stored value that differs from its own normalised form (full-width
+        # characters from a Chinese IME, a zero-width space) is unusable as-is;
+        # rewrite it before the vendor reads it.
+        if current and current != raw_current:
+            settings["lie_product_key"] = current
+            try:
+                _write_service_settings(path, settings)
+            except OSError as exc:
+                LOG.warning(
+                    "local lie service: the WS key could not be normalised (%s)", exc
+                )
+                return False
+            LOG.warning(
+                "local lie service: the stored WS product key contained full-width "
+                "or invisible characters; normalised it to %s", _mask(current),
+            )
+            return True
         return False
-    replacement = _build_profile_ws_key(app_root)
+    replacement = ""
+    try:
+        from auto_lie_secret import get_server_secret
+
+        delivered = normalise_credential(get_server_secret())
+    except Exception:  # noqa: BLE001 - the heartbeat key is optional here
+        delivered = ""
+    if delivered and delivered.casefold() != current.casefold():
+        replacement = delivered
+    # NOTE: the constant this package ships is deliberately NOT used as a
+    # fallback.  The tracking server answers
+    # ``{'type': 'auth_denied', 'message': 'unknown_or_deleted_product_key'}`` for
+    # it (measured 2026-11-16), so writing it converts "not configured yet" into
+    # "permanently failing": exactly the field state
+    # ``"partner_license_code": "CT_IN-…", "lie_product_key": "LIE-PLANET-001"``.
+    # Without a delivered key the field is left empty and the next start, after
+    # the licence heartbeat arrives, fills it.
     if not replacement:
         return False          # nothing better to write: leave the file alone
     settings["lie_product_key"] = replacement
@@ -1305,10 +1862,12 @@ def normalize_placeholder_ws_key(app_root: Path | str) -> bool:
     except OSError as exc:
         LOG.warning("local lie service: the WS key could not be written (%s)", exc)
         return False
-    LOG.info(
-        "local lie service: the placeholder WS key in %s was replaced by the "
-        "package's own key (%s) so the startup handshake can pass",
-        path.name, _mask(replacement),
+    reason = ("non-ASCII" if unusable else
+              "shipped-constant" if shipped_constant else "placeholder")
+    LOG.warning(
+        "local lie service: the %s WS key in %s was replaced by %s so the startup "
+        "handshake can pass",
+        reason, path.name, _mask(replacement),
     )
     return True
 
@@ -1331,23 +1890,38 @@ def _build_profile_ws_key(app_root: Path | str) -> str:
 def _product_key_writable(app_root: Path | str, settings: dict) -> bool:
     """Whether the key delivered at heartbeat may become the local WS key.
 
-    The key the licence server hands out at heartbeat (``auto_lie.secret_key``,
-    the operator's ``tx_key``) is the credential the tracking WS authenticates
-    with, so it wins over the one baked into the vendor package.  It has to: the
-    packaged ``build_profile.json`` key is a shipped constant that the partner
-    server can revoke at any time, and when that happens the local service fails
-    its handshake with ``auth_denied: unknown_or_deleted_product_key`` and 8765
-    never listens - which is exactly the 2026-11 field case.
+    There are TWO separate credentials on this service and they must never be
+    swapped (vendor template ``data/ct_login_config.json.example``):
 
-    A placeholder (``LIE-你的坐标云密钥``) is still never written, and a package that
-    ships no key at all keeps the old behaviour (ours fills the field).
+      * ``partner_license_code`` - the CT_IN 月卡 card, verified on port 8004;
+      * ``lie_product_key``      - the coordinate-cloud product key the RoiTrack
+        WS handshakes with.
+
+    Measured against the REAL tracking server (117.50.223.113:8888, probe run on
+    2026-11-16): the key the heartbeat delivers (``auto_lie.secret_key`` /
+    ``tx_key``, here ``tw-x87…4323``) handshakes with ``auth=True quota_left=100``,
+    while the constant this package ships (``LIE-PLANET-001``) is answered with
+    ``unknown_or_deleted_product_key``.  So:
+
+      * an empty or placeholder field is filled - with the DELIVERED key, because
+        it is the live one;
+      * a field that still holds the PACKAGE's own constant is replaced by the
+        delivered key: that constant is shared by every install and the server
+        has already deleted it, so keeping it guarantees a failed handshake;
+      * any other real key is KEPT - it may be the partner-issued key, and the
+        heartbeat secret belongs to the remote backend's cloud.
+
+    The caller's key is written only when it is non-empty; see write_credentials.
     """
 
-    if _looks_like_placeholder(settings.get("lie_product_key")):
-        # Nothing usable yet: the package's own key fills the field when it has
-        # one, otherwise the delivered key is the only candidate.
-        return not _build_profile_ws_key(app_root)
-    return True                          # a delivered key always replaces it
+    current = normalise_credential(settings.get("lie_product_key"))
+    if _looks_like_placeholder(current):
+        return True                       # nothing usable yet: any real key wins
+    package_key = _build_profile_ws_key(app_root)
+    if package_key and current.casefold() == package_key.casefold():
+        # The shipped constant: revocable, and already refused by the server.
+        return True
+    return False                          # a real, working key is never replaced
 
 
 
@@ -1371,10 +1945,20 @@ def canonical_card(value: object) -> str:
     ("CT_IN-.... CT_I") or padded arrives truncated.  Keeping the first clean
     token makes the config usable and surfaces the truncation (masked) instead of
     silently writing a broken code.
+
+    The value is normalised first, so a card typed through a Chinese IME with
+    full-width letters/hyphens (``ＣＴ＿ＩＮ－…``) is accepted as the ASCII card
+    instead of being written as an unusable string.
     """
 
-    raw = str(value or "").strip()
+    raw = normalise_credential(value)
     if not raw:
+        return ""
+    if credential_has_cjk(raw):
+        LOG.warning(
+            "local lie service: the CT card contains non-ASCII characters and was "
+            "ignored (masked: %s)", _mask(raw),
+        )
         return ""
     for token in raw.replace(",", " ").replace(";", " ").split():
         candidate = token.strip().upper()
@@ -1474,24 +2058,22 @@ def normalize_auth_server(app_root: Path | str) -> bool:
 def write_credentials(
     app_root: Path | str, card_code: str, product_key: str = "",
 ) -> Path:
-    """Write the CT_IN card into the service config (the WS key only as fallback).
+    """Write the CT_IN card into the service config (and the live WS key).
 
     本地测谎 needs the CT_* card in ``data/ct_login_config.json``.  The coordinate
-    cloud key is a DIFFERENT thing here: the service package ships its own
-    ``ws_product_key`` in ``data/build_profile.json`` and handshakes its own
-    endpoint with it (``ws://<host>:8888``), while the licence heartbeat's key
-    belongs to the ``8001-8003`` cloud the REMOTE 测谎 backend uses.  Overwriting
-    a working key would point the service at the wrong endpoint, so the caller's
-    key is written ONLY when the config field is empty (or still the vendor's
-    placeholder) and the package carries none of its own.  The document keeps every
-    other setting it was shipped with, including the ones we never read
+    cloud key is a DIFFERENT credential: the field ``lie_product_key`` is what the
+    service handshakes ``ws://<host>:8888`` with.
+
+    Measured against the real tracking server (2026-11-16): the key the
+    heartbeat delivers (``tw-x87…4323``) is accepted with ``auth=True
+    quota_left=100``, while the constant this package ships (``LIE-PLANET-001``)
+    is refused with ``unknown_or_deleted_product_key``.  So the delivered key
+    REPLACES the package's own constant and any placeholder/empty field; any
+    other real key is kept (it may be the partner-issued one).  The document keeps
+    every other setting it was shipped with, including the ones we never read
     (``vm_pierce_*``, ``lie3_ort_ep``, the http/ws fallback flags).  It is written
     as ASCII-only JSON without a BOM: the 2026-11 package ships this file in GBK,
     so escaped Unicode is the only form both readers agree on.
-
-    A placeholder ``lie_product_key`` is replaced with the package's own
-    ``build_profile.json`` key, because the literal template text would fail the
-    startup WS handshake and 8765 would never listen.
     """
 
     path = service_credentials_path(app_root)
@@ -1515,34 +2097,107 @@ def write_credentials(
             "local lie service: card authorization URL corrected to %s", auth_url,
         )
         settings["license_server_url"] = auth_url
-    key = str(product_key or "").strip()
+    key = normalise_credential(product_key)
     if key and _product_key_writable(app_root, settings):
-        settings["lie_product_key"] = key
+        if credential_has_cjk(key):
+            LOG.warning(
+                "local lie service: the delivered WS key contains non-ASCII "
+                "characters and was not written (masked: %s)", _mask(key),
+            )
+        else:
+            settings["lie_product_key"] = key
+            LOG.info(
+                "local lie service: WS product key taken from the activation server "
+                "(card=%s, key=%s)",
+                _mask(card), _mask(key),
+            )
+    elif key:
         LOG.info(
-            "local lie service: WS product key taken from the activation server "
-            "(card=%s, key=%s)",
-            _mask(card), _mask(key),
+            "local lie service: keeping the configured WS product key "
+            "(the activation-server key replaces it only when the field is empty, a "
+            "placeholder, or the constant this package ships)"
         )
-    else:
-        own = _package_ws_key_or_empty(app_root, settings)
-        if own and str(settings.get("lie_product_key") or "").strip() != own:
-            settings["lie_product_key"] = own
-            LOG.info(
-                "local lie service: the placeholder WS key was replaced by the "
-                "package's own key (%s)", _mask(own),
-            )
-        if key:
-            LOG.info(
-                "local lie service: keeping the package's own WS product key for now "
-                "(the activation-server key is only used by a package that ships none)"
-            )
+    # The constant this package ships is NEVER written (see
+    # normalize_placeholder_ws_key): the tracking server answers
+    # unknown_or_deleted_product_key for it, so writing it would turn a
+    # not-yet-configured service into a permanently failing one.  An empty field
+    # simply waits for the licence heartbeat's key.
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_service_settings(path, settings)
+    _sync_partner_card_state(find_service_root(app_root), card)
     LOG.info(
         "local lie service: credentials written to %s (card=%s, ws key=%s)",
         path, _mask(card), _mask(str(settings.get("lie_product_key") or "")) or "none",
     )
     return path
+
+
+def _sync_partner_card_state(root: Optional[Path], card: str) -> None:
+    """Keep the vendor's remembered code (and its ticket) in step with *card*.
+
+    The service keeps ``data/license/ct_partner_last_code.json`` - the code it
+    activated last - and the ticket that code received in
+    ``ct_partner_in_state.json``.  Both OUTRANK ``ct_login_config.json``: a start
+    validates the remembered code (and its cached ticket) even when the config
+    carries a different card, so a card change written only into the config never
+    took effect.  Proved on 2026-11-15: the operator's test card was written to
+    the config and passed as ``--license-code``, yet the vendor validated the
+    previous card because of these two files.
+
+    A ticket issued for another code cannot validate this one, so it is removed
+    (the vendor re-activates the card it was given) and the remembered code is
+    rewritten.  Only files that already exist are touched: a fresh package has
+    neither.
+    """
+
+    if root is None or not card:
+        return
+    state_dir = Path(root) / "data" / "license"
+    if not state_dir.is_dir():
+        return
+    last_code = state_dir / "ct_partner_last_code.json"
+    ticket = state_dir / "ct_partner_in_state.json"
+    recorded = ""
+    if last_code.is_file():
+        try:
+            recorded = str(
+                (json.loads(last_code.read_text(encoding="utf-8", errors="replace")) or {})
+                .get("license_code") or ""
+            ).strip()
+        except (OSError, ValueError):
+            recorded = ""
+        if recorded != card:
+            try:
+                last_code.write_text(
+                    json.dumps({"license_code": card}, ensure_ascii=True) + "\n",
+                    encoding="utf-8",
+                )
+                LOG.info(
+                    "local lie service: the service's remembered CT card now follows "
+                    "the config (%s)", _mask(card),
+                )
+            except OSError as exc:
+                LOG.warning(
+                    "local lie service: could not update the remembered CT card (%s)",
+                    exc,
+                )
+    if not ticket.is_file():
+        return
+    try:
+        state = json.loads(ticket.read_text(encoding="utf-8", errors="replace")) or {}
+    except (OSError, ValueError):
+        state = {}
+    ticket_card = str(state.get("license_code") or "").strip()
+    if not ticket_card or ticket_card == card:
+        return
+    try:
+        ticket.unlink()
+        LOG.warning(
+            "local lie service: the cached CT ticket belonged to %s; removed so the "
+            "new card %s is activated", _mask(ticket_card), _mask(card),
+        )
+    except OSError as exc:
+        LOG.warning("local lie service: could not remove the stale CT ticket (%s)", exc)
 
 
 def local_binding_files(app_root: Path | str) -> tuple[Path, ...]:
@@ -1652,29 +2307,16 @@ def sync_product_key(product_key: str, app_root: Path | str | None = None) -> bo
     settings = _load_service_settings(path, what="the service credentials")
     if settings is None:
         return False
-    placeholder_fix = _package_ws_key_or_empty(root, settings)
-    if str(settings.get("lie_product_key") or "").strip() == key:
+    if normalise_credential(settings.get("lie_product_key")) == key:
         return False
     if not _product_key_writable(root, settings):
-        # Still clean the vendor's template key up, so the service can handshake
-        # with the package's own key instead of the placeholder text.
-        if (placeholder_fix
-                and str(settings.get("lie_product_key") or "").strip() != placeholder_fix):
-            settings["lie_product_key"] = placeholder_fix
-            try:
-                _write_service_settings(path, settings)
-            except OSError as exc:
-                LOG.warning("local lie service: the WS key could not be written (%s)", exc)
-                return False
-            LOG.info(
-                "local lie service: placeholder WS key replaced by the package's own "
-                "key (%s); the activation-server key was not applied",
-                _mask(placeholder_fix),
-            )
-            return True
+        # The configured key is a real one that is not the packaged constant:
+        # keep it (it may be the partner-issued key).  The shipped constant is
+        # never written here either - the tracking server refuses it.
         LOG.info(
-            "local lie service: WS key refresh skipped - the package's own key is "
-            "in use (as requested while testing the local service)"
+            "local lie service: WS key refresh skipped - the config already carries "
+            "a real product key (%s), and the activation-server key never replaces "
+            "one", _mask(normalise_credential(settings.get("lie_product_key")))
         )
         return False
     settings["lie_product_key"] = key
@@ -1739,19 +2381,15 @@ def apply_online_card(card_code: str) -> bool:
         # an unreadable document is left alone instead of being replaced.
         return False
     changed = False
-    if str(settings.get("partner_license_code") or "").strip() != card:
+    if normalise_credential(settings.get("partner_license_code")) != card:
         settings["partner_license_code"] = card
         changed = True
-    # The updated package ships the WS key as a placeholder; replacing it with the
-    # package's own key is what lets the startup handshake succeed.
-    own = _package_ws_key_or_empty(root, settings)
-    if own and str(settings.get("lie_product_key") or "").strip() != own:
-        settings["lie_product_key"] = own
-        changed = True
-        LOG.info(
-            "local lie service: placeholder WS key replaced by the package's own "
-            "key (%s)", _mask(own),
-        )
+    # The WS product key is NOT touched here: ``normalize_placeholder_ws_key``
+    # (called on the way into every start) is the one owner of that field, and it
+    # writes only a key the tracking server accepts.  Writing this package's own
+    # constant here is what produced the field state
+    # ``"partner_license_code": "CT_IN-…", "lie_product_key": "LIE-PLANET-001"``,
+    # which the server refuses with unknown_or_deleted_product_key.
     if not changed:
         # Nothing to rewrite: the file this install already uses matches the reply,
         # and ``note_online_card`` above has already armed the start.
@@ -1886,7 +2524,8 @@ def activate(
 def hint_state() -> str:
     """Which hint_text() branch applies right now.
 
-    ``off`` / ``no_card`` / ``waiting`` / ``starting`` / ``up`` / ``failed``.
+    ``off`` / ``no_card`` / ``waiting`` / ``verifying`` / ``starting`` / ``up`` /
+    ``failed``.
     ``waiting`` is the operator's 等待授权信息 stage: 本地测谎 is selected and a CT
     card exists somewhere, but no *validated reply of this session* has delivered
     it yet, so nothing may be started (2026-11-13 rule: wait for the heartbeat,
@@ -1909,6 +2548,10 @@ def hint_state() -> str:
         return "no_card"
     if rejected:
         return "failed"
+    if state == "verifying":
+        # The credentials are being checked before a launch is even attempted (a
+        # launch without a usable WS key would be refused by the tracking server).
+        return "verifying"
     if state == "starting":
         return "starting"
     if state == "waiting":
@@ -1927,10 +2570,13 @@ def hint_state() -> str:
 def hint_text() -> str:
     """One short sentence for the 图层校准与巡逻 hint line, or "".
 
-    The operator's set (2026-11-13) is exactly these four service sentences:
+    The operator's set is exactly these four service sentences:
       * 本地测谎: 等待授权信息 - selected, waiting for a validated licence
         reply to deliver the CT card
-      * 本地测谎: 启动中       - a launch is in flight
+      * 本地测谎服务：正在校验，还未启动 - the card/key are being verified; no
+        launch has been attempted yet
+      * 本地测谎服务：正在启动，还未成功 - a launch is in flight (the operator's
+        wording: it must not read like a state that already works)
       * 本地测谎: 启动失败     - the service refused, died, or gave up
       * 本地测谎: 启动成功     - /v1/health answers
     Plus 本地测谎未开通 when this activation code carries no CT card at all (that is
@@ -1945,15 +2591,21 @@ def hint_text() -> str:
         return "本地测谎未开通"
     if state == "up":
         return "本地测谎: 启动成功"
+    if state == "verifying":
+        return "本地测谎服务：正在校验，还未启动"
     if state == "starting":
-        return "本地测谎: 启动中"
+        return "本地测谎服务：正在启动，还未成功"
     if state == "waiting":
         return "本地测谎: 等待授权信息"
-    return "本地测谎: 启动失败"
+    # The failure sentence carries the vendor's own short reason ("坐标云启动握手
+    # 失败"), because a bare 启动失败 tells the operator nothing about whether the
+    # card, the network or the deployment is at fault.
+    reason = failure_reason()
+    return f"本地测谎: 启动失败（{reason}）" if reason else "本地测谎: 启动失败"
 
 def reset_for_tests() -> None:
     global _launch_process, _start_attempts, _selected_at, _heartbeat_wait_logged
-    global _card_wait_thread
+    global _card_wait_thread, _last_attempt_booting
     with _lock:
         _state.update(state="idle", note="", root="", started_by_app=False, pids=[],
                       card_rejected=False, card_denied=False)
@@ -1965,12 +2617,13 @@ def reset_for_tests() -> None:
         _start_attempts = 0
         _selected_at = 0.0
         _card_wait_thread = None
+        _last_attempt_booting = False
     _heartbeat_wait_logged = False
 
 
 __all__ = [
     "SERVICE_FOLDER", "LocalLieServiceError", "activate", "ensure_started",
-    "find_service_root", "hint_text", "is_running", "note_failure",
+    "failure_reason", "find_service_root", "hint_text", "is_running", "note_failure",
     "reset_for_tests", "service_credentials_path", "start_in_background",
     "stop_started_service", "sync_product_key", "set_busy_probe", "install_root", "write_credentials",
 ]

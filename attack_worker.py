@@ -168,6 +168,19 @@ class AttackWorker(threading.Thread):
         if callback is not None:
             self.layer_attack_allowed_callback = callback
 
+    def stop_for_abnormal(self, event_type: str) -> None:
+        """Stop future combat beats without touching non-combat workers."""
+
+        self.enabled = False
+        runner = self.atomic_motion_runner
+        interrupt = getattr(runner, "interrupt_charge", None)
+        if callable(interrupt):
+            try:
+                interrupt()
+            except Exception:
+                LOG.warning("abnormal attack charge interrupt failed", exc_info=True)
+        LOG.warning("ATTACK STOPPED: abnormal event=%s", event_type)
+
     def _layer_attack_allowed(self) -> bool:
         if not self.layer_attack_only:
             return True
