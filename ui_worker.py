@@ -1114,8 +1114,17 @@ class NumericValueRangeControl:
         before_change: Optional[Callable[[], None]] = None,
         on_change: Optional[Callable[[], None]] = None,
         formatter: Optional[Callable[[float | int], str]] = None,
+        align: str = "center",
     ) -> None:
         self.range_mode = bool(range_mode)
+        # A cell is ``value_width`` characters wide and the text is centred, so
+        # a short value floats in the middle of the cell and leaves blank space
+        # on both sides - which reads as padding between a row's label and its
+        # number.  ``align="w"`` hugs the digits to the left without shrinking
+        # the cell that keeps a wide value visible.
+        self._anchor = (
+            str(align) if str(align) in ("center", "w", "e") else "center"
+        )
         self._tk = tk_module
         self._ttk = ttk_module
         self.value_type = value_type
@@ -1157,7 +1166,7 @@ class NumericValueRangeControl:
         )
         self.frame.pack_propagate(False)
         self.min_label = ttk_module.Label(
-            self.frame, width=value_width, anchor="center",
+            self.frame, width=value_width, anchor=self._anchor,
             style=self._NORMAL_STYLE,
         )
         self.min_label.pack(side="left", fill="y")
@@ -1165,7 +1174,7 @@ class NumericValueRangeControl:
         if self.range_mode:
             ttk_module.Label(self.frame, text="~").pack(side="left", fill="y")
             self.max_label = ttk_module.Label(
-                self.frame, width=value_width, anchor="center",
+                self.frame, width=value_width, anchor=self._anchor,
                 style=self._NORMAL_STYLE,
             )
             self.max_label.pack(side="left", fill="y")
@@ -2127,6 +2136,13 @@ class UiWorker(threading.Thread):
                 font=("Segoe UI", 10), foreground="#a0a0a0",
             )
             style.configure("Locked.TButton", foreground="#777777")
+            # 药品 rows use their own compact pair: the theme's internal padding
+            # is what pushes a row's label away from its key button, so these
+            # keep the text space and drop the rest (measured: label->button gap
+            # 49 -> 38 px, panel 500 -> 438 px wide).
+            style.configure("Drug.TCheckbutton", padding=(0, 0))
+            style.configure("DrugKey.TButton", padding=(1, 1), foreground="#777777")
+            style.map("DrugKey.TButton", foreground=[("!disabled", "#777777")])
             style.map("Locked.TButton", foreground=[("!disabled", "#777777")])
             # 本地测谎 without a CT card: the radio is greyed, and a disabled
             # Radiobutton alone is easy to miss in this theme (its text keeps the
@@ -2750,14 +2766,17 @@ class UiWorker(threading.Thread):
             pickup_row = ttk.Frame(stationary_options_row)
             self._stationary_pickup_row = pickup_row
             self._stationary_pickup_enabled_var = tk.BooleanVar(value=False)
+            # 定时巡逻 is four CJK glyphs (52 px at Segoe UI 10): a 7-character
+            # cell gives it 49 px and shaves the last stroke, so the cell is one
+            # character wider and the gaps around it are halved.
             pickup_enabled = ttk.Checkbutton(
-                pickup_row, text="定时巡逻", width=7,
+                pickup_row, text="定时巡逻", width=8,
                 variable=self._stationary_pickup_enabled_var,
                 command=self._fixed_on_change,
             )
-            pickup_enabled.pack(side="left", padx=(0, 4))
+            pickup_enabled.pack(side="left", padx=(0, 2))
             self._stationary_pickup_enabled_button = pickup_enabled
-            ttk.Label(pickup_row, text="每").pack(side="left", padx=(0, 2))
+            ttk.Label(pickup_row, text="每").pack(side="left", padx=(0, 0))
             # mode.txt = 0 (debug) may test the same circuit much faster: the
             # minimum drops from 1m to 10s and the wheel steps one second, so
             # 10s..59s is reachable and is displayed in seconds.  Produce mode
@@ -2774,10 +2793,12 @@ class UiWorker(threading.Thread):
                 lower_bound=(self._STATIONARY_PICKUP_INTERVAL_MIN_MINUTES
                              if pickup_debug else 1.0),
                 upper_bound=30.0, unit="m",
-                value_width=5,
-                # Keep the full second value inside the pickup component so
-                # it cannot paint underneath the following 小碎步 checkbox.
-                extra_width_px=24,
+                # A 5-character cell is 39 px and "12.5m" needs 35 px - no room
+                # left once Windows scales the font. 6 characters (46 px) leaves
+                # 11 px, and the component itself no longer carries the extra
+                # padding that existed to protect the 小碎步 checkbox.
+                value_width=6,
+                extra_width_px=10,
                 before_change=lambda: self._undo_capture_callback("定时巡逻间隔"),
                 on_change=self._fixed_on_change,
                 formatter=(self._format_stationary_pickup_interval
@@ -2889,8 +2910,9 @@ class UiWorker(threading.Thread):
             self._small_step_row = step_row
             self._dead_flower_attack_rows.append(step_row)
             self._small_step_enabled_var = tk.BooleanVar(value=False)
+            # "小碎步" is 39 px: a 5-character cell gives it 35 px and clips it.
             small_step_button = ttk.Checkbutton(
-                step_row, text="小碎步", width=5,
+                step_row, text="小碎步", width=6,
                 variable=self._small_step_enabled_var,
                 command=self._fixed_on_change,
             )
@@ -2901,14 +2923,17 @@ class UiWorker(threading.Thread):
             )
             small_step_hint.set_enabled(True)
             self._bind_key_tooltips.append(small_step_hint)
-            ttk.Label(step_row, text="每").pack(side="left", padx=(0, 2))
+            ttk.Label(step_row, text="每").pack(side="left", padx=(0, 0))
             self._small_step_control = NumericValueRangeControl(
                 step_row,
                 tk_module=tk, ttk_module=ttk,
                 minimum=5.0, maximum=5.0,
-                range_mode=True, value_type=float, step=0.1,
-                lower_bound=5.0, upper_bound=60.0, unit="s",
-                value_width=5,
+                # 0.5 s units with a 2 s floor (operator rule): the value only
+                # moves in half seconds - 2.0, 2.5, ... 60.0 - so the cell shows
+                # "55.5s" completely. A click keeps the shared 50-unit coarse step.
+                range_mode=True, value_type=float, step=0.5,
+                lower_bound=2.0, upper_bound=60.0, unit="s",
+                value_width=6,
                 # Keep this cadence range compact: the 后摇 field follows in
                 # the same row.
                 extra_width_px=4,
@@ -2918,14 +2943,15 @@ class UiWorker(threading.Thread):
             self._small_step_interval_var = self._small_step_control.minimum_var
             self._small_step_max_seconds_var = self._small_step_control.maximum_var
             self._small_step_control.pack(side="left")
-            ttk.Label(step_row, text="后摇").pack(side="left", padx=(4, 1))
+            ttk.Label(step_row, text="后摇").pack(side="left", padx=(1, 1))
             self._small_step_post_attack_control = NumericValueRangeControl(
                 step_row,
                 tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=0.70,
                 range_mode=False, value_type=float, step=0.05,
                 lower_bound=0.20, upper_bound=5.00, unit="s",
-                value_width=5,
+                value_width=6,
                 before_change=lambda: self._undo_capture_callback("小碎步后摇"),
                 on_change=self._fixed_on_change,
             )
@@ -2947,7 +2973,7 @@ class UiWorker(threading.Thread):
             # The StatusWorker taps the bound key when the bar ratio drops
             # below the chosen percent (debounced by frames + cooldown).
             drug_panel = ttk.LabelFrame(
-                col2, text="药品 (HP/MP 药水)", padding=(8, 6)
+                col2, text="药品 (HP/MP 药水)", padding=(4, 3)
             )
             self._drug_panel = drug_panel
             drug_panel.pack(fill="x", pady=(0, 8))
@@ -2958,25 +2984,26 @@ class UiWorker(threading.Thread):
             drug_left = ttk.Frame(drug_columns)
             drug_left.pack(side="left", anchor="n")
             drug_right = ttk.Frame(drug_columns)
-            drug_right.pack(side="left", anchor="n", padx=(12, 0))
+            drug_right.pack(side="left", anchor="n", padx=(6, 0))
             hp_row = ttk.Frame(drug_left)
             hp_row.pack(fill="x")
             self._hp_use_var = tk.BooleanVar(value=True)
             hp_use_button = ttk.Checkbutton(
-                hp_row, text="HP", width=6, variable=self._hp_use_var,
+                hp_row, text="HP", width=5,
+                style="Drug.TCheckbutton", variable=self._hp_use_var,
                 command=self._drug_on_change,
             )
             hp_use_button.pack(side="left")
             self._hp_key_var = tk.StringVar(value="delete")
             hp_key_button = ttk.Button(
-                hp_row, text=self._hp_key_var.get(), width=10,
-                style="Locked.TButton",
+                hp_row, text=self._hp_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     hp_key_button, self._hp_key_var, "_hp_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            hp_key_button.pack(side="left", padx=(0, 4))
+            hp_key_button.pack(side="left", padx=(0, 2))
             self._hp_key_button = hp_key_button
             self._attach_bind_hint(hp_key_button)
             # Every visible value in the right column uses the same direct,
@@ -2984,6 +3011,7 @@ class UiWorker(threading.Thread):
             # force a wide trough or low-precision pointer drag.
             self._hp_threshold_control = NumericValueRangeControl(
                 hp_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=50, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=95, unit="%", value_width=5,
                 before_change=lambda: self._undo_capture_callback("HP阈值"),
@@ -2991,30 +3019,32 @@ class UiWorker(threading.Thread):
             )
             self._hp_threshold_var = self._hp_threshold_control.minimum_var
             self._hp_threshold_label = self._hp_threshold_control.min_label
-            ttk.Label(hp_row, text="小于").pack(side="left", padx=(8, 2))
+            ttk.Label(hp_row, text="小于").pack(side="left", padx=(1, 1))
             self._hp_threshold_control.pack(side="left")
             mp_row = ttk.Frame(drug_left)
-            mp_row.pack(fill="x", pady=(2, 0))
+            mp_row.pack(fill="x", pady=(1, 0))
             self._mp_use_var = tk.BooleanVar(value=True)
             mp_use_button = ttk.Checkbutton(
-                mp_row, text="MP", width=6, variable=self._mp_use_var,
+                mp_row, text="MP", width=5,
+                style="Drug.TCheckbutton", variable=self._mp_use_var,
                 command=self._drug_on_change,
             )
             mp_use_button.pack(side="left")
             self._mp_key_var = tk.StringVar(value="end")
             mp_key_button = ttk.Button(
-                mp_row, text=self._mp_key_var.get(), width=10,
-                style="Locked.TButton",
+                mp_row, text=self._mp_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     mp_key_button, self._mp_key_var, "_mp_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            mp_key_button.pack(side="left", padx=(0, 4))
+            mp_key_button.pack(side="left", padx=(0, 2))
             self._mp_key_button = mp_key_button
             self._attach_bind_hint(mp_key_button)
             self._mp_threshold_control = NumericValueRangeControl(
                 mp_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=30, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=95, unit="%", value_width=5,
                 before_change=lambda: self._undo_capture_callback("MP阈值"),
@@ -3022,35 +3052,37 @@ class UiWorker(threading.Thread):
             )
             self._mp_threshold_var = self._mp_threshold_control.minimum_var
             self._mp_threshold_label = self._mp_threshold_control.min_label
-            ttk.Label(mp_row, text="小于").pack(side="left", padx=(8, 2))
+            ttk.Label(mp_row, text="小于").pack(side="left", padx=(1, 1))
             self._mp_threshold_control.pack(side="left")
             # Periodic buff rows: a bound key tapped on a timer.  Each row has
             # its own 5..600 second slider (default 600 seconds) that decides
             # when the key is triggered.  Unlike HP/MP these are time-based,
             # not bar-percent based.
             buff1_row = ttk.Frame(drug_left)
-            buff1_row.pack(fill="x", pady=(2, 0))
+            buff1_row.pack(fill="x", pady=(1, 0))
             self._buff1_use_var = tk.BooleanVar(value=False)
             buff1_use_button = ttk.Checkbutton(
-                buff1_row, text="饲料", width=6, variable=self._buff1_use_var,
+                buff1_row, text="饲料", width=5,
+                style="Drug.TCheckbutton", variable=self._buff1_use_var,
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
             self._buff1_key_var = tk.StringVar(value="home")
             buff1_key_button = ttk.Button(
-                buff1_row, text=self._buff1_key_var.get(), width=10,
-                style="Locked.TButton",
+                buff1_row, text=self._buff1_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff1_key_button, self._buff1_key_var,
                     "_buff1_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff1_key_button.pack(side="left", padx=(0, 4))
+            buff1_key_button.pack(side="left", padx=(0, 2))
             self._buff1_key_button = buff1_key_button
             self._attach_bind_hint(buff1_key_button)
             self._buff1_interval_control = NumericValueRangeControl(
                 buff1_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
@@ -3059,31 +3091,33 @@ class UiWorker(threading.Thread):
             )
             self._buff1_interval_var = self._buff1_interval_control.minimum_var
             self._buff1_interval_label = self._buff1_interval_control.min_label
-            ttk.Label(buff1_row, text="每隔").pack(side="left", padx=(8, 2))
+            ttk.Label(buff1_row, text="每隔").pack(side="left", padx=(1, 1))
             self._buff1_interval_control.pack(side="left")
             buff2_row = ttk.Frame(drug_left)
-            buff2_row.pack(fill="x", pady=(2, 0))
+            buff2_row.pack(fill="x", pady=(1, 0))
             self._buff2_use_var = tk.BooleanVar(value=False)
             buff2_use_button = ttk.Checkbutton(
-                buff2_row, text="补药", width=6, variable=self._buff2_use_var,
+                buff2_row, text="补药", width=5,
+                style="Drug.TCheckbutton", variable=self._buff2_use_var,
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
             self._buff2_key_var = tk.StringVar(value="insert")
             buff2_key_button = ttk.Button(
-                buff2_row, text=self._buff2_key_var.get(), width=10,
-                style="Locked.TButton",
+                buff2_row, text=self._buff2_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff2_key_button, self._buff2_key_var,
                     "_buff2_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff2_key_button.pack(side="left", padx=(0, 4))
+            buff2_key_button.pack(side="left", padx=(0, 2))
             self._buff2_key_button = buff2_key_button
             self._attach_bind_hint(buff2_key_button)
             self._buff2_interval_control = NumericValueRangeControl(
                 buff2_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
@@ -3092,31 +3126,33 @@ class UiWorker(threading.Thread):
             )
             self._buff2_interval_var = self._buff2_interval_control.minimum_var
             self._buff2_interval_label = self._buff2_interval_control.min_label
-            ttk.Label(buff2_row, text="每隔").pack(side="left", padx=(8, 2))
+            ttk.Label(buff2_row, text="每隔").pack(side="left", padx=(1, 1))
             self._buff2_interval_control.pack(side="left")
             buff3_row = ttk.Frame(drug_right)
             buff3_row.pack(fill="x")
             self._buff3_use_var = tk.BooleanVar(value=False)
             buff3_use_button = ttk.Checkbutton(
-                buff3_row, text="增益 1", width=6, variable=self._buff3_use_var,
+                buff3_row, text="增益1", width=5,
+                style="Drug.TCheckbutton", variable=self._buff3_use_var,
                 command=self._drug_on_change,
             )
             buff3_use_button.pack(side="left")
             self._buff3_key_var = tk.StringVar(value="pageup")
             buff3_key_button = ttk.Button(
-                buff3_row, text=self._buff3_key_var.get(), width=10,
-                style="Locked.TButton",
+                buff3_row, text=self._buff3_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff3_key_button, self._buff3_key_var,
                     "_buff3_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff3_key_button.pack(side="left", padx=(0, 4))
+            buff3_key_button.pack(side="left", padx=(0, 2))
             self._buff3_key_button = buff3_key_button
             self._attach_bind_hint(buff3_key_button)
             self._buff3_interval_control = NumericValueRangeControl(
                 buff3_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
@@ -3125,31 +3161,33 @@ class UiWorker(threading.Thread):
             )
             self._buff3_interval_var = self._buff3_interval_control.minimum_var
             self._buff3_interval_label = self._buff3_interval_control.min_label
-            ttk.Label(buff3_row, text="每隔").pack(side="left", padx=(8, 2))
+            ttk.Label(buff3_row, text="每隔").pack(side="left", padx=(1, 1))
             self._buff3_interval_control.pack(side="left")
             buff4_row = ttk.Frame(drug_right)
-            buff4_row.pack(fill="x", pady=(2, 0))
+            buff4_row.pack(fill="x", pady=(1, 0))
             self._buff4_use_var = tk.BooleanVar(value=False)
             buff4_use_button = ttk.Checkbutton(
-                buff4_row, text="增益 2", width=6, variable=self._buff4_use_var,
+                buff4_row, text="增益2", width=5,
+                style="Drug.TCheckbutton", variable=self._buff4_use_var,
                 command=self._drug_on_change,
             )
             buff4_use_button.pack(side="left")
             self._buff4_key_var = tk.StringVar(value="pagedown")
             buff4_key_button = ttk.Button(
-                buff4_row, text=self._buff4_key_var.get(), width=10,
-                style="Locked.TButton",
+                buff4_row, text=self._buff4_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff4_key_button, self._buff4_key_var,
                     "_buff4_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff4_key_button.pack(side="left", padx=(0, 4))
+            buff4_key_button.pack(side="left", padx=(0, 2))
             self._buff4_key_button = buff4_key_button
             self._attach_bind_hint(buff4_key_button)
             self._buff4_interval_control = NumericValueRangeControl(
                 buff4_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
@@ -3158,31 +3196,33 @@ class UiWorker(threading.Thread):
             )
             self._buff4_interval_var = self._buff4_interval_control.minimum_var
             self._buff4_interval_label = self._buff4_interval_control.min_label
-            ttk.Label(buff4_row, text="每隔").pack(side="left", padx=(8, 2))
+            ttk.Label(buff4_row, text="每隔").pack(side="left", padx=(1, 1))
             self._buff4_interval_control.pack(side="left")
             buff5_row = ttk.Frame(drug_right)
-            buff5_row.pack(fill="x", pady=(2, 0))
+            buff5_row.pack(fill="x", pady=(1, 0))
             self._buff5_use_var = tk.BooleanVar(value=False)
             buff5_use_button = ttk.Checkbutton(
-                buff5_row, text="增益 3", width=6, variable=self._buff5_use_var,
+                buff5_row, text="增益3", width=5,
+                style="Drug.TCheckbutton", variable=self._buff5_use_var,
                 command=self._drug_on_change,
             )
             buff5_use_button.pack(side="left")
             self._buff5_key_var = tk.StringVar(value="-")
             buff5_key_button = ttk.Button(
-                buff5_row, text=self._buff5_key_var.get(), width=10,
-                style="Locked.TButton",
+                buff5_row, text=self._buff5_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff5_key_button, self._buff5_key_var,
                     "_buff5_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff5_key_button.pack(side="left", padx=(0, 4))
+            buff5_key_button.pack(side="left", padx=(0, 2))
             self._buff5_key_button = buff5_key_button
             self._attach_bind_hint(buff5_key_button)
             self._buff5_interval_control = NumericValueRangeControl(
                 buff5_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
@@ -3191,31 +3231,33 @@ class UiWorker(threading.Thread):
             )
             self._buff5_interval_var = self._buff5_interval_control.minimum_var
             self._buff5_interval_label = self._buff5_interval_control.min_label
-            ttk.Label(buff5_row, text="每隔").pack(side="left", padx=(8, 2))
+            ttk.Label(buff5_row, text="每隔").pack(side="left", padx=(1, 1))
             self._buff5_interval_control.pack(side="left")
             buff6_row = ttk.Frame(drug_right)
-            buff6_row.pack(fill="x", pady=(2, 0))
+            buff6_row.pack(fill="x", pady=(1, 0))
             self._buff6_use_var = tk.BooleanVar(value=False)
             buff6_use_button = ttk.Checkbutton(
-                buff6_row, text="增益 4", width=6, variable=self._buff6_use_var,
+                buff6_row, text="增益4", width=5,
+                style="Drug.TCheckbutton", variable=self._buff6_use_var,
                 command=self._drug_on_change,
             )
             buff6_use_button.pack(side="left")
             self._buff6_key_var = tk.StringVar(value="-")
             buff6_key_button = ttk.Button(
-                buff6_row, text=self._buff6_key_var.get(), width=10,
-                style="Locked.TButton",
+                buff6_row, text=self._buff6_key_var.get(), width=9,
+                style="DrugKey.TButton",
                 command=lambda: self._bind_capture_begin(
                     buff6_key_button, self._buff6_key_var,
                     "_buff6_key_previous",
                     lambda: self._drug_on_change(),
                 ),
             )
-            buff6_key_button.pack(side="left", padx=(0, 4))
+            buff6_key_button.pack(side="left", padx=(0, 2))
             self._buff6_key_button = buff6_key_button
             self._attach_bind_hint(buff6_key_button)
             self._buff6_interval_control = NumericValueRangeControl(
                 buff6_row, tk_module=tk, ttk_module=ttk,
+                align="w",
                 minimum=600, range_mode=False, value_type=int, step=1,
                 lower_bound=5, upper_bound=600, unit="s", value_width=5,
                 extra_width_px=12,
@@ -3224,7 +3266,7 @@ class UiWorker(threading.Thread):
             )
             self._buff6_interval_var = self._buff6_interval_control.minimum_var
             self._buff6_interval_label = self._buff6_interval_control.min_label
-            ttk.Label(buff6_row, text="每隔").pack(side="left", padx=(8, 2))
+            ttk.Label(buff6_row, text="每隔").pack(side="left", padx=(1, 1))
             self._buff6_interval_control.pack(side="left")
             # Restore previously saved drug settings and apply them live.
             self._drug_load_settings()
@@ -12875,6 +12917,8 @@ class UiWorker(threading.Thread):
             button, var, previous_attr, on_change, bool(allow_null),
         )
         setattr(self, previous_attr, var.get())
+        # Remember the locked style this button had: 药品 uses its own compact one.
+        self._key_capture_style = str(button.cget("style") or "Locked.TButton")
         button.configure(text="请按一个按键…", style="TButton")
         root = getattr(self, "_root", None)
         if root is not None:
@@ -12897,7 +12941,11 @@ class UiWorker(threading.Thread):
                 on_change()
         else:
             var.set(getattr(self, previous_attr, var.get()))
-        button.configure(text=var.get(), style="Locked.TButton")
+        button.configure(
+            text=var.get(),
+            style=str(getattr(self, "_key_capture_style", "") or "Locked.TButton"),
+        )
+        self._key_capture_style = ""
         self._key_capturing = False
         self._key_capture_target = None
         root = getattr(self, "_root", None)
