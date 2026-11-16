@@ -270,7 +270,13 @@ UPDATE_NOTICE_TOOLTIP_LINES = 8
 # the icon is hidden entirely while the operator has published nothing.  The
 # heartbeat carries only the sequence number and the level; the text is fetched
 # on a later tick and cached in memory by ``user_notice``.
-NOTICE_ICON_INK_GREY = "#7d8794"
+#
+# The grey is deliberately darker than UPDATE_ICON_INK_GREY.  A 20-pixel FILLED
+# shape in #7d8794 measures only 3.2:1 against the #f0f0f0 caption bar, and the
+# operator reported it as "totally blended into the background" while the same
+# tone reads fine as thin strokes in the neighbouring icons.  #4a5560 measures
+# 6.7:1 and still reads as grey next to the red state.
+NOTICE_ICON_INK_GREY = "#4a5560"
 NOTICE_ICON_RED = "#c0392b"
 NOTICE_ICON_BG = "#f0f0f0"
 # How much of a long message the hover hint shows before it is truncated: the
