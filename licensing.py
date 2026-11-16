@@ -265,6 +265,12 @@ class LicenseStatus:
     # ``None`` means the server said nothing (older server, or nothing published),
     # which is deliberately different from an empty version string.
     server_release: Optional[dict[str, Any]] = None
+    # The newest 用户提示 the server announces, as ``{"seq": 42, "level": "critical"}``.
+    # Same two-stage rule as ``server_release``: this is only the ANNOUNCEMENT
+    # (the sequence number and the colour), and ``user_notice.fetch_notice()``
+    # pulls the message body on a later tick.  ``None`` means nothing is
+    # published or the server is older than this feature.
+    server_notice: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -1559,6 +1565,14 @@ def _heartbeat_via_server(
     release = answer.get("release") if isinstance(answer, dict) else None
     if isinstance(release, dict) and release.get("version"):
         persisted = replace(persisted, server_release=release)
+    # 用户提示 follows the same two-stage rule: the heartbeat carries only the
+    # sequence number and the level (enough to light the icon in the right
+    # colour), and the message itself is fetched by ``user_notice.fetch_notice``
+    # when the client has not seen that seq yet.  A server that predates the
+    # feature simply omits the key.
+    notice = answer.get("user_notice") if isinstance(answer, dict) else None
+    if isinstance(notice, dict) and notice.get("seq") is not None:
+        persisted = replace(persisted, server_notice=notice)
     if persisted.valid:
         _save_sealed_fingerprint(fingerprint, persisted.license_id, root)
         SERVER_LOG.info("license heartbeat accepted license_id=%s", persisted.license_id)

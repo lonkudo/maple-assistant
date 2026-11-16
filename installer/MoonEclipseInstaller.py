@@ -1100,6 +1100,205 @@ def _version_from_name(name: str) -> str:
     return found.group(1) if found else ""
 
 
+# Only these images are an assistant; a foreign python.exe under the install
+# root would still be ours (the source layout runs ``startup_probe.py`` through
+# ``.venv\Scripts\pythonw.exe``), which is why the image PATH is the filter, not
+# the process name alone.
+_ASSISTANT_IMAGE_NAMES = frozenset({
+    "mooneclipse.exe", "todohelper.exe", "mapleassistant.exe",
+    "pythonw.exe", "python.exe",
+})
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_TERMINATE = 0x0001
+_ERROR_ACCESS_DENIED = 5
+
+
+def _iter_process_images() -> list[tuple[int, str]]:
+    """``(pid, image path)`` for every process this account can name.
+
+    Never raises: an enumeration failure returns what it managed to read.  Pure
+    ``ctypes`` on purpose - spawning ``taskkill`` or PowerShell here would give
+    the installer its own console window and a second copy of the same parsing
+    the rest of this file avoids.
+    """
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001 - non-Windows or a stripped runtime
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        psapi.EnumProcesses.argtypes = (
+            ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        psapi.EnumProcesses.restype = wintypes.BOOL
+
+        capacity = 4096
+        while True:
+            buffer = (wintypes.DWORD * capacity)()
+            used = wintypes.DWORD()
+            if not psapi.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(used)):
+                return []
+            count = int(used.value) // ctypes.sizeof(wintypes.DWORD)
+            if count < capacity:
+                break
+            capacity *= 2
+            if capacity > 65536:
+                return []
+
+        images: list[tuple[int, str]] = []
+        for index in range(count):
+            pid = int(buffer[index])
+            if pid <= 0:
+                continue
+            handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                continue
+            try:
+                size = wintypes.DWORD(32768)
+                name = ctypes.create_unicode_buffer(int(size.value))
+                if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, name, ctypes.byref(size)
+                ):
+                    images.append((pid, str(name.value)))
+            finally:
+                kernel32.CloseHandle(handle)
+        return images
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return []
+
+
+def _instances_under(root: Path) -> list[tuple[int, str]]:
+    """Assistant processes whose executable lives inside *root*."""
+
+    try:
+        prefix = str(Path(root).resolve()).rstrip("\\/").casefold() + "\\"
+    except OSError:
+        prefix = str(root).rstrip("\\/").casefold() + "\\"
+    own = os.getpid()
+    found: list[tuple[int, str]] = []
+    for pid, image in _iter_process_images():
+        if pid == own:
+            continue
+        folded = image.casefold()
+        if not folded.startswith(prefix):
+            continue
+        if Path(image).name.casefold() not in _ASSISTANT_IMAGE_NAMES:
+            continue
+        found.append((pid, image))
+    return found
+
+
+def _stop_running_instances(
+    root: Path,
+    *,
+    on_stage: Any = None,
+    timeout_seconds: float = 20.0,
+) -> list[int]:
+    """Terminate every assistant instance rooted at *root* before unpacking.
+
+    A live instance keeps ``endpoints_protected.pyd``, its ``.py`` modules and
+    its own executable open, so unpacking the archive straight over the install
+    folder fails with "Access is denied" (WinError 5) - the installer must not
+    be the one that loses that race.  Only images under this install root are
+    stopped: a second installation elsewhere, and every unrelated python
+    process, keep running.
+
+    Returns the pids that were asked to terminate (empty when nothing ran).
+    """
+
+    instances = _instances_under(root)
+    if not instances:
+        logging.info("installer: no assistant instance is running under %s", root)
+        return []
+    if on_stage is not None:
+        on_stage("正在关闭已运行的助手…")
+    logging.info(
+        "installer: stopping %d assistant instance(s) under %s before unpacking: %s",
+        len(instances), root, ", ".join(f"{pid}:{Path(image).name}"
+                                        for pid, image in instances),
+    )
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return []
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    stopped: list[int] = []
+    denied: list[int] = []
+    for pid, image in instances:
+        handle = kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        if not handle:
+            denied.append(pid)
+            logging.warning(
+                "installer: cannot open pid %s (%s) to stop it - the assistant runs "
+                "with higher rights than this installer", pid, image,
+            )
+            continue
+        try:
+            if kernel32.TerminateProcess(handle, 1):
+                stopped.append(pid)
+            else:
+                denied.append(pid)
+                logging.warning(
+                    "installer: TerminateProcess failed for pid %s (error %s)",
+                    pid, ctypes.get_last_error(),
+                )
+        finally:
+            kernel32.CloseHandle(handle)
+
+    # Windows releases the file handles of a terminated process asynchronously;
+    # unpacking before that returns to the same WinError 5 the kill just avoided.
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        if not _instances_under(root):
+            logging.info(
+                "installer: assistant stopped (%s); the install folder is free",
+                ", ".join(str(pid) for pid in stopped) or "no pid",
+            )
+            return stopped
+        time.sleep(0.2)
+    remaining = _instances_under(root)
+    if remaining:
+        # Unpacking now would fail with "Access is denied" half way, leaving a
+        # mixed installation - the failure mode that makes the next start die at
+        # import.  Refuse with one actionable sentence instead.
+        names = "、".join(f"pid {pid}" for pid, _image in remaining)
+        logging.error(
+            "installer: %d assistant instance(s) still running under %s after %.0fs: %s",
+            len(remaining), root, timeout_seconds,
+            ", ".join(f"{pid}:{image}" for pid, image in remaining),
+        )
+        raise RuntimeError(
+            f"助手仍在运行，无法安装：{names}。" + "\n"
+            "请先关闭助手（右下角托盘/任务管理器结束 MoonEclipse），再重新安装；"
+            "若助手以管理员身份运行，安装程序也需要以管理员身份运行。"
+        )
+    logging.info(
+        "installer: assistant stopped (%s); the install folder is free",
+        ", ".join(str(pid) for pid in stopped) or "no pid",
+    )
+    return stopped
+
+
 def _version_tuple(value: str) -> tuple[int, ...]:
     """``"1.2.284"`` -> ``(1, 2, 284)`` for the downgrade guard."""
 
@@ -1172,6 +1371,12 @@ def _fetch_package(
         raise RuntimeError(
             f"下载到的安装包是 {version}，低于服务器公布的 {location.version}。"
         )
+    # A running assistant holds endpoints_protected.pyd, its .py modules and its
+    # own executable open.  Unpacking the archive over that folder fails with
+    # "Access is denied" (WinError 5) and leaves a half-unpacked install, so the
+    # installer closes the instance it is about to replace and waits for the
+    # file handles to be released before the first byte is written.
+    _stop_running_instances(target_root, on_stage=stage)
     stage("正在解压安装包…")
     _extract_bundle(
         archive, target_root,

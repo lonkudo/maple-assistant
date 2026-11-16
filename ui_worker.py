@@ -78,6 +78,7 @@ from auto_lie_secret import clear_server_secret, get_server_secret, has_server_s
 from auto_lie_outcome import (
     LieSuccessBoxDetector, SUCCESS_CONSECUTIVE_FRAMES, SUCCESS_THRESHOLD,
 )
+import user_notice
 
 
 LOG = logging.getLogger(__name__)
@@ -180,13 +181,23 @@ class _AutoLieDetectorEvent:
 # The height stays user-resizable (only the minimum is enforced).
 _INITIAL_WINDOW_WIDTH = 980
 _INITIAL_WINDOW_HEIGHT = 560
-# Every panel in the left stack follows this single compact track.  The
+# Every panel in the left stack follows this single track.  The
 # right-side controls retain their own wider track because their key bindings
 # and numeric values need it.
-_LEFT_COLUMN_WIDTH = 375
+# The 图层校准与巡逻 hint line lives in the left stack, and the operator's sentence
+# (本地测谎 state, 巡逻 refusals, 死花/重置花 notices) needs 440px to stay on ONE
+# line; the panel's own 8px padding puts that at 456px of column.  The old 375px
+# track wrapped those sentences onto two 17px lines and clipped longer ones.
+_LEFT_COLUMN_WIDTH = 460
 # Direct-value controls replaced the wide right-column slider troughs.  The
 # widest visible right row now fits comfortably in this tighter track.
 _RIGHT_COLUMN_WIDTH = 393
+# The 图层校准与巡逻 hint line wraps at this width.  Measured on the vista theme
+# with TkDefaultFont (17px line height): the longest operator sentence — a
+# 巡逻 refusal or a 本地测谎 state note — needs 440px for one line and took two
+# lines at the old 330px.  It must stay below _LEFT_COLUMN_WIDTH minus the
+# panel's 2x8px padding, or the label is clipped instead of wrapped.
+_STATUS_HINT_WRAPLENGTH = 440
 # The outer 8% at each side never contains a recordable layer element. Crop
 # it from the UI axis so the useful middle 84% gets a wider canvas.
 # The layer row also contains a radio selector and its label.  296px left the
@@ -253,6 +264,19 @@ UPDATE_ICON_INK_GREEN = "#ffffff"
 UPDATE_ICON_BUSY = "#2f6fd0"
 # Tooltip line budget: enough for the version, a few note lines and the hint.
 UPDATE_NOTICE_TOOLTIP_LINES = 8
+# 用户提示 (the operator's own message) has its own caption icon: a triangle with
+# an exclamation mark, drawn in the notice's level colour.  Two statuses only -
+# 普通 is grey so it reads as information, 紧急 is red so it cannot be missed - and
+# the icon is hidden entirely while the operator has published nothing.  The
+# heartbeat carries only the sequence number and the level; the text is fetched
+# on a later tick and cached in memory by ``user_notice``.
+NOTICE_ICON_INK_GREY = "#7d8794"
+NOTICE_ICON_RED = "#c0392b"
+NOTICE_ICON_BG = "#f0f0f0"
+# How much of a long message the hover hint shows before it is truncated: the
+# full text is one click away in the dialog.
+NOTICE_TOOLTIP_LINES = 10
+NOTICE_TOOLTIP_CHARS = 60
 # A byte count is never shown alone: the caption says ``下载更新 12.3/175.4 MB
 # (7%)`` so the operator can tell how much is left, not only how much arrived.
 # A share that does not report its size keeps the downloaded figure without
@@ -2233,7 +2257,7 @@ class UiWorker(threading.Thread):
             self._control_status = ttk.Label(
                 control_status_slot,
                 text="先录制 最左、绳索、最右，然后添加上方图层。",
-                justify="left", wraplength=330,
+                justify="left", wraplength=_STATUS_HINT_WRAPLENGTH,
             )
             self._control_status.pack(anchor="w", fill="x")
             automation_status_slot = ttk.Frame(controls, height=21)
@@ -3067,6 +3091,11 @@ class UiWorker(threading.Thread):
                 command=self._drug_on_change,
             )
             buff1_use_button.pack(side="left")
+            # 饲料 taps a pet-food item on a timer; the hint names the item class
+            # instead of repeating the panel label.
+            buff1_use_hint = HoverTooltip(buff1_use_button, "宠物食品")
+            buff1_use_hint.set_enabled(True)
+            self._bind_key_tooltips.append(buff1_use_hint)
             self._buff1_key_var = tk.StringVar(value="home")
             buff1_key_button = ttk.Button(
                 buff1_row, text=self._buff1_key_var.get(), width=9,
@@ -3102,6 +3131,10 @@ class UiWorker(threading.Thread):
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
+            # 补药 covers the attack-boost potions used on a timer.
+            buff2_use_hint = HoverTooltip(buff2_use_button, "增加攻击药等")
+            buff2_use_hint.set_enabled(True)
+            self._bind_key_tooltips.append(buff2_use_hint)
             self._buff2_key_var = tk.StringVar(value="insert")
             buff2_key_button = ttk.Button(
                 buff2_row, text=self._buff2_key_var.get(), width=9,
@@ -3998,7 +4031,7 @@ class UiWorker(threading.Thread):
                 text="导入配置", command=self._import_user_config,
             )
             import_config_hint = HoverTooltip(
-                self._import_config_button, "导入后会刷新当前助手并停止巡逻"
+                self._import_config_button, "导入/导出 地图和其他配置"
             )
             import_config_hint.set_enabled(True)
             self._bind_key_tooltips.append(import_config_hint)
@@ -4007,7 +4040,7 @@ class UiWorker(threading.Thread):
                 text="导出配置", command=self._export_user_config,
             )
             export_config_hint = HoverTooltip(
-                self._export_config_button, "导出全部设置到 助手配置\\新配置.json"
+                self._export_config_button, "导入/导出 地图和其他配置"
             )
             export_config_hint.set_enabled(True)
             self._bind_key_tooltips.append(export_config_hint)
@@ -4017,7 +4050,7 @@ class UiWorker(threading.Thread):
             )
             import_map_hint = HoverTooltip(
                 self._import_map_button,
-                "只导入地图录制（地图/图层/绳索/跳点），不改其它设置；导入后停止巡逻",
+                "只导入地图录制（地图/图层/绳索/跳点），不改其它设置",
             )
             import_map_hint.set_enabled(True)
             self._bind_key_tooltips.append(import_map_hint)
@@ -4300,12 +4333,31 @@ class UiWorker(threading.Thread):
         # ``side=right`` adds each later child to the left.  Re-pack these two
         # controls as refresh then teaching so their visible order is book,
         # refresh, help, minimize, maximize, close.
+        # 用户提示: the operator's own message, announced by the heartbeat.  The
+        # triangle is packed to the LEFT of the release icon and only while a
+        # message exists - an always-visible grey triangle would train the
+        # operator to ignore it.  Grey = 普通, red = 紧急, hover = the text,
+        # click = the whole message in a dialog.
+        self._notice_button = tk.Canvas(
+            bar, width=30, height=_CAPTION_HEIGHT,
+            bg=NOTICE_ICON_BG, highlightthickness=0, cursor="hand2",
+        )
+        self._notice_button.bind(
+            "<Button-1>", lambda _event: self._show_notice_dialog()
+        )
+        _bind_caption_hover(self._notice_button)
+        self._notice_button_tooltip = HoverTooltip(
+            self._notice_button, "用户提示"
+        )
+        self._notice_button_tooltip.set_enabled(True)
         self._teaching_button.pack_forget()
         self._update_button.pack_forget()
         self._update_button.pack(side="right", fill="y")
         self._release_button.pack(side="right", fill="y")
+        self._notice_button.pack(side="right", fill="y")
         self._teaching_button.pack(side="right", fill="y")
         self._paint_release_icon()
+        self._apply_user_notice(force=True)
         # Hover-triggered help: show on mouse-enter, disappear on mouse-leave
         # (the popup is floating and never takes keyboard focus).
         # Keep the caption hover shade registered by ``_button`` while also
@@ -4661,6 +4713,171 @@ class UiWorker(threading.Thread):
             LOG.warning("更新提示：获取更新说明失败", exc_info=True)
         finally:
             self._release_check_in_flight = False
+
+    # --- 用户提示 -------------------------------------------------------------
+    def _user_notice_announcement(self) -> Optional[dict[str, Any]]:
+        """What the last heartbeat announced: ``{"seq": n, "level": ...}`` or None.
+
+        The heartbeat is the authority for "there is a message"; the text comes
+        from ``user_notice.cached()`` once the fetch below has finished.
+        """
+
+        status = getattr(self, "_license_status", None)
+        announcement = getattr(status, "server_notice", None)
+        return announcement if isinstance(announcement, dict) else None
+
+    def _notice_state(self) -> Optional[tuple[int, str, str]]:
+        """``(seq, level, message)`` to display, or None for "no triangle".
+
+        The cached message wins, because it carries the text; the announcement is
+        the fallback so the triangle is already in the right colour on the tick
+        the heartbeat arrives, before the body request has returned.
+        """
+
+        notice = user_notice.cached()
+        if notice is not None:
+            return notice.seq, notice.level, notice.message
+        announcement = self._user_notice_announcement()
+        seq = user_notice.announced_seq(announcement)
+        if seq is None:
+            return None
+        return seq, user_notice.level_of(announcement), ""
+
+    def _notice_tooltip_text(self) -> str:
+        """Hover hint: the level, the message and what a click does."""
+
+        state = self._notice_state()
+        if state is None:
+            return "用户提示"
+        _seq, level, message = state
+        label = "紧急" if level == user_notice.LEVEL_CRITICAL else "普通"
+        lines = [f"用户提示（{label}）"]
+        body = [line.strip() for line in str(message or "").splitlines() if line.strip()]
+        if not body:
+            lines.append("正在获取提示内容…")
+        else:
+            lines.extend(body[:NOTICE_TOOLTIP_LINES])
+            if len(body) > NOTICE_TOOLTIP_LINES or any(
+                len(line) > NOTICE_TOOLTIP_CHARS for line in body[:NOTICE_TOOLTIP_LINES]
+            ):
+                lines.append("…")
+            lines.append("点击查看完整内容")
+        return "\n".join(lines)
+
+    def _refresh_notice_tooltip(self) -> None:
+        tooltip = getattr(self, "_notice_button_tooltip", None)
+        if tooltip is not None:
+            tooltip.text = self._notice_tooltip_text()
+
+    def _paint_notice_icon(self) -> None:
+        """Draw the triangle: grey for 普通, red for 紧急, nothing when silent.
+
+        The canvas is never un-packed.  Hiding it by re-packing would move it to
+        the other side of its neighbours (``side="right"`` puts the later child
+        further left), so an empty canvas simply draws no items and leaves the
+        caption bar looking unchanged.
+        """
+
+        canvas = getattr(self, "_notice_button", None)
+        if canvas is None:
+            return
+        state = self._notice_state()
+        try:
+            canvas.delete("all")
+            if state is None:
+                return
+            _seq, level, _message = state
+            ink = (
+                NOTICE_ICON_RED
+                if level == user_notice.LEVEL_CRITICAL
+                else NOTICE_ICON_INK_GREY
+            )
+            # Triangle with an exclamation mark: readable at 30 px and distinct
+            # from the release icon's downward arrow beside it.
+            canvas.create_polygon(
+                15, 6, 25, 26, 5, 26,
+                fill=ink, outline=ink, width=1,
+            )
+            canvas.create_line(15, 12, 15, 19, fill="#ffffff", width=2)
+            canvas.create_line(15, 22, 15, 23, fill="#ffffff", width=2)
+        except Exception:  # noqa: BLE001 - a caption glyph is cosmetic
+            LOG.debug("用户提示：图标绘制失败", exc_info=True)
+
+    def _show_notice_dialog(self) -> None:
+        """Click on the triangle: the whole message, one dialog."""
+
+        state = self._notice_state()
+        if state is None:
+            return
+        _seq, level, message = state
+        critical = level == user_notice.LEVEL_CRITICAL
+        title = "用户提示（紧急）" if critical else "用户提示"
+        body = str(message or "").strip() or "正在获取提示内容，请稍后再试。"
+        try:
+            from tkinter import messagebox
+
+            parent = getattr(self, "_root", None)
+            if critical:
+                messagebox.showwarning(title, body, parent=parent)
+            else:
+                messagebox.showinfo(title, body, parent=parent)
+        except Exception:  # noqa: BLE001 - never break the UI over a dialog
+            LOG.warning("用户提示：无法显示提示内容", exc_info=True)
+
+    def _apply_user_notice(self, force: bool = False) -> None:
+        """Tk tick: adopt the newest notice state and repaint the triangle once."""
+
+        if bool(getattr(self, "_notice_result_pending", False)):
+            self._notice_result_pending = False
+            force = True
+        # A VALID heartbeat with no announcement means the operator withdrew the
+        # message, so the icon must go away - otherwise a cached notice would
+        # outlive its publication forever.  An invalid status (no licence yet,
+        # offline) proves nothing and must never clear it.
+        status = getattr(self, "_license_status", None)
+        if (self._user_notice_announcement() is None
+                and getattr(status, "valid", False)
+                and user_notice.cached() is not None):
+            user_notice.remember(None)
+            LOG.info("用户提示：服务器已撤下提示，图标隐藏")
+            force = True
+        state = self._notice_state()
+        signature = None if state is None else (state[0], state[1])
+        if not force and signature == getattr(self, "_notice_signature", None):
+            return
+        self._notice_signature = signature
+        self._paint_notice_icon()
+        self._refresh_notice_tooltip()
+        if state is not None:
+            LOG.info("用户提示：显示 %s 提示 seq=%s", state[1], state[0])
+
+    def _schedule_notice_fetch(self, announcement: Any) -> None:
+        """Worker thread: fetch the body of a sequence we do not display yet.
+
+        The heartbeat announces the seq on every round; ``needs_fetch`` compares
+        it with the message in memory, and ``begin_fetch`` claims it so a slow
+        request is not restarted on the next round.
+        """
+
+        if not user_notice.needs_fetch(announcement):
+            return
+        if user_notice.begin_fetch(announcement) is None:
+            return
+        threading.Thread(
+            target=self._notice_fetch_job, args=(dict(announcement),),
+            name="user-notice", daemon=True,
+        ).start()
+
+    def _notice_fetch_job(self, announcement: dict[str, Any]) -> None:
+        """Worker: one content request, then hand the result to the UI tick."""
+
+        try:
+            user_notice.apply_fetched(user_notice.fetch_notice(), announcement)
+        except Exception:  # noqa: BLE001 - a notice is never worth a crash
+            LOG.warning("用户提示：获取内容失败", exc_info=True)
+        finally:
+            user_notice.end_fetch()
+            self._notice_result_pending = True
 
     def _put_release_state(self, action: str, payload: Any) -> None:
         """Queue one update-icon event for Tk; dropping a cosmetic one is fine.
@@ -5383,6 +5600,12 @@ class UiWorker(threading.Thread):
             # dispatch: an armed live pass never waits for cosmetic/status
             # work or configuration I/O.
             self._drain_license_heartbeat_results,
+            # 用户提示: repaint the caption triangle from whatever the last
+            # heartbeat announced and whatever the fetch returned.  It runs right
+            # after the heartbeat drain so the icon appears on the same tick the
+            # announcement lands, and it costs one comparison while nothing is
+            # published.
+            self._apply_user_notice,
             self._drain_release_states,
             self._drain_device_memo_results,
             self._drain_device_unbind_results,
@@ -5550,6 +5773,13 @@ class UiWorker(threading.Thread):
                         self._schedule_release_check(status.server_release)
                     except Exception:
                         LOG.warning("更新提示：版本检查调度失败", exc_info=True)
+                # 用户提示 follows the same two stages one tick later: the
+                # heartbeat carried the sequence number, this fetches its text.
+                if getattr(status, "server_notice", None):
+                    try:
+                        self._schedule_notice_fetch(status.server_notice)
+                    except Exception:
+                        LOG.warning("用户提示：内容获取调度失败", exc_info=True)
                 # The first iteration happens immediately. A failed result
                 # keeps the dashboard grey and receives one confirmation ten
                 # minutes later; an accepted result resumes the normal
@@ -6803,6 +7033,9 @@ class UiWorker(threading.Thread):
                 flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
                 if callable(flower_cycle_setter):
                     flower_cycle_setter(False, 0.0, 0.0)
+                wait_flower_setter = getattr(mover, "set_wait_dead_flower_schedule", None)
+                if callable(wait_flower_setter):
+                    wait_flower_setter(False, 0.0, 0.0)
             except Exception:
                 LOG.debug("license lock could disable stationary actions", exc_info=True)
         for variable_name in (
@@ -7425,13 +7658,8 @@ class UiWorker(threading.Thread):
                 message = "本地测谎启动中，请稍后再试"
             elif state != "up":
                 message = "本地测谎服务未就绪，请启动后重试"
-                if state == "failed":
-                    try:
-                        detail = str(local_lie_service.failure_reason() or "")
-                    except Exception:  # noqa: BLE001 - the plain sentence stands
-                        detail = ""
-                    if detail:
-                        message = f"本地测谎服务未就绪（{detail}），请稍后重试"
+                # No vendor reason in the popup: the client reads a state, the
+                # log keeps the cause (operator rule, 2026-11-16).
             else:
                 message = ""
             if message:
@@ -8854,7 +9082,7 @@ class UiWorker(threading.Thread):
         except Exception as exc:
             AUTO_LIE_LOG.warning("自动过测谎 could not start", exc_info=True)
             if hasattr(self, "_api_test_status"):
-                self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
+                self._api_test_status.configure(text="自动过测谎: 启动失败")
             return
         feed_anchor_setter = getattr(worker, "set_feed_start_from_detection", None)
         if callable(feed_anchor_setter):
@@ -8880,7 +9108,7 @@ class UiWorker(threading.Thread):
         except Exception as exc:
             AUTO_LIE_LOG.warning("自动过测谎 worker could not be started", exc_info=True)
             if hasattr(self, "_api_test_status"):
-                self._api_test_status.configure(text=f"自动过测谎: 启动失败（{exc}）")
+                self._api_test_status.configure(text="自动过测谎: 启动失败")
             return
         detected_at = getattr(self, "_api_auto_lie_pending_since", None)
         if isinstance(detected_at, (float, int)):
@@ -12080,7 +12308,7 @@ class UiWorker(threading.Thread):
         )
         stationary_enabled = mode == "stationary" and self._license_allowed()
         dual_stationary_enabled = mode == "dual_stationary" and self._license_allowed()
-        flower_cycle_enabled = mode in ("stationary", "dual_stationary", "dead_flower") and self._license_allowed()
+        flower_cycle_enabled = mode in ("fixed", "stationary", "dual_stationary", "dead_flower") and self._license_allowed()
         dead_flower_mode = mode == "dead_flower"
         # 随机休息 only exists where the character patrols or stands on a 桩.  It
         # shares a row with 延时回桩/跳反打, so only the checkbox is gated - the
@@ -12124,7 +12352,11 @@ class UiWorker(threading.Thread):
             # The same persisted interval control drives two different route
             # machines. Its meaning follows the active mode without changing
             # the backwards-compatible saved configuration fields.
-            pickup_label.configure(text="重置花" if dead_flower_mode else "定时巡逻")
+            pickup_label.configure(
+                text=("重置花" if dead_flower_mode
+                      else "等死花" if mode == "fixed"
+                      else "定时巡逻")
+            )
         for row in getattr(self, "_dead_flower_attack_rows", ()):
             if row is not None:
                 self._set_panel_state(
@@ -12375,6 +12607,9 @@ class UiWorker(threading.Thread):
                 flower_cycle_setter = getattr(mover, "set_dead_flower_ground_schedule", None)
                 if callable(flower_cycle_setter):
                     flower_cycle_setter(False, 0.0, 0.0)
+                wait_flower_setter = getattr(mover, "set_wait_dead_flower_schedule", None)
+                if callable(wait_flower_setter):
+                    wait_flower_setter(False, 0.0, 0.0)
                 flower_patrol_setter = getattr(mover, "set_flower_patrol_mode", None)
                 if callable(flower_patrol_setter):
                     flower_patrol_setter(False)
@@ -12581,6 +12816,14 @@ class UiWorker(threading.Thread):
                 flower_cycle_setter(
                     bool(data.get("stationary_pickup_enabled", False))
                     and dead_flower_mode,
+                    pickup_min * 60.0,
+                    max(0.0, pickup_max - pickup_min) * 60.0,
+                )
+            wait_flower_setter = getattr(mover, "set_wait_dead_flower_schedule", None)
+            if callable(wait_flower_setter):
+                wait_flower_setter(
+                    bool(data.get("stationary_pickup_enabled", False))
+                    and mode == "fixed",
                     pickup_min * 60.0,
                     max(0.0, pickup_max - pickup_min) * 60.0,
                 )
@@ -15529,14 +15772,30 @@ class UiWorker(threading.Thread):
         stationary_mode = self._stationary_attack_selected()
         dead_flower_mode = self._dead_flower_selected()
         mode_var = getattr(self, "_attack_mode_var", None)
+        wait_dead_flower_selected = bool(
+            mode_var is not None and str(mode_var.get()) == "fixed"
+            and getattr(self, "_stationary_pickup_enabled_var", None) is not None
+            and self._stationary_pickup_enabled_var.get()
+        )
         if (mode_var is not None and str(mode_var.get()) == "dual_stationary"
                 and len(self._dual_stationary_posts_data()) != 2):
             self._control_status.configure(
                 text="双桩模式开始条件不满足：请用 Ctrl+R 后按 D/F/G 录制两个桩点。"
             )
             return False
-        if not (stationary_mode or dead_flower_mode) and not self.patrol_controller.can_start():
+        try:
+            route_ready = self.patrol_controller.can_start(
+                allow_flower_only_layers=wait_dead_flower_selected,
+            )
+            route_errors = self.patrol_controller.validate_patrol_route(
+                allow_flower_only_layers=wait_dead_flower_selected,
+            )
+        except TypeError:
+            # Compatibility for lightweight integrations which expose only
+            # the former no-argument controller surface.
+            route_ready = self.patrol_controller.can_start()
             route_errors = self.patrol_controller.validate_patrol_route()
+        if not (stationary_mode or dead_flower_mode) and not route_ready:
             # Logged, not only shown: this refusal used to leave no trace in the log the operator
             # sends, so "the patrol toggle does nothing" was undiagnosable.
             LOG.warning(
@@ -15546,7 +15805,9 @@ class UiWorker(threading.Thread):
                 sorted(self.patrol_controller.snapshot_layers()),
             )
             self._control_status.configure(
-                text=("无法开始: 巡逻路线的每层都需要最左和最右点。"
+                text=(("无法开始: 等死花之外的巡逻层都需要最左和最右点。"
+                       if wait_dead_flower_selected
+                       else "无法开始: 巡逻路线的每层都需要最左和最右点。")
                       + (" " + "；".join(route_errors) if route_errors else ""))
             )
             return False
@@ -15558,9 +15819,14 @@ class UiWorker(threading.Thread):
             try:
                 result = self.on_patrol_start()
             except OSError as exc:
+                # One operator-facing hint for every window-selection failure
+                # (no window, several windows, scan timeout, the foreground
+                # being refused).  The reason stays in the log: the status line
+                # is too narrow for a paragraph, and the operator's rule is a
+                # single recognisable sentence.
                 LOG.warning("START PATROL refused: game window/calibration step failed: %s", exc)
                 self._control_status.configure(
-                    text=f"无法开始: 游戏窗口选择失败: {exc}"
+                    text="无法开始: 检测不到游戏窗口"
                 )
                 return False
             except Exception as exc:
@@ -15581,7 +15847,7 @@ class UiWorker(threading.Thread):
                 "the calibration step vetoed it)"
             )
             self._control_status.configure(
-                text="无法开始: 输入未武装（游戏窗口未就绪或焦点丢失），请重试。"
+                text="无法开始: 检测不到游戏窗口"
             )
             LOG.info(LOG_RUN_START + "（未武装输入，未开始）。")
             return False
@@ -15919,10 +16185,23 @@ class UiWorker(threading.Thread):
         # 站桩攻击 records only a temporary current-position anchor at Start
         # Patrol. It intentionally has no recorded layers, ropes, bands or
         # route completeness requirement.
+        mode_value = str(getattr(self, "_attack_mode_var", None).get()
+                         if hasattr(self, "_attack_mode_var") else "")
+        wait_dead_flower_selected = bool(
+            mode_value == "fixed"
+            and getattr(self, "_stationary_pickup_enabled_var", None) is not None
+            and self._stationary_pickup_enabled_var.get()
+        )
+        try:
+            route_can_start = self.patrol_controller.can_start(
+                allow_flower_only_layers=wait_dead_flower_selected,
+            )
+        except TypeError:
+            route_can_start = self.patrol_controller.can_start()
         can_start = (
             self._stationary_attack_selected()
             or self._dead_flower_selected()
-            or self.patrol_controller.can_start()
+            or route_can_start
         )
         selected = self.patrol_controller.selected_layer()
         snapshot = self.patrol_controller.snapshot()

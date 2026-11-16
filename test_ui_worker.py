@@ -1844,7 +1844,10 @@ class UiLogHandlerTests(unittest.TestCase):
 
         self.assertFalse(worker._start_patrol())
         self.assertFalse(worker.patrol_controller.enabled)
-        self.assertIn("输入未武装", worker._control_status.text)
+        # One operator-facing sentence for every window failure: the cause lives
+        # in the log (START PATROL refused: input was not armed ...), not in the
+        # narrow status line.
+        self.assertEqual(worker._control_status.text, "无法开始: 检测不到游戏窗口")
         self.assertEqual(refreshes, [])
 
     def test_start_patrol_enables_patrol_when_input_is_armed(self):

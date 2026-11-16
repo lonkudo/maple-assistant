@@ -58,11 +58,12 @@ PROBE_INTERVAL_SECONDS = 0.5
 # Three consequences are handled here:
 #   * a start attempt whose vendor process has already exited is reported as a
 #     failure at once (not after the full 90 s budget), quoting the vendor's own
-#     reason from data\logs\client.log;
+#     reason from data\logs\client.log in the LOG;
 #   * a launch that is still BOOTING is never counted as a failed attempt;
-#   * after the budget the panel says 启动失败 WITH that reason and the supervisor
-#     keeps watching at a slow cadence, so a deployment that recovers is picked up
-#     without toggling the radio.
+#   * after the budget the panel says 本地测谎：启动失败 (no reason: the reason is a
+#     developer sentence and stays in the log) and the supervisor keeps watching
+#     at a slow cadence, so a deployment that recovers is picked up without
+#     toggling the radio.
 VENDOR_GONE_GRACE_SECONDS = 6.0
 MAX_AUTO_START_ATTEMPTS = 8
 # Retry gap after a start attempt that FAILED (the vendor aborted or its process
@@ -1058,11 +1059,12 @@ def _supervisor_job(root, interval: float) -> None:
         service that was about to listen),
       * a real failure retries every ``START_RETRY_FAST_SECONDS`` while the
         attempt budget lasts,
-      * when the budget is spent the panel flips to 启动失败 WITH the vendor's own
-        reason, and the supervisor keeps watching and retrying every
-        ``SLOW_RETRY_SECONDS`` - it never quits, so a deployment that recovers is
-        adopted and the panel turns 启动成功 without a radio toggle (the previous
-        version returned from this thread and required reselecting 本地测谎),
+      * when the budget is spent the panel flips to 本地测谎：启动失败 (the vendor's
+        reason stays in the log), and the supervisor keeps watching and retrying
+        every ``SLOW_RETRY_SECONDS`` - it never quits, so a deployment that
+        recovers is adopted and the panel turns 启动成功 without a radio toggle
+        (the previous version returned from this thread and required reselecting
+        本地测谎),
       * a service that answers resets the budget and clears the rejection latch.
     """
 
@@ -2570,14 +2572,16 @@ def hint_state() -> str:
 def hint_text() -> str:
     """One short sentence for the 图层校准与巡逻 hint line, or "".
 
-    The operator's set is exactly these four service sentences:
+    The operator's set is exactly these service sentences, and none of them
+    carries a reason, a retry cadence or any other developer note — this build
+    ships to clients:
+      * 本地测谎：启动失败    - the service refused, died, or gave up
       * 本地测谎: 等待授权信息 - selected, waiting for a validated licence
         reply to deliver the CT card
       * 本地测谎服务：正在校验，还未启动 - the card/key are being verified; no
         launch has been attempted yet
       * 本地测谎服务：正在启动，还未成功 - a launch is in flight (the operator's
         wording: it must not read like a state that already works)
-      * 本地测谎: 启动失败     - the service refused, died, or gave up
       * 本地测谎: 启动成功     - /v1/health answers
     Plus 本地测谎未开通 when this activation code carries no CT card at all (that is
     an access fact, not a service state: the radio is labelled 本地测谎（未开通）),
@@ -2597,11 +2601,13 @@ def hint_text() -> str:
         return "本地测谎服务：正在启动，还未成功"
     if state == "waiting":
         return "本地测谎: 等待授权信息"
-    # The failure sentence carries the vendor's own short reason ("坐标云启动握手
-    # 失败"), because a bare 启动失败 tells the operator nothing about whether the
-    # card, the network or the deployment is at fault.
-    reason = failure_reason()
-    return f"本地测谎: 启动失败（{reason}）" if reason else "本地测谎: 启动失败"
+    # ONE word for the client: 启动失败.  The vendor's own reason ("坐标云启动握手失败")
+    # is a developer sentence a player can neither act on nor understand, so it
+    # stays in assistant.log (`_log_vendor_reason` / `note_failure` write it on
+    # every failure) and never reaches the panel hint.  No cadence/retry note
+    # either: the supervisor keeps retrying every SLOW_RETRY_SECONDS without
+    # asking, which is not something the operator has to read.
+    return "本地测谎：启动失败"
 
 def reset_for_tests() -> None:
     global _launch_process, _start_attempts, _selected_at, _heartbeat_wait_logged

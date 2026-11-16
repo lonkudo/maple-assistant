@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Persistent MoonEclipse restart and ZIP-update helper.
 
@@ -153,11 +153,27 @@ function Copy-Package([string]$source, [string]$destination) {
                 $_.Name -ieq "user_config.json" -or
                 $_.Name -ieq "auth.json" -or
                 $_.Name -ieq "cim_identity.dat")) { return }
-        $target = Join-Path $destination $relative
         if ($_.PSIsContainer) {
+            $target = Join-Path $destination $relative
             New-Item -ItemType Directory -Path $target -Force | Out-Null
             return
         }
+        # This very script is running from the destination.  Replacing it while
+        # PowerShell still holds it fails the whole copy, and a failed copy is
+        # what restarts a half-applied install.  Stage it and swap it in at the
+        # very end, after the new instance is up.
+        if ($relative -ieq "todohelper_update.ps1") {
+            $pending = Join-Path $destination "todohelper_update.ps1.new"
+            try {
+                Copy-Item -LiteralPath $_.FullName -Destination $pending -Force -ErrorAction Stop
+                $script:pendingSupervisorUpdate = $pending
+                Write-UpdateLog "deferred the supervisor script update to the end of this run"
+            } catch {
+                Write-UpdateLog ("WARNING: the supervisor script could not be staged: " + $_.Exception.Message)
+            }
+            return
+        }
+        $target = Join-Path $destination $relative
         New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
         for ($attempt = 1; ; $attempt++) {
             try {
@@ -175,6 +191,82 @@ function Copy-Package([string]$source, [string]$destination) {
             }
         }
     }
+}
+
+function Backup-ReplacedFiles([string]$source, [string]$destination, [string]$backupRoot) {
+    # Snapshot every file the package is about to overwrite, so a copy that dies
+    # half way (a locked .pyd, a dropped drive, a full disk) can be rolled back to
+    # the exact previous installation instead of restarting a mixed tree - the
+    # "the instance started after the update flashes closed" report.
+    $copied = 0
+    Get-ChildItem -LiteralPath $source -Recurse -Force -File | ForEach-Object {
+        $relative = $_.FullName.Substring($source.Length).TrimStart('\')
+        if (-not $relative -or $relative -match '^(\.git|\.venv|work|node_modules)(\\|$)') { return }
+        if ($_.Name -ieq "user_config.json" -or $_.Name -ieq "auth.json" -or
+                $_.Name -ieq "cim_identity.dat") { return }
+        $existing = Join-Path $destination $relative
+        if (-not (Test-Path -LiteralPath $existing -PathType Leaf)) { return }
+        $target = Join-Path $backupRoot $relative
+        New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+        try {
+            Copy-Item -LiteralPath $existing -Destination $target -Force -ErrorAction Stop
+            $copied++
+        } catch {
+            throw ("could not back up " + $relative + " before installing: " + $_.Exception.Message)
+        }
+    }
+    Write-UpdateLog ("backup: " + $copied + " file(s) -> " + $backupRoot)
+    return $copied
+}
+
+function Restore-Backup([string]$backupRoot, [string]$destination) {
+    # Put the snapshot back.  Best effort per file: a file that cannot be
+    # restored is reported, and the rest of the install still becomes whole.
+    if (-not (Test-Path -LiteralPath $backupRoot -PathType Container)) {
+        Write-UpdateLog "restore: no backup to restore"
+        return 0
+    }
+    $restored = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $backupRoot -Recurse -Force -File)) {
+        $relative = $file.FullName.Substring($backupRoot.Length).TrimStart('\')
+        $target = Join-Path $destination $relative
+        New-Item -ItemType Directory -Path (Split-Path $target) -Force | Out-Null
+        $ok = $false
+        for ($attempt = 1; $attempt -le 20 -and -not $ok; $attempt++) {
+            try {
+                Copy-Item -LiteralPath $file.FullName -Destination $target -Force -ErrorAction Stop
+                $ok = $true
+                $restored++
+            } catch {
+                Start-Sleep -Milliseconds 300
+            }
+        }
+        if (-not $ok) {
+            Write-UpdateLog ("restore: could not put back " + $relative)
+        }
+    }
+    Write-UpdateLog ("restore: " + $restored + " file(s) restored from " + $backupRoot)
+    return $restored
+}
+
+function Complete-DeferredSupervisorUpdate() {
+    # Swap the staged supervisor script in now that nothing needs it.  A failure
+    # here is harmless: the previous script also performs this hand-over, so the
+    # next update simply stages it again.
+    $pending = $script:pendingSupervisorUpdate
+    if (-not $pending) { return }
+    if (-not (Test-Path -LiteralPath $pending -PathType Leaf)) { return }
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        try {
+            Move-Item -LiteralPath $pending -Destination $PSCommandPath -Force -ErrorAction Stop
+            Write-UpdateLog "supervisor script updated to the packaged version"
+            return
+        } catch {
+            Start-Sleep -Milliseconds 300
+        }
+    }
+    Write-UpdateLog ("WARNING: the packaged supervisor script stays as " + $pending +
+        " (the running one is still mapped); it is applied by the next update")
 }
 
 function Install-ImportedConfig([string]$sourcePath, [string]$destinationRoot) {
@@ -216,6 +308,25 @@ function Install-ImportedConfig([string]$sourcePath, [string]$destinationRoot) {
     } finally {
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
     }
+}
+
+# ONE supervisor at a time, and this is the first thing it decides: the block
+# below kills assistant instances, so a second supervisor that ran concurrently
+# with the first would terminate the instance the first one had just started -
+# the "instance started after the update flashes closed" report.
+$supervisorLock = $null
+$supervisorLockOwned = $false
+try {
+    $supervisorLock = New-Object System.Threading.Mutex($false, "Local\TodoHelper.UpdateSupervisor.v1")
+    $supervisorLockOwned = $supervisorLock.WaitOne(3000)
+} catch {
+    Write-UpdateLog ("supervisor lock unavailable: " + $_.Exception.Message)
+}
+if (-not $supervisorLockOwned) {
+    Write-UpdateLog ("another update supervisor already holds the lock; this one exits without touching " +
+        "anything (mode=" + $Mode + " pid=" + $TargetPid + ")")
+    Write-UpdateLog "supervisor finished: nothing done (single supervisor)"
+    exit 2
 }
 
 try {
@@ -282,6 +393,7 @@ if ($Mode -eq "Update") {
     $step = "start"
     $versionBefore = Read-InstalledVersion $root
     Write-UpdateLog ("install: installed version before = '" + $versionBefore + "'")
+    $backupRoot = Join-Path $root ("work\update-backup\" + (Get-Date -Format "yyyyMMdd_HHmmss"))
     try {
         $step = "resolve package"
         $PackagePath = Resolve-PackagePath $PackagePath $root
@@ -293,6 +405,11 @@ if ($Mode -eq "Update") {
             $source = Find-PackageRoot $stage $PackageFormat
             $packageVersion = Read-InstalledVersion $source
             Write-UpdateLog ("install: package root=" + $source + " package version='" + $packageVersion + "'")
+            # Snapshot first: a copy that dies half way must be reversible,
+            # otherwise the restart launches a mixed tree and the new instance
+            # dies at import (native fault, no log line).
+            $step = "back up " + $root + " -> " + $backupRoot
+            [void](Backup-ReplacedFiles $source $root $backupRoot)
             $step = "copy " + $source + " -> " + $root
             Copy-Package $source $root
             $versionAfter = Read-InstalledVersion $root
@@ -316,7 +433,19 @@ if ($Mode -eq "Update") {
         }
     } catch {
         $installFailure = ("[" + $step + "] " + $_.Exception.Message)
-        Write-UpdateLog "INSTALL FAILED (current installation kept, restarting anyway): $installFailure"
+        Write-UpdateLog "INSTALL FAILED: $installFailure"
+        # Roll the snapshot back before restarting.  Restarting a half-applied
+        # tree is what makes the fresh instance flash closed with no trace: a
+        # new .py against an old .pyd dies natively, writing nothing.
+        try {
+            [void](Restore-Backup $backupRoot $root)
+            $versionRestored = Read-InstalledVersion $root
+            Write-UpdateLog ("install: rolled back to '" + $versionRestored +
+                "'; the previous installation runs again")
+        } catch {
+            Write-UpdateLog ("RESTORE FAILED: " + $_.Exception.Message +
+                " - the installation is inconsistent; reinstalling the package by hand is required")
+        }
     }
 }
 if ($ConfigSource) {
@@ -462,6 +591,7 @@ if ($startedPid -eq 0) {
     $retryPid = Start-Assistant $root
     if (Test-AssistantAlive $root $retryPid 10) {
         Write-UpdateLog "restart confirmed after retry: pid=$retryPid"
+        $startedPid = $retryPid
     } else {
         Write-UpdateLog ("WARNING: no MoonEclipse process after the retry (UAC declined, or the new install cannot start); " +
             "start it by hand with 启动助手.bat")
@@ -471,8 +601,23 @@ if ($startedPid -eq 0) {
 } else {
     Write-UpdateLog "restart confirmed: pid=$startedPid"
 }
+# The supervisor's own script is only swapped in now: while this run needed it,
+# the file was open.  Done before the failure message so a successful update
+# never leaves a *.ps1.new behind.
+Complete-DeferredSupervisorUpdate
 if ($installFailure) {
-    Show-OperatorMessage ("The update was NOT installed; the previous version is running again." + [Environment]::NewLine +
-        $installFailure + [Environment]::NewLine +
-        "Details: update-helper.log in the install folder.")
+    Write-UpdateLog ("update summary: NOT installed (" + $installFailure +
+        "); previous installation restored and restarted (pid=" + $startedPid + ")")
+} else {
+    Write-UpdateLog ("update summary: installed; running pid=" + $startedPid)
 }
+# One closing record plus an explicit exit: the supervisor must not linger in the
+# task list (an idle PowerShell holding the install folder open is what blocked
+# the next update).
+Write-UpdateLog ("supervisor finished: mode=" + $Mode + " installFailure=" +
+    $(if ($installFailure) { "yes" } else { "no" }) + " startedPid=" + $startedPid)
+if ($supervisorLockOwned -and $supervisorLock) {
+    try { $supervisorLock.ReleaseMutex() } catch { }
+    try { $supervisorLock.Dispose() } catch { }
+}
+exit 0

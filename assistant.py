@@ -23,7 +23,7 @@ from minimap_detector import hud_scale_for
 from runtime_paths import application_root
 from auto_lie_secret import CredentialRedactionFilter, get_server_secret
 from async_log_writer import AsyncBatchLogWriter
-from crash_reporter import record_exception
+from crash_reporter import install_fatal_handler, record_exception
 from versioning import version_label
 import run_mode
 
@@ -457,6 +457,10 @@ def _clear_previous_log_files() -> None:
                         "update-helper.log",
                         "assistant-launch-status.log",
                         "assistant-launch-error.log",
+                        # startup_probe writes the same traceback here, and the
+                        # docstring above promises it is kept: a successful
+                        # launch used to delete it before anyone read it.
+                        "error.log",
                     }:
                         continue
                     try:
@@ -520,6 +524,15 @@ def main() -> int:
         return 0
     args = parse_args()
     _clear_previous_log_files()
+    # Armed right after the cleanup (which deliberately keeps crash_report.log)
+    # and before any worker starts: a native death in a compiled extension or in
+    # Tcl writes nothing to a Python log, and that silence is what made the
+    # "instance started after the update flashed closed" report undiagnosable.
+    if not install_fatal_handler():
+        logging.getLogger(__name__).warning(
+            "the fatal-signal handler could not be armed; a native crash will "
+            "leave no trace in work/crash_report.log"
+        )
     # 本地测谎: bring the local service up with the app when this build ships it
     # and it is not already listening.  Backgrounded - licence validation and the
     # WS handshake take seconds and must never delay the UI.  Shutdown stops it

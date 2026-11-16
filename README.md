@@ -49,6 +49,53 @@ If a required library is missing, the normal package repairs itself: the hidden 
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, clears any other assistant instance that still holds the packaged files or the single-instance mutex, installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app through `MoonEclipse.exe`, then `launch_assistant.vbs`, then `启动助手.bat`, retrying once and logging the PID it started. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
+### Current release behavior (v1.3.36 – v1.3.48)
+
+- **The 测谎 alarm sounds on the FIRST matching scan — never on a run of
+  frames.** v1.3.4x briefly delayed 声音/闪烁/消息 until two consecutive scans
+  matched, to stop a 钉钉 `测谎警报` that arrived with no lie on screen on
+  2026-11-15. That removed the alarm instead of the false alarm: the grey
+  `#c9ced0` block is a *transitional paint*. Replaying the diagnostic recordings
+  (`screenshots/lie_*`, which start on the first sighting — the detector sees the
+  game at 5 FPS) gives 142 frames with **exactly one** match: the next frame
+  already shows the popup at ≈`#f3f4f7`, 46 grey levels above the target, so a
+  second consecutive match never exists. Pushed through the real
+  `LieDetectorWorker`, the two-scan version produced 0 alarms and 0 flashes for a
+  real lie window; the shipped rule produces one. The alarm fires on the first
+  sighting, at most once per window, and the first scan that no longer matches
+  re-arms it, so the next lie window alerts again. Every scan is still forwarded
+  to the recorder and the auto-pass, which keep their own confirmation. If a
+  false 警报 ever needs filtering, gate on the 测谎 window or its contents — never
+  on the number of consecutive grey-square frames.
+- **Every start refusal caused by the game window reads one sentence:**
+  `无法开始: 检测不到游戏窗口`. It replaces the paragraph that used to be pasted
+  into the status line (`无法开始: 游戏窗口选择失败: 无法自动选择当前游戏窗口：expected
+  exactly one visible game window containing …`) and the separate
+  `无法开始: 输入未武装（游戏窗口未就绪或焦点丢失），请重试。`. The status line is
+  narrow and the operator needs one recognisable sentence; the cause — no window,
+  several windows, a title-scan timeout, a refused foreground, a failed window
+  enumeration, or input that could not be armed — still goes to `assistant.log`
+  as `START PATROL refused: …`. The hint line itself wraps at 440 px and the left
+  column is 460 px wide, so such a sentence stays on one 17 px line instead of
+  splitting over two.
+- **Hover hints name the action, not the mechanism.** 导入配置 and 导出配置 both
+  read `导入/导出 地图和其他配置`; 导入地图 lost its `；导入后停止巡逻` tail and now
+  reads `只导入地图录制（地图/图层/绳索/跳点），不改其它设置`; the 药品 panel's
+  饲料 checkbox explains `宠物食品` and 补药 explains `增加攻击药等`.
+- **The 药品 panel is dense, and every number sits next to its label.** The panel
+  frame is padded 4×3, the checkbox and key columns are sized to their text with
+  no extra padding, rows sit 1 px apart, and `NumericValueRangeControl` gained an
+  `align` option: the single-cell fields (HP/MP 阈值, the 饲料/补药/增益 intervals and
+  小碎步后摇) use `align="w"`, which took the measured label→number gap from
+  6–7 px down to 1 px. A model of those widgets measures the panel at 500×120 px
+  before the work and 438×111 px after it, with no value clipped; the cells keep
+  their width, so `600s`, `12.5m` and `55.5s` still display completely. A min~max
+  pair stays centred, because left-hugging one cell of a pair moves the blank into
+  the middle of the expression.
+- **小碎步 counts in half seconds above a 2 s floor.** The cadence steps 0.5 s from
+  2.0 s to 60.0 s, so `2.0s` … `60.0s` are all reachable and readable, and one
+  click still moves 50 steps at a time.
+
 ### Current release behavior (v1.3.26 – v1.3.35)
 
 - **The installer activates a fresh PC like the desktop does.** `auth.json` is
@@ -139,23 +186,25 @@ The update icon in the title bar turns green when the activation server announce
   failure in a popup that closes by itself.  A second instance held
   `Local\TodoHelper.Singleton.v1`, so the fresh copy exited silently — that is
   what "restart always failed" looked like.
-- **本地测谎 starts on this session's card and reports the vendor's own reason
-  when it cannot.** Selecting 本地测谎 waits up to 30 s for a validated licence
-  reply to deliver the CT card (`等待授权信息` while it waits) instead of starting
-  on a card an earlier session left behind.  The vendor is launched through its
-  own wrapper (a launcher exit is not a failure), a vendor process that dies is
-  reported at once with its `data\logs\client.log` reason, and a launch that is
-  still booting never counts as a failed attempt.  Eight failed attempts retry
-  every 3 s; after that the panel reads `本地测谎: 启动失败（<vendor reason>）` and
+- **本地测谎 starts on this session's card and says only whether it works.**
+  Selecting 本地测谎 waits up to 30 s for a validated licence reply to deliver the
+  CT card (`等待授权信息` while it waits) instead of starting on a card an earlier
+  session left behind.  The vendor is launched through its own wrapper (a launcher
+  exit is not a failure), a vendor process that dies is reported at once, and a
+  launch that is still booting never counts as a failed attempt.  Eight failed
+  attempts retry every 3 s; after that the panel reads **`本地测谎：启动失败`** and
   the supervisor keeps watching at a 60 s cadence, so a deployment that recovers
-  is adopted without toggling the radio.  The vendor's startup gate probes a
-  candidate list compiled into its binary (the retired `221.10.121.69:44444`
-  included), so a start still depends on `117.50.223.113:8888` answering — the
-  packaged `roi_track_servers` trim only keeps the declared deployment consistent.
+  is adopted without toggling the radio.  The vendor's own reason (`coordinates
+  cloud handshake failed` and the like) is a developer sentence and stays in
+  `assistant.log`; this build ships to clients, so the panel never appends it.
+  The vendor's startup gate probes a candidate list compiled into its binary
+  (the retired `221.10.121.69:44444` included), so a start still depends on
+  `117.50.223.113:8888` answering — the packaged `roi_track_servers` trim only
+  keeps the declared deployment consistent.
 - **A 本地测谎 test run needs a listening service.** `测试API` refuses with
   `本地测谎启动中，请稍后再试` while the panel says 正在启动，还未成功, and with
-  `本地测谎服务未就绪（<reason>），请稍后重试` while it says 等待授权信息 or 启动失败,
-  instead of opening a video against a backend that cannot answer.
+  `本地测谎服务未就绪，请启动后重试` while it says 等待授权信息 or 启动失败, instead
+  of opening a video against a backend that cannot answer.
 - **The panel hint line carries one 本地测谎 sentence, replaced rather than
   appended.** The base text a label carries is remembered and the older
   wordings are stripped as a whole, so a one-shot 钉钉 note can no longer grow
@@ -1257,7 +1306,7 @@ A reading that is merely *between* two bands but within the nearest-floor allowa
 
 **巡逻攻击** performs the configured attack key at its selected fixed interval. **小碎步** is an optional timed motion with its own interval.
 
-**小碎步** is an atomic left/right correction. Its first and return directions are each held for 100 ms, with one attack between them. The configurable **后摇** is the post-attack quiet period before the return direction: it is a single `0.20–5.00 s` direct-value field in 0.05 s steps and defaults to 0.70 s. The configured `每 … s` cadence starts only after the complete pair finishes, including 后摇 and the return release; it never starts when the pair is merely queued, so the motion’s own duration cannot make consecutive 小碎步 appear too frequent.
+**小碎步** is an atomic left/right correction. Its first and return directions are each held for 100 ms, with one attack between them. The configurable **后摇** is the post-attack quiet period before the return direction: it is a single `0.20–5.00 s` direct-value field in 0.05 s steps and defaults to 0.70 s. The cadence field works in **half seconds above a 2 s floor** (`2.0 s` to `60.0 s` in 0.5 s steps, one click moving 50 steps at a time), so every reachable value — `2.0s` … `60.0s` — is also fully readable in its cell. The configured `每 … s` cadence starts only after the complete pair finishes, including 后摇 and the return release; it never starts when the pair is merely queued, so the motion’s own duration cannot make consecutive 小碎步 appear too frequent.
 
 **站桩攻击** captures the character’s current location each time patrol starts. It is independent of recorded map layers and uses that temporary position only for its own local recovery. **跳打**, **小碎步**, and **朝向** are available in this mode. 朝向 can be left, right, or 双向; 双向 flips the required facing every 80 settled minimap frames through a short atomic facing tap. Patrol start itself does not issue a facing tap.
 
@@ -1269,6 +1318,18 @@ enabled, one flower point means attach to the rope, buff there, then leave the r
 circuit before returning. Two or more flower points mean climb between their distinct Y positions
 and refresh Buff1 at each timer boundary. Normal attack controls and 小碎步 are unavailable in
 this mode.
+
+**等死花** is the same control row when **巡逻攻击** is selected, but it is a separate
+ordinary-patrol schedule rather than 死花模式. The character continues its normal walk-and-attack
+route until the final **10 seconds** of the inclusive displayed interval. It then targets the
+recorded 花 point's X, proves that it attached to the rope, moves to that point's Y, and attacks
+there until the deadline. At the deadline it arms the following interval immediately, leaves the
+rope with the established departure jump, and hands the descent back to the normal patrol loop.
+The deadline is therefore not reset by a buff, a flower event, or a successful landing. A 花 point
+is a private rope waypoint, not a floor: after attachment is proven, one marker Y sample within
+`±0.010` of its recorded Y releases Up and starts the hold; it never waits for normal two-frame
+layer confirmation. A layer containing only a 花 point is legal for the 等死花 startup check and
+does not need 最左/最右 or to be recognised as a patrol layer.
 
 **随机休息** is the only option here that touches both workers. It is available in 巡逻攻击,
 站桩攻击 and 双桩模式 (greyed out elsewhere) and takes a break every `75m~120m`, lasting
@@ -1599,6 +1660,15 @@ automatic lie handling. When automatic lie handling is enabled:
    click. The detector then ignores the old square until it disappears, which
    prevents duplicate billing while allowing the next real lie window to start.
 
+The alarm contract is deliberately one frame wide. `LieDetectorWorker` raises the
+声音, the 闪烁 and the 消息 on the first scan that matches the grey `#c9ced0`
+block, at most once per lie window, and the first scan that no longer matches
+re-arms it. Scans that keep matching only keep feeding the diagnostic recorder and
+the auto-pass workflow, which confirm on their own. Do not add a "N consecutive
+scans" confirmation: the block is a transitional paint that matches on one frame
+of a real window (measured: 1 of 142 frames in `screenshots/lie_20261111_123022`),
+so such a gate silences real alarms instead of false ones.
+
 The purple detection area and one-shot target indication are visual feedback only. They are not used as tracking input and do not block target chasing.
 
 `autolie_api/` is vendor reference material. Do not edit files inside that directory.
@@ -1782,6 +1852,7 @@ number alone.
 
 | Release version | Git tag | Status |
 | --- | --- | --- |
+| `1.3.36` – `1.3.48` | — | The one-frame 测谎 alarm (restored after the two-scan confirmation silenced it), the 本地测谎 credential authority (`data/ct_login_config.json` is written before the vendor starts and scrubbed after every outcome, memory always wins over the file), `非正常运行` as the only 卡地图 report, the `异常` 下机, the 1.3.40 "walks to the right edge at start" fix, the compact 药品/定时巡逻/小碎步 rows with left-hugged numeric cells, and the single `无法开始: 检测不到游戏窗口` start hint. `1.3.47` is commit `806947f` and `1.3.48` is commit `c2f3b31`; the documentation below was written after that build and describes the same code. **Untagged: the intermediate builds were superseded and pruned.** |
 | `1.3.27` – `1.3.35` | — | 站桩 recovery in the marker's own rows and columns, 范围桩, 延时回桩 `1.0–2.0 s`, the world-Y floor guard, the retired five-minute rescue sweep, the multi-instance relaunch helper, the installer readiness wait, and the 本地测谎 start policy. **Untagged: the source is the commit that carries this document; the intermediate builds `1.3.27` – `1.3.34` were superseded and pruned.** |
 | `1.3.26` | — | Installer activation parity, 被撞反击 in 巡逻攻击, a healed 本地测谎 hint, and symmetric 0.02 layer bands. **Committed, untagged.** |
 | `1.3.24` | — | The 自动测谎 radio group and its armed flag are one selection: a disarmed row always shows 关闭, a 测谎-off disarm can no longer leave 云端测谎 selected, and 关闭 no longer rewrites the saved backend. **No tag exists for this version, so the exact source of the built package is not recoverable.** |
@@ -1950,10 +2021,11 @@ a card.
 * The app starts the service at launch when the folder ships and `8765` is not already
   listening (`local_lie_service.start_in_background`), and stops it at shutdown **only
   if the app started it** — a hand-launched instance survives.
-* The state is shown on the `图层校准与巡逻` hint line as exactly one sentence:
-  `本地测谎: 等待授权信息` (selected, but no validated reply of this session has
-  delivered the CT card yet), `本地测谎服务：正在启动，还未成功`, `本地测谎: 启动失败`,
-  or `本地测谎: 启动成功` (127.0.0.1:8765 answers).
+* The state is shown on the `图层校准与巡逻` hint line as exactly one sentence, with
+  no reason, retry cadence or other developer note appended (those go to
+  `assistant.log`): `本地测谎: 等待授权信息` (selected, but no validated reply of
+  this session has delivered the CT card yet), `本地测谎服务：正在启动，还未成功`,
+  `本地测谎：启动失败`, or `本地测谎: 启动成功` (127.0.0.1:8765 answers).
 * Selecting 本地测谎 waits up to 30 s for this session's validated heartbeat reply to
   deliver the CT card before it starts anything; a card sitting in the service config
   is used only when no reply arrives inside that window (an offline install), and the
@@ -2005,7 +2077,7 @@ The panel hint carries exactly one of these sentences:
 | --- | --- |
 | `本地测谎: 等待授权信息` | 本地测谎 is selected, but no validated reply of this session has delivered a `CT_` card yet; nothing is started on a card an earlier session left behind |
 | `本地测谎服务：正在启动，还未成功` | a launch is in flight (up to 90 s on the first start after an update) |
-| `本地测谎: 启动失败` | the vendor process refused, exited, or all 8 attempts failed — the panel quotes the vendor's own `data\logs\client.log` reason |
+| `本地测谎：启动失败` | the vendor process refused, exited, or all 8 attempts failed — the panel says exactly this, and the vendor's own `data\logs\client.log` reason is quoted in `assistant.log` only |
 | `本地测谎: 启动成功` | the service answers `/v1/health` on 8765 |
 | `本地测谎未开通` | the licence reply carried **no** `CT_` card, so the 本地测谎 radio is greyed, not clickable (label `本地测谎（未开通）`) and the service is deliberately not started |
 | *(nothing)* | the selection is 关闭 / 云端测谎 |

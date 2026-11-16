@@ -697,6 +697,15 @@ full interval. The storage field names are historical and unchanged, which is wh
 an old `user_config.json` keep every key, interval and enable; `补药` additionally opens
 the 死花模式 flower gate through the same worker.
 
+The 药品 panel is laid out for density, not for a form: two four-row columns, a
+checkbox column sized to its text (`Drug.TCheckbutton`, `width=5`, no internal
+padding), a key column also sized to its text (`DrugKey.TButton`, `width=9`), rows
+1 px apart and frame padding `(4, 3)`.  A model of the same widgets measures
+500×120 px before that work and 438×111 px after it, with the widest label
+(`增益1`, 31 px) still inside its 35 px of cell.  饲料 and 补药 carry the item hints
+`宠物食品` and `增加攻击药等`; the numeric cells are documented under *UI,
+configuration, and optional tools*.
+
 **The attack-animation window is `attack_grace_seconds` (v1.3.16).** `MotionArbiter`
 refuses to emit any motion key inside that window after the last attack tap; it was a
 hard-coded 0.73 s and is now 1.2 s (configurable per map profile). The client discards a
@@ -754,6 +763,23 @@ it uses the established rope attachment and jump routes; a single flower point r
 point and a multi-point circuit moves vertically between distinct flower Ys. The reset-ground
 routine starts only after attachment is confirmed, so a failed rope jump cannot start its timer or
 simulate a completed flower circuit.
+
+**等死花** is deliberately separate from that private 死花/重置花 program. It is enabled only
+when 巡逻攻击 is the active attack mode and reuses the same persisted interval row, while its
+own `MovementWorker` schedule leaves the ordinary patrol and `AttackWorker` alive. The timer is
+wall-clock based: on each deadline it immediately samples and arms the next interval; no Buff
+delivery, flower event, rope departure, or landing is allowed to reset it. Ten seconds before a
+deadline, `_wait_dead_flower_route()` selects a recorded flower point and `_route_target_impl()`
+temporarily returns that point's X as the next rope target. A flower point is **not** added to
+`_route_layers` and never becomes a layer-band supporter: it may be in mid-air on a rope. After
+the normal climb state has independently proven rope attachment, the first marker-Y sample within
+`DEAD_FLOWER_Y_TOLERANCE` (`±0.010`) of the flower Y switches to the private wait state and
+releases Up immediately. It intentionally bypasses the ordinary two-stable-frame floor resolver;
+that resolver would keep Up held and climb through the flower. At the deadline, the private state
+uses the established rope departure jump and then returns vertical descent/next-loop ownership to
+the normal route state machine. Patrol startup validation accepts a flower-only layer only for
+this enabled 巡逻攻击 option; it remains excluded from normal route construction, so other modes
+retain their ordinary 最左/最右 requirements and layer-resolution semantics.
 
 In stationary attack mode, the temporary anchor is captured only on a manual patrol start. Its X/Y recovery band is local to that anchor and never depends on a recorded layer (the window, facing shift, 范围桩 option and hand-over rules are in the stand-still attack section above). A requested stationary facing is queued only after a real recovery or a later setting change: startup deliberately records the current position without injecting a directional tap. 双向 changes the desired facing after 80 settled observations; the arbiter performs one short facing tap rather than a walking movement.
 
@@ -879,6 +905,10 @@ have their actual, different rectangle sizes.
 
 The live frame stream uses the shared capture cadence. The temporary detection rectangle and one-shot target marker are display-only overlays and must never become tracking input.
 
+`lie_detector_worker.LieDetectorWorker` owns the *event* side of that stream, and its alarm is one frame wide by design. `_update_alert()` raises 声音 (`dingdong.mp3` through `run_sound_async`, never inline), 闪烁 (`screen_blinker`) and 消息 (`_message_alert`) on the **first** scan whose `detect_lie_square()` returns a box, at most once per window (`_alerted_for_current_event`), and the first scan that returns `None` re-arms it — which is what lets the next lie window alert again. Every scan of a window that stays up is still forwarded to the raw listeners (`add_lie_seen_callback`: the diagnostic recorder and the auto-lie candidate forwarder), so only the operator-facing alarm is rate-limited, not the diagnosis.
+
+That width is not tunable. The grey `#c9ced0` block is a transitional paint: in the diagnostic recordings, which begin on the first sighting, 142 frames contain exactly one match, because the next frame already shows the popup at ≈`#f3f4f7`. A "two consecutive matching scans" confirmation therefore fires never, not rarely — replaying those frames through the worker gave 0 alarms and 0 flashes. Beware the tempting inverse too: `set_enabled()` clears `_alerted_for_current_event` whenever the panel re-applies settings, so any confirmation state would have to be re-derived from the frames themselves instead of carried across a settings refresh. Filtering a false alarm belongs on the 测谎 window's geometry and contents, never on a run of grey frames.
+
 A server answer is fed to the real cursor as a physical desktop point. `api_lie_test.py` converts the answer with `point.to_screen()`, the same conversion its overlay draws with, and pushes it through `MouseAimController.push_screen_target(..., immediate=True)`. Sending it as client pixels would re-map an already-correct screen coordinate through the video's client rectangle, which is wrong under DPI virtualization because the captured bitmap and Windows' logical client size differ; `immediate=True` also bypasses the interactive viewer's dead band and speed limit, both of which are hover affordances rather than part of an automated pass.
 
 When the pass ends, `ui_worker.py` focuses the game and uses `click_screen()` to press the lie dialog's measured confirmation point. The point is `(630, 428)` on a 1080×768 client; all other clients derive from `(800, 472)` in the 1366×768 reference layout by width scaling. This post-pass acknowledgement is separate from WebSocket completion and must complete (or safely refuse when focus is unavailable) before patrol is resumed.
@@ -891,17 +921,54 @@ When the pass ends, `ui_worker.py` focuses the game and uses `click_screen()` to
 alert selections use it to explain their visible effects, and the automatic-lie
 selection additionally explains its mouse ownership, Esc interruption, and
 accounting behavior. Tooltips have a shared maximum width and wrap only at that
-limit.
+limit. Hint wording names the operator's action or item rather than the
+mechanism, because the same sentence is also what a field report quotes back:
+导入配置 and 导出配置 share `导入/导出 地图和其他配置`, 导入地图 says only
+`只导入地图录制（地图/图层/绳索/跳点），不改其它设置`, and the 药品 panel's 饲料 and
+补药 checkboxes read `宠物食品` and `增加攻击药等`.
 
-Telegram setup is also UI-owned but delivery is isolated in
-`telegram_notifier.py`. A normal left click on **设备名称** opens a set/clear
-dialog; setting a bot token updates the button to **已设置**. The notifier uses
-the Windows system HTTP proxy first, then probes common local HTTP proxy ports,
-then attempts a direct connection. Its selected proxy is cached, invalidated,
-and detected again after a transport failure, so proxy configuration never
-blocks the UI or gameplay workers. The title-bar teaching viewer independently
-loads one JPG at a time from packaged `teach-assets/`; `build_release.ps1`
-copies that folder unchanged for both package formats.
+The status line carries one sentence per refusal. `_start_patrol()` used to
+concatenate the underlying `OSError` into it (`无法开始: 游戏窗口选择失败: <paragraph>`)
+and to use a second sentence for a start that was vetoed before arming; both now
+read `无法开始: 检测不到游戏窗口`, while the cause is logged as
+`START PATROL refused: …` for the diagnosis. The rule for new UI text is the
+same: the status line stays short and recognisable, and the reason goes to the
+log. The line wraps at `_STATUS_HINT_WRAPLENGTH` (440 px): on the vista theme with
+TkDefaultFont the longest operator sentence needs 440 px for one line and took two
+at the old 330 px, which is why `_LEFT_COLUMN_WIDTH` is 460 — the panel's own
+2×8 px padding leaves exactly 444 px for it. A wrap length above the column's
+inner width does not wrap, it clips.
+
+`NumericValueRangeControl` is the shared direct-value field (wheel, click, arrow
+keys) in the right-hand panels. It keeps a fixed pixel width so a row never
+reflows while a value changes, and it takes an `align` option: `value_width`
+characters of cell with a centred label left blank space on both sides of a short
+value, which read as padding between the row label and its number. The
+single-cell fields (HP/MP 阈值, the 饲料/补药/增益 intervals, 小碎步后摇) pass
+`align="w"` (measured 6–7 px → 1 px of gap); a min~max pair stays centred,
+because hugging one cell of a pair moves the blank into the middle of the
+expression. The cell width is unchanged either way, so `600s`, `12.5m` and `55.5s`
+still fit.
+
+**Telegram is retired; 钉钉 is the alert channel.** The `消息` checkbox in the 提醒
+row is the master switch for it, the `钉钉消息` button stores the group robot's
+webhook, and `dingtalk_notifier.py` delivers the push on its own short-lived
+thread (`send_in_background`) so a slow or unreachable robot can never stall the
+UI or a gameplay worker. Every message starts with the `MoonEclipse` keyword
+(DingTalk rejects a robot message without it, `errcode 310000`) followed by the
+device name, the event and the time, which is what lets a group message be traced
+to the machine that sent it. A normal left click on **设备名称** opens a set/clear
+dialog for that name (the button then reads **名称已设置**). Each attempt is
+appended to `dingtalk_sent.log` in the install root — `assistant.log` is wiped at
+every start, so that file is the only durable evidence for a report like "the
+group got a 掉线警报 at 09:52 while no such machine was running".
+`telegram_notifier.py` still exists and `UiWorker` still accepts a
+`telegram_notifier`, but nothing constructs a live notifier: the old
+proxy-detection path is not reachable from the panel.
+
+The title-bar teaching viewer independently loads one JPG at a time from packaged
+`teach-assets/`; `build_release.ps1` copies that folder unchanged for both package
+formats.
 
 A diagnostic region is converted from captured-pixel coordinates to screen coordinates by `_capture_pixel_to_screen()`: scaling through the logical client rectangle is correct only while the captured bitmap matches it, and when the bitmap is DPI-virtualized (a different width/height) its pixels are already screen pixels relative to the capture origin. That conversion is display-only. The logical window rectangle that game input and the auto-lie cursor workflow use is never derived from it — changing the shared rectangle to fix an overlay was what made earlier builds unstable.
 

@@ -81,4 +81,54 @@ def record_current_exception(context: str) -> None:
     record_exception(context, exc_type, exc_value, exc_traceback)
 
 
-__all__ = ["crash_report_path", "record_current_exception", "record_exception"]
+# faulthandler needs the stream to outlive the call, so the handle is kept here
+# for the whole process.  A local would be collected and the dump would go to a
+# closed file - or nowhere - exactly when it is needed.
+_FATAL_STREAM = None
+
+
+def install_fatal_handler(path: Path | None = None) -> bool:
+    """Dump a traceback on a native fault, not only on a Python exception.
+
+    ``sys.excepthook`` / ``threading.excepthook`` cover exceptions.  They cannot
+    see an access violation inside a compiled extension, a Tcl abort, or a fatal
+    interpreter error - the cases where the window disappears and NOTHING is
+    written ("the instance started after the update flashes closed").  Windows
+    reports such a death to WER, not to the install folder, so without this the
+    only record is the absence of the next line in ``assistant.log``.
+
+    The dump is appended to ``work/crash_report.log`` beside the exception
+    reports (same file, same "read it after the fact" role).  Returns whether
+    the handler was installed; a failure is never fatal.
+    """
+
+    global _FATAL_STREAM
+    if _FATAL_STREAM is not None:
+        return True
+    try:
+        import faulthandler
+
+        report = Path(path) if path is not None else crash_report_path()
+        report.parent.mkdir(parents=True, exist_ok=True)
+        # Line buffered and append-only: a crash must never erase the report of
+        # the previous one, and the last line has to reach the disk as it is
+        # written instead of sitting in a buffer the dead process cannot flush.
+        stream = report.open("a", encoding="utf-8", errors="backslashreplace",
+                             buffering=1)
+        stream.write(
+            "\n" + "=" * 76
+            + f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} | fatal-signal handler armed"
+            + f" | pid={os.getpid()}\n"
+        )
+        stream.flush()
+        faulthandler.enable(file=stream, all_threads=True)
+        _FATAL_STREAM = stream
+        return True
+    except Exception:
+        return False
+
+
+__all__ = [
+    "crash_report_path", "install_fatal_handler", "record_current_exception",
+    "record_exception",
+]
