@@ -141,6 +141,87 @@ class _AnyEvent:
         return any(event.is_set() for event in self._events)
 
 
+def _note_duplicate_instance() -> None:
+    """Record a refused duplicate start; the app exits silently by design.
+
+    The single-instance guard deliberately returns 0 with no dialog and no log
+    header (the log is opened later), so a start that raced the previous process -
+    the normal shape of an update restart - left NO evidence anywhere: the
+    operator only saw a process appear and vanish.  One appended line in
+    ``work/single-instance.log`` names the time, the pid and the reason, and the
+    previous instance's pid when it can be read, so the next "it flashed closed"
+    report is answerable.
+    """
+
+    try:
+        root = application_root(__file__)
+        work = root / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"[{stamp}] duplicate start refused: the single-instance mutex is "
+            f"already owned (pid={os.getpid()})"
+        ]
+        others = _assistant_instance_pids()
+        if others:
+            lines.append("    owning instance pid(s): " + ", ".join(map(str, others)))
+        with (work / "single-instance.log").open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except Exception:  # noqa: BLE001 - a refusal must never fail loudly
+        pass
+
+
+def _assistant_instance_pids() -> list[int]:
+    """Pids of other assistant processes, for the duplicate-instance note."""
+
+    pids: list[int] = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+        kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot:
+            return pids
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                while True:
+                    image = str(entry.szExeFile).casefold()
+                    if image.startswith(("mooneclipse", "todohelper", "mapleassistant")):
+                        pid = int(entry.th32ProcessID)
+                        if pid != os.getpid():
+                            pids.append(pid)
+                    if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return pids
+    return pids
+
+
 def _acquire_single_instance_mutex(
     mutex_name: str = SINGLE_INSTANCE_MUTEX_NAME,
 ) -> int | None:
@@ -536,17 +617,24 @@ def main() -> int:
     # the whole Tk dashboard) and a hidden launch shows nothing while it runs.
     # Put the 启动中。。。 hint up first; the UI removes it the moment the window is
     # mapped (``ui_worker._close_startup_hint``).
+    # The 启动中。。。 hint goes up only AFTER the singleton guard (see below): a
+    # duplicate instance that is about to exit must never flash a hint, which is
+    # exactly what an update restart looked like ("the restarted instance flashed
+    # closed") - the hint appeared, then the process returned 0 because the old
+    # copy still owned the mutex.
+    singleton_handle = _acquire_single_instance_mutex()
+    if singleton_handle is None:
+        # The launcher replaces an existing copy before starting a fresh one.
+        # A short process-exit race can still reach this guard; exit silently
+        # instead of showing a misleading "close the old instance" prompt - but
+        # leave ONE durable line, otherwise a flash-close has no evidence at all.
+        _note_duplicate_instance()
+        return 0
     if startup_splash is not None:
         try:
             startup_splash.show()
         except Exception:  # noqa: BLE001 - the hint is cosmetic
             pass
-    singleton_handle = _acquire_single_instance_mutex()
-    if singleton_handle is None:
-        # The launcher replaces an existing copy before starting a fresh one.
-        # A short process-exit race can still reach this guard; exit silently
-        # instead of showing a misleading "close the old instance" prompt.
-        return 0
     args = parse_args()
     _clear_previous_log_files()
     # Armed right after the cleanup (which deliberately keeps crash_report.log)

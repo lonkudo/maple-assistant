@@ -562,19 +562,38 @@ function Test-AssistantAlive([string]$installRoot, [int]$startedPid, [int]$secon
     # "no MoonEclipse process" while pid 19496 had just started a helper).  Judge
     # by the process this helper created, and accept ANY assistant process that
     # started after the helper did.
+    #
+    # v1.3.54: "alive at some point" is not alive.  The 21:47 update logged
+    # "restart confirmed: pid=5344" and the operator watched that instance close
+    # a moment later, because the check returned true on the first poll and never
+    # looked again.  So: follow ONE pid (the launched one, or the newest assistant
+    # process created by this launch when the launcher chain returns a pid that
+    # exits immediately), and only report success when that pid is STILL alive
+    # when the window ends.
+    $launchTime = [DateTime]::Now.AddSeconds(-3)
     $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+    $tracked = $startedPid
     do {
-        if ($startedPid -gt 0) {
-            $process = Get-Process -Id $startedPid -ErrorAction SilentlyContinue
-            if ($process) { return $true }
+        if ($tracked -gt 0) {
+            if (-not (Get-Process -Id $tracked -ErrorAction SilentlyContinue)) {
+                Write-UpdateLog ("restart: pid=" + $tracked + " exited; looking for the instance it started")
+                $tracked = 0
+            }
         }
-        foreach ($name in @("MoonEclipse", "TodoHelper", "MapleAssistant")) {
-            $alive = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
-            if ($alive.Count -gt 0) { return $true }
+        if ($tracked -eq 0) {
+            foreach ($name in @("MoonEclipse", "TodoHelper", "MapleAssistant")) {
+                $candidate = $null
+                try {
+                    $candidate = Get-Process -Name $name -ErrorAction SilentlyContinue |
+                        Where-Object { $_.StartTime -ge $launchTime } |
+                        Sort-Object StartTime -Descending | Select-Object -First 1
+                } catch { $candidate = $null }
+                if ($candidate) { $tracked = $candidate.Id; break }
+            }
         }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
-    return $false
+    return ($tracked -gt 0 -and (Get-Process -Id $tracked -ErrorAction SilentlyContinue))
 }
 
 $startedPid = Start-Assistant $root
