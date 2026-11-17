@@ -31,7 +31,7 @@ from marker_detector import (
     detect_red_diamonds,
     detect_yellow_diamond,
 )
-from motion_arbiter import BUFF_TAP_HOLD_SECONDS, buff_double_tap
+from motion_arbiter import BUFF_TAP_HOLD_SECONDS, buff_triple_tap
 from patrol_control import CoordinateLayout, _layer_present_actions
 
 from combat_coordination import AttackStateFile, PatrolStateFile, RopeStateFile
@@ -3323,7 +3323,19 @@ class MovementWorker(threading.Thread):
     ) -> str:
         """Advance the persistent climb state machine one frame."""
 
-        arrival_y, arrival_tolerance = self._next_layer_arrival_band()
+        waiting_for_flower = bool(
+            self._wait_dead_flower_preparing
+            and self._wait_dead_flower_target is not None
+            and self._wait_dead_flower_target_layer is not None
+        )
+        # A waiting-flower approach is intentionally not a layer arrival.
+        # It uses the recorded flower Y only to stop the private rope leg;
+        # normal route-layer confirmation remains unchanged everywhere else.
+        if waiting_for_flower:
+            arrival_y = self._wait_dead_flower_target.y
+            arrival_tolerance = DEAD_FLOWER_Y_TOLERANCE
+        else:
+            arrival_y, arrival_tolerance = self._next_layer_arrival_band()
         # 层到达确认已经开始（worker 的图层逻辑正在计数）时，到顶的停滞
         # 检测必须抑制：即使 arrival_y 缺失/未命中，也保持 Up 直到确认完成。
         arrival_in_progress = bool(
@@ -3400,7 +3412,39 @@ class MovementWorker(threading.Thread):
             arrival_in_progress=arrival_in_progress,
             )
         LOG.info("climb recovery state: %s", result)
-        if result == "succeeded" and self._route_layers:
+        flower_reached = bool(
+            waiting_for_flower
+            and observation.player is not None
+            # This is the same private arrival rule as 重置花: attachment was
+            # proven first by the climb state, then ONE flower-Y sample inside
+            # the recorded tolerance is enough.  A flower is on a rope, not
+            # a platform, so waiting for two stable layer frames keeps Up held
+            # and carries the character straight past it.
+            and self._climb_state.phase == "climbing-up"
+            and abs(observation.player.y - self._wait_dead_flower_target.y)
+            <= DEAD_FLOWER_Y_TOLERANCE
+        )
+        if (result == "succeeded" or flower_reached) and waiting_for_flower:
+            self._release_climb_up()
+            self._climb_state = ClimbState()
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.clear()
+            self._wait_dead_flower_preparing = False
+            self._wait_dead_flower_active = True
+            # The normal climb verifier, not a coincident marker Y, supplied
+            # the attachment proof.  Reuse the private flower hold only after
+            # that proof, so the 10-second deadline never fires a rope jump
+            # from a floor beside the rope.
+            with self._dead_flower_state_lock:
+                self._dead_flower_rope_attached = True
+                self._dead_flower_entry_checked = True
+                self._dead_flower_started_from_layer1 = False
+            self._dead_flower_phase = "flower"
+            LOG.info(
+                "WAIT DEAD FLOWER: flower reached after verified rope attachment; "
+                "released Up without layer-settle confirmation"
+            )
+        elif result == "succeeded" and self._route_layers:
             self._climb_arrival_at = time.monotonic()
             self._climb_cycle_reset()
             # A real grab ended the under-rope lateral-recovery streak.
@@ -5525,6 +5569,22 @@ class MovementWorker(threading.Thread):
         self._dead_flower_drop_attempts = 0
         self._dead_flower_drop_retry_at = 0.0
         self._dead_flower_ground_jump_tokens: set[int] = set()
+        # 等死花 is deliberately NOT 死花/重置花.  It borrows the recorded
+        # flower waypoint only for the final approach of an ordinary patrol:
+        # the normal route and fixed attack worker remain live until the
+        # private rope departure at the wall-clock deadline.
+        self.wait_dead_flower_enabled = False
+        self.wait_dead_flower_interval_seconds = 900.0
+        self.wait_dead_flower_jitter_seconds = 0.0
+        self._wait_dead_flower_next_at = float("inf")
+        self._wait_dead_flower_depart_at = float("inf")
+        self._wait_dead_flower_preparing = False
+        self._wait_dead_flower_active = False
+        self._wait_dead_flower_target_layer: Optional[str] = None
+        self._wait_dead_flower_target: Optional[Point] = None
+        self._wait_dead_flower_leave_started_at: Optional[float] = None
+        self._wait_dead_flower_leave_attempts = 0
+        self._wait_dead_flower_leave_retry_at = 0.0
         # UI-only association of the temporary standing point with an
         # existing recorded layer.  It remains visible even when the route
         # configuration is not sufficient to arm a return.
@@ -5953,6 +6013,21 @@ class MovementWorker(threading.Thread):
         # suppressed so an intermediate platform cannot hijack the descent
         # and restart patrol on a middle layer.
         self._descending_to_first = False
+        # Whether the frame that ARMED the descent already had the marker
+        # inside the first layer's band - i.e. there is nothing left to drop
+        # THROUGH.  A 等死花 rope departure hands the descent over while the
+        # marker is still falling onto layer1, and the old "not before one
+        # Alt+Down chord" rule then spent a Down+Alt on a character that was
+        # already landing on its target floor (12:32 field log: one capture
+        # after "Alt+Left rope departure"; Alt is the game's jump key, so the
+        # chord reads as a wrong jump).  With the flag set,
+        # ``_final_drop_arrived`` accepts a SETTLED marker instead of demanding
+        # a chord it has no use for.
+        self._descent_entry_on_first_layer = False
+        # Set when a descent chord was withheld because the marker was still
+        # falling, so the reason is logged once per episode instead of per
+        # capture (see the ``drop`` branch of the frame loop).
+        self._drop_settle_wait_logged = False
         # The floor the descent last saw the marker on while it kept the route (the log evidence, once
         # per floor instead of every frame).
         self._drop_descent_saw: Optional[str] = None
@@ -7201,6 +7276,28 @@ class MovementWorker(threading.Thread):
             if float(player.y) - float(last_y) >= self._fall_marker_y_gain:
                 return True
         return False
+
+    def _descent_drop_needs_settled_marker(self) -> bool:
+        """True for the DESCENT drops that must wait for a settled marker.
+
+        Alt+Down is Down plus the game's jump key, so on a marker that is still
+        falling it is not a descent input at all - it is an extra jump on a
+        character that is already on its way down, and the platform it was
+        meant to fall through is already behind it.  The unresolved-floor
+        recovery has always required settled frames before its first chord
+        ("matched no recorded floor for %d settled frames"); the planned
+        descent (``drop-to-first``, the return drop, and the split/timed
+        circuits that use the same phase) must obey the same rule.  The 12:32
+        field log is why: the 等死花 rope departure armed the descent on a
+        marker that had just fallen 0.065 in one capture, and the chord went
+        out on a character that was landing on layer1.
+        """
+
+        return bool(
+            self._descending_to_first
+            or self._return_mode == "drop-to-route"
+            or self._route_phase == "drop"
+        )
 
     def _perform_jump_up(self) -> bool:
         """Send the jump-up chord: the game's jump key, Alt.
@@ -10864,6 +10961,216 @@ class MovementWorker(threading.Thread):
             if debug_mode else "",
         )
 
+    def set_wait_dead_flower_schedule(
+        self, enabled: bool, interval_seconds: float, jitter_seconds: float,
+    ) -> None:
+        """Configure 等死花 for ordinary 巡逻攻击.
+
+        The countdown is wall-clock based.  Its next deadline is re-armed
+        immediately when the deadline is consumed, never by a flower/buff
+        event or by a successful rope departure.
+        """
+
+        self.wait_dead_flower_enabled = bool(enabled)
+        self.wait_dead_flower_interval_seconds = min(
+            STATIONARY_PICKUP_MAX_INTERVAL_SECONDS,
+            max(STATIONARY_PICKUP_MIN_INTERVAL_SECONDS, float(interval_seconds)),
+        )
+        self.wait_dead_flower_jitter_seconds = max(0.0, float(jitter_seconds))
+        # This setter is also called while switching *into* 死花模式.  Only
+        # release a vertical key that this schedule itself owns; never steal
+        # the private 重置花 rope hold merely because the UI disabled 等死花.
+        if self._wait_dead_flower_active or self._wait_dead_flower_preparing:
+            self._dead_flower_release_vertical()
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.clear()
+        self._reset_wait_dead_flower_state()
+        if self.wait_dead_flower_enabled:
+            self._wait_dead_flower_next_at = (
+                time.monotonic() + self._wait_dead_flower_delay()
+            )
+        # Refresh the normal route after a mode switch, but never add flower
+        # points as resolver layers: 等死花 owns them privately.
+        self._sync_patrol_controller()
+        LOG.info(
+            "WAIT DEAD FLOWER %s interval=%.1fm random_gap=%.1fs",
+            "enabled" if self.wait_dead_flower_enabled else "disabled",
+            self.wait_dead_flower_interval_seconds / 60.0,
+            self.wait_dead_flower_jitter_seconds,
+        )
+
+    def _wait_dead_flower_delay(self) -> float:
+        return self.wait_dead_flower_interval_seconds + random.uniform(
+            0.0, self.wait_dead_flower_jitter_seconds,
+        )
+
+    def _reset_wait_dead_flower_state(self) -> None:
+        """Forget one 等死花 approach without touching normal patrol state."""
+
+        self._wait_dead_flower_depart_at = float("inf")
+        self._wait_dead_flower_preparing = False
+        self._wait_dead_flower_active = False
+        self._wait_dead_flower_target_layer = None
+        self._wait_dead_flower_target = None
+        self._wait_dead_flower_leave_started_at = None
+        self._wait_dead_flower_leave_attempts = 0
+        self._wait_dead_flower_leave_retry_at = 0.0
+
+    def _wait_dead_flower_route(self) -> Optional[tuple[str, dict[str, Any], Point]]:
+        """Return one ordinary-route flower waypoint, without 死花's restrictions."""
+
+        # Flower points are private rope waypoints.  They can be recorded on
+        # a layer with no ordinary patrol actions, so do not look only at the
+        # resolver route here.
+        for layer_name in sorted(self.important_positions, key=_layer_number):
+            layer = self.important_positions.get(layer_name)
+            if not isinstance(layer, dict):
+                continue
+            points = layer.get("flower_points")
+            if not isinstance(points, list):
+                continue
+            try:
+                flower = next(
+                    Point(float(item["x"]), float(item["y"]))
+                    for item in points if isinstance(item, dict)
+                )
+            except (StopIteration, KeyError, TypeError, ValueError):
+                continue
+            return layer_name, layer, flower
+        return None
+
+    def _arm_wait_dead_flower_round(self, now: float) -> None:
+        """Make the next normal route target the flower waypoint ten seconds early."""
+
+        route = self._wait_dead_flower_route()
+        if route is None:
+            # Do not repeatedly interrupt normal patrol for an incomplete
+            # recording.  The clock still advances routinely as promised.
+            self._wait_dead_flower_next_at = now + self._wait_dead_flower_delay()
+            LOG.warning("WAIT DEAD FLOWER skipped: record a flower point on a patrol layer")
+            return
+        layer_name, _layer, flower = route
+        self._wait_dead_flower_preparing = True
+        self._wait_dead_flower_target_layer = layer_name
+        self._wait_dead_flower_target = flower
+        self._wait_dead_flower_depart_at = self._wait_dead_flower_next_at
+        LOG.info(
+            "WAIT DEAD FLOWER: 10s remaining; next route target is %s flower x=%.6f y=%.6f",
+            layer_name, flower.x, flower.y,
+        )
+
+    def _service_wait_dead_flower_schedule(
+        self, observation: MinimapObservation, now: float,
+    ) -> bool:
+        """Advance the ordinary-patrol 等死花 wall clock.
+
+        ``True`` means the private flower/rope leg owns this capture.  A due
+        timer always schedules the following round here, rather than waiting
+        for an input, flower event, or successful departure.
+        """
+
+        if not self.wait_dead_flower_enabled or self.dead_flower_mode:
+            return False
+        if self._wait_dead_flower_active:
+            self._wait_dead_flower_step(observation, now)
+            return True
+        if now >= self._wait_dead_flower_next_at:
+            # The 10-second approach may have missed its rope.  A deadline is
+            # still a clean patrol-round boundary; never send a blind jump.
+            if self._wait_dead_flower_preparing:
+                LOG.warning("WAIT DEAD FLOWER: deadline reached before rope attachment; cancelling only the flower approach")
+                self._reset_wait_dead_flower_state()
+                self._wait_dead_flower_next_at = now + self._wait_dead_flower_delay()
+                return False
+            self._wait_dead_flower_next_at = now + self._wait_dead_flower_delay()
+        if (not self._wait_dead_flower_preparing
+                and now >= self._wait_dead_flower_next_at - 10.0):
+            self._arm_wait_dead_flower_round(now)
+        return False
+
+    def _wait_dead_flower_step(
+        self, observation: MinimapObservation, now: float) -> None:
+        """Hold at a reached flower, then jump off it at the fixed deadline."""
+
+        player = observation.player
+        target = self._wait_dead_flower_target
+        if player is None or target is None:
+            self._finish_wait_dead_flower_round(observation, "marker/target lost")
+            return
+        if now < self._wait_dead_flower_depart_at:
+            y_gap = target.y - player.y
+            if abs(y_gap) > DEAD_FLOWER_Y_TOLERANCE:
+                direction = "down" if y_gap > 0.0 else "up"
+                if self.climbing_active_event is not None:
+                    self.climbing_active_event.set()
+                if self._dead_flower_vertical_key != direction:
+                    self._dead_flower_release_vertical()
+                    key_down = getattr(self.key_sender, "key_down", None)
+                    if callable(key_down) and key_down(direction) is not False:
+                        self._dead_flower_vertical_key = direction
+                self._release_walk_hold()
+                self.last_decision = MovementDecision(
+                    None, f"wait dead flower: moving {direction} to flower point",
+                )
+                return
+            self._dead_flower_release_vertical()
+            self._release_walk_hold()
+            if self.climbing_active_event is not None:
+                self.climbing_active_event.clear()
+            self.last_decision = MovementDecision(None, "wait dead flower: attacking at flower point")
+            return
+        if self._dead_flower_phase != "wait-dead-flower-leave":
+            self._dead_flower_phase = "wait-dead-flower-leave"
+            self._wait_dead_flower_leave_started_at = float(player.y)
+            self._wait_dead_flower_leave_attempts = 0
+            self._wait_dead_flower_leave_retry_at = 0.0
+            # The next interval is deliberately armed *at the deadline*, not
+            # on landing or on any event from another worker.
+            self._wait_dead_flower_next_at = now + self._wait_dead_flower_delay()
+            LOG.info("WAIT DEAD FLOWER: deadline reached; leaving rope for next patrol round")
+        self._dead_flower_release_vertical()
+        self._release_walk_hold()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.set()
+        start_y = self._wait_dead_flower_leave_started_at
+        if start_y is not None and player.y >= start_y + DEAD_FLOWER_DROP_PROGRESS_Y:
+            self._finish_wait_dead_flower_round(observation, "rope departure confirmed")
+            return
+        if now >= self._wait_dead_flower_leave_retry_at:
+            if self._wait_dead_flower_leave_attempts >= DEAD_FLOWER_DROP_MAX_ATTEMPTS:
+                self._finish_wait_dead_flower_round(observation, "rope departure retry limit")
+                return
+            # Same proven rope departure as 重置花.  It is emitted only after
+            # the flower point has been positively reached, never while the
+            # normal route is merely approaching its rope.
+            if self.perform_stair_jump("left"):
+                self._wait_dead_flower_leave_attempts += 1
+                self._wait_dead_flower_leave_retry_at = now + self.drop_retry_seconds
+                LOG.info("WAIT DEAD FLOWER: Alt+Left rope departure %d/%d",
+                         self._wait_dead_flower_leave_attempts, DEAD_FLOWER_DROP_MAX_ATTEMPTS)
+        self.last_decision = MovementDecision("drop", "wait dead flower: leaving rope")
+
+    def _finish_wait_dead_flower_round(
+        self, observation: MinimapObservation, reason: str) -> None:
+        self._dead_flower_release_vertical()
+        target_layer = self._wait_dead_flower_target_layer
+        self._reset_wait_dead_flower_state()
+        if self.climbing_active_event is not None:
+            self.climbing_active_event.clear()
+        # Do not pretend the first post-jump marker has landed.  Hand the
+        # descent back to the normal drop-to-first state, which already owns
+        # stable landing confirmation and then starts a fresh patrol loop.
+        if self._route_layers:
+            if target_layer in self._route_layers:
+                self._route_layer_index = self._route_layers.index(target_layer)
+            elif self._route_layer_index is None:
+                self._route_layer_index = len(self._route_layers) - 1
+            self._route_phase = "drop"
+            self._reset_route_completion()
+            LOG.info("WAIT DEAD FLOWER: %s; normal drop starts the next patrol round", reason)
+        else:
+            LOG.warning("WAIT DEAD FLOWER: %s; flower layer vanished, leaving normal route unchanged", reason)
+
     def _dead_flower_ground_delay(self) -> float:
         return self.dead_flower_ground_interval_seconds + random.uniform(
             0.0, self.dead_flower_ground_jitter_seconds,
@@ -13789,6 +14096,14 @@ class MovementWorker(threading.Thread):
             if event is not None:
                 event.clear()
 
+        # A manual/reconnect Start Patrol is a new 等死花 clock as well.  The
+        # countdown must never inherit a deadline from the preceding run.
+        self._reset_wait_dead_flower_state()
+        self._wait_dead_flower_next_at = (
+            time.monotonic() + self._wait_dead_flower_delay()
+            if self.wait_dead_flower_enabled else float("inf")
+        )
+
         if above_route:
             # ``floor`` is the top route layer only as a stable world-Y
             # reference.  The live marker was above it, so never let that
@@ -14333,15 +14648,18 @@ class MovementWorker(threading.Thread):
 
         The operator's rule: "when we meet with unresolved floor we shall
         alt+down to change layer", with the reconnect respawn's own shape - two
-        Alt+Down chords, then walk toward the nearer outer side (X > 0.5 left,
-        X < 0.5 right) to find a drop edge, then the opposite side.  With no
-        floor there is no route, no anchor band and no landing test, so every
-        other recovery is inert and the worker would just walk a floor that
-        belongs to no layer (his 17:46 log: ``action=right`` while every frame
-        was refused as "0.1284 away from layer2").
+        Alt+Down chords, then the nearer outer side held as a Direction+Down chord
+        (X > 0.5 left, X < 0.5 right) to find a drop edge, then the opposite side.
+        The side passes are ``drop_edge_<side>_down``, exactly the reconnect
+        recovery's input, so a character that a plain walk cannot move (hanging on
+        a rope) is freed by the Down half of the chord.  With no floor there is no
+        route, no anchor band and no landing test, so every other recovery is
+        inert and the worker would just walk a floor that belongs to no layer
+        (his 17:46 log: ``action=right`` while every frame was refused as
+        "0.1284 away from layer2").
 
-        Returns a decision that either holds still, drops, or holds a direction,
-        or ``None`` when the recovery does not apply this frame.
+        Returns a decision that either holds still, drops, or holds
+        Direction+Down, or ``None`` when the recovery does not apply this frame.
         """
 
         player = observation.player
@@ -14420,19 +14738,20 @@ class MovementWorker(threading.Thread):
                     self._unresolved_edge_started_at
                     + UNRESOLVED_EDGE_HOLD_SECONDS - now
                 )
-                # A PLAIN walk decision, not the ``drop_edge_*`` chord.  The
-                # chord holds Direction+Down for its whole phase through
-                # ``_start_reconnect_drop_edge_hold``, which nothing in the
-                # ordinary walk arbitration can shorten - in 1.3.40 that dragged
-                # the character all the way to the right edge of the map the
-                # moment patrol or 站桩 started, because this recovery runs on the
-                # first unresolved frames.  1.3.34 walked here and the walk was
-                # re-decided every frame; the chord stays reserved for the
-                # route/reconnect drop-to-route descent it was written for.
+                # The Direction+Down chord, reusing the reconnect/respawn edge
+                # recovery: the frame loop hands a ``drop_edge_*`` decision to
+                # ``_start_reconnect_drop_edge_hold`` with ``source="unresolved"``
+                # (one SendInput packet, 5 s phase, rope-attach watch, attacks
+                # deferred).  A plain direction walk cannot move a character that
+                # is hanging on a rope, and that is exactly the state this
+                # recovery runs in - 14:54 field log: the marker stood at
+                # (0.260000, 0.230392) with X frozen through both plain-walk
+                # passes ("ROPE approach walk frozen far from rope") while
+                # Alt+Down only slid it one row at a time.
                 return MovementDecision(
-                    phase,
-                    f"unresolved floor; walking {phase} to find a layer-changing "
-                    "drop edge",
+                    f"drop_edge_{phase}_down",
+                    f"unresolved floor: holding {phase}+Down to find a "
+                    "layer-changing drop edge",
                     max(0.05, remaining),
                 )
             next_phase = "left" if phase == "right" else "right"
@@ -14442,16 +14761,16 @@ class MovementWorker(threading.Thread):
                 self._unresolved_edge_started_at = now
                 self._unresolved_edge_start_y = y
                 LOG.warning(
-                    "UNRESOLVED FLOOR: %s edge found no descent; walking %s for "
-                    "%.1fs",
+                    "UNRESOLVED FLOOR: %s+Down edge found no descent; holding "
+                    "%s+Down for %.1fs",
                     phase, next_phase, UNRESOLVED_EDGE_HOLD_SECONDS,
                 )
-                # Plain walk again (see the note above): a Direction+Down chord
-                # here walked the character to the map edge in 1.3.40.
+                # Same Direction+Down chord as the pass above (see the note
+                # there): a plain walk cannot free a character held by a rope.
                 return MovementDecision(
-                    next_phase,
-                    f"unresolved floor: {phase} edge did not descend; seeking "
-                    f"the {next_phase} edge",
+                    f"drop_edge_{next_phase}_down",
+                    f"unresolved floor: {phase}+Down edge did not descend; "
+                    f"seeking the {next_phase}+Down edge",
                     UNRESOLVED_EDGE_HOLD_SECONDS,
                 )
             self._unresolved_edge_cycles += 1
@@ -14637,12 +14956,14 @@ class MovementWorker(threading.Thread):
     def _begin_unresolved_edge_walk(
         self, observation: MinimapObservation, y: float, now: float,
     ) -> Optional[MovementDecision]:
-        """After two stalled chords, walk to the nearer outer side first.
+        """After two stalled chords, hold the nearer outer side + Down first.
 
         Same rule as the reconnect respawn recovery: a marker right of centre
-        (X > 0.5) walks LEFT and one left of centre walks RIGHT, i.e. toward the
+        (X > 0.5) goes LEFT and one left of centre goes RIGHT, i.e. toward the
         side its own platform edge is nearest to; the opposite side is tried
-        afterwards when this one produces no descent.
+        afterwards when this one produces no descent.  The side is pressed as
+        the Direction+Down chord (``drop_edge_<side>_down``), never as a plain
+        walk - see the note at the return below.
         """
 
         player = observation.player
@@ -14654,19 +14975,32 @@ class MovementWorker(threading.Thread):
         self._unresolved_drop_stalls = 0
         LOG.warning(
             "UNRESOLVED FLOOR: %d Alt+Down attempts made no downward progress; "
-            "marker X=%.6f; walking %s first for %.1fs",
+            "marker X=%.6f; holding %s+Down first for %.1fs",
             UNRESOLVED_DROP_STALLED_ATTEMPTS,
             float(player.x),
             first_phase,
             UNRESOLVED_EDGE_HOLD_SECONDS,
         )
-        # Plain walk, never the ``drop_edge_*`` chord: the chord's un-interruptible
-        # Direction+Down phase is what ran the character to the right edge of the
-        # map at Start Patrol / 站桩 start in 1.3.40 (1.3.34 walked here and was
-        # fine).  The chord stays for the route/reconnect drop-to-route descent.
+        # The operator's sequence is Alt+Down, then len+Down / right+Down - the
+        # Direction+Down chord, not a plain walk.  The chord is the reconnect/
+        # respawn edge recovery that already exists: ``drop_edge_*`` decisions are
+        # taken by the frame loop's ``is_reconnect_drop_edge`` branch and started
+        # through ``_start_reconnect_drop_edge_hold(..., source="unresolved")``,
+        # which emits one SendInput chord, keeps it for this phase, arms the
+        # rope-attach watch with the expected side and defers attacks.
+        #
+        # It replaces the plain walk that lived here because of 1.3.40 ("the chord
+        # dragged the character to the right edge of the map at Start Patrol").
+        # That risk is smaller now: this recovery only runs after the Left/Right
+        # stall probe and two stalled Alt+Down chords, and the phase is bounded by
+        # UNRESOLVED_EDGE_HOLD_SECONDS.  What forced the change is the 14:54 log:
+        # the character hung on a rope at (0.260000, 0.230392) and every plain
+        # walk did nothing, while the chord's Down half slides a rope - which is
+        # the only input that can free it.
         return MovementDecision(
-            first_phase,
-            f"unresolved floor: Alt+Down stalled; seeking the {first_phase} edge",
+            f"drop_edge_{first_phase}_down",
+            f"unresolved floor: Alt+Down stalled; holding {first_phase}+Down to "
+            "find a drop edge",
             UNRESOLVED_EDGE_HOLD_SECONDS,
         )
 
@@ -16340,6 +16674,16 @@ class MovementWorker(threading.Thread):
                 # de-duplicated warning above names what is missing.
                 return None, False, "return-climb-no-rope"
             return rope_x, True, "return.climb"
+        # A 花 point is a private rope waypoint, not a resolver floor.  This
+        # must happen before the empty-route branch as a legal 等死花 profile
+        # may contain nothing except that flower point.
+        if (self._wait_dead_flower_preparing
+                and self._wait_dead_flower_target is not None):
+            return (
+                self._wait_dead_flower_target.x,
+                True,
+                "wait-dead-flower",
+            )
         if not self._route_layers:
             # Nothing recorded on any layer: stand still (Fixed Attack / YOLO
             # keep attacking) instead of the old fall-back-to-rope walk.  An
@@ -16528,6 +16872,7 @@ class MovementWorker(threading.Thread):
             previous_name = self._route_layers[self._route_layer_index]
         # The route is every action-bearing layer (any subset of Left/Rope/
         # Right), in recorded bottom-up order plus any newly recorded layers.
+        # Flower points remain private rope waypoints, never route layers.
         routable = {
             name for name, layer in source_layers.items()
             if _layer_present_actions(layer)
@@ -16945,7 +17290,11 @@ class MovementWorker(threading.Thread):
             elif callable(key_up):
                 key_up(previous)
         LOG.info(
-            "endpoint turn armed: released %s at recorded edge; "%
+            # One statement: the misplaced ``%`` used to bind to the first
+            # literal alone, so the format string ended up with two placeholders
+            # and three arguments and every endpoint turn logged
+            # "<unformattable log record ...>" instead of this line.
+            "endpoint turn armed: released %s at recorded edge; "
             "neutral %.0fms then %s",
             previous,
             DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS * 1000.0,
@@ -17400,10 +17749,30 @@ class MovementWorker(threading.Thread):
         return False
 
     def _final_drop_arrived(self, observation: MinimapObservation) -> bool:
-        """Require at least one real drop chord before accepting arrival."""
+        """Whether the planned descent may end here.
+
+        The descent normally has to spend at least one real Alt+Down chord
+        before its arrival may be accepted: a marker that merely *aliases*
+        inside the first layer's band is not proof, and ending the descent
+        before its chord left the route on the lower floor forever.
+
+        The exception is a descent that began with the marker ALREADY on the
+        first layer (``_descent_entry_on_first_layer``): there the character has
+        nothing under its feet to drop through, and the mandatory chord became a
+        jump press.  The 12:32 field log is that case - the 等死花 round left the
+        rope with Alt+Left and the very next capture pressed Down+Alt on a marker
+        standing at layer1's own row (0.711382), which the next capture then
+        accepted unchanged once the chord had been spent.  Such an entry is
+        accepted on a SETTLED marker instead (``_update_marker_settle``: the
+        same two-stable-captures rule every other floor decision uses).
+        """
 
         if self._last_drop_attempt == float("-inf"):
-            return False
+            return bool(
+                getattr(self, "_descent_entry_on_first_layer", False)
+                and self._marker_settled_now()
+                and self._on_first_layer(observation)
+            )
         return self._on_first_layer(observation)
 
     def _reset_route_loop(self, observation: MinimapObservation) -> None:
@@ -17435,6 +17804,7 @@ class MovementWorker(threading.Thread):
         self._descending_to_first = False
         self._descending_since = None
         self._drop_descent_saw = None
+        self._descent_entry_on_first_layer = False
         # The new loop owns the vertical movement again: no fall, no return, no half-finished resync may
         # cross this boundary (see ``_reset_fall_tracking``).
         self._reset_fall_tracking()
@@ -18030,7 +18400,7 @@ class MovementWorker(threading.Thread):
 
         This is called only by MotionArbiter.  It releases the ordinary
         Left/Right(+Z) walk under the same directional lock used by climb,
-        drops and small-step, double-taps the buff, then leaves the next patrol
+        drops and small-step, triple-taps the buff, then leaves the next patrol
         frame free to re-arm its previous direction.  It never runs during
         vertical movement or a climb/transition.
         """
@@ -18048,10 +18418,10 @@ class MovementWorker(threading.Thread):
             if self.moving_active_event is not None:
                 self.moving_active_event.clear()
             try:
-                # The walk stays released across BOTH presses: a patrol frame
-                # landing between the two taps would put a direction key in the
+                # The walk stays released across all three presses: a patrol frame
+                # landing between taps would put a direction key in the
                 # middle of the buff tap sequence.
-                sent = buff_double_tap(
+                sent = buff_triple_tap(
                     self.key_sender, key, hold_seconds=hold_seconds,
                 )
             except Exception:
@@ -19627,6 +19997,15 @@ class MovementWorker(threading.Thread):
                     self.last_observation = observation
                     self._dead_flower_step(observation)
                     continue
+                # 等死花 belongs to ordinary 巡逻攻击.  Its wall-clock
+                # schedule is checked before route planning so a reached
+                # flower point can own only its final rope departure; every
+                # other capture follows the unchanged patrol path.
+                if self._service_wait_dead_flower_schedule(
+                    observation, time.monotonic(),
+                ):
+                    self.last_observation = observation
+                    continue
                 # 自动重连: the first frame after the reconnect gave the input back decides
                 # whether the character is on the patrol route, before the walk resumes.
                 self._run_pending_route_check(observation, time.monotonic())
@@ -19741,8 +20120,25 @@ class MovementWorker(threading.Thread):
                         # The descent owns the floors in between: this is where the resync guard (see
                         # _resync_route_layer) starts, and the per-floor log evidence is reset with it.
                         self._drop_descent_saw = None
-                        LOG.info("final layer patrol done; descending to %s",
-                                 self.first_layer)
+                        # Is there anything to drop FROM?  A hand-over with the
+                        # marker already inside the first layer's band (the
+                        # 等死花 rope departure lands on it) arms the descent
+                        # with nothing to fall through, so its first chord is
+                        # withheld and the arrival accepted on a settled
+                        # marker instead (see ``_final_drop_arrived``).
+                        self._descent_entry_on_first_layer = self._on_first_layer(
+                            observation
+                        )
+                        self._drop_settle_wait_logged = False
+                        LOG.info(
+                            "final layer patrol done; descending to %s "
+                            "(marker %s the first layer%s)",
+                            self.first_layer,
+                            "already on" if self._descent_entry_on_first_layer
+                            else "above",
+                            ", waiting for a settled marker" if (
+                                self._descent_entry_on_first_layer) else "",
+                        )
                         self._descending_to_first = True
                         self._descending_since = time.monotonic()
                     elif (self._descending_since is not None
@@ -19759,6 +20155,7 @@ class MovementWorker(threading.Thread):
                         self._descending_to_first = False
                         self._descending_since = None
                         self._drop_descent_saw = None
+                        self._descent_entry_on_first_layer = False
                     if self._final_drop_arrived(observation):
                         self._reset_route_loop(observation)
                         self._reanchor_tracker_to_current_layer(observation)
@@ -20659,6 +21056,28 @@ class MovementWorker(threading.Thread):
                             continue
                         if self._drop_attempt_in_progress():
                             continue
+                        if (self._descent_drop_needs_settled_marker()
+                                and not self._marker_settled_now()):
+                            # A marker that is still falling is not a floor
+                            # decision, and the descent chord would land as a
+                            # jump on a character already on the way down.
+                            # Wait for the same two stable captures every other
+                            # floor decision waits for (the platform landing is
+                            # then one capture away, and the descent continues
+                            # from there).
+                            if not self._drop_settle_wait_logged:
+                                self._drop_settle_wait_logged = True
+                                LOG.info(
+                                    "DROP hold: marker y=%.6f is not a settled "
+                                    "reading yet (needs %d stable captures); "
+                                    "no Alt+Down on a falling character",
+                                    (observation.player.y
+                                     if observation.player is not None
+                                     else float("nan")),
+                                    LAYER_SETTLE_FRAMES,
+                                )
+                            continue
+                        self._drop_settle_wait_logged = False
                         if self._last_drop_attempt != float("-inf"):
                             LOG.info(
                                 "DROP RETRY: previous Alt+Down produced no descent "

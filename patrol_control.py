@@ -69,13 +69,15 @@ LAYER_UP_REACH_FACTOR = 0.7
 LAYER_BAND_UPPER_EDGE_REACH = 0.02
 LAYER_BAND_LOWER_EDGE_REACH = 0.02
 
-# Schema stamp written into ``layer_band``.  Version 4 is the symmetric 0.02
-# reach.  3 was the swapped hairline (0.003 up / 0.0015 down), 2 its mirror, 1 a
-# flat 0.003.  ``_refresh_all_layer_bands()`` recomputes every stored band from
+# Schema stamp written into ``layer_band``.  5 adds the support points to the
+# WORLD envelope (they already fed the marker envelope), so a recorded 低/高
+# supporter widens both bands the way the three route endpoints do.  4 is the
+# symmetric 0.02 reach.  3 was the swapped hairline (0.003 up / 0.0015 down), 2
+# its mirror, 1 a flat 0.003.  ``_refresh_all_layer_bands()`` recomputes every stored band from
 # this rule on load, so an existing recording adopts the new edges instead of
 # keeping the old ones; the stamp makes a stale document recognisable when a
 # profile is inspected.
-LAYER_BAND_VERSION = 4
+LAYER_BAND_VERSION = 5
 
 # Last-resort ``small_gap`` for a single-supporter layer whose recording carries no layout at all, so one
 # marker row cannot be derived.  Kept identical to
@@ -163,8 +165,14 @@ def _coherent_observed_world_values(layer: Any) -> list[float]:
     """Use raw per-point world Y only when it agrees with diamond-space Y."""
 
     readings: list[tuple[float, float]] = []
-    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
-        point = layer.get(point_name) if isinstance(layer, dict) else None
+    # Supporters are evidence here for the same reason they are evidence in the
+    # band: a 低/高 row is where the character really stood.
+    supporters: list[Any] = [
+        layer.get(name) for name in ("left_most_pos", "rope_pos", "right_most_pos")
+    ] if isinstance(layer, dict) else []
+    if isinstance(layer, dict) and isinstance(layer.get("support_points"), list):
+        supporters.extend(layer["support_points"])
+    for point in supporters:
         coordinate = point.get("coordinate_v2") if isinstance(point, dict) else None
         if (not isinstance(point, dict)
                 or not isinstance(coordinate, dict)
@@ -201,10 +209,7 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
                 return upper, lower
     values = _coherent_observed_world_values(layer)
     if not values:
-        for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
-            point = layer.get(point_name)
-            if isinstance(point, dict) and "world_y" in point:
-                values.append(float(point["world_y"]))
+        values = _layer_world_values(layer)
     if not values and isinstance(layer, dict) and "layer_world_y" in layer:
         values = [float(layer["layer_world_y"])]
     if not values:
@@ -212,6 +217,37 @@ def _layer_world_y_band(layer: Any, tolerance: float) -> Optional[tuple[float, f
     # Same rule as _layer_y_band: tolerance only above the topmost point,
     # never below the lowermost point (no reach into the layer below).
     return min(values) - tolerance, max(values)
+
+
+def _layer_world_values(layer: Any) -> list[float]:
+    """Every recorded world Y that makes this layer's world envelope.
+
+    The three route endpoints AND every support point - the same supporter set
+    the marker-Y envelope uses.  A 低/高 support point is a row the character
+    really stood on, so the world signal (the tie-breaker when the marker row is
+    ambiguous) has to know about it; leaving it out was the 2026-11-16 report:
+    the marker band widened with a supporter and the world band did not.
+    """
+
+    values: list[float] = []
+    if not isinstance(layer, dict):
+        return values
+    for point_name in ("left_most_pos", "rope_pos", "right_most_pos"):
+        point = layer.get(point_name)
+        if isinstance(point, dict) and "world_y" in point:
+            try:
+                values.append(float(point["world_y"]))
+            except (TypeError, ValueError):
+                pass
+    supports = layer.get("support_points")
+    if isinstance(supports, list):
+        for point in supports:
+            if isinstance(point, dict) and "world_y" in point:
+                try:
+                    values.append(float(point["world_y"]))
+                except (TypeError, ValueError):
+                    continue
+    return values
 
 
 def _recalculate_layer_band(layer: Any) -> bool:
@@ -245,14 +281,10 @@ def _recalculate_layer_band(layer: Any) -> bool:
     y_upper = raw_upper - LAYER_BAND_UPPER_EDGE_REACH
     y_lower = raw_lower + LAYER_BAND_LOWER_EDGE_REACH
 
-    world_values: list[float] = []
-    for point_name in REQUIRED_LAYER_POINTS:
-        point = layer.get(point_name)
-        if isinstance(point, dict) and "world_y" in point:
-            try:
-                world_values.append(float(point["world_y"]))
-            except (TypeError, ValueError):
-                pass
+    # Same supporters as the marker-Y envelope above: the endpoints AND every
+    # support point, so a 低/高 row widens the world band exactly the way it
+    # widens the marker band.
+    world_values = _layer_world_values(layer)
     if not world_values and "layer_world_y" in layer:
         try:
             world_values = [float(layer["layer_world_y"])]
@@ -348,6 +380,19 @@ def _layer_present_actions(layer: Any) -> list[str]:
         if isinstance(layer.get(name), dict)
         and "x" in layer[name] and "y" in layer[name]
     ]
+
+
+def _layer_has_flower_point(layer: Any) -> bool:
+    """Whether a layer has at least one usable flower waypoint."""
+
+    points = layer.get("flower_points") if isinstance(layer, dict) else None
+    return bool(
+        isinstance(points, list)
+        and any(
+            isinstance(point, dict) and "x" in point and "y" in point
+            for point in points
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -547,10 +592,12 @@ class PatrolController:
             self._selected_layer = self._final_layer_name_locked()
             self._inverted_range_reported = ("", "")
 
-    def can_start(self) -> bool:
-        """Whether the selected patrol route has both horizontal endpoints."""
+    def can_start(self, *, allow_flower_only_layers: bool = False) -> bool:
+        """Whether the selected patrol route passes its active-mode gate."""
 
-        return not self.validate_patrol_route()
+        return not self.validate_patrol_route(
+            allow_flower_only_layers=allow_flower_only_layers,
+        )
 
     def _patrol_route_layers_locked(self) -> list[str]:
         """Physical layers inside the selected contiguous patrol range."""
@@ -564,7 +611,9 @@ class PatrolController:
             if start_number <= _layer_number(name) <= end_number
         ]
 
-    def validate_patrol_route(self) -> tuple[str, ...]:
+    def validate_patrol_route(
+        self, *, allow_flower_only_layers: bool = False,
+    ) -> tuple[str, ...]:
         """Return human-readable errors for the selected patrol route.
 
         Recording stays deliberately loose: a layer outside the route may have
@@ -606,6 +655,10 @@ class PatrolController:
                 return tuple(errors)
             for name in route:
                 layer = layers.get(name)
+                # 等死花 may deliberately wait on a flower-only layer.  In
+                # that one mode, 花 is a legal route supporter without 最左/最右.
+                if allow_flower_only_layers and _layer_has_flower_point(layer):
+                    continue
                 missing = [
                     label for point, label in (
                         ("left_most_pos", "最左"),
@@ -1526,6 +1579,8 @@ class PatrolController:
     def record_support_point(
         self, player_x: float, player_y: float,
         layout: Optional[CoordinateLayout] = None,
+        world_y: Optional[float] = None,
+        tracking_confidence: Optional[float] = None,
     ) -> RecordedEndpoint:
         """Record a local, detection-only layer supporter.
 
@@ -1551,6 +1606,17 @@ class PatrolController:
                     "y_diamond": round(stable_y, 6),
                     "recorded_layout": layout.as_dict(),
                 }
+            # The world reading, stored exactly as an endpoint stores it
+            # (record_endpoint): without it the supporter could widen the marker
+            # band but never the world band - the 2026-11-16 report.
+            if world_y is not None:
+                try:
+                    point["world_y"] = round(float(world_y), 6)
+                    point["tracking_confidence"] = round(
+                        float(tracking_confidence or 0.0), 6
+                    )
+                except (TypeError, ValueError):
+                    pass
             target = (
                 self._part_layer_locked(
                     layer, self._part_index_for_x_locked(point["x"]), create=True,

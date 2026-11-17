@@ -3152,8 +3152,13 @@ class UiWorker(threading.Thread):
                 command=self._drug_on_change,
             )
             buff2_use_button.pack(side="left")
-            # 补药 covers the attack-boost potions used on a timer.
-            buff2_use_hint = HoverTooltip(buff2_use_button, "增加攻击药等")
+            # 补药 covers the attack-boost potions used on a timer, and it is
+            # also the row 死花/重置花 binds its flower cadence to (the tip says
+            # both, because the binding is not visible anywhere else).
+            buff2_use_hint = HoverTooltip(
+                buff2_use_button,
+                "食用攻击药等补药，重置花模式，花的按键绑定到这里",
+            )
             buff2_use_hint.set_enabled(True)
             self._bind_key_tooltips.append(buff2_use_hint)
             self._buff2_key_var = tk.StringVar(value="insert")
@@ -3434,8 +3439,11 @@ class UiWorker(threading.Thread):
             abnormal_check.pack(side="left", padx=(0, 6))
             abnormal_hint = HoverTooltip(
                 abnormal_check,
-                "异常时通过已选的声音、闪烁、消息方式提醒"
-                "（例如 非正常运行：只在无法恢复时提醒）",
+                # The hint names the situations the alarm exists for and what it
+                # does (下机), which is what the operator wants a client to read;
+                # the acoustic/visual channels are the 声音/闪烁 switches' own
+                # affair and do not need repeating here.
+                "传送回主城，卡在特殊位置无法继续运行等情况自动下机",
             )
             abnormal_hint.set_enabled(True)
             self._bind_key_tooltips.append(abnormal_hint)
@@ -11619,8 +11627,13 @@ class UiWorker(threading.Thread):
             return False
         try:
             undo_saved = self._undo_capture("录制支持点")
+            # The supporter takes the SAME world reading a route endpoint
+            # records, so it widens the world-Y band as well as the marker band
+            # (a 低/高 row is real floor evidence for both signals).
             point = self.patrol_controller.record_support_point(
                 snapshot.player_x, snapshot.player_y, snapshot.coordinate_layout,
+                world_y=snapshot.world_y_diamonds,
+                tracking_confidence=snapshot.structure_confidence,
             )
         except (OSError, TypeError, ValueError) as exc:
             if undo_saved:

@@ -1,6 +1,6 @@
 """增益 1..4 schedule tests (the ``buff_scheduler`` worker).
 
-These rows are casts, so each refresh is a DOUBLE tap and the delivery goes
+These rows are casts, so each refresh is a TRIPLE tap and the delivery goes
 through MotionArbiter when one is wired.  The two 时间药 rows (饲料 /
 补药) are a different worker - see ``test_time_drug_worker`` - and must never be
 touched from here.
@@ -69,16 +69,16 @@ class BuffScheduleTests(unittest.TestCase):
         # 增益不从开局立即触发（用户会先手动触发第一次）。
         scheduler._check_buffs(time.monotonic())
         self.assertEqual(sender.keys, [])
-        # 计时器到期后按一次（回拨时间戳模拟时间流逝）；每一行是双击。
+        # 计时器到期后按一次（回拨时间戳模拟时间流逝）；每一行是三击。
         scheduler._last_buff["buff3"] = time.monotonic() - 61.0
         scheduler._last_buff["buff4"] = time.monotonic() - 61.0
         scheduler._check_buffs(time.monotonic())
-        self.assertEqual(sender.keys, ["pageup", "pageup", "pagedown", "pagedown"])
+        self.assertEqual(sender.keys, ["pageup", "pageup", "pageup", "pagedown", "pagedown", "pagedown"])
         # Interval not elapsed yet: no repeat.
         scheduler._check_buffs(time.monotonic())
-        self.assertEqual(sender.keys, ["pageup", "pageup", "pagedown", "pagedown"])
+        self.assertEqual(sender.keys, ["pageup", "pageup", "pageup", "pagedown", "pagedown", "pagedown"])
 
-    def test_buff_is_a_double_tap_with_the_buff_hold(self) -> None:
+    def test_buff_is_a_triple_tap_with_the_buff_hold(self) -> None:
         sender = FakeSender()
         config = replace(
             StatusConfig(),
@@ -87,9 +87,9 @@ class BuffScheduleTests(unittest.TestCase):
         scheduler = scheduler_with(config, sender)
         scheduler._last_buff["buff3"] = time.monotonic() - 61.0
         scheduler._check_buffs(time.monotonic())
-        self.assertEqual(sender.keys, ["pageup", "pageup"])
+        self.assertEqual(sender.keys, ["pageup", "pageup", "pageup"])
         self.assertEqual(
-            sender.holds, [BUFF_TAP_HOLD_SECONDS, BUFF_TAP_HOLD_SECONDS]
+            sender.holds, [BUFF_TAP_HOLD_SECONDS] * 3
         )
         self.assertAlmostEqual(BUFF_TAP_HOLD_SECONDS, 0.15)
 
@@ -206,9 +206,9 @@ class BuffScheduleTests(unittest.TestCase):
         self.assertEqual(sender.keys, [])          # not due yet
         scheduler._last_buff["buff6"] = time.monotonic() - 46.0
         scheduler._check_buffs(time.monotonic())
-        self.assertEqual(sender.keys, ["m", "m"])
+        self.assertEqual(sender.keys, ["m", "m", "m"])
         self.assertEqual(
-            sender.holds, [BUFF_TAP_HOLD_SECONDS, BUFF_TAP_HOLD_SECONDS]
+            sender.holds, [BUFF_TAP_HOLD_SECONDS] * 3
         )
         # And the shipped default keeps it unbound/disabled like the others.
         self.assertEqual(StatusConfig().buff6_key, "-")

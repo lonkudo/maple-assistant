@@ -1954,10 +1954,13 @@ class InstallerWindow:
                 logging.info("installer: removed the legacy app/ folder")
 
             _save_pointer(root)
-            try:
-                update_dir.rmdir()
-            except OSError:
-                pass
+            # The old flow downloaded into <root>\update and removed that scratch
+            # directory here.  The selected-version flow downloads into
+            # <root>\版本 and KEEPS the archive (仅下载保存 exists for the same
+            # file), so there is nothing to clean up - and the removal that was
+            # left behind referenced ``update_dir``, which no longer exists in
+            # this scope: it raised NameError *after* the files were unpacked,
+            # aborting the authorization and first-install setup below.
             # Authorize the finished installation: the customer typed the code
             # once, at the start, so the client must open already licensed
             # instead of asking for the same code again.

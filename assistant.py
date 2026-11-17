@@ -2106,7 +2106,7 @@ def main() -> int:
 
     attack_workers = []
     # Jump/buff motion keys are executed one at a time by the motion arbiter
-    # (0.9s jump window / 0.6s buff window).  Fixed attack defers while the
+    # (0.9s jump window / 1.4s total buff action).  Fixed attack defers while the
     # arbiter is busy, so a jump or buff tap never lands inside action
     # motion and gets swallowed by the game.
     motion_arbiter = MotionArbiter(

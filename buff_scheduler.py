@@ -35,13 +35,17 @@ from typing import Any, Callable, Optional
 # config this scheduler reads.  Importing the constant keeps one source of truth.
 from status_worker import BINDABLE_KEYS
 # The buff tap shape is shared with every other buff owner (MotionArbiter and
-# MovementWorker.perform_arbiter_buff): 150 ms press, short release, 150 ms press.
-from motion_arbiter import BUFF_TAP_HOLD_SECONDS, buff_double_tap
+# MovementWorker.perform_arbiter_buff): three 150 ms presses with short releases.
+from motion_arbiter import (
+    BUFF_POST_TAP_QUIET_SECONDS,
+    BUFF_TAP_HOLD_SECONDS,
+    buff_triple_tap,
+)
 
 LOG = logging.getLogger(__name__)
 
-# How a 增益 key is pressed: twice, 150 ms each, with a short release between
-# (``motion_arbiter.buff_double_tap``).  Measured: a single shorter press is
+# How a 增益 key is pressed: three times, 150 ms each, with a short release between
+# (``motion_arbiter.buff_triple_tap``).  Measured: a single shorter press is
 # dropped by the game client often enough that a whole refresh is lost, and each
 # miss costs one interval (minutes); one longer hold is not what the client wants.
 # The constant itself lives with the other buff tap parameters.
@@ -172,7 +176,8 @@ class BuffScheduler(threading.Thread):
                         self._buff_pending[name] = False
                 continue
 
-            # No arbiter: double-tap directly, still with the buff hold time.  A
+            # No arbiter: triple-tap directly, then keep the same post-tap quiet
+            # window as the arbiter so the whole refresh action remains 1.4 s. A
             # held charge owns the keyboard, so the timer simply stays due.
             if self._charge_active():
                 continue
@@ -183,12 +188,15 @@ class BuffScheduler(threading.Thread):
                             name.upper(), key, interval)
 
     def _tap_buff(self, key: str) -> bool:
-        """Double-tap one 增益 key with the shared buff tap shape."""
+        """Triple-tap one 增益 key with the shared 1.4 s action shape."""
 
-        return buff_double_tap(
+        sent = buff_triple_tap(
             self.key_sender, key, hold_seconds=BUFF_TAP_HOLD_SECONDS,
             wait=self.stop_event.wait,
         )
+        if sent and BUFF_POST_TAP_QUIET_SECONDS:
+            self.stop_event.wait(BUFF_POST_TAP_QUIET_SECONDS)
+        return sent
 
     # ---- thread ------------------------------------------------------------
     def run(self) -> None:

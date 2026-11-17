@@ -65,34 +65,43 @@ _DELIVERY_RETRY_DELAY = 0.15
 # making a left/right walk decision).
 _GATE_WAIT_WARN_SECONDS = 4.0
 
-# Buff keys are double-tapped: 150 ms press, a short release, then the same press
-# again.  The operator's measurement - a single short press is dropped by the
-# client often enough to lose a whole refresh, and one long hold is not what the
-# client wants either, so the insurance is a second tap rather than a longer
-# hold.  The gap must outlast one input-poll slice, otherwise the client merges
-# the two presses into one hold and the second tap buys nothing.
+# Buff keys are triple-tapped: three 150 ms presses separated by short releases.
+# A single short press is dropped by the client often enough to lose a whole
+# refresh, while one long hold is not what the client wants.  Each release must
+# outlast one input-poll slice or the client can merge the neighbouring presses.
 BUFF_TAP_HOLD_SECONDS = 0.150
-BUFF_DOUBLE_TAP_GAP_SECONDS = 0.080
+BUFF_TAP_GAP_SECONDS = 0.080
+BUFF_TAP_COUNT = 3
+# A full refresh action stays 1.4 s from the first key-down to the next action.
+# The triple press itself consumes 0.61 s (3 * 150 ms + 2 * 80 ms), leaving this
+# quiet window for the arbiter after the final key-up.
+BUFF_TOTAL_MOTION_SECONDS = 1.400
+BUFF_POST_TAP_QUIET_SECONDS = max(
+    0.0,
+    BUFF_TOTAL_MOTION_SECONDS
+    - (BUFF_TAP_COUNT * BUFF_TAP_HOLD_SECONDS)
+    - ((BUFF_TAP_COUNT - 1) * BUFF_TAP_GAP_SECONDS),
+)
 
 
-def buff_double_tap(
+def buff_triple_tap(
     key_sender: Any,
     key: str,
     *,
     hold_seconds: float = BUFF_TAP_HOLD_SECONDS,
-    gap_seconds: float = BUFF_DOUBLE_TAP_GAP_SECONDS,
+    gap_seconds: float = BUFF_TAP_GAP_SECONDS,
     wait: Optional[Callable[[float], Any]] = None,
 ) -> bool:
-    """Double-tap one periodic buff key; True when the first press was accepted.
+    """Triple-tap one periodic buff key; True when the first press was accepted.
 
     Every buff owner (the periodic scheduler, the arbiter's own executor and
     ``MovementWorker.perform_arbiter_buff``) goes through this one function, so
     the hold and the gap cannot drift apart between them.  A sender that only
     implements ``tap(key)`` keeps working: its own hold is used for both presses.
 
-    The second press is the recovery for a client that swallowed the first one,
-    so it is best-effort - the buff already counts as delivered once the first
-    press was claimed, and a refused second press only logs.
+    The second and third presses are recovery for a client that swallowed an
+    earlier one, so they are best-effort.  The buff counts as delivered once
+    the first press was claimed.
     """
 
     tap = getattr(key_sender, "tap", None)
@@ -112,21 +121,25 @@ def buff_double_tap(
         if not press():
             return False
     except Exception:  # noqa: BLE001 - the caller retries an undelivered buff
-        LOG.exception("buff double tap: the first press of %s failed", key)
+        LOG.exception("buff triple tap: the first press of %s failed", key)
         return False
-    if gap:
-        try:
-            if callable(wait):
-                wait(gap)
-            else:
+    for press_number in range(2, BUFF_TAP_COUNT + 1):
+        if gap:
+            try:
+                if callable(wait):
+                    wait(gap)
+                else:
+                    time.sleep(gap)
+            except Exception:  # noqa: BLE001 - a stop/shutdown wait must not break it
                 time.sleep(gap)
-        except Exception:  # noqa: BLE001 - a stop/shutdown wait must not break it
-            time.sleep(gap)
-    try:
-        if not press():
-            LOG.warning("buff double tap: the second press of %s was refused", key)
-    except Exception:  # noqa: BLE001 - the first press already delivered the buff
-        LOG.exception("buff double tap: the second press of %s failed", key)
+        try:
+            if not press():
+                LOG.warning(
+                    "buff triple tap: press %d of %s was refused",
+                    press_number, key,
+                )
+        except Exception:  # noqa: BLE001 - the first press already delivered the buff
+            LOG.exception("buff triple tap: press %d of %s failed", press_number, key)
     return True
 
 
@@ -141,7 +154,7 @@ class MotionArbiter(threading.Thread):
         climbing_active_event: Optional[threading.Event] = None,
         automation_active_event: Optional[threading.Event] = None,
         jump_motion_seconds: float = 0.9,
-        buff_motion_seconds: float = 1.0,
+        buff_motion_seconds: float = BUFF_POST_TAP_QUIET_SECONDS,
         buff_tap_hold_seconds: float = BUFF_TAP_HOLD_SECONDS,
         micro_step_motion_seconds: float = 0.25,
         micro_step_pre_step_quiet_seconds: float = 0.20,
@@ -1240,9 +1253,9 @@ class MotionArbiter(threading.Thread):
             if callable(callback):
                 tap_ok = callback(key, self.buff_tap_hold_seconds) is not False
             else:
-                # No movement owner wired: double-tap here, with the same hold and
+                # No movement owner wired: triple-tap here, with the same hold and
                 # gap every other buff path uses.
-                tap_ok = buff_double_tap(
+                tap_ok = buff_triple_tap(
                     self.key_sender, key,
                     hold_seconds=self.buff_tap_hold_seconds,
                     wait=self.stop_event.wait,
