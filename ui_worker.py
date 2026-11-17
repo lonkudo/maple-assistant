@@ -513,6 +513,26 @@ def _clamp_window_geometry(
 _GEOMETRY_FORMAT = 17
 
 
+def _close_startup_hint() -> None:
+    """Remove the 启动中。。。 hint and report how long the launch took.
+
+    Runs the moment the dashboard is mapped: the hint has done its job, and the
+    log line it leaves behind measures the real launch - the launcher's probe
+    (or, in the packaged build, ``assistant``'s own import) up to the visible
+    window.  Never raises: this runs inside a Tk callback.
+    """
+
+    try:
+        import startup_splash
+
+        elapsed = startup_splash.since_launch()
+        startup_splash.close("window shown")
+        if elapsed is not None:
+            LOG.info("STARTUP: 窗口已显示，启动耗时 %.1fs（含命令行→UAC→导入→界面）", elapsed)
+    except Exception:  # noqa: BLE001 - the hint is cosmetic
+        LOG.debug("startup hint could not be closed", exc_info=True)
+
+
 def _load_window_geometry(default_geometry: str) -> str:
     """Return the saved debug UI geometry, or ``default_geometry`` when the
     settings file is missing/corrupt/stale.  Never raises.
@@ -4168,6 +4188,11 @@ class UiWorker(threading.Thread):
             # sees only the compact finished layout.
             self._refit_window_to_content()
             root.deiconify()
+            # The dashboard is on screen: the launch hint that covered the slow
+            # part of the start has done its job.  Scheduled instead of called so
+            # the window is really mapped first, and imported lazily because a
+            # test rig or a headless build may not have the module at all.
+            root.after(0, _close_startup_hint)
             # A few saved-setting callbacks are deliberately scheduled during
             # startup.  They apply initial values only and must not become
             # fake Ctrl+Z steps.

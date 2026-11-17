@@ -56,6 +56,30 @@ This keeps patrol recovery, combat, alerts, and optional helpers from fighting o
 
 The coordinator is intentionally the only place where a capture source, a worker callback, and a UI action are connected together. Feature workers should remain independently understandable and should not reach across the application to manipulate unrelated state.
 
+### Startup hint and launch timing (v1.3.51)
+
+A hidden, elevated launch (`.bat` → `launch_assistant.vbs` → `MoonEclipse.exe` →
+`startup_probe.py` → `assistant.main`) shows nothing until the dashboard exists,
+so `startup_splash.py` draws a small rounded card in the top-left corner of the
+primary screen for that interval: background `#f3f3f3`, centred text
+`启动中...` in `#00a4fa`, no border, click-through (`WS_EX_TRANSPARENT`), never
+activated (`WS_EX_NOACTIVATE`), no taskbar entry, removed after
+`MAX_SECONDS = 90` if nobody closes it. Three rules are each the result of a
+field failure: it is **Win32-only** (a Tk root in a background thread set
+`tkinter._default_root`, so the dashboard's first `StringVar` failed with
+`RuntimeError: main thread is not in main loop`); it is **topmost and re-asserts**
+`HWND_TOPMOST` every 0.5 s (`WS_EX_TOPMOST` alone was covered by a desktop icon);
+and it **paints itself on `WM_PAINT`** from a class brush + `DrawTextW` instead of
+using a layered surface, because `UpdateLayeredWindow` loses its content when the
+window is shown or re-positioned — which the topmost rule requires.
+
+`assistant.main()` shows it as its first statement; `ui_worker.run()` calls
+`_close_startup_hint()` through `root.after(0, …)` right after `deiconify()`, so
+it disappears the moment the window is mapped. `startup_timing.py` is the launch
+clock behind the three `STARTUP:` log lines (imports done / worker threads
+created / window shown); its origin is the probe on a source launch and
+`assistant`'s own import in a packaged build.
+
 ### Licensing and online-service boundary
 
 `licensing.py` is the local authorization boundary: it verifies signed license
@@ -469,7 +493,8 @@ Patrol has these core rules:
 - Crossing a recorded endpoint advances the route phase only after the intended direction reaches or passes its target.
 - A return drop ends on landing evidence read from the marker, never on the world-Y tracker: the marker's own recorded band, or — when the landing is away from the recorded row and therefore matches no band — the at/below-bottom-floor and bounded nearest-floor answers ordinary patrol already uses. Those answers are computed over **every recorded floor** (`_landing_candidate_layers()`), not only the patrol range: with a single-floor range the floor a descent is aimed at is otherwise not even a candidate. Both relaxed answers require an Alt+Down chord to have really moved the marker down by at least `RECONNECT_DROP_Y_PROGRESS` (0.015) and the reading to hold for two consecutive settled frames, so a character falling *through* a floor is never read as landed. The world-Y tracker is excluded here because at a fresh start above the route its origin is anchored to the route's top floor while the character is still above it.
 - The world-Y tracker is guarded against its own drift (v1.3.35). The two shift estimates (against the stored reference and against the previous frame) must agree within `ESTIMATOR_AGREEMENT_DIAMONDS = 0.35` diamond before one may replace the other — the previous 1.50 / 0.75 allowed a silent switch more than two floors apart. `reanchor_world_y()` refuses a correction larger than `WORLD_REANCHOR_MAX_FLOOR_FRACTION` (one floor) and logs the refusal, because such a correction means the floor belief is wrong and writing it puts the coordinate outside every recorded band. `_world_drift_check()` re-anchors a cruising drift (strict, so refused when a floor or more) at most `WORLD_DRIFT_MAX_REANCHORS` (2) times per `WORLD_DRIFT_WINDOW_SECONDS` (20 s) and then marks the origin untrusted instead of trusting a belief. Evidence: the 11:24 log re-anchored +1.647 and then −1.602 while the character stood still at its 桩, after which every floor read unresolved and the unresolved-floor recovery started pressing Alt+Down.
-- A marker that matches **no recorded floor at all** is an unresolved floor, and the worker changes layer deliberately instead of walking it (`_unresolved_floor_drop_decision()`). It arms after four settled frames, presses Alt+Down, and after two chords without downward progress walks to the nearer outer side (X > 0.5 → left, X < 0.5 → right) for 5 s, then the opposite side, resuming the chords whenever a walk produces a descent; it stops after 3 edge cycles or 12 chords. Placement matters: the check runs after `route-complete` and before `stationary-attack`, so it preempts the anchor/patrol walking an unresolved reading would otherwise produce. It is gated on real vertical owners only — `_return_mode`, `_descending_to_first`, `_climb_state.up_held`, a jump-point Up claim, the reconnect drop recovery (and only while its `drop-to-route` return is running), a pickup leg, and a pending post-reconnect route check — and `_unresolved_drop_blocker()` names the owner in the log. `_climb_state.phase` is deliberately *not* a gate: a completed rope attempt leaves the phase non-idle after Up was released, and treating that bookkeeping as a climb kept the recovery from ever running.
+- A marker that matches **no recorded floor at all** is an unresolved floor, and the worker changes layer deliberately instead of walking it (`_unresolved_floor_drop_decision()`). It arms after four settled frames, presses Alt+Down, and after two chords without downward progress holds the nearer outer side (X > 0.5 → left, X < 0.5 → right) for 5 s, then the opposite side, resuming the chords whenever a hold produces a descent; it stops after 3 edge cycles or 12 chords. Since v1.3.51 those two side passes are `drop_edge_left_down` / `drop_edge_right_down` — the reconnect respawn's Direction+Down hold, started through `_start_reconnect_drop_edge_hold(..., source="unresolved")` with the rope-attach watch armed for that side — and not plain walks: left/right are ignored on a rope, while the Down half still slides it (the 14:54 log stayed at `pos=(0.260000, 0.230392)` through a plain-walk pass on each side). Placement matters: the check runs after `route-complete` and before `stationary-attack`, so it preempts the anchor/patrol walking an unresolved reading would otherwise produce. It is gated on real vertical owners only — `_return_mode`, `_descending_to_first`, `_climb_state.up_held`, a jump-point Up claim, the reconnect drop recovery (and only while its `drop-to-route` return is running), a pickup leg, and a pending post-reconnect route check — and `_unresolved_drop_blocker()` names the owner in the log. `_climb_state.phase` is deliberately *not* a gate: a completed rope attempt leaves the phase non-idle after Up was released, and treating that bookkeeping as a climb kept the recovery from ever running.
+- A planned descent never spends a chord on a falling marker (v1.3.51). `_final_drop_arrived()` requires at least one real Alt+Down chord before it accepts a landing, and that rule used to press Down+Alt on a marker that was still mid-fall — the 12:32 log did it one capture after the 等死花 rope departure, on a character standing on layer1, which reads as a wrong jump because Alt is the game's jump key. Two gates keep it honest: the `drop` branch of the frame loop withholds the chord while `self._marker_settled_now()` is false for a descent (`_descent_drop_needs_settled_marker()` covers `drop-to-first`, the return drop and the split/timed circuits) and logs `DROP hold: …`; and `_descent_entry_on_first_layer` — recorded on the frame that ARMS the descent — lets a descent that began with the marker already inside the first layer's band be accepted on a settled marker, because there is nothing under the character to drop through.
 - Vertical ownership claims are dropped together with the physical key. `_forget_up_claims()` clears `_climb_state.up_held` and the whole jump-point session, and `_release_stuck_keys()` calls it immediately after its forced key-ups — the Start Patrol, confirmed-fall and global `INPUT RESET` paths all pass through there. `_begin_jump_point_pass()` refuses to inherit a claim from the previous pass, and `_jump_point_session_expired()` releases a jump-point claim that produced no landing, no handoff and no rising marker after `JUMP_POINT_SESSION_MAX_SECONDS` (3 s). A claim that outlives its key is what replaced every later rope climb with `action=wait (recorded directional jump point owns Up; waiting for landing)`.
 - Rope jumps have no patrol-start grace (v1.2.280). Standing inside the rope band means the mount jump is the wanted action; the old three-second "do not jump onto the rope the character happens to start next to" hold cost three seconds of every Start Patrol at a rope and left the attack blocked for the same window. The stair-jump stall detector keeps its own start grace, because a character that has not moved yet is not one stuck at a stair.
 - The reconnect drop recovery walks an edge after `RECONNECT_DROP_STALLED_ATTEMPTS` (2) stalled chords and is bounded by `RECONNECT_DROP_MAX_EDGE_CYCLES` and `RECONNECT_DROP_RECOVERY_MAX_SECONDS`.
@@ -491,6 +516,23 @@ the reverse hold while this state exists. The gate is then cleared, and a
 watchdog clears a stranded pending turnover on lifecycle interruption. This
 prevents overlapping directions and attack swallowing without making the
 endpoint gate a long patrol pause.
+
+**An endpoint that leads to the rope is a handoff, not a reverse (v1.3.51).**
+The last horizontal leg can end with the next route phase being `rope`/`up`/`stand`;
+`_begin_endpoint_turn()` used to return immediately for that case, so nothing
+released the old walk key (the character rode up to 0.11 past the recorded
+endpoint while `route state: …rope` was already active) and the following
+direction change went through the *general* `_send_walk_hold()` switch, which
+pends on `MotionArbiter.attack_motion_active()` for `max(1.0, attack_grace + 0.1)`
+— 1.3 s with a 1.2 s grace. At a 0.8 s attack cadence that predicate is true
+almost continuously, so every such handoff burned the whole cap: the 15:09 log
+holds the rope phase for 4 s of `attack skipped: patrol direction handoff is
+active` plus the walk back from the overshoot. Now the non-directional phase
+releases the walk at once through `_release_endpoint_walk()` (no event is set,
+because nothing is reserved to protect), and the general handoff asks
+`_attack_handoff_wait_seconds()` for the **remaining** part of the current grace
+(`grace - (now - last_attack_at) + 0.05`, clamped to 0.05–1.25 s). The classic
+left↔right turnover is unchanged.
 
 Movement never sends raw, competing direction requests. Every decision goes through the input boundary and, for atomic motions, the dedicated motion worker.
 
@@ -1105,6 +1147,21 @@ file is never overwritten by the package's default), the legacy `app\` tree is
 deleted only after every legacy config file is confirmed present at the root
 (`_legacy_config_missing`), and the downgrade guard compares the archive version
 with the folder's `VERSION` (`_installed_version`).
+
+**The operator picks the version (v1.3.50).** The window's 选择版本 step lists
+what the activation server offers (`/api/v1/update/list`, one row per
+`ReleaseUpdate` whose 开放 switch is on), and the installer downloads THAT
+version's share link into `<install root>\版本` and keeps the archive there —
+`版本` and the older scratch `update\` directory are different things, and the
+leftover `update_dir.rmdir()` from the scratch design survived the rewrite as a
+`name 'update_dir' is not defined` failure that aborted the install *after*
+unpacking, before `authorize_installation()`. Every folder the flow needs is
+created on demand (`root`, `版本`, `助手配置`, and every extracted file's parent),
+so a deleted or never-created target folder is not an error. 仅下载保存 stops
+after the verified archive; 下载并安装 extracts it over the root. The same two
+choices exist in the client's 更新 window, where `update_core.install_from_library()`
+copies the chosen ZIP into `<root>\update` for `todohelper_update.ps1` and leaves
+the library copy untouched.
 
 **The installation authorizes itself (v1.3.16).** `/api/v1/installer/session` only proves
 the code so the download may start; it binds nothing and returns no entitlement, which is

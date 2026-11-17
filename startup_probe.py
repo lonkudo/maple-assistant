@@ -131,6 +131,13 @@ def _restart_probe() -> int:
 
 def _run_assistant() -> int:
     _write_status("Python startup probe reached.")
+    # Start the launch-time clock here, before the assistant (and its ~30 worker
+    # modules) is imported, so the ``STARTUP:`` lines in the log measure the real
+    # launch instead of the part that happens after the imports.
+    try:
+        import startup_timing  # noqa: F401 - the import itself starts the clock
+    except Exception:  # noqa: BLE001 - timing is diagnostic only
+        pass
     from assistant import main as run_assistant
 
     result = run_assistant()

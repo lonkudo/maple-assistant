@@ -47,7 +47,66 @@ The standalone package starts no console window and needs no `安装.bat`: it ca
 
 If a required library is missing, the normal package repairs itself: the hidden launcher writes the traceback to `assistant-launch-error.log`, runs `安装.bat` once automatically, and starts the assistant again in a fresh process. A failed automatic install leaves the log and a message box instead of a silent start.
 
-The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking downloads it from the operator's 更新链接 record (netdisk share), verifies the archive, and installs it. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, clears any other assistant instance that still holds the packaged files or the single-instance mutex, installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app through `MoonEclipse.exe`, then `launch_assistant.vbs`, then `启动助手.bat`, retrying once and logging the PID it started. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking opens the **更新** window (v1.3.50). That window lists every version the operator offers — the announced one first — with its 更新说明, and each row has **仅下载保存** (the ZIP is downloaded into `<root>\版本` and kept) and **下载并安装** (the supervisor installs that copy; the library copy stays). An older version can be listed and installed on purpose: the picked version is the authority, not the newest, and a rollback row does not light the title-bar icon. The download comes from that version's 更新链接 record (netdisk share); the archive is verified before anything is unpacked. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, clears any other assistant instance that still holds the packaged files or the single-instance mutex, installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app through `MoonEclipse.exe`, then `launch_assistant.vbs`, then `启动助手.bat`, retrying once and logging the PID it started. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
+
+### Current release behavior (v1.3.49 – v1.3.51)
+
+- **A hidden start now says 启动中... while it loads.** `启动助手.bat` runs a
+  hidden, elevated launcher, so until the dashboard exists the user sees nothing
+  at all — worker imports, logging setup, the licence handshake and the whole Tk
+  layout happen first. `startup_splash.py` paints a small rounded card in the
+  top-left corner of the primary screen (background `#f3f3f3`, text `#00a4fa`,
+  centred, no border), click-through, never activated, no taskbar entry, and
+  `ui_worker` removes it the instant the window is mapped. Three `STARTUP:` log
+  lines (`startup_timing.py`) report imports done / worker threads created /
+  window shown, so a slow launch can be measured instead of guessed at. The hint
+  is Win32-only on purpose: a first version used a Tk root in a background thread,
+  which set `tkinter._default_root` and made the dashboard's first `StringVar`
+  fail with `RuntimeError: main thread is not in main loop`. It is topmost and
+  re-asserts that every 0.5 s (`WS_EX_TOPMOST` alone was covered by a desktop
+  icon), and it paints itself on `WM_PAINT` because a layered window loses its
+  surface when it is shown or re-positioned.
+- **A layer switch no longer costs a second of standing still.** When the last
+  patrol leg ends and the next phase is the rope, `_begin_endpoint_turn()` now
+  releases the old walk key immediately instead of riding it past the recorded
+  endpoint and then taking the *general* direction handoff — which waited out the
+  whole attack animation (`max(1.0, attack_grace + 0.1)` = 1.3 s) before the new
+  key could go down. That wait now uses only the remaining part of the current
+  attack grace (`_attack_handoff_wait_seconds()`), so a handoff costs 0.05–1.25 s
+  instead of always 1.3 s. Evidence: the 15:09 log held `route state:
+  layer1.rope` for 4 s (`attack skipped: patrol direction handoff is active`) and
+  drifted 0.11 past the endpoint before walking back.
+- **A descent never presses Alt+Down on a marker that is still falling**
+  (`DROP hold`), and a descent that begins with the marker already on the first
+  layer is accepted on a settled marker instead of spending a chord there
+  (`_descent_entry_on_first_layer`). The 12:32 field log pressed Down+Alt one
+  capture after the 等死花 rope departure, on a character standing on layer1 —
+  Alt is the game's jump key, so it read as a wrong jump.
+- **The unresolved-floor recovery changes layer with Direction+Down.** The two
+  side passes are `side+Down` chords (`drop_edge_left_down` / `_right_down`,
+  reusing the reconnect respawn's `_start_reconnect_drop_edge_hold` with
+  `source="unresolved"`), not plain walks: a character hanging on a rope ignores
+  left/right entirely, and the Down half is what actually moves it. The 14:54 log
+  sat frozen at `pos=(0.260000, 0.230392)` through both plain-walk passes.
+- **等死花 belongs to 巡逻攻击** (see the mode section below): the recorded 花 point
+  becomes the next route target for the final 10 s of its interval, the character
+  proves it attached to the rope, waits there until the deadline and then leaves
+  with Alt+Left. The 补药 row's hover hint says both jobs: `食用攻击药等补药，重置花模式，花的按键绑定到这里`.
+- **增益 rows are tapped three times** (`motion_arbiter.buff_triple_tap`) while the
+  two 时间药 rows (饲料 / 补药) stay single 150 ms taps, because those are consumed
+  by the press. A single shorter 增益 press is dropped by the client often enough
+  to lose a whole refresh.
+- **The update window offers versions.** The update icon opens a list of the
+  versions the operator has made available, each row offering 仅下载保存 (the ZIP
+  stays in `<root>\版本`) or 下载并安装 (the supervisor installs that copy and the
+  library copy is kept). The installer asks the same question in its 选择版本 step,
+  and the server has a per-version 开放 switch, so an older version can be offered
+  on purpose — the version the operator picks is the authority, not the newest.
+- **The installer finishes its job again.** The selected-version flow kept a
+  leftover `update_dir.rmdir()` from the old scratch-download design; the variable
+  no longer existed, so the install aborted with `name 'update_dir' is not
+  defined` **after** unpacking — before writing the activation and starting the
+  first-install setup.
 
 ### Current release behavior (v1.3.36 – v1.3.48)
 
@@ -1253,6 +1312,18 @@ The hold manager preserves that reverse hold until this verdict, and no second
 attack may enter the handoff. This keeps endpoint turns responsive while
 preventing attack, jump, or stale walk input from swallowing the reverse.
 
+**Leaving an endpoint for the rope is the same handoff (v1.3.51).** The last
+patrol leg can end with the next phase being the rope rather than the opposite
+direction. That case used to fall through to the general direction switch, which
+waited out the whole attack animation (`max(1.0, attack_grace + 0.1)` = 1.3 s)
+before the new key, while the old key was still held and carried the character
+0.11 past the recorded endpoint. `_begin_endpoint_turn()` now releases the walk
+immediately whenever the next phase has no horizontal direction of its own, and
+`_attack_handoff_wait_seconds()` shortens the remaining wait to the *remaining*
+part of the current attack grace (0.05–1.25 s instead of always 1.3 s), so the
+next frame simply walks to the rope. Logged as `endpoint handoff: released …
+at recorded edge; the rope phase picks its own direction`.
+
 ### Returning to the route from a lower floor
 
 A return climb heads for the recorded floor directly above the floor it is climbing from, capped at the bottom of the patrol range — not for the next route layer, which sits one floor too high while the character is below the range (v1.2.21). The arrival test uses that floor's band widened by one marker row on both sides.
@@ -1284,7 +1355,9 @@ A return drop (a reconnect or a fall that left the character above the patrol ra
 - Both relaxed answers need real drop evidence first: at least one Alt+Down chord actually sent, and the marker moved down by at least `RECONNECT_DROP_Y_PROGRESS` (0.015, one and a half marker rows) from where the descent began. They also need the reading to be **settled**: a character falling *through* the floor sweeps the marker down the minimap (the 14:38 log ran 0.372 → 0.397 → 0.409 → 0.445 → 0.482, about 0.027 per frame) and must never be read as a landing. The answer must hold for two consecutive settled frames (`DROP_ARRIVAL_CONFIRM_FRAMES`).
 - The scroll-compensated world-Y tracker is deliberately **never** consulted for the landing: at a fresh start above the route its origin is anchored to the route's *top* floor while the character is still above it, so it would end the drop before the first Alt+Down chord. Since v1.2.280 the same distrust applies globally after 自动重连: the world-Y origin is re-taken only from a marker-confirmed floor.
 
-The drop itself is bounded the same way a standing character's layer change is (v1.2.280): two Alt+Down chords without downward progress send the character to the nearer outer edge (X > 0.5 → left, X < 0.5 → right) to look for a drop edge, then the opposite one, and the recovery abandons after three cycles or a 30-second window. A marker that matches no recorded floor at all is handled by the unresolved-floor recovery below.
+The drop itself is bounded the same way a standing character's layer change is (v1.2.280): two Alt+Down chords without downward progress send the character to the nearer outer edge (X > 0.5 → left, X < 0.5 → right) to look for a drop edge, then the opposite one, and the recovery abandons after three cycles or a 30-second window. Since v1.3.51 those two edge passes are **Direction+Down** chords (`drop_edge_left_down` / `drop_edge_right_down`, the reconnect respawn's own hold), not plain walks: a character that a walk cannot move — hanging on a rope — is freed by the Down half, and the 14:54 log sat frozen at `pos=(0.260000, 0.230392)` through a plain-walk pass on each side. A marker that matches no recorded floor at all is handled by the unresolved-floor recovery below.
+
+No chord is spent on a marker that is still falling (v1.3.51): every planned-descent drop (`drop-to-first`, the return drop, the split/timed circuits) waits for the settled reading the rest of the layer logic already requires and logs `DROP hold: marker y=… is not a settled reading yet`. And when the descent is *entered* with the marker already inside the first layer's band — the 等死花 rope departure lands there — `_descent_entry_on_first_layer` accepts that settled marker without the mandatory first chord, because there is nothing under the character to drop through and the chord's Alt is the game's jump key.
 
 The landing evidence belongs to one descent. It is cleared on a fresh patrol start and once the return mode ends, and it survives a frame in which the marker is momentarily lost so one missing reading cannot restart the measured descent. The log names the floor and the evidence: `DROP TO ROUTE: accepting layer3 as the landing floor (marker y=0.408000 matches no patrol-floor band; the drop moved the marker 0.078000 down and the reading held for 2 frames); restarting patrol`.
 
@@ -1295,8 +1368,8 @@ A marker that matches no recorded band and is farther than the nearest-floor all
 The floor is therefore changed deliberately (v1.2.280), with the reconnect respawn's own shape:
 
 - Alt+Down repeatedly while the character stands still. Each chord is assessed once `drop_retry_seconds` (1.5 s) has passed; a descent of at least `RECONNECT_DROP_Y_PROGRESS` (0.015) clears the stall count, so a real multi-floor descent keeps dropping.
-- After two chords without downward progress, walk to the nearer outer side for `UNRESOLVED_EDGE_HOLD_SECONDS` (5 s): **X > 0.5 → left, X < 0.5 → right**, the same rule the reconnect respawn uses. That side's platform edge is the one the character is closest to. A descent during the walk returns straight to Alt+Down.
-- The opposite side is tried next. If neither edge descends, the chords resume; after `UNRESOLVED_DROP_MAX_EDGE_CYCLES` (3) cycles or `UNRESOLVED_DROP_MAX_ATTEMPTS` (12) chords the recovery stops and logs why, instead of hopping on one spot forever.
+- After two chords without downward progress, hold the nearer outer side for `UNRESOLVED_EDGE_HOLD_SECONDS` (5 s): **X > 0.5 → left, X < 0.5 → right**, the same rule the reconnect respawn uses. That side's platform edge is the one the character is closest to. Since v1.3.51 the side is pressed as the **Direction+Down** chord (`drop_edge_left_down` / `drop_edge_right_down`, the reconnect recovery's own hold, `source="unresolved"`), never as a plain walk: left/right do nothing on a rope, while the Down half still moves the character (the 14:54 log was frozen at `pos=(0.260000, 0.230392)` through both plain-walk passes). A descent during the hold returns straight to Alt+Down.
+- The opposite side is held next. If neither edge descends, the chords resume; after `UNRESOLVED_DROP_MAX_EDGE_CYCLES` (3) cycles or `UNRESOLVED_DROP_MAX_ATTEMPTS` (12) chords the recovery stops and logs why, instead of hopping on one spot forever.
 - Four settled frames are required before the first chord (a falling marker sweeps the minimap and is never "settled"), and the recovery yields to every other vertical owner: a return, the planned descent to the first layer, an attached climb, a jump-point Up claim, the reconnect drop recovery (only while its `drop-to-route` return is actually running), a pickup leg, or a pending post-reconnect route check. The log names the owner once per change: `UNRESOLVED FLOOR: layer change deferred while the drop-to-route return is over` / `… while an attached climb holds Up`.
 - The moment the marker resolves, everything resets and normal routing resumes: `UNRESOLVED FLOOR: the marker resolved as layer1 after 2 layer-change attempt(s); resuming normal routing`. A fresh Start Patrol also resets it.
 

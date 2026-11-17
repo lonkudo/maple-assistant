@@ -27,6 +27,22 @@ from crash_reporter import install_fatal_handler, record_exception
 from versioning import version_label
 import run_mode
 
+# The 启动中。。。 launch hint.  Imported at module level ON PURPOSE: the packaged
+# build compiles this module as its entry and only follows *its* import closure,
+# so a hint known only to the source launcher would never reach a frozen EXE.
+# It is Win32-only (no Tk, no threads touching the UI) and swallows every
+# failure, so it cannot affect the dashboard.
+try:
+    import startup_splash
+except Exception:  # noqa: BLE001 - a missing hint must never block a launch
+    startup_splash = None
+
+# Launch-time origin for the ``STARTUP:`` log lines.
+try:
+    from startup_timing import elapsed as startup_elapsed
+except Exception:  # noqa: BLE001 - timing is diagnostic only
+    startup_elapsed = None
+
 
 class CompactThreadFormatter(logging.Formatter):
     """Display worker thread names without the redundant ``-worker``."""
@@ -516,6 +532,15 @@ def _migrate_recording_assets_out_of_config(
 
 
 def main() -> int:
+    # Nothing below is instant (single-instance mutex, config, ~30 worker imports,
+    # the whole Tk dashboard) and a hidden launch shows nothing while it runs.
+    # Put the 启动中。。。 hint up first; the UI removes it the moment the window is
+    # mapped (``ui_worker._close_startup_hint``).
+    if startup_splash is not None:
+        try:
+            startup_splash.show()
+        except Exception:  # noqa: BLE001 - the hint is cosmetic
+            pass
     singleton_handle = _acquire_single_instance_mutex()
     if singleton_handle is None:
         # The launcher replaces an existing copy before starting a fresh one.
@@ -795,6 +820,21 @@ def main() -> int:
     from map_structure_tracker import MapStructureTracker
     from patrol_control import CoordinateLayout, PatrolController, _layer_y_band
     from ui_worker import UiLogHandler, UiWorker
+
+    # Two launch-time milestones, so a slow start can be attributed instead of
+    # guessed at (``startup_timing`` starts at the launcher, or at this module's
+    # own import in the packaged build; ui_worker logs the window itself).
+    def _startup_elapsed() -> Optional[float]:
+        if startup_elapsed is None:
+            return None
+        try:
+            return startup_elapsed()
+        except Exception:  # noqa: BLE001 - timing is diagnostic only
+            return None
+
+    _import_elapsed = _startup_elapsed()
+    if _import_elapsed is not None:
+        logging.info("STARTUP: 模块导入完成 after %.1fs", _import_elapsed)
 
     stop_event = threading.Event()
     climb_attack_lock = threading.Lock()
@@ -3273,6 +3313,9 @@ def main() -> int:
         dingtalk_notifier,
         focus_worker,
     ]
+    _workers_elapsed = _startup_elapsed()
+    if _workers_elapsed is not None:
+        logging.info("STARTUP: 后台线程已创建 after %.1fs；开始构建界面", _workers_elapsed)
     ui_worker = None if args.no_ui else (
         UiWorker(
             ui_frames,

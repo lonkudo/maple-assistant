@@ -4776,19 +4776,16 @@ class MovementWorker(threading.Thread):
                             self.motion_arbiter, "attack_motion_active", None
                         )
                         if callable(attack_motion_active):
-                            # Cover the arbiter's WHOLE animation window.  A fixed
-                            # 1.0s cap is shorter than attack_grace_seconds (1.2s),
-                            # so the opposite direction went out while the client
-                            # was still animating - exactly the press it swallows,
-                            # the same failure class as a buff tap issued too early.
-                            grace = float(
-                                getattr(
-                                    self.motion_arbiter,
-                                    "attack_grace_seconds",
-                                    0.0,
-                                ) or 0.0
+                            # Only the REMAINDER of this attack's grace can mask a
+                            # key pressed now (see ``_attack_handoff_wait_seconds``).
+                            # Waiting the whole window was the operator's "about 1 s
+                            # pause at the switching stage": at the field cadence
+                            # (one beat every ~0.8 s) ``attack_motion_active`` was
+                            # true almost continuously, so every handoff burned its
+                            # full 1.3 s cap before the new key could go down.
+                            deadline = (
+                                time.monotonic() + self._attack_handoff_wait_seconds()
                             )
-                            deadline = time.monotonic() + max(1.0, grace + 0.10)
                             while (attack_motion_active()
                                    and time.monotonic() < deadline):
                                 if not self._wait_for_patrol_motion(0.02):
@@ -6365,6 +6362,37 @@ class MovementWorker(threading.Thread):
             if self._patrol_abort_event.wait(min(0.02, remaining)):
                 return False
         return False
+
+    def _attack_handoff_wait_seconds(self) -> float:
+        """How long a new walk direction must still yield to an attack animation.
+
+        ``MotionArbiter.attack_motion_active()`` stays true for the WHOLE
+        ``attack_grace_seconds`` (1.2 s) after every attack beat, so waiting for
+        it to clear cost an entire animation window on every walk-direction
+        handoff.  At the field cadence (a beat every ~0.8 s) the predicate was
+        true almost continuously, so the handoff never found an animation-free
+        moment and always burned its cap: the 15:09 log holds ``route state:
+        layer1.rope`` at 15:09:58 with "attack skipped: patrol direction handoff
+        is active" and no movement key until 15:10:00, which the operator sees as
+        "about 1 s pause at the switching stage".
+
+        Only the REMAINING part of the current grace can mask a key pressed now,
+        so that is what the caller waits for.  When the arbiter cannot report its
+        last beat the previous, conservative cap is kept.
+        """
+
+        grace = float(
+            getattr(self.motion_arbiter, "attack_grace_seconds", 0.0) or 0.0
+        )
+        cap = max(1.0, grace + 0.10)
+        last_attack_at = getattr(self.motion_arbiter, "last_attack_at", None)
+        if not callable(last_attack_at) or grace <= 0.0:
+            return cap
+        try:
+            elapsed = time.monotonic() - float(last_attack_at())
+        except (TypeError, ValueError):
+            return cap
+        return max(0.05, min(cap, max(0.0, grace - elapsed) + 0.05))
 
     def _consume_stair_jump_completion(self) -> None:
         """Apply the confirmed queue result on the movement thread.
@@ -17259,9 +17287,33 @@ class MovementWorker(threading.Thread):
         direction down.
         """
 
-        if (previous not in ("left", "right")
-                or next_direction not in ("left", "right")
-                or previous == next_direction):
+        if previous not in ("left", "right"):
+            return
+        if next_direction not in ("left", "right"):
+            # The next phase has no horizontal direction of its own (rope, up
+            # jump point, stand): the walking frame computes one, so there is no
+            # reverse to reserve by name - but the OLD hold must still end HERE.
+            # Leaving it down rode the character past the recorded endpoint while
+            # the route had already asked for the rope (15:09 field log:
+            # 0.802857 -> 0.854286 with "route state: layer1.rope" already
+            # active), and the reversal that followed then took the GENERAL
+            # direction handoff, which waits out the whole attack animation
+            # (up to 1.3 s) before the new key may go down - the operator's
+            # "about 1 s pause at the switching stage".
+            #
+            # Releasing here makes that handoff the cheap one: the next frame
+            # finds no old key to release, so it presses the new direction at
+            # once.  ``direction_transition_event`` is deliberately NOT set:
+            # nothing is reserved to protect, and an event nobody clears would
+            # silence the attack cadence ("patrol direction handoff is active").
+            self._release_endpoint_walk(previous)
+            LOG.info(
+                "endpoint handoff: released %s at recorded edge; the %s phase "
+                "picks its own direction",
+                previous, next_direction,
+            )
+            return
+        if previous == next_direction:
             return
         with self._skill_delivery_lock:
             self._skill_fired_tokens.clear()
@@ -17274,6 +17326,22 @@ class MovementWorker(threading.Thread):
         transition_event = self.direction_transition_event
         if transition_event is not None:
             transition_event.set()
+        self._release_endpoint_walk(previous)
+        LOG.info(
+            # One statement: the misplaced ``%`` used to bind to the first
+            # literal alone, so the format string ended up with two placeholders
+            # and three arguments and every endpoint turn logged
+            # "<unformattable log record ...>" instead of this line.
+            "endpoint turn armed: released %s at recorded edge; "
+            "neutral %.0fms then %s",
+            previous,
+            DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS * 1000.0,
+            next_direction,
+        )
+
+    def _release_endpoint_walk(self, previous: str) -> None:
+        """Take the endpoint's walk key off, without reserving a reverse."""
+
         key_up = getattr(self.key_sender, "key_up", None)
         force_key_up = getattr(self.key_sender, "force_key_up", None)
         with self._direction_lock, self._hold_lock:
@@ -17289,17 +17357,6 @@ class MovementWorker(threading.Thread):
                 force_key_up(previous, reason="patrol endpoint reached")
             elif callable(key_up):
                 key_up(previous)
-        LOG.info(
-            # One statement: the misplaced ``%`` used to bind to the first
-            # literal alone, so the format string ended up with two placeholders
-            # and three arguments and every endpoint turn logged
-            # "<unformattable log record ...>" instead of this line.
-            "endpoint turn armed: released %s at recorded edge; "
-            "neutral %.0fms then %s",
-            previous,
-            DIRECTION_SWITCH_NEUTRAL_GAP_SECONDS * 1000.0,
-            next_direction,
-        )
 
     def _clear_endpoint_turn_rearm(self) -> None:
         """Forget a completed/cancelled endpoint re-arm and open attacks."""
