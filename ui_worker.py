@@ -183,7 +183,10 @@ class _AutoLieDetectorEvent:
 # window (including the in-window caption bar when active) is compact by
 # default while remaining user-resizable.
 # The height stays user-resizable (only the minimum is enforced).
-_INITIAL_WINDOW_WIDTH = 980
+# 960 = the operator's chosen initial width (20 px narrower than the old 980).
+# The column tracks below (460 + 393 + 36 gutter = 889) still fit, so the initial
+# geometry is what decides the opened width.
+_INITIAL_WINDOW_WIDTH = 960
 _INITIAL_WINDOW_HEIGHT = 560
 # Every panel in the left stack follows this single track.  The
 # right-side controls retain their own wider track because their key bindings
@@ -275,6 +278,11 @@ UPDATE_CENTER_WIDTH = 900
 UPDATE_CENTER_HEIGHT = 470
 UPDATE_CENTER_MIN_WIDTH = 640
 UPDATE_CENTER_MIN_HEIGHT = 260
+# The window, the scrolling body and every row share ONE face colour.  The window
+# and its canvas used to be plain white while the ttk rows inside were the theme's
+# grey, so 选择版本 showed a white panel with grey bands.  #f0f0f0 (240,240,240) is
+# what the ttk widgets themselves paint, so the whole window is uniform.
+UPDATE_CENTER_BACKGROUND = "#f0f0f0"
 # Characters of the notes shown inline before the tooltip takes over.
 UPDATE_CENTER_SUMMARY_CHARS = 46
 # 用户提示 (the operator's own message) has its own caption icon: a triangle with
@@ -5028,7 +5036,7 @@ class UiWorker(threading.Thread):
         win = tk.Toplevel(root)
         win.title("更新 · 选择版本")
         win.transient(root)
-        win.configure(bg="#ffffff")
+        win.configure(bg=UPDATE_CENTER_BACKGROUND)
         win.geometry(f"{UPDATE_CENTER_WIDTH}x{UPDATE_CENTER_HEIGHT}")
         win.minsize(UPDATE_CENTER_MIN_WIDTH, UPDATE_CENTER_MIN_HEIGHT)
         win.protocol("WM_DELETE_WINDOW", self._close_update_center)
@@ -5046,7 +5054,7 @@ class UiWorker(threading.Thread):
         body = ttk.Frame(win)
         body.pack(fill="both", expand=True, padx=12)
         self._update_center_canvas = tk.Canvas(
-            body, highlightthickness=0, bg="#ffffff", height=240,
+            body, highlightthickness=0, bg=UPDATE_CENTER_BACKGROUND, height=240,
         )
         scrollbar = ttk.Scrollbar(body, orient="vertical",
                                   command=self._update_center_canvas.yview)

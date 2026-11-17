@@ -4387,15 +4387,38 @@ class MovementWorker(threading.Thread):
                     "climbing up (Z paused)", self._rope_stuck_recoveries)
 
     def _movement_busy_now(self) -> bool:
-        """True while vertical recovery or a confirmed stair action is active.
+        """True while vertical recovery, a stair action or a skill cast is active.
 
         The post-arrival timestamp still suppresses unsafe stair jumps, but it
         must not suppress attacks after the new layer has been confirmed.
+
+        A recorded SKILL point belongs here too (v1.3.53).  Its three taps own the
+        keyboard for ~0.55 s and the client freezes horizontal movement for the
+        cast, so a patrol leg that makes no progress during it is not a stall.
+        Without this the 18:42 field log counted 10 "stationary" frames while C was
+        casting, probed with Left/Right against the arbiter's own motion, declared
+        "confirmed stuck (on a rope)" and jumped a healthy character off layer2 -
+        after which every layer it reported was nonsense.  Buffs and ordinary
+        attacks deliberately do NOT set this: they overlap a walk without stopping
+        it, and silencing the stall detector for them would hide a real stall.
         """
+
         if (self.dropping_active_event is not None
                 and self.dropping_active_event.is_set()):
             return True
         if self._climb_state.phase != "idle":
+            return True
+        # Queued or executing skill tap: the worker-side token set (written under
+        # ``_skill_delivery_lock``; a plain truth test on a set is atomic) plus the
+        # arbiter's own view, so a token the arbiter dropped cannot pin this on.
+        # ``skill_motion_active()`` takes the arbiter's condition lock, which is
+        # re-entrant (``threading.Condition`` owns an ``RLock``) because
+        # ``motion_arbiter_motion_allowed()`` - the arbiter's own gate callback -
+        # calls this method while holding it.
+        if self._skill_pending_tokens:
+            return True
+        skill_motion_active = getattr(self.motion_arbiter, "skill_motion_active", None)
+        if callable(skill_motion_active) and skill_motion_active():
             return True
         stair_jump_active = getattr(self.stair_jump_worker, "is_active", None)
         if callable(stair_jump_active) and stair_jump_active():

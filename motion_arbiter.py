@@ -876,6 +876,34 @@ class MotionArbiter(threading.Thread):
     # Attack-facing state                                                #
     # ------------------------------------------------------------------ #
 
+    def skill_motion_active(self) -> bool:
+        """True while a recorded skill-point tap is queued or executing.
+
+        A skill point taps its key three times (~0.55 s) while patrol keeps its
+        left/right hold down, and the client freezes horizontal movement for the
+        cast.  The movement worker asks this so a walk that cannot progress during
+        a cast is not mistaken for a stall: the 18:42 field log fired
+        ``SELF-RESCUE: character stationary on a horizontal patrol leg for 10
+        frames`` because the cast was in flight, the probe then pressed Left and
+        Right while this arbiter still owned the keyboard, and the "confirmed
+        stuck (on a rope)" verdict threw a healthy character off its platform.
+
+        Only SKILL tokens count.  A buff or an ordinary attack may overlap a walk
+        without stopping it, so neither may silence the stall detector.
+
+        Re-entrancy note: ``_cv`` is a ``threading.Condition``, which owns an
+        ``RLock``, so this is safe to call from ``motion_arbiter_motion_allowed()``
+        - the gate the arbiter itself invokes while holding ``_cv``.  Keep that
+        property if the condition is ever replaced: a plain ``Lock`` here would
+        deadlock the arbiter against its own gate callback.
+        """
+
+        prefix = f"{SKILL}:"
+        with self._cv:
+            if (self._executing_token or "").startswith(prefix):
+                return True
+            return any(token.startswith(prefix) for token in self._pending)
+
     def is_idle(self) -> bool:
         """True when no event is queued and no motion window is running."""
 
