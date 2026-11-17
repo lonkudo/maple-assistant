@@ -1179,14 +1179,24 @@ uses `/api/v1/activate` rather than the preview/confirm pair because the install
 before any heartbeat could re-anchor anything, and the tolerant device check
 (`binding_matches`) makes it accept a restored PC.
 
-**A brand-new PC waits for its own signals (v1.3.35).** `warm_device_identity(8.0)`
-re-reads the hardware signals until two of the three are available (MachineGuid,
-firmware UUID, motherboard serial) — a readiness wait that sends nothing to the server —
-and only then does the single activation attempt run. On a fresh machine the two CIM
-reads are PowerShell calls with a 4 s budget while the WMI providers are still starting
-and Defender is scanning the freshly copied package, so the first read often returned
-nothing and the install stopped at its very first step with `设备未就绪，稍后重试`. For
-the same reason a `device_not_ready` verdict no longer refuses the write: the local
+**A brand-new PC waits for its own signals (v1.3.35, repaced v1.3.52).**
+`warm_device_identity(20.0)` re-reads the hardware signals until two of the three
+are available (MachineGuid, firmware UUID, motherboard serial) — a readiness wait
+that sends nothing to the server — and only then does the single activation attempt
+run. On a fresh machine the two CIM reads are PowerShell calls with a 4 s budget
+while the WMI providers are still starting and Defender is scanning the freshly
+copied package, so the first read often returned nothing and the install stopped at
+its very first step with `设备未就绪，稍后重试`. v1.3.52 fixed the *pacing* of that
+wait: `machine_fingerprint_components(retry_cim=False)` reads each signal exactly
+once, so one attempt can no longer consume the whole budget — the inner retry could
+spend up to 8.4 s per signal (17 s for one attempt, inside an 8 s budget), which
+made the wait a single-shot check that always failed on a cold start while the same
+PC authenticated normally a minute later. The installer now waits up to 20 s and
+adds one more `_activate()` attempt after `DEVICE_RETRY_SLEEP_SECONDS = 5` when the
+device is still cold. Measured: 4 attempts inside a 3 s budget with every CIM read
+failing, versus one attempt before. The signal set and the hashing are unchanged, so
+a client's fingerprint still matches the installer's. For the same reason a
+`device_not_ready` verdict no longer refuses the write: the local
 check needs those same signals, so its failure is not evidence against the document the
 server has just signed for the composite this process proved. The installer logs
 `local device check postponed` and writes the entitlement; the desktop re-verifies it on

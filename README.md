@@ -49,7 +49,7 @@ If a required library is missing, the normal package repairs itself: the hidden 
 
 The update icon in the title bar turns green when the activation server announces a newer version; hovering shows that version's 更新说明, and clicking opens the **更新** window (v1.3.50). That window lists every version the operator offers — the announced one first — with its 更新说明, and each row has **仅下载保存** (the ZIP is downloaded into `<root>\版本` and kept) and **下载并安装** (the supervisor installs that copy; the library copy stays). An older version can be listed and installed on purpose: the picked version is the authority, not the newest, and a rollback row does not light the title-bar icon. The download comes from that version's 更新链接 record (netdisk share); the archive is verified before anything is unpacked. A fixed packaged helper (`todohelper_update.ps1`) waits for the current process to exit, clears any other assistant instance that still holds the packaged files or the single-instance mutex, installs the ZIP, preserves `user_config.json`, removes the consumed ZIP, and restarts the app through `MoonEclipse.exe`, then `launch_assistant.vbs`, then `启动助手.bat`, retrying once and logging the PID it started. It is the same reusable process for normal and standalone releases; no update-specific script is generated. Normal and EXE packages only replace their own format. **导入配置** is deliberately separate from package updates: it validates the selected JSON, stops patrol, atomically replaces the live configuration in a background task, then redraws the user-owned panels in the current assistant. The status line shows `↻ 正在刷新导入配置…` while this happens; it does not need a manual restart.
 
-### Current release behavior (v1.3.49 – v1.3.51)
+### Current release behavior (v1.3.49 – v1.3.52)
 
 - **A hidden start now says 启动中... while it loads.** `启动助手.bat` runs a
   hidden, elevated launcher, so until the dashboard exists the user sees nothing
@@ -107,6 +107,17 @@ The update icon in the title bar turns green when the activation server announce
   no longer existed, so the install aborted with `name 'update_dir' is not
   defined` **after** unpacking — before writing the activation and starting the
   first-install setup.
+- **A cold start no longer reports 设备未就绪 for a machine that is perfectly
+  valid.** The readiness wait before activation was budgeted at 8 s, but one
+  read of the two WMI signals could spend up to 17 s inside it (`4 s timeout +
+  0.4 s + 4 s` per signal), so the wait was really a single attempt: right after
+  UAC, with Defender scanning the freshly extracted installer, that attempt timed
+  out and the customer was told to retry later — while the same PC authenticates
+  normally a minute afterwards. Each attempt now reads every signal exactly once
+  (so the budget buy several attempts — measured: 4 attempts inside a 3 s budget
+  instead of one), the installer waits up to 20 s, and a still-not-ready device
+  gets ONE more activation attempt after 5 s. The signal set and the hashing are
+  unchanged, so fingerprints still match the client's.
 
 ### Current release behavior (v1.3.36 – v1.3.48)
 

@@ -594,21 +594,35 @@ def warm_device_identity(seconds: float = 8.0, *, poll_seconds: float = 1.0) -> 
     the caller then tells the operator to retry later.  The desktop's heartbeat
     worker has its own readiness schedule; this exists for the installer, whose
     single attempt is the customer's first impression.
+
+    Each attempt reads every signal exactly ONCE (``retry_cim=False``) so the
+    budget buys several attempts instead of being consumed by one: the earlier
+    inner retry could spend 17 s on a single attempt and turn an 8 s wait into a
+    one-shot check that always reported 设备未就绪 on a cold start.
     """
 
     deadline = time.monotonic() + max(0.0, float(seconds))
     attempt = 0
     while True:
         attempt += 1
-        components = machine_fingerprint_components(force_refresh=True)
+        started = time.monotonic()
+        components = machine_fingerprint_components(
+            force_refresh=True, retry_cim=False,
+        )
         if len(components) >= 2:
             if attempt > 1:
                 SERVER_LOG.info(
-                    "device identity ready after %d read(s) (%d signal(s))",
-                    attempt, len(components),
+                    "device identity ready after %d read(s) (%d signal(s): %s)",
+                    attempt, len(components), ", ".join(sorted(components)),
                 )
             return True
         remaining = deadline - time.monotonic()
+        SERVER_LOG.warning(
+            "device identity attempt %d incomplete after %.1fs (%d signal(s): %s); "
+            "%.1fs left",
+            attempt, time.monotonic() - started, len(components),
+            ", ".join(sorted(components)) or "none", max(0.0, remaining),
+        )
         if remaining <= 0:
             SERVER_LOG.warning(
                 "device identity still incomplete after %d read(s) (%d signal(s)); "
@@ -618,8 +632,20 @@ def warm_device_identity(seconds: float = 8.0, *, poll_seconds: float = 1.0) -> 
         time.sleep(min(max(0.1, poll_seconds), remaining))
 
 
-def machine_fingerprint_components(*, force_refresh: bool = False) -> dict[str, str]:
-    """Return hashed hardware signals suitable for a signed device binding."""
+def machine_fingerprint_components(
+    *, force_refresh: bool = False, retry_cim: bool = True,
+) -> dict[str, str]:
+    """Return hashed hardware signals suitable for a signed device binding.
+
+    ``retry_cim=False`` reads each CIM signal ONCE, without the inner retry that
+    ``_cim_value_with_one_retry`` performs.  The readiness wait uses it so one
+    attempt cannot consume the whole budget: with the retry, a machine whose
+    PowerShell is slow (or still being scanned by Defender right after UAC) spent
+    up to 8.4 s per signal - 17 s for one attempt - inside an 8 s budget, so
+    ``warm_device_identity`` gave up after a SINGLE attempt with "设备未就绪"
+    even though the very same machine authenticates fine a minute later.  The
+    signal set and the hashing are identical either way; only the pacing differs.
+    """
 
     global _fingerprint_cache_at, _fingerprint_cache, _fingerprint_last_good_cache
     with _fingerprint_cache_lock:
@@ -631,14 +657,24 @@ def machine_fingerprint_components(*, force_refresh: bool = False) -> dict[str, 
         if (not force_refresh
                 and time.monotonic() - _fingerprint_cache_at < cache_lifetime):
             return dict(_fingerprint_cache)
+    read_firmware = (
+        _cim_value_with_one_retry(
+            "Win32_ComputerSystemProduct", "UUID", "firmware UUID",
+        )
+        if retry_cim
+        else _cim_value("Win32_ComputerSystemProduct", "UUID")
+    )
+    read_board = (
+        _cim_value_with_one_retry(
+            "Win32_BaseBoard", "SerialNumber", "motherboard serial",
+        )
+        if retry_cim
+        else _cim_value("Win32_BaseBoard", "SerialNumber")
+    )
     raw = {
         "windows": _machine_guid(),
-        "firmware": _cim_value_with_one_retry(
-            "Win32_ComputerSystemProduct", "UUID", "firmware UUID",
-        ),
-        "board": _cim_value_with_one_retry(
-            "Win32_BaseBoard", "SerialNumber", "motherboard serial",
-        ),
+        "firmware": read_firmware,
+        "board": read_board,
     }
     components: dict[str, str] = {}
     for name, value in raw.items():

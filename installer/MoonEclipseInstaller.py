@@ -728,6 +728,29 @@ def _activate(code: str) -> tuple[str, Any, Any]:
     raise RuntimeError("授权失败：服务器未返回下载信息。")
 
 
+def _activate_with_device_retry(code: str) -> tuple[str, Any, Any]:
+    """``_activate`` with one extra chance when the DEVICE is the problem.
+
+    A not-ready device is the one activation failure that heals by itself: WMI is
+    still starting, or Defender is finishing the scan of the freshly extracted
+    onefile.  The readiness wait in ``_prepare_worker`` covers the first 20 s; this
+    second attempt covers the machine that needs a few more, instead of telling a
+    customer whose code is perfectly valid to "retry later".  Every other failure
+    propagates unchanged, so a refused code or an unreachable server is still
+    reported immediately.
+    """
+
+    try:
+        return _activate(code)
+    except DeviceNotReadyError:
+        logging.warning(
+            "installer: device still not ready after the readiness wait; "
+            "retrying activation once in %.0fs", DEVICE_RETRY_SLEEP_SECONDS,
+        )
+        time.sleep(max(0.0, DEVICE_RETRY_SLEEP_SECONDS))
+        return _activate(code)
+
+
 # The signed entitlement the desktop verifies, and the desktop's own record of
 # the code it was activated with (both are the client's own file names).
 ENTITLEMENT_FILE = "auth.json"
@@ -909,7 +932,16 @@ def _write_license_settings(
 # retry of the activation - nothing is sent to the server - and it is what lets a
 # new machine install on the first try.
 DEVICE_NOT_READY_HINT = "设备未就绪，稍后重试"
-DEVICE_READY_WAIT_SECONDS = 8.0
+# The wait covers SEVERAL reads of the hardware signals.  Each read is one
+# bounded PowerShell call per signal, and on a cold start (right after UAC, with
+# Defender scanning the freshly extracted onefile) the first call can hit its 4 s
+# budget - so an 8 s wait was in practice a single attempt, and the installer
+# stopped with "设备未就绪" while the same PC authenticates fine a minute later.
+DEVICE_READY_WAIT_SECONDS = 20.0
+# One more activation attempt after this pause when the first one still reports a
+# not-ready device: the readiness wait above is the primary repair, this is the
+# second chance a customer needs if WMI came up late.
+DEVICE_RETRY_SLEEP_SECONDS = 5.0
 
 
 class ActivationBoundElsewhereError(RuntimeError):
@@ -1728,7 +1760,7 @@ class InstallerWindow:
                 self.events.put(("hint", DEVICE_NOT_READY_HINT))
                 return
             try:
-                _token, release, versions = _activate(code)
+                _token, release, versions = _activate_with_device_retry(code)
             except DeviceNotReadyError:
                 logging.warning("installer: device fingerprint not ready")
                 self.events.put(("hint", DEVICE_NOT_READY_HINT))
