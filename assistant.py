@@ -3642,5 +3642,60 @@ def main() -> int:
     return 0
 
 
+def _report_startup_crash(detail: str = "") -> None:
+    """Leave a file behind when a launch dies before the log can hold it.
+
+    A packaged build has no ``startup_probe`` wrapper and no console, so an
+    unhandled exception inside ``main()`` printed its traceback to a console
+    nobody can see and the process simply vanished - the operator's "flash
+    close".  The 22:09/22:10 field reports are exactly that shape: the
+    ``crash_report.log`` holds ``fatal-signal handler armed`` for each attempt
+    (so the mutex, the hint, argument parsing and the log cleanup all ran) and
+    nothing else - no dump, because it was not a native crash, and no log line,
+    because the logging writer is created later in ``main()``.
+
+    ``work/startup-error.log`` is written with the pid, the version and the full
+    traceback, and ``crash_report.log`` gets a one-line pointer to it.  Deliberately
+    dependency-free: no logger, no config, no Tk.
+    """
+
+    try:
+        import traceback
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        root = application_root(__file__)
+        work = root / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        body = detail or traceback.format_exc()
+        if not body or body.strip() in ("NoneType: None", ""):
+            body = "(no traceback captured)"
+        try:
+            version = (root / "VERSION").read_text(encoding="utf-8").strip()
+        except OSError:
+            version = "unknown"
+        entry = (
+            f"\n===== startup failure {stamp} | pid={os.getpid()} | v{version} "
+            f"=====\n{body}\n"
+        )
+        with (work / "startup-error.log").open("a", encoding="utf-8") as handle:
+            handle.write(entry)
+        with (work / "crash_report.log").open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n{stamp} | STARTUP FAILURE pid={os.getpid()} | traceback in "
+                "work/startup-error.log\n"
+            )
+    except Exception:  # noqa: BLE001 - reporting must never raise
+        pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # The packaged build's only entry point.  SystemExit keeps its own meaning;
+    # anything else is a startup failure that must not be silent.
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException:  # noqa: BLE001 - re-raised after being recorded
+        _report_startup_crash()
+        raise
